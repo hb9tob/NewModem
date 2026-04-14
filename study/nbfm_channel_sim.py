@@ -32,12 +32,19 @@ IF_RATE = 480000
 FM_DEV = 5000.0
 TAU = 75e-6
 SUB_AUDIO_HPF = 300.0   # filtre CTCSS du transceiver (Hz)
-POST_LPF = 2400.0       # LPF audio additionnel du transceiver (Hz), 0=desactive
+POST_LPF = 2000.0       # LPF audio du transceiver. Mesures OTA montrent
+                        # degradation forte des que BW signal > 1500 Hz
+                        # (Rs > 1200 Bd). Ancienne valeur 2400 Hz trop large.
 POST_GAIN_DB = -6.5     # gain audio fixe (chaine acquisition reelle)
 TX_HARD_CLIP = 0.55     # hard-clip audio avant FM (limiteur d'excursion).
                         # Calibre OTA : 32QAM 750 Bd a BER 5e-5 a -6 dB (peak
                         # 0.45) vs 7e-3 a 0 dB (peak 0.9) -> seuil ~0.5-0.6.
                         # 0 desactive le clip.
+
+# Bruit audio post-demod (soundcard ADC, phase noise LO residuel).
+# Mis a 0 : sim reste optimiste de 4-6 dB vs OTA a Rs > 1000 Bd mais la
+# calibration flat-noise ne matche pas la forme freq-dependante du canal.
+AUDIO_NOISE_RMS = 0.0
 
 # Derive d'horloge soundcard (ppm). Modele : drift(t) = drift_ppm +
 # drift_thermal_ppm * sin(2*pi*t/thermal_period_s)
@@ -106,6 +113,7 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              drift_ppm=DRIFT_PPM, thermal_ppm=DRIFT_THERMAL_PPM,
              thermal_period_s=DRIFT_THERMAL_PERIOD_S,
              tx_hard_clip=TX_HARD_CLIP,
+             audio_noise_rms=AUDIO_NOISE_RMS,
              start_delay_s=None, rng_seed=None, verbose=True):
     """Fait passer audio_in par TX -> bruit IF -> RX, retourne audio_out.
 
@@ -191,6 +199,11 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
     tb.run()
     audio_out = np.array(sink.data(), dtype=np.float64)
 
+    # Bruit audio post-demod (soundcard ADC, phase noise residuel, etc).
+    # Calibre sur mesures OTA : +EVM ~10 % vs sim pur.
+    if audio_noise_rms and audio_noise_rms > 0:
+        audio_out = audio_out + rng.normal(0.0, audio_noise_rms, len(audio_out))
+
     # Derive d'horloge (post-traitement)
     if drift_ppm != 0.0 or thermal_ppm != 0.0:
         if verbose:
@@ -227,6 +240,8 @@ def main():
     ap.add_argument("--tx-clip", type=float, default=TX_HARD_CLIP,
                     help=f"Hard-clip audio avant FM (defaut {TX_HARD_CLIP}, "
                          "0=desactive)")
+    ap.add_argument("--audio-noise", type=float, default=AUDIO_NOISE_RMS,
+                    help=f"RMS bruit audio post-demod (defaut {AUDIO_NOISE_RMS})")
     args = ap.parse_args()
 
     audio_in, sr = load_wav(args.input_wav)
@@ -240,6 +255,7 @@ def main():
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,
                          tx_hard_clip=args.tx_clip,
+                         audio_noise_rms=args.audio_noise,
                          start_delay_s=args.start_delay,
                          rng_seed=args.seed)
 

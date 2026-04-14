@@ -112,11 +112,36 @@ le 16QAM trouvé en simulation pure. Au bon niveau d'entrée, on obtient
 imposée par la phase non-linéaire du canal (40° std), pas par le TX.
 Poussera plus loin nécessite un égaliseur.
 
+## LDPC WiMAX soft-decision (IEEE 802.16)
+
+Ajout de FEC avec codes LDPC WiMAX (proven, fournis par commpy) :
+
+- Rate **3/4** : code (960, 720) — 720 info bits / 960 codeword
+- Rate **1/2** : code (1440, 720) — meme info, plus de protection
+- Decodeur : Belief Propagation min-sum, 50 iterations max
+
+Resultats sim (canal calibre LPF 2000 Hz) :
+
+| Mod | Rate | Rs | BER raw | BER decoded | Net bps |
+|---|---|---|---|---|---|
+| 16QAM | 3/4 | 1500 | 9e-4 | **0** | **4235** |
+| 32QAM | 3/4 | 1200 | 4e-3 | **0** | **4235** |
+| 16QAM | 1/2 | 1600 | 1.5e-2 | 0 | 3012 |
+| 32QAM | 1/2 | 1500 | 2e-2 | 0 | 3529 |
+| 8PSK | 3/4 | 1500 | 2.2e-3 | 0 | 3176 |
+
+**Sweet spot sim** : 16QAM 3/4 a 1500 Bd ou 32QAM 3/4 a 1200 Bd
+→ **4235 bps net avec BER 0**.
+
+Note : sim reste optimiste de 4-6 dB vs OTA aux Rs > 1000 Bd. Projection OTA :
+3-3.5 kb/s net realiste, 4 kb/s net optimiste.
+
 ## Reproduire
 
 ```bash
 # Simulation :
 python study/modem_ber_bench.py
+python study/modem_ldpc_ber_bench.py
 
 # OTA :
 python study/generate_ota_test_wav.py

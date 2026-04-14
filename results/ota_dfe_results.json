@@ -1,0 +1,166 @@
+{
+  "blocks": [
+    {
+      "label": "dfe_8PSK_1500Bd_-3dB",
+      "mod": "8PSK",
+      "symbol_rate": 1500,
+      "level_db": -3.0,
+      "ber": 0.03115229161900404,
+      "evm_pct": 31.620412282451632,
+      "n_bits": 26226
+    },
+    {
+      "label": "dfe_8PSK_1600Bd_-3dB",
+      "mod": "8PSK",
+      "symbol_rate": 1600,
+      "level_db": -3.0,
+      "ber": 0.040498108898879615,
+      "evm_pct": 33.882334875285125,
+      "n_bits": 28026
+    },
+    {
+      "label": "dfe_8PSK_2000Bd_-3dB",
+      "mod": "8PSK",
+      "symbol_rate": 2000,
+      "level_db": -3.0,
+      "ber": 0.10285892740538853,
+      "evm_pct": 45.43780467167745,
+      "n_bits": 35223
+    },
+    {
+      "label": "dfe_16QAM_1200Bd_-3dB",
+      "mod": "16QAM",
+      "symbol_rate": 1200,
+      "level_db": -3.0,
+      "ber": 0.03978827596139997,
+      "evm_pct": 24.561913309427478,
+      "n_bits": 27772
+    },
+    {
+      "label": "dfe_16QAM_1500Bd_-3dB",
+      "mod": "16QAM",
+      "symbol_rate": 1500,
+      "level_db": -3.0,
+      "ber": 0.17817110831522362,
+      "evm_pct": 40.75093163013018,
+      "n_bits": 34972
+    },
+    {
+      "label": "dfe_16QAM_1600Bd_-3dB",
+      "mod": "16QAM",
+      "symbol_rate": 1600,
+      "level_db": -3.0,
+      "ber": 0.21304720111313283,
+      "evm_pct": 45.98780202591502,
+      "n_bits": 37372
+    },
+    {
+      "label": "dfe_32QAM_1000Bd_-3dB",
+      "mod": "32QAM",
+      "symbol_rate": 1000,
+      "level_db": -3.0,
+      "ber": 0.066016713091922,
+      "evm_pct": 18.572559460713585,
+      "n_bits": 28720
+    },
+    {
+      "label": "dfe_32QAM_1200Bd_-3dB",
+      "mod": "32QAM",
+      "symbol_rate": 1200,
+      "level_db": -3.0,
+      "ber": 0.16134792626728112,
+      "evm_pct": 25.379198146193144,
+      "n_bits": 34720
+    },
+    {
+      "label": "dfe_32QAM_1500Bd_-3dB",
+      "mod": "32QAM",
+      "symbol_rate": 1500,
+      "level_db": -3.0,
+      "ber": 0.31192954363490794,
+      "evm_pct": 40.33036947576242,
+      "n_bits": 43715
+    },
+    {
+      "label": "dfe_8PSK_1500Bd_-6dB",
+      "mod": "8PSK",
+      "symbol_rate": 1500,
+      "level_db": -6.0,
+      "ber": 0.027714242146996037,
+      "evm_pct": 30.543696723305736,
+      "n_bits": 26232
+    },
+    {
+      "label": "dfe_8PSK_1600Bd_-6dB",
+      "mod": "8PSK",
+      "symbol_rate": 1600,
+      "level_db": -6.0,
+      "ber": 0.02108304794520548,
+      "evm_pct": 29.75053462746253,
+      "n_bits": 28032
+    },
+    {
+      "label": "dfe_8PSK_2000Bd_-6dB",
+      "mod": "8PSK",
+      "symbol_rate": 2000,
+      "level_db": -6.0,
+      "ber": 0.09452439751341224,
+      "evm_pct": 44.487616058704646,
+      "n_bits": 35229
+    },
+    {
+      "label": "dfe_16QAM_1200Bd_-6dB",
+      "mod": "16QAM",
+      "symbol_rate": 1200,
+      "level_db": -6.0,
+      "ber": 0.01357286866359447,
+      "evm_pct": 20.422654231751565,
+      "n_bits": 27776
+    },
+    {
+      "label": "dfe_16QAM_1500Bd_-6dB",
+      "mod": "16QAM",
+      "symbol_rate": 1500,
+      "level_db": -6.0,
+      "ber": 0.17271843549862764,
+      "evm_pct": 40.07940958683389,
+      "n_bits": 34976
+    },
+    {
+      "label": "dfe_16QAM_1600Bd_-6dB",
+      "mod": "16QAM",
+      "symbol_rate": 1600,
+      "level_db": -6.0,
+      "ber": 0.21382705479452055,
+      "evm_pct": 45.7997780494714,
+      "n_bits": 37376
+    },
+    {
+      "label": "dfe_32QAM_1000Bd_-6dB",
+      "mod": "32QAM",
+      "symbol_rate": 1000,
+      "level_db": -6.0,
+      "ber": 0.0233983286908078,
+      "evm_pct": 14.773651036703633,
+      "n_bits": 28720
+    },
+    {
+      "label": "dfe_32QAM_1200Bd_-6dB",
+      "mod": "32QAM",
+      "symbol_rate": 1200,
+      "level_db": -6.0,
+      "ber": 0.17419354838709677,
+      "evm_pct": 26.06395072107431,
+      "n_bits": 34720
+    },
+    {
+      "label": "dfe_32QAM_1500Bd_-6dB",
+      "mod": "32QAM",
+      "symbol_rate": 1500,
+      "level_db": -6.0,
+      "ber": 0.29768984446477587,
+      "evm_pct": 39.40675241831082,
+      "n_bits": 43720
+    }
+  ]
+}

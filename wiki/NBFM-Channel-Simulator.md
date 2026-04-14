@@ -26,7 +26,8 @@ récepteur FM.
 | `max_dev` | 5000 Hz | déviation FM max |
 | `tau` | 75 µs | pré/de-emphase |
 | `sub_audio_hpf` | 300 Hz | filtre CTCSS |
-| `post_lpf` | 2400 Hz | LPF audio du transceiver |
+| `post_lpf` | **2000 Hz** | LPF audio du transceiver (recalibre apres OTA) |
+| `audio_noise_rms` | 0.0 | bruit audio post-demod (0 par defaut) |
 | `post_gain_db` | -6.5 dB | calibration niveau |
 | `tx_hard_clip` | 0.55 | seuil de hard-clip audio avant FM (simule limiteur d'excursion) |
 | `if_noise` | 0.165 | std bruit IF (cible ~30 dB SNR audio) |
