@@ -10,7 +10,10 @@
 //! Cette premiere version expose juste le modulateur sans FEC.
 
 pub mod constellation;
+pub mod crc;
+pub mod frame;
 pub mod framing;
+pub mod header;
 pub mod ldpc;
 pub mod modulator;
 pub mod rrc;
@@ -42,6 +45,29 @@ pub enum ModemMode {
 }
 
 impl ModemMode {
+    /// Code numerique 1 octet pour le header de frame.
+    pub fn to_code(&self) -> u8 {
+        match self {
+            ModemMode::Psk8R12_1500 => 1,
+            ModemMode::Psk8R12_500 => 2,
+            ModemMode::Qam16R12_1600 => 3,
+            ModemMode::Qam16R34_1500 => 4,
+            ModemMode::Qam32R34_1200 => 5,
+        }
+    }
+
+    /// Inverse de `to_code()`.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(ModemMode::Psk8R12_1500),
+            2 => Some(ModemMode::Psk8R12_500),
+            3 => Some(ModemMode::Qam16R12_1600),
+            4 => Some(ModemMode::Qam16R34_1500),
+            5 => Some(ModemMode::Qam32R34_1200),
+            _ => None,
+        }
+    }
+
     /// Code LDPC associe au mode (utilise par le pipeline TX/RX).
     pub fn ldpc_code(&self) -> ldpc::LdpcCode {
         match self {

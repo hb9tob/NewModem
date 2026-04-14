@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 num-complex = "0.4"
 cpal = "0.15"
 serialport = "4"
+thiserror = "1"
 
 [profile.release]
 opt-level = 3

@@ -15,6 +15,7 @@ use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use modem_core::{
+    frame::build_frame,
     modulator::{modulate_bytes, vox_tone},
     ModemMode, AUDIO_RATE,
 };
@@ -233,11 +234,23 @@ fn main() -> Result<()> {
 
     // Lecture fichier
     let bytes = std::fs::read(&file).with_context(|| format!("lecture {}", file))?;
+    let filename = std::path::Path::new(&file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file.bin")
+        .to_string();
     println!("[file] {} octets ({})", bytes.len(), file);
+    println!("[frame] filename='{}'", filename);
+
+    // Assemble frame (header + body) - rs_level=0 pour l'instant
+    let frame_bytes = build_frame(mode, 0, 0, true, &filename, &bytes)
+        .context("build_frame")?;
+    println!("[frame] {} octets total (header 16 + body+padding {})",
+        frame_bytes.len(), frame_bytes.len() - 16);
 
     // Module (LDPC encode + modulation)
     println!("[modem] LDPC encode + modulation...");
-    let data_audio = modulate_bytes(&bytes, mode, args.peak);
+    let data_audio = modulate_bytes(&frame_bytes, mode, args.peak);
     let data_dur = data_audio.len() as f32 / AUDIO_RATE as f32;
     println!("[modem] {} samples, {:.2} s",
         data_audio.len(), data_dur);
