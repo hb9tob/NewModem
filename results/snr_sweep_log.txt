@@ -1,0 +1,221 @@
+Config                      IF_n  SNRdB    BERraw    BERdec     Net   time
+
+--- if_noise = 0.165 ---
+len(audio_taps) = 2313
+pagesize :error: no info; setting pagesize = 4096
+32QAM 3/4 @ 1200 Bd         0.17  29.4  9.0e-04  0.0e+00   4235b   22.2s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.17  26.1  6.0e-04  0.0e+00   4235b    1.0s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.17  26.5  5.7e-03  0.0e+00   3529b    1.4s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.17  30.1  1.5e-04  0.0e+00   3388b   24.9s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.17  18.5  4.0e-03  0.0e+00   3012b    1.4s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.17  23.6  0.0e+00  0.0e+00   3176b    1.0s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.17  26.7  1.4e-03  0.0e+00   2824b    1.4s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.17  23.6  1.3e-03  0.0e+00   2118b    1.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.17  26.3  7.5e-04  0.0e+00   1412b   42.8s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.17  25.9  6.0e-04  0.0e+00   1059b   52.3s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.17  24.9  6.5e-04  0.0e+00    706b   72.6s
+
+--- if_noise = 0.25 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.25  29.3  9.0e-04  0.0e+00   4235b   22.3s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.25  26.0  6.0e-04  0.0e+00   4235b    1.0s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.25  26.4  5.8e-03  0.0e+00   3529b    1.4s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.25  29.9  1.5e-04  0.0e+00   3388b   24.3s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.25  18.5  3.9e-03  0.0e+00   3012b    1.4s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.25  23.6  0.0e+00  0.0e+00   3176b    1.0s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.25  26.6  1.4e-03  0.0e+00   2824b    1.4s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.25  23.6  1.3e-03  0.0e+00   2118b    1.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.25  26.2  7.0e-04  0.0e+00   1412b   41.1s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.25  25.9  6.0e-04  0.0e+00   1059b   51.7s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.25  24.9  6.5e-04  0.0e+00    706b   74.5s
+
+--- if_noise = 0.3 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.30  29.2  9.0e-04  0.0e+00   4235b   23.3s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.30  25.9  6.0e-04  0.0e+00   4235b    1.1s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.30  26.3  5.8e-03  0.0e+00   3529b    1.4s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.30  29.8  1.5e-04  0.0e+00   3388b   25.6s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.30  18.5  3.9e-03  0.0e+00   3012b    1.5s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.30  23.5  0.0e+00  0.0e+00   3176b    1.1s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.30  26.5  1.4e-03  0.0e+00   2824b    1.4s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.30  23.5  1.3e-03  0.0e+00   2118b    1.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.30  26.2  6.5e-04  0.0e+00   1412b   43.3s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.30  25.8  6.0e-04  0.0e+00   1059b   54.4s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.30  24.9  6.5e-04  0.0e+00    706b   74.3s
+
+--- if_noise = 0.35 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.35  29.1  9.0e-04  0.0e+00   4235b   22.8s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.35  25.8  8.3e-04  0.0e+00   4235b    1.0s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.35  26.2  6.1e-03  0.0e+00   3529b    1.4s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.35  29.6  1.5e-04  0.0e+00   3388b   24.5s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.35  18.5  4.3e-03  0.0e+00   3012b    1.5s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.35  23.5  0.0e+00  0.0e+00   3176b    1.1s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.35  26.3  1.6e-03  0.0e+00   2824b    1.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.35  23.5  1.3e-03  0.0e+00   2118b    1.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.35  26.2  7.0e-04  0.0e+00   1412b   42.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.35  25.8  7.0e-04  0.0e+00   1059b   53.2s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.35  24.9  6.5e-04  0.0e+00    706b   73.6s
+
+--- if_noise = 0.42 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.42  22.0  4.4e-03  0.0e+00   4235b   23.7s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.42  21.4  3.7e-03  0.0e+00   4235b    1.3s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.42  26.0  1.1e-02  0.0e+00   3529b    1.9s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.42  20.8  2.9e-03  0.0e+00   3388b   25.7s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.42  18.5  7.0e-03  0.0e+00   3012b    1.6s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.42  23.4  2.4e-03  0.0e+00   3176b    1.2s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.42  18.7  4.4e-03  0.0e+00   2824b    1.9s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.42  23.4  3.6e-03  0.0e+00   2118b    1.8s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.42  19.8  1.6e-03  0.0e+00   1412b   42.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.42  22.5  2.3e-03  0.0e+00   1059b   54.2s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.42  23.7  1.3e-03  0.0e+00    706b   74.3s
+
+--- if_noise = 0.5 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.50  14.2  4.1e-02  6.4e-02   4235b   35.8s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.50  13.4  3.2e-02  3.5e-02   4235b   10.4s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.50  10.7  5.5e-02  2.9e-02   3529b   10.9s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.50  12.2  2.9e-02  2.0e-02   3388b   30.9s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.50  10.6  3.6e-02  0.0e+00   3012b    3.9s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.50  13.7  2.4e-02  4.5e-03   3176b    5.3s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.50  10.6  3.2e-02  0.0e+00   2824b    3.3s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.50  13.7  2.7e-02  0.0e+00   2118b    2.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.50  14.5  1.4e-02  0.0e+00   1412b   44.6s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.50  16.0  1.6e-02  0.0e+00   1059b   54.7s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.50  17.2  6.7e-03  0.0e+00    706b   75.6s
+
+--- if_noise = 0.55 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.55   8.9  1.3e-01  1.7e-01   4235b   35.8s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.55   7.3  8.2e-02  1.1e-01   4235b   14.0s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.55   7.2  1.5e-01  2.0e-01   3529b   18.9s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.55   8.2  8.1e-02  1.1e-01   3388b   38.0s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.55   7.0  9.6e-02  1.1e-01   3012b   18.8s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.55   7.9  6.0e-02  7.0e-02   3176b   13.0s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.55   6.5  9.0e-02  9.2e-02   2824b   16.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.55   7.9  6.6e-02  0.0e+00   2118b    3.9s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.55  11.5  4.1e-02  0.0e+00   1412b   44.2s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.55  11.3  3.3e-02  0.0e+00   1059b   54.9s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.55  14.1  2.1e-02  0.0e+00    706b   74.2s
+
+--- if_noise = 0.65 ---
+len(audio_taps) = 2313
+32QAM 3/4 @ 1200 Bd         0.65   4.5  3.4e-01  3.4e-01   4235b   35.1s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1500 Bd         0.65   2.7  2.5e-01  2.6e-01   4235b   13.8s
+len(audio_taps) = 2313
+32QAM 1/2 @ 1500 Bd         0.65   2.3  3.6e-01  3.8e-01   3529b   18.5s
+len(audio_taps) = 2313
+16QAM 3/4 @ 1200 Bd         0.65   3.8  2.6e-01  2.7e-01   3388b   37.3s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1600 Bd         0.65   1.8  2.7e-01  3.1e-01   3012b   18.6s
+len(audio_taps) = 2313
+8PSK 3/4 @ 1500 Bd          0.65   3.1  1.7e-01  1.9e-01   3176b   13.8s
+len(audio_taps) = 2313
+16QAM 1/2 @ 1500 Bd         0.65   2.2  2.6e-01  3.1e-01   2824b   18.6s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1500 Bd          0.65   3.1  1.9e-01  2.3e-01   2118b   19.0s
+len(audio_taps) = 2313
+8PSK 1/2 @ 1000 Bd          0.65   5.7  1.5e-01  1.5e-01   1412b   61.7s
+len(audio_taps) = 2313
+8PSK 1/2 @ 750 Bd           0.65   6.8  1.3e-01  8.1e-02   1059b   68.5s
+len(audio_taps) = 2313
+8PSK 1/2 @ 500 Bd           0.65   8.2  9.1e-02  0.0e+00    706b   76.7s
+
+
+=== TABLEAU SYNTHESE BER DECODE ===
+Config                      Net  TX10ko | if0.17 if0.25 if0.30 if0.35 if0.42 if0.50 if0.55 if0.65
+32QAM 3/4 @ 1200 Bd       4235b   19.3s |   OK     OK     OK     OK     OK    KO     KO     KO   
+16QAM 3/4 @ 1500 Bd       4235b   19.3s |   OK     OK     OK     OK     OK    KO     KO     KO   
+32QAM 1/2 @ 1500 Bd       3529b   23.2s |   OK     OK     OK     OK     OK    KO     KO     KO   
+16QAM 3/4 @ 1200 Bd       3388b   24.2s |   OK     OK     OK     OK     OK    KO     KO     KO   
+16QAM 1/2 @ 1600 Bd       3012b   27.2s |   OK     OK     OK     OK     OK     OK    KO     KO   
+8PSK 3/4 @ 1500 Bd        3176b   25.8s |   OK     OK     OK     OK     OK    KO     KO     KO   
+16QAM 1/2 @ 1500 Bd       2824b   29.0s |   OK     OK     OK     OK     OK     OK    KO     KO   
+8PSK 1/2 @ 1500 Bd        2118b   38.7s |   OK     OK     OK     OK     OK     OK     OK    KO   
+8PSK 1/2 @ 1000 Bd        1412b   58.0s |   OK     OK     OK     OK     OK     OK     OK    KO   
+8PSK 1/2 @ 750 Bd         1059b   77.4s |   OK     OK     OK     OK     OK     OK     OK    KO   
+8PSK 1/2 @ 500 Bd          706b  116.1s |   OK     OK     OK     OK     OK     OK     OK     OK  
+
+Mapping if_noise -> SNR moyen (Es/N0 dB):
+  if_noise=0.17  ->  SNR moyen 25.6 dB
+  if_noise=0.25  ->  SNR moyen 25.5 dB
+  if_noise=0.30  ->  SNR moyen 25.5 dB
+  if_noise=0.35  ->  SNR moyen 25.4 dB
+  if_noise=0.42  ->  SNR moyen 21.8 dB
+  if_noise=0.50  ->  SNR moyen 13.4 dB
+  if_noise=0.55  ->  SNR moyen 8.9 dB
+  if_noise=0.65  ->  SNR moyen 4.0 dB
+
+Figure : C:\git\NewModem\study\..\results\modem_ldpc_snr_sweep.png

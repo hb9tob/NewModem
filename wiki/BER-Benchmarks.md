@@ -136,12 +136,31 @@ Resultats sim (canal calibre LPF 2000 Hz) :
 Note : sim reste optimiste de 4-6 dB vs OTA aux Rs > 1000 Bd. Projection OTA :
 3-3.5 kb/s net realiste, 4 kb/s net optimiste.
 
+## Modes adaptatifs (sweep SNR + LDPC)
+
+Balayage SNR de 25 a 4 dB sur 11 configs (8PSK/16QAM/32QAM x 1/2,3/4 x Rs varies).
+Donne une hierarchie claire de modes par robustesse, avec temps de transmission
+pour 10 ko.
+
+| Plage SNR | Mode | Net bps | Temps 10 ko |
+|---|---|---|---|
+| ≥ 22 dB | **32QAM 3/4 @ 1200 Bd** ou **16QAM 3/4 @ 1500 Bd** | 4235 | **19 s** |
+| 13-22 dB | 16QAM 1/2 @ 1600 Bd | 3012 | 27 s |
+| 9-13 dB | 8PSK 1/2 @ 1500 Bd | 2118 | 39 s |
+| 4-9 dB | 8PSK 1/2 @ 500 Bd | 706 | 116 s |
+| < 4 dB | (rien ne passe) | — | — |
+
+Le canal a une **falaise nette entre 22 et 13 dB** : toutes les configs full
+speed crashent en meme temps. La famille 8PSK 1/2 forme un escalier robuste
+pour les bas SNR, jusqu'a Rs 500 Bd qui survit a 4 dB SNR.
+
 ## Reproduire
 
 ```bash
 # Simulation :
 python study/modem_ber_bench.py
 python study/modem_ldpc_ber_bench.py
+python study/modem_ldpc_snr_sweep.py
 
 # OTA :
 python study/generate_ota_test_wav.py
