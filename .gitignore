@@ -4,7 +4,12 @@ __pycache__/
 .ipynb_checkpoints/
 .vscode/
 .idea/
+.claude/
 *.swp
 *~
 .DS_Store
 Thumbs.db
+
+# Intermediate sim artifacts (reproducible)
+results/sim_*.wav
+results/ota_results.json
