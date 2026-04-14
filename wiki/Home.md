@@ -27,6 +27,8 @@ transmettre des images à travers les relais NBFM voix. Contraintes :
 - [x] Simulateur canal GNU Radio validé (écart <1 dB avec mesures)
 - [x] Étude placement pilote (single + dual)
 - [x] Banc BER 8PSK/16QAM/32QAM
+- [x] **Validation OTA** et balayage de niveau — 32QAM 750 Bd à -6 dB → ~3 kb/s net
+- [x] Hard-clip TX ajouté au simulateur
 - [ ] Pilotes TDM (pour pousser au-delà de 1000 Bd)
 - [ ] FEC LDPC short frames (DVB-S2X VL-SNR)
 - [ ] Prototype broadcast complet

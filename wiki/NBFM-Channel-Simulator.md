@@ -6,11 +6,11 @@ Simulateur de canal basé sur les blocs GNU Radio `analog.nbfm_tx` et
 ## Architecture
 
 ```
-audio_in → HPF 300 Hz → nbfm_tx → + bruit IF complexe → nbfm_rx
-                                                      → LPF 2400 Hz
-                                                      → gain -6.5 dB
-                                                      → clock drift (ppm)
-                                                      → audio_out
+audio_in → hard-clip TX → HPF 300 Hz → nbfm_tx → + bruit IF complexe → nbfm_rx
+                                                                     → LPF 2400 Hz
+                                                                     → gain -6.5 dB
+                                                                     → clock drift (ppm)
+                                                                     → audio_out
 ```
 
 Le bruit est injecté **à l'IF** (domaine complexe, entre pré-emphase/modulation
@@ -28,6 +28,7 @@ récepteur FM.
 | `sub_audio_hpf` | 300 Hz | filtre CTCSS |
 | `post_lpf` | 2400 Hz | LPF audio du transceiver |
 | `post_gain_db` | -6.5 dB | calibration niveau |
+| `tx_hard_clip` | 0.55 | seuil de hard-clip audio avant FM (simule limiteur d'excursion) |
 | `if_noise` | 0.165 | std bruit IF (cible ~30 dB SNR audio) |
 | `drift_ppm` | -16 ppm | dérive horloge statique |
 | `thermal_ppm` | 0 ppm | amplitude variation thermique |
@@ -48,6 +49,19 @@ Mesures comparées aux enregistrements réels en mode data :
 
 Le mode voice (avec compresseur/limiteur audio) **n'est pas modélisé** —
 ajouter un compresseur audio en amont du TX pour le simuler.
+
+## Hard-clip TX (limiteur FM)
+
+Le modulateur FM des transceivers hard-clippe l'amplitude audio pour limiter
+l'excursion de fréquence sous la bande licenciée. Sur les signaux à PAPR
+non-négligeable (QAM dense), ce clip dégrade le BER si le niveau d'entrée
+est trop élevé.
+
+**Validation OTA** : 32QAM 750 Bd passe de BER 7.2e-3 à 0 dB vers **4.7e-5**
+à -6 dB, soit un facteur 150 d'amélioration. Le sim reproduit cet effet
+qualitativement avec `tx_hard_clip=0.55`.
+
+Désactiver avec `--tx-clip 0`.
 
 ## Usage
 

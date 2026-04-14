@@ -64,12 +64,66 @@ résiduelle. Corrigeable par FEC 2/3 pour un débit net supérieur.
 | VARA FM | 8-15 kb/s | propriétaire, pas broadcast |
 | **Ce design** | **3-3.3 kb/s** | broadcast, ouvert, voice-compatible |
 
+## Validation OTA (canal réel)
+
+Le design a été validé en OTA (over-the-air) via un vrai TX NBFM, avec un
+balayage de niveau sur les constellations 8PSK / 16QAM / 32QAM à 500, 750
+et 1000 Bd.
+
+### Niveau 0 dB (crête 0.9) — TX saturé
+
+| Modulation | 500 Bd | 750 Bd | 1000 Bd |
+|---|---|---|---|
+| 8PSK | 0 | 0 | 1.2e-3 |
+| 16QAM | 0 | 1.2e-4 | 2.1e-2 |
+| 32QAM | 0 | 1.3e-2 | 4.3e-2 |
+
+### Balayage de niveau — révèle le hard-clip TX
+
+Sur **32QAM 750 Bd** :
+
+| Niveau | BER |
+|---|---|
+| 0 dB | 7.2e-3 |
+| -3 dB | 2.1e-3 |
+| **-6 dB** | **4.7e-5** |
+| -10 dB | 3.8e-4 |
+| -15 dB | 3.4e-3 |
+
+Facteur **150 d'amélioration** entre 0 dB et -6 dB → le modulateur FM
+écrête les pics du signal à fort niveau. Le simulateur a été mis à jour
+avec un paramètre `tx_hard_clip` (défaut 0.55) pour modéliser cet effet.
+
+### Sweet spot OTA (après niveau optimal -6 dB)
+
+| Modulation | Rs | BER | Débit brut | FEC | Débit net |
+|---|---|---|---|---|---|
+| **32QAM** | **750 Bd** | **4.7e-5** | **3.75 kb/s** | 3/4 | **~3 kb/s** |
+| 16QAM | 750 Bd | 0 | 3.00 kb/s | 3/4 | 2.25 kb/s |
+| 8PSK | 750 Bd | 0 | 2.25 kb/s | minimale | 2.1 kb/s |
+
+Le **32QAM 750 Bd à -6 dB** est le nouveau meilleur compromis, dépassant
+le 16QAM trouvé en simulation pure. Au bon niveau d'entrée, on obtient
+**~3 kb/s net en broadcast** sur un canal NBFM voice.
+
+### Limite canal (non liée au TX)
+
+**16QAM 1000 Bd** : BER reste ~1e-2 indépendamment du niveau → limite
+imposée par la phase non-linéaire du canal (40° std), pas par le TX.
+Poussera plus loin nécessite un égaliseur.
+
 ## Reproduire
 
 ```bash
+# Simulation :
 python study/modem_ber_bench.py
-```
 
-Produit `results/modem_ber_vs_rs.png` et `results/modem_constellations.png`.
+# OTA :
+python study/generate_ota_test_wav.py
+# (jouer les WAV sur TX, enregistrer RX)
+python study/analyse_ota_recording.py \
+    results/rec_part02.wav \
+    --timelines results/ota_test_part02_levelsweep02.json
+```
 
 Voir le [rapport HTML](../rapport_modem.html) pour les graphiques.

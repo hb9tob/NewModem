@@ -195,10 +195,11 @@ def process_one(recording_wav, timeline_json, out_dir):
             continue
         line = {"label": lab, "mod": t["mod"],
                 "symbol_rate": t["symbol_rate"],
+                "level_db": t.get("level_db", 0.0),
                 "ber": r["ber"], "evm_pct": r["evm_pct"],
                 "n_bits": r["n_bits"]}
         results["blocks"].append(line)
-        print(f"  {lab:25s} BER={r['ber']:.2e}  EVM={r['evm_pct']:5.1f}%  "
+        print(f"  {lab:32s} BER={r['ber']:.2e}  EVM={r['evm_pct']:5.1f}%  "
               f"({r['n_bits']} bits)")
 
         # Constellation figure
@@ -222,23 +223,21 @@ def process_one(recording_wav, timeline_json, out_dir):
 
 
 def compare_with_sim(ota_blocks):
-    """Compare BER OTA vs resultats du simulateur (modem_ber_bench)."""
-    # Les BER sim precedents (hardcode d'apres le dernier run modem_ber_bench) :
-    SIM_BER = {
-        ("8PSK", 500): 0.0, ("8PSK", 750): 0.0, ("8PSK", 1000): 0.0,
-        ("16QAM", 500): 0.0, ("16QAM", 750): 0.0, ("16QAM", 1000): 0.0,
-        ("32QAM", 500): 1.5e-3, ("32QAM", 750): 2.0e-3, ("32QAM", 1000): 2.2e-3,
-    }
-    print(f"\n{'Modulation':12s} {'Rs':>5s}  {'BER sim':>10s}  {'BER OTA':>10s}  "
-          f"{'EVM OTA':>8s}")
-    for b in ota_blocks:
-        key = (b["mod"], b["symbol_rate"])
-        sim = SIM_BER.get(key, None)
-        sim_s = f"{sim:.1e}" if sim is not None else "n/a"
+    """Resume BER/EVM par (mod, Rs, niveau)."""
+    print(f"\n{'Modulation':10s} {'Rs':>5s} {'Level':>6s}  "
+          f"{'BER OTA':>10s}  {'EVM OTA':>8s}  {'n_bits':>8s}")
+    # Trie par mod, Rs, level
+    sorted_blocks = sorted(
+        ota_blocks,
+        key=lambda b: (b["mod"], b["symbol_rate"], -b.get("level_db", 0.0))
+    )
+    for b in sorted_blocks:
+        lvl = b.get("level_db", 0.0)
         ber_s = f"{b['ber']:.1e}" if b["ber"] is not None else "n/a"
         evm_s = f"{b['evm_pct']:.1f}%" if b["evm_pct"] is not None else "n/a"
-        print(f"{b['mod']:12s} {b['symbol_rate']:>5d}  {sim_s:>10s}  "
-              f"{ber_s:>10s}  {evm_s:>8s}")
+        n_bits = b.get("n_bits", 0)
+        print(f"{b['mod']:10s} {b['symbol_rate']:>5d} {lvl:>+5.0f}dB  "
+              f"{ber_s:>10s}  {evm_s:>8s}  {n_bits:>8d}")
 
 
 def main():

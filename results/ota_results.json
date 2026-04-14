@@ -1,0 +1,282 @@
+{
+  "runs": [
+    {
+      "file": "sim_levelsweep_clip.wav",
+      "part": 2,
+      "offset_s": 0.019999999999999574,
+      "blocks": [
+        {
+          "label": "modem_8PSK_750Bd_+0dB",
+          "mod": "8PSK",
+          "symbol_rate": 750,
+          "level_db": 0.0,
+          "ber": 0.0,
+          "evm_pct": 7.0035764302719326,
+          "n_bits": 12708
+        },
+        {
+          "label": "modem_8PSK_1000Bd_+0dB",
+          "mod": "8PSK",
+          "symbol_rate": 1000,
+          "level_db": 0.0,
+          "ber": 0.0,
+          "evm_pct": 10.032978882175804,
+          "n_bits": 17202
+        },
+        {
+          "label": "modem_16QAM_750Bd_+0dB",
+          "mod": "16QAM",
+          "symbol_rate": 750,
+          "level_db": 0.0,
+          "ber": 0.0,
+          "evm_pct": 6.628392996128133,
+          "n_bits": 16944
+        },
+        {
+          "label": "modem_16QAM_1000Bd_+0dB",
+          "mod": "16QAM",
+          "symbol_rate": 1000,
+          "level_db": 0.0,
+          "ber": 0.00039239623299616326,
+          "evm_pct": 10.018659467486431,
+          "n_bits": 22936
+        },
+        {
+          "label": "modem_32QAM_500Bd_+0dB",
+          "mod": "32QAM",
+          "symbol_rate": 500,
+          "level_db": 0.0,
+          "ber": 0.0,
+          "evm_pct": 6.205186773698065,
+          "n_bits": 13695
+        },
+        {
+          "label": "modem_32QAM_750Bd_+0dB",
+          "mod": "32QAM",
+          "symbol_rate": 750,
+          "level_db": 0.0,
+          "ber": 4.720320981826764e-05,
+          "evm_pct": 6.792057025133305,
+          "n_bits": 21185
+        },
+        {
+          "label": "modem_8PSK_750Bd_-3dB",
+          "mod": "8PSK",
+          "symbol_rate": 750,
+          "level_db": -3.0,
+          "ber": 0.0,
+          "evm_pct": 6.47027456625152,
+          "n_bits": 12711
+        },
+        {
+          "label": "modem_8PSK_1000Bd_-3dB",
+          "mod": "8PSK",
+          "symbol_rate": 1000,
+          "level_db": -3.0,
+          "ber": 0.0,
+          "evm_pct": 9.511875117532712,
+          "n_bits": 17202
+        },
+        {
+          "label": "modem_16QAM_750Bd_-3dB",
+          "mod": "16QAM",
+          "symbol_rate": 750,
+          "level_db": -3.0,
+          "ber": 0.0,
+          "evm_pct": 5.981289555708627,
+          "n_bits": 16948
+        },
+        {
+          "label": "modem_16QAM_1000Bd_-3dB",
+          "mod": "16QAM",
+          "symbol_rate": 1000,
+          "level_db": -3.0,
+          "ber": 0.0,
+          "evm_pct": 8.825382914785052,
+          "n_bits": 22940
+        },
+        {
+          "label": "modem_32QAM_500Bd_-3dB",
+          "mod": "32QAM",
+          "symbol_rate": 500,
+          "level_db": -3.0,
+          "ber": 0.0,
+          "evm_pct": 3.9541252497895885,
+          "n_bits": 13695
+        },
+        {
+          "label": "modem_32QAM_750Bd_-3dB",
+          "mod": "32QAM",
+          "symbol_rate": 750,
+          "level_db": -3.0,
+          "ber": 0.0,
+          "evm_pct": 6.281840203080804,
+          "n_bits": 21185
+        },
+        {
+          "label": "modem_8PSK_750Bd_-6dB",
+          "mod": "8PSK",
+          "symbol_rate": 750,
+          "level_db": -6.0,
+          "ber": 0.0,
+          "evm_pct": 6.993659040493191,
+          "n_bits": 12711
+        },
+        {
+          "label": "modem_8PSK_1000Bd_-6dB",
+          "mod": "8PSK",
+          "symbol_rate": 1000,
+          "level_db": -6.0,
+          "ber": 0.0,
+          "evm_pct": 7.4937169447372565,
+          "n_bits": 17205
+        },
+        {
+          "label": "modem_16QAM_750Bd_-6dB",
+          "mod": "16QAM",
+          "symbol_rate": 750,
+          "level_db": -6.0,
+          "ber": 0.0,
+          "evm_pct": 6.508012521613728,
+          "n_bits": 16948
+        },
+        {
+          "label": "modem_16QAM_1000Bd_-6dB",
+          "mod": "16QAM",
+          "symbol_rate": 1000,
+          "level_db": -6.0,
+          "ber": 0.0,
+          "evm_pct": 9.627520596997963,
+          "n_bits": 22940
+        },
+        {
+          "label": "modem_32QAM_500Bd_-6dB",
+          "mod": "32QAM",
+          "symbol_rate": 500,
+          "level_db": -6.0,
+          "ber": 0.0,
+          "evm_pct": 4.375591319857765,
+          "n_bits": 13695
+        },
+        {
+          "label": "modem_32QAM_750Bd_-6dB",
+          "mod": "32QAM",
+          "symbol_rate": 750,
+          "level_db": -6.0,
+          "ber": 0.0,
+          "evm_pct": 6.763204646429267,
+          "n_bits": 21190
+        },
+        {
+          "label": "modem_8PSK_750Bd_-10dB",
+          "mod": "8PSK",
+          "symbol_rate": 750,
+          "level_db": -10.0,
+          "ber": 0.0,
+          "evm_pct": 7.662415259207064,
+          "n_bits": 12714
+        },
+        {
+          "label": "modem_8PSK_1000Bd_-10dB",
+          "mod": "8PSK",
+          "symbol_rate": 1000,
+          "level_db": -10.0,
+          "ber": 0.0,
+          "evm_pct": 8.404637511800713,
+          "n_bits": 17208
+        },
+        {
+          "label": "modem_16QAM_750Bd_-10dB",
+          "mod": "16QAM",
+          "symbol_rate": 750,
+          "level_db": -10.0,
+          "ber": 0.0,
+          "evm_pct": 7.297369082846651,
+          "n_bits": 16952
+        },
+        {
+          "label": "modem_16QAM_1000Bd_-10dB",
+          "mod": "16QAM",
+          "symbol_rate": 1000,
+          "level_db": -10.0,
+          "ber": 0.0,
+          "evm_pct": 7.914771195771864,
+          "n_bits": 22944
+        },
+        {
+          "label": "modem_32QAM_500Bd_-10dB",
+          "mod": "32QAM",
+          "symbol_rate": 500,
+          "level_db": -10.0,
+          "ber": 0.0,
+          "evm_pct": 4.814545181142414,
+          "n_bits": 13700
+        },
+        {
+          "label": "modem_32QAM_750Bd_-10dB",
+          "mod": "32QAM",
+          "symbol_rate": 750,
+          "level_db": -10.0,
+          "ber": 9.438414346389807e-05,
+          "evm_pct": 7.570133939132913,
+          "n_bits": 21190
+        },
+        {
+          "label": "modem_8PSK_750Bd_-15dB",
+          "mod": "8PSK",
+          "symbol_rate": 750,
+          "level_db": -15.0,
+          "ber": 0.0,
+          "evm_pct": 6.744425663975269,
+          "n_bits": 12714
+        },
+        {
+          "label": "modem_8PSK_1000Bd_-15dB",
+          "mod": "8PSK",
+          "symbol_rate": 1000,
+          "level_db": -15.0,
+          "ber": 0.0,
+          "evm_pct": 9.494387389655845,
+          "n_bits": 17208
+        },
+        {
+          "label": "modem_16QAM_750Bd_-15dB",
+          "mod": "16QAM",
+          "symbol_rate": 750,
+          "level_db": -15.0,
+          "ber": 0.0,
+          "evm_pct": 8.362798557185654,
+          "n_bits": 16952
+        },
+        {
+          "label": "modem_16QAM_1000Bd_-15dB",
+          "mod": "16QAM",
+          "symbol_rate": 1000,
+          "level_db": -15.0,
+          "ber": 0.0,
+          "evm_pct": 9.163699660977812,
+          "n_bits": 22948
+        },
+        {
+          "label": "modem_32QAM_500Bd_-15dB",
+          "mod": "32QAM",
+          "symbol_rate": 500,
+          "level_db": -15.0,
+          "ber": 0.0,
+          "evm_pct": 5.648718200807703,
+          "n_bits": 13700
+        },
+        {
+          "label": "modem_32QAM_750Bd_-15dB",
+          "mod": "32QAM",
+          "symbol_rate": 750,
+          "level_db": -15.0,
+          "ber": 0.00033026657230478886,
+          "evm_pct": 8.609951485862672,
+          "n_bits": 21195
+        }
+      ],
+      "noise_floor_rms": 0.0011155245872013857
+    }
+  ]
+}

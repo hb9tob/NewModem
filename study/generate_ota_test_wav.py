@@ -46,19 +46,24 @@ TEST_DATA_DURATION = 6.0       # duree du signal modem (preamble + data)
                                 # limite par le demod actuel (sans timing
                                 # dynamique) vs derive d'horloge.
 
-# Tests : seulement ce qui marche sur le simulateur (Rs <= 1000 Bd,
-# pilotes propres hors spectre data). On ajoute 750 Bd comme point
-# intermediaire utile pour la validation.
+# Niveaux a tester (dB, relatifs au max 0.9 crete). On cherche le point de
+# saturation du modulateur FM (hard clip sur l'excursion).
+TEST_LEVELS_DB = [0.0, -3.0, -6.0, -10.0, -15.0]
+
+# Combinaisons modulation/Rs a tester a chaque niveau.
+TEST_MOD_RS = [
+    ("8PSK",  750),
+    ("8PSK",  1000),
+    ("16QAM", 750),
+    ("16QAM", 1000),
+    ("32QAM", 500),
+    ("32QAM", 750),
+]
+# Expansion : (mod, rs, seed) pour chaque niveau
 TEST_CONFIGS = [
-    ("8PSK",  500, 100),
-    ("8PSK",  750, 101),
-    ("8PSK",  1000, 102),
-    ("16QAM", 500, 103),
-    ("16QAM", 750, 104),
-    ("16QAM", 1000, 105),
-    ("32QAM", 500, 106),
-    ("32QAM", 750, 107),
-    ("32QAM", 1000, 108),
+    (mod, rs, 100 + 10 * i + j, lvl)
+    for j, lvl in enumerate(TEST_LEVELS_DB)
+    for i, (mod, rs) in enumerate(TEST_MOD_RS)
 ]
 
 
@@ -83,12 +88,10 @@ def pilot_block(duration_s, amplitude, seed=0):
     return sig.astype(np.float32)
 
 
-def build_test_block(mod_name, symbol_rate, seed):
-    """Reutilise build_tx de modem_ber_bench, ajuste duree par n_data_symbols."""
+def build_test_block(mod_name, symbol_rate, seed, level_db=0.0):
+    """Reutilise build_tx, ajuste duree, puis applique le niveau."""
     rng = np.random.RandomState(seed)
-    # Calculer nb de symboles pour atteindre ~TEST_DATA_DURATION
     target_sym = int(TEST_DATA_DURATION * symbol_rate) - N_PREAMBLE_SYMBOLS
-    # Backup config module
     import modem_ber_bench as mbb
     saved = mbb.N_DATA_SYMBOLS
     mbb.N_DATA_SYMBOLS = target_sym
@@ -97,6 +100,10 @@ def build_test_block(mod_name, symbol_rate, seed):
             symbol_rate, mod_name, rng)
     finally:
         mbb.N_DATA_SYMBOLS = saved
+
+    # Applique le niveau : scale global (data + pilotes ensemble)
+    gain = 10 ** (level_db / 20.0)
+    sig = sig * gain
 
     # Rampe douce pour eviter clicks aux transitions
     ramp = int(0.010 * AUDIO_RATE)
@@ -107,6 +114,7 @@ def build_test_block(mod_name, symbol_rate, seed):
         "mod": mod_name,
         "symbol_rate": symbol_rate,
         "seed": seed,
+        "level_db": level_db,
         "n_preamble_symbols": N_PREAMBLE_SYMBOLS,
         "n_data_symbols": target_sym,
         "sps": sps,
@@ -197,28 +205,27 @@ def main():
     p.add("silence", silence(SILENCE_BETWEEN))
     files.append(finalize_part(p, len(files) + 1))
 
-    # --- Parts 2..N : blocs modem (remplissage glouton a 5 min max) ---
+    # --- Parts 2..N : blocs modem avec balayage de niveau ---
+    # Ordre : on groupe par niveau pour qu'une meme part contienne plusieurs
+    # modulations au meme niveau (plus facile a analyser si on joue part par part)
     current = None
-    part_name = None
-    for mod, rs, seed in TEST_CONFIGS:
-        print(f"  prepare {mod} @ {rs} Bd (seed {seed})...", end=" ")
-        sig, info = build_test_block(mod, rs, seed)
+    for mod, rs, seed, level_db in TEST_CONFIGS:
+        print(f"  prepare {mod} @ {rs} Bd niveau {level_db:+.0f} dB...", end=" ")
+        sig, info = build_test_block(mod, rs, seed, level_db=level_db)
         block_dur = len(sig) / AUDIO_RATE + GAP_BETWEEN_TESTS
-        # Overhead pour demarrer une nouvelle part : silence+marker+silence+fin
-        overhead = (SILENCE_INITIAL + MARKER_DURATION + SILENCE_BETWEEN
-                    + MARKER_DURATION + SILENCE_FINAL)
         if current is None or current.duration + block_dur + MARKER_DURATION + SILENCE_FINAL > MAX_FILE_DURATION_S:
             if current is not None:
                 files.append(finalize_part(current, len(files) + 1))
-            part_name = f"modem{len(files)+1:02d}"
+            part_name = f"levelsweep{len(files)+1:02d}"
             print(f"-> nouvelle part {part_name}")
             current = new_part(part_name)
         else:
-            print("(ajoute a la part courante)")
-        current.add(f"modem_{mod}_{rs}Bd", sig, **info)
+            print("(ajoute)")
+        label = f"modem_{mod}_{rs}Bd_{level_db:+.0f}dB"
+        current.add(label, sig, **info)
         current.add("gap", silence(GAP_BETWEEN_TESTS))
 
-    if current is not None and len(current.segments) > 3:  # pas que silence+marker
+    if current is not None and len(current.segments) > 3:
         files.append(finalize_part(current, len(files) + 1))
 
     total = sum(os.path.getsize(f[0]) for f in files) / (1024 * 1024)

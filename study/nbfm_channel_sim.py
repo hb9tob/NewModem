@@ -34,6 +34,10 @@ TAU = 75e-6
 SUB_AUDIO_HPF = 300.0   # filtre CTCSS du transceiver (Hz)
 POST_LPF = 2400.0       # LPF audio additionnel du transceiver (Hz), 0=desactive
 POST_GAIN_DB = -6.5     # gain audio fixe (chaine acquisition reelle)
+TX_HARD_CLIP = 0.55     # hard-clip audio avant FM (limiteur d'excursion).
+                        # Calibre OTA : 32QAM 750 Bd a BER 5e-5 a -6 dB (peak
+                        # 0.45) vs 7e-3 a 0 dB (peak 0.9) -> seuil ~0.5-0.6.
+                        # 0 desactive le clip.
 
 # Derive d'horloge soundcard (ppm). Modele : drift(t) = drift_ppm +
 # drift_thermal_ppm * sin(2*pi*t/thermal_period_s)
@@ -101,6 +105,7 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              post_lpf=POST_LPF, post_gain_db=POST_GAIN_DB,
              drift_ppm=DRIFT_PPM, thermal_ppm=DRIFT_THERMAL_PPM,
              thermal_period_s=DRIFT_THERMAL_PERIOD_S,
+             tx_hard_clip=TX_HARD_CLIP,
              start_delay_s=None, rng_seed=None, verbose=True):
     """Fait passer audio_in par TX -> bruit IF -> RX, retourne audio_out.
 
@@ -119,6 +124,16 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
         if verbose:
             print(f"[sim] delai initial: {start_delay_s:.3f} s "
                   f"(porteuse + bruit IF seuls)")
+
+    # Hard-clip TX (limiteur d'excursion du modulateur FM reel).
+    # Applique avant la chaine GNU Radio car le clip instantane doit operer
+    # sur l'amplitude audio, pas sur l'IF complexe.
+    if tx_hard_clip and tx_hard_clip > 0:
+        clip_count = int(np.sum(np.abs(audio_in) > tx_hard_clip))
+        if clip_count > 0 and verbose:
+            print(f"[sim] TX hard-clip a +/-{tx_hard_clip:.3f} : "
+                  f"{clip_count} samples ({100*clip_count/len(audio_in):.2f}%)")
+        audio_in = np.clip(audio_in, -tx_hard_clip, tx_hard_clip)
 
     tb = gr.top_block("nbfm_sim")
 
@@ -209,6 +224,9 @@ def main():
                          f"Passer 0 pour desactiver.")
     ap.add_argument("--seed", type=int, default=None,
                     help="Seed aleatoire (pour delai reproductible)")
+    ap.add_argument("--tx-clip", type=float, default=TX_HARD_CLIP,
+                    help=f"Hard-clip audio avant FM (defaut {TX_HARD_CLIP}, "
+                         "0=desactive)")
     args = ap.parse_args()
 
     audio_in, sr = load_wav(args.input_wav)
@@ -221,6 +239,7 @@ def main():
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,
+                         tx_hard_clip=args.tx_clip,
                          start_delay_s=args.start_delay,
                          rng_seed=args.seed)
 

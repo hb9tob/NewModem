@@ -52,6 +52,7 @@ constellations.</p>
 <li><a href="#pilote-placement">Placement optimal du pilote CW</a></li>
 <li><a href="#dual-pilote">Pilote unique vs dual pilotes</a></li>
 <li><a href="#ber">BER : 8PSK / 16QAM / 32QAM vs symbol rate</a></li>
+<li><a href="#ota">Validation OTA et balayage de niveau</a></li>
 <li><a href="#conclusions">Conclusions et perspectives</a></li>
 </ol>
 </nav>
@@ -232,7 +233,96 @@ une bande symetrique de part et d'autre :</p>
 data d'environ 10-15 dB (le pilote a -6 dB contribue comme interference
 coherente sur les bins data qui lui correspondent).</p>
 
-<h2 id="conclusions">5. Conclusions et perspectives</h2>
+<h2 id="ota">5. Validation OTA et balayage de niveau</h2>
+
+<p>Les WAVs generes ont ete joues a travers un vrai TX NBFM, la sortie RX
+enregistree sur le canal reel. Un second test fait varier le niveau d'entree
+TX (0, -3, -6, -10, -15 dB) pour reveler le comportement du limiteur
+d'excursion du modulateur FM.</p>
+
+<h3>5.1 Resultats OTA initial (niveau 0 dB)</h3>
+
+<table>
+<tr><th>Modulation</th><th>500 Bd</th><th>750 Bd</th><th>1000 Bd</th></tr>
+<tr><td>8PSK</td><td class="good">0</td><td class="good">0</td><td class="warn">1.2e-3</td></tr>
+<tr><td>16QAM</td><td class="good">0</td><td class="warn">1.2e-4</td><td class="bad">2.1e-2</td></tr>
+<tr><td>32QAM</td><td class="good">0</td><td class="warn">1.3e-2</td><td class="bad">4.3e-2</td></tr>
+</table>
+
+<p>Au niveau 0 dB, le BER etait systematiquement plus degrade que prevu par
+le simulateur, surtout en 32QAM et 16QAM 1000 Bd. Hypothese : le modulateur
+FM ecrete les pics du signal (hard-clip sur l'excursion).</p>
+
+<h3>5.2 Balayage de niveau : revelation du hard-clip TX</h3>
+
+<table>
+<tr><th>Modulation</th><th>Rs</th><th>0 dB</th><th>-3 dB</th><th>-6 dB</th>
+    <th>-10 dB</th><th>-15 dB</th></tr>
+<tr><td>8PSK</td><td>750</td>
+    <td class="good">0</td><td class="good">0</td><td class="good">0</td>
+    <td class="good">0</td><td class="good">0</td></tr>
+<tr><td>8PSK</td><td>1000</td>
+    <td class="warn">2.7e-3</td><td class="warn">3.5e-4</td>
+    <td class="warn">3.5e-4</td><td class="warn">4.1e-4</td>
+    <td class="warn">1.7e-4</td></tr>
+<tr><td>16QAM</td><td>750</td>
+    <td class="warn">5.9e-5</td><td class="good">0</td><td class="good">0</td>
+    <td class="good">0</td><td class="warn">1.8e-4</td></tr>
+<tr><td>16QAM</td><td>1000</td>
+    <td class="bad">1.4e-2</td><td class="bad">1.4e-2</td>
+    <td class="bad">6.4e-3</td><td class="bad">1.0e-2</td>
+    <td class="bad">1.1e-2</td></tr>
+<tr><td>32QAM</td><td>500</td>
+    <td class="warn">1.5e-4</td><td class="good">0</td><td class="good">0</td>
+    <td class="good">0</td><td class="warn">4.4e-4</td></tr>
+<tr><td>32QAM</td><td>750</td>
+    <td class="bad">7.2e-3</td><td class="warn">2.1e-3</td>
+    <td class="good"><strong>4.7e-5</strong></td>
+    <td class="warn">3.8e-4</td><td class="warn">3.4e-3</td></tr>
+</table>
+
+<div class="key">
+<strong>Le TX hard-clip confirme.</strong>
+<ul>
+<li><strong>32QAM 750 Bd</strong> : BER passe de 7.2e-3 a <strong>4.7e-5</strong> en baissant a -6 dB
+    (facteur 150 d'amelioration !) -> clipping a 0 dB</li>
+<li><strong>32QAM 500 Bd</strong> et <strong>16QAM 750 Bd</strong> : BER 0 partout entre -3 et -10 dB,
+    leger residu a 0 dB</li>
+<li><strong>16QAM 1000 Bd</strong> : BER ~1e-2 independant du niveau -> la limite est bien
+    la phase non-lineaire du canal, pas le TX</li>
+<li><strong>Sweet spot niveau : -3 a -6 dB</strong>, au-dessus on clippe, en dessous
+    on passe sous le seuil de bruit</li>
+</ul>
+</div>
+
+<h3>5.3 Nouveau sweet spot global OTA</h3>
+
+<table>
+<tr><th>Modulation</th><th>Rs</th><th>Niveau</th><th>BER</th><th>Debit brut</th>
+    <th>FEC</th><th>Debit net</th></tr>
+<tr><td>8PSK</td><td>750 Bd</td><td>n'importe</td><td>0</td><td>2.25 kb/s</td>
+    <td>minimale</td><td>2.1 kb/s</td></tr>
+<tr><td>16QAM</td><td>750 Bd</td><td>-3 a -10 dB</td><td>0</td><td>3.00 kb/s</td>
+    <td>3/4</td><td>2.25 kb/s</td></tr>
+<tr><td><strong>32QAM</strong></td><td><strong>750 Bd</strong></td><td><strong>-6 dB</strong></td>
+    <td><strong>4.7e-5</strong></td><td><strong>3.75 kb/s</strong></td>
+    <td><strong>3/4</strong></td><td class="good"><strong>~3 kb/s</strong></td></tr>
+</table>
+
+<p><strong>Le 32QAM 750 Bd a -6 dB est le vrai optimum OTA</strong>, depassant
+le 16QAM identifie sur simulateur. Le simulateur seul sous-estimait ce qui
+etait atteignable parce qu'il ne modelisait pas le hard-clip TX.</p>
+
+<h3>5.4 Mise a jour du simulateur</h3>
+
+<p>Le simulateur <code>nbfm_channel_sim.py</code> a ete enrichi d'un parametre
+<code>tx_hard_clip</code> (defaut 0.55) qui clip l'amplitude audio avant le
+modulateur FM. Avec ce parametre active, le simulateur reproduit la degradation
+BER observee a 0 dB en 32QAM 750 Bd (BER 4.7e-5 vs 0 sans clip), meme si la
+severite exacte de l'OTA (7e-3) indique un soft-clipping additionnel du TX
+reel.</p>
+
+<h2 id="conclusions">6. Conclusions et perspectives</h2>
 
 <div class="key">
 <strong>Design viable confirme :</strong> single-carrier 16QAM 1000 Bd
