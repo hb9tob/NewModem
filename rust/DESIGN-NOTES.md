@@ -1,8 +1,24 @@
 # Design notes - reprise
 
-État au moment de la pause.
+État au moment de la pause (mis à jour).
 
-## Ce qui est fait (commit `fd0de4e` sur main)
+## Avancement dernière session
+
+- **Header de frame** : 16 octets avec `total_frames` (multi-frame) + flag `HAS_FILENAME` ✓
+- **CRC16-CCITT + CRC32** implémentés avec test vectors standards ✓
+- **RS erasure code** : crate `reed-solomon-erasure` GF(2^8), 4 niveaux (0/6/12/25 %) ✓
+- **Multi-frame automatique** : `build_frames()` découpe payload en N frames ✓
+- **TX CLI amélioré** : progress %, drain stream, device match exact ✓
+
+**État** : commit `cdcd711` sur main. 31/31 tests OK. Build OK Windows.
+
+## Reprise
+
+**Prochaine étape** : WASAPI exclusif ou RX complet ? Le RX est le gros chantier
+restant (3-5j). WASAPI exclusif demanderait de bypasser cpal (crate `wasapi`
+direct) ou activer la feature ASIO.
+
+## Ce qui est fait (historique)
 
 ### Rust v0.2
 
