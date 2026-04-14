@@ -11,6 +11,7 @@
 
 pub mod constellation;
 pub mod framing;
+pub mod ldpc;
 pub mod modulator;
 pub mod rrc;
 
@@ -41,6 +42,16 @@ pub enum ModemMode {
 }
 
 impl ModemMode {
+    /// Code LDPC associe au mode (utilise par le pipeline TX/RX).
+    pub fn ldpc_code(&self) -> ldpc::LdpcCode {
+        match self {
+            ModemMode::Psk8R12_1500
+            | ModemMode::Psk8R12_500
+            | ModemMode::Qam16R12_1600 => ldpc::LdpcCode::Rate12,
+            ModemMode::Qam16R34_1500 | ModemMode::Qam32R34_1200 => ldpc::LdpcCode::Rate34,
+        }
+    }
+
     pub fn symbol_rate(&self) -> u32 {
         match self {
             ModemMode::Psk8R12_1500 | ModemMode::Qam16R34_1500 => 1500,

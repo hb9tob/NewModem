@@ -15,7 +15,7 @@ use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use modem_core::{
-    modulator::{modulate_raw_bits, vox_tone},
+    modulator::{modulate_bytes, vox_tone},
     ModemMode, AUDIO_RATE,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -235,17 +235,9 @@ fn main() -> Result<()> {
     let bytes = std::fs::read(&file).with_context(|| format!("lecture {}", file))?;
     println!("[file] {} octets ({})", bytes.len(), file);
 
-    // Convertit bytes en bits MSB first
-    let mut bits = Vec::with_capacity(bytes.len() * 8);
-    for b in &bytes {
-        for k in (0..8).rev() {
-            bits.push((b >> k) & 1);
-        }
-    }
-
-    // Module
-    println!("[modem] modulation...");
-    let data_audio = modulate_raw_bits(&bits, mode, args.peak);
+    // Module (LDPC encode + modulation)
+    println!("[modem] LDPC encode + modulation...");
+    let data_audio = modulate_bytes(&bytes, mode, args.peak);
     let data_dur = data_audio.len() as f32 / AUDIO_RATE as f32;
     println!("[modem] {} samples, {:.2} s",
         data_audio.len(), data_dur);
