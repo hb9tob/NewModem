@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Caracterisation canal NBFM - voice vs data</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+         max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222;
+         line-height: 1.5; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 0.3em; }
+  h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
+  h3 { margin-top: 1.5em; }
+  table { border-collapse: collapse; margin: 1em 0; }
+  th, td { border: 1px solid #ccc; padding: 0.3em 0.8em; text-align: right; }
+  th { background: #f0f0f0; }
+  td:first-child, th:first-child { text-align: left; }
+  img { max-width: 100%; height: auto; border: 1px solid #ddd;
+        margin: 0.5em 0; display: block; }
+  .fig { margin: 1em 0; }
+  .caption { font-style: italic; color: #555; font-size: 0.9em; }
+  .key { background: #eef7ff; border-left: 4px solid #1e6fbf;
+         padding: 0.6em 1em; margin: 1em 0; }
+  .warn { background: #fff3e0; border-left: 4px solid #e07a00;
+          padding: 0.6em 1em; margin: 1em 0; }
+  code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Caracterisation du canal NBFM &mdash; modes voice et data</h1>
+<p><strong>Projet :</strong> modem audio pour transmission d'images sur canal radio amateur NBFM.<br>
+<strong>Date :</strong> 2026-04-14.<br>
+<strong>Protocole :</strong> WAV multitone de 79 tones (100-4000 Hz, espacement 50 Hz, phases aleatoires seed 42), balayage de niveau en 11 paliers de 0 dB (crete 0.9) a -20 dB par pas de 2 dB. Sortie TX rebouclee en RX, enregistrement 48 kHz mono 16-bit. Deux sessions : TX en mode voice, TX en mode data.</p>
+
+<div class="key">
+<strong>Conclusion principale :</strong> utiliser le <strong>mode data</strong> pour le modem.
+La reponse en amplitude est parfaitement lineaire de 0 a -20 dB et la phase est stable.
+Le mode voice presente une compression audio (~1 dB) et un ecrasement de la bande
+haute a niveau nominal, inutilisable pour un modem.
+</div>
+
+<h2>1. Bande passante et reponse en amplitude</h2>
+
+<h3>1.1 Gain moyen (300-2200 Hz) vs niveau d'entree</h3>
+<div class="fig">
+<img src="results/nbfm_level_sweep_result_gain_vs_level.png" alt="Gain vs niveau">
+<p class="caption">Gain moyen de la bande utile en fonction du niveau d'entree TX.
+Data : plat a -6.5 dB sur toute la plage. Voice : compression ~1 dB aux niveaux
+eleves, artefact a -18 dB.</p>
+</div>
+
+<table>
+<tr><th>Niveau TX</th><th>Gain voice (dB)</th><th>BW -3dB voice</th>
+    <th>Gain data (dB)</th><th>BW -3dB data</th></tr>
+<tr><td>0 dB</td><td>-5.2</td><td>300-1450 Hz</td><td>-7.0</td><td>300-1800 Hz</td></tr>
+<tr><td>-2 dB</td><td>-4.7</td><td>300-1800 Hz</td><td>-6.5</td><td>300-2200 Hz</td></tr>
+<tr><td>-4 dB</td><td>-4.3</td><td>300-2200 Hz</td><td>-6.6</td><td>300-2100 Hz</td></tr>
+<tr><td>-6 dB</td><td>-4.2</td><td>300-2100 Hz</td><td>-6.5</td><td>300-2150 Hz</td></tr>
+<tr><td>-8 dB</td><td>-4.1</td><td>300-2150 Hz</td><td>-6.5</td><td>300-2150 Hz</td></tr>
+<tr><td>-10 dB</td><td>-4.2</td><td>300-2100 Hz</td><td>-6.4</td><td>300-2100 Hz</td></tr>
+<tr><td>-12 dB</td><td>-4.1</td><td>300-2150 Hz</td><td>-6.5</td><td>300-2150 Hz</td></tr>
+<tr><td>-14 dB</td><td>-4.1</td><td>300-2150 Hz</td><td>-6.5</td><td>300-2150 Hz</td></tr>
+<tr><td>-16 dB</td><td>-4.1</td><td>300-2150 Hz</td><td>-6.5</td><td>300-2150 Hz</td></tr>
+<tr><td>-18 dB</td><td><strong>-11.5</strong></td><td><strong>300-1100 Hz</strong></td><td>-6.5</td><td>300-2100 Hz</td></tr>
+<tr><td>-20 dB</td><td>-4.2</td><td>300-2150 Hz</td><td>-6.6</td><td>300-2100 Hz</td></tr>
+</table>
+
+<h3>1.2 Reponse frequentielle par niveau &mdash; mode voice</h3>
+<div class="fig">
+<img src="results/nbfm_level_sweep_result_freq_resp_voice.png" alt="Reponse voice">
+<p class="caption">Chaque courbe represente un niveau d'entree. A 0 dB (violet) la
+bande haute est ecrasee par le limiteur audio qui genere des IMD.</p>
+</div>
+
+<h3>1.3 Reponse frequentielle par niveau &mdash; mode data</h3>
+<div class="fig">
+<img src="results/nbfm_level_sweep_result_freq_resp_data.png" alt="Reponse data">
+<p class="caption">Courbes superposees sur toute la plage : reponse independante
+du niveau, comportement lineaire attendu d'un modem numerique.</p>
+</div>
+
+<h3>1.4 Comparaison voice vs data au niveau nominal</h3>
+<div class="fig">
+<img src="results/nbfm_level_sweep_result_voice_vs_data.png" alt="Voice vs data amplitude">
+<p class="caption">A 0 dB : la difference principale est en haut de bande
+(1500-2500 Hz) ou le mode voice s'effondre a cause du limiteur.
+Coupure basse a 300 Hz commune (filtre sub-audio CTCSS du transceiver).</p>
+</div>
+
+<h2>2. Reponse en phase</h2>
+
+<h3>2.1 Phase residuelle par niveau (retard lineaire retire)</h3>
+<div class="fig">
+<img src="results/nbfm_phase_residual_by_level.png" alt="Phase residuelle">
+<p class="caption">Forme de la phase apres fit lineaire (suppression du retard
+de transmission). Les courbes se superposent quasi-parfaitement entre niveaux
+<strong>et entre modes</strong> : la non-linearite de phase est une propriete
+du canal, independante du niveau et du mode de modulation.</p>
+</div>
+
+<h3>2.2 Comparaison voice vs data (phase)</h3>
+<div class="fig">
+<img src="results/nbfm_phase_voice_vs_data.png" alt="Phase voice vs data">
+<p class="caption">Phase residuelle a -4 dB : meme signature pour les deux modes.
+Le limiteur voice agit sur l'amplitude mais n'introduit pas de distorsion de phase.</p>
+</div>
+
+<h3>2.3 Group delay</h3>
+<div class="fig">
+<img src="results/nbfm_group_delay.png" alt="Group delay">
+<p class="caption">Group delay local (derivee lissee de la phase) : variation
+d'environ 1 ms entre 300 et 2500 Hz, typique d'un cascade de filtres
+HPF sub-audio + LPF audio + pre/de-emphase.</p>
+</div>
+
+<p><strong>Ecart-type du residu de phase sur la bande :</strong> ~40&deg; en voice
+comme en data, sur tous les niveaux sauf -18 dB voice (89&deg;, artefact).</p>
+
+<h2>3. Anomalies</h2>
+
+<div class="warn">
+<strong>Bloc -18 dB en mode voice :</strong> gain moyen -11.5 dB (vs -4.1 dB attendu),
+bande retrecie a 1100 Hz et ecart-type de phase double (89&deg; vs 40&deg;).
+Probable artefact ponctuel a l'enregistrement (squelch qui coupe, interference,
+ou decoupage temporel). A refaire si cette mesure a de l'importance.
+</div>
+
+<div class="warn">
+<strong>Derive apparente du group delay avec le niveau en mode data</strong>
+(-0.04 ms/dB, monotone) : <em>artefact d'horloge soundcard</em>. Les blocs sont
+enregistres sequentiellement, le drift entre horloge playback et capture
+s'accumule. Ce n'est pas un effet du canal.
+</div>
+
+<h2>4. Implications pour le modem</h2>
+
+<ul>
+<li><strong>Mode a utiliser : data</strong>. Compresseur/limiteur audio desactive,
+reponse lineaire sur 20 dB de plage dynamique.</li>
+
+<li><strong>Bande utile reelle : 300-2200 Hz</strong> (a -3 dB). Bien plus etroite
+que la bande theorique de <code>analog.nbfm_rx</code> (100-2600 Hz) : le
+transceiver reel ajoute un HPF sub-audio a 300 Hz (anti-CTCSS) et un rolloff
+haut plus doux.</li>
+
+<li><strong>Non-linearite de phase ~50&deg; / 1 ms dans la bande</strong>. Impose
+un egaliseur (FIR court ou adaptatif) et/ou une sequence de training pour
+modulation coherente (PSK/QAM). Pas ideal mais exploitable.</li>
+
+<li><strong>Canal quasi-stationnaire</strong> en amplitude et en phase : les
+parametres d'egalisation peuvent etre fixes, pas besoin d'adaptation temps-reel
+rapide.</li>
+
+<li><strong>SNR &agrave; revoir</strong> : la mesure precedente donnait SNR ~0 dB
+(comparaison crete-par-tone vs RMS large bande). Une mesure per-bin plus juste
+reste a faire pour dimensionner le debit.</li>
+</ul>
+
+<h2>5. Simulateur GNU Radio et validation</h2>
+
+<p>Simulateur base sur les blocs <code>analog.nbfm_tx</code> et
+<code>analog.nbfm_rx</code> de GNU Radio, avec injection de bruit gaussien
+complexe a l'IF (entre pre-emphase/modulation et demodulation/de-emphase).</p>
+
+<pre><code>audio_in -> HPF 300 Hz -> nbfm_tx -> + bruit IF (gr_complex) -> nbfm_rx
+                                                               -> LPF 2400 Hz -> gain -6.5 dB -> audio_out</code></pre>
+
+<p><strong>Parametres calibres :</strong></p>
+<ul>
+<li>Audio : 48 kHz, IF : 480 kHz, deviation FM &plusmn;5 kHz, tau 75 us</li>
+<li>HPF sub-audio 300 Hz (emule filtre CTCSS du transceiver)</li>
+<li>LPF post-demod 2400 Hz (emule filtre audio du RX)</li>
+<li>Gain audio -6.5 dB (calibration chaine acquisition reelle)</li>
+<li>Bruit IF : amplitude 0.165 complexe &rarr; plancher audio 0.00114 RMS
+    (cible 0.00113 mesuree en gap data)</li>
+<li>Derive d'horloge soundcard : -16 ppm statique (mesure reelle), avec
+    option de variation thermique sinusoidale (<code>--thermal-ppm</code>,
+    <code>--thermal-period</code>) pour emuler les drifts de plusieurs ppm
+    observes sur certains TX au reechauffement</li>
+</ul>
+
+<p><strong>Validation de la derive d'horloge</strong> (group delay par niveau,
+sur 55 s) :</p>
+<table>
+<tr><th>Niveau</th><th>Sim GD (ms)</th><th>Data GD (ms)</th></tr>
+<tr><td>0 dB (debut)</td><td>4.951</td><td>5.389</td></tr>
+<tr><td>-20 dB (fin)</td><td>4.071</td><td>4.514</td></tr>
+<tr><td>&Delta;GD sur 55 s</td><td>-0.88 ms</td><td>-0.88 ms</td></tr>
+<tr><td>Derive estimee</td><td><strong>-16 ppm</strong></td><td><strong>-16 ppm</strong></td></tr>
+</table>
+
+<p><strong>Validation</strong> contre les enregistrements reels (bloc -18 dB voice exclu) :</p>
+
+<div class="fig">
+<img src="results/sim_validation_gain_vs_level.png" alt="Gain vs niveau sim vs reel">
+<p class="caption">Gain moyen (300-2200 Hz) vs niveau : simulateur (vert) et
+mode data (bleu) pratiquement superposes. Mode voice (orange) decroche a
+niveau fort a cause du compresseur.</p>
+</div>
+
+<div class="fig">
+<img src="results/sim_validation_freq_resp.png" alt="Reponse frequentielle sim vs reel">
+<p class="caption">Reponse frequentielle par niveau : sim (vert), data (bleu),
+voice (orange). La simulation suit la mesure data a &lt; 1.5 dB pres sur toute
+la bande utile, pour tous les niveaux.</p>
+</div>
+
+<div class="fig">
+<img src="results/sim_validation_bandwidth.png" alt="Bande passante sim vs reel">
+<p class="caption">Bande passante a -3 dB : sim stable a 300-2300 Hz,
+data stable a 300-2150 Hz. L'ecart de 150 Hz en haut vient du filtre audio du
+transceiver specifique utilise ; le simulateur est plus representatif d'un
+canal NBFM generique.</p>
+</div>
+
+<div class="key">
+<strong>Metriques de validation :</strong>
+<ul>
+<li>Plancher de bruit : sim 0.00114, data 0.00113 &mdash; <strong>match &lt; 1 %</strong></li>
+<li>Gain : ecart constant &lt; 0.5 dB sur tous les niveaux (offset residuel de
+calibration)</li>
+<li>RMS d'ecart sim vs data sur la bande 300-2200 Hz :
+<strong>1.2 dB moyen</strong> (11 niveaux)</li>
+<li>Linearite : sim parfaitement lineaire comme data (&plusmn;0.02 dB entre niveaux)</li>
+<li>Mode voice (avec compresseur) <strong>non modelise</strong> : pour l'etudier,
+ajouter un compresseur/limiteur audio en amont du TX</li>
+</ul>
+</div>
+
+<p><strong>Utilisation du simulateur :</strong></p>
+<pre><code>python study/nbfm_channel_sim.py input.wav output.wav \
+    --if-noise 0.165 --drift-ppm -16 \
+    --thermal-ppm 5 --thermal-period 180</code></pre>
+<ul>
+<li><code>--if-noise</code> : amplitude du bruit IF (0.165 = canal nominal mesure)</li>
+<li><code>--drift-ppm</code> : derive d'horloge statique (ppm, signe indique le sens)</li>
+<li><code>--thermal-ppm</code> : amplitude crete de la variation thermique
+    sinusoidale (0 pour derive constante)</li>
+<li><code>--thermal-period</code> : periode de la variation thermique (s),
+    typiquement 60-300 s pour un TX qui chauffe</li>
+</ul>
+<p>Pour les relais instables, il est courant d'observer 50-200 ppm de derive
+statique et plusieurs ppm de variation thermique au cours d'une longue
+transmission.</p>
+
+<h2>Annexes</h2>
+<p>Scripts :
+<code>study/generate_level_sweep_wav.py</code>,
+<code>study/analyse_level_sweep.py</code>,
+<code>study/analyse_phase.py</code>,
+<code>study/nbfm_channel_sim.py</code>,
+<code>study/validate_simulator.py</code>.<br>
+Donnees sources :
+<code>results/result_voice_nbfm_level_sweep.wav</code>,
+<code>results/result_data_nbfm_level_sweep.wav</code>.<br>
+Parametres TX : <code>results/nbfm_level_sweep_params.json</code>.</p>
+
+</body>
+</html>

@@ -1,0 +1,10 @@
+start_s,end_s,label
+0.0000,1.0000,silence_start
+1.0000,3.0000,pilot_1000Hz
+3.0000,3.5000,gap
+3.5000,8.5000,multitone_0
+8.5000,9.0000,gap
+9.0000,14.0000,multitone_1
+14.0000,14.5000,gap
+14.5000,16.5000,pilot_end_1000Hz
+16.5000,17.5000,silence_end

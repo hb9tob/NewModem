@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Modem single-carrier sur canal NBFM - design et BER</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+         max-width: 1150px; margin: 2em auto; padding: 0 1em; color: #222;
+         line-height: 1.55; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 0.3em; }
+  h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
+  h3 { margin-top: 1.5em; color: #334; }
+  table { border-collapse: collapse; margin: 1em 0; font-size: 0.95em; }
+  th, td { border: 1px solid #ccc; padding: 0.35em 0.8em; text-align: right; }
+  th { background: #f0f0f0; }
+  td:first-child, th:first-child { text-align: left; }
+  td.good { background: #e8f7ea; }
+  td.warn { background: #fff5d9; }
+  td.bad { background: #fde2e2; }
+  img { max-width: 100%; height: auto; border: 1px solid #ddd;
+        margin: 0.5em 0; display: block; }
+  .fig { margin: 1em 0; }
+  .caption { font-style: italic; color: #555; font-size: 0.9em; }
+  .key { background: #eef7ff; border-left: 4px solid #1e6fbf;
+         padding: 0.6em 1em; margin: 1em 0; }
+  .warn { background: #fff3e0; border-left: 4px solid #e07a00;
+          padding: 0.6em 1em; margin: 1em 0; }
+  code, pre { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px;
+              font-size: 0.92em; }
+  pre { padding: 0.8em; overflow-x: auto; }
+  .two-col { display: flex; gap: 1em; flex-wrap: wrap; }
+  .two-col > div { flex: 1 1 48%; min-width: 320px; }
+  nav.toc { background: #f7f7f7; padding: 0.7em 1.2em; border-radius: 6px;
+            margin: 1em 0; }
+  nav.toc ol { margin: 0.3em 0 0 1em; padding: 0; }
+  nav.toc a { text-decoration: none; color: #1e6fbf; }
+</style>
+</head>
+<body>
+
+<h1>Modem single-carrier 8PSK/QAM sur canal NBFM</h1>
+
+<p><strong>Objectif :</strong> concevoir un modem broadcast (point-multipoint,
+sans ARQ) pour transmettre des images via les relais NBFM voix radio amateur.
+Exploration du placement des pilotes, balayage de debit, comparaison de
+constellations.</p>
+
+<nav class="toc">
+<strong>Sommaire</strong>
+<ol>
+<li><a href="#contexte">Contexte et cibles</a></li>
+<li><a href="#pilote-placement">Placement optimal du pilote CW</a></li>
+<li><a href="#dual-pilote">Pilote unique vs dual pilotes</a></li>
+<li><a href="#ber">BER : 8PSK / 16QAM / 32QAM vs symbol rate</a></li>
+<li><a href="#conclusions">Conclusions et perspectives</a></li>
+</ol>
+</nav>
+
+<h2 id="contexte">1. Contexte et cibles</h2>
+
+<p>Les caracteristiques du canal NBFM mesurees (voir
+<a href="rapport_canal_nbfm.html">rapport canal</a>) :</p>
+
+<table>
+<tr><th>Parametre</th><th>Valeur</th></tr>
+<tr><td>Bande utile a -3 dB</td><td>300 - 2200 Hz (1900 Hz)</td></tr>
+<tr><td>SNR audio en mode data</td><td>~30 dB</td></tr>
+<tr><td>Derive d'horloge mesuree</td><td>-16 ppm (jusqu'a 200 ppm possible)</td></tr>
+<tr><td>Phase non-lineaire residuelle</td><td>~40 deg std dans la bande</td></tr>
+<tr><td>Group delay</td><td>~1 ms de variation dans la bande</td></tr>
+<tr><td>Limiteur audio en mode voice</td><td>compression ~1 dB, ecrase la BW haute</td></tr>
+</table>
+
+<p><strong>Contraintes modem :</strong></p>
+<ul>
+<li>Point-multipoint (pas d'ARQ) -> FEC forte, pilotes permanents</li>
+<li>Resynchronisation rapide (QRM, nouveau receiver) -> pilotes continus</li>
+<li>Ouvert (pas de VARA) et inspire de HSMODEM (DJ0ABR) : single-carrier
+    shaped PSK/APSK, <strong>PAPR faible</strong> pour passer le limiteur voice</li>
+<li>FEC moderne (LDPC ou equivalent) dans un second temps</li>
+</ul>
+
+<h2 id="pilote-placement">2. Placement optimal du pilote CW</h2>
+
+<p>HSMODEM place le pilote au centre du signal data (heritage SSB QO-100).
+En FM l'optimisation differe a cause du <strong>noise shaping triangulaire</strong>
+post-demodulation et des <strong>filtres de bord</strong> (HPF CTCSS 300 Hz,
+LPF audio 2200 Hz).</p>
+
+<p><strong>Banc</strong> : signal 8PSK 1500 Bd RRC α=0.25 a 1100 Hz + pilote
+CW -6 dB/data a differentes frequences (400-1800 Hz). Mesure apres passage
+dans le simulateur canal.</p>
+
+<div class="fig">
+<img src="results/pilot_placement_metrics.png" alt="Metriques placement pilote">
+<p class="caption">SNR bande etroite (1 Hz), clarte vs spectre data, stabilite
+de phase, et temps de lock en fonction de la frequence du pilote.</p>
+</div>
+
+<div class="fig">
+<img src="results/pilot_placement_spectra.png" alt="Spectres par position pilote">
+<p class="caption">Spectres complets mesures apres canal : on voit le bruit
+triangulaire en montant en frequence, la bande data autour de 1100 Hz, et le
+pilote (barre rouge). Les pilotes en bord de bande (400 et 1800 Hz) sont hors
+du spectre data -> SNR maximal.</p>
+</div>
+
+<div class="key">
+<strong>Verdict :</strong> pilote en <strong>bord de bande (400 Hz ou 1800 Hz)</strong>,
+hors du spectre data, gagne 2-3 dB de SNR par rapport au pilote central.
+La position 400 Hz profite en plus du noise shaping FM plus faible en bas
+de bande. Le pilote doit rester au-dessus du HPF CTCSS a 300 Hz et sous le
+LPF a 2200 Hz.
+</div>
+
+<h2 id="dual-pilote">3. Pilote unique vs dual pilotes</h2>
+
+<p>Avec 2 pilotes encadrant le data, on peut separer deux informations :</p>
+<ul>
+<li><strong>Phase commune</strong> (moyenne des deux) : dérive d'horloge,
+    offset frequentiel porteuse</li>
+<li><strong>Phase differentielle</strong> (delta entre les deux) :
+    <em>group delay</em>, dispersion, phase non-lineaire du canal</li>
+</ul>
+
+<div class="fig">
+<img src="results/dual_pilot_summary.png" alt="Synthese dual pilote">
+<p class="caption">SNR et stabilite de phase selon le scenario. Le mono
+pilote garde 3 dB d'avance en SNR (budget de puissance non partage), mais
+le dual apporte le tracking du group delay.</p>
+</div>
+
+<div class="fig">
+<img src="results/dual_pilot_traces.png" alt="Traces phase pour dual pilotes">
+<p class="caption">Phase commune (drift) et phase differentielle (group delay)
+au cours du temps, pour les deux scenarios dual. La pente de la phase
+differentielle donne la derive d'horloge quasi-parfaitement
+(estime -16 ppm mesure = -16 ppm injecte).</p>
+</div>
+
+<table>
+<tr><th>Scenario</th><th>SNR pilote(s)</th><th>Phase sigma</th>
+    <th>Freq offset</th><th>GD rate</th></tr>
+<tr><td>Mono 1000 Hz (centre data)</td><td>20.5 dB</td><td>5.5 deg</td>
+    <td>+0.02 Hz</td><td>-</td></tr>
+<tr><td>Mono 400 Hz (bord)</td><td class="good"><strong>21.4 dB</strong></td>
+    <td class="good"><strong>4.4 deg</strong></td>
+    <td>+0.01 Hz</td><td>-</td></tr>
+<tr><td>Dual 400/1800 Hz</td><td>18.4 / 18.9 dB</td><td>6.2 deg</td>
+    <td>+0.02 Hz</td><td class="good"><strong>+0.016 ms/s</strong></td></tr>
+<tr><td>Dual 600/1600 Hz</td><td>17.1 / 17.4 dB</td><td>7.8 deg</td>
+    <td>+0.02 Hz</td><td>+0.015 ms/s</td></tr>
+</table>
+
+<div class="key">
+<strong>Choix pour le modem :</strong> <strong>dual pilotes 400 / 1800 Hz</strong>
+malgre la penalite de -3 dB par pilote. On garde ~19 dB SNR pilote
+(tres suffisant), on acquiert un tracker natif de group delay, et on est
+robuste a une coupure partielle du spectre (QRM etroit).
+</div>
+
+<h2 id="ber">4. BER - 8PSK / 16QAM / 32QAM vs symbol rate</h2>
+
+<p><strong>Banc complet</strong> : TX = preambule 256 symboles QPSK
+deterministes (pour sync timing) + 6000 symboles data, RRC α=0.25.
+Data centre a 1100 Hz, pilotes a 400 et 1800 Hz (-6 dB/data).
+Canal : simulateur NBFM avec bruit IF 0.165 (SNR audio ~30 dB), derive
+-16 ppm, delai initial fixe 3 s.
+RX : correlation preambule pour timing, phase recuperee via moyenne des
+phases pilotes, match RRC, slicer dur.</p>
+
+<div class="fig">
+<img src="results/modem_ber_vs_rs.png" alt="BER vs symbol rate">
+<p class="caption">BER et EVM pour les trois constellations. La zone verte
+(Rs &le; 1000 Bd) : pilotes hors du spectre data, BER nul. Au-dela de 1200 Bd,
+interference pilote-data, la constellation s'effondre.</p>
+</div>
+
+<h3>4.1 Resume quantitatif</h3>
+
+<table>
+<tr><th>Modulation</th><th>500 Bd</th><th>750 Bd</th><th>1000 Bd</th>
+    <th>1200 Bd</th><th>1500 Bd</th><th>2000 Bd</th></tr>
+<tr><td>8PSK BER</td>
+    <td class="good">0</td><td class="good">0</td><td class="good">0</td>
+    <td class="warn">5.1e-3</td><td class="bad">0.20</td><td class="bad">0.25</td></tr>
+<tr><td>16QAM BER</td>
+    <td class="good">0</td><td class="good">0</td><td class="good">0</td>
+    <td class="warn">3.2e-2</td><td class="bad">0.38</td><td class="bad">0.40</td></tr>
+<tr><td>32QAM BER</td>
+    <td class="warn">1.5e-3</td><td class="warn">2.0e-3</td>
+    <td class="warn">2.2e-3</td><td class="bad">0.17</td>
+    <td class="bad">0.39</td><td class="bad">0.42</td></tr>
+<tr><td>EVM</td>
+    <td>~9 %</td><td>~9 %</td><td>~9 %</td>
+    <td>~26 %</td><td>~73 %</td><td>~85 %</td></tr>
+</table>
+
+<div class="fig">
+<img src="results/modem_constellations.png" alt="Constellations par modulation et Rs">
+<p class="caption">Constellations recues par modulation (lignes) et symbol
+rate (colonnes). Les croix rouges sont les points theoriques. A Rs &le; 1000 Bd
+les nuages sont serres autour des references ; a partir de 1200 Bd la
+contamination par les pilotes cree une signature geometrique (rayures
+diagonales typiques d'une interference CW dans le symbol period).</p>
+</div>
+
+<h3>4.2 Debit brut max avant mur</h3>
+
+<table>
+<tr><th>Modulation</th><th>Rs max propre</th><th>Debit brut</th>
+    <th>FEC 3/4</th><th>Debit net</th></tr>
+<tr><td>8PSK</td><td>1000 Bd</td><td>3.00 kb/s</td><td>3/4</td><td>2.25 kb/s</td></tr>
+<tr><td>16QAM</td><td>1000 Bd</td><td>4.00 kb/s</td><td>3/4</td>
+    <td class="good"><strong>3.00 kb/s</strong></td></tr>
+<tr><td>32QAM</td><td>1000 Bd</td><td>5.00 kb/s</td><td>2/3</td>
+    <td class="good"><strong>3.33 kb/s</strong></td></tr>
+</table>
+
+<h3>4.3 Pourquoi le mur a 1200 Bd</h3>
+
+<p>Le spectre occupe par le signal shape RRC est <code>Rs x (1 + alpha)</code>.
+Avec α = 0.25 et les pilotes a 400/1800 Hz, la data centree a 1100 Hz occupe
+une bande symetrique de part et d'autre :</p>
+<ul>
+<li>1000 Bd -> 1250 Hz -> data dans [475, 1725] -> <strong>pilotes propres</strong></li>
+<li>1200 Bd -> 1500 Hz -> data dans [350, 1850] -> <strong>pilotes dans la bande data</strong></li>
+<li>1500 Bd -> 1875 Hz -> data dans [162, 2037] -> depasse la bande utile du canal</li>
+</ul>
+
+<p>La contamination mutuelle pilote-data degrade le SNR effectif par symbole
+data d'environ 10-15 dB (le pilote a -6 dB contribue comme interference
+coherente sur les bins data qui lui correspondent).</p>
+
+<h2 id="conclusions">5. Conclusions et perspectives</h2>
+
+<div class="key">
+<strong>Design viable confirme :</strong> single-carrier 16QAM 1000 Bd
+RRC α=0.25 avec dual pilotes 400/1800 Hz, sur canal NBFM ~30 dB SNR,
+delivre <strong>4 kb/s brut / 3 kb/s net</strong> avec LDPC 3/4.
+Depasse largement les performances HamDRM+turbo actuelles et reste dans les
+moyens du TX (voice mode compatible grace au PAPR faible).
+</div>
+
+<h3>Axes d'optimisation a explorer</h3>
+
+<ol>
+<li><strong>Reduire l'α RRC a 0.10-0.15</strong> : autorise Rs jusqu'a
+~1270 Bd sans toucher aux pilotes (+27 % de debit). Cout : filtres plus
+longs, sensibilite timing accrue.</li>
+<li><strong>Pilotes TDM</strong> au lieu de CW : inserer periodiquement des
+symboles pilotes dans le flux data. Plus d'interference spectrale,
+permet Rs jusqu'a 1500 Bd. Cout : ~10 % de symboles "perdus" (mais
+utilisables pour training equaliseur).</li>
+<li><strong>Soustraction pilote au RX</strong> : estimer amplitude/phase
+des pilotes et les retrancher avant slicer. Permet pilotes dans la bande
+data sans penalite. Plus complexe, mais le banc de test est pret.</li>
+<li><strong>Equaliseur adaptatif</strong> (LMS/DFE) pour compenser la phase
+non-lineaire 40 deg + l'eventuelle interference pilote residuelle.</li>
+<li><strong>FEC LDPC short frames</strong> (DVB-S2X VL-SNR) : gagne 5-7 dB
+de sensibilite -> 16QAM devient utilisable plus loin du bord, et permet
+le broadcast avec frames independantes.</li>
+</ol>
+
+<h3>Prochaine iteration proposee</h3>
+
+<p>Option <strong>2 (pilotes TDM)</strong> comme prochain prototype, car elle
+apporte le plus de debit avec le moins de complexite. Mesurer BER vs Rs
+avec pilotes inseres 1/20 symboles, pousser jusqu'a 1500 Bd pour voir
+le plafond canal pur.</p>
+
+<h2>Annexes</h2>
+<p>Scripts :
+<code>study/pilot_placement_bench.py</code>,
+<code>study/dual_pilot_bench.py</code>,
+<code>study/modem_ber_bench.py</code>,
+<code>study/nbfm_channel_sim.py</code>.</p>
+<p>Voir aussi : <a href="rapport_canal_nbfm.html">rapport de caracterisation
+du canal et du simulateur</a>.</p>
+
+</body>
+</html>
