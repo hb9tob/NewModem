@@ -85,6 +85,11 @@ struct Args {
     /// Silence entre frames multiples (s)
     #[arg(long, default_value_t = 0.3)]
     inter_frame_gap: f32,
+
+    /// Taille du buffer audio (samples, par canal). Laisser vide pour defaut
+    /// systeme. Valeurs typiques : 512, 1024, 2048.
+    #[arg(long)]
+    buffer_size: Option<u32>,
 }
 
 fn list_audio_devices() -> Result<()> {
@@ -112,15 +117,24 @@ fn list_serial_ports() -> Result<()> {
     Ok(())
 }
 
-fn pick_output_device(name_substr: Option<&str>)
+fn pick_output_device(name_query: Option<&str>, buffer_size: Option<u32>)
     -> Result<(cpal::Device, StreamConfig, SampleFormat)>
 {
     let host = cpal::default_host();
-    let device = if let Some(sub) = name_substr {
-        host.output_devices()?
-            .find(|d| d.name().map(|n| n.to_lowercase()
-                .contains(&sub.to_lowercase())).unwrap_or(false))
-            .ok_or_else(|| anyhow!("aucune carte son contenant '{}'", sub))?
+    let device = if let Some(q) = name_query {
+        // Match exact prioritaire, sinon substring (case-insensitive)
+        let devices: Vec<_> = host.output_devices()?.collect();
+        let q_lower = q.to_lowercase();
+        let exact = devices.iter().find(|d|
+            d.name().map(|n| n == q).unwrap_or(false));
+        if let Some(d) = exact {
+            d.clone()
+        } else {
+            devices.into_iter()
+                .find(|d| d.name().map(|n| n.to_lowercase().contains(&q_lower))
+                    .unwrap_or(false))
+                .ok_or_else(|| anyhow!("aucune carte son nommee/contenant '{}'", q))?
+        }
     } else {
         host.default_output_device()
             .ok_or_else(|| anyhow!("pas de peripherique audio par defaut"))?
@@ -139,7 +153,11 @@ fn pick_output_device(name_substr: Option<&str>)
             && sc.sample_format() == SampleFormat::F32
         {
             let cfg = sc.with_sample_rate(SampleRate(AUDIO_RATE));
-            chosen = Some((cfg.config(), sc.sample_format()));
+            let mut cfg_s = cfg.config();
+            if let Some(bs) = buffer_size {
+                cfg_s.buffer_size = cpal::BufferSize::Fixed(bs);
+            }
+            chosen = Some((cfg_s, sc.sample_format()));
             break;
         }
     }
@@ -149,13 +167,14 @@ fn pick_output_device(name_substr: Option<&str>)
         let cfg = StreamConfig {
             channels: dcfg.channels(),
             sample_rate: SampleRate(AUDIO_RATE),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: buffer_size.map(cpal::BufferSize::Fixed)
+                .unwrap_or(cpal::BufferSize::Default),
         };
         chosen = Some((cfg, dcfg.sample_format()));
     }
     let (cfg, fmt) = chosen.unwrap();
-    println!("[audio] config : {} ch, {} Hz, {:?}",
-        cfg.channels, cfg.sample_rate.0, fmt);
+    println!("[audio] config : {} ch, {} Hz, {:?}, buffer {:?}",
+        cfg.channels, cfg.sample_rate.0, fmt, cfg.buffer_size);
     Ok((device, cfg, fmt))
 }
 
@@ -179,8 +198,8 @@ fn ptt_set(port: &mut Box<dyn serialport::SerialPort>, line: PttLine, on: bool) 
     Ok(())
 }
 
-/// Envoie le buffer audio (mono f32) sur le device. Met a jour `progress`
-/// pour suivre la progression.
+/// Envoie le buffer audio (mono f32) sur le device avec affichage %
+/// et attente de drain propre en fin de stream.
 fn play_audio(
     audio_mono: Vec<f32>,
     device: &cpal::Device,
@@ -192,6 +211,7 @@ fn play_audio(
     let channels = config.channels as usize;
     let audio_arc = Arc::new(audio_mono);
     let audio_cb = Arc::clone(&audio_arc);
+    let total_duration_s = total as f32 / AUDIO_RATE as f32;
 
     let err_fn = |err| eprintln!("[audio] erreur stream : {}", err);
 
@@ -200,27 +220,45 @@ fn play_audio(
         move |data: &mut [f32], _info| {
             let pos = progress_cb.load(Ordering::Relaxed);
             let frames = data.len() / channels;
-            let mut written = 0usize;
             for f in 0..frames {
                 let i = pos + f;
                 let v = if i < audio_cb.len() { audio_cb[i] } else { 0.0 };
                 for c in 0..channels {
                     data[f * channels + c] = v;
                 }
-                written += 1;
             }
-            progress_cb.fetch_add(written, Ordering::Relaxed);
+            progress_cb.fetch_add(frames, Ordering::Relaxed);
         },
         err_fn,
         None,
     ).context("build_output_stream")?;
     stream.play().context("stream.play")?;
 
-    // Attend la fin de la lecture
-    let target = total + (AUDIO_RATE as usize / 4);  // marge 250 ms
-    while progress.load(Ordering::Relaxed) < target {
+    // Boucle d'affichage + attente de fin de donnees utiles
+    let mut last_pct = -1i32;
+    loop {
+        let p = progress.load(Ordering::Relaxed);
+        let done = p.min(total);
+        let pct = (done as f32 / total as f32 * 100.0) as i32;
+        if pct != last_pct {
+            let elapsed_s = done as f32 / AUDIO_RATE as f32;
+            eprint!("\r[tx] {:3} %  ({:.1} / {:.1} s)   ",
+                pct, elapsed_s, total_duration_s);
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+            last_pct = pct;
+        }
+        if p >= total {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+    eprintln!();
+
+    // Drain du buffer du driver : attente supplementaire pour que les derniers
+    // samples passent par le DAC. La latence WASAPI shared est typiquement
+    // 20-200 ms. On attend 500 ms pour etre tranquille, puis drop.
+    std::thread::sleep(Duration::from_millis(500));
     drop(stream);
     Ok(())
 }
@@ -293,7 +331,8 @@ fn main() -> Result<()> {
     println!("[total] {:.2} s a transmettre", total_dur);
 
     // Audio device
-    let (device, config, _fmt) = pick_output_device(args.device.as_deref())?;
+    let (device, config, _fmt) = pick_output_device(
+        args.device.as_deref(), args.buffer_size)?;
 
     // PTT
     let mut serial = if let Some(s) = &args.serial {
