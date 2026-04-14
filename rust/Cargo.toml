@@ -18,6 +18,7 @@ num-complex = "0.4"
 cpal = "0.15"
 serialport = "4"
 thiserror = "1"
+reed-solomon-erasure = "6"
 
 [profile.release]
 opt-level = 3

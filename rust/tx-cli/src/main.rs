@@ -77,6 +77,10 @@ struct Args {
     /// Crete audio cible (0..1)
     #[arg(long, default_value_t = 0.5)]
     peak: f32,
+
+    /// Niveau RS outer FEC : 0=aucun, 1=light (~6%), 2=medium (~12%), 3=heavy (~25%)
+    #[arg(long, default_value_t = 0)]
+    rs_level: u8,
 }
 
 fn list_audio_devices() -> Result<()> {
@@ -242,11 +246,11 @@ fn main() -> Result<()> {
     println!("[file] {} octets ({})", bytes.len(), file);
     println!("[frame] filename='{}'", filename);
 
-    // Assemble frame (header + body) - rs_level=0 pour l'instant
-    let frame_bytes = build_frame(mode, 0, 0, true, &filename, &bytes)
+    // Assemble frame (header + body + RS parity)
+    let frame_bytes = build_frame(mode, args.rs_level, 0, true, &filename, &bytes)
         .context("build_frame")?;
-    println!("[frame] {} octets total (header 16 + body+padding {})",
-        frame_bytes.len(), frame_bytes.len() - 16);
+    println!("[frame] RS level={}, total {} octets",
+        args.rs_level, frame_bytes.len());
 
     // Module (LDPC encode + modulation)
     println!("[modem] LDPC encode + modulation...");

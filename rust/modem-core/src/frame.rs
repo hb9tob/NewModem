@@ -15,6 +15,7 @@
 
 use crate::crc::crc32;
 use crate::header::{FrameHeader, FLAG_LAST};
+use crate::rs::{encode as rs_encode, parity_blocks_for, RsError};
 use crate::ModemMode;
 
 /// Taille d'un bloc de data = 1 codeword LDPC info (valable pour rate 1/2 et 3/4).
@@ -24,12 +25,12 @@ pub const BLOCK_BYTES: usize = 90;
 pub enum FrameError {
     #[error("filename trop long (max 255 octets UTF-8), recu {0}")]
     FilenameTooLong(usize),
-    #[error("RS non supporte dans cette version (rs_level={0})")]
-    RsNotImplemented(u8),
     #[error("body corrompu : CRC32 mismatch")]
     BadBodyCrc,
     #[error("frame trop courte")]
     Truncated,
+    #[error("RS: {0}")]
+    Rs(#[from] RsError),
 }
 
 /// Construit le body a partir de (filename, payload).
@@ -95,7 +96,7 @@ pub fn concatenate_blocks(blocks: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// Assemble la frame complete : header + body. Pas encore de RS.
+/// Assemble la frame complete : header + blocs data + blocs parity RS.
 ///
 /// Retourne les bytes de la frame, prets a passer dans le modulateur.
 pub fn build_frame(
@@ -106,28 +107,29 @@ pub fn build_frame(
     filename: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>, FrameError> {
-    if rs_level != 0 {
-        return Err(FrameError::RsNotImplemented(rs_level));
-    }
     let body = build_body(filename, payload)?;
     let data_blocks = split_into_blocks(&body);
-    let n_data = data_blocks.len() as u16;
-    let n_parity = 0u16;  // rs_level=0 -> aucun parity bloc
+    let n_data = data_blocks.len();
+    let n_parity = parity_blocks_for(n_data, rs_level);
+
+    // RS encode : retourne data + parity blocs
+    let all_blocks = rs_encode(&data_blocks, rs_level)?;
+    assert_eq!(all_blocks.len(), n_data + n_parity);
 
     let header = FrameHeader {
         version: crate::header::VERSION,
         mode_code: mode.to_code(),
         rs_level,
-        n_data_blocks: n_data,
-        n_parity_blocks: n_parity,
+        n_data_blocks: n_data as u16,
+        n_parity_blocks: n_parity as u16,
         frame_id,
         flags: if is_last { FLAG_LAST } else { 0 },
     };
 
     let header_bytes = header.encode();
-    let mut out = Vec::with_capacity(header_bytes.len() + data_blocks.len() * BLOCK_BYTES);
+    let mut out = Vec::with_capacity(header_bytes.len() + all_blocks.len() * BLOCK_BYTES);
     out.extend_from_slice(&header_bytes);
-    for block in &data_blocks {
+    for block in &all_blocks {
         out.extend_from_slice(block);
     }
     Ok(out)
@@ -191,10 +193,17 @@ mod tests {
     }
 
     #[test]
-    fn build_frame_rs_rejected() {
-        let err = build_frame(
-            ModemMode::Qam16R34_1500, 1, 0, true, "x", b"y",
-        );
-        assert!(err.is_err());
+    fn build_frame_with_rs() {
+        let bytes = build_frame(
+            ModemMode::Qam16R34_1500, 2, 7, false, "test.bin", &[0xAA; 1000],
+        ).unwrap();
+        let h = FrameHeader::decode(&bytes[..16]).unwrap();
+        // body = 1 + 8 + 1000 + 4 = 1013 bytes
+        // blocs = ceil(1013/90) = 12 data blocs
+        // parity level 2 = ceil(12/8) = 2
+        assert_eq!(h.n_data_blocks, 12);
+        assert_eq!(h.n_parity_blocks, 2);
+        assert_eq!(h.rs_level, 2);
+        assert_eq!(bytes.len(), 16 + (12 + 2) * BLOCK_BYTES);
     }
 }

@@ -17,6 +17,7 @@ pub mod header;
 pub mod ldpc;
 pub mod modulator;
 pub mod rrc;
+pub mod rs;
 
 pub const AUDIO_RATE: u32 = 48_000;
 pub const DATA_CENTER_HZ: f32 = 1100.0;
