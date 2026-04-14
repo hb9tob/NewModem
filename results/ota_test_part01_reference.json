@@ -1,0 +1,63 @@
+{
+  "audio_rate": 48000,
+  "pilot_freqs": [
+    400.0,
+    1800.0
+  ],
+  "pilot_rel_db": -6.0,
+  "data_center": 1100.0,
+  "rolloff": 0.25,
+  "part": 1,
+  "part_name": "reference",
+  "duration_s": 26.0,
+  "timeline": [
+    {
+      "label": "silence_initial",
+      "start_s": 0.0,
+      "end_s": 5.0
+    },
+    {
+      "label": "marker_start",
+      "start_s": 5.0,
+      "end_s": 7.0,
+      "pilot_freqs": [
+        400.0,
+        1800.0
+      ]
+    },
+    {
+      "label": "silence",
+      "start_s": 7.0,
+      "end_s": 9.0
+    },
+    {
+      "label": "pilot_only",
+      "start_s": 9.0,
+      "end_s": 19.0,
+      "pilot_freqs": [
+        400.0,
+        1800.0
+      ],
+      "amplitude": 0.4
+    },
+    {
+      "label": "silence",
+      "start_s": 19.0,
+      "end_s": 21.0
+    },
+    {
+      "label": "marker_end",
+      "start_s": 21.0,
+      "end_s": 23.0,
+      "pilot_freqs": [
+        400.0,
+        1800.0
+      ]
+    },
+    {
+      "label": "silence_final",
+      "start_s": 23.0,
+      "end_s": 26.0
+    }
+  ]
+}
