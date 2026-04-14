@@ -15,7 +15,7 @@ use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use modem_core::{
-    frame::build_frame,
+    frame::build_frames,
     modulator::{modulate_bytes, vox_tone},
     ModemMode, AUDIO_RATE,
 };
@@ -81,6 +81,10 @@ struct Args {
     /// Niveau RS outer FEC : 0=aucun, 1=light (~6%), 2=medium (~12%), 3=heavy (~25%)
     #[arg(long, default_value_t = 0)]
     rs_level: u8,
+
+    /// Silence entre frames multiples (s)
+    #[arg(long, default_value_t = 0.3)]
+    inter_frame_gap: f32,
 }
 
 fn list_audio_devices() -> Result<()> {
@@ -246,17 +250,29 @@ fn main() -> Result<()> {
     println!("[file] {} octets ({})", bytes.len(), file);
     println!("[frame] filename='{}'", filename);
 
-    // Assemble frame (header + body + RS parity)
-    let frame_bytes = build_frame(mode, args.rs_level, 0, true, &filename, &bytes)
-        .context("build_frame")?;
-    println!("[frame] RS level={}, total {} octets",
-        args.rs_level, frame_bytes.len());
+    // Assemble les frames (multi-frame auto selon taille payload)
+    let frames = build_frames(mode, args.rs_level, &filename, &bytes)
+        .context("build_frames")?;
+    println!("[frame] RS level={}, {} frame(s)",
+        args.rs_level, frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        println!("  frame {}: {} octets", i, f.len());
+    }
 
-    // Module (LDPC encode + modulation)
+    // Module chaque frame en audio
     println!("[modem] LDPC encode + modulation...");
-    let data_audio = modulate_bytes(&frame_bytes, mode, args.peak);
+    let gap_between_frames: Vec<f32> =
+        vec![0.0; (AUDIO_RATE as f32 * args.inter_frame_gap) as usize];
+    let mut data_audio: Vec<f32> = Vec::new();
+    for (i, frame_bytes) in frames.iter().enumerate() {
+        let a = modulate_bytes(frame_bytes, mode, args.peak);
+        if i > 0 {
+            data_audio.extend_from_slice(&gap_between_frames);
+        }
+        data_audio.extend_from_slice(&a);
+    }
     let data_dur = data_audio.len() as f32 / AUDIO_RATE as f32;
-    println!("[modem] {} samples, {:.2} s",
+    println!("[modem] {} samples, {:.2} s total",
         data_audio.len(), data_dur);
 
     // VOX preamble (carrier 1100 Hz)

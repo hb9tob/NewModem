@@ -11,9 +11,9 @@
 //!   4..5    rs_level (0..3)
 //!   5..7    n_data_blocks (BE u16)
 //!   7..9    n_parity_blocks (BE u16)
-//!   9..11   frame_id (BE u16)
-//!   11..12  flags (bit0=last frame)
-//!   12..14  reserved (2 octets zeros)
+//!   9..11   frame_id (BE u16, 0..N-1)
+//!   11..13  total_frames (BE u16, N)
+//!   13..14  flags (bit0=LAST, bit1=HAS_FILENAME)
 //!   14..16  header_crc16 (BE, CRC16-CCITT sur octets 0..14)
 
 use crate::crc::crc16_ccitt;
@@ -24,6 +24,7 @@ pub const VERSION: u8 = 1;
 
 /// Flags du header (bitmask).
 pub const FLAG_LAST: u8 = 0x01;
+pub const FLAG_HAS_FILENAME: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -34,6 +35,7 @@ pub struct FrameHeader {
     pub n_data_blocks: u16,
     pub n_parity_blocks: u16,
     pub frame_id: u16,
+    pub total_frames: u16,
     pub flags: u8,
 }
 
@@ -48,8 +50,8 @@ impl FrameHeader {
         buf[5..7].copy_from_slice(&self.n_data_blocks.to_be_bytes());
         buf[7..9].copy_from_slice(&self.n_parity_blocks.to_be_bytes());
         buf[9..11].copy_from_slice(&self.frame_id.to_be_bytes());
-        buf[11] = self.flags;
-        // reserved 12..14 reste a zero
+        buf[11..13].copy_from_slice(&self.total_frames.to_be_bytes());
+        buf[13] = self.flags;
         let crc = crc16_ccitt(&buf[0..14]);
         buf[14..16].copy_from_slice(&crc.to_be_bytes());
         buf
@@ -75,12 +77,17 @@ impl FrameHeader {
             n_data_blocks: u16::from_be_bytes([data[5], data[6]]),
             n_parity_blocks: u16::from_be_bytes([data[7], data[8]]),
             frame_id: u16::from_be_bytes([data[9], data[10]]),
-            flags: data[11],
+            total_frames: u16::from_be_bytes([data[11], data[12]]),
+            flags: data[13],
         })
     }
 
     pub fn is_last_frame(&self) -> bool {
         self.flags & FLAG_LAST != 0
+    }
+
+    pub fn has_filename(&self) -> bool {
+        self.flags & FLAG_HAS_FILENAME != 0
     }
 }
 
@@ -97,11 +104,14 @@ mod tests {
             n_data_blocks: 112,
             n_parity_blocks: 14,
             frame_id: 42,
-            flags: FLAG_LAST,
+            total_frames: 100,
+            flags: FLAG_LAST | FLAG_HAS_FILENAME,
         };
         let buf = h.encode();
         let back = FrameHeader::decode(&buf).expect("decode ok");
         assert_eq!(h, back);
+        assert!(back.is_last_frame());
+        assert!(back.has_filename());
     }
 
     #[test]
@@ -117,7 +127,7 @@ mod tests {
         let h = FrameHeader {
             version: 1, mode_code: 3, rs_level: 0,
             n_data_blocks: 10, n_parity_blocks: 0,
-            frame_id: 1, flags: 0,
+            frame_id: 1, total_frames: 1, flags: 0,
         };
         let mut buf = h.encode();
         buf[5] ^= 0x80;  // flip un bit
@@ -130,7 +140,7 @@ mod tests {
         let h = FrameHeader {
             version: 1, mode_code: 0, rs_level: 0,
             n_data_blocks: 0, n_parity_blocks: 0,
-            frame_id: 0, flags: 0,
+            frame_id: 0, total_frames: 0, flags: 0,
         };
         assert_eq!(h.encode().len(), 16);
     }
