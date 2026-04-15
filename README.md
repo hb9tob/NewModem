@@ -30,8 +30,14 @@ Design single-carrier inspiré du modem QO-100 d'EA4GPZ (HSMODEM) :
 - **Dual pilotes** à 400 et 1800 Hz (tracking phase commune + group delay)
 - Symbol rate max viable : **1000 Bd** avant collision pilote-data
 
-Voir [rapport modem](rapport_modem.html) pour les détails, courbes BER et
+Voir [rapport modem SC](rapport_modem.html) pour les détails, courbes BER et
 constellations.
+
+Une exploration plus récente teste **16-APSK (4,12) DVB-S2 + RRC agressif +
+FTN (τ<1)** avec FSE T/2 + DD-PLL + soft demap LLR alignée sur la chaîne
+LDPC LNMS WiMAX 2304 visée : voir [rapport 16-APSK + FTN](rapport_apsk16_ftn.html).
+Résultat principal : **Rs=1500 β=0.20 τ=1.0** est le nouveau sweet spot
+(6000 bit/s uncoded, BW=1800 Hz dans le plateau NBFM, BER=0 sans bruit IF).
 
 ## Simulateur
 

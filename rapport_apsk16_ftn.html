@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Banc 16-APSK + RRC agressif (FTN) sur canal NBFM</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+         max-width: 1150px; margin: 2em auto; padding: 0 1em; color: #222;
+         line-height: 1.55; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 0.3em; }
+  h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
+  h3 { margin-top: 1.5em; color: #334; }
+  table { border-collapse: collapse; margin: 1em 0; font-size: 0.95em; }
+  th, td { border: 1px solid #ccc; padding: 0.35em 0.8em; text-align: right; }
+  th { background: #f0f0f0; }
+  td:first-child, th:first-child { text-align: left; }
+  td.good { background: #e8f7ea; }
+  td.warn { background: #fff5d9; }
+  td.bad  { background: #fde2e2; }
+  img { max-width: 100%; height: auto; border: 1px solid #ddd;
+        margin: 0.5em 0; display: block; }
+  .fig { margin: 1em 0; }
+  .caption { font-style: italic; color: #555; font-size: 0.9em; }
+  .key  { background: #eef7ff; border-left: 4px solid #1e6fbf;
+          padding: 0.6em 1em; margin: 1em 0; }
+  .warn { background: #fff3e0; border-left: 4px solid #e07a00;
+          padding: 0.6em 1em; margin: 1em 0; }
+  code, pre { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px;
+              font-size: 0.92em; }
+  pre { padding: 0.8em; overflow-x: auto; }
+  .two-col { display: flex; gap: 1em; flex-wrap: wrap; }
+  .two-col > div { flex: 1 1 48%; min-width: 320px; }
+  nav.toc { background: #f7f7f7; padding: 0.7em 1.2em; border-radius: 6px;
+            margin: 1em 0; }
+  nav.toc ol { margin: 0.3em 0 0 1em; padding: 0; }
+  nav.toc a { text-decoration: none; color: #1e6fbf; }
+</style>
+</head>
+<body>
+
+<h1>Banc 16-APSK (4,12) + RRC agressif / FTN sur canal NBFM</h1>
+
+<p><strong>Objectif :</strong> evaluer en simulation si une constellation
+16-APSK DVB-S2 combinee a un RRC agressif (β petit) et optionnellement a
+une transmission FTN (Faster Than Nyquist, τ&lt;1) permet de depasser le
+plafond mesure des modems QAM actuels (~1000&nbsp;Bd pour 16-QAM avec DFE)
+sur le canal NBFM radio amateur. Choix de la meilleure configuration pour
+essai OTA via des criteres physiques (GMI, ouverture d'oeil, marge au
+seuil LDPC).</p>
+
+<nav class="toc">
+<strong>Sommaire</strong>
+<ol>
+<li><a href="#contexte">Contexte et contraintes</a></li>
+<li><a href="#arch">Architecture receveur</a></li>
+<li><a href="#regles">Regles imposees et blocs standards</a></li>
+<li><a href="#results">Resultats du sweep</a></li>
+<li><a href="#reco">Recommandations OTA</a></li>
+<li><a href="#limits">Limites et pistes parkees</a></li>
+</ol>
+</nav>
+
+<h2 id="contexte">1. Contexte et contraintes</h2>
+
+<p>Le canal NBFM amateur (voir <a href="rapport_canal_nbfm.html">rapport
+canal</a>) est caracterise par :</p>
+
+<table>
+<tr><th>Parametre canal NBFM</th><th>Valeur</th></tr>
+<tr><td>Bande utile -3 dB</td><td>300 – 2200 Hz</td></tr>
+<tr><td>Pre/de-emphase</td><td>τ = 75 µs</td></tr>
+<tr><td>LPF post-demod</td><td>2000 Hz (coupure raide)</td></tr>
+<tr><td>Clip TX audio</td><td>0.55 (limiteur excursion FM)</td></tr>
+<tr><td>Derive horloge mesuree</td><td>-16 ppm</td></tr>
+<tr><td>SNR cible post-demod</td><td>20 dB</td></tr>
+</table>
+
+<p>Les essais 16-QAM / 32-QAM precedents (voir <a href="rapport_modem.html">rapport
+modem SC</a>) plafonnent autour de Rs=1000&nbsp;Bd. Au-dela, la bande
+occupee sort du plateau plat NBFM et le BER explose meme avec une DFE
+9+5 taps.</p>
+
+<div class="key">
+<strong>Hypothese testee :</strong> une constellation 16-APSK (ronde) +
+RRC avec β petit (spectre plus compact) + optionnellement FTN (τ&lt;1)
++ FSE T/2 (oversamplee) permet-elle de pousser au-dela ?
+</div>
+
+<h2 id="arch">2. Architecture recepteur simulee</h2>
+
+<p>Chaine alignee sur l'architecture OTA visee
+(FSE + DD-PLL + soft demap LLR &rarr; LDPC LNMS WiMAX 2304 &rarr; CRC32 &rarr; QRaptor) :</p>
+
+<pre>
+audio 48 kHz &rarr; downmix 1100 Hz &rarr; RRC matched (β)
+             &rarr; sync grossiere (correlation preambule post-MF)
+             &rarr; decimation entiere d_fse = GCD(SPS, pitch)
+             &rarr; FSE FFE T/2 (LMS, taps=17 a τ=1, 41 a τ=0.9)
+               + DFE T-spaced (auto-desactive pour FTN, error propagation)
+             &rarr; DD-PLL 2e ordre (discriminateur Im{y·conj(a)}/|a|²)
+             &rarr; soft demapper max-log LLR
+             &rarr; [LDPC LNMS externe / non inclus dans le banc]
+</pre>
+
+<p>Regles "N entier" : a 48&nbsp;kHz, SPS = 48000/Rs entier, et pitch
+= τ·SPS entier. Le facteur de decimation d_fse divise simultanement
+SPS et pitch, ce qui donne FSE T/2 classique a τ=1 (9-17 taps) et FSE
+T/10 oversamplee a τ=0.9 (41 taps). Aucun resampling fractionnaire.</p>
+
+<h2 id="regles">3. Regles imposees et blocs standards</h2>
+
+<p>Toutes les briques sont publiques, eprouvees, referencees :</p>
+
+<table>
+<tr><th>Bloc</th><th>Reference</th></tr>
+<tr><td>16-APSK (4,12), γ=2.85</td><td>DVB-S2 ETSI EN 302 307-1 §5.4.3
+(rate 3/4), table extraite de <code>gr-dvbs2</code> (public)</td></tr>
+<tr><td>RRC β ∈ {0.15, 0.20, 0.25}</td><td>Nyquist / Proakis</td></tr>
+<tr><td>FTN τ&lt;1</td><td>Mazo 1975, Anderson &amp; Rusek 2013</td></tr>
+<tr><td>Preambule + pilotes TDM</td><td>Meme convention que les benchs
+precedents (D=32 data + P=2 pilotes QPSK)</td></tr>
+<tr><td>FSE T/2 LMS</td><td>Gitlin-Weinstein, Proakis ch.10</td></tr>
+<tr><td>DFE LMS</td><td>Proakis</td></tr>
+<tr><td>Decision-Directed PLL (APSK)</td><td>Meyr/Moeneclaey/Fechtel
+"Digital Communication Receivers" ch.8</td></tr>
+<tr><td>Soft demapper max-log LLR</td><td>Viterbi 1998</td></tr>
+<tr><td>GMI (BICM)</td><td>Alvarado et al., IEEE TIT 2008</td></tr>
+<tr><td>LDPC WiMAX N=2304 reference</td><td>IEEE 802.16e-2005, rates
+1/2, 2/3, 3/4</td></tr>
+</table>
+
+<h2 id="results">4. Resultats du sweep</h2>
+
+<p><strong>Grille :</strong> 10 points (Rs, τ) &times; 3 β &times; 6 if_noise
+= 180 combinaisons, N=1000 symboles par point.</p>
+
+<h3>4.1 Points testes</h3>
+
+<table>
+<tr><th>Rs (Bd)</th><th>SPS</th><th>τ options</th><th>BW occupee (Hz)</th></tr>
+<tr><td>1000</td><td>48</td><td>1.0</td><td>1200 (β=0.2)</td></tr>
+<tr><td>1200</td><td>40</td><td>1.0, 0.900</td><td>1440 / 1600</td></tr>
+<tr><td>1411.76</td><td>34</td><td>1.0, 0.941</td><td>1694 / 1800</td></tr>
+<tr><td>1500</td><td>32</td><td>1.0, 0.938</td><td>1800 / 1920</td></tr>
+<tr><td>1600</td><td>30</td><td>1.0, 0.900</td><td>1920 / 2133</td></tr>
+<tr><td>2000</td><td>24</td><td>1.0</td><td>2400 (hors bande NBFM)</td></tr>
+</table>
+
+<h3>4.2 Heatmaps BER / GMI par τ</h3>
+
+<div class="two-col">
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/heatmaps/ber_tau1.00.png" alt="BER tau=1">
+<div class="caption">BER uncoded, τ=1.0 (Nyquist orthogonal). Colonnes
+= if_noise, axe X = Rs, axe Y = β.</div>
+</div>
+</div>
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/heatmaps/gmi_tau1.00.png" alt="GMI tau=1">
+<div class="caption">GMI (bits/symb), τ=1.0. Max = 4.</div>
+</div>
+</div>
+</div>
+
+<div class="two-col">
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/heatmaps/ber_tau0.90.png" alt="BER tau=0.9">
+<div class="caption">BER uncoded, FTN τ=0.90 (et τ=0.938, τ=0.941).</div>
+</div>
+</div>
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/heatmaps/gmi_tau0.90.png" alt="GMI tau=0.9">
+<div class="caption">GMI pour FTN. Degradation visible au bord de
+bande NBFM.</div>
+</div>
+</div>
+</div>
+
+<h3>4.3 Observations physiques</h3>
+
+<ol>
+<li><strong>Rs=1500 (SPS=32) est le nouveau sweet spot.</strong> La BW
+occupee (1800 Hz) reste dans le plateau NBFM. BER=0 sans bruit IF, GMI=4.
+C'est +25% de debit vs Rs=1200 sans perte de robustesse.</li>
+<li><strong>Rs=1600 (SPS=30) tombe.</strong> BW=1920 Hz touche la coupure
+du LPF post-demod 2000 Hz. Convergence FSE marginale, GMI ~2.7.</li>
+<li><strong>Rs=2000 elimine.</strong> BW=2400 Hz hors bande. Non viable.</li>
+<li><strong>FTN τ=0.94 fonctionne.</strong> +6% de debit a Rs=1500 avec
+BER&lt;0.01 sans bruit IF. GMI=3.88 (au-dessus du seuil LDPC 2/3).</li>
+<li><strong>Le "genou FTN" est entre τ=0.88 et τ=0.92.</strong> En-dessous,
+BER passe de 0.001 a &gt;0.10 brutalement, comme prevu par la
+litterature Anderson/Rusek pour une FSE FFE-only sans BCJR.</li>
+<li><strong>La DFE nuit au FTN</strong> (error propagation sur ISI
+pre-curseur). Auto-desactivee quand τ&lt;1.</li>
+</ol>
+
+<h2 id="reco">5. Recommandations OTA</h2>
+
+<p>Top configurations par rate LDPC WiMAX 2304
+(seuil GMI = 4·r + 0.5 bits/symb de marge) :</p>
+
+<h3>5.1 LDPC rate 1/2 (seuil GMI = 2.50)</h3>
+
+<table>
+<tr><th>Rs (Bd)</th><th>β</th><th>τ</th><th>if_noise max OK</th>
+    <th>Debit utile</th><th>GMI</th><th>BER uncoded</th><th>Oeil</th></tr>
+<tr class="good"><td>1500.00</td><td>0.15</td><td>1.000</td><td>0.500</td>
+    <td>3000 bit/s</td><td>3.33</td><td>0.028</td><td>0.22</td></tr>
+<tr class="good"><td>1500.00</td><td>0.25</td><td>1.000</td><td>0.300</td>
+    <td>3000 bit/s</td><td>4.00</td><td>0.000</td><td>0.50</td></tr>
+<tr><td>1411.76</td><td>0.25</td><td>1.000</td><td>0.500</td>
+    <td>2823 bit/s</td><td>3.30</td><td>0.025</td><td>0.21</td></tr>
+</table>
+
+<h3>5.2 LDPC rate 2/3 (seuil GMI = 3.17)</h3>
+
+<table>
+<tr><th>Rs (Bd)</th><th>β</th><th>τ</th><th>if_noise max OK</th>
+    <th>Debit utile</th><th>GMI</th><th>BER uncoded</th><th>Oeil</th></tr>
+<tr class="good"><td>1500.00</td><td>0.20</td><td>1.000</td><td>0.300</td>
+    <td>4000 bit/s</td><td>4.00</td><td>0.000</td><td>0.56</td></tr>
+<tr class="good"><td>1500.00</td><td>0.25</td><td>1.000</td><td>0.300</td>
+    <td>4000 bit/s</td><td>4.00</td><td>0.000</td><td>0.50</td></tr>
+<tr class="good"><td>1411.76</td><td>0.20</td><td>1.000</td><td>0.300</td>
+    <td>3764 bit/s</td><td>4.00</td><td>0.000</td><td>0.79</td></tr>
+<tr><td>1500.00</td><td>0.25</td><td>0.938</td><td>0.300</td>
+    <td>3750 bit/s</td><td>3.98</td><td>0.001</td><td>0.47</td></tr>
+</table>
+
+<h3>5.3 LDPC rate 3/4 (seuil GMI = 3.50)</h3>
+
+<table>
+<tr><th>Rs (Bd)</th><th>β</th><th>τ</th><th>if_noise max OK</th>
+    <th>Debit utile</th><th>GMI</th><th>BER uncoded</th><th>Oeil</th></tr>
+<tr class="good"><td>1500.00</td><td>0.20</td><td>1.000</td><td>0.300</td>
+    <td>4500 bit/s</td><td>4.00</td><td>0.000</td><td>0.56</td></tr>
+<tr class="good"><td>1500.00</td><td>0.25</td><td>1.000</td><td>0.300</td>
+    <td>4500 bit/s</td><td>4.00</td><td>0.000</td><td>0.50</td></tr>
+<tr class="good"><td>1411.76</td><td>0.20</td><td>1.000</td><td>0.300</td>
+    <td>4235 bit/s</td><td>4.00</td><td>0.000</td><td>0.79</td></tr>
+</table>
+
+<div class="key">
+<strong>Candidats OTA prioritaires :</strong>
+<ul>
+<li><strong>Debit max :</strong> Rs=1500, β=0.20, τ=1.0 (6000 bit/s uncoded,
+4500 bit/s coded rate 3/4, BW=1800 Hz).</li>
+<li><strong>Robustesse max :</strong> Rs=1411, β=0.25, τ=1.0 (5647 bit/s
+uncoded, BW=1694 Hz, tolere if_noise=0.5).</li>
+<li><strong>FTN +6% :</strong> Rs=1500, β=0.25, τ=0.938 (6395 bit/s
+uncoded, BW=1920 Hz, BER uncoded 0.001).</li>
+</ul>
+</div>
+
+<h2 id="limits">6. Limites et pistes parkees</h2>
+
+<div class="warn">
+<strong>Limites honnetes du banc :</strong>
+<ul>
+<li><strong>SNR si injecte</strong> par <code>if_noise_voltage</code>
+(0 a 0.5), pas en dB calibre. Une cartographie exacte SNR ↔ if_noise
+reste a faire si on veut croiser avec les seuils LDPC AWGN publies.</li>
+<li><strong>N=1000 symboles par point</strong> donne des stats correctes
+sur GMI mais BER&lt;1e-3 est bruite. Pour validation fine : augmenter a
+10000+ symboles (cout CPU).</li>
+<li><strong>LDPC non decode dans le banc.</strong> Les LLR sont exportees
+(<code>results/apsk16_ftn/llr_dumps/*.npy</code>) pour branchement
+ulterieur sur un decodeur LNMS WiMAX 2304 externe.</li>
+</ul>
+</div>
+
+<h3>Pistes parkees (pour plus tard)</h3>
+
+<ul>
+<li><strong>FTN τ ≤ 0.88</strong> — cliff observe, BER&gt;0.1. Necessite
+un detecteur BCJR/Viterbi sur l'ISI (Mazo bound recuperable). Non aligne
+sur l'architecture finale LNMS-only. A rouvrir uniquement si l'OTA reel
+sur la piste &ldquo;τ=1, Rs=1500&rdquo; est decevant et justifie
+d'ajouter un BCJR temps reel dans le modem Rust.</li>
+<li><strong>Scan γ APSK</strong> — γ=2.85 (DVB-S2 rate 3/4) fixe ici.
+Les valeurs tabulees {2.57, 2.85, 3.15} (rates {3/4, 2/3, 1/2}) pourraient
+etre testees en phase 2 si le candidat γ=2.85 est prometteur sur OTA
+mais pas au-dessus du seuil LDPC cible.</li>
+<li><strong>Timing tracking pilot-aided</strong> — diagnostique
+(<code>pilot_metrics_from_fse</code>) mais pas compense activement. Sur
+canal NBFM le drift 16 ppm reste sous T/4 meme sur des paquets de
+1000 symboles, donc la FSE T/2 l'absorbe. A activer si l'OTA revele
+des paquets plus longs.</li>
+</ul>
+
+<h2 id="outils">7. Outils et reproductibilite</h2>
+
+<p>Source : <code>study/modem_apsk16_ftn_bench.py</code>. Tests unitaires
+complets :</p>
+
+<pre>/c/Users/tous/radioconda/python.exe study/modem_apsk16_ftn_bench.py --test</pre>
+
+<p>Sweep rapide (18 points, &lt;2 min) :</p>
+
+<pre>/c/Users/tous/radioconda/python.exe study/modem_apsk16_ftn_bench.py --sweep --quick</pre>
+
+<p>Sweep complet (180 points, ~15-20 min) :</p>
+
+<pre>/c/Users/tous/radioconda/python.exe study/modem_apsk16_ftn_bench.py --sweep --n-symbols 1000</pre>
+
+<p>Sorties : <code>results/apsk16_ftn/sweep.csv</code>,
+<code>heatmaps/*.png</code>, <code>recommendation.md</code>,
+<code>llr_dumps/*.npy</code>.</p>
+
+</body>
+</html>

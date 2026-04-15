@@ -9,6 +9,7 @@ Conception, caractérisation de canal, simulateur et bancs de test.
 - **[NBFM Channel Simulator](NBFM-Channel-Simulator)** — simulateur GNU Radio du canal, calibré sur les mesures
 - **[Modem Design](Modem-Design)** — choix single-carrier, placement des pilotes, dual pilotes 400/1800 Hz
 - **[BER Benchmarks](BER-Benchmarks)** — BER 8PSK / 16QAM / 32QAM vs symbol rate
+- **[16-APSK + FTN Bench](APSK16-FTN-Bench)** — 16-APSK DVB-S2 + RRC agressif + FTN, FSE+DD-PLL, GMI, sweep complet
 - **[Scripts Reference](Scripts-Reference)** — comment lancer chaque script
 
 ## Objectifs du projet
