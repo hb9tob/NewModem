@@ -1,0 +1,124 @@
+{
+  "recording": "C:\\git\\NewModem\\results\\apsk16_ftn\\ota\\result2_run2_low.wav",
+  "results": [
+    {
+      "profile": "MEGA",
+      "rs": 1500.0,
+      "beta": 0.2,
+      "tau": 0.9375,
+      "mod": "16-APSK",
+      "ber": 0.22325,
+      "ser": 0.636,
+      "gmi": 1.134682279742281,
+      "gmi_max": 4,
+      "evm": 0.27922095329663904,
+      "snr_db": 6.305386039595612,
+      "n_processed": 2382,
+      "clip_diagnostic": {
+        "clipping_suspected": true,
+        "reasons": [
+          "ring ratio mesure 2.30 vs 2.85 ideal (ecart 19.3%) -> compression/clipping TX probable"
+        ],
+        "gamma_ideal": 2.8500000000000005,
+        "gamma_measured": 2.299660001620839,
+        "gamma_error_pct": 19.310175381724967,
+        "envelope_p50": 0.8482770523126943,
+        "envelope_p99": 1.6394111572235524,
+        "envelope_p99_over_p50": 1.9326364573389732,
+        "evm_inner": 0.26552784201588187,
+        "evm_outer": 0.2895199928773748,
+        "evm_outer_over_inner": 1.0903564412656128
+      }
+    },
+    {
+      "profile": "HIGH",
+      "rs": 1500.0,
+      "beta": 0.2,
+      "tau": 1.0,
+      "mod": "16-APSK",
+      "ber": 0.0,
+      "ser": 0.0,
+      "gmi": 3.995614866389344,
+      "gmi_max": 4,
+      "evm": 0.092514188138265,
+      "snr_db": 13.957044916231773,
+      "n_processed": 2382,
+      "clip_diagnostic": {
+        "clipping_suspected": false,
+        "reasons": [],
+        "gamma_ideal": 2.8500000000000005,
+        "gamma_measured": 2.828151492508353,
+        "gamma_error_pct": 0.7666142979525502,
+        "envelope_p50": 1.076688551422666,
+        "envelope_p99": 1.2522968678948518,
+        "envelope_p99_over_p50": 1.1631003842663215,
+        "evm_inner": 0.0906283994818077,
+        "evm_outer": 0.09245186347151738,
+        "evm_outer_over_inner": 1.0201202272150431
+      }
+    },
+    {
+      "profile": "NORMAL",
+      "rs": 1500.0,
+      "beta": 0.2,
+      "tau": 1.0,
+      "mod": "8PSK",
+      "ber": 0.0,
+      "ser": 0.0,
+      "gmi": 2.9998998228752063,
+      "gmi_max": 3,
+      "evm": 0.10290292807147798,
+      "snr_db": 13.786478724543096,
+      "n_processed": 2382,
+      "clip_diagnostic": {
+        "clipping_suspected": false,
+        "reasons": [],
+        "envelope_p50": 0.9844947593574727,
+        "envelope_p99": 1.1453240544040961,
+        "envelope_p99_over_p50": 1.1633622662974745
+      }
+    },
+    {
+      "profile": "ROBUST",
+      "rs": 1000.0,
+      "beta": 0.25,
+      "tau": 1.0,
+      "mod": "QPSK",
+      "ber": 0.0,
+      "ser": 0.0,
+      "gmi": 2.0,
+      "gmi_max": 2,
+      "evm": 0.03285303284069928,
+      "snr_db": 24.694122369052906,
+      "n_processed": 2382,
+      "clip_diagnostic": {
+        "clipping_suspected": false,
+        "reasons": [],
+        "envelope_p50": 1.000292218994191,
+        "envelope_p99": 1.050005431889453,
+        "envelope_p99_over_p50": 1.0496986899940592
+      }
+    },
+    {
+      "profile": "ULTRA",
+      "rs": 500.0,
+      "beta": 0.25,
+      "tau": 1.0,
+      "mod": "QPSK",
+      "ber": 0.0,
+      "ser": 0.0,
+      "gmi": 2.0,
+      "gmi_max": 2,
+      "evm": 0.02375639234722632,
+      "snr_db": 33.165419493810944,
+      "n_processed": 2382,
+      "clip_diagnostic": {
+        "clipping_suspected": false,
+        "reasons": [],
+        "envelope_p50": 1.0006497693074086,
+        "envelope_p99": 1.0358924755209686,
+        "envelope_p99_over_p50": 1.0352198214545665
+      }
+    }
+  ]
+}

@@ -470,14 +470,13 @@ def rx_matched_and_timing(rx_passband: np.ndarray, tx_info: dict,
     # 2) Matched filter (meme RRC qu'au TX, par definition du filtre adapte)
     mf = np.convolve(bb, taps, mode="same")
 
-    # 3) Sync grossiere : reference preambule telle qu'elle apparait APRES
-    #    matched filter (RRC applique deux fois -> pulse RC). Cela evite
-    #    le biais d'offset entre la forme RRC (TX) et la forme RC (post-MF).
+    # 3) Sync grossiere : reference preambule post-MF (= pulse RC), donne
+    #    meilleur SNR de correlation que single-RRC.
     pre_total_len = (len(preamble_syms) - 1) * pitch + len(taps)
     up_pre = np.zeros(pre_total_len, dtype=np.complex128)
     up_pre[np.arange(len(preamble_syms)) * pitch] = preamble_syms
-    tx_pre_bb = np.convolve(up_pre, taps, mode="same")      # TX RRC (1x)
-    tx_pre_mf = np.convolve(tx_pre_bb, taps, mode="same")   # + MF RRC = RC
+    tx_pre_bb = np.convolve(up_pre, taps, mode="same")
+    tx_pre_mf = np.convolve(tx_pre_bb, taps, mode="same")
 
     corr = np.correlate(mf, tx_pre_mf, mode="valid")
     if len(corr) == 0:
@@ -595,7 +594,7 @@ def run_fse(fse_input: np.ndarray, tx_info: dict, rx_info: dict,
             n_ff: int = None, n_dfe: int = 5,
             mu_ff_train: float = 0.01, mu_dfe_train: float = 0.01,
             mu_ff_dd: float = 0.0, mu_dfe_dd: float = 0.0,
-            ffe_only: bool = False,
+            ffe_only: bool = True,
             pll_alpha: float = 0.01, pll_beta: float = 0.001,
             pll_enabled: bool = True):
     """FSE T/d_fse (FFE complexe) + DFE T-spaced, LMS, APSK + DD-PLL 2e ordre.

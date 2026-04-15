@@ -29,7 +29,131 @@ from modem_apsk16_ftn_bench import (
     MOD_QPSK, MOD_8PSK, MOD_16APSK,
     build_tx, decode_rx_audio, AUDIO_RATE,
     plot_constellation, rx_matched_and_timing,
+    slice_nearest,
 )
+
+
+def diagnose_modulator_clipping(outputs, mod, data_mask):
+    """Detecte les signes de clipping/saturation cote TX modulateur FM,
+    en analysant la geometrie du signal RECU (pas les dBFS carte son).
+
+    Signaux diagnostiques :
+
+    1) Ring ratio (16-APSK seul) : rapport mesure r2/r1 vs r2/r1 ideal
+       (= gamma=2.85). Si le modulateur compresse les pics, l'anneau
+       exterieur est "aplati" -> ratio mesure < gamma ideal.
+       Flag si ecart > 15 %.
+
+    2) Envelope peak compression : 99e percentile de |y| mesure vs
+       attendu (Es=1 moyenne). Pour constellation sans clip, on a
+       typiquement |y|_max ~ 1.2..1.5. Si le 99e percentile est
+       "ecretee" (grande concentration au meme niveau), c'est suspect.
+
+    3) EVM outer-vs-inner (16-APSK) : EVM sur points outer doit etre
+       du meme ordre que EVM inner. Si outer EVM >> inner, clipping.
+
+    Retourne un dict avec les chiffres + un flag `clipping_suspected`.
+    """
+    y = outputs[~data_mask] if data_mask is not None else outputs
+    idx = slice_nearest(y, mod)
+    const = mod.constellation
+    radii = np.abs(const)
+    has_two_rings = len(np.unique(np.round(radii, 3))) == 2
+
+    diag = {
+        "clipping_suspected": False,
+        "reasons": [],
+    }
+
+    # --- 1) Ring ratio (seulement pour 16-APSK) ---
+    if has_two_rings and mod.name == "16-APSK":
+        inner_radius_ideal = radii.min()
+        outer_radius_ideal = radii.max()
+        gamma_ideal = outer_radius_ideal / inner_radius_ideal
+
+        inner_points = np.where(radii < np.median(radii))[0]
+        outer_points = np.where(radii > np.median(radii))[0]
+
+        inner_mags = []
+        outer_mags = []
+        for k in inner_points:
+            sel = y[idx == k]
+            if len(sel) >= 5:
+                inner_mags.append(np.mean(np.abs(sel)))
+        for k in outer_points:
+            sel = y[idx == k]
+            if len(sel) >= 5:
+                outer_mags.append(np.mean(np.abs(sel)))
+
+        if inner_mags and outer_mags:
+            r1_meas = float(np.mean(inner_mags))
+            r2_meas = float(np.mean(outer_mags))
+            gamma_meas = r2_meas / r1_meas if r1_meas > 0 else 0
+            gamma_error_pct = 100 * abs(gamma_meas - gamma_ideal) / gamma_ideal
+            diag["gamma_ideal"] = gamma_ideal
+            diag["gamma_measured"] = gamma_meas
+            diag["gamma_error_pct"] = gamma_error_pct
+            if gamma_error_pct > 15:
+                diag["clipping_suspected"] = True
+                diag["reasons"].append(
+                    f"ring ratio mesure {gamma_meas:.2f} vs {gamma_ideal:.2f} "
+                    f"ideal (ecart {gamma_error_pct:.1f}%) "
+                    f"-> compression/clipping TX probable"
+                )
+
+    # --- 2) Envelope peak dispersion ---
+    # Pour constellations a module CONSTANT (QPSK, 8PSK), tous les symboles
+    # ont meme |y|. Une variation p99/p50 > 1.2 indique une distorsion non
+    # prevue (mod clipping non-lineaire, bruit anormal). Pour 16-APSK le
+    # ratio theorique depend des proportions inner/outer (75% outer) et
+    # tombe ~1.0 ; la compression se voit mieux via ring ratio (cas 1) et
+    # EVM out/in (cas 3). On publie le chiffre mais on ne l'utilise comme
+    # critere de flag que pour constant-modulus.
+    envelope = np.abs(y)
+    p99 = float(np.percentile(envelope, 99))
+    p50 = float(np.percentile(envelope, 50))
+    p99_over_p50 = p99 / p50 if p50 > 0 else 0
+    diag["envelope_p50"] = p50
+    diag["envelope_p99"] = p99
+    diag["envelope_p99_over_p50"] = p99_over_p50
+    if mod.name in ("QPSK", "8PSK") and p99_over_p50 > 1.25:
+        diag["clipping_suspected"] = True
+        diag["reasons"].append(
+            f"mod constant-modulus ({mod.name}) mais p99/p50 envelope = "
+            f"{p99_over_p50:.2f} (>1.25) -> distorsion non-lineaire TX"
+        )
+
+    # --- 3) EVM outer vs inner (16-APSK) ---
+    if has_two_rings and mod.name == "16-APSK":
+        inner_evm_sq = []
+        outer_evm_sq = []
+        for k in inner_points:
+            sel = y[idx == k]
+            if len(sel) >= 5:
+                err = sel - const[k]
+                inner_evm_sq.append(np.mean(np.abs(err) ** 2))
+        for k in outer_points:
+            sel = y[idx == k]
+            if len(sel) >= 5:
+                err = sel - const[k]
+                outer_evm_sq.append(np.mean(np.abs(err) ** 2))
+        if inner_evm_sq and outer_evm_sq:
+            evm_inner = np.sqrt(np.mean(inner_evm_sq))
+            evm_outer = np.sqrt(np.mean(outer_evm_sq))
+            diag["evm_inner"] = float(evm_inner)
+            diag["evm_outer"] = float(evm_outer)
+            ratio = evm_outer / evm_inner if evm_inner > 0 else 0
+            diag["evm_outer_over_inner"] = float(ratio)
+            # En canal AWGN uniforme, ratio = 1. Si outer >> inner (ratio>2),
+            # c'est signe de clipping des pics outer.
+            if ratio > 2.0:
+                diag["clipping_suspected"] = True
+                diag["reasons"].append(
+                    f"EVM outer/inner = {ratio:.2f} (>2) "
+                    f"-> distorsion specifique aux pics outer = clip TX"
+                )
+
+    return diag
 
 
 MOD_FACTORIES = {
@@ -122,6 +246,47 @@ def main():
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
 
+    # Detection globale de l'offset TX : le WAV TX prevoit 3 s de silence
+    # initial + 0.5 s marker + data. L'OTA commence souvent + tard (PTT,
+    # demarrage lecteur). On cherche la 1ere activite significative et on
+    # cale tout le metadata dessus.
+    win_s = 0.1
+    win = int(win_s * AUDIO_RATE)
+    n_rx = len(rx_audio)
+    rms = np.array([
+        np.sqrt(np.mean(rx_audio[i:i+win] ** 2))
+        for i in range(0, n_rx - win, win // 2)
+    ])
+    floor = np.percentile(rms, 10)
+    threshold = max(10.0 * floor, 0.02)
+    # Cherche la 1ere region SOUTENUE (>= 5 fenetres consecutives = 250 ms)
+    # au-dessus du seuil, pour eviter les clicks / glitches isoles.
+    n_consec_required = 5
+    above = rms > threshold
+    first_sustained = -1
+    run_len = 0
+    for i, a in enumerate(above):
+        if a:
+            run_len += 1
+            if run_len >= n_consec_required:
+                first_sustained = i - n_consec_required + 1
+                break
+        else:
+            run_len = 0
+    if first_sustained < 0:
+        print(f"!! Aucune activite soutenue detectee (seuil {threshold:.4f}), "
+              f"analyse sans alignement global.")
+        rx_tx_offset_s = 0.0
+    else:
+        rx_tx_start_s = first_sustained * (win_s / 2.0)
+        meta_mega_start = meta["profiles"][0].get("marker_start_s")
+        if meta_mega_start is None:
+            meta_mega_start = meta["profiles"][0]["profile_start_s"]
+        rx_tx_offset_s = rx_tx_start_s - meta_mega_start
+        print(f"Alignement : 1ere activite RX a {rx_tx_start_s:.2f} s ; "
+              f"metadata prevoit {meta_mega_start:.2f} s ; "
+              f"offset applique = {rx_tx_offset_s:+.2f} s")
+
     # Pour chaque profil : regenerate tx_info, decoder, reporter
     results = []
     csv_path = os.path.join(out_dir, "ota_cascade_results.csv")
@@ -140,14 +305,13 @@ def main():
         tx = build_tx(prof_meta["rs"], prof_meta["beta"], prof_meta["tau"],
                       mod, n_data_symbols=prof_meta["n_data_symbols"], rng=rng)
 
-        # Fenetre de recherche autour du debut attendu du profil
-        # (le decalage TX/RX peut etre jusqu'a qq centaines de ms)
-        coarse_start_s = prof_meta["profile_start_s"]
-        search_window_s = prof_meta["profile_end_s"] - coarse_start_s + 2.0
+        # Fenetre de recherche autour du debut attendu, offset global applique
+        coarse_start_s = prof_meta["profile_start_s"] + rx_tx_offset_s
+        coarse_end_s = prof_meta["profile_end_s"] + rx_tx_offset_s
 
         i0 = max(0, int((coarse_start_s - 1.0) * AUDIO_RATE))
         i1 = min(len(rx_audio),
-                 int((prof_meta["profile_end_s"] + 1.0) * AUDIO_RATE))
+                 int((coarse_end_s + 1.0) * AUDIO_RATE))
         if i1 <= i0 + 100:
             print(f"  !! segment trop court, skip")
             continue
@@ -175,6 +339,29 @@ def main():
         print(f"  SNR sortie   : {snr_db:.2f} dB")
         print(f"  Symboles decodes : {n_proc}")
 
+        # --- Diagnostic clipping modulateur FM ---
+        try:
+            mask = result["fse_out"]["training_mask"]
+            outputs = result["fse_out"]["outputs"]
+            diag = diagnose_modulator_clipping(outputs, mod, mask)
+            if diag.get("gamma_ideal") is not None:
+                print(f"  Ring ratio   : mesure {diag['gamma_measured']:.2f} "
+                      f"vs ideal {diag['gamma_ideal']:.2f} "
+                      f"(ecart {diag['gamma_error_pct']:.1f}%)")
+            if diag.get("evm_outer_over_inner") is not None:
+                print(f"  EVM out/in   : "
+                      f"{diag['evm_outer_over_inner']:.2f} (1.0 = pas de clip)")
+            print(f"  Env p99/p50  : {diag['envelope_p99_over_p50']:.2f}")
+            if diag["clipping_suspected"]:
+                print(f"  !! CLIPPING TX SUSPECTE :")
+                for r in diag["reasons"]:
+                    print(f"     - {r}")
+            else:
+                print(f"  clip diag   : OK (pas de clip detecte)")
+        except Exception as e:
+            diag = {"error": str(e)}
+            print(f"  diag clip failed: {e}")
+
         # Plot constellation
         const_path = os.path.join(out_dir, f"ota_{name}_constellation.png")
         try:
@@ -201,6 +388,7 @@ def main():
             "evm": evm,
             "snr_db": snr_db,
             "n_processed": n_proc,
+            "clip_diagnostic": diag,
         })
 
         with open(csv_path, "a", encoding="utf-8") as f:
