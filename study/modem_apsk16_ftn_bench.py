@@ -61,6 +61,113 @@ APSK16_GAMMA_BY_RATE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Cascade de robustesse : QPSK et 8PSK (Gray) pour les profils NORMAL/ROBUST
+# ---------------------------------------------------------------------------
+
+def qpsk_constellation() -> np.ndarray:
+    """QPSK Gray, 4 points unit-circle. Es = 1.
+
+    Mapping MSB-first : b1 b0 -> index. Gray cyclique confirme :
+      00 -> pi/4, 01 -> 3pi/4, 11 -> -3pi/4, 10 -> -pi/4.
+    Voisins angulaires different toujours d'1 bit.
+    """
+    pts = np.empty(4, dtype=np.complex128)
+    pts[0b00] = np.exp(1j * math.pi / 4.0)
+    pts[0b01] = np.exp(1j * 3.0 * math.pi / 4.0)
+    pts[0b11] = np.exp(1j * -3.0 * math.pi / 4.0)
+    pts[0b10] = np.exp(1j * -math.pi / 4.0)
+    return pts
+
+
+def psk8_constellation() -> np.ndarray:
+    """8PSK Gray, 8 points unit-circle. Es = 1.
+
+    Mapping standard : position angulaire k (angle = k*pi/4, k=0..7) a
+    pour label bit_pattern = gray_code(k) = k XOR (k>>1). On inverse :
+    pour un bit_pattern b, la position sur le cercle est unique.
+    """
+    pts = np.empty(8, dtype=np.complex128)
+    for k in range(8):
+        bit_pattern = k ^ (k >> 1)  # Gray code
+        angle = k * math.pi / 4.0
+        pts[bit_pattern] = math.cos(angle) + 1j * math.sin(angle)
+    return pts
+
+
+def make_bit_map(n_points: int, bits_per_sym: int) -> np.ndarray:
+    """bit_map[i, k] = k-eme bit (MSB first) de l'index i."""
+    return np.array(
+        [[(i >> (bits_per_sym - 1 - k)) & 1 for k in range(bits_per_sym)]
+         for i in range(n_points)],
+        dtype=np.uint8,
+    )
+
+
+class ModFormat:
+    """Format de modulation : constellation + mapping bits <-> symboles."""
+    __slots__ = ("name", "constellation", "bits_per_sym", "bit_map")
+
+    def __init__(self, name: str, constellation: np.ndarray, bits_per_sym: int):
+        if len(constellation) != 2 ** bits_per_sym:
+            raise ValueError(f"constellation size {len(constellation)} != 2^{bits_per_sym}")
+        self.name = name
+        self.constellation = constellation
+        self.bits_per_sym = bits_per_sym
+        self.bit_map = make_bit_map(len(constellation), bits_per_sym)
+
+
+# Instances standard
+def MOD_QPSK():
+    return ModFormat("QPSK", qpsk_constellation(), 2)
+
+def MOD_8PSK():
+    return ModFormat("8PSK", psk8_constellation(), 3)
+
+def MOD_16APSK(gamma: float = 2.85):
+    return ModFormat("16-APSK", apsk16_constellation(gamma), 4)
+
+
+# Fonctions generiques (remplacent a terme les apsk16_*)
+
+def bits_to_symbols(bits: np.ndarray, mod: ModFormat) -> np.ndarray:
+    bits = np.asarray(bits, dtype=np.uint8).reshape(-1, mod.bits_per_sym)
+    idx = np.zeros(len(bits), dtype=np.int64)
+    for k in range(mod.bits_per_sym):
+        idx = (idx << 1) | bits[:, k]
+    return mod.constellation[idx]
+
+
+def slice_nearest(y: np.ndarray, mod: ModFormat) -> np.ndarray:
+    y = np.asarray(y, dtype=np.complex128).reshape(-1)
+    d2 = np.abs(y[:, None] - mod.constellation[None, :]) ** 2
+    return np.argmin(d2, axis=1).astype(np.int64)
+
+
+def symbols_to_bits(indices: np.ndarray, mod: ModFormat) -> np.ndarray:
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    bits = np.empty((idx.size, mod.bits_per_sym), dtype=np.uint8)
+    for k in range(mod.bits_per_sym):
+        bits[:, k] = (idx >> (mod.bits_per_sym - 1 - k)) & 1
+    return bits.reshape(-1)
+
+
+def llr_maxlog(y: np.ndarray, sigma2_total: float, mod: ModFormat) -> np.ndarray:
+    if sigma2_total <= 0:
+        raise ValueError("sigma2_total doit etre > 0")
+    y = np.asarray(y, dtype=np.complex128).reshape(-1)
+    d2 = np.abs(y[:, None] - mod.constellation[None, :]) ** 2
+    bits_per_sym = mod.bits_per_sym
+    llr = np.empty((y.size, bits_per_sym), dtype=np.float64)
+    for k in range(bits_per_sym):
+        mask0 = mod.bit_map[:, k] == 0
+        mask1 = mod.bit_map[:, k] == 1
+        d2_0 = d2[:, mask0].min(axis=1)
+        d2_1 = d2[:, mask1].min(axis=1)
+        llr[:, k] = (d2_1 - d2_0) / sigma2_total
+    return llr
+
+
 def apsk16_constellation(gamma: float = 2.85) -> np.ndarray:
     """Retourne le tableau complexe des 16 points APSK, normalise Es = 1.
 
@@ -225,8 +332,8 @@ def check_integer_constraints(symbol_rate, tau: float):
     return sps, int(round(pitch))
 
 
-def build_tx(symbol_rate: int, beta: float, tau: float,
-             constellation: np.ndarray, n_data_symbols: int, rng: np.random.Generator,
+def build_tx(symbol_rate, beta: float, tau: float,
+             mod_or_const, n_data_symbols: int, rng: np.random.Generator,
              rrc_span_sym: int = 12, peak_normalize: float = 0.9):
     """Chaine TX complete :
 
@@ -238,10 +345,16 @@ def build_tx(symbol_rate: int, beta: float, tau: float,
     """
     sps, pitch = check_integer_constraints(symbol_rate, tau)
 
-    # 1) Bits -> symboles APSK
-    n_bits = n_data_symbols * 4
+    # Backward compat : accepte un array brut (assume 16-APSK, 4 bits/sym)
+    if isinstance(mod_or_const, ModFormat):
+        mod = mod_or_const
+    else:
+        mod = ModFormat("16-APSK", np.asarray(mod_or_const), 4)
+
+    # 1) Bits -> symboles (generique)
+    n_bits = n_data_symbols * mod.bits_per_sym
     data_bits = rng.integers(0, 2, size=n_bits, dtype=np.uint8)
-    data_syms = apsk16_bits_to_symbols(data_bits, constellation)
+    data_syms = bits_to_symbols(data_bits, mod)
 
     # 2) Preambule + insertion pilotes TDM
     preamble_syms = make_preamble()
@@ -287,6 +400,7 @@ def build_tx(symbol_rate: int, beta: float, tau: float,
         "data_bits": data_bits,
         "pilot_positions": abs_pilot_positions,
         "n_data_symbols": n_data_symbols,
+        "mod": mod,
     }
 
 
@@ -477,7 +591,7 @@ def training_mask_and_symbols(tx_info: dict):
 
 
 def run_fse(fse_input: np.ndarray, tx_info: dict, rx_info: dict,
-            constellation: np.ndarray,
+            mod_or_const,
             n_ff: int = None, n_dfe: int = 5,
             mu_ff_train: float = 0.01, mu_dfe_train: float = 0.01,
             mu_ff_dd: float = 0.0, mu_dfe_dd: float = 0.0,
@@ -508,6 +622,12 @@ def run_fse(fse_input: np.ndarray, tx_info: dict, rx_info: dict,
     pitch_fse = rx_info["pitch_fse"]
     sps_fse = rx_info["sps_fse"]
     fse_start = rx_info["fse_start"]
+
+    # Backward compat : accepte array brut (assume 16-APSK)
+    if isinstance(mod_or_const, ModFormat):
+        mod = mod_or_const
+    else:
+        mod = ModFormat("16-APSK", np.asarray(mod_or_const), 4)
 
     all_syms = tx_info["all_symbols"]
     n_sym = len(all_syms)
@@ -591,8 +711,8 @@ def run_fse(fse_input: np.ndarray, tx_info: dict, rx_info: dict,
             mu_ff = mu_ff_train
             mu_dfe = mu_dfe_train
         else:
-            idx = apsk16_slice(np.array([y_rot]), constellation)[0]
-            d = constellation[idx]
+            idx = slice_nearest(np.array([y_rot]), mod)[0]
+            d = mod.constellation[idx]
             mu_ff = mu_ff_dd
             mu_dfe = mu_dfe_dd
         decisions[k] = d
@@ -705,7 +825,9 @@ def compute_gmi_bits_per_symbol(llr: np.ndarray, bits_tx: np.ndarray) -> float:
 
     Retourne : GMI en bits/symbole. Max = 4 pour APSK-16.
     """
-    bits = np.asarray(bits_tx, dtype=np.int64).reshape(-1, 4)
+    # Deduit bits_per_sym du shape de llr
+    bps = llr.shape[1] if llr.ndim == 2 else 4
+    bits = np.asarray(bits_tx, dtype=np.int64).reshape(-1, bps)
     # Signe : +LLR si bit=0, -LLR si bit=1
     signed = (1 - 2 * bits) * llr
     # Eviter overflow exp : on clippe
@@ -730,40 +852,99 @@ def _lazy_channel_sim():
     return simulate
 
 
-def run_full_chain(tx_info: dict, constellation: np.ndarray,
+def apply_audio_phase_rotation(rx_audio: np.ndarray, phase_rad: float) -> np.ndarray:
+    """Rotation de phase globale appliquee au signal audio RX (apres demod FM).
+
+    Usage : tester la robustesse de la DD-PLL a une rotation de phase statique
+    typique d'une reception indirecte (reflexion simple, chemin different).
+    Le signal audio est traite comme analytique (Hilbert) -> phase shift ->
+    retour reel. Equivalent a un dephasage rigide du passband data.
+    """
+    pb = np.asarray(rx_audio, dtype=np.float64)
+    from scipy.signal import hilbert
+    analytic = hilbert(pb)
+    rotated = analytic * np.exp(1j * phase_rad)
+    return np.real(rotated).astype(np.float32)
+
+
+def apply_audio_multipath(rx_audio: np.ndarray, paths: list) -> np.ndarray:
+    """Multipath applique au signal AUDIO post-FM (modele lineaire limite).
+
+    LIMITE HONNETE : en reception NBFM reelle, le multipath agit AU NIVEAU
+    RF (avant le demod FM), et le demod FM est non-lineaire (effet de
+    capture, click-noise). Modeliser ca proprement demanderait de reinjecter
+    des signaux FM-modules additionnels au niveau IF dans le simulateur,
+    ce que nbfm_channel_sim.simulate ne permet pas facilement.
+
+    Ce modele audio-domain simule UNIQUEMENT la composante ISI lineaire
+    (echo du signal audio demodule, avec phase et delai). Il est valide
+    pour tester la capacite de la FSE a absorber une ISI supplementaire,
+    MAIS ne capture pas l'effet de capture FM ni les clicks.
+
+    Args:
+      rx_audio : audio sortie du sim NBFM
+      paths : [(delay_s, amp_dB, phase_rad)] -- 1er chemin = direct (delay=0)
+
+    Retourne : audio avec multipath lineaire additionne.
+    """
+    pb = np.asarray(rx_audio, dtype=np.float64)
+    from scipy.signal import hilbert
+    analytic = hilbert(pb)
+    n = len(analytic)
+    out = np.zeros(n, dtype=np.complex128)
+    for delay_s, amp_dB, phase_rad in paths:
+        n_delay = int(round(delay_s * AUDIO_RATE))
+        if n_delay < 0 or n_delay >= n:
+            continue
+        gain = 10.0 ** (amp_dB / 20.0)
+        shifted = np.zeros_like(analytic)
+        if n_delay == 0:
+            shifted = analytic
+        else:
+            shifted[n_delay:] = analytic[:n - n_delay]
+        out += gain * shifted * np.exp(1j * phase_rad)
+    return np.real(out).astype(np.float32)
+
+
+def run_full_chain(tx_info: dict, mod_or_const,
                    if_noise_voltage: float = 0.0,
                    rng_seed: int = 0,
                    channel_kwargs: dict = None,
                    fse_kwargs: dict = None,
                    compute_llr: bool = True,
                    auto_ffe_only_for_ftn: bool = True) -> dict:
-    """
-    Note physique importante : `auto_ffe_only_for_ftn=True` (defaut) active
-    `ffe_only=True` pour tau<1. La DFE souffre de propagation d'erreur sur
-    l'ISI pre-curseur induite par FTN (Anderson/Rusek). Pour tau=1
-    (orthogonal Nyquist), FFE+DFE est le choix standard.
-    """
-    """TX -> canal NBFM -> matched filter + FSE + PLL -> LLR.
-
-    Pipeline integre pour le sweep :
-      1) audio TX (tx_info['passband']) -> nbfm_channel_sim.simulate avec
-         if_noise_voltage et parametres canal (pre-emphase/clip/drift).
-      2) rx_matched_and_timing : synchro grossiere + decim entiere.
-      3) run_fse : FFE+DFE LMS + DD-PLL.
-      4) sigma2_from_residuals + apsk16_llr_maxlog + compute_gmi.
-    """
+    """TX -> canal NBFM simule -> decode. Auto_ffe_only_for_ftn=True pour
+    tau<1 (DFE nuit au FTN, error propagation)."""
     simulate = _lazy_channel_sim()
     ck = dict(channel_kwargs or {})
     ck.setdefault("verbose", False)
     rx_audio = simulate(tx_info["passband"],
                         if_noise_voltage=if_noise_voltage,
                         rng_seed=rng_seed, **ck)
+    return decode_rx_audio(rx_audio, tx_info, mod_or_const,
+                           fse_kwargs=fse_kwargs, compute_llr=compute_llr,
+                           auto_ffe_only_for_ftn=auto_ffe_only_for_ftn)
 
-    rx_info = rx_matched_and_timing(rx_audio.astype(np.float64), tx_info)
+
+def decode_rx_audio(rx_audio, tx_info, mod_or_const,
+                    fse_kwargs=None, compute_llr=True,
+                    auto_ffe_only_for_ftn=True):
+    """Decode un audio RX (issu du sim ou d'un WAV enregistre OTA).
+
+    Meme pipeline : rx_matched_and_timing + run_fse + metriques + LLR.
+    Usage OTA : charger WAV, extraire segment contenant un profil, appeler
+    cette fonction avec le tx_info regenere pour ce profil.
+    """
+    rx_info = rx_matched_and_timing(np.asarray(rx_audio, dtype=np.float64), tx_info)
     fk = dict(fse_kwargs or {})
     if auto_ffe_only_for_ftn and tx_info.get("tau_effective", 1.0) < 1.0:
         fk.setdefault("ffe_only", True)
-    out = run_fse(rx_info["fse_input"], tx_info, rx_info, constellation, **fk)
+    # Normalise en ModFormat
+    if isinstance(mod_or_const, ModFormat):
+        mod = mod_or_const
+    else:
+        mod = ModFormat("16-APSK", np.asarray(mod_or_const), 4)
+    out = run_fse(rx_info["fse_input"], tx_info, rx_info, mod, **fk)
 
     result = {
         "rx_audio": rx_audio,
@@ -789,25 +970,25 @@ def run_full_chain(tx_info: dict, constellation: np.ndarray,
     all_syms = tx_info["all_symbols"]
     data_pos = np.where(~mask)[0]
     if len(data_pos):
-        idx_tx = apsk16_slice(all_syms[data_pos], constellation)
-        idx_rx = apsk16_slice(decisions[data_pos], constellation)
+        idx_tx = slice_nearest(all_syms[data_pos], mod)
+        idx_rx = slice_nearest(decisions[data_pos], mod)
         n_ser = int(np.sum(idx_tx != idx_rx))
         result["ser"] = n_ser / len(data_pos)
-        bits_tx = apsk16_symbols_to_bits(idx_tx)
-        bits_rx = apsk16_symbols_to_bits(idx_rx)
+        bits_tx = symbols_to_bits(idx_tx, mod)
+        bits_rx = symbols_to_bits(idx_rx, mod)
         result["ber_uncoded"] = float(np.mean(bits_tx != bits_rx))
         # EVM rms sur data
         result["evm_rms"] = float(
             np.sqrt(np.mean(np.abs(outputs[data_pos] - decisions[data_pos]) ** 2))
         )
         # Eye opening sur cluster data
-        result["eye_opening"] = eye_opening_metric(outputs[data_pos], constellation)
+        result["eye_opening"] = eye_opening_metric(outputs[data_pos], mod.constellation)
 
         # LLR + GMI
         if compute_llr and sigma2 > 0:
-            llr = apsk16_llr_maxlog(outputs[data_pos], sigma2, constellation)
-            result["llr"] = llr
-            result["gmi"] = compute_gmi_bits_per_symbol(llr, bits_tx)
+            llr_values = llr_maxlog(outputs[data_pos], sigma2, mod)
+            result["llr"] = llr_values
+            result["gmi"] = compute_gmi_bits_per_symbol(llr_values, bits_tx)
     else:
         result["ser"] = None
         result["ber_uncoded"] = None
@@ -973,32 +1154,32 @@ def eye_opening_metric(symbols: np.ndarray, constellation: np.ndarray) -> float:
     constelle, entre le centroide observe et le point voisin le plus proche.
     """
     y = np.asarray(symbols, dtype=np.complex128)
-    idx = apsk16_slice(y, constellation)
-    n_obs = np.array([np.sum(idx == k) for k in range(16)])
+    constellation = np.asarray(constellation, dtype=np.complex128)
+    n_points = len(constellation)
+    # Slice nearest-neighbor generique
+    d2_all = np.abs(y[:, None] - constellation[None, :]) ** 2
+    idx = np.argmin(d2_all, axis=1)
+    n_obs = np.array([np.sum(idx == k) for k in range(n_points)])
     if n_obs.sum() == 0:
         return 0.0
-    # Centroides observes
     centroids = np.array([
         np.mean(y[idx == k]) if n_obs[k] > 0 else constellation[k]
-        for k in range(16)
+        for k in range(n_points)
     ])
-    # Dispersion de chaque cluster (ecart type)
     stds = np.array([
         np.sqrt(np.mean(np.abs(y[idx == k] - centroids[k]) ** 2))
         if n_obs[k] > 1 else 0.0
-        for k in range(16)
+        for k in range(n_points)
     ])
-    # Distance min entre centroides
     dmin_obs = math.inf
-    for i in range(16):
-        for j in range(i + 1, 16):
+    for i in range(n_points):
+        for j in range(i + 1, n_points):
             d = abs(centroids[i] - centroids[j]) - (stds[i] + stds[j])
             if d < dmin_obs:
                 dmin_obs = d
-    # Distance min ideale
     dmin_ideal = math.inf
-    for i in range(16):
-        for j in range(i + 1, 16):
+    for i in range(n_points):
+        for j in range(i + 1, n_points):
             d = abs(constellation[i] - constellation[j])
             if d < dmin_ideal:
                 dmin_ideal = d
@@ -1320,6 +1501,51 @@ def _test_ftn_09_fse_recovers():
         assert ber is not None and ber < 0.20, f"FTN BER trop eleve : {ber:.4f}"
 
 
+def _test_qpsk_psk8_constellations():
+    """Sanity geometrique : QPSK Gray, 8PSK Gray, Es=1."""
+    for mod in (MOD_QPSK(), MOD_8PSK()):
+        c = mod.constellation
+        # Module unitaire
+        assert np.allclose(np.abs(c), 1.0), f"{mod.name} : pas unit-circle"
+        # Es = 1
+        assert abs(np.mean(np.abs(c) ** 2) - 1.0) < 1e-9
+        # Gray cyclique : voisins angulaires different d'1 bit
+        order = np.argsort(np.angle(c) % (2 * math.pi))
+        for a, b in zip(order, np.roll(order, -1)):
+            d = bin(int(a) ^ int(b)).count("1")
+            assert d == 1, f"{mod.name} : labels {a} et {b} diferent de {d} bits"
+
+
+def _test_qpsk_psk8_loopback_ideal():
+    """QPSK et 8PSK : loopback ideal -> SER=0."""
+    for mod in (MOD_QPSK(), MOD_8PSK()):
+        rng = np.random.default_rng(hash(mod.name) % 2**31)
+        tx = build_tx(1000, 0.25, 1.0, mod, n_data_symbols=800, rng=rng)
+        rx_info = rx_matched_and_timing(tx["passband"].astype(np.float64), tx)
+        out = run_fse(rx_info["fse_input"], tx, rx_info, mod)
+        mask = out["training_mask"]
+        data_pos = np.where(~mask)[0]
+        n = out["n_processed"]
+        data_pos = data_pos[data_pos < n]
+        idx_tx = slice_nearest(tx["all_symbols"][data_pos], mod)
+        idx_rx = slice_nearest(out["decisions"][data_pos], mod)
+        ser = int(np.sum(idx_tx != idx_rx)) / max(1, len(data_pos))
+        assert ser == 0.0, f"{mod.name} loopback ideal SER={ser}"
+
+
+def _test_qpsk_nbfm_sanity():
+    """QPSK sur canal NBFM Rs=1000, doit passer sans bruit IF."""
+    mod = MOD_QPSK()
+    rng = np.random.default_rng(77)
+    tx = build_tx(1000, 0.25, 1.0, mod, n_data_symbols=500, rng=rng)
+    r = run_full_chain(tx, mod, if_noise_voltage=0.0, rng_seed=77,
+                       channel_kwargs={"start_delay_s": 0.0})
+    print(f"    QPSK Rs=1000 beta=0.25 tau=1 : "
+          f"SER={r['ser']:.4f} BER={r['ber_uncoded']:.4f} "
+          f"GMI={r['gmi']:.3f}/2 EVM={r['evm_rms']:.3f}")
+    assert r["ber_uncoded"] is not None and r["ber_uncoded"] < 0.05
+
+
 def _test_nbfm_channel_sanity():
     """Rs=1200, beta=0.25, tau=1, canal NBFM sans bruit IF (if_noise=0) :
     la chaine doit recuperer le signal avec BER=0 ou tres faible (le canal
@@ -1541,6 +1767,13 @@ def run_unit_tests():
     print("Tests unitaires visualisations :")
     _test_visualizations_generate_files()
     print("  [OK] eye/constellation/spectra generes + eye_opening > 0.5")
+    print("Tests unitaires modulations de repli (QPSK, 8PSK) :")
+    _test_qpsk_psk8_constellations()
+    print("  [OK] QPSK/8PSK geometrie (unit-circle, Es=1, Gray)")
+    _test_qpsk_psk8_loopback_ideal()
+    print("  [OK] QPSK/8PSK loopback ideal : SER=0")
+    _test_qpsk_nbfm_sanity()
+    print("  [OK] QPSK canal NBFM sans bruit IF : BER < 5%")
     print("Tests unitaires integration canal NBFM :")
     _test_nbfm_channel_sanity()
     print("  [OK] canal NBFM sans bruit IF : chaine operationnelle")

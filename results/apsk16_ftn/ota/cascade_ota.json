@@ -1,0 +1,79 @@
+{
+  "sample_rate": 48000,
+  "n_data_symbols": 2000,
+  "silence_s": 2.0,
+  "marker_s": 0.5,
+  "profiles": [
+    {
+      "name": "MEGA",
+      "rs": 1500.0,
+      "beta": 0.2,
+      "tau": 0.9375,
+      "mod_name": "16-APSK",
+      "seed": 2001,
+      "n_data_symbols": 2000,
+      "marker_freq_hz": 300.0,
+      "marker_start_s": 3.0,
+      "profile_start_s": 3.5,
+      "profile_end_s": 4.996145833333333,
+      "debit_uncoded_bps": 6400
+    },
+    {
+      "name": "HIGH",
+      "rs": 1500.0,
+      "beta": 0.2,
+      "tau": 1.0,
+      "mod_name": "16-APSK",
+      "seed": 2002,
+      "n_data_symbols": 2000,
+      "marker_freq_hz": 500.0,
+      "marker_start_s": 6.996145833333333,
+      "profile_start_s": 7.496145833333333,
+      "profile_end_s": 9.0915,
+      "debit_uncoded_bps": 6000
+    },
+    {
+      "name": "NORMAL",
+      "rs": 1500.0,
+      "beta": 0.2,
+      "tau": 1.0,
+      "mod_name": "8PSK",
+      "seed": 2003,
+      "n_data_symbols": 2000,
+      "marker_freq_hz": 800.0,
+      "marker_start_s": 11.0915,
+      "profile_start_s": 11.5915,
+      "profile_end_s": 13.186854166666667,
+      "debit_uncoded_bps": 4500
+    },
+    {
+      "name": "ROBUST",
+      "rs": 1000.0,
+      "beta": 0.25,
+      "tau": 1.0,
+      "mod_name": "QPSK",
+      "seed": 2004,
+      "n_data_symbols": 2000,
+      "marker_freq_hz": 1200.0,
+      "marker_start_s": 15.186854166666667,
+      "profile_start_s": 15.686854166666667,
+      "profile_end_s": 18.079875,
+      "debit_uncoded_bps": 2000
+    },
+    {
+      "name": "ULTRA",
+      "rs": 500.0,
+      "beta": 0.25,
+      "tau": 1.0,
+      "mod_name": "QPSK",
+      "seed": 2005,
+      "n_data_symbols": 2000,
+      "marker_freq_hz": 1800.0,
+      "marker_start_s": 20.079875,
+      "profile_start_s": 20.579875,
+      "profile_end_s": 25.365895833333333,
+      "debit_uncoded_bps": 1000
+    }
+  ],
+  "total_duration_s": 29.365895833333333
+}
