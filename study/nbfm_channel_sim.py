@@ -22,6 +22,7 @@ Usage :
 """
 
 import argparse
+import math
 import os
 import numpy as np
 import wave
@@ -114,6 +115,7 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              thermal_period_s=DRIFT_THERMAL_PERIOD_S,
              tx_hard_clip=TX_HARD_CLIP,
              audio_noise_rms=AUDIO_NOISE_RMS,
+             multipath_paths=None,
              start_delay_s=None, rng_seed=None, verbose=True):
     """Fait passer audio_in par TX -> bruit IF -> RX, retourne audio_out.
 
@@ -167,6 +169,24 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
                                       float(if_noise_voltage), 0)
     adder = blocks.add_cc()
 
+    # Multipath IF-level : modelise la reception indirecte (echos de trajets
+    # reflechis). Applique au signal complexe IF apres nbfm_tx.
+    # multipath_paths : liste de (delay_s, amplitude_dB, phase_rad).
+    # Premier element = trajet direct (typ. delay=0, amp=0dB, phase=0).
+    # Autres elements = echos.
+    mp_summer = None
+    mp_delays = []
+    mp_gains = []
+    if multipath_paths and len(multipath_paths) >= 2:
+        mp_summer = blocks.add_cc()
+        for delay_s, amp_dB, phase_rad in multipath_paths:
+            n_delay = int(round(delay_s * IF_RATE))
+            # Complex gain = amp_linear * exp(j*phase)
+            amp_lin = 10.0 ** (amp_dB / 20.0)
+            complex_gain = amp_lin * (math.cos(phase_rad) + 1j * math.sin(phase_rad))
+            mp_delays.append(blocks.delay(gr.sizeof_gr_complex, n_delay))
+            mp_gains.append(blocks.multiply_const_cc(complex(complex_gain)))
+
     # Post-demod audio LPF pour emuler le filtre audio du RX reel
     use_post_lpf = post_lpf and post_lpf > 0
     if use_post_lpf:
@@ -184,7 +204,14 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
         tb.connect(src, hpf, nbfm_tx)
     else:
         tb.connect(src, nbfm_tx)
-    tb.connect(nbfm_tx, (adder, 0))
+
+    if mp_summer is not None:
+        # nbfm_tx -> N branches (delay + gain complexe) -> mp_summer -> adder
+        for i, (delay_blk, gain_blk) in enumerate(zip(mp_delays, mp_gains)):
+            tb.connect(nbfm_tx, delay_blk, gain_blk, (mp_summer, i))
+        tb.connect(mp_summer, (adder, 0))
+    else:
+        tb.connect(nbfm_tx, (adder, 0))
     tb.connect(noise_src, (adder, 1))
     if use_post_lpf:
         tb.connect(adder, nbfm_rx, post_lpf_blk, mul, sink)

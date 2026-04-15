@@ -44,6 +44,11 @@ PROFILES = [
 IF_NOISE_LEVELS = [0.0, 0.05, 0.1, 0.165, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
 N_DATA_SYMBOLS = 1500
 RNG_BASE = 2000
+# Calibration audio_noise_rms=0.125 -> match OTA HIGH SNR-out 14 dB
+# (sim etait 4-6 dB optimiste avec AUDIO_NOISE_RMS=0 par defaut).
+# Narrow-band reste pessimiste ~5-15 dB (bruit reel non-flat en frequence)
+# mais wideband (Rs=1500) calibre dans 0.5 dB.
+CALIBRATED_AUDIO_NOISE_RMS = 0.125
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "results", "apsk16_ftn", "cascade")
@@ -69,7 +74,8 @@ def run_profile(profile, if_noise, seed):
     tx = build_tx(profile["rs"], profile["beta"], profile["tau"],
                   mod, n_data_symbols=N_DATA_SYMBOLS, rng=rng)
     r = run_full_chain(tx, mod, if_noise_voltage=if_noise, rng_seed=seed,
-                       channel_kwargs={"start_delay_s": 0.0})
+                       channel_kwargs={"start_delay_s": 0.0,
+                                       "audio_noise_rms": CALIBRATED_AUDIO_NOISE_RMS})
     outputs = r["fse_out"]["outputs"]
     mask = r["fse_out"]["training_mask"]
     refs = np.zeros_like(outputs)
@@ -127,14 +133,14 @@ def main():
                     color=prof["color"])
     ax.set_xlabel("if_noise_voltage (IF AWGN amplitude)")
     ax.set_ylabel("BER uncoded")
-    ax.set_title("Cascade robustesse -- BER vs bruit IF (sim NBFM, defauts)")
+    ax.set_title(f"Cascade robustesse -- BER vs bruit IF "
+                 f"(sim NBFM calibre OTA, audio_noise_rms={CALIBRATED_AUDIO_NOISE_RMS})")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=9, loc="lower right")
     ax.text(0.02, 0.98,
-            "AVERTISSEMENT : sim NBFM avec AUDIO_NOISE_RMS=0 = 4-6 dB\n"
-            "optimiste vs OTA. Comparaison RELATIVE fiable, absolue non.",
-            transform=ax.transAxes, va="top", fontsize=8,
-            color="#c00", alpha=0.8)
+            f"Calibre : audio_noise_rms={CALIBRATED_AUDIO_NOISE_RMS}\n"
+            f"match OTA HIGH SNR-out 14 dB. Narrow-band reste pessimiste ~5-15 dB.",
+            transform=ax.transAxes, va="top", fontsize=8, alpha=0.7)
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "ber_vs_noise.png"), dpi=100)
     plt.close(fig)
