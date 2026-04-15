@@ -170,4 +170,4 @@ python study/analyse_ota_recording.py \
     --timelines results/ota_test_part02_levelsweep02.json
 ```
 
-Voir le [rapport HTML](https://htmlpreview.github.io/?https://github.com/hb9tob/NewModem/blob/main/rapport_modem.html) pour les graphiques.
+Voir le [rapport HTML](https://hb9tob.github.io/NewModem/rapport_modem.html) pour les graphiques.

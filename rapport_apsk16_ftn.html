@@ -56,6 +56,7 @@ seuil LDPC).</p>
 <li><a href="#regles">Regles imposees et blocs standards</a></li>
 <li><a href="#results">Resultats du sweep</a></li>
 <li><a href="#reco">Recommandations OTA</a></li>
+<li><a href="#noise-limits">Limites de bruit (etude ciblee)</a></li>
 <li><a href="#limits">Limites et pistes parkees</a></li>
 </ol>
 </nav>
@@ -256,7 +257,117 @@ uncoded, BW=1920 Hz, BER uncoded 0.001).</li>
 </ul>
 </div>
 
-<h2 id="limits">6. Limites et pistes parkees</h2>
+<h2 id="noise-limits">6. Limites de bruit (etude ciblee)</h2>
+
+<p>Etude focalisee sur les 5 meilleurs candidats pour trouver ou se trouve
+exactement la limite. Balayage fin <code>if_noise ∈ [0, 1.5]</code> (14 points),
+<code>N=2000</code> symboles/point. Source :
+<code>study/apsk16_ftn_limit_study.py</code>.</p>
+
+<p>Deux metriques cles :</p>
+<ul>
+<li><strong>SNR sortie FSE</strong> = 10·log10(&lt;|y|²&gt; / &lt;|y − ref|²&gt;)
+mesure sur les positions training (preambule + pilotes).</li>
+<li><strong>BER uncoded</strong> — avant le futur decodeur LDPC LNMS.</li>
+</ul>
+
+<h3>6.1 SNR sortie au plancher (if_noise = 0)</h3>
+
+<p>Calibration du bruit &quot;hors IF&quot; (pre/de-emphase + drift + residus FSE) :</p>
+
+<table>
+<tr><th>Candidat</th><th>SNR-out @ if_noise=0</th><th>Interpretation</th></tr>
+<tr><td>Rs=1200 β=0.20 τ=1.0 (fallback)</td>
+    <td class="good">28.4 dB</td>
+    <td>BW=1440 Hz, pur dans le plateau NBFM</td></tr>
+<tr><td>Rs=1411.76 β=0.25 τ=1.0 (robuste)</td>
+    <td class="good">25.3 dB</td>
+    <td>BW=1694 Hz, dans le plateau</td></tr>
+<tr><td>Rs=1500 β=0.20 τ=1.0 (sweet spot)</td>
+    <td>20.9 dB</td>
+    <td>BW=1800 Hz, bord du plateau</td></tr>
+<tr><td>Rs=1500 β=0.25 τ=1.0</td>
+    <td>19.4 dB</td>
+    <td>BW=1875 Hz, legerement en zone de rolloff</td></tr>
+<tr><td>Rs=1500 β=0.25 τ=0.938 (FTN)</td>
+    <td class="warn">15.3 dB</td>
+    <td>BW=1920 Hz + ISI residuelle FTN</td></tr>
+</table>
+
+<h3>6.2 Decouverte : effet de seuil FM (threshold effect)</h3>
+
+<div class="key">
+Le BER et le GMI montrent une <strong>transition brutale</strong> entre
+<code>if_noise=0.4</code> et <code>if_noise=0.5</code>, identique pour TOUS
+les candidats. Ce n'est pas une degradation graduelle SNR : c'est
+l'<strong>effet de seuil du demodulateur FM</strong> (bascule de regime
+lineaire vers click-noise sous IF SNR ~10 dB). Le modem n'est pas la
+limite — c'est le recepteur FM lui-meme.
+</div>
+
+<table>
+<tr><th>if_noise</th><th>Tous candidats</th></tr>
+<tr><td class="good">≤ 0.4</td>
+    <td>BER &lt; 0.01, GMI ≥ 3.2, SNR-out 14–29 dB.
+        Tous les LDPC decodent.</td></tr>
+<tr><td class="bad">≥ 0.5</td>
+    <td>BER &gt; 0.1, GMI &lt; 1, SNR-out 3–9 dB.
+        <strong>Cliff brutal</strong>. Meme LDPC rate 1/2 echoue.</td></tr>
+</table>
+
+<h3>6.3 Graphiques</h3>
+
+<div class="two-col">
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/limit_study/ber_vs_noise.png" alt="BER vs if_noise">
+<div class="caption">BER uncoded (log) vs bruit IF, 5 candidats. Cliff visible
+a if_noise ≈ 0.45 pour tous.</div>
+</div>
+</div>
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/limit_study/gmi_vs_noise.png" alt="GMI vs if_noise">
+<div class="caption">GMI avec seuils LDPC WiMAX 2304 (pointilles) : 2.5
+pour rate 1/2, 3.17 pour 2/3, 3.5 pour 3/4.</div>
+</div>
+</div>
+</div>
+
+<div class="two-col">
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/limit_study/snr_vs_noise.png" alt="SNR vs if_noise">
+<div class="caption">SNR sortie FSE (dB) -- calibration if_noise_voltage
+injecte vs SNR effectif apres demod FM + FSE.</div>
+</div>
+</div>
+<div>
+<div class="fig">
+<img src="results/apsk16_ftn/limit_study/ber_vs_snr.png" alt="BER vs SNR">
+<div class="caption">BER uncoded vs SNR sortie -- courbe operationnelle,
+comparable aux seuils LDPC AWGN (~7 dB Es/N0 pour rate 1/2).</div>
+</div>
+</div>
+</div>
+
+<h3>6.4 Implications OTA</h3>
+
+<ul>
+<li><strong>Marge modem &gt;10 dB</strong> : tous les candidats ont largement
+la marge pour absorber le FM threshold. Le choix de Rs/β/τ n'est pas dicte
+par la sensibilite au bruit.</li>
+<li><strong>Le bottleneck est le RF</strong> (sensibilite du transceiver,
+NF du recepteur). Sous threshold FM (~10 dB IF SNR), rien ne marche, quelle
+que soit la modulation ou le code.</li>
+<li><strong>Critere OTA pratique</strong> : observer le S-meter et le bruit
+audio. Si le signal est &quot;bien recu&quot; (S7+, bruit faible audible),
+la marge modem est confortable (≥15 dB SNR sortie). Si le signal est juste
+a la limite (S1-2, bruit notable), on est dans la zone FM threshold et le
+modem ne pourra rien recuperer.</li>
+</ul>
+
+<h2 id="limits">7. Limites et pistes parkees</h2>
 
 <div class="warn">
 <strong>Limites honnetes du banc :</strong>

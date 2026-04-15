@@ -5,7 +5,7 @@ RRC agressif (β ∈ {0.15, 0.20, 0.25}) et optionnellement FTN (Faster Than
 Nyquist, τ < 1), pour pousser au-dela du plafond des modems 16-QAM/32-QAM
 actuels (~1000 Bd) sur les relais NBFM amateur.
 
-Voir le [rapport HTML complet](https://htmlpreview.github.io/?https://github.com/hb9tob/NewModem/blob/main/rapport_apsk16_ftn.html) pour les graphiques, heatmaps et la methodologie detaillee.
+Voir le [rapport HTML complet](https://hb9tob.github.io/NewModem/rapport_apsk16_ftn.html) pour les graphiques, heatmaps et la methodologie detaillee.
 
 ## Architecture recepteur
 
@@ -77,6 +77,36 @@ aucun resampling fractionnaire.
 - **Robustesse max** : `Rs=1411, β=0.25, τ=1.0` → 5647 bit/s uncoded, tolere
   if_noise=0.5.
 - **FTN modere** : `Rs=1500, β=0.25, τ=0.938` → 6395 bit/s uncoded, BER 0.001.
+
+## Etude limites de bruit
+
+Balayage fin `if_noise ∈ [0, 1.5]` sur les 5 top candidats, 2000 sym/point.
+
+**SNR sortie FSE @ if_noise = 0** (plancher bruit hors IF) :
+
+| Candidat | SNR-out |
+|----------|---------|
+| Rs=1200 β=0.20 τ=1.0 | 28.4 dB |
+| Rs=1411 β=0.25 τ=1.0 | 25.3 dB |
+| Rs=1500 β=0.20 τ=1.0 | 20.9 dB |
+| Rs=1500 β=0.25 τ=1.0 | 19.4 dB |
+| Rs=1500 β=0.25 τ=0.938 FTN | 15.3 dB |
+
+**Decouverte : effet de seuil FM (threshold effect)**. Cliff brutal entre
+`if_noise=0.4` (BER<0.01) et `if_noise=0.5` (BER>0.1), identique pour tous
+les candidats. C'est le demodulateur FM qui bascule en regime click-noise
+sous IF SNR ~10 dB, pas le modem.
+
+**Implications OTA** :
+- Marge modem >10 dB pour tous les candidats avant le FM threshold.
+- Le bottleneck est la sensibilite RF, pas la modem.
+- Critere OTA : si le signal est bien recu (S7+), marge confortable.
+  Si signal a la limite (S1-2), rien ne marchera.
+
+Voir les plots : `results/apsk16_ftn/limit_study/{ber,gmi,snr}_vs_noise.png`
+et `ber_vs_snr.png` dans le [rapport HTML](https://hb9tob.github.io/NewModem/rapport_apsk16_ftn.html).
+
+Script : `study/apsk16_ftn_limit_study.py`.
 
 ## Pistes parkees
 

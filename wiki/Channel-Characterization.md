@@ -53,4 +53,4 @@ Voir [Scripts Reference](Scripts-Reference) pour les commandes exactes.
 
 ## Rapport complet
 
-Voir le [rapport HTML](https://htmlpreview.github.io/?https://github.com/hb9tob/NewModem/blob/main/rapport_canal_nbfm.html) avec tous les graphiques.
+Voir le [rapport HTML](https://hb9tob.github.io/NewModem/rapport_canal_nbfm.html) avec tous les graphiques.
