@@ -80,6 +80,25 @@ def qpsk_constellation() -> np.ndarray:
     return pts
 
 
+def qam16_constellation() -> np.ndarray:
+    """16-QAM grille 4x4 Gray-coded, Es=1.
+
+    Convention : bits b3 b2 b1 b0 (MSB=b3). b3 b2 encodent I, b1 b0 encodent Q
+    (Gray 2-bits : 00->-3, 01->-1, 11->+1, 10->+3 -- standard PAM Gray).
+    Normalisation Es=1 : scale = 1/sqrt(10).
+    """
+    # Bit pair (b1 b0) -> amplitude level (Gray)
+    lvl = {0b00: -3, 0b01: -1, 0b11: +1, 0b10: +3}
+    pts = np.empty(16, dtype=np.complex128)
+    for bits in range(16):
+        b_i = (bits >> 2) & 0b11  # I bits = b3 b2
+        b_q = bits & 0b11          # Q bits = b1 b0
+        i = lvl[b_i]
+        q = lvl[b_q]
+        pts[bits] = (i + 1j * q) / math.sqrt(10.0)
+    return pts
+
+
 def psk8_constellation() -> np.ndarray:
     """8PSK Gray, 8 points unit-circle. Es = 1.
 
@@ -126,6 +145,9 @@ def MOD_8PSK():
 
 def MOD_16APSK(gamma: float = 2.85):
     return ModFormat("16-APSK", apsk16_constellation(gamma), 4)
+
+def MOD_16QAM():
+    return ModFormat("16-QAM", qam16_constellation(), 4)
 
 
 # Fonctions generiques (remplacent a terme les apsk16_*)
