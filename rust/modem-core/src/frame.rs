@@ -73,7 +73,23 @@ pub fn build_superframe(data: &[u8], config: &ModemConfig) -> Vec<Complex64> {
     let (data_with_pilots, _) = pilot::interleave_data_pilots(&data_syms);
     all_symbols.extend_from_slice(&data_with_pilots);
 
-    // 5. Runout: flush RRC filter tails + FSE margin
+    // 5. Runout: flush RRC filter tails + extra pilot groups at the end
+    //    to improve phase tracking near the signal's right edge.
+    //    Structure: N extra pilot groups (each = 32 zero-data + 2 pilot symbols),
+    //    giving the RX extra known symbols for interpolation at the tail.
+    let n_extra_pilot_groups = 4;
+    let first_extra_group_idx = data_with_pilots.len() / (crate::types::D_SYMS + crate::types::P_SYMS);
+    for eg in 0..n_extra_pilot_groups {
+        // 32 zero data symbols
+        for _ in 0..crate::types::D_SYMS {
+            all_symbols.push(Complex64::new(0.0, 0.0));
+        }
+        // 2 pilot symbols at the continued group index
+        let pilots = pilot::pilots_for_group(first_extra_group_idx + eg);
+        all_symbols.extend_from_slice(&pilots);
+    }
+
+    // Final RRC tail flush
     let runout_len = 24;
     for _ in 0..runout_len {
         all_symbols.push(Complex64::new(0.0, 0.0));

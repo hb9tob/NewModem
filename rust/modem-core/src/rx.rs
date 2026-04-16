@@ -97,23 +97,37 @@ pub fn rx(samples: &[f32], config: &ModemConfig) -> Option<RxResult> {
         });
     };
 
-    // Reconstruct pilot positions and values for phase tracking
+    // Reconstruct pilot positions (data + extra trailing pilot groups for edge tracking)
     let n_pure_data = n_codewords * syms_per_codeword;
     let dummy: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); n_pure_data];
-    let (data_with_pilots_ref, pilot_positions) = pilot::interleave_data_pilots(&dummy);
+    let (data_with_pilots_ref, pilot_positions_data) = pilot::interleave_data_pilots(&dummy);
 
     if data_region.len() < data_with_pilots_ref.len() {
         return None;
     }
 
-    // Pilot-aided gain + phase tracking:
-    // 1. At each pilot group, estimate local complex gain:
-    //    g_k = sum(pilot_rx * conj(pilot_tx)) / sum(|pilot_tx|^2)
-    // 2. Unwrap phase to handle > pi jumps
-    // 3. Interpolate gain magnitude and phase linearly between pilots
-    let mut pilot_gains: Vec<(usize, Complex64)> = Vec::new(); // (center_idx, complex gain)
+    // Include extra trailing pilot groups (post-data) if present in the signal.
+    // TX adds n_extra_pilot_groups × (D_SYMS zeros + P_SYMS pilots) after data.
+    let mut pilot_positions: Vec<(usize, usize)> = pilot_positions_data.clone();
+    let base_group_idx = pilot_positions_data.len();
+    let group_sz = crate::types::D_SYMS + crate::types::P_SYMS;
+    let mut extra_group_origin_idx = data_with_pilots_ref.len();
+    loop {
+        let pilot_start = extra_group_origin_idx + crate::types::D_SYMS;
+        let pilot_end = pilot_start + crate::types::P_SYMS;
+        if pilot_end > data_region.len() { break; }
+        pilot_positions.push((pilot_start, pilot_end));
+        extra_group_origin_idx += group_sz;
+    }
+    let n_data_pilots = pilot_positions_data.len();
+
+    // Pilot-aided gain + phase tracking
+    let mut pilot_gains: Vec<(usize, Complex64)> = Vec::new();
     for (g, &(s, e)) in pilot_positions.iter().enumerate() {
-        let pilots_tx = pilot::pilots_for_group(g);
+        // g index maps to pilot group: g < n_data_pilots uses pilots_for_group(g);
+        // trailing groups continue the sequence at base_group_idx + (g - n_data_pilots).
+        let group_idx = if g < n_data_pilots { g } else { base_group_idx + (g - n_data_pilots) };
+        let pilots_tx = pilot::pilots_for_group(group_idx);
         let mut num = Complex64::new(0.0, 0.0);
         let mut den = 0.0f64;
         for (k, idx) in (s..e).enumerate() {
