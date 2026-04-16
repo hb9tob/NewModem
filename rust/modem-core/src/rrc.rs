@@ -1,71 +1,70 @@
-//! Generation des taps Root-Raised-Cosine (RRC) et upsampling.
+//! Root Raised Cosine (RRC) pulse shaping.
+//!
+//! Port exact de modem_apsk16_ftn_bench.py lignes 266-354.
+//! Forme standard (Proakis), normalisée en énergie.
 
-/// Genere `n_taps = 2 * span_sym * sps + 1` taps RRC.
-/// Energie totale normalisee a 1 (sum(taps^2) = 1).
-pub fn rrc_taps(beta: f32, span_sym: usize, sps: usize) -> Vec<f32> {
-    let n = 2 * span_sym * sps;
-    let mut taps = vec![0.0f32; n + 1];
+use std::f64::consts::PI;
+
+/// Compute RRC filter taps, energy-normalised.
+///
+/// Returns `span_sym * sps + 1` taps, causal, centered at index n/2.
+pub fn rrc_taps(beta: f64, span_sym: usize, sps: usize) -> Vec<f64> {
+    assert!(beta > 0.0 && beta <= 1.0, "beta must be in (0, 1]");
+
+    let n = span_sym * sps;
+    let mut taps = Vec::with_capacity(n + 1);
+    let nyquist_t = 1.0 / (4.0 * beta);
+
     for i in 0..=n {
-        let t = (i as f32 - n as f32 / 2.0) / sps as f32;
-        let v = if t.abs() < 1e-7 {
-            1.0 - beta + 4.0 * beta / std::f32::consts::PI
-        } else if (t.abs() - 1.0 / (4.0 * beta)).abs() < 1e-5 {
-            (beta / (2.0_f32).sqrt())
-                * ((1.0 + 2.0 / std::f32::consts::PI)
-                    * (std::f32::consts::PI / (4.0 * beta)).sin()
-                    + (1.0 - 2.0 / std::f32::consts::PI)
-                        * (std::f32::consts::PI / (4.0 * beta)).cos())
+        let t = (i as f64 - n as f64 / 2.0) / sps as f64;
+
+        let val = if t.abs() < 1e-12 {
+            1.0 - beta + 4.0 * beta / PI
+        } else if (t.abs() - nyquist_t).abs() < 1e-8 {
+            (beta / std::f64::consts::SQRT_2)
+                * ((1.0 + 2.0 / PI) * (PI / (4.0 * beta)).sin()
+                    + (1.0 - 2.0 / PI) * (PI / (4.0 * beta)).cos())
         } else {
-            let pi_t = std::f32::consts::PI * t;
-            let num = (pi_t * (1.0 - beta)).sin()
-                + 4.0 * beta * t * (pi_t * (1.0 + beta)).cos();
-            let den = pi_t * (1.0 - (4.0 * beta * t).powi(2));
+            let num = (PI * t * (1.0 - beta)).sin()
+                + 4.0 * beta * t * (PI * t * (1.0 + beta)).cos();
+            let den = PI * t * (1.0 - (4.0 * beta * t).powi(2));
             num / den
         };
-        taps[i] = v;
+        taps.push(val);
     }
-    let energy: f32 = taps.iter().map(|t| t * t).sum();
+
+    // Energy normalisation
+    let energy: f64 = taps.iter().map(|&x| x * x).sum();
     let norm = energy.sqrt();
-    for t in &mut taps {
-        *t /= norm;
+    for tap in &mut taps {
+        *tap /= norm;
     }
+
     taps
 }
 
-/// Upsample par insertion de zeros : retourne `samples * sps` echantillons.
-pub fn upsample(symbols: &[num_complex::Complex32], sps: usize)
-    -> Vec<num_complex::Complex32> {
-    let mut out = vec![num_complex::Complex32::new(0.0, 0.0); symbols.len() * sps];
-    for (i, s) in symbols.iter().enumerate() {
-        out[i * sps] = *s;
+/// Check that SPS and tau*SPS are both integers. Returns (sps, pitch).
+///
+/// `symbol_rate` can be fractional as long as `AUDIO_RATE / symbol_rate` is integer
+/// (e.g. 48000/34 = 1411.76 Bd with SPS=34).
+pub fn check_integer_constraints(audio_rate: u32, symbol_rate: f64, tau: f64) -> Result<(usize, usize), String> {
+    let sps_float = audio_rate as f64 / symbol_rate;
+    if (sps_float - sps_float.round()).abs() > 1e-9 {
+        return Err(format!(
+            "SPS non entier: AUDIO_RATE ({audio_rate}) / symbol_rate ({symbol_rate}) = {sps_float}"
+        ));
     }
-    out
-}
+    let sps = sps_float.round() as usize;
 
-/// Convolution complex avec taps reels (RRC). Retourne un vecteur de la
-/// meme longueur que `signal` (mode "same").
-pub fn convolve_complex_real(
-    signal: &[num_complex::Complex32],
-    taps: &[f32],
-) -> Vec<num_complex::Complex32> {
-    let n = signal.len();
-    let m = taps.len();
-    let mut out = vec![num_complex::Complex32::new(0.0, 0.0); n];
-    let half = m / 2;
-    for i in 0..n {
-        let mut acc_re = 0.0f32;
-        let mut acc_im = 0.0f32;
-        for k in 0..m {
-            let j = i as isize + k as isize - half as isize;
-            if j >= 0 && (j as usize) < n {
-                let s = signal[j as usize];
-                acc_re += s.re * taps[m - 1 - k];
-                acc_im += s.im * taps[m - 1 - k];
-            }
-        }
-        out[i] = num_complex::Complex32::new(acc_re, acc_im);
+    let pitch_float = tau * sps as f64;
+    if (pitch_float - pitch_float.round()).abs() > 1e-9 {
+        return Err(format!(
+            "tau*SPS non entier: tau={tau}, SPS={sps}, tau*SPS = {pitch_float}"
+        ));
     }
-    out
+    let pitch = pitch_float.round() as usize;
+
+    Ok((sps, pitch))
 }
 
 #[cfg(test)]
@@ -73,15 +72,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rrc_taps_normalized() {
+    fn rrc_taps_length() {
         let taps = rrc_taps(0.25, 12, 32);
-        let energy: f32 = taps.iter().map(|t| t * t).sum();
-        assert!((energy - 1.0).abs() < 1e-4);
+        assert_eq!(taps.len(), 12 * 32 + 1);
     }
 
     #[test]
-    fn rrc_taps_count() {
+    fn rrc_taps_energy_unity() {
         let taps = rrc_taps(0.25, 12, 32);
-        assert_eq!(taps.len(), 2 * 12 * 32 + 1);
+        let energy: f64 = taps.iter().map(|&x| x * x).sum();
+        assert!((energy - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rrc_taps_symmetric() {
+        let taps = rrc_taps(0.20, 12, 32);
+        let n = taps.len();
+        for i in 0..n / 2 {
+            assert!(
+                (taps[i] - taps[n - 1 - i]).abs() < 1e-12,
+                "RRC not symmetric at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_constraints_ok() {
+        let (sps, pitch) = check_integer_constraints(48000, 1500.0, 1.0).unwrap();
+        assert_eq!(sps, 32);
+        assert_eq!(pitch, 32);
+    }
+
+    #[test]
+    fn integer_constraints_ftn() {
+        let (sps, pitch) = check_integer_constraints(48000, 1500.0, 30.0 / 32.0).unwrap();
+        assert_eq!(sps, 32);
+        assert_eq!(pitch, 30);
+    }
+
+    #[test]
+    fn integer_constraints_500bd() {
+        let (sps, pitch) = check_integer_constraints(48000, 500.0, 1.0).unwrap();
+        assert_eq!(sps, 96);
+        assert_eq!(pitch, 96);
+    }
+
+    #[test]
+    fn integer_constraints_fail() {
+        assert!(check_integer_constraints(48000, 1234.0, 1.0).is_err());
     }
 }

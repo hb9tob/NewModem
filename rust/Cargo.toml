@@ -1,25 +1,9 @@
 [workspace]
+members = ["modem-core", "modem-cli"]
 resolver = "2"
-members = [
-    "modem-core",
-    "tx-cli",
-]
-
-[workspace.package]
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-authors = ["hb9tob"]
 
 [workspace.dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 num-complex = "0.4"
-cpal = "0.15"
-serialport = "4"
-thiserror = "1"
-reed-solomon-erasure = "6"
-
-[profile.release]
-opt-level = 3
-lto = "thin"
+thiserror = "2"
+hound = "3.5"
+clap = { version = "4", features = ["derive"] }

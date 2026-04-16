@@ -1,0 +1,14 @@
+[package]
+name = "modem-cli"
+version = "0.1.0"
+edition = "2021"
+description = "NBFM modem CLI — WAV file TX/RX"
+
+[[bin]]
+name = "nbfm-modem"
+path = "src/main.rs"
+
+[dependencies]
+modem-core = { path = "../modem-core" }
+hound = { workspace = true }
+clap = { workspace = true }

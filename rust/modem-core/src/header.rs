@@ -1,147 +1,230 @@
-//! Header de frame NBFM modem.
+//! Superframe header: 12 bytes -> Golay(24,12) coded -> 96 QPSK symbols.
 //!
-//! Structure fixe de 16 octets, non-RS-encode, protege par CRC16-CCITT.
-//! Meme si le body est RS-encode, le header passe tel quel (mais quand meme
-//! a travers le LDPC + modulation avec le reste de la frame).
-//!
-//! Layout :
-//!   0..2    magic 0xCAFE (BE)
-//!   2..3    version
-//!   3..4    mode (code ModemMode)
-//!   4..5    rs_level (0..3)
-//!   5..7    n_data_blocks (BE u16)
-//!   7..9    n_parity_blocks (BE u16)
-//!   9..11   frame_id (BE u16, 0..N-1)
-//!   11..13  total_frames (BE u16, N)
-//!   13..14  flags (bit0=LAST, bit1=HAS_FILENAME)
-//!   14..16  header_crc16 (BE, CRC16-CCITT sur octets 0..14)
+//! Header is always modulated in QPSK regardless of data mode,
+//! like DVB-S2 PLHEADER (always pi/2-BPSK).
 
-use crate::crc::crc16_ccitt;
+use crate::constellation::qpsk_gray;
+use crate::crc::crc8;
+use crate::golay::{golay_decode, golay_encode};
+use crate::profile::ModemConfig;
+use crate::types::Complex64;
 
-pub const HEADER_SIZE: usize = 16;
-pub const MAGIC: u16 = 0xCAFE;
-pub const VERSION: u8 = 1;
+const HEADER_MAGIC: u16 = 0xCAFE;
+const HEADER_VERSION: u8 = 1;
 
-/// Flags du header (bitmask).
+/// Header flags.
 pub const FLAG_LAST: u8 = 0x01;
 pub const FLAG_HAS_FILENAME: u8 = 0x02;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameHeader {
+/// Parsed header information.
+#[derive(Clone, Debug)]
+pub struct Header {
     pub version: u8,
-    /// Code numerique du mode modem (correspond a ModemMode::to_code())
     pub mode_code: u8,
-    pub rs_level: u8,
-    pub n_data_blocks: u16,
-    pub n_parity_blocks: u16,
-    pub frame_id: u16,
-    pub total_frames: u16,
+    pub frame_counter: u16,
+    pub payload_length: u16,
     pub flags: u8,
+    pub freq_offset: u8,
+    pub reserved: u8,
 }
 
-impl FrameHeader {
-    /// Serialise en 16 octets avec CRC16 calcule sur les 14 premiers.
-    pub fn encode(&self) -> [u8; HEADER_SIZE] {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0..2].copy_from_slice(&MAGIC.to_be_bytes());
+impl Header {
+    /// Serialize to 12 bytes: magic(2) + version(1) + mode_code(1) + frame_counter(2)
+    /// + payload_length(2) + flags(1) + freq_offset(1) + reserved(1) + crc8(1).
+    pub fn to_bytes(&self) -> [u8; 12] {
+        let mut buf = [0u8; 12];
+        buf[0] = (HEADER_MAGIC >> 8) as u8;
+        buf[1] = (HEADER_MAGIC & 0xFF) as u8;
         buf[2] = self.version;
         buf[3] = self.mode_code;
-        buf[4] = self.rs_level;
-        buf[5..7].copy_from_slice(&self.n_data_blocks.to_be_bytes());
-        buf[7..9].copy_from_slice(&self.n_parity_blocks.to_be_bytes());
-        buf[9..11].copy_from_slice(&self.frame_id.to_be_bytes());
-        buf[11..13].copy_from_slice(&self.total_frames.to_be_bytes());
-        buf[13] = self.flags;
-        let crc = crc16_ccitt(&buf[0..14]);
-        buf[14..16].copy_from_slice(&crc.to_be_bytes());
+        buf[4] = (self.frame_counter >> 8) as u8;
+        buf[5] = (self.frame_counter & 0xFF) as u8;
+        buf[6] = (self.payload_length >> 8) as u8;
+        buf[7] = (self.payload_length & 0xFF) as u8;
+        buf[8] = self.flags;
+        buf[9] = self.freq_offset;
+        buf[10] = self.reserved;
+        buf[11] = crc8(&buf[0..11]);
         buf
     }
 
-    /// Deserialise 16 octets. Retourne None si magic ou CRC invalides.
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < HEADER_SIZE {
+    /// Deserialize from 12 bytes. Returns None if magic or CRC mismatch.
+    pub fn from_bytes(buf: &[u8; 12]) -> Option<Self> {
+        let magic = ((buf[0] as u16) << 8) | buf[1] as u16;
+        if magic != HEADER_MAGIC {
             return None;
         }
-        let magic = u16::from_be_bytes([data[0], data[1]]);
-        if magic != MAGIC {
+        let computed_crc = crc8(&buf[0..11]);
+        if computed_crc != buf[11] {
             return None;
         }
-        let crc_recv = u16::from_be_bytes([data[14], data[15]]);
-        if crc16_ccitt(&data[0..14]) != crc_recv {
-            return None;
-        }
-        Some(FrameHeader {
-            version: data[2],
-            mode_code: data[3],
-            rs_level: data[4],
-            n_data_blocks: u16::from_be_bytes([data[5], data[6]]),
-            n_parity_blocks: u16::from_be_bytes([data[7], data[8]]),
-            frame_id: u16::from_be_bytes([data[9], data[10]]),
-            total_frames: u16::from_be_bytes([data[11], data[12]]),
-            flags: data[13],
+        Some(Header {
+            version: buf[2],
+            mode_code: buf[3],
+            frame_counter: ((buf[4] as u16) << 8) | buf[5] as u16,
+            payload_length: ((buf[6] as u16) << 8) | buf[7] as u16,
+            flags: buf[8],
+            freq_offset: buf[9],
+            reserved: buf[10],
         })
     }
 
-    pub fn is_last_frame(&self) -> bool {
-        self.flags & FLAG_LAST != 0
+    /// Create a header from a modem config.
+    pub fn from_config(config: &ModemConfig, frame_counter: u16, payload_length: u16, flags: u8) -> Self {
+        Header {
+            version: HEADER_VERSION,
+            mode_code: config.mode_code(),
+            frame_counter,
+            payload_length,
+            flags,
+            freq_offset: freq_hz_to_offset(config.center_freq_hz),
+            reserved: 0,
+        }
+    }
+}
+
+/// Encode header to 96 QPSK symbols via Golay(24,12).
+///
+/// 12 bytes = 96 bits -> 8 Golay blocks of 12 info bits -> 192 coded bits -> 96 QPSK symbols.
+pub fn encode_header_symbols(header: &Header) -> Vec<Complex64> {
+    let bytes = header.to_bytes();
+    let qpsk = qpsk_gray();
+
+    // Pack 12 bytes into 8 blocks of 12 bits (96 bits total)
+    let bits = bytes_to_bits(&bytes);
+    assert_eq!(bits.len(), 96);
+
+    let mut coded_bits = Vec::with_capacity(192);
+    for block in bits.chunks_exact(12) {
+        let info: u16 = block.iter().enumerate().fold(0u16, |acc, (i, &b)| {
+            acc | ((b as u16) << (11 - i))
+        });
+        let cw = golay_encode(info);
+        // 24 coded bits, MSB first
+        for bit in (0..24).rev() {
+            coded_bits.push(((cw >> bit) & 1) as u8);
+        }
+    }
+    assert_eq!(coded_bits.len(), 192);
+
+    // Map to QPSK symbols (2 bits per symbol)
+    qpsk.map_bits(&coded_bits)
+}
+
+/// Decode 96 QPSK symbols back to header.
+///
+/// Returns None if Golay decoding or header validation fails.
+pub fn decode_header_symbols(symbols: &[Complex64]) -> Option<Header> {
+    if symbols.len() != 96 {
+        return None;
     }
 
-    pub fn has_filename(&self) -> bool {
-        self.flags & FLAG_HAS_FILENAME != 0
+    let qpsk = qpsk_gray();
+    let indices = qpsk.slice_nearest(symbols);
+    let bits = qpsk.symbols_to_bits(&indices);
+    assert_eq!(bits.len(), 192);
+
+    // Decode 8 Golay blocks
+    let mut info_bits = Vec::with_capacity(96);
+    for block in bits.chunks_exact(24) {
+        let received: u32 = block.iter().enumerate().fold(0u32, |acc, (i, &b)| {
+            acc | ((b as u32) << (23 - i))
+        });
+        let decoded = golay_decode(received)?;
+        for bit in (0..12).rev() {
+            info_bits.push(((decoded >> bit) & 1) as u8);
+        }
     }
+    assert_eq!(info_bits.len(), 96);
+
+    let bytes = bits_to_bytes(&info_bits);
+    let mut buf = [0u8; 12];
+    buf.copy_from_slice(&bytes);
+    Header::from_bytes(&buf)
+}
+
+fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+    let mut bits = Vec::with_capacity(bytes.len() * 8);
+    for &byte in bytes {
+        for bit in (0..8).rev() {
+            bits.push((byte >> bit) & 1);
+        }
+    }
+    bits
+}
+
+fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+    bits.chunks_exact(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0u8, |acc, (i, &b)| acc | ((b & 1) << (7 - i)))
+        })
+        .collect()
+}
+
+/// Encode center frequency as offset byte: 0 = 800 Hz, step = 10 Hz, range 800-1550 Hz.
+fn freq_hz_to_offset(freq_hz: f64) -> u8 {
+    let offset = ((freq_hz - 800.0) / 10.0).round() as i32;
+    offset.clamp(0, 75) as u8
+}
+
+/// Decode offset byte back to center frequency.
+pub fn freq_offset_to_hz(offset: u8) -> f64 {
+    800.0 + offset as f64 * 10.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::profile_normal;
 
     #[test]
-    fn roundtrip() {
-        let h = FrameHeader {
+    fn header_bytes_roundtrip() {
+        let h = Header {
             version: 1,
-            mode_code: 3,
-            rs_level: 2,
-            n_data_blocks: 112,
-            n_parity_blocks: 14,
-            frame_id: 42,
-            total_frames: 100,
-            flags: FLAG_LAST | FLAG_HAS_FILENAME,
+            mode_code: 0x15,
+            frame_counter: 42,
+            payload_length: 1024,
+            flags: FLAG_LAST,
+            freq_offset: 30, // 1100 Hz
+            reserved: 0,
         };
-        let buf = h.encode();
-        let back = FrameHeader::decode(&buf).expect("decode ok");
-        assert_eq!(h, back);
-        assert!(back.is_last_frame());
-        assert!(back.has_filename());
+        let bytes = h.to_bytes();
+        let h2 = Header::from_bytes(&bytes).unwrap();
+        assert_eq!(h2.version, h.version);
+        assert_eq!(h2.mode_code, h.mode_code);
+        assert_eq!(h2.frame_counter, h.frame_counter);
+        assert_eq!(h2.payload_length, h.payload_length);
+        assert_eq!(h2.flags, h.flags);
+        assert_eq!(h2.freq_offset, h.freq_offset);
     }
 
     #[test]
-    fn bad_magic_rejected() {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = 0xDE;
-        buf[1] = 0xAD;
-        assert!(FrameHeader::decode(&buf).is_none());
+    fn header_symbols_roundtrip() {
+        let cfg = profile_normal();
+        let h = Header::from_config(&cfg, 7, 512, 0);
+        let symbols = encode_header_symbols(&h);
+        assert_eq!(symbols.len(), 96);
+        let h2 = decode_header_symbols(&symbols).unwrap();
+        assert_eq!(h2.mode_code, h.mode_code);
+        assert_eq!(h2.frame_counter, h.frame_counter);
+        assert_eq!(h2.payload_length, h.payload_length);
     }
 
     #[test]
-    fn bad_crc_rejected() {
-        let h = FrameHeader {
-            version: 1, mode_code: 3, rs_level: 0,
-            n_data_blocks: 10, n_parity_blocks: 0,
-            frame_id: 1, total_frames: 1, flags: 0,
-        };
-        let mut buf = h.encode();
-        buf[5] ^= 0x80;  // flip un bit
-        assert!(FrameHeader::decode(&buf).is_none());
+    fn header_bad_magic() {
+        let mut bytes = [0u8; 12];
+        bytes[0] = 0xDE;
+        bytes[1] = 0xAD;
+        assert!(Header::from_bytes(&bytes).is_none());
     }
 
     #[test]
-    fn header_size_constant() {
-        assert_eq!(HEADER_SIZE, 16);
-        let h = FrameHeader {
-            version: 1, mode_code: 0, rs_level: 0,
-            n_data_blocks: 0, n_parity_blocks: 0,
-            frame_id: 0, total_frames: 0, flags: 0,
-        };
-        assert_eq!(h.encode().len(), 16);
+    fn freq_offset_roundtrip() {
+        assert_eq!(freq_offset_to_hz(freq_hz_to_offset(1100.0)), 1100.0);
+        assert_eq!(freq_offset_to_hz(freq_hz_to_offset(800.0)), 800.0);
+        assert_eq!(freq_offset_to_hz(freq_hz_to_offset(1500.0)), 1500.0);
     }
 }

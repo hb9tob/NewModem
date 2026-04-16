@@ -1,10 +1,9 @@
 [package]
 name = "modem-core"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+description = "NBFM audio modem library — APSK/PSK/QPSK + LDPC WiMAX"
 
 [dependencies]
-num-complex.workspace = true
-thiserror.workspace = true
-reed-solomon-erasure.workspace = true
+num-complex = { workspace = true }
+thiserror = { workspace = true }
