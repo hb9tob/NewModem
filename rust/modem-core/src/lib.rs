@@ -17,10 +17,9 @@ pub mod interleaver;
 
 pub mod ldpc;
 
-// Phase 3
-// pub mod modulator;
-// pub mod frame;
-// pub mod tx;
+pub mod modulator;
+pub mod frame;
+pub mod tx;
 
 // Phase 4
 // pub mod demodulator;
