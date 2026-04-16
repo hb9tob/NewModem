@@ -125,7 +125,7 @@ pub fn rx(samples: &[f32], config: &ModemConfig) -> Option<RxResult> {
         pilot_gains.push((center_idx, gain));
     }
 
-    // Unwrap phases in pilot_gains for stable interpolation
+    // Unwrap phases
     let mut phases: Vec<f64> = pilot_gains.iter().map(|(_, g)| g.arg()).collect();
     for i in 1..phases.len() {
         let diff = phases[i] - phases[i-1];
@@ -136,7 +136,22 @@ pub fn rx(samples: &[f32], config: &ModemConfig) -> Option<RxResult> {
         }
     }
 
-    // Apply complex gain correction via interpolation between pilots
+    // Smooth pilot estimates: 3-point moving average reduces pilot-noise influence
+    // on interpolation, while keeping the underlying drift.
+    let n_p = phases.len();
+    let phases_smooth: Vec<f64> = (0..n_p).map(|i| {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 1).min(n_p - 1);
+        (phases[lo] + phases[i] + phases[hi]) / (hi - lo + 1) as f64
+    }).collect();
+    let mags: Vec<f64> = pilot_gains.iter().map(|(_, g)| g.norm()).collect();
+    let mags_smooth: Vec<f64> = (0..n_p).map(|i| {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 1).min(n_p - 1);
+        (mags[lo] + mags[i] + mags[hi]) / (hi - lo + 1) as f64
+    }).collect();
+
+    // Apply complex gain correction via spline-like interpolation (linear on smoothed)
     let mut data_syms: Vec<Complex64> = Vec::new();
     for i in 0..data_with_pilots_ref.len() {
         let is_pilot = pilot_positions.iter().any(|&(s, e)| i >= s && i < e);
@@ -145,21 +160,19 @@ pub fn rx(samples: &[f32], config: &ModemConfig) -> Option<RxResult> {
         let (mag, phase) = if pilot_gains.is_empty() {
             (1.0, 0.0)
         } else if i <= pilot_gains[0].0 {
-            (pilot_gains[0].1.norm(), phases[0])
+            (mags_smooth[0], phases_smooth[0])
         } else if i >= pilot_gains.last().unwrap().0 {
-            let last = pilot_gains.len() - 1;
-            (pilot_gains[last].1.norm(), phases[last])
+            (mags_smooth[n_p-1], phases_smooth[n_p-1])
         } else {
-            // Linear interp between bracketing pilots
             let mut j = 0;
             while j + 1 < pilot_gains.len() && pilot_gains[j+1].0 < i {
                 j += 1;
             }
-            let (i0, g0) = pilot_gains[j];
-            let (i1, _g1) = pilot_gains[j+1];
+            let i0 = pilot_gains[j].0;
+            let i1 = pilot_gains[j+1].0;
             let alpha = (i - i0) as f64 / (i1 - i0) as f64;
-            let mag = g0.norm() * (1.0 - alpha) + pilot_gains[j+1].1.norm() * alpha;
-            let phase = phases[j] * (1.0 - alpha) + phases[j+1] * alpha;
+            let mag = mags_smooth[j] * (1.0 - alpha) + mags_smooth[j+1] * alpha;
+            let phase = phases_smooth[j] * (1.0 - alpha) + phases_smooth[j+1] * alpha;
             (mag, phase)
         };
 
