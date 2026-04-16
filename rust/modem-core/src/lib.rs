@@ -21,10 +21,9 @@ pub mod modulator;
 pub mod frame;
 pub mod tx;
 
-// Phase 4
-// pub mod demodulator;
-// pub mod sync;
-// pub mod equalizer;
-// pub mod pll;
-// pub mod soft_demod;
-// pub mod rx;
+pub mod demodulator;
+pub mod sync;
+pub mod equalizer;
+pub mod pll;
+pub mod soft_demod;
+pub mod rx;
