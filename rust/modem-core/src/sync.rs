@@ -8,45 +8,70 @@ use crate::types::{Complex64, N_PREAMBLE, RRC_SPAN_SYM};
 
 /// Find preamble position in the matched-filtered signal.
 ///
-/// Cross-correlates `mf` with the preamble reference waveform (post-MF).
+/// Two-pass approach for speed:
+/// 1. Coarse: correlate at symbol-rate (one sample per `pitch`), using
+///    only the symbol-rate samples of the preamble. O(n/pitch * 256).
+/// 2. Fine: refine within ±pitch/2 around the coarse peak.
+///
 /// Returns the index of the correlation peak (= first symbol position).
-pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, beta: f64) -> Option<usize> {
-    let taps = rrc_taps(beta, RRC_SPAN_SYM, sps);
+pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> Option<usize> {
     let preamble_syms = preamble::make_preamble();
+    let n_pre = preamble_syms.len(); // 256
 
-    // Build preamble reference waveform (TX RRC + MF = RC pulse)
-    let pre_len = (preamble_syms.len() - 1) * pitch + taps.len();
-    let mut up_pre = vec![Complex64::new(0.0, 0.0); pre_len];
-    for (k, &sym) in preamble_syms.iter().enumerate() {
-        up_pre[k * pitch] = sym;
-    }
-    // TX RRC
-    let tx_pre = convolve_same(&up_pre, &taps);
-    // MF (second RRC) -> RC pulse
-    let ref_waveform = convolve_same(&tx_pre, &taps);
+    // After matched filter, the preamble symbols appear as RC pulses at
+    // pitch-spaced positions. At the correct sampling instant, mf[sync + k*pitch]
+    // should correlate well with preamble_syms[k].
 
-    // Cross-correlate: find peak of |corr|
-    if mf.len() < ref_waveform.len() {
+    // Pass 1: coarse search at pitch stride
+    let max_start = mf.len().saturating_sub(n_pre * pitch);
+    if max_start == 0 {
         return None;
     }
 
-    let corr_len = mf.len() - ref_waveform.len() + 1;
-    let mut best_pos = 0;
+    let mut best_coarse = 0usize;
     let mut best_mag = 0.0f64;
 
-    for start in 0..corr_len {
-        let mut acc = Complex64::new(0.0, 0.0);
-        for (k, &r) in ref_waveform.iter().enumerate() {
-            acc += mf[start + k] * r.conj();
-        }
-        let mag = acc.norm_sqr();
+    // Search every `pitch` samples (symbol-rate search)
+    let coarse_step = pitch;
+    let mut start = 0;
+    while start <= max_start {
+        let mag = correlate_at(mf, &preamble_syms, start, pitch);
         if mag > best_mag {
             best_mag = mag;
-            best_pos = start;
+            best_coarse = start;
+        }
+        start += coarse_step;
+    }
+
+    // Pass 2: fine search within ±pitch around coarse peak
+    let fine_lo = best_coarse.saturating_sub(pitch);
+    let fine_hi = (best_coarse + pitch).min(max_start);
+    let mut best_fine = best_coarse;
+    let mut best_fine_mag = best_mag;
+
+    for s in fine_lo..=fine_hi {
+        let mag = correlate_at(mf, &preamble_syms, s, pitch);
+        if mag > best_fine_mag {
+            best_fine_mag = mag;
+            best_fine = s;
         }
     }
 
-    Some(best_pos)
+    Some(best_fine)
+}
+
+/// Correlate mf at position `start` with preamble symbols at `pitch` spacing.
+#[inline]
+fn correlate_at(mf: &[Complex64], preamble: &[Complex64], start: usize, pitch: usize) -> f64 {
+    let mut acc = Complex64::new(0.0, 0.0);
+    for (k, &sym) in preamble.iter().enumerate() {
+        let idx = start + k * pitch;
+        if idx >= mf.len() {
+            break;
+        }
+        acc += mf[idx] * sym.conj();
+    }
+    acc.norm_sqr()
 }
 
 /// Compute the FSE decimation factor.

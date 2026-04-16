@@ -33,65 +33,50 @@ pub fn build_superframe(data: &[u8], config: &ModemConfig) -> Vec<Complex64> {
 
     let k_bytes = encoder.k() / 8;
     let n_blocks = (data.len() + k_bytes - 1) / k_bytes;
-    let n_segments = (n_blocks + CODEWORDS_PER_SEGMENT - 1) / CODEWORDS_PER_SEGMENT;
 
     let preamble_syms = preamble::make_preamble();
     let mut all_symbols: Vec<Complex64> = Vec::new();
-    let mut block_cursor = 0;
 
-    for seg_idx in 0..n_segments {
-        // Insert preamble at intervals
-        if seg_idx % PREAMBLE_INTERVAL == 0 {
-            all_symbols.extend_from_slice(&preamble_syms);
-        }
+    // MVP file mode: single preamble + single header + all data in one block.
+    // No intermediate headers (avoids FSE divergence from constellation mismatch).
+    // Streaming with periodic headers/preambles is for future implementation.
 
-        // Determine how many codewords in this segment
-        let blocks_remaining = n_blocks - block_cursor;
-        let cw_count = blocks_remaining.min(CODEWORDS_PER_SEGMENT);
-        let is_last_segment = seg_idx == n_segments - 1;
+    // 1. Preamble
+    all_symbols.extend_from_slice(&preamble_syms);
 
-        // Build header
-        let payload_len = if is_last_segment {
-            data.len() - block_cursor * k_bytes
-        } else {
-            cw_count * k_bytes
-        };
-        let flags = if is_last_segment { FLAG_LAST } else { 0 };
-        let hdr = Header::from_config(config, seg_idx as u16, payload_len as u16, flags);
-        let header_syms = header::encode_header_symbols(&hdr);
-        all_symbols.extend_from_slice(&header_syms);
+    // 2. Header (QPSK Golay)
+    let hdr = Header::from_config(config, 0, data.len() as u16, FLAG_LAST);
+    let header_syms = header::encode_header_symbols(&hdr);
+    all_symbols.extend_from_slice(&header_syms);
 
-        // Encode and modulate data codewords for this segment
-        let mut segment_data_syms: Vec<Complex64> = Vec::new();
+    // 3. Encode all data codewords
+    let mut data_syms: Vec<Complex64> = Vec::new();
 
-        for _ in 0..cw_count {
-            let start = block_cursor * k_bytes;
-            let end = (start + k_bytes).min(data.len());
+    for block_idx in 0..n_blocks {
+        let start = block_idx * k_bytes;
+        let end = (start + k_bytes).min(data.len());
 
-            // Pad to k_bytes if needed
-            let mut info_bits = vec![0u8; encoder.k()];
-            for (byte_idx, &byte) in data[start..end].iter().enumerate() {
-                for bit in 0..8 {
-                    info_bits[byte_idx * 8 + bit] = (byte >> (7 - bit)) & 1;
-                }
+        let mut info_bits = vec![0u8; encoder.k()];
+        for (byte_idx, &byte) in data[start..end].iter().enumerate() {
+            for bit in 0..8 {
+                info_bits[byte_idx * 8 + bit] = (byte >> (7 - bit)) & 1;
             }
-
-            // LDPC encode
-            let codeword = encoder.encode(&info_bits);
-
-            // Bit interleave (BICM)
-            let interleaved = interleaver::apply_permutation(&codeword, &interleave_perm);
-
-            // Symbol mapping
-            let syms = constellation.map_bits(&interleaved);
-            segment_data_syms.extend_from_slice(&syms);
-
-            block_cursor += 1;
         }
 
-        // Insert TDM pilots into data symbols
-        let (data_with_pilots, _) = pilot::interleave_data_pilots(&segment_data_syms);
-        all_symbols.extend_from_slice(&data_with_pilots);
+        let codeword = encoder.encode(&info_bits);
+        let interleaved = interleaver::apply_permutation(&codeword, &interleave_perm);
+        let syms = constellation.map_bits(&interleaved);
+        data_syms.extend_from_slice(&syms);
+    }
+
+    // 4. Insert TDM pilots
+    let (data_with_pilots, _) = pilot::interleave_data_pilots(&data_syms);
+    all_symbols.extend_from_slice(&data_with_pilots);
+
+    // 5. Runout: flush RRC filter tails + FSE margin
+    let runout_len = 24;
+    for _ in 0..runout_len {
+        all_symbols.push(Complex64::new(0.0, 0.0));
     }
 
     all_symbols
