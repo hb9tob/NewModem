@@ -97,7 +97,7 @@ pub fn rx(samples: &[f32], config: &ModemConfig) -> Option<RxResult> {
         });
     };
 
-    // Reconstruct pilot positions to strip them
+    // Reconstruct pilot positions and values for phase tracking
     let n_pure_data = n_codewords * syms_per_codeword;
     let dummy: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); n_pure_data];
     let (data_with_pilots_ref, pilot_positions) = pilot::interleave_data_pilots(&dummy);
@@ -106,21 +106,82 @@ pub fn rx(samples: &[f32], config: &ModemConfig) -> Option<RxResult> {
         return None;
     }
 
-    // Strip pilots, keep data only
-    let mut data_syms: Vec<Complex64> = Vec::new();
-    for i in 0..data_with_pilots_ref.len() {
-        let is_pilot = pilot_positions.iter().any(|&(s, e)| i >= s && i < e);
-        if !is_pilot {
-            data_syms.push(data_region[i]);
+    // Pilot-aided gain + phase tracking:
+    // 1. At each pilot group, estimate local complex gain:
+    //    g_k = sum(pilot_rx * conj(pilot_tx)) / sum(|pilot_tx|^2)
+    // 2. Unwrap phase to handle > pi jumps
+    // 3. Interpolate gain magnitude and phase linearly between pilots
+    let mut pilot_gains: Vec<(usize, Complex64)> = Vec::new(); // (center_idx, complex gain)
+    for (g, &(s, e)) in pilot_positions.iter().enumerate() {
+        let pilots_tx = pilot::pilots_for_group(g);
+        let mut num = Complex64::new(0.0, 0.0);
+        let mut den = 0.0f64;
+        for (k, idx) in (s..e).enumerate() {
+            num += data_region[idx] * pilots_tx[k].conj();
+            den += pilots_tx[k].norm_sqr();
+        }
+        let gain = if den > 1e-12 { num / den } else { Complex64::new(1.0, 0.0) };
+        let center_idx = (s + e) / 2;
+        pilot_gains.push((center_idx, gain));
+    }
+
+    // Unwrap phases in pilot_gains for stable interpolation
+    let mut phases: Vec<f64> = pilot_gains.iter().map(|(_, g)| g.arg()).collect();
+    for i in 1..phases.len() {
+        let diff = phases[i] - phases[i-1];
+        if diff > std::f64::consts::PI {
+            phases[i] -= 2.0 * std::f64::consts::PI;
+        } else if diff < -std::f64::consts::PI {
+            phases[i] += 2.0 * std::f64::consts::PI;
         }
     }
 
-    // 7. Estimate sigma^2 from preamble residuals
+    // Apply complex gain correction via interpolation between pilots
+    let mut data_syms: Vec<Complex64> = Vec::new();
+    for i in 0..data_with_pilots_ref.len() {
+        let is_pilot = pilot_positions.iter().any(|&(s, e)| i >= s && i < e);
+        if is_pilot { continue; }
+
+        let (mag, phase) = if pilot_gains.is_empty() {
+            (1.0, 0.0)
+        } else if i <= pilot_gains[0].0 {
+            (pilot_gains[0].1.norm(), phases[0])
+        } else if i >= pilot_gains.last().unwrap().0 {
+            let last = pilot_gains.len() - 1;
+            (pilot_gains[last].1.norm(), phases[last])
+        } else {
+            // Linear interp between bracketing pilots
+            let mut j = 0;
+            while j + 1 < pilot_gains.len() && pilot_gains[j+1].0 < i {
+                j += 1;
+            }
+            let (i0, g0) = pilot_gains[j];
+            let (i1, _g1) = pilot_gains[j+1];
+            let alpha = (i - i0) as f64 / (i1 - i0) as f64;
+            let mag = g0.norm() * (1.0 - alpha) + pilot_gains[j+1].1.norm() * alpha;
+            let phase = phases[j] * (1.0 - alpha) + phases[j+1] * alpha;
+            (mag, phase)
+        };
+
+        let inv_gain = Complex64::from_polar(1.0 / mag.max(1e-6), -phase);
+        data_syms.push(data_region[i] * inv_gain);
+    }
+
+    // 7. Estimate sigma^2 from pilot residuals (post-correction)
     let sigma2 = {
-        let sum: f64 = (0..N_PREAMBLE)
-            .map(|k| (corrected[k] - preamble_syms[k]).norm_sqr())
-            .sum();
-        (sum / N_PREAMBLE as f64).max(1e-6)
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for (g, &(s, e)) in pilot_positions.iter().enumerate() {
+            let pilots_tx = pilot::pilots_for_group(g);
+            let gain = pilot_gains[g].1;
+            let inv = Complex64::new(1.0, 0.0) / gain;
+            for (k, idx) in (s..e).enumerate() {
+                let corrected_pilot = data_region[idx] * inv;
+                sum += (corrected_pilot - pilots_tx[k]).norm_sqr();
+                count += 1;
+            }
+        }
+        if count > 0 { (sum / count as f64).max(1e-6) } else { 1.0 }
     };
 
     // 8. Soft demod + deinterleave + LDPC decode per codeword
