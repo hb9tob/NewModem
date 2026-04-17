@@ -95,27 +95,42 @@ pub fn build_superframe(data: &[u8], config: &ModemConfig) -> Vec<Complex64> {
 
     // 5. Runout: flush RRC filter tails + extra pilot groups at the end
     //    to improve phase tracking near the signal's right edge.
-    //    Structure: N extra pilot groups (each = 32 zero-data + 2 pilot symbols),
+    //    Structure: N extra pilot groups (each = 32 filler-data + 2 pilot symbols),
     //    giving the RX extra known symbols for interpolation at the tail.
+    //    Filler = deterministic QPSK BPSK-like pattern (NOT zeros — zeros
+    //    would create a silent region that the adaptive FFE interprets as a
+    //    sudden channel change and tries to compensate with garbage taps).
     let n_extra_pilot_groups = 4;
     let first_extra_group_idx = data_with_pilots.len() / (crate::types::D_SYMS + crate::types::P_SYMS);
     for eg in 0..n_extra_pilot_groups {
-        // 32 zero data symbols
-        for _ in 0..crate::types::D_SYMS {
-            all_symbols.push(Complex64::new(0.0, 0.0));
+        for k in 0..crate::types::D_SYMS {
+            all_symbols.push(runout_filler_symbol(eg * crate::types::D_SYMS + k));
         }
-        // 2 pilot symbols at the continued group index
         let pilots = pilot::pilots_for_group(first_extra_group_idx + eg);
         all_symbols.extend_from_slice(&pilots);
     }
 
-    // Final RRC tail flush
+    // Final RRC tail flush with the same filler pattern
     let runout_len = 24;
-    for _ in 0..runout_len {
-        all_symbols.push(Complex64::new(0.0, 0.0));
+    for k in 0..runout_len {
+        all_symbols.push(runout_filler_symbol(
+            n_extra_pilot_groups * crate::types::D_SYMS + k,
+        ));
     }
 
     all_symbols
+}
+
+/// Deterministic BPSK filler used for runout / trailing edge padding. The
+/// pattern alternates ±(1+j)/√2 on the pi/4 axis so the waveform stays power-
+/// normalised to Es = 1 (same as any QPSK symbol), keeping the adaptive FFE
+/// in a sane operating regime through the tail. `k` is the sample index so
+/// callers can generate long non-constant sequences.
+fn runout_filler_symbol(k: usize) -> Complex64 {
+    // Alternating BPSK on the pi/4 axis : +1+j / sqrt(2) then -1-j / sqrt(2).
+    let sign = if k & 1 == 0 { 1.0 } else { -1.0 };
+    let m = std::f64::consts::FRAC_1_SQRT_2;
+    Complex64::new(sign * m, sign * m)
 }
 
 /// Create the appropriate constellation for a config.
@@ -295,19 +310,21 @@ pub fn build_superframe_v2(
     }
 
     // Trailing pilot groups (edge interpolation on final segment) + runout.
-    // Tie pilot group indexing to the end of the last segment's pilot stream
-    // by restarting at group 0 (consistent with per-segment indexing).
+    // Filler = BPSK ±(1+j)/√2 so the runout stays at the same average power
+    // as real data (no adaptive-FFE drift on a sudden zero region).
     let n_extra_pilot_groups = 4;
     for eg in 0..n_extra_pilot_groups {
-        for _ in 0..crate::types::D_SYMS {
-            all_symbols.push(Complex64::new(0.0, 0.0));
+        for k in 0..crate::types::D_SYMS {
+            all_symbols.push(runout_filler_symbol(eg * crate::types::D_SYMS + k));
         }
         let pilots = pilot::pilots_for_group(eg);
         all_symbols.extend_from_slice(&pilots);
     }
     let runout_len = 24;
-    for _ in 0..runout_len {
-        all_symbols.push(Complex64::new(0.0, 0.0));
+    for k in 0..runout_len {
+        all_symbols.push(runout_filler_symbol(
+            n_extra_pilot_groups * crate::types::D_SYMS + k,
+        ));
     }
 
     all_symbols

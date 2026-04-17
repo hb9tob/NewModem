@@ -32,3 +32,4 @@ pub mod pll;
 pub mod soft_demod;
 pub mod rx;
 pub mod rx_v2;
+pub mod rx_stream;
