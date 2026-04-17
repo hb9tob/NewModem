@@ -12,6 +12,8 @@ pub mod pilot;
 pub mod crc;
 pub mod golay;
 pub mod header;
+pub mod app_header;
+pub mod marker;
 pub mod profile;
 pub mod interleaver;
 
@@ -28,3 +30,4 @@ pub mod equalizer;
 pub mod pll;
 pub mod soft_demod;
 pub mod rx;
+pub mod rx_v2;

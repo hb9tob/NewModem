@@ -153,6 +153,136 @@ fn gauss_solve(mut a: Vec<Vec<Complex64>>, mut b: Vec<Complex64>) -> Option<Vec<
     Some(b)
 }
 
+/// Apply a LS-trained FFE with continuous LMS adaptation (decision-directed
+/// after the initial training region) across a symbol-rate pass over the stream.
+///
+/// The FFE starts from `initial_taps` (produced by `train_ffe_ls` on a known
+/// training prefix) and then continues to refine the taps for every subsequent
+/// symbol using DD-LMS. This absorbs residual ISI that the truncated FFE could
+/// not capture from the preamble alone — crucial on FTN profiles where the
+/// RRC pulse tails span more symbols than the FFE's finite length.
+///
+/// For symbol k, the slicer uses `data_constellation` to pick the nearest point
+/// as the training reference. The learning rate is `mu_dd` throughout. (Callers
+/// who want a different mu during a known-training prefix can re-call
+/// `train_ffe_ls` then feed the result here; the DD-LMS tracks from there.)
+///
+/// Returns `(outputs, final_taps)` where `outputs[k]` is the FFE result at
+/// symbol slot k = first_center + k * pitch_fse.
+pub fn apply_ffe_lms(
+    fse_input: &[Complex64],
+    initial_taps: &[Complex64],
+    first_center: usize,
+    pitch_fse: usize,
+    n_total_sym: usize,
+    data_constellation: &crate::constellation::Constellation,
+    mu_dd: f64,
+) -> (Vec<Complex64>, Vec<Complex64>) {
+    let n_ff = initial_taps.len();
+    let half = n_ff / 2;
+    let zero = Complex64::new(0.0, 0.0);
+    let mut taps = initial_taps.to_vec();
+    let mut outputs = Vec::with_capacity(n_total_sym);
+
+    for k in 0..n_total_sym {
+        let center = first_center + k * pitch_fse;
+        if center < half || center + half + 1 > fse_input.len() {
+            outputs.push(zero);
+            continue;
+        }
+        // FFE output
+        let lo = center - half;
+        let mut y = zero;
+        for i in 0..n_ff {
+            y += taps[i] * fse_input[lo + i];
+        }
+        outputs.push(y);
+
+        // DD-LMS update using slicer on data constellation
+        let idx = data_constellation.slice_nearest(&[y])[0];
+        let d = data_constellation.points[idx];
+        let e = d - y;
+        // Normalise by input power to stabilise — classic NLMS
+        let mut r_pow = 1e-12f64;
+        for i in 0..n_ff {
+            r_pow += fse_input[lo + i].norm_sqr();
+        }
+        let mu_eff = mu_dd / r_pow;
+        for i in 0..n_ff {
+            taps[i] += Complex64::new(mu_eff, 0.0) * e * fse_input[lo + i].conj();
+        }
+    }
+
+    (outputs, taps)
+}
+
+/// Hybrid LS-then-DD-LMS apply: iterate over the stream, using KNOWN training
+/// references at positions where they are available (preamble + optionally
+/// trailing pilots once segment layout is known) and slicer-decision references
+/// elsewhere. This is the workhorse used by the v2 RX pipeline.
+///
+/// `training` is a slice of `(symbol_index, reference_symbol)` sorted by
+/// symbol_index. At those indices, the LMS update uses the given reference
+/// with learning rate `mu_train`. At all other indices, the update uses the
+/// data-constellation slicer with rate `mu_dd`. Setting either rate to 0
+/// freezes the taps for that class of symbol.
+pub fn apply_ffe_lms_with_training(
+    fse_input: &[Complex64],
+    initial_taps: &[Complex64],
+    first_center: usize,
+    pitch_fse: usize,
+    n_total_sym: usize,
+    training: &[(usize, Complex64)],
+    data_constellation: &crate::constellation::Constellation,
+    mu_train: f64,
+    mu_dd: f64,
+) -> (Vec<Complex64>, Vec<Complex64>) {
+    let n_ff = initial_taps.len();
+    let half = n_ff / 2;
+    let zero = Complex64::new(0.0, 0.0);
+    let mut taps = initial_taps.to_vec();
+    let mut outputs = Vec::with_capacity(n_total_sym);
+
+    let mut train_cursor = 0usize;
+    for k in 0..n_total_sym {
+        let center = first_center + k * pitch_fse;
+        if center < half || center + half + 1 > fse_input.len() {
+            outputs.push(zero);
+            continue;
+        }
+        let lo = center - half;
+        let mut y = zero;
+        for i in 0..n_ff {
+            y += taps[i] * fse_input[lo + i];
+        }
+        outputs.push(y);
+
+        // Advance training cursor to catch up
+        while train_cursor < training.len() && training[train_cursor].0 < k {
+            train_cursor += 1;
+        }
+        let (d, mu) = if train_cursor < training.len() && training[train_cursor].0 == k {
+            (training[train_cursor].1, mu_train)
+        } else {
+            let idx = data_constellation.slice_nearest(&[y])[0];
+            (data_constellation.points[idx], mu_dd)
+        };
+        if mu > 0.0 {
+            let e = d - y;
+            let mut r_pow = 1e-12f64;
+            for i in 0..n_ff {
+                r_pow += fse_input[lo + i].norm_sqr();
+            }
+            let mu_eff = mu / r_pow;
+            for i in 0..n_ff {
+                taps[i] += Complex64::new(mu_eff, 0.0) * e * fse_input[lo + i].conj();
+            }
+        }
+    }
+
+    (outputs, taps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
