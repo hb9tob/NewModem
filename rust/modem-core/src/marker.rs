@@ -1,45 +1,56 @@
-//! Resync marker: 32-symbol QPSK sync pattern + 32-symbol QPSK control payload.
+//! Resync marker: 32-symbol QPSK sync pattern + 96-symbol QPSK Golay-protected
+//! control payload.
 //!
 //! Inserted between segments of `N` full LDPC codewords. Provides a reacquisition
 //! anchor for phase/timing + a segment identifier, session fingerprint and RaptorQ
 //! ESI base so the RX can reenter the stream after a channel outage (squelch, deep
 //! fade) without loss of frame context.
 //!
-//! Total length: 64 QPSK symbols (2 bits/sym → 128 bits).
-//! Layout: [32 sync][16 ctrl]. Control is CRC8-protected, with 8 bytes total:
+//! Total length: 128 QPSK symbols (2 bits/sym → 256 bits).
+//! Layout: [32 sync][96 ctrl]. The 12-byte control payload is Golay(24,12)-encoded
+//! (8 blocks → 192 coded bits → 96 QPSK syms), reusing the same FEC strength as
+//! the protocol header. Golay corrects up to 3 bits per 12-bit block, which makes
+//! marker detection robust to residual FFE error near constellation boundaries
+//! — especially important on FTN profiles where QPSK markers sit between 16-APSK
+//! payload symbols.
 //!
+//! Control payload layout (12 bytes, big-endian fields):
 //! ```text
-//!   seg_id           : 16 bits  (segment counter, wraps at 65536)
-//!   session_id_low   :  8 bits  (session fingerprint for fast change detection)
-//!   base_ESI         : 24 bits  (RaptorQ ESI of the first codeword in the segment)
-//!   flags            :  8 bits  (bit 0 = meta_flag, 1..7 reserved)
-//!   CRC8             :  8 bits  (CCITT over the preceding 7 bytes)
-//!   total            :  64 bits = 32 QPSK symbols
+//!   seg_id          : 2 B   segment counter (wraps at 65536)
+//!   session_id_low  : 1 B   session fingerprint for fast change detection
+//!   base_ESI[hi..lo]: 3 B   RaptorQ ESI of this segment's first codeword
+//!   flags           : 1 B   bit 0 = meta_flag; bits 1..7 reserved
+//!   reserved        : 4 B   must be zero; available for future extensions
+//!   CRC8            : 1 B   CCITT over the preceding 11 bytes (sanity)
 //! ```
+//!
+//! Decoding uses the 32-symbol sync pattern as a known-reference LS probe to
+//! compute a *local* complex gain, then normalises the ctrl symbols by that
+//! gain before Golay decode — this compensates residual FFE errors and any
+//! position-dependent phase offset in the stream.
 
 use crate::constellation::qpsk_gray;
 use crate::crc::crc8;
+use crate::golay::{golay_decode, golay_encode};
 use crate::types::Complex64;
 
 /// Sync-pattern length in symbols (QPSK).
 pub const MARKER_SYNC_LEN: usize = 32;
 
-/// Control-payload length in symbols (QPSK). 8 bytes × 4 syms/byte.
-pub const MARKER_CTRL_LEN: usize = 32;
+/// Control-payload length in symbols (QPSK). 12 bytes × 8 coded Golay bits ÷ 2 bits/sym.
+pub const MARKER_CTRL_LEN: usize = 96;
 
 /// Total marker length in symbols.
 pub const MARKER_LEN: usize = MARKER_SYNC_LEN + MARKER_CTRL_LEN;
 
 /// Control-payload size in bytes.
-pub const MARKER_CTRL_BYTES: usize = 8;
+pub const MARKER_CTRL_BYTES: usize = 12;
 
 /// meta_flag bit position inside the flags byte.
 pub const META_FLAG_BIT: u8 = 0x01;
 
 /// Fixed sync-pattern phase table (32 QPSK symbols).
-/// Chosen distinct from the preamble's phase distribution; any shift has
-/// sufficient autocorrelation margin for peak detection at typical OTA SNR.
-/// Values are in {0,1,2,3}, mapped to `exp(j*(pi/4 + q*pi/2))` to match the
+/// Values in {0,1,2,3}, mapped to `exp(j*(pi/4 + q*pi/2))` to match the
 /// preamble convention.
 const MARKER_SYNC_PHASES: [u8; MARKER_SYNC_LEN] = [
     0, 2, 1, 3, 2, 0, 3, 1, 3, 1, 0, 2, 1, 3, 2, 0, 1, 3, 0, 2, 3, 1, 2, 0, 2, 0, 3, 1, 0, 2, 1, 3,
@@ -64,6 +75,7 @@ pub struct MarkerPayload {
     pub session_id_low: u8,
     pub base_esi: u32, // 24-bit value, upper 8 bits must be zero
     pub flags: u8,
+    pub reserved: u32, // 32-bit reserved for future extensions
 }
 
 impl MarkerPayload {
@@ -71,7 +83,8 @@ impl MarkerPayload {
         self.flags & META_FLAG_BIT != 0
     }
 
-    /// Serialize to 8 bytes: [seg_id][session_id_low][base_ESI_msb..lsb][flags][crc8].
+    /// Serialize to 12 bytes: seg_id(2) + session(1) + base_esi(3) + flags(1)
+    /// + reserved(4) + crc8(1).
     pub fn to_bytes(&self) -> [u8; MARKER_CTRL_BYTES] {
         assert!(self.base_esi < (1 << 24), "base_esi must fit in 24 bits");
         let mut buf = [0u8; MARKER_CTRL_BYTES];
@@ -81,43 +94,78 @@ impl MarkerPayload {
         buf[4] = ((self.base_esi >> 8) & 0xFF) as u8;
         buf[5] = (self.base_esi & 0xFF) as u8;
         buf[6] = self.flags;
-        buf[7] = crc8(&buf[0..7]);
+        buf[7..11].copy_from_slice(&self.reserved.to_be_bytes());
+        buf[11] = crc8(&buf[0..11]);
         buf
     }
 
-    /// Deserialize from 8 bytes; returns None on CRC mismatch.
+    /// Deserialize from 12 bytes; returns None on CRC mismatch.
     pub fn from_bytes(buf: &[u8; MARKER_CTRL_BYTES]) -> Option<Self> {
-        if crc8(&buf[0..7]) != buf[7] {
+        if crc8(&buf[0..11]) != buf[11] {
             return None;
         }
         let seg_id = u16::from_be_bytes([buf[0], buf[1]]);
         let session_id_low = buf[2];
         let base_esi = ((buf[3] as u32) << 16) | ((buf[4] as u32) << 8) | (buf[5] as u32);
         let flags = buf[6];
+        let reserved = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
         Some(MarkerPayload {
             seg_id,
             session_id_low,
             base_esi,
             flags,
+            reserved,
         })
     }
 }
 
-/// Map a marker payload to 32 QPSK symbols (8 bytes × 4 syms/byte, MSB first).
-pub fn encode_control_symbols(payload: &MarkerPayload) -> Vec<Complex64> {
-    let bytes = payload.to_bytes();
-    let mut bits = Vec::with_capacity(MARKER_CTRL_LEN * 2);
-    for &byte in &bytes {
+fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+    let mut bits = Vec::with_capacity(bytes.len() * 8);
+    for &byte in bytes {
         for bit in (0..8).rev() {
             bits.push((byte >> bit) & 1);
         }
     }
-    let qpsk = qpsk_gray();
-    qpsk.map_bits(&bits)
+    bits
 }
 
-/// Decode 32 QPSK symbols back to a marker payload.
-/// Returns None if CRC8 fails (marker corrupted).
+fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+    bits.chunks_exact(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0u8, |acc, (i, &b)| acc | ((b & 1) << (7 - i)))
+        })
+        .collect()
+}
+
+/// Map a marker payload to 96 QPSK symbols via Golay(24,12) on each 12-bit chunk
+/// of the serialised payload. 12 B × 8 bits = 96 info bits → 8 Golay blocks →
+/// 192 coded bits → 96 QPSK symbols (2 bits/symbol).
+pub fn encode_control_symbols(payload: &MarkerPayload) -> Vec<Complex64> {
+    let bytes = payload.to_bytes();
+    let bits = bytes_to_bits(&bytes);
+    assert_eq!(bits.len(), 96);
+
+    let mut coded_bits = Vec::with_capacity(192);
+    for block in bits.chunks_exact(12) {
+        let info: u16 = block
+            .iter()
+            .enumerate()
+            .fold(0u16, |acc, (i, &b)| acc | ((b as u16) << (11 - i)));
+        let cw = golay_encode(info);
+        for bit in (0..24).rev() {
+            coded_bits.push(((cw >> bit) & 1) as u8);
+        }
+    }
+    assert_eq!(coded_bits.len(), 192);
+
+    let qpsk = qpsk_gray();
+    qpsk.map_bits(&coded_bits)
+}
+
+/// Decode 96 QPSK symbols back to a marker payload via Golay then CRC8 check.
 pub fn decode_control_symbols(symbols: &[Complex64]) -> Option<MarkerPayload> {
     if symbols.len() != MARKER_CTRL_LEN {
         return None;
@@ -125,24 +173,70 @@ pub fn decode_control_symbols(symbols: &[Complex64]) -> Option<MarkerPayload> {
     let qpsk = qpsk_gray();
     let indices = qpsk.slice_nearest(symbols);
     let bits = qpsk.symbols_to_bits(&indices);
-    assert_eq!(bits.len(), MARKER_CTRL_LEN * 2);
-    let mut buf = [0u8; MARKER_CTRL_BYTES];
-    for (i, byte) in buf.iter_mut().enumerate() {
-        let mut b: u8 = 0;
-        for k in 0..8 {
-            b = (b << 1) | (bits[i * 8 + k] & 1);
+    assert_eq!(bits.len(), 192);
+
+    let mut info_bits = Vec::with_capacity(96);
+    for block in bits.chunks_exact(24) {
+        let received: u32 = block
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &b)| acc | ((b as u32) << (23 - i)));
+        let decoded = golay_decode(received)?;
+        for bit in (0..12).rev() {
+            info_bits.push(((decoded >> bit) & 1) as u8);
         }
-        *byte = b;
     }
+    assert_eq!(info_bits.len(), 96);
+
+    let bytes = bits_to_bytes(&info_bits);
+    let mut buf = [0u8; MARKER_CTRL_BYTES];
+    buf.copy_from_slice(&bytes);
     MarkerPayload::from_bytes(&buf)
 }
 
-/// Generate a complete marker (sync pattern + control payload) as 64 QPSK symbols.
+/// Generate a complete marker (sync pattern + control payload) as 128 QPSK symbols.
 pub fn make_marker(payload: &MarkerPayload) -> Vec<Complex64> {
     let mut out = Vec::with_capacity(MARKER_LEN);
     out.extend(make_sync_pattern());
     out.extend(encode_control_symbols(payload));
     out
+}
+
+/// Decode a full marker (sync pattern + control payload) from the received stream.
+///
+/// Uses the 32-symbol sync pattern as a known-reference LS probe to compute a
+/// local complex gain, then normalises the control symbols by that gain before
+/// Golay decode. This compensates residual FFE errors and any per-position phase
+/// offset in the stream, so markers survive FTN profiles where QPSK markers
+/// sit between 16-APSK payload symbols (residual ISI from the high-amplitude
+/// outer ring leaks into neighbouring QPSK symbols).
+///
+/// Returns `None` if the sync pattern correlation is too weak (probably not a
+/// marker position) or if Golay / CRC8 reject the ctrl payload.
+pub fn decode_marker_at(symbols: &[Complex64]) -> Option<MarkerPayload> {
+    if symbols.len() != MARKER_LEN {
+        return None;
+    }
+    let (sync_rx, ctrl_rx) = symbols.split_at(MARKER_SYNC_LEN);
+    let sync_tx = make_sync_pattern();
+
+    // LS gain on sync pattern
+    let mut num = Complex64::new(0.0, 0.0);
+    let mut den = 0.0f64;
+    for (a, b) in sync_rx.iter().zip(sync_tx.iter()) {
+        num += *a * b.conj();
+        den += b.norm_sqr();
+    }
+    if den < 1e-12 {
+        return None;
+    }
+    let gain = num / den;
+    if gain.norm() < 0.2 {
+        return None;
+    }
+
+    let ctrl_norm: Vec<Complex64> = ctrl_rx.iter().map(|&s| s / gain).collect();
+    decode_control_symbols(&ctrl_norm)
 }
 
 #[cfg(test)]
@@ -165,6 +259,7 @@ mod tests {
             session_id_low: 0xAB,
             base_esi: 0x00F0_F0F0,
             flags: META_FLAG_BIT,
+            reserved: 0xDEAD_BEEF,
         };
         let bytes = p.to_bytes();
         let p2 = MarkerPayload::from_bytes(&bytes).expect("CRC valid");
@@ -178,6 +273,7 @@ mod tests {
             session_id_low: 2,
             base_esi: 3,
             flags: 0,
+            reserved: 0,
         };
         let mut bytes = p.to_bytes();
         bytes[0] ^= 0x01;
@@ -191,6 +287,7 @@ mod tests {
             session_id_low: 0x5A,
             base_esi: 0x123456,
             flags: META_FLAG_BIT,
+            reserved: 0,
         };
         let syms = encode_control_symbols(&p);
         assert_eq!(syms.len(), MARKER_CTRL_LEN);
@@ -205,6 +302,7 @@ mod tests {
             session_id_low: 0,
             base_esi: 0,
             flags: 0,
+            reserved: 0,
         };
         let m = make_marker(&p);
         assert_eq!(m.len(), MARKER_LEN);
@@ -217,6 +315,7 @@ mod tests {
             session_id_low: 0,
             base_esi: 0,
             flags: 0,
+            reserved: 0,
         };
         assert!(!p.is_meta());
         p.flags |= META_FLAG_BIT;
@@ -225,8 +324,6 @@ mod tests {
 
     #[test]
     fn sync_pattern_distinct_from_preamble() {
-        // Autocorrelation sanity: cross-correlate sync pattern with first 32 syms
-        // of preamble and check peak < full self-correlation.
         let sync = make_sync_pattern();
         let pre = crate::preamble::make_preamble();
         let mut peak: f64 = 0.0;
@@ -245,5 +342,28 @@ mod tests {
             peak < self_corr * 0.6,
             "Marker sync cross-correlates too strongly with preamble: {peak:.2} vs {self_corr:.2}"
         );
+    }
+
+    /// Golay corrects up to 3 bit-errors per 24-bit block. Verify that a
+    /// realistic corruption pattern (a handful of flipped QPSK symbols spread
+    /// across the ctrl payload) is still recovered.
+    #[test]
+    fn golay_recovers_from_symbol_errors() {
+        let p = MarkerPayload {
+            seg_id: 7,
+            session_id_low: 0x99,
+            base_esi: 0x000ABC,
+            flags: 0,
+            reserved: 0x1111_2222,
+        };
+        let mut syms = encode_control_symbols(&p);
+        // Corrupt 4 symbols across different Golay blocks. Each QPSK symbol
+        // corrupts 2 bits, spread across 8 blocks → ≤1 error per block on
+        // average, well under the 3-bit correction capacity.
+        for &k in &[3usize, 20, 45, 80] {
+            syms[k] = -syms[k]; // 180° flip = both bits flip
+        }
+        let p2 = decode_control_symbols(&syms).expect("Golay should correct");
+        assert_eq!(p, p2);
     }
 }

@@ -243,6 +243,7 @@ pub fn build_superframe_v2(
             session_id_low,
             base_esi: data_cursor as u32,
             flags: META_FLAG_BIT,
+            reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));
         let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
@@ -259,6 +260,7 @@ pub fn build_superframe_v2(
                 session_id_low,
                 base_esi: data_cursor as u32,
                 flags: META_FLAG_BIT,
+                reserved: 0,
             };
             all_symbols.extend(marker::make_marker(&payload));
             let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
@@ -280,6 +282,7 @@ pub fn build_superframe_v2(
             session_id_low,
             base_esi: data_cursor as u32,
             flags: 0,
+            reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));
         let (with_pilots, _) = pilot::interleave_data_pilots(&seg_data);

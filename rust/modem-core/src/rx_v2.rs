@@ -144,14 +144,13 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let mut session_id_low_lock: Option<u8> = None;
 
     while cursor + MARKER_LEN <= data_region.len() {
-        let ctrl_start = cursor + MARKER_SYNC_LEN;
-        let ctrl_end = ctrl_start + MARKER_CTRL_LEN;
-        let ctrl_syms = &data_region[ctrl_start..ctrl_end];
-        let marker_payload = match marker::decode_control_symbols(ctrl_syms) {
+        let marker_syms = &data_region[cursor..cursor + MARKER_LEN];
+        // Decode-with-local-normalisation: uses the 32-sym sync pattern as a
+        // known LS probe so residual FFE errors + per-position phase offsets
+        // don't corrupt the ctrl CRC.
+        let marker_payload = match marker::decode_marker_at(marker_syms) {
             Some(p) => p,
             None => {
-                // Marker CRC failed. For now: advance one marker width and retry.
-                // Sliding correlation re-acquisition will be added later for OTA gaps.
                 segments_lost += 1;
                 cursor += MARKER_LEN;
                 continue;
@@ -392,7 +391,7 @@ mod tests {
     use super::*;
     use crate::app_header::mime;
     use crate::modulator;
-    use crate::profile::{profile_high, profile_normal, profile_robust, profile_ultra};
+    use crate::profile::{profile_high, profile_mega, profile_normal, profile_robust, profile_ultra};
 
     fn make_session_hash(data: &[u8]) -> u16 {
         let mut h: u16 = 0;
@@ -416,6 +415,25 @@ mod tests {
         modulator::modulate(&symbols, sps, pitch, &taps, config.center_freq_hz)
     }
 
+    /// Diagnostic: MEGA (FTN τ=30/32) with a minimal v2 frame (1 data CW).
+    /// Isolates whether the v2 MEGA failure is about segment boundaries or
+    /// about the FTN pipeline in isolation.
+    #[test]
+    fn loopback_v2_mega_single_codeword() {
+        let config = profile_mega();
+        let data = vec![0x5Au8; 200]; // 1 codeword at r3/4 (k_bytes=216)
+        let samples = tx_v2(&data, &config, 0xCAFE_BEEF);
+        let result = rx_v2(&samples, &config).expect("RX v2 MEGA 1cw failed");
+        eprintln!(
+            "MEGA 1 CW : {}/{} converged, sigma²={:.4}, segments={}, lost={}",
+            result.converged_blocks,
+            result.total_blocks,
+            result.sigma2,
+            result.segments_decoded,
+            result.segments_lost
+        );
+    }
+
     #[test]
     fn loopback_v2_normal_small() {
         let config = profile_normal();
@@ -434,6 +452,7 @@ mod tests {
     fn loopback_v2_818_bytes_all_profiles() {
         let data: Vec<u8> = (0..818).map(|i| (i % 256) as u8).collect();
         for (name, config) in [
+            ("MEGA", profile_mega()),
             ("HIGH", profile_high()),
             ("NORMAL", profile_normal()),
             ("ROBUST", profile_robust()),
