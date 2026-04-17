@@ -723,6 +723,28 @@ mod tests {
         );
     }
 
+    /// End-to-end test of the payload envelope: wrap a user file with
+    /// filename + callsign, push through v2 TX → RX, unwrap, compare.
+    #[test]
+    fn loopback_v2_with_payload_envelope() {
+        use crate::payload_envelope::PayloadEnvelope;
+        let config = profile_normal();
+        let user_content: Vec<u8> = (0..500).map(|i| (i * 7 + 3) as u8).collect();
+        let envelope =
+            PayloadEnvelope::new("photo.avif", "HB9TOB", user_content.clone())
+                .expect("envelope fits in size limits");
+        let wire_payload = envelope.encode();
+
+        let samples = tx_v2(&wire_payload, &config, 0xAABB_CCDD);
+        let result = rx_v2(&samples, &config).expect("RX v2 must decode");
+        assert_eq!(result.converged_blocks, result.total_blocks);
+
+        let decoded_env = PayloadEnvelope::decode(&result.data).expect("envelope must decode");
+        assert_eq!(decoded_env.filename, "photo.avif");
+        assert_eq!(decoded_env.callsign, "HB9TOB");
+        assert_eq!(decoded_env.content, user_content);
+    }
+
     #[test]
     fn loopback_v2_normal_small() {
         let config = profile_normal();

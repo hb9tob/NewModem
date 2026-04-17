@@ -14,6 +14,7 @@ pub mod golay;
 pub mod header;
 pub mod app_header;
 pub mod marker;
+pub mod payload_envelope;
 pub mod profile;
 pub mod interleaver;
 
