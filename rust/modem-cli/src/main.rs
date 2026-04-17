@@ -62,6 +62,16 @@ enum Commands {
         /// v2 only: 32-bit session identifier (hex, random if omitted)
         #[arg(long)]
         session_id: Option<String>,
+
+        /// v2 only: original filename to embed in the payload envelope
+        /// (default = basename of --input, max 64 UTF-8 bytes)
+        #[arg(long)]
+        filename: Option<String>,
+
+        /// v2 only: operator callsign (QRZ) to embed in the payload envelope
+        /// (required for v2, max 10 ASCII bytes). Example: HB9TOB.
+        #[arg(long)]
+        callsign: Option<String>,
     },
 
     /// Decode a WAV audio signal to a file
@@ -121,6 +131,8 @@ fn main() {
             vox,
             frame_version,
             session_id,
+            filename,
+            callsign,
         } => {
             let mut config = parse_profile(&profile);
 
@@ -161,15 +173,40 @@ fn main() {
                     }
                 }
                 2 => {
+                    // Wrap user data in a payload envelope carrying filename +
+                    // callsign so the RX GUI can identify the transmitter and
+                    // the original file name even before decoding the content.
+                    let fname = filename
+                        .clone()
+                        .unwrap_or_else(|| infer_filename(&input));
+                    let qrz = callsign.clone().unwrap_or_else(|| {
+                        eprintln!(
+                            "TX v2 error: --callsign is required (e.g. HB9TOB)"
+                        );
+                        std::process::exit(1);
+                    });
+                    let envelope = modem_core::payload_envelope::PayloadEnvelope::new(
+                        &fname, &qrz, data.clone(),
+                    )
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "TX v2 error: filename (len {}) / callsign (len {}) exceed size limits or contain NUL",
+                            fname.len(),
+                            qrz.len()
+                        );
+                        std::process::exit(1);
+                    });
+                    let wire_payload = envelope.encode();
+
                     let sid = parse_session_id(session_id.as_deref());
-                    let hash = content_hash_short(&data);
+                    let hash = content_hash_short(&wire_payload);
                     let mime = infer_mime(&input);
                     eprintln!(
-                        "TX v2: session_id=0x{:08X}, mime=0x{:02X}, hash=0x{:04X}",
-                        sid, mime, hash
+                        "TX v2: session_id=0x{:08X}, callsign={}, filename={}, mime=0x{:02X}, hash=0x{:04X}",
+                        sid, qrz, fname, mime, hash
                     );
                     let symbols = modem_core::frame::build_superframe_v2(
-                        &data, &config, sid, mime, hash,
+                        &wire_payload, &config, sid, mime, hash,
                     );
                     // Reuse TX modulation pipeline
                     let (sps, pitch) = modem_core::rrc::check_integer_constraints(
@@ -308,11 +345,38 @@ fn main() {
                                 ah.mime_type, ah.hash_short
                             );
                         }
-                        std::fs::write(&output, &result.data).unwrap_or_else(|e| {
+
+                        // Attempt to unwrap the payload envelope (v2 TX adds one
+                        // since the GUI RX phase). On legacy v2 transmissions
+                        // without envelope, decode_or_fallback returns an empty
+                        // envelope with the full buffer as content.
+                        let envelope = modem_core::payload_envelope::PayloadEnvelope::decode_or_fallback(
+                            &result.data,
+                        );
+                        if envelope.version == 0 {
+                            eprintln!(
+                                "Payload envelope: none (legacy v2, writing raw content)"
+                            );
+                        } else {
+                            eprintln!(
+                                "Payload envelope: v{}, from={}, filename={}, content_size={} B",
+                                envelope.version,
+                                envelope.callsign,
+                                envelope.filename,
+                                envelope.content.len()
+                            );
+                        }
+
+                        let to_write = if envelope.version == 0 {
+                            &result.data
+                        } else {
+                            &envelope.content
+                        };
+                        std::fs::write(&output, to_write).unwrap_or_else(|e| {
                             eprintln!("Error writing {}: {e}", output.display());
                             std::process::exit(1);
                         });
-                        eprintln!("Written {} bytes to {}", result.data.len(), output.display());
+                        eprintln!("Written {} bytes to {}", to_write.len(), output.display());
                     }
                     None => {
                         eprintln!(
@@ -389,6 +453,23 @@ fn content_hash_short(data: &[u8]) -> u16 {
         h = h.wrapping_mul(16777619);
     }
     (h ^ (h >> 16)) as u16
+}
+
+fn infer_filename(path: &PathBuf) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| {
+            if s.len() > modem_core::payload_envelope::MAX_FILENAME_BYTES {
+                // Keep the extension, truncate the stem to fit
+                let max = modem_core::payload_envelope::MAX_FILENAME_BYTES;
+                let (stem, ext) = s.rfind('.').map(|i| s.split_at(i)).unwrap_or((s, ""));
+                let keep = max.saturating_sub(ext.len());
+                format!("{}{}", &stem[..keep.min(stem.len())], ext)
+            } else {
+                s.to_string()
+            }
+        })
+        .unwrap_or_else(|| "unknown.bin".to_string())
 }
 
 fn infer_mime(path: &PathBuf) -> u8 {
