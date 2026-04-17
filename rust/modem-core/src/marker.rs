@@ -202,6 +202,50 @@ pub fn make_marker(payload: &MarkerPayload) -> Vec<Complex64> {
     out
 }
 
+/// Find the marker sync pattern in a search window and return (position, gain).
+///
+/// Correlates the 32-symbol sync pattern across positions `[start..start+window]`
+/// and returns the argmax of `|Σ rx[k] * sync[k].conj()|`. This tolerates small
+/// symbol-timing drift (a few syms) from TCXO mismatch on long OTA transmissions,
+/// and lets the caller recover the marker position after a channel gap (squelch).
+///
+/// `min_corr_norm` sets the detection threshold — the correlation magnitude at
+/// the best position must exceed this ratio of the self-correlation
+/// (32 * |Es|) to accept the candidate. Returns `None` if no position qualifies.
+pub fn find_sync_in_window(
+    stream: &[Complex64],
+    start: usize,
+    window: usize,
+    min_corr_ratio: f64,
+) -> Option<(usize, Complex64)> {
+    let sync = make_sync_pattern();
+    let n = sync.len();
+    let self_corr: f64 = sync.iter().map(|s| s.norm_sqr()).sum();
+    let threshold = min_corr_ratio * self_corr;
+
+    let mut best_pos = start;
+    let mut best_mag = 0.0f64;
+    let mut best_gain = Complex64::new(0.0, 0.0);
+
+    let end = (start + window).min(stream.len().saturating_sub(n));
+    for pos in start..=end {
+        let mut num = Complex64::new(0.0, 0.0);
+        for (k, s) in sync.iter().enumerate() {
+            num += stream[pos + k] * s.conj();
+        }
+        let mag = num.norm();
+        if mag > best_mag {
+            best_mag = mag;
+            best_pos = pos;
+            best_gain = num / self_corr;
+        }
+    }
+    if best_mag < threshold {
+        return None;
+    }
+    Some((best_pos, best_gain))
+}
+
 /// Decode a full marker (sync pattern + control payload) from the received stream.
 ///
 /// Uses the 32-symbol sync pattern as a known-reference LS probe to compute a
