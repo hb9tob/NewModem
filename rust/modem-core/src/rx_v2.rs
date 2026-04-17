@@ -675,6 +675,54 @@ mod tests {
     ///
     /// Marked #[ignore] so regular `cargo test` stays fast; run explicitly:
     ///   cargo test -p modem-core --release -- --ignored loopback_v2_stress
+    /// Ultimate frontier: 100 kB of random payload through MEGA (16-APSK
+    /// FTN τ=30/32, LDPC rate 3/4) — the hardest profile × largest volume.
+    /// ~210 s of signal, ~460 segments, ~46 meta-segment repeats.
+    ///
+    /// Exercises : adaptive FFE on long-duration FTN, sliding marker correlation
+    /// across hundreds of markers, per-segment pilot interpolation, DD-LMS
+    /// stability over long runs, base_ESI assembly across many codewords.
+    #[test]
+    #[ignore]
+    fn loopback_v2_100kb_mega_ultimate() {
+        let config = profile_mega();
+        let size = 100_000;
+        let data: Vec<u8> = (0..size)
+            .map(|i| ((i * 61 + (i >> 3) * 239) as u32 ^ 0xDEAD_BEEF) as u8)
+            .collect();
+        let samples = tx_v2(&data, &config, 0xFF00_AA55);
+        let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
+        eprintln!(
+            "MEGA 100 kB TX : {} samples ({:.1} s), {:.1} kbps raw audio",
+            samples.len(),
+            duration_s,
+            (samples.len() as f64 * 16.0 / 1000.0) / duration_s
+        );
+
+        let result = rx_v2(&samples, &config).expect("RX v2 should not fail");
+        let ah = result.app_header.as_ref().expect("AppHeader");
+        assert_eq!(ah.file_size as usize, size);
+        assert_eq!(
+            result.converged_blocks, result.total_blocks,
+            "MEGA 100 kB: {}/{} blocks converged, σ²={:.4}, {} segs OK / {} lost",
+            result.converged_blocks, result.total_blocks, result.sigma2,
+            result.segments_decoded, result.segments_lost
+        );
+        assert_eq!(
+            &result.data[..size],
+            &data[..],
+            "MEGA 100 kB: payload mismatch"
+        );
+        eprintln!(
+            "MEGA 100 kB RX : {}/{} blocks, {} segs, σ²={:.4}, net bitrate={:.0} bps",
+            result.converged_blocks,
+            result.total_blocks,
+            result.segments_decoded,
+            result.sigma2,
+            (size as f64 * 8.0) / duration_s
+        );
+    }
+
     #[test]
     #[ignore]
     fn loopback_v2_stress_10_25_50_kb() {
