@@ -52,6 +52,16 @@ enum Commands {
         /// VOX preamble duration (seconds, 0 to disable)
         #[arg(long, default_value = "0.5")]
         vox: f64,
+
+        /// Frame format version: 1 = monolithic (legacy), 2 = segmented with
+        /// resync markers and periodic app headers (enables long-transmission
+        /// recovery and RaptorQ framing)
+        #[arg(long, default_value = "1")]
+        frame_version: u8,
+
+        /// v2 only: 32-bit session identifier (hex, random if omitted)
+        #[arg(long)]
+        session_id: Option<String>,
     },
 
     /// Decode a WAV audio signal to a file
@@ -75,6 +85,11 @@ enum Commands {
         /// Override center frequency
         #[arg(long)]
         fc: Option<f64>,
+
+        /// Frame format version: 1 = monolithic (legacy), 2 = segmented with
+        /// resync markers. Default 1 for backward compat with existing WAVs.
+        #[arg(long, default_value = "1")]
+        frame_version: u8,
     },
 
     /// Inspect a WAV file (detect preamble, show parameters)
@@ -99,6 +114,8 @@ fn main() {
             beta,
             fc,
             vox,
+            frame_version,
+            session_id,
         } => {
             let mut config = parse_profile(&profile);
 
@@ -125,15 +142,66 @@ fn main() {
                 std::process::exit(1);
             });
 
-            eprintln!("TX: {} bytes, profile={}, constellation={:?}, LDPC={:?}, Rs={} Bd, beta={}, fc={} Hz",
-                data.len(), profile, config.constellation, config.ldpc_rate,
+            eprintln!("TX v{}: {} bytes, profile={}, constellation={:?}, LDPC={:?}, Rs={} Bd, beta={}, fc={} Hz",
+                frame_version, data.len(), profile, config.constellation, config.ldpc_rate,
                 config.symbol_rate, config.beta, config.center_freq_hz);
 
             // Generate audio
-            let samples = if vox > 0.0 {
-                modem_core::tx::tx_with_vox(&data, &config, vox)
-            } else {
-                modem_core::tx::tx(&data, &config)
+            let samples = match frame_version {
+                1 => {
+                    if vox > 0.0 {
+                        modem_core::tx::tx_with_vox(&data, &config, vox)
+                    } else {
+                        modem_core::tx::tx(&data, &config)
+                    }
+                }
+                2 => {
+                    let sid = parse_session_id(session_id.as_deref());
+                    let hash = content_hash_short(&data);
+                    let mime = infer_mime(&input);
+                    eprintln!(
+                        "TX v2: session_id=0x{:08X}, mime=0x{:02X}, hash=0x{:04X}",
+                        sid, mime, hash
+                    );
+                    let symbols = modem_core::frame::build_superframe_v2(
+                        &data, &config, sid, mime, hash,
+                    );
+                    // Reuse TX modulation pipeline
+                    let (sps, pitch) = modem_core::rrc::check_integer_constraints(
+                        AUDIO_RATE,
+                        config.symbol_rate,
+                        config.tau,
+                    )
+                    .expect("invalid profile");
+                    let taps =
+                        modem_core::rrc::rrc_taps(config.beta, modem_core::types::RRC_SPAN_SYM, sps);
+                    let mut modulated = modem_core::modulator::modulate(
+                        &symbols,
+                        sps,
+                        pitch,
+                        &taps,
+                        config.center_freq_hz,
+                    );
+                    // Prepend VOX tone + silence if requested (same shape as tx_with_vox)
+                    if vox > 0.0 {
+                        let mut out = Vec::new();
+                        out.extend_from_slice(&modem_core::modulator::tone(
+                            config.center_freq_hz,
+                            vox,
+                            0.5,
+                        ));
+                        out.extend_from_slice(&modem_core::modulator::silence(0.05));
+                        out.append(&mut modulated);
+                        out.extend_from_slice(&modem_core::modulator::silence(0.1));
+                        out
+                    } else {
+                        modulated
+                    }
+                }
+                v => {
+                    eprintln!("Unsupported frame_version {v} (use 1 or 2)");
+                    std::process::exit(1);
+                }
             };
 
             let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
@@ -150,6 +218,7 @@ fn main() {
             profile,
             rs,
             fc,
+            frame_version,
         } => {
             let mut config = parse_profile(&profile);
             if let Some(r) = rs {
@@ -162,40 +231,89 @@ fn main() {
             // Read WAV
             let samples = read_wav(&input);
             let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
-            eprintln!("RX: {} samples ({:.2}s) from {}", samples.len(), duration_s, input.display());
+            eprintln!(
+                "RX v{}: {} samples ({:.2}s) from {}",
+                frame_version,
+                samples.len(),
+                duration_s,
+                input.display()
+            );
 
-            // Decode
-            match modem_core::rx::rx(&samples, &config) {
-                Some(result) => {
-                    eprintln!(
-                        "Decoded: {} bytes, {}/{} LDPC blocks converged, sigma²={:.4}",
-                        result.data.len(),
-                        result.converged_blocks,
-                        result.total_blocks,
-                        result.sigma2
-                    );
-                    if let Some(ref hdr) = result.header {
-                        eprintln!(
-                            "Header: version={}, mode=0x{:02X}, frame={}, payload_len={}, flags=0x{:02X}",
-                            hdr.version, hdr.mode_code, hdr.frame_counter,
-                            hdr.payload_length, hdr.flags
-                        );
+            match frame_version {
+                1 => {
+                    match modem_core::rx::rx(&samples, &config) {
+                        Some(result) => {
+                            eprintln!(
+                                "Decoded: {} bytes, {}/{} LDPC blocks converged, sigma²={:.4}",
+                                result.data.len(),
+                                result.converged_blocks,
+                                result.total_blocks,
+                                result.sigma2
+                            );
+                            if let Some(ref hdr) = result.header {
+                                eprintln!(
+                                    "Header: version={}, mode=0x{:02X}, frame={}, payload_len={}, flags=0x{:02X}",
+                                    hdr.version, hdr.mode_code, hdr.frame_counter,
+                                    hdr.payload_length, hdr.flags
+                                );
+                            }
+                            let payload_len = result
+                                .header
+                                .as_ref()
+                                .map(|h| h.payload_length as usize)
+                                .unwrap_or(result.data.len());
+                            let trimmed = &result.data[..payload_len.min(result.data.len())];
+                            std::fs::write(&output, trimmed).unwrap_or_else(|e| {
+                                eprintln!("Error writing {}: {e}", output.display());
+                                std::process::exit(1);
+                            });
+                            eprintln!("Written {} bytes to {}", trimmed.len(), output.display());
+                        }
+                        None => {
+                            eprintln!("RX failed: no preamble found or signal too short");
+                            std::process::exit(1);
+                        }
                     }
-
-                    // Trim decoded data to payload_length from header if available
-                    let payload_len = result.header.as_ref()
-                        .map(|h| h.payload_length as usize)
-                        .unwrap_or(result.data.len());
-                    let trimmed = &result.data[..payload_len.min(result.data.len())];
-
-                    std::fs::write(&output, trimmed).unwrap_or_else(|e| {
-                        eprintln!("Error writing {}: {e}", output.display());
-                        std::process::exit(1);
-                    });
-                    eprintln!("Written {} bytes to {}", trimmed.len(), output.display());
                 }
-                None => {
-                    eprintln!("RX failed: no preamble found or signal too short");
+                2 => match modem_core::rx_v2::rx_v2(&samples, &config) {
+                    Some(result) => {
+                        eprintln!(
+                            "Decoded: {} bytes, {}/{} LDPC blocks converged, {} segments, {} lost, sigma²={:.4}",
+                            result.data.len(),
+                            result.converged_blocks,
+                            result.total_blocks,
+                            result.segments_decoded,
+                            result.segments_lost,
+                            result.sigma2
+                        );
+                        if let Some(ref hdr) = result.header {
+                            eprintln!(
+                                "Protocol header: version={}, mode=0x{:02X}, payload_len={}",
+                                hdr.version, hdr.mode_code, hdr.payload_length
+                            );
+                        }
+                        if let Some(ref ah) = result.app_header {
+                            eprintln!(
+                                "App header: session_id=0x{:08X}, file_size={}, K={}, T={}, mime=0x{:02X}, hash=0x{:04X}",
+                                ah.session_id, ah.file_size, ah.k_symbols, ah.t_bytes,
+                                ah.mime_type, ah.hash_short
+                            );
+                        }
+                        std::fs::write(&output, &result.data).unwrap_or_else(|e| {
+                            eprintln!("Error writing {}: {e}", output.display());
+                            std::process::exit(1);
+                        });
+                        eprintln!("Written {} bytes to {}", result.data.len(), output.display());
+                    }
+                    None => {
+                        eprintln!(
+                            "RX v2 failed: no preamble found, wrong frame version, or signal too short"
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                v => {
+                    eprintln!("Unsupported frame_version {v} (use 1 or 2)");
                     std::process::exit(1);
                 }
             }
@@ -232,6 +350,51 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+fn parse_session_id(arg: Option<&str>) -> u32 {
+    match arg {
+        Some(s) => {
+            let cleaned = s.trim_start_matches("0x").trim_start_matches("0X");
+            u32::from_str_radix(cleaned, 16).unwrap_or_else(|_| {
+                eprintln!("Invalid session_id '{s}' (expected hex, e.g. 'DEADBEEF')");
+                std::process::exit(1);
+            })
+        }
+        None => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            nanos ^ (std::process::id() as u32).wrapping_mul(2654435761)
+        }
+    }
+}
+
+fn content_hash_short(data: &[u8]) -> u16 {
+    let mut h: u32 = 2166136261;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    (h ^ (h >> 16)) as u16
+}
+
+fn infer_mime(path: &PathBuf) -> u8 {
+    use modem_core::app_header::mime;
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("avif") => mime::IMAGE_AVIF,
+        Some("jpg") | Some("jpeg") => mime::IMAGE_JPEG,
+        Some("png") => mime::IMAGE_PNG,
+        Some("txt") | Some("md") => mime::TEXT,
+        _ => mime::BINARY,
     }
 }
 
