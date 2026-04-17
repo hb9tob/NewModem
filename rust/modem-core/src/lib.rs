@@ -30,3 +30,4 @@ pub mod equalizer;
 pub mod pll;
 pub mod soft_demod;
 pub mod rx;
+pub mod rx_v2;
