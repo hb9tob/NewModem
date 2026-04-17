@@ -79,7 +79,7 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let training_positions: Vec<usize> = (0..N_PREAMBLE)
         .map(|k| fse_start + k * pitch_fse)
         .collect();
-    let ffe_taps = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
+    let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
 
     let half = n_ff / 2;
     let max_syms = if fse_input.len() > fse_start + half {
@@ -87,7 +87,30 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     } else {
         0
     };
-    let all_rx_syms = ffe::apply_ffe(&fse_input, &ffe_taps, fse_start, pitch_fse, max_syms);
+
+    // Use the preamble as explicit training (refs known, high mu), then switch
+    // to decision-directed LMS on the data constellation for the rest of the
+    // stream. This absorbs FTN ISI tails that the finite LS-trained FFE leaves
+    // as residuals (critical for MEGA; harmless for other profiles since the
+    // DD slicer is very reliable at high SNR).
+    let preamble_training: Vec<(usize, Complex64)> = preamble_syms
+        .iter()
+        .enumerate()
+        .map(|(k, &s)| (k, s))
+        .collect();
+    let mu_train = 0.10;
+    let mu_dd = 0.02;
+    let (all_rx_syms, _final_taps) = ffe::apply_ffe_lms_with_training(
+        &fse_input,
+        &ffe_initial,
+        fse_start,
+        pitch_fse,
+        max_syms,
+        &preamble_training,
+        &constellation,
+        mu_train,
+        mu_dd,
+    );
     if all_rx_syms.len() < N_PREAMBLE + header_sym_count {
         return None;
     }
@@ -284,24 +307,32 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     })
 }
 
-/// Pilot-aided magnitude correction + DD-PLL phase tracking on one segment.
+/// Pilot-aided complex-gain (magnitude + phase) interpolation on one segment.
+///
+/// Uses the same approach as the v1 `rx::rx` pipeline that proved robust for
+/// MEGA FTN on OTA: per-group complex LS gain, unwrap phase, 3-point smooth,
+/// linear interpolate the complex gain per symbol, apply its inverse.
 ///
 /// Pilot group indexing within a segment restarts at 0 (matches the TX
-/// per-segment call to `pilot::interleave_data_pilots`). The DD-PLL `pll`
-/// is threaded across segments so phase tracking is continuous.
+/// per-segment call to `pilot::interleave_data_pilots`).
 ///
-/// Sigma² residuals at pilot positions are accumulated in-place.
+/// Sigma² residuals at pilot positions (post-correction) are accumulated in-place.
+///
+/// The `_pll` parameter is kept for API compatibility and may be used later
+/// for inter-pilot decision-directed refinement, but the current implementation
+/// relies only on pilot-based interpolation to avoid decision-noise amplification
+/// on FTN profiles where 16-APSK decisions are marginal.
 fn track_segment(
     seg_syms: &[Complex64],
-    pll: &mut DdPll,
-    constellation: &crate::constellation::Constellation,
+    _pll: &mut DdPll,
+    _constellation: &crate::constellation::Constellation,
     sigma2_sum: &mut f64,
     sigma2_count: &mut usize,
 ) -> Vec<Complex64> {
     let group_sz = D_SYMS + P_SYMS;
     let n_groups = seg_syms.len() / group_sz;
 
-    // Per-group complex gain (for magnitude reference)
+    // Per-group complex gain (LS fit of 2 known pilot symbols onto received)
     let mut pilot_gains: Vec<(usize, Complex64)> = Vec::with_capacity(n_groups);
     for g in 0..n_groups {
         let offset = g * group_sz;
@@ -323,7 +354,36 @@ fn track_segment(
     }
 
     let n_p = pilot_gains.len();
+    if n_p == 0 {
+        return seg_syms
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % group_sz < D_SYMS)
+            .map(|(_, &s)| s)
+            .collect();
+    }
+
+    // Unwrap phase sequence
+    let mut phases: Vec<f64> = pilot_gains.iter().map(|(_, g)| g.arg()).collect();
+    for i in 1..n_p {
+        let diff = phases[i] - phases[i - 1];
+        if diff > std::f64::consts::PI {
+            phases[i] -= 2.0 * std::f64::consts::PI;
+        } else if diff < -std::f64::consts::PI {
+            phases[i] += 2.0 * std::f64::consts::PI;
+        }
+    }
     let mags: Vec<f64> = pilot_gains.iter().map(|(_, g)| g.norm()).collect();
+
+    // 3-point smoothing (reduces pilot-noise impact on interpolation)
+    let phases_smooth: Vec<f64> = (0..n_p)
+        .map(|i| {
+            let lo = i.saturating_sub(1);
+            let hi = (i + 1).min(n_p.saturating_sub(1));
+            let span = hi - lo + 1;
+            (phases[lo] + phases[i] + phases[hi]) / span as f64
+        })
+        .collect();
     let mags_smooth: Vec<f64> = (0..n_p)
         .map(|i| {
             let lo = i.saturating_sub(1);
@@ -333,15 +393,12 @@ fn track_segment(
         })
         .collect();
 
-    let interp_mag = |i: usize| -> f64 {
-        if n_p == 0 {
-            return 1.0;
-        }
+    let interp = |i: usize| -> (f64, f64) {
         if i <= pilot_gains[0].0 {
-            return mags_smooth[0];
+            return (mags_smooth[0], phases_smooth[0]);
         }
         if i >= pilot_gains.last().unwrap().0 {
-            return mags_smooth[n_p - 1];
+            return (mags_smooth[n_p - 1], phases_smooth[n_p - 1]);
         }
         let mut j = 0;
         while j + 1 < n_p && pilot_gains[j + 1].0 < i {
@@ -350,36 +407,27 @@ fn track_segment(
         let i0 = pilot_gains[j].0;
         let i1 = pilot_gains[j + 1].0;
         let a = (i - i0) as f64 / (i1 - i0) as f64;
-        mags_smooth[j] * (1.0 - a) + mags_smooth[j + 1] * a
+        let mag = mags_smooth[j] * (1.0 - a) + mags_smooth[j + 1] * a;
+        let phase = phases_smooth[j] * (1.0 - a) + phases_smooth[j + 1] * a;
+        (mag, phase)
     };
 
     let mut data_syms: Vec<Complex64> = Vec::new();
     for (i, &y_raw) in seg_syms.iter().enumerate() {
-        let mag = interp_mag(i);
-        let y = y_raw / Complex64::new(mag.max(1e-6), 0.0);
-
-        let group = i / group_sz;
         let inner = i % group_sz;
         let is_pilot = inner >= D_SYMS;
-
-        let decision = if is_pilot {
-            let pilots_tx = pilot::pilots_for_group(group);
-            pilots_tx[inner - D_SYMS]
-        } else {
-            let rot_prev = Complex64::from_polar(1.0, -pll.theta);
-            let y_rot_prev = y * rot_prev;
-            let idx = constellation.slice_nearest(&[y_rot_prev])[0];
-            constellation.points[idx]
-        };
-
-        let y_rot = pll.derotate_and_update(y, decision);
+        let (mag, phase) = interp(i);
+        let inv_gain = Complex64::from_polar(1.0 / mag.max(1e-6), -phase);
+        let y_corrected = y_raw * inv_gain;
 
         if is_pilot {
-            let err = y_rot - decision;
-            *sigma2_sum += err.norm_sqr();
+            let group = i / group_sz;
+            let pilots_tx = pilot::pilots_for_group(group);
+            let expected = pilots_tx[inner - D_SYMS];
+            *sigma2_sum += (y_corrected - expected).norm_sqr();
             *sigma2_count += 1;
         } else {
-            data_syms.push(y_rot);
+            data_syms.push(y_corrected);
         }
     }
 
@@ -446,6 +494,67 @@ mod tests {
         assert_eq!(ah.session_id, 0xCAFEBABE);
         assert_eq!(ah.file_size, data.len() as u32);
         assert_eq!(&result.data[..data.len()], data);
+    }
+
+    /// Stress test: loopback v2 with realistic payload volumes (10/25/50 kB)
+    /// across all 5 profiles. Exercises many segments, multiple meta-segment
+    /// injections (cadence boost→nominal switch), long DD-PLL tracking, larger
+    /// ESI ranges, and session_id_low non-wrap.
+    ///
+    /// Marked #[ignore] so regular `cargo test` stays fast; run explicitly:
+    ///   cargo test -p modem-core --release -- --ignored loopback_v2_stress
+    #[test]
+    #[ignore]
+    fn loopback_v2_stress_10_25_50_kb() {
+        let sizes = [10_000usize, 25_000, 50_000];
+        // Keep MEGA at the end — if it regresses we want other profiles to run
+        // first and isolate the failure mode.
+        let profiles: Vec<(&str, ModemConfig)> = vec![
+            ("ULTRA", profile_ultra()),
+            ("ROBUST", profile_robust()),
+            ("NORMAL", profile_normal()),
+            ("HIGH", profile_high()),
+            ("MEGA", profile_mega()),
+        ];
+
+        for size in sizes {
+            let data: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+            for (name, config) in &profiles {
+                let samples = tx_v2(&data, config, 0xA1B2_C3D4);
+                let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
+                let result = rx_v2(&samples, config).unwrap_or_else(|| {
+                    panic!("{name} {size}B: rx_v2 returned None (duration {duration_s:.1}s)")
+                });
+                let ah = result
+                    .app_header
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name} {size}B: AppHeader missing"));
+                assert_eq!(ah.file_size as usize, size, "{name} {size}B: AppHeader.file_size");
+                assert_eq!(
+                    result.converged_blocks, result.total_blocks,
+                    "{name} {size}B: {}/{} blocks converged, sigma²={:.4}, segs={}/{} (ok/lost), duration={:.1}s",
+                    result.converged_blocks,
+                    result.total_blocks,
+                    result.sigma2,
+                    result.segments_decoded,
+                    result.segments_lost,
+                    duration_s,
+                );
+                assert_eq!(
+                    &result.data[..size],
+                    &data[..],
+                    "{name} {size}B: payload mismatch"
+                );
+                eprintln!(
+                    "{name:6} {size:>5}B : {}/{} blocks OK, {} segs, σ²={:.4}, {:.1}s",
+                    result.converged_blocks,
+                    result.total_blocks,
+                    result.segments_decoded,
+                    result.sigma2,
+                    duration_s,
+                );
+            }
+        }
     }
 
     #[test]
