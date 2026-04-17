@@ -16,6 +16,22 @@ pub fn crc8(data: &[u8]) -> u8 {
     crc
 }
 
+/// CRC-16/CCITT-FALSE (polynomial 0x1021, init 0xFFFF, no reflection).
+pub fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
 /// CRC-32 (IEEE 802.3, polynomial 0xEDB88320 reflected).
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
@@ -53,5 +69,12 @@ mod tests {
     #[test]
     fn crc8_empty() {
         assert_eq!(crc8(&[]), 0xFF);
+    }
+
+    #[test]
+    fn crc16_known() {
+        // "123456789" -> CRC-16/CCITT-FALSE = 0x29B1
+        let data = b"123456789";
+        assert_eq!(crc16(data), 0x29B1);
     }
 }
