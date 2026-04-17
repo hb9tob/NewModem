@@ -105,6 +105,74 @@ pub struct ModemConfig {
     pub apsk_gamma: f64,
 }
 
+/// Canonical profile identifier.
+///
+/// Transported as a single byte in the protocol header's `profile_index` field
+/// so the RX can unambiguously reconstruct the full `ModemConfig` (including
+/// `tau` and `beta`, which are NOT captured by `mode_code`). A byte here also
+/// resolves the HIGH vs MEGA ambiguity (same constellation + rate + symbol_rate
+/// → same mode_code; only `tau` differs).
+///
+/// Value 0xFF reserved for "unknown / legacy / not-set".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProfileIndex {
+    Ultra = 0,
+    Robust = 1,
+    Normal = 2,
+    High = 3,
+    Mega = 4,
+}
+
+impl ProfileIndex {
+    pub const UNKNOWN: u8 = 0xFF;
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Ultra),
+            1 => Some(Self::Robust),
+            2 => Some(Self::Normal),
+            3 => Some(Self::High),
+            4 => Some(Self::Mega),
+            _ => None,
+        }
+    }
+
+    /// Build the full `ModemConfig` for this profile.
+    pub fn to_config(self) -> ModemConfig {
+        match self {
+            Self::Ultra => profile_ultra(),
+            Self::Robust => profile_robust(),
+            Self::Normal => profile_normal(),
+            Self::High => profile_high(),
+            Self::Mega => profile_mega(),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ultra => "ULTRA",
+            Self::Robust => "ROBUST",
+            Self::Normal => "NORMAL",
+            Self::High => "HIGH",
+            Self::Mega => "MEGA",
+        }
+    }
+
+    /// All profile indices in canonical order.
+    pub const ALL: [Self; 5] = [
+        Self::Ultra,
+        Self::Robust,
+        Self::Normal,
+        Self::High,
+        Self::Mega,
+    ];
+}
+
 impl ModemConfig {
     /// Net data rate in bits/s (after LDPC + pilot overhead).
     pub fn net_bitrate(&self) -> f64 {

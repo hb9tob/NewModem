@@ -25,12 +25,16 @@ pub struct Header {
     pub payload_length: u16,
     pub flags: u8,
     pub freq_offset: u8,
-    pub reserved: u8,
+    /// Canonical `ProfileIndex::as_u8()`, or `ProfileIndex::UNKNOWN` (0xFF)
+    /// for legacy TX that didn't populate this field. The RX uses this byte
+    /// to unambiguously reconstruct the full `ModemConfig`, including `tau`
+    /// and `beta` which are not captured by `mode_code`.
+    pub profile_index: u8,
 }
 
 impl Header {
     /// Serialize to 12 bytes: magic(2) + version(1) + mode_code(1) + frame_counter(2)
-    /// + payload_length(2) + flags(1) + freq_offset(1) + reserved(1) + crc8(1).
+    /// + payload_length(2) + flags(1) + freq_offset(1) + profile_index(1) + crc8(1).
     pub fn to_bytes(&self) -> [u8; 12] {
         let mut buf = [0u8; 12];
         buf[0] = (HEADER_MAGIC >> 8) as u8;
@@ -43,7 +47,7 @@ impl Header {
         buf[7] = (self.payload_length & 0xFF) as u8;
         buf[8] = self.flags;
         buf[9] = self.freq_offset;
-        buf[10] = self.reserved;
+        buf[10] = self.profile_index;
         buf[11] = crc8(&buf[0..11]);
         buf
     }
@@ -65,12 +69,17 @@ impl Header {
             payload_length: ((buf[6] as u16) << 8) | buf[7] as u16,
             flags: buf[8],
             freq_offset: buf[9],
-            reserved: buf[10],
+            profile_index: buf[10],
         })
     }
 
-    /// Create a header from a modem config.
+    /// Create a header from a modem config. Auto-derives the `profile_index`
+    /// by matching against the known predefined profiles; returns
+    /// `ProfileIndex::UNKNOWN` (0xFF) if the config doesn't match any of
+    /// them (custom overrides). Override-heavy transmissions should use
+    /// `from_config_with_profile` to set it explicitly.
     pub fn from_config(config: &ModemConfig, frame_counter: u16, payload_length: u16, flags: u8) -> Self {
+        let profile_index = derive_profile_index(config);
         Header {
             version: HEADER_VERSION,
             mode_code: config.mode_code(),
@@ -78,9 +87,47 @@ impl Header {
             payload_length,
             flags,
             freq_offset: freq_hz_to_offset(config.center_freq_hz),
-            reserved: 0,
+            profile_index,
         }
     }
+
+    /// Same as `from_config` but with an explicit profile index override.
+    pub fn from_config_with_profile(
+        config: &ModemConfig,
+        frame_counter: u16,
+        payload_length: u16,
+        flags: u8,
+        profile_index: u8,
+    ) -> Self {
+        Header {
+            version: HEADER_VERSION,
+            mode_code: config.mode_code(),
+            frame_counter,
+            payload_length,
+            flags,
+            freq_offset: freq_hz_to_offset(config.center_freq_hz),
+            profile_index,
+        }
+    }
+}
+
+/// Best-effort mapping from `ModemConfig` to a canonical profile byte, by
+/// matching the tuple `(constellation, ldpc_rate, symbol_rate, tau)` against
+/// the five predefined profiles. If nothing matches (custom rate/rate combo),
+/// returns `ProfileIndex::UNKNOWN`.
+fn derive_profile_index(config: &ModemConfig) -> u8 {
+    use crate::profile::ProfileIndex;
+    for p in ProfileIndex::ALL {
+        let ref_cfg = p.to_config();
+        if ref_cfg.constellation == config.constellation
+            && ref_cfg.ldpc_rate == config.ldpc_rate
+            && (ref_cfg.symbol_rate - config.symbol_rate).abs() < 1.0
+            && (ref_cfg.tau - config.tau).abs() < 1e-6
+        {
+            return p.as_u8();
+        }
+    }
+    ProfileIndex::UNKNOWN
 }
 
 /// Encode header to 96 QPSK symbols via Golay(24,12).
@@ -189,7 +236,7 @@ mod tests {
             payload_length: 1024,
             flags: FLAG_LAST,
             freq_offset: 30, // 1100 Hz
-            reserved: 0,
+            profile_index: 3, // HIGH
         };
         let bytes = h.to_bytes();
         let h2 = Header::from_bytes(&bytes).unwrap();
@@ -199,6 +246,27 @@ mod tests {
         assert_eq!(h2.payload_length, h.payload_length);
         assert_eq!(h2.flags, h.flags);
         assert_eq!(h2.freq_offset, h.freq_offset);
+        assert_eq!(h2.profile_index, h.profile_index);
+    }
+
+    #[test]
+    fn header_profile_index_roundtrip_all_profiles() {
+        use crate::profile::{profile_high, profile_mega, profile_normal, profile_robust, profile_ultra, ProfileIndex};
+        let cases: [(ModemConfig, ProfileIndex); 5] = [
+            (profile_ultra(),  ProfileIndex::Ultra),
+            (profile_robust(), ProfileIndex::Robust),
+            (profile_normal(), ProfileIndex::Normal),
+            (profile_high(),   ProfileIndex::High),
+            (profile_mega(),   ProfileIndex::Mega),
+        ];
+        for (cfg, expected) in cases {
+            let h = Header::from_config(&cfg, 0, 0, 0);
+            assert_eq!(h.profile_index, expected.as_u8(),
+                "derive_profile_index mismatch for {:?}", expected);
+            let bytes = h.to_bytes();
+            let h2 = Header::from_bytes(&bytes).unwrap();
+            assert_eq!(h2.profile_index, expected.as_u8());
+        }
     }
 
     #[test]

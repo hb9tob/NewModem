@@ -333,9 +333,18 @@ fn main() {
                             result.sigma2
                         );
                         if let Some(ref hdr) = result.header {
+                            let profile_name = modem_core::profile::ProfileIndex::from_u8(
+                                hdr.profile_index,
+                            )
+                            .map(|p| p.name())
+                            .unwrap_or("UNKNOWN");
                             eprintln!(
-                                "Protocol header: version={}, mode=0x{:02X}, payload_len={}",
-                                hdr.version, hdr.mode_code, hdr.payload_length
+                                "Protocol header: version={}, mode=0x{:02X}, profile={} ({}), payload_len={}",
+                                hdr.version,
+                                hdr.mode_code,
+                                profile_name,
+                                hdr.profile_index,
+                                hdr.payload_length
                             );
                         }
                         if let Some(ref ah) = result.app_header {
