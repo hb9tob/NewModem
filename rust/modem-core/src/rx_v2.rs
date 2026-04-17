@@ -42,11 +42,223 @@ pub struct RxV2Result {
     pub sigma2: f64,
 }
 
-/// Decode a v2 superframe from audio samples.
+/// Linear-interpolation resample of a float audio stream to compensate a
+/// sample-rate mismatch of `drift_ppm` ppm between the transmitter and the
+/// receiver sound cards. A positive `drift_ppm` means the RX clock was faster
+/// than TX (RX captured `(1 + ε)` samples for each TX sample) and the output
+/// is a SHORTER stream that matches TX timing.
+fn resample_audio(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
+    let ratio = 1.0 + drift_ppm * 1e-6;
+    let n_out = ((samples.len() as f64) / ratio) as usize;
+    let mut out = Vec::with_capacity(n_out);
+    for i in 0..n_out {
+        let t = i as f64 * ratio;
+        let idx = t.floor() as usize;
+        let frac = (t - idx as f64) as f32;
+        if idx + 1 < samples.len() {
+            out.push((1.0 - frac) * samples[idx] + frac * samples[idx + 1]);
+        } else if idx < samples.len() {
+            out.push(samples[idx]);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Top-level v2 decode with automatic sound-card drift compensation.
 ///
-/// Returns `None` if preamble sync fails, the protocol header is not v2, or
-/// no segments at all could be decoded.
+/// Runs the single-pass decode once. If it's not a clean decode, sweeps a
+/// grid of ppm corrections around zero and keeps the best result. Integer
+/// symbol-resolution drift estimators don't have enough SNR to resolve the
+/// sub-symbol drift (~0.05 sym/segment at 50 ppm), so a brute-force grid
+/// search is more robust than any single-pass estimator. Refinement via
+/// binary search around the best grid point picks up the last ~5 ppm.
 pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
+    let first = rx_v2_single(samples, config);
+    let clean = match &first {
+        Some(r) if r.total_blocks > 0 => {
+            r.converged_blocks * 100 >= r.total_blocks * 99 && r.segments_decoded > 0
+        }
+        _ => false,
+    };
+    if clean {
+        return first;
+    }
+    // Coarse grid: ±80 ppm in 20-ppm steps. This range covers two sound cards
+    // at ±40 ppm each (worst realistic). If none improve the decode, we return
+    // the first-pass result unchanged.
+    let mut best = first;
+    let mut best_score = best.as_ref().map(score_result).unwrap_or(-1.0);
+    let grid: [f64; 9] = [-80.0, -60.0, -40.0, -20.0, 0.0, 20.0, 40.0, 60.0, 80.0];
+    let mut best_ppm = 0.0f64;
+    for &ppm in &grid {
+        if ppm == 0.0 {
+            continue; // already tried as `first`
+        }
+        let corrected = resample_audio(samples, ppm);
+        if let Some(r) = rx_v2_single(&corrected, config) {
+            let s = score_result(&r);
+            if s > best_score {
+                best_score = s;
+                best = Some(r);
+                best_ppm = ppm;
+            }
+        }
+    }
+    // Fine-refine around the best grid point ±10 ppm in 5-ppm steps.
+    if best_ppm != 0.0 {
+        let refine: [f64; 4] = [-10.0, -5.0, 5.0, 10.0];
+        for &delta in &refine {
+            let ppm = best_ppm + delta;
+            let corrected = resample_audio(samples, ppm);
+            if let Some(r) = rx_v2_single(&corrected, config) {
+                let s = score_result(&r);
+                if s > best_score {
+                    best_score = s;
+                    best = Some(r);
+                    best_ppm = ppm;
+                }
+            }
+        }
+        eprintln!("[rx_v2] drift-compensated at {best_ppm:+.0} ppm");
+    }
+    best
+}
+
+/// Score a decode result for comparing drift candidates. Higher is better.
+/// Combines (a) number of segments actually decoded (penalises scans that
+/// fail at markers), and (b) fraction of LDPC blocks that converged.
+fn score_result(r: &RxV2Result) -> f64 {
+    let seg_score = r.segments_decoded as f64;
+    let block_score = if r.total_blocks > 0 {
+        r.converged_blocks as f64 / r.total_blocks as f64
+    } else {
+        0.0
+    };
+    // Blocks-converged is the metric that matters for payload integrity;
+    // weight it 10× more than segment count.
+    seg_score + 10.0 * block_score * r.total_blocks as f64
+}
+
+/// Estimate the TX-to-RX sound-card drift in ppm from the spacing between
+/// consecutive marker sync pattern correlation peaks. Returns `None` if fewer
+/// than two markers could be located.
+fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
+    let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+        .ok()?;
+    let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+    let constellation = frame::make_constellation(config);
+    let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
+    let bps = config.constellation.bits_per_sym();
+    let syms_per_cw = decoder.n() / bps;
+
+    let bb = demodulator::downmix(samples, config.center_freq_hz);
+    let mf = demodulator::matched_filter(&bb, &taps);
+    let sync_pos = sync::find_preamble(&mf, sps, pitch, config.beta)?;
+    let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
+    let pitch_fse = pitch / d_fse;
+    let sps_fse = sps / d_fse;
+    let tau_eff = pitch_fse as f64 / sps_fse as f64;
+    let mut n_ff = if tau_eff >= 0.99 { 8 * sps_fse + 1 } else { 4 * sps_fse + 1 };
+    if n_ff % 2 == 0 { n_ff += 1; }
+    let preamble_syms = preamble::make_preamble();
+    let training_positions: Vec<usize> = (0..N_PREAMBLE).map(|k| fse_start + k * pitch_fse).collect();
+    let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
+    let half = n_ff / 2;
+    let max_syms = if fse_input.len() > fse_start + half {
+        (fse_input.len() - fse_start - half) / pitch_fse + 1
+    } else { 0 };
+    let preamble_training: Vec<(usize, Complex64)> = preamble_syms
+        .iter().enumerate().map(|(k, &s)| (k, s)).collect();
+    let (all_rx_syms, _) = ffe::apply_ffe_lms_with_training(
+        &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
+        &preamble_training, &constellation, 0.10, 0.02,
+    );
+    if all_rx_syms.len() < N_PREAMBLE + 96 { return None; }
+    let gain = {
+        let mut num = Complex64::new(0.0, 0.0);
+        let mut den = 0.0f64;
+        for k in 0..N_PREAMBLE {
+            num += all_rx_syms[k] * preamble_syms[k].conj();
+            den += preamble_syms[k].norm_sqr();
+        }
+        if den > 1e-12 { num / den } else { Complex64::new(1.0, 0.0) }
+    };
+    let corrected: Vec<Complex64> = all_rx_syms.iter().map(|&s| s / gain).collect();
+    let data_region = &corrected[N_PREAMBLE + 96..];
+
+    // Scan for markers: find sync peaks with coarse stride, then refine and
+    // decode the payload. Collect (position_in_data_region, is_meta) pairs.
+    let mut markers: Vec<(usize, bool)> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + MARKER_LEN <= data_region.len() {
+        let window = 64;
+        let end = (cursor + window).min(data_region.len().saturating_sub(MARKER_LEN));
+        let hit = marker::find_sync_in_window(data_region, cursor, end - cursor, 0.5);
+        let pos = match hit {
+            Some((p, _)) => p,
+            None => { cursor += MARKER_LEN; continue; }
+        };
+        let payload = marker::decode_marker_at(&data_region[pos..pos + MARKER_LEN]);
+        match payload {
+            Some(p) => {
+                markers.push((pos, p.is_meta()));
+                // Jump past the corresponding segment. We don't know the final
+                // codeword count for data segments without the AppHeader yet,
+                // so assume the default N=V2_CW_PER_SEG — overshooting slightly
+                // on the last segment is fine for drift estimation.
+                let n_cw = if p.is_meta() { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+                let data_sym_count = n_cw * syms_per_cw;
+                let n_pilot_groups = (data_sym_count + D_SYMS - 1) / D_SYMS;
+                let seg_sym_len = data_sym_count + n_pilot_groups * P_SYMS;
+                cursor = pos + MARKER_LEN + seg_sym_len;
+            }
+            None => cursor += MARKER_LEN,
+        }
+    }
+    eprintln!(
+        "[rx_v2 drift-estim] found {} markers in data_region of {} syms",
+        markers.len(),
+        data_region.len()
+    );
+    for (i, &(pos, meta)) in markers.iter().take(3).enumerate() {
+        eprintln!("  marker[{i}] pos={pos} meta={meta}");
+    }
+    if markers.len() >= 3 {
+        let last = markers.len() - 1;
+        eprintln!("  marker[{last}] pos={} meta={}", markers[last].0, markers[last].1);
+    }
+    if markers.len() < 3 {
+        return None;
+    }
+
+    // Use cumulative drift from first-to-last marker for signal integration gain.
+    // Per-pair spacing is dominated by integer-symbol quantisation noise; the
+    // accumulated drift over hundreds of markers is what actually matters.
+    let (first_pos, _) = markers[0];
+    let (last_pos, _) = *markers.last().unwrap();
+    let actual_total: i64 = last_pos as i64 - first_pos as i64;
+    let mut expected_total: i64 = 0;
+    // Distance from markers[i] to markers[i+1] is MARKER_LEN + segment(markers[i])
+    for i in 0..markers.len() - 1 {
+        let (_, m) = markers[i];
+        let n_cw = if m { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+        let data_sym_count = n_cw * syms_per_cw;
+        let n_pilot_groups = (data_sym_count + D_SYMS - 1) / D_SYMS;
+        expected_total += (MARKER_LEN + data_sym_count + n_pilot_groups * P_SYMS) as i64;
+    }
+    if expected_total <= 0 {
+        return None;
+    }
+    let ratio = actual_total as f64 / expected_total as f64;
+    Some((ratio - 1.0) * 1e6)
+}
+
+/// Single-pass v2 decode (formerly `rx_v2` body). Called by the drift-aware
+/// wrapper and also exposed for direct use when caller already knows the
+/// input is drift-free (loopback, simulated channels).
+pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
