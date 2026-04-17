@@ -78,6 +78,11 @@ enum Commands {
         #[arg(short, long, default_value = "NORMAL")]
         profile: String,
 
+        /// Override LDPC rate used at TX (required if TX used a non-default
+        /// rate for this profile): 1/2, 2/3, 3/4
+        #[arg(long)]
+        ldpc_rate: Option<String>,
+
         /// Override symbol rate
         #[arg(long)]
         rs: Option<f64>,
@@ -216,11 +221,15 @@ fn main() {
             input,
             output,
             profile,
+            ldpc_rate,
             rs,
             fc,
             frame_version,
         } => {
             let mut config = parse_profile(&profile);
+            if let Some(r) = ldpc_rate {
+                config.ldpc_rate = parse_ldpc_rate(&r);
+            }
             if let Some(r) = rs {
                 config.symbol_rate = r;
             }
