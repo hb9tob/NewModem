@@ -23,6 +23,7 @@ pub mod tx;
 
 pub mod demodulator;
 pub mod sync;
+pub mod ffe;
 pub mod equalizer;
 pub mod pll;
 pub mod soft_demod;
