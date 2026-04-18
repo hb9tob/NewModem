@@ -4,6 +4,10 @@
   "description": "Default permissions for main window",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    {
+      "identifier": "core:image:allow-new",
+      "allow": [{ "path": "**" }]
+    }
   ]
 }

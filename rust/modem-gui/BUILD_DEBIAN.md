@@ -100,6 +100,48 @@ Uninstall:
 sudo apt remove -y nbfm-modem-gui
 ```
 
+## 7. CLI TX (for OTA testing)
+
+The `modem-cli` crate builds the `nbfm-modem` binary (TX / RX via WAV
+files). It has no extra system deps beyond `build-essential` — Rust +
+pure-Rust crates (hound, clap). If steps 1–2 were done, the build is
+immediate.
+
+```bash
+cd NewModem/rust
+cargo build -p modem-cli --release
+./target/release/nbfm-modem --help
+```
+
+**OTA TX example** — encode an image into a WAV, then play the WAV
+through the radio's audio input (PTT triggered by VOX preamble) :
+
+```bash
+./target/release/nbfm-modem tx \
+  --input image.avif \
+  --output tx.wav \
+  --profile NORMAL \
+  --frame-version 2 \
+  --filename image.avif \
+  --callsign HB9TOB \
+  --session-id DEADBEEF \
+  --vox 0.8
+
+# Play tx.wav on the sound card connected to the radio's mic input :
+aplay -D plughw:CARD=UMC,DEV=0 tx.wav   # adjust CARD= to your device
+# or via PulseAudio / PipeWire :
+paplay tx.wav
+```
+
+Profile quick-guide :
+- `ULTRA` / `ROBUST` : lowest baud, best resilience — use for weak links
+- `NORMAL` : balanced default, ~1500 Bd
+- `HIGH` / `MEGA` : fastest, clean channels only
+
+The receiver (CLI `rx` or the GUI) must use the same `--frame-version 2`
+and any LDPC/rate overrides you set on TX. The protocol header embeds
+the profile index, so the GUI auto-detects it on reception.
+
 ## Troubleshooting
 
 | Symptom | Cause / Fix |

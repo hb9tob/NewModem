@@ -12,6 +12,7 @@ body {
   padding: 0.75rem 1rem;
   background: #2a2a2a;
   border-bottom: 1px solid #3a3a3a;
+  flex-wrap: wrap;
 }
 .top-bar select {
   appearance: none;
@@ -30,11 +31,84 @@ body {
   background: #1e1e1e;
   color: #e0e0e0;
 }
+.top-bar button {
+  background: #2d5a2d;
+  color: #e0e0e0;
+  border: 1px solid #3a7a3a;
+  border-radius: 3px;
+  padding: 0.3rem 0.9rem;
+  cursor: pointer;
+}
+.top-bar button:disabled {
+  background: #333;
+  border-color: #444;
+  color: #777;
+  cursor: not-allowed;
+}
+.top-bar #btn-stop {
+  background: #5a2d2d;
+  border-color: #7a3a3a;
+}
+.top-bar #btn-stop:disabled {
+  background: #333;
+  border-color: #444;
+}
+.save-dir {
+  font-size: 0.8rem;
+  color: #9e9e9e;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .status {
   margin-left: auto;
   font-size: 0.875rem;
   color: #9ccc65;
 }
 main {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
   padding: 1rem;
+}
+.panel {
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  padding: 1rem;
+}
+.panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: #9ccc65;
+}
+#current-image-wrap img {
+  max-width: 100%;
+  max-height: 60vh;
+  display: block;
+  margin-top: 0.5rem;
+  border: 1px solid #3a3a3a;
+}
+#event-log {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+}
+#event-log li {
+  padding: 0.2rem 0;
+  border-bottom: 1px solid #333;
+  color: #c0c0c0;
+}
+#event-log li .ev-time {
+  color: #777;
+  margin-right: 0.5rem;
+}
+#event-log li .ev-name {
+  color: #81d4fa;
+  margin-right: 0.4rem;
 }

@@ -13,10 +13,21 @@
         <option>Chargement…</option>
       </select>
     </label>
+    <button id="btn-start" disabled>Démarrer</button>
+    <button id="btn-stop" disabled>Arrêter</button>
+    <span id="save-dir-label" class="save-dir" title="Dossier de sauvegarde"></span>
     <span id="status" class="status">prêt</span>
   </header>
   <main>
-    <p id="placeholder">Phase 4a — liste des cartes son via cpal.</p>
+    <section id="current-file" class="panel">
+      <h2>Fichier courant</h2>
+      <div id="current-info">Aucun fichier reçu</div>
+      <div id="current-image-wrap"></div>
+    </section>
+    <section class="panel">
+      <h2>Événements</h2>
+      <ul id="event-log"></ul>
+    </section>
   </main>
   <script type="module" src="main.js"></script>
 </body>
