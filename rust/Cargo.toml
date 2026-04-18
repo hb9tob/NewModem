@@ -1,5 +1,5 @@
 [workspace]
-members = ["modem-core", "modem-cli"]
+members = ["modem-core", "modem-cli", "modem-gui/src-tauri"]
 resolver = "2"
 
 [workspace.dependencies]

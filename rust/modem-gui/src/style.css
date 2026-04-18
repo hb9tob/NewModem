@@ -1,0 +1,30 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #1e1e1e;
+  color: #e0e0e0;
+}
+.top-bar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  background: #2a2a2a;
+  border-bottom: 1px solid #3a3a3a;
+}
+.top-bar select {
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  padding: 0.25rem 0.5rem;
+  min-width: 260px;
+}
+.status {
+  margin-left: auto;
+  font-size: 0.875rem;
+  color: #9ccc65;
+}
+main {
+  padding: 1rem;
+}
