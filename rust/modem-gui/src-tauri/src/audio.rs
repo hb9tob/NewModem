@@ -7,11 +7,14 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 const TARGET_RATE: u32 = 48_000;
-const LOG_PATH: &str = "/tmp/nbfm-audio.log";
+
+fn log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("nbfm-audio.log")
+}
 
 fn log(msg: &str) {
     eprintln!("{msg}");
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(LOG_PATH) {
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path()) {
         let _ = writeln!(f, "{msg}");
     }
 }
@@ -71,13 +74,21 @@ fn friendly(name: &str, cards: &std::collections::HashMap<String, String>) -> St
 /// (`hw:CARD=*,DEV=0`) plus the high-level `default`/`pulse`/`pipewire`
 /// aliases. Drops `sysdefault`, `surround*`, `iec958`, `dsnoop`, `front`,
 /// rate converters, etc., which would otherwise flood the dropdown.
+/// On non-Linux hosts (WASAPI / CoreAudio), cpal already returns one clean
+/// entry per device — no filtering needed.
+#[cfg(target_os = "linux")]
 fn keep_device(name: &str) -> bool {
     matches!(name, "default" | "pulse" | "pipewire")
         || (name.starts_with("hw:CARD=") && name.ends_with(",DEV=0"))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn keep_device(_name: &str) -> bool {
+    true
+}
+
 pub fn list_input_devices() -> Result<Vec<DeviceInfo>, Box<dyn std::error::Error>> {
-    let _ = std::fs::remove_file(LOG_PATH);
+    let _ = std::fs::remove_file(log_path());
     let host = cpal::default_host();
     log(&format!("[audio] host = {:?}", host.id()));
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
