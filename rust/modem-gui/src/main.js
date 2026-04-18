@@ -18,14 +18,24 @@ async function loadDevices() {
       status.style.color = "#ef5350";
       return;
     }
+    let preferred = null;
     for (const dev of devices) {
       const opt = document.createElement("option");
       opt.value = dev.name;
-      opt.textContent = `${dev.name} (${dev.default_sample_rate} Hz)${dev.is_default ? " [default]" : ""}`;
-      if (dev.is_default) opt.selected = true;
+      const range = dev.max_sample_rate > 0
+        ? `${dev.min_sample_rate}–${dev.max_sample_rate} Hz`
+        : "?";
+      const tag48 = dev.supports_48k ? " ✓48k" : "";
+      const tagDef = dev.is_default ? " [default]" : "";
+      const tagErr = dev.error ? ` [${dev.error}]` : "";
+      opt.textContent = `${dev.friendly_name} — ${range}${tag48}${tagDef}${tagErr}`;
       select.appendChild(opt);
+      if (preferred === null && dev.supports_48k) preferred = opt;
+      if (dev.is_default && dev.supports_48k) preferred = opt;
     }
-    status.textContent = `${devices.length} entrée(s)`;
+    if (preferred) preferred.selected = true;
+    const n48 = devices.filter(d => d.supports_48k).length;
+    status.textContent = `${devices.length} entrée(s), ${n48} compat. 48 kHz`;
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
