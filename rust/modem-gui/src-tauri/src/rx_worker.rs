@@ -5,9 +5,11 @@
 //! to disk under the configured save directory.
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use modem_core::profile::ProfileIndex;
+use modem_core::payload_envelope::PayloadEnvelope;
+use modem_core::profile::{ModemConfig, ProfileIndex};
 use modem_core::rx_stream::{StreamEvent, StreamReceiver};
 use modem_core::rx_stream_v2::{SessionEndReason, StreamEventV2, StreamReceiverV2};
+use modem_core::rx_v2;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -167,6 +169,27 @@ struct V2SessionEndPayload {
     reason: &'static str,
 }
 
+/// Result of a batch decode triggered at v2 SessionEnd.
+/// Saved alongside the streaming v2 file save (different `_batch` suffix) to
+/// allow comparison; the streaming pipeline is intentionally NOT short-circuited.
+#[derive(Debug, Clone, Serialize)]
+struct BatchDecodePayload {
+    profile: String,
+    converged_blocks: usize,
+    total_blocks: usize,
+    data_blocks_recovered: usize,
+    segments_decoded: usize,
+    segments_lost: usize,
+    sigma2: f64,
+    bytes_decoded: usize,
+    saved_path: Option<String>,
+    decode_ms: u128,
+    sample_count: usize,
+    mime_type: u8,
+    callsign: String,
+    filename: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct V2ProgressPayload {
     blocks_converged: usize,
@@ -232,6 +255,14 @@ fn run_worker(
     let mut receiver_v2 = StreamReceiverV2::new();
     emit_v2_state(&app, "idle");
     let mut total_samples: u64 = 0;
+    // Buffered audio for the batch-on-buffer parallel decode path. Filled
+    // alongside the v1/v2 receivers ; consumed at v2 SessionEnd to invoke
+    // rx_v2::rx_v2 on the full transmission. This validates the sliding-
+    // window batch architecture (currently degenerate window = full
+    // session) on V2 captures before extending TX to insert periodic
+    // preambles for true windowed decoding.
+    let mut session_buffer: Vec<f32> = Vec::new();
+    let mut session_profile: Option<ProfileIndex> = None;
     // Drain the channel in batches of ~500 ms of audio (24 000 samples at 48 k
     // mono). This amortises the per-feed() overhead and, critically, reduces
     // the retry_decode_every=5 cadence inside StreamReceiver — each feed
@@ -320,9 +351,151 @@ fn run_worker(
                 events_v2.len()
             ));
         }
+        // Tee samples into the session buffer for the batch-on-buffer path.
+        // We accumulate from the moment the worker starts (before preamble);
+        // rx_v2 will locate the preamble itself in the buffer.
+        session_buffer.extend_from_slice(&batch);
+
         for event in events_v2 {
+            // Snapshot batch-relevant state before handing off ownership.
+            match &event {
+                StreamEventV2::PreambleDetected { .. } => {
+                    // Drop pre-session noise. The preamble was received within
+                    // the most recent batch (≤500 ms back) ; keep 1 s of audio
+                    // to safely include it for the eventual rx_v2 invocation.
+                    let keep = AUDIO_RATE as usize;
+                    let len = session_buffer.len();
+                    if len > keep {
+                        session_buffer.drain(..len - keep);
+                    }
+                    session_profile = None;
+                }
+                StreamEventV2::HeaderDecoded { profile, .. } => {
+                    session_profile = Some(*profile);
+                }
+                StreamEventV2::SessionEnd { .. } => {
+                    if let Some(profile) = session_profile.take() {
+                        let samples = std::mem::take(&mut session_buffer);
+                        let app_clone = app.clone();
+                        let save_dir_clone = save_dir.clone();
+                        thread::spawn(move || {
+                            run_batch_decode(app_clone, save_dir_clone, samples, profile);
+                        });
+                    } else {
+                        // No header was decoded ; drop accumulated samples.
+                        session_buffer.clear();
+                    }
+                }
+                _ => {}
+            }
             handle_v2_event(&app, &save_dir, event, &mut file_saved_this_session);
         }
+    }
+}
+
+/// Run the rx_v2 batch decoder on the accumulated session audio in a worker
+/// thread. Always emits a `batch_decode_complete` event with stats ; on
+/// success also persists the file with a `_batch` suffix to coexist with the
+/// streaming-pipeline save.
+fn run_batch_decode(
+    app: AppHandle,
+    save_dir: Arc<Mutex<PathBuf>>,
+    samples: Vec<f32>,
+    profile: ProfileIndex,
+) {
+    let t0 = Instant::now();
+    let config: ModemConfig = profile.to_config();
+    let result = rx_v2::rx_v2(&samples, &config);
+    let elapsed_ms = t0.elapsed().as_millis();
+    let sample_count = samples.len();
+
+    match result {
+        Some(r) => {
+            let app_mime = r.app_header.as_ref().map(|ah| ah.mime_type).unwrap_or(0);
+            let envelope = PayloadEnvelope::decode_or_fallback(&r.data);
+            let (filename, callsign, content) = if envelope.version == 0 {
+                (
+                    format!(
+                        "decoded_{}_batch.bin",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    ),
+                    String::new(),
+                    r.data.clone(),
+                )
+            } else {
+                (
+                    add_batch_suffix(&envelope.filename),
+                    envelope.callsign.clone(),
+                    envelope.content.clone(),
+                )
+            };
+            let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
+            let saved_path = match save_file(&dir, &filename, &content) {
+                Ok(path) => Some(path.to_string_lossy().into_owned()),
+                Err(e) => {
+                    let _ = app.emit(
+                        "error",
+                        ErrorPayload {
+                            message: format!("batch save failed: {e}"),
+                        },
+                    );
+                    None
+                }
+            };
+            let _ = app.emit(
+                "batch_decode_complete",
+                BatchDecodePayload {
+                    profile: format!("{profile:?}"),
+                    converged_blocks: r.converged_blocks,
+                    total_blocks: r.total_blocks,
+                    data_blocks_recovered: r.data_blocks_recovered,
+                    segments_decoded: r.segments_decoded,
+                    segments_lost: r.segments_lost,
+                    sigma2: r.sigma2,
+                    bytes_decoded: content.len(),
+                    saved_path,
+                    decode_ms: elapsed_ms,
+                    sample_count,
+                    mime_type: app_mime,
+                    callsign,
+                    filename,
+                },
+            );
+        }
+        None => {
+            let _ = app.emit(
+                "batch_decode_complete",
+                BatchDecodePayload {
+                    profile: format!("{profile:?}"),
+                    converged_blocks: 0,
+                    total_blocks: 0,
+                    data_blocks_recovered: 0,
+                    segments_decoded: 0,
+                    segments_lost: 0,
+                    sigma2: 0.0,
+                    bytes_decoded: 0,
+                    saved_path: None,
+                    decode_ms: elapsed_ms,
+                    sample_count,
+                    mime_type: 0,
+                    callsign: String::new(),
+                    filename: String::new(),
+                },
+            );
+        }
+    }
+}
+
+/// Insert "_batch" before the extension so the batch-decoded file does not
+/// overwrite the streaming-pipeline save of the same transmission.
+fn add_batch_suffix(name: &str) -> String {
+    let safe = sanitize_filename(name);
+    match safe.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}_batch.{ext}"),
+        None => format!("{safe}_batch"),
     }
 }
 

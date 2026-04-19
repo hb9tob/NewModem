@@ -475,6 +475,32 @@ function wireEvents() {
       }
     });
   }
+  // Batch-on-buffer parallel decode: reuse showCurrentFile so the user sees
+  // the high-quality batch result alongside the streaming-pipeline save.
+  // The payload shape is compatible with showCurrentFile (callsign, filename,
+  // size, mime_type, sigma2, saved_path) plus extra batch-specific fields.
+  listen("batch_decode_complete", (event) => {
+    const p = event.payload || {};
+    logEvent("batch_decode_complete", {
+      profile: p.profile,
+      converged: `${p.converged_blocks}/${p.total_blocks}`,
+      data_recovered: p.data_blocks_recovered,
+      bytes: p.bytes_decoded,
+      sigma2: p.sigma2,
+      decode_ms: p.decode_ms,
+      sample_count: p.sample_count,
+    });
+    if (p.saved_path) {
+      showCurrentFile({
+        callsign: p.callsign,
+        filename: p.filename,
+        size: p.bytes_decoded,
+        mime_type: p.mime_type,
+        sigma2: p.sigma2,
+        saved_path: p.saved_path,
+      });
+    }
+  });
   listen("audio_level", (event) => {
     const p = event.payload;
     updateLevel(p.rms, p.peak, p.total_samples);
