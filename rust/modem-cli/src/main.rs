@@ -185,7 +185,7 @@ fn main() {
                         modem_core::tx::tx(&data, &config)
                     }
                 }
-                2 => {
+                2 | 3 => {
                     // Wrap user data in a payload envelope carrying filename +
                     // callsign so the RX GUI can identify the transmitter and
                     // the original file name even before decoding the content.
@@ -194,7 +194,7 @@ fn main() {
                         .unwrap_or_else(|| infer_filename(&input));
                     let qrz = callsign.clone().unwrap_or_else(|| {
                         eprintln!(
-                            "TX v2 error: --callsign is required (e.g. HB9TOB)"
+                            "TX v{frame_version} error: --callsign is required (e.g. HB9TOB)"
                         );
                         std::process::exit(1);
                     });
@@ -203,7 +203,8 @@ fn main() {
                     )
                     .unwrap_or_else(|| {
                         eprintln!(
-                            "TX v2 error: filename (len {}) / callsign (len {}) exceed size limits or contain NUL",
+                            "TX v{} error: filename (len {}) / callsign (len {}) exceed size limits or contain NUL",
+                            frame_version,
                             fname.len(),
                             qrz.len()
                         );
@@ -215,12 +216,18 @@ fn main() {
                     let hash = content_hash_short(&wire_payload);
                     let mime = infer_mime(&input);
                     eprintln!(
-                        "TX v2: session_id=0x{:08X}, callsign={}, filename={}, mime=0x{:02X}, hash=0x{:04X}",
-                        sid, qrz, fname, mime, hash
+                        "TX v{}: session_id=0x{:08X}, callsign={}, filename={}, mime=0x{:02X}, hash=0x{:04X}",
+                        frame_version, sid, qrz, fname, mime, hash
                     );
-                    let symbols = modem_core::frame::build_superframe_v2(
-                        &wire_payload, &config, sid, mime, hash,
-                    );
+                    let symbols = if frame_version == 3 {
+                        modem_core::frame::build_superframe_v3(
+                            &wire_payload, &config, sid, mime, hash,
+                        )
+                    } else {
+                        modem_core::frame::build_superframe_v2(
+                            &wire_payload, &config, sid, mime, hash,
+                        )
+                    };
                     // Reuse TX modulation pipeline
                     let (sps, pitch) = modem_core::rrc::check_integer_constraints(
                         AUDIO_RATE,
@@ -254,7 +261,7 @@ fn main() {
                     }
                 }
                 v => {
-                    eprintln!("Unsupported frame_version {v} (use 1 or 2)");
+                    eprintln!("Unsupported frame_version {v} (use 1, 2 or 3)");
                     std::process::exit(1);
                 }
             };
@@ -334,7 +341,7 @@ fn main() {
                         }
                     }
                 }
-                2 => match modem_core::rx_v2::rx_v2(&samples, &config) {
+                2 | 3 => match modem_core::rx_v2::rx_v2(&samples, &config) {
                     Some(result) => {
                         eprintln!(
                             "Decoded: {} bytes, {}/{} LDPC blocks converged, {} segments, {} lost, sigma²={:.4}",
@@ -408,7 +415,7 @@ fn main() {
                     }
                 },
                 v => {
-                    eprintln!("Unsupported frame_version {v} (use 1 or 2)");
+                    eprintln!("Unsupported frame_version {v} (use 1, 2 or 3)");
                     std::process::exit(1);
                 }
             }

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::app_header::{self, AppHeader};
 use crate::demodulator;
 use crate::ffe;
-use crate::frame::{self, HEADER_VERSION_V2, V2_CODEWORDS_PER_SEGMENT};
+use crate::frame::{self, HEADER_VERSION_V2, HEADER_VERSION_V3, V2_CODEWORDS_PER_SEGMENT};
 use crate::header;
 use crate::interleaver;
 use crate::ldpc::decoder::LdpcDecoder;
@@ -347,10 +347,12 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     };
     let corrected: Vec<Complex64> = all_rx_syms.iter().map(|&s| s / gain).collect();
 
-    // Protocol header (must be v2)
+    // Protocol header (v2 or v3 — same structure ; v3 only adds periodic
+    // preamble+header insertions before each meta segment, transparent to
+    // the marker-based segment walker below).
     let header_syms = &corrected[N_PREAMBLE..N_PREAMBLE + header_sym_count];
     let decoded_header = header::decode_header_symbols(header_syms)?;
-    if decoded_header.version != HEADER_VERSION_V2 {
+    if decoded_header.version != HEADER_VERSION_V2 && decoded_header.version != HEADER_VERSION_V3 {
         return None;
     }
 

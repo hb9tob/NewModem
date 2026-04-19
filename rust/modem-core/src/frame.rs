@@ -28,6 +28,12 @@ pub const PREAMBLE_INTERVAL: usize = 4;
 /// Header version tag used by the segmented v2 format (marker-enabled).
 pub const HEADER_VERSION_V2: u8 = 2;
 
+/// Header version tag used by the v3 format. Same segmented structure as v2,
+/// plus a fresh preamble + protocol header before every periodic meta segment
+/// so the RX can sliding-window batch-decode without a dedicated late-entry
+/// path. Overhead ≈ 2-3 % depending on cadence and profile.
+pub const HEADER_VERSION_V3: u8 = 3;
+
 /// v2 data codewords per segment (between resync markers). 2 CW aligns
 /// segment durations roughly to 0.77 s at 16-APSK / 1 s at 8PSK / 2.3 s at QPSK.
 pub const V2_CODEWORDS_PER_SEGMENT: usize = 2;
@@ -312,6 +318,165 @@ pub fn build_superframe_v2(
     // Trailing pilot groups (edge interpolation on final segment) + runout.
     // Filler = BPSK ±(1+j)/√2 so the runout stays at the same average power
     // as real data (no adaptive-FFE drift on a sudden zero region).
+    let n_extra_pilot_groups = 4;
+    for eg in 0..n_extra_pilot_groups {
+        for k in 0..crate::types::D_SYMS {
+            all_symbols.push(runout_filler_symbol(eg * crate::types::D_SYMS + k));
+        }
+        let pilots = pilot::pilots_for_group(eg);
+        all_symbols.extend_from_slice(&pilots);
+    }
+    let runout_len = 24;
+    for k in 0..runout_len {
+        all_symbols.push(runout_filler_symbol(
+            n_extra_pilot_groups * crate::types::D_SYMS + k,
+        ));
+    }
+
+    all_symbols
+}
+
+/// v3 superframe builder: identical to `build_superframe_v2` but inserts a
+/// fresh preamble + protocol header before every periodic meta segment.
+///
+/// The receiver can then sliding-window batch-decode each `[preamble + header
+/// + meta + N data segments]` chunk independently, avoiding the cumulative
+/// drift that limits per-block streaming. Overhead = 256 (preamble) + 96
+/// (protocol header) syms per meta cycle ≈ 2.7 % at HIGH steady cadence.
+///
+/// NOTE the initial preamble + header (always present, identical to v2)
+/// already serves the first meta cycle ; the periodic insertion only kicks
+/// in for subsequent meta segments emitted by the cadence rule.
+pub fn build_superframe_v3(
+    data: &[u8],
+    config: &ModemConfig,
+    session_id: u32,
+    mime_type: u8,
+    hash_short: u16,
+) -> Vec<Complex64> {
+    let encoder = LdpcEncoder::new(config.ldpc_rate);
+    let constellation_ = make_constellation(config);
+    let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
+
+    let k_bytes = encoder.k() / 8;
+    let n_data_cw = (data.len() + k_bytes - 1) / k_bytes;
+
+    let mut data_cw_syms: Vec<Vec<Complex64>> = Vec::with_capacity(n_data_cw);
+    for block_idx in 0..n_data_cw {
+        let start = block_idx * k_bytes;
+        let end = (start + k_bytes).min(data.len());
+        let mut block_bytes = vec![0u8; k_bytes];
+        block_bytes[..end - start].copy_from_slice(&data[start..end]);
+        let syms = encode_one_codeword(&block_bytes, &encoder, &interleave_perm, &constellation_);
+        data_cw_syms.push(syms);
+    }
+
+    let app_hdr = AppHeader {
+        session_id,
+        file_size: data.len() as u32,
+        k_symbols: n_data_cw as u16,
+        t_bytes: k_bytes as u8,
+        mode_code: config.mode_code(),
+        mime_type,
+        hash_short,
+    };
+    let meta_payload_bytes = app_header::encode_meta_payload(&app_hdr, k_bytes);
+    let meta_syms = encode_one_codeword(
+        &meta_payload_bytes,
+        &encoder,
+        &interleave_perm,
+        &constellation_,
+    );
+
+    // Pre-encode the preamble + protocol header bundle inserted before each
+    // periodic meta. Same content every time → encode once, reuse.
+    let preamble_syms = preamble::make_preamble();
+    let mut hdr = Header::from_config(config, 0, data.len() as u16, FLAG_LAST);
+    hdr.version = HEADER_VERSION_V3;
+    let header_syms = header::encode_header_symbols(&hdr);
+
+    let mut all_symbols: Vec<Complex64> = Vec::new();
+    all_symbols.extend_from_slice(&preamble_syms);
+    all_symbols.extend_from_slice(&header_syms);
+
+    let session_id_low = (session_id & 0xFF) as u8;
+    let boost_threshold_sym = (V2_BOOT_DURATION_S * config.symbol_rate) as usize;
+    let mut seg_id: u16 = 0;
+    let mut data_cursor: usize = 0;
+    let mut data_segs_since_meta: usize = 0;
+    let mut elapsed_sym: usize = 0;
+
+    let meta_cadence = |elapsed: usize| -> usize {
+        if elapsed < boost_threshold_sym {
+            V2_META_CADENCE_BOOT
+        } else {
+            V2_META_CADENCE_NORMAL
+        }
+    };
+
+    // Initial meta segment (covered by the leading preamble+header above).
+    {
+        let payload = MarkerPayload {
+            seg_id,
+            session_id_low,
+            base_esi: data_cursor as u32,
+            flags: META_FLAG_BIT,
+            reserved: 0,
+        };
+        all_symbols.extend(marker::make_marker(&payload));
+        let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
+        elapsed_sym += marker::MARKER_LEN + with_pilots.len();
+        all_symbols.extend(with_pilots);
+        seg_id = seg_id.wrapping_add(1);
+    }
+
+    while data_cursor < n_data_cw {
+        if data_segs_since_meta >= meta_cadence(elapsed_sym) {
+            // V3-specific: fresh preamble + protocol header before this
+            // periodic meta, so a sliding-window RX can re-acquire here.
+            all_symbols.extend_from_slice(&preamble_syms);
+            elapsed_sym += preamble_syms.len();
+            all_symbols.extend_from_slice(&header_syms);
+            elapsed_sym += header_syms.len();
+
+            let payload = MarkerPayload {
+                seg_id,
+                session_id_low,
+                base_esi: data_cursor as u32,
+                flags: META_FLAG_BIT,
+                reserved: 0,
+            };
+            all_symbols.extend(marker::make_marker(&payload));
+            let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
+            elapsed_sym += marker::MARKER_LEN + with_pilots.len();
+            all_symbols.extend(with_pilots);
+            seg_id = seg_id.wrapping_add(1);
+            data_segs_since_meta = 0;
+            continue;
+        }
+
+        let cw_take = V2_CODEWORDS_PER_SEGMENT.min(n_data_cw - data_cursor);
+        let mut seg_data: Vec<Complex64> = Vec::new();
+        for i in 0..cw_take {
+            seg_data.extend_from_slice(&data_cw_syms[data_cursor + i]);
+        }
+        let payload = MarkerPayload {
+            seg_id,
+            session_id_low,
+            base_esi: data_cursor as u32,
+            flags: 0,
+            reserved: 0,
+        };
+        all_symbols.extend(marker::make_marker(&payload));
+        let (with_pilots, _) = pilot::interleave_data_pilots(&seg_data);
+        elapsed_sym += marker::MARKER_LEN + with_pilots.len();
+        all_symbols.extend(with_pilots);
+
+        data_cursor += cw_take;
+        seg_id = seg_id.wrapping_add(1);
+        data_segs_since_meta += 1;
+    }
+
     let n_extra_pilot_groups = 4;
     for eg in 0..n_extra_pilot_groups {
         for k in 0..crate::types::D_SYMS {

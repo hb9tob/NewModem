@@ -25,7 +25,7 @@ use std::f64::consts::PI;
 use crate::app_header::{self, AppHeader};
 use crate::constellation::Constellation;
 use crate::ffe;
-use crate::frame::{self, HEADER_VERSION_V2, V2_CODEWORDS_PER_SEGMENT};
+use crate::frame::{self, HEADER_VERSION_V2, HEADER_VERSION_V3, V2_CODEWORDS_PER_SEGMENT};
 use crate::header::{self, Header};
 use crate::interleaver;
 use crate::ldpc::decoder::LdpcDecoder;
@@ -802,11 +802,12 @@ impl StreamingDecoder {
             .map(|&s| s / gain)
             .collect();
         let decoded_header = match header::decode_header_symbols(&header_syms) {
-            Some(h) if h.version == HEADER_VERSION_V2 => h,
+            Some(h) if h.version == HEADER_VERSION_V2 || h.version == HEADER_VERSION_V3 => h,
             _ => {
-                // Preamble locked but header didn't decode as v2 — treat as a
-                // permanent init failure. The outer state machine's finalise
-                // path (rx_v2 batch fallback) will have a chance to recover.
+                // Preamble locked but header didn't decode as v2/v3 — treat
+                // as a permanent init failure. The outer state machine's
+                // finalise path (rx_v2 batch fallback) will have a chance to
+                // recover.
                 self.init_failed = true;
                 return false;
             }
