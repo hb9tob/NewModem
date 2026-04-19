@@ -40,6 +40,10 @@ pub struct RxV2Result {
     pub segments_decoded: usize,
     pub segments_lost: usize,
     pub sigma2: f64,
+    /// Unique DATA ESIs recovered (excludes meta-segment blocks, which are
+    /// framing overhead rather than payload content). This is the metric
+    /// the GUI should display as real decode progress.
+    pub data_blocks_recovered: usize,
 }
 
 /// Linear-interpolation resample of a float audio stream to compensate a
@@ -494,10 +498,16 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             }
 
             if marker_payload.is_meta() {
-                if let Some(h) = app_header::decode_meta_payload(&bytes) {
-                    app_hdr = Some(h);
+                if converged {
+                    if let Some(h) = app_header::decode_meta_payload(&bytes) {
+                        app_hdr = Some(h);
+                    }
                 }
-            } else {
+            } else if converged {
+                // Only accept data blocks whose LDPC parity passes. A
+                // non-converged block carries corrupted bytes that would
+                // poison the hash check — treat it as missing instead,
+                // zero-padded in the final assembly.
                 let esi = marker_payload.base_esi + cw_idx as u32;
                 cw_bytes.insert(esi, bytes);
             }
@@ -545,6 +555,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         segments_decoded,
         segments_lost,
         sigma2,
+        data_blocks_recovered: cw_bytes.len(),
     })
 }
 

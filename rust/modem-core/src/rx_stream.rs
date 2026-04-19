@@ -146,10 +146,15 @@ impl StreamReceiver {
 
     /// Create a receiver with default settings for live capture.
     pub fn default_live() -> Self {
-        Self::new(
+        let mut r = Self::new(
             20 * 60 * AUDIO_RATE as usize,
             AUDIO_RATE as usize, // 1 s scan cadence
-        )
+        );
+        // In live capture, decode only when the transmission ends (silence
+        // detected) — periodic retries every few feeds run the whole rx_v2
+        // pipeline on an ever-growing buffer and freeze the worker thread.
+        r.retry_decode_every = usize::MAX;
+        r
     }
 
     /// Reset to Idle state, discarding the buffer.
@@ -180,6 +185,16 @@ impl StreamReceiver {
         // State transitions
         match &mut self.state {
             State::Idle => {
+                // Keep only a sliding window in Idle : the preamble is ~0.5 s
+                // long, so a 3 s window is always enough to detect it; older
+                // samples are useless and scanning them scales linearly. Without
+                // this cap, feed() becomes O(total_runtime) and the worker
+                // falls irrecoverably behind in live capture.
+                const IDLE_WINDOW_SAMPLES: usize = 3 * AUDIO_RATE as usize;
+                while self.buffer.len() > IDLE_WINDOW_SAMPLES {
+                    self.buffer.pop_front();
+                }
+
                 // Scan for preamble periodically
                 let should_scan = self
                     .total_samples_fed

@@ -15,18 +15,54 @@
     </label>
     <button id="btn-start" disabled>Démarrer</button>
     <button id="btn-stop" disabled>Arrêter</button>
+    <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
     <span id="save-dir-label" class="save-dir" title="Dossier de sauvegarde"></span>
+    <span id="level-meter" class="level-meter">
+      <span class="level-bar"><span id="level-fill"></span></span>
+      <span id="level-text">—</span>
+    </span>
+    <span id="v2-state-chip" class="state-chip state-idle" title="État du récepteur v2">idle</span>
+    <span id="v2-marker-info" class="marker-info" title="Dernier marker resync v2">—</span>
+    <span id="v2-progress-mini" class="progress-meter" title="Décodage incrémental v2">
+      <span id="v2-progress-text">—</span>
+    </span>
     <span id="status" class="status">prêt</span>
   </header>
+  <nav class="tab-bar">
+    <button class="tab active" data-tab="rx">RX</button>
+    <button class="tab" data-tab="tx">TX</button>
+    <button class="tab" data-tab="info">Info</button>
+  </nav>
   <main>
-    <section id="current-file" class="panel">
-      <h2>Fichier courant</h2>
-      <div id="current-info">Aucun fichier reçu</div>
-      <div id="current-image-wrap"></div>
+    <section id="tab-rx" class="tab-panel active rx-layout">
+      <div class="rx-body">
+        <div class="rx-main panel">
+          <h2>Fichier courant</h2>
+          <div id="current-info">Aucun fichier reçu</div>
+          <div id="current-image-wrap"></div>
+        </div>
+        <aside class="rx-side panel">
+          <h2>Constellation</h2>
+          <canvas id="constellation-canvas" width="260" height="260"></canvas>
+          <div id="constellation-info" class="constellation-info">—</div>
+        </aside>
+      </div>
+      <div class="rx-progress-full">
+        <canvas id="progress-blocks" height="28"></canvas>
+        <div id="progress-label" class="progress-label">—</div>
+      </div>
     </section>
-    <section class="panel">
-      <h2>Événements</h2>
-      <ul id="event-log"></ul>
+    <section id="tab-tx" class="tab-panel">
+      <div class="panel">
+        <h2>TX</h2>
+        <p class="tx-placeholder">Mode émission — à venir.</p>
+      </div>
+    </section>
+    <section id="tab-info" class="tab-panel">
+      <div class="panel">
+        <h2>Événements</h2>
+        <ul id="event-log"></ul>
+      </div>
     </section>
   </main>
   <script type="module" src="main.js"></script>

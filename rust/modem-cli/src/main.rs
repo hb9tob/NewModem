@@ -113,6 +113,19 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
     },
+
+    /// Replay a WAV through StreamReceiverV2 as if it were live audio.
+    /// Prints every StreamEventV2 with its wall-clock timestamp so the
+    /// state-machine behaviour on a given capture can be diagnosed off-line.
+    RxStream {
+        /// Input WAV file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Chunk size in milliseconds (matches the live worker's batching).
+        #[arg(long, default_value = "500")]
+        chunk_ms: u64,
+    },
 }
 
 fn main() {
@@ -399,6 +412,143 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::RxStream { input, chunk_ms } => {
+            use modem_core::rx_stream_v2::{SessionEndReason, StreamEventV2, StreamReceiverV2};
+            let samples = read_wav(&input);
+            let sr = AUDIO_RATE as f64;
+            let duration_s = samples.len() as f64 / sr;
+            let chunk = ((chunk_ms as f64 / 1000.0) * sr) as usize;
+            eprintln!(
+                "RxStream: {} samples ({:.2}s), chunk={} samples ({}ms)",
+                samples.len(),
+                duration_s,
+                chunk,
+                chunk_ms
+            );
+            let mut rx = StreamReceiverV2::new();
+            let mut total_events = 0usize;
+            let mut max_feed_ms: u128 = 0;
+            let mut last_feed_ms: u128 = 0;
+            let mut first_streaming_feed_ms: Option<u128> = None;
+            let mut latest_constellation: Vec<[f32; 2]> = Vec::new();
+            for (k, batch) in samples.chunks(chunk).enumerate() {
+                let t_abs = (k * chunk) as f64 / sr;
+                let t0 = std::time::Instant::now();
+                let events = rx.feed(batch);
+                let dt = t0.elapsed().as_millis();
+                last_feed_ms = dt;
+                if dt > max_feed_ms {
+                    max_feed_ms = dt;
+                }
+                if rx.is_locked() && first_streaming_feed_ms.is_none() {
+                    first_streaming_feed_ms = Some(dt);
+                }
+                for ev in events {
+                    total_events += 1;
+                    match ev {
+                        StreamEventV2::PreambleDetected { profile } => {
+                            eprintln!("[{t_abs:7.2}s] PreambleDetected {:?}", profile);
+                        }
+                        StreamEventV2::HeaderDecoded {
+                            profile,
+                            mode_code,
+                            payload_length,
+                        } => {
+                            eprintln!(
+                                "[{t_abs:7.2}s] HeaderDecoded profile={:?} mode=0x{:02X} payload_length={}",
+                                profile, mode_code, payload_length
+                            );
+                        }
+                        StreamEventV2::MarkerSynced {
+                            seg_id,
+                            base_esi,
+                            is_meta,
+                        } => {
+                            eprintln!(
+                                "[{t_abs:7.2}s] MarkerSynced seg={} esi={} {}",
+                                seg_id,
+                                base_esi,
+                                if is_meta { "meta" } else { "data" }
+                            );
+                        }
+                        StreamEventV2::SignalLost => {
+                            eprintln!("[{t_abs:7.2}s] SignalLost");
+                        }
+                        StreamEventV2::SignalReacquired => {
+                            eprintln!("[{t_abs:7.2}s] SignalReacquired");
+                        }
+                        StreamEventV2::AppHeaderDecoded {
+                            session_id,
+                            file_size,
+                            mime_type,
+                            hash_short,
+                        } => {
+                            eprintln!(
+                                "[{t_abs:7.2}s] AppHeaderDecoded session=0x{:08X} size={} mime=0x{:02X} hash=0x{:04X}",
+                                session_id, file_size, mime_type, hash_short
+                            );
+                        }
+                        StreamEventV2::ProgressUpdate {
+                            blocks_converged,
+                            blocks_total,
+                            blocks_expected,
+                            sigma2,
+                            constellation_sample,
+                            ..
+                        } => {
+                            eprintln!(
+                                "[{t_abs:7.2}s] ProgressUpdate {}/{} data blocks (attempted={}), sigma2={:.4}",
+                                blocks_converged, blocks_expected, blocks_total, sigma2
+                            );
+                            latest_constellation = constellation_sample;
+                        }
+                        StreamEventV2::EnvelopeDecoded { filename, callsign } => {
+                            eprintln!(
+                                "[{t_abs:7.2}s] EnvelopeDecoded from={} filename={}",
+                                callsign, filename
+                            );
+                        }
+                        StreamEventV2::FileComplete {
+                            filename,
+                            callsign,
+                            mime_type,
+                            content,
+                            sigma2,
+                        } => {
+                            eprintln!(
+                                "[{t_abs:7.2}s] FileComplete from={} filename={} mime=0x{:02X} size={} sigma2={:.4}",
+                                callsign,
+                                filename,
+                                mime_type,
+                                content.len(),
+                                sigma2
+                            );
+                        }
+                        StreamEventV2::SessionEnd { reason } => {
+                            let r = match reason {
+                                SessionEndReason::Completed => "Completed",
+                                SessionEndReason::AbortTimeout => "AbortTimeout",
+                            };
+                            eprintln!("[{t_abs:7.2}s] SessionEnd reason={}", r);
+                        }
+                    }
+                }
+            }
+            eprintln!("done: {} events emitted", total_events);
+            eprintln!(
+                "feed_latency: first_streaming={:?}ms, last={}ms, max={}ms (chunk={}ms of audio)",
+                first_streaming_feed_ms, last_feed_ms, max_feed_ms, chunk_ms
+            );
+            // Dump the last-known constellation sample on stdout as JSON
+            // lines so it can be piped into an analysis script.
+            println!("{{\"constellation_sample\": [");
+            for (i, p) in latest_constellation.iter().enumerate() {
+                let comma = if i + 1 < latest_constellation.len() { "," } else { "" };
+                println!("  [{}, {}]{}", p[0], p[1], comma);
+            }
+            println!("]}}");
         }
 
         Commands::Info { input } => {

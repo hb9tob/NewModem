@@ -53,6 +53,21 @@ body {
   background: #333;
   border-color: #444;
 }
+.top-bar #btn-raw {
+  background: #2a3f5a;
+  border-color: #3a5a7a;
+  color: #b0d0f0;
+}
+.top-bar #btn-raw.recording {
+  background: #7a3a3a;
+  border-color: #ff6060;
+  color: #ffe0e0;
+  animation: rec-pulse 1.2s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
 .save-dir {
   font-size: 0.8rem;
   color: #9e9e9e;
@@ -61,16 +76,170 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.level-meter {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  color: #c0c0c0;
+}
+.level-bar {
+  display: inline-block;
+  width: 120px;
+  height: 10px;
+  background: #111;
+  border: 1px solid #444;
+  border-radius: 2px;
+  overflow: hidden;
+}
+#level-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(to right, #4caf50 0%, #ffeb3b 70%, #f44336 95%);
+  transition: width 0.15s linear;
+}
+.state-chip {
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 3px;
+  border: 1px solid #555;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+.state-chip.state-idle {
+  background: #2a2a2a;
+  border-color: #555;
+  color: #9e9e9e;
+}
+.state-chip.state-locked_training {
+  background: #3a3200;
+  border-color: #aa9500;
+  color: #ffd54f;
+}
+.state-chip.state-streaming {
+  background: #003a0f;
+  border-color: #3a7a3a;
+  color: #9ccc65;
+}
+.state-chip.state-lost_signal {
+  background: #3a0000;
+  border-color: #7a3a3a;
+  color: #ef5350;
+  animation: state-pulse 1.2s ease-in-out infinite;
+}
+@keyframes state-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.marker-info {
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  color: #81d4fa;
+  min-width: 140px;
+}
+.progress-meter {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  color: #c0c0c0;
+}
 .status {
   margin-left: auto;
   font-size: 0.875rem;
   color: #9ccc65;
 }
+.tab-bar {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0 1rem;
+  background: #2a2a2a;
+  border-bottom: 1px solid #3a3a3a;
+}
+.tab-bar .tab {
+  background: transparent;
+  color: #9e9e9e;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  padding: 0.45rem 1.1rem;
+  margin-top: 0.25rem;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.9rem;
+  letter-spacing: 0.02em;
+}
+.tab-bar .tab:hover {
+  color: #e0e0e0;
+}
+.tab-bar .tab.active {
+  color: #9ccc65;
+  background: #1e1e1e;
+  border-color: #3a3a3a;
+  border-bottom-color: #1e1e1e;
+  margin-bottom: -1px;
+}
 main {
-  display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: 1rem;
   padding: 1rem;
+}
+.tab-panel {
+  display: none;
+}
+.tab-panel.active {
+  display: block;
+}
+.rx-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: calc(100vh - 180px);
+}
+.rx-body {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 1rem;
+  flex: 1;
+  min-height: 0;
+}
+.rx-side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+#constellation-canvas {
+  background: #111;
+  border: 1px solid #3a3a3a;
+  border-radius: 3px;
+}
+.constellation-info {
+  margin-top: 0.5rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  color: #9e9e9e;
+  text-align: center;
+}
+.rx-progress-full {
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+}
+#progress-blocks {
+  display: block;
+  width: 100%;
+  background: #111;
+  border-radius: 2px;
+}
+.progress-label {
+  margin-top: 0.4rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  color: #c0c0c0;
+  text-align: right;
 }
 .panel {
   background: #262626;
@@ -94,7 +263,7 @@ main {
   list-style: none;
   padding: 0;
   margin: 0;
-  max-height: 60vh;
+  max-height: 70vh;
   overflow-y: auto;
   font-family: ui-monospace, monospace;
   font-size: 0.8rem;
@@ -111,4 +280,8 @@ main {
 #event-log li .ev-name {
   color: #81d4fa;
   margin-right: 0.4rem;
+}
+.tx-placeholder {
+  color: #9e9e9e;
+  font-style: italic;
 }

@@ -2158,6 +2158,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "dirs 5.0.1",
+ "hound",
  "modem-core",
  "serde",
  "serde_json",

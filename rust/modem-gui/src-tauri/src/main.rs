@@ -6,9 +6,10 @@ mod rx_worker;
 
 use audio::{list_input_devices, DeviceInfo};
 use audio_capture::CaptureHandle;
-use rx_worker::WorkerHandle;
+use rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 
 struct CaptureSession {
@@ -20,6 +21,7 @@ struct CaptureSession {
 struct AppState {
     session: Mutex<Option<CaptureSession>>,
     save_dir: Arc<Mutex<PathBuf>>,
+    wav_sink: SharedWavSink,
 }
 
 fn default_save_dir() -> PathBuf {
@@ -45,7 +47,12 @@ fn start_capture(
         return Err("capture already running".into());
     }
     let (capture, samples) = audio_capture::start(&device_name)?;
-    let worker = rx_worker::spawn(samples, app.clone(), state.save_dir.clone());
+    let worker = rx_worker::spawn(
+        samples,
+        app.clone(),
+        state.save_dir.clone(),
+        state.wav_sink.clone(),
+    );
     *guard = Some(CaptureSession {
         capture,
         worker,
@@ -64,7 +71,68 @@ fn stop_capture(state: State<'_, AppState>) -> Result<(), String> {
         session.capture.stop();
         session.worker.stop();
     }
+    // If a raw recording was still armed, finalize it now so the WAV is
+    // closed properly. We don't error out if it fails — audio capture is
+    // already stopped.
+    if let Ok(mut sink_guard) = state.wav_sink.lock() {
+        if let Some(sink) = sink_guard.take() {
+            let _ = sink.finalize();
+        }
+    }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct RawRecordingStatus {
+    path: String,
+    samples: u64,
+    duration_sec: f64,
+}
+
+/// Arm raw-audio capture. Returns the absolute path of the new WAV. Fails if
+/// a recording is already in progress.
+#[tauri::command]
+fn start_raw_recording(state: State<'_, AppState>) -> Result<String, String> {
+    let mut sink_guard = state.wav_sink.lock().map_err(|e| e.to_string())?;
+    if sink_guard.is_some() {
+        return Err("raw recording already in progress".into());
+    }
+    let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("capture-{ts}.wav"));
+    let sink = WavSink::create(&path).map_err(|e| format!("wav create: {e}"))?;
+    let path_str = sink.path.to_string_lossy().into_owned();
+    *sink_guard = Some(sink);
+    Ok(path_str)
+}
+
+/// Finalise raw-audio capture. Returns the WAV path and number of samples
+/// written. Fails if no recording was active.
+#[tauri::command]
+fn stop_raw_recording(state: State<'_, AppState>) -> Result<RawRecordingStatus, String> {
+    let mut sink_guard = state.wav_sink.lock().map_err(|e| e.to_string())?;
+    let sink = sink_guard
+        .take()
+        .ok_or_else(|| "no raw recording in progress".to_string())?;
+    let (path, samples) = sink.finalize().map_err(|e| format!("wav finalize: {e}"))?;
+    Ok(RawRecordingStatus {
+        path: path.to_string_lossy().into_owned(),
+        samples,
+        duration_sec: samples as f64 / 48_000.0,
+    })
+}
+
+#[tauri::command]
+fn is_raw_recording(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state
+        .wav_sink
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false))
 }
 
 #[tauri::command]
@@ -91,6 +159,7 @@ fn main() {
             app.manage(AppState {
                 session: Mutex::new(None),
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
+                wav_sink: Arc::new(Mutex::new(None)),
             });
             Ok(())
         })
@@ -100,6 +169,9 @@ fn main() {
             stop_capture,
             get_save_dir,
             set_save_dir,
+            start_raw_recording,
+            stop_raw_recording,
+            is_raw_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
