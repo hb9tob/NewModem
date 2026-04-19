@@ -127,11 +127,27 @@ struct ErrorPayload {
     message: String,
 }
 
+// #HB9TOB: tuning constants for TX-overdrive detection.
+// La signature retenue est la compression du PAPR de l'audio démodulé. Le
+// limiteur du modulateur NBFM (DSP de la radio TX, anti-débordement BW) écrase
+// le crest-factor des modulations linéaires shaped (QPSK / 16-APSK avec RRC).
+// Note 8-FSK : enveloppe constante, PAPR ≈ 0 dB → ce détecteur ne s'applique
+// pas à des modes futurs FSK.
+// Calibration 2026-04-19 sur OTA 48 kHz (per batch ≈ 500 ms) :
+//   captures clean    → crest p10 ≈ 9 dB  (p50 ≈ 9.5 dB)
+//   captures écrêtées → crest p90 ≤ 7.5 dB (p50 6-7.5 dB)
+// Seuil 8.5 dB pris au creux. RMS_GATE_LINEAR ≈ -25 dBFS pour ne pas évaluer
+// sur du silence/squelch fermé. Ajuster ces deux valeurs si faux pos/neg.
+const OVERDRIVE_RMS_GATE_LINEAR: f32 = 0.056;
+const OVERDRIVE_CREST_GATE_DB: f32 = 8.5;
+
 #[derive(Debug, Clone, Serialize)]
 struct AudioLevelPayload {
     rms: f32,
     peak: f32,
     total_samples: u64,
+    overdrive: bool,
+    crest_db: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -259,12 +275,22 @@ fn run_worker(
             sqsum += (s as f64) * (s as f64);
         }
         let rms = (sqsum / batch.len() as f64).sqrt() as f32;
+        // #HB9TOB: voir constantes OVERDRIVE_* en tête de fichier pour le seuil.
+        let crest_db = if peak > 1e-9 && rms > 1e-9 {
+            20.0 * (peak / rms).log10()
+        } else {
+            0.0
+        };
+        let overdrive =
+            rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
         let _ = app.emit(
             "audio_level",
             AudioLevelPayload {
                 rms,
                 peak,
                 total_samples,
+                overdrive,
+                crest_db,
             },
         );
 

@@ -109,6 +109,31 @@ body {
   text-transform: lowercase;
   letter-spacing: 0.02em;
 }
+/* #HB9TOB: voir OVD_STICKY_MS dans main.js pour la durée d'affichage. */
+.ovd-chip {
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 3px;
+  border: 1px solid;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+.ovd-off {
+  background: #2a2a2a;
+  border-color: #444;
+  color: #555;
+}
+.ovd-on {
+  background: #5a0000;
+  border-color: #ef5350;
+  color: #ffe0e0;
+  animation: ovd-pulse 0.8s ease-in-out infinite;
+}
+@keyframes ovd-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
 .state-chip.state-idle {
   background: #2a2a2a;
   border-color: #555;
@@ -139,6 +164,14 @@ body {
   font-size: 0.75rem;
   color: #81d4fa;
   min-width: 140px;
+}
+.papr-info {
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  color: #c0c0c0;
+}
+.papr-info.papr-warn {
+  color: #ffb74d;
 }
 .progress-meter {
   display: flex;

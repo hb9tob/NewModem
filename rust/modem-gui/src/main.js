@@ -229,6 +229,74 @@ function updateLevel(rms, peak, totalSamples) {
   text.textContent = `${db.toFixed(1)} dB (peak ${peak.toFixed(2)}) #${levelCount} ${samplesK}k`;
 }
 
+// #HB9TOB: durée d'affichage rouge du chip OVD après dernière détection.
+// Le chip s'efface tout seul après ce délai si plus aucun batch n'est marqué
+// overdrive. Voir OVERDRIVE_* côté Rust pour le seuil de détection.
+const OVD_STICKY_MS = 5000;
+
+// #HB9TOB: PAPR de référence audio-passband par profil (peak/RMS, dB), à
+// calibrer empiriquement sur des captures clean ; affiché à côté du chip OVD
+// pour comparer la mesure courante. La détection d'overdrive utilise un seuil
+// unique côté Rust (OVERDRIVE_CREST_GATE_DB), pas cette table.
+//   - HIGH/MEGA (16-APSK, 2 anneaux) : calibré 2026-04-19 sur OTA MEGA
+//     (capture-1776547952 etc.) p50 ≈ 9.48 dB
+//   - ULTRA/ROBUST/NORMAL : valeurs provisoires à confirmer sur capture clean
+//     du profil correspondant
+const PAPR_REF_DB = {
+  ULTRA: 8.5,
+  ROBUST: 8.5,
+  NORMAL: 8.5,
+  HIGH: 9.5,
+  MEGA: 9.5,
+};
+
+let lastOverdriveMs = 0;
+let lastCrestDb = NaN;
+let currentProfile = null;
+
+function refreshOverdriveChip() {
+  const chip = document.getElementById("ovd-chip");
+  if (!chip) return;
+  const active = lastOverdriveMs > 0 && (Date.now() - lastOverdriveMs) < OVD_STICKY_MS;
+  chip.classList.toggle("ovd-on", active);
+  chip.classList.toggle("ovd-off", !active);
+  if (Number.isFinite(lastCrestDb)) {
+    chip.title = `Overdrive TX — crest ${lastCrestDb.toFixed(1)} dB (seuil 8.5 dB)`;
+  }
+}
+
+function refreshPaprInfo() {
+  const elt = document.getElementById("papr-info");
+  if (!elt) return;
+  const ref = currentProfile && PAPR_REF_DB[currentProfile] != null
+    ? PAPR_REF_DB[currentProfile]
+    : null;
+  const measuredStr = Number.isFinite(lastCrestDb) && lastCrestDb > 0
+    ? `${lastCrestDb.toFixed(1)}` : "—";
+  const refStr = ref != null ? `${ref.toFixed(1)}` : "—";
+  const profileTag = currentProfile ? ` ${currentProfile}` : "";
+  elt.textContent = `PAPR ${measuredStr} / réf ${refStr} dB${profileTag}`;
+  // Souligne en orange si on est franchement sous la référence (≥ 1 dB de
+  // compression). Indication visuelle complémentaire au chip rouge.
+  const warn = ref != null
+    && Number.isFinite(lastCrestDb)
+    && lastCrestDb > 0
+    && lastCrestDb < ref - 1.0;
+  elt.classList.toggle("papr-warn", warn);
+}
+
+function noteAudioOverdrive(overdrive, crestDb) {
+  if (Number.isFinite(crestDb)) lastCrestDb = crestDb;
+  if (overdrive) lastOverdriveMs = Date.now();
+  refreshOverdriveChip();
+  refreshPaprInfo();
+}
+
+function noteProfileFromHeader(profileStr) {
+  currentProfile = (profileStr || "").toUpperCase() || null;
+  refreshPaprInfo();
+}
+
 function updateV2State(state) {
   const chip = document.getElementById("v2-state-chip");
   chip.className = `state-chip state-${state}`;
@@ -236,6 +304,7 @@ function updateV2State(state) {
   if (state === "idle") {
     document.getElementById("v2-marker-info").textContent = "—";
     resetRxVisuals();
+    noteProfileFromHeader(null);
   }
 }
 
@@ -401,10 +470,15 @@ function wireEvents() {
     listen(name, (event) => {
       logEvent(name, event.payload);
       if (name === "file_complete") showCurrentFile(event.payload);
+      if (name === "header" && event.payload && event.payload.profile) {
+        noteProfileFromHeader(event.payload.profile);
+      }
     });
   }
   listen("audio_level", (event) => {
-    updateLevel(event.payload.rms, event.payload.peak, event.payload.total_samples);
+    const p = event.payload;
+    updateLevel(p.rms, p.peak, p.total_samples);
+    noteAudioOverdrive(!!p.overdrive, p.crest_db);
   });
 
   listen("v2_state", (event) => {
@@ -443,6 +517,9 @@ async function init() {
   window.addEventListener("resize", redrawAll);
   await refreshRawRecordingState();
   resetRxVisuals();
+  // #HB9TOB: tick périodique pour effacer le chip OVD si aucun batch overdrive
+  // n'est arrivé depuis OVD_STICKY_MS (utile aussi quand la capture est arrêtée).
+  setInterval(refreshOverdriveChip, 200);
 }
 
 if (document.readyState === "loading") {
