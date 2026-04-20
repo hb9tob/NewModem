@@ -686,6 +686,22 @@ main {
   background: #3a5a7a;
   color: #e0f0ff;
 }
+.tx-btn-warn {
+  background: #5a4a1a !important;
+  border-color: #aa8a1a !important;
+  color: #ffd54f !important;
+}
+.tx-btn-warn:not(:disabled):hover {
+  background: #7a6222 !important;
+}
+.tx-progress-text {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: #c0c0c0;
+  margin-top: 0.4rem;
+  text-align: center;
+  min-height: 1.2em;
+}
 
 .rx-device-label {
   font-family: ui-monospace, monospace;

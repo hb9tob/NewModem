@@ -5,9 +5,11 @@ mod audio_capture;
 mod rx_worker;
 mod settings;
 mod tx_encode;
+mod tx_worker;
 
 use audio::{list_input_devices, list_output_devices, DeviceInfo};
 use settings::Settings;
+use tx_worker::TxHandle;
 use audio_capture::CaptureHandle;
 use rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, CompressOpts};
@@ -27,6 +29,7 @@ struct AppState {
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     tx_source: Arc<Mutex<Option<Vec<u8>>>>,
+    tx_handle: Mutex<Option<TxHandle>>,
 }
 
 fn default_save_dir() -> PathBuf {
@@ -165,6 +168,94 @@ struct CompressResult {
     byte_len: usize,
 }
 
+#[derive(serde::Serialize)]
+struct TxEstimate {
+    duration_s: f64,
+    total_blocks: u32,
+}
+
+#[tauri::command]
+fn tx_estimate(
+    payload_bytes: usize,
+    mode: String,
+    callsign: String,
+    filename: String,
+) -> Result<TxEstimate, String> {
+    let duration_s =
+        tx_worker::estimate_duration_s(payload_bytes, &mode, callsign.len(), filename.len())?;
+    let total_blocks =
+        tx_worker::estimate_total_blocks(payload_bytes, &mode, callsign.len(), filename.len())?;
+    Ok(TxEstimate {
+        duration_s,
+        total_blocks,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct TxStartArgs {
+    mode: String,
+    callsign: String,
+    filename: String,
+    tx_device: String,
+}
+
+#[tauri::command]
+fn tx_start(
+    args: TxStartArgs,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
+    if tx_guard.is_some() {
+        return Err("TX déjà en cours".into());
+    }
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let avif_path = save_dir.join("tx_preview.avif");
+    if !avif_path.exists() {
+        return Err(format!(
+            "preview AVIF absent ({}), recompresse une image avant TX",
+            avif_path.display()
+        ));
+    }
+    if args.callsign.trim().is_empty() {
+        return Err("indicatif vide (Paramètres → Indicatif)".into());
+    }
+    if args.tx_device.trim().is_empty() {
+        return Err("carte son TX non sélectionnée (Paramètres)".into());
+    }
+    let handle = tx_worker::spawn(
+        avif_path,
+        args.mode,
+        args.callsign.trim().to_uppercase(),
+        args.filename,
+        args.tx_device,
+        save_dir,
+        app,
+    );
+    *tx_guard = Some(handle);
+    Ok(())
+}
+
+#[tauri::command]
+fn tx_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
+    if let Some(h) = tx_guard.take() {
+        h.stop();
+    }
+    Ok(())
+}
+
+/// Called by JS once it has consumed tx_complete/tx_error. Cleans up the
+/// handle slot so subsequent tx_start calls work.
+#[tauri::command]
+fn tx_reset(state: State<'_, AppState>) -> Result<(), String> {
+    let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
+    if let Some(h) = tx_guard.take() {
+        h.stop();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn set_tx_source(bytes: Vec<u8>, state: State<'_, AppState>) -> Result<usize, String> {
     let len = bytes.len();
@@ -230,6 +321,7 @@ fn main() {
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
                 wav_sink: Arc::new(Mutex::new(None)),
                 tx_source: Arc::new(Mutex::new(None)),
+                tx_handle: Mutex::new(None),
             });
             Ok(())
         })
@@ -248,6 +340,10 @@ fn main() {
             set_tx_source,
             clear_tx_source,
             compress_image,
+            tx_estimate,
+            tx_start,
+            tx_stop,
+            tx_reset,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

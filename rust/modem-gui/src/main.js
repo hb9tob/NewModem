@@ -315,8 +315,12 @@ function setupSettingsTab() {
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
   if (call) {
-    call.addEventListener("change", persistSettings);
-    call.addEventListener("blur", persistSettings);
+    const onCallsignChange = async () => {
+      await persistSettings();
+      refreshTxEstimate();
+    };
+    call.addEventListener("change", onCallsignChange);
+    call.addEventListener("blur", onCallsignChange);
   }
   if (rxSel) {
     rxSel.addEventListener("change", () => {
@@ -712,6 +716,18 @@ function wireEvents() {
     updateV2Marker(event.payload);
     logEvent("v2_marker", event.payload);
   });
+  listen("tx_plan", (ev) => {
+    logEvent("tx_plan", ev.payload);
+  });
+  listen("tx_progress", (ev) => {
+    onTxProgress(ev.payload);
+  });
+  listen("tx_complete", (ev) => {
+    onTxComplete(ev.payload);
+  });
+  listen("tx_error", (ev) => {
+    onTxError(ev.payload);
+  });
   listen("v2_signal_lost", () => logEvent("v2_signal_lost", null));
   listen("v2_signal_reacquired", () => logEvent("v2_signal_reacquired", null));
   listen("v2_session_end", (event) => logEvent("v2_session_end", event.payload));
@@ -753,7 +769,27 @@ const txState = {
   compressing: false,
   compressTimer: null,
   compressSeq: 0,
+  // Estimation calculée par le backend après chaque compression ou
+  // changement de mode ; pilote l'activation du bouton TX et l'affichage
+  // "durée estimée · nb blocs".
+  estimate: null,
+  // Suivi d'une émission en cours.
+  progress: null,
+  restartRxAfter: false,
 };
+
+// Limites du transport (spec utilisateur) : interdit > 100 ko ou > 5 min,
+// warning > 2 min. Sous ces seuils, TX est activé normalement.
+const TX_HARD_BYTES = 100 * 1024;
+const TX_HARD_SECONDS = 5 * 60;
+const TX_WARN_SECONDS = 2 * 60;
+
+function fmtSeconds(s) {
+  if (!Number.isFinite(s)) return "—";
+  const m = Math.floor(s / 60);
+  const r = Math.round(s - m * 60);
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
 
 function refreshTxButtons() {
   const btnTx = document.getElementById("tx-btn-tx");
@@ -762,10 +798,48 @@ function refreshTxButtons() {
   const morePct = document.getElementById("tx-more-pct");
   if (!btnTx) return;
   const hasImage = !!txState.sourceImage;
-  btnTx.disabled = !hasImage || txState.txActive;
+  const hasCompressed = txState.compressedBytes != null;
+  const est = txState.estimate;
+
+  // Validation stricte : interdire TX si payload > 100 ko ou durée > 5 min.
+  const bytes = txState.compressedBytes || 0;
+  const dur = est ? est.duration_s : 0;
+  const tooBig = bytes > TX_HARD_BYTES;
+  const tooLong = dur > TX_HARD_SECONDS;
+  const warn = dur > TX_WARN_SECONDS && !tooLong;
+
+  const canTx = hasImage
+    && hasCompressed
+    && !txState.compressing
+    && !txState.txActive
+    && !tooBig
+    && !tooLong;
+  btnTx.disabled = !canTx;
   btnMore.disabled = !hasImage || txState.txActive;
   btnStop.disabled = !txState.txActive;
   if (morePct) morePct.disabled = !hasImage || txState.txActive;
+
+  // Libellé + couleur du bouton TX selon l'état.
+  if (txState.txActive) {
+    btnTx.textContent = "TX en cours…";
+    btnTx.title = "émission en cours";
+  } else if (tooBig) {
+    btnTx.textContent = `TX ✖ fichier > 100 ko`;
+    btnTx.title = `${(bytes / 1024).toFixed(1)} Kio dépasse la limite 100 Kio`;
+  } else if (tooLong) {
+    btnTx.textContent = `TX ✖ > 5 min`;
+    btnTx.title = `durée estimée ${fmtSeconds(dur)} dépasse la limite 5 min`;
+  } else if (warn) {
+    btnTx.textContent = `TX ⚠ ${fmtSeconds(dur)}`;
+    btnTx.title = `transmission longue (> 2 min) — durée estimée ${fmtSeconds(dur)}, ${est.total_blocks} blocs`;
+  } else if (est) {
+    btnTx.textContent = `TX (${fmtSeconds(dur)})`;
+    btnTx.title = `durée estimée ${fmtSeconds(dur)}, ${est.total_blocks} blocs`;
+  } else {
+    btnTx.textContent = "TX";
+    btnTx.title = "";
+  }
+  btnTx.classList.toggle("tx-btn-warn", warn && !txState.txActive);
 }
 
 function txFormatBytes(n) {
@@ -842,6 +916,37 @@ function scheduleTxCompress(delayMs = 300) {
   }, delayMs);
 }
 
+function getTxFilename() {
+  if (!txState.sourceFile) return "image.avif";
+  const base = txState.sourceFile.name.replace(/\.[^/.]+$/, "");
+  // Envelope autorise 64 octets UTF-8, on garde un peu de marge.
+  return `${base.slice(0, 56)}.avif`;
+}
+
+async function refreshTxEstimate() {
+  txState.estimate = null;
+  if (!txState.compressedBytes) {
+    refreshTxButtons();
+    refreshTxPreview();
+    return;
+  }
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    const est = await invoke("tx_estimate", {
+      payloadBytes: txState.compressedBytes,
+      mode: txState.mode,
+      callsign: currentSettings.callsign || "HB9XXX",
+      filename: getTxFilename(),
+    });
+    txState.estimate = est;
+  } catch (err) {
+    logEvent("tx_estimate_error", { message: String(err) });
+  }
+  refreshTxButtons();
+  refreshTxPreview();
+}
+
 async function runTxCompress() {
   if (!txState.sourceImage || !txState.sourceFile) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
@@ -887,6 +992,8 @@ async function runTxCompress() {
       actual_h: result.actual_h,
       byte_len: result.byte_len,
     });
+    // Rafraîchit l'estimation (durée + blocs) pour activer/verrouiller TX.
+    refreshTxEstimate();
   } catch (err) {
     if (seq === txState.compressSeq) {
       logEvent("tx_compress_error", { message: String(err) });
@@ -1025,6 +1132,7 @@ function setupTxTab() {
   document.getElementById("tx-mode").addEventListener("change", (ev) => {
     txState.mode = ev.target.value;
     refreshTxPreview();
+    refreshTxEstimate();
   });
 
   const resizeRadios = document.querySelectorAll('input[name="tx-resize"]');
@@ -1073,39 +1181,145 @@ function setupTxTab() {
     scheduleTxCompress();
   });
 
-  // Boutons TX / Stop / TX more — handlers placeholder jusqu'au câblage
-  // backend. Les transitions d'état (txActive on/off) seront pilotées par
-  // les événements Tauri une fois la pipeline TX branchée.
-  document.getElementById("tx-btn-tx").addEventListener("click", () => {
-    logEvent("tx_click", {
-      action: "tx",
-      mode: txState.mode,
-      resize: txState.resize,
-      dims: txTargetDims(),
-      quality: txState.quality,
-      file: txState.sourceFile && txState.sourceFile.name,
-      note: "backend TX à câbler",
-    });
-  });
-  document.getElementById("tx-btn-stop").addEventListener("click", () => {
-    logEvent("tx_click", { action: "stop", note: "backend TX à câbler" });
-  });
+  document.getElementById("tx-btn-tx").addEventListener("click", txStart);
+  document.getElementById("tx-btn-stop").addEventListener("click", txStop);
   document.getElementById("tx-btn-more").addEventListener("click", () => {
     logEvent("tx_click", {
       action: "tx_more",
-      mode: txState.mode,
-      resize: txState.resize,
-      dims: txTargetDims(),
-      quality: txState.quality,
-      more_pct: txState.morePct,
-      file: txState.sourceFile && txState.sourceFile.name,
-      note: "backend TX à câbler",
+      note: "code fontaine non-MVP, bouton placeholder",
     });
   });
   document.getElementById("tx-more-pct").addEventListener("change", (ev) => {
     txState.morePct = parseInt(ev.target.value, 10) || 10;
   });
   refreshTxButtons();
+}
+
+// ────────────────────────────────────────────── TX orchestration (RX↔TX)
+async function txStart() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  if (txState.txActive) return;
+  if (!txState.estimate) {
+    logEvent("tx_start_skipped", { reason: "pas d'estimation (compresse d'abord)" });
+    return;
+  }
+  const { invoke } = window.__TAURI__.core;
+  const rxStopBtn = document.getElementById("btn-stop");
+  const rxWasActive = rxStopBtn && !rxStopBtn.disabled;
+  if (rxWasActive) {
+    try {
+      await invoke("stop_capture");
+    } catch (err) {
+      logEvent("tx_pre_stop_error", { message: String(err) });
+    }
+  }
+  txState.restartRxAfter = rxWasActive;
+  txState.txActive = true;
+  txState.progress = null;
+  updateTxProgressText();
+  refreshTxButtons();
+  logEvent("tx_start", {
+    mode: txState.mode,
+    callsign: currentSettings.callsign,
+    tx_device: currentSettings.tx_device,
+    estimate: txState.estimate,
+  });
+  try {
+    await invoke("tx_start", {
+      args: {
+        mode: txState.mode,
+        callsign: currentSettings.callsign || "",
+        filename: getTxFilename(),
+        tx_device: currentSettings.tx_device || "",
+      },
+    });
+  } catch (err) {
+    logEvent("tx_start_error", { message: String(err) });
+    txState.txActive = false;
+    refreshTxButtons();
+    await maybeRestartRx();
+  }
+}
+
+async function txStop() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    await invoke("tx_stop");
+  } catch (err) {
+    logEvent("tx_stop_error", { message: String(err) });
+  }
+}
+
+async function maybeRestartRx() {
+  if (!txState.restartRxAfter) return;
+  txState.restartRxAfter = false;
+  // Petit délai pour laisser la carte son TX libérer ses handles avant
+  // d'ouvrir la capture RX (surtout si la même carte est utilisée).
+  await new Promise((r) => setTimeout(r, 300));
+  await startCapture();
+}
+
+function updateTxProgressText() {
+  const txt = document.getElementById("tx-progress-text");
+  if (!txt) return;
+  const p = txState.progress;
+  if (!p) {
+    if (txState.estimate) {
+      txt.textContent = `— / ${txState.estimate.total_blocks} blocs · durée ~${fmtSeconds(txState.estimate.duration_s)}`;
+    } else {
+      txt.textContent = "—";
+    }
+    return;
+  }
+  txt.textContent =
+    `TX ${p.blocks_sent} / ${p.total_blocks} blocs · ${fmtSeconds(p.elapsed_s)} / ${fmtSeconds(p.duration_s)}`;
+}
+
+function onTxProgress(payload) {
+  txState.progress = payload;
+  updateTxProgressText();
+  // Réutilise la barre de progression du bas (blocs) en mode TX.
+  const bitmap = new Uint8Array(Math.ceil((payload.total_blocks || 0) / 8));
+  for (let i = 0; i < payload.blocks_sent; i++) {
+    bitmap[i >> 3] |= 1 << (i & 7);
+  }
+  lastProgress = {
+    bitmap,
+    expected: payload.total_blocks,
+    converged: payload.blocks_sent,
+    sigma2: null,
+  };
+  drawProgressBlocks();
+}
+
+async function onTxComplete(payload) {
+  logEvent("tx_complete", payload);
+  txState.txActive = false;
+  txState.progress = null;
+  updateTxProgressText();
+  refreshTxButtons();
+  try {
+    const { invoke } = window.__TAURI__.core;
+    await invoke("tx_reset");
+  } catch (_) {}
+  // Reset affichage RX + relance si besoin.
+  resetRxVisuals();
+  await maybeRestartRx();
+}
+
+async function onTxError(payload) {
+  logEvent("tx_error", payload);
+  txState.txActive = false;
+  txState.progress = null;
+  updateTxProgressText();
+  refreshTxButtons();
+  try {
+    const { invoke } = window.__TAURI__.core;
+    await invoke("tx_reset");
+  } catch (_) {}
+  resetRxVisuals();
+  await maybeRestartRx();
 }
 
 async function init() {
