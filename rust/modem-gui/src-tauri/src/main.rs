@@ -3,9 +3,11 @@
 mod audio;
 mod audio_capture;
 mod rx_worker;
+mod settings;
 mod tx_encode;
 
-use audio::{list_input_devices, DeviceInfo};
+use audio::{list_input_devices, list_output_devices, DeviceInfo};
+use settings::Settings;
 use audio_capture::CaptureHandle;
 use rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, CompressOpts};
@@ -37,6 +39,21 @@ fn default_save_dir() -> PathBuf {
 #[tauri::command]
 fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_input_devices().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
+    list_output_devices().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_settings() -> Settings {
+    settings::load()
+}
+
+#[tauri::command]
+fn save_settings(settings: Settings) -> Result<(), String> {
+    settings::save(&settings)
 }
 
 #[tauri::command]
@@ -218,6 +235,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
+            list_output_audio_devices,
+            get_settings,
+            save_settings,
             start_capture,
             stop_capture,
             get_save_dir,

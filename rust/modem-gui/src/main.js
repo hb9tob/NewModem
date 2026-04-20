@@ -192,9 +192,67 @@ function setupLightbox() {
   });
 }
 
-// ───────────────────────────────────────────────────── Device / control
+// ─────────────────────────────────────────── Settings / device selection
+// Les deux cartes son (RX/TX) + l'indicatif vivent dans l'onglet Paramètres
+// et sont persistés via les commandes Tauri get_settings / save_settings.
+let currentSettings = { callsign: "", rx_device: "", tx_device: "" };
+
+function populateDeviceSelect(selectId, devices, savedName) {
+  const select = document.getElementById(selectId);
+  if (!select) return null;
+  select.innerHTML = "";
+  if (!devices || devices.length === 0) {
+    const opt = document.createElement("option");
+    opt.textContent = "aucune carte détectée";
+    opt.value = "";
+    select.appendChild(opt);
+    return null;
+  }
+  let preferred = null;
+  for (const dev of devices) {
+    const opt = document.createElement("option");
+    opt.value = dev.name;
+    const range = dev.max_sample_rate > 0
+      ? `${dev.min_sample_rate}–${dev.max_sample_rate} Hz`
+      : "?";
+    const tag48 = dev.supports_48k ? " ✓48k" : "";
+    const tagDef = dev.is_default ? " [default]" : "";
+    const tagErr = dev.error ? ` [${dev.error}]` : "";
+    opt.textContent = `${dev.friendly_name} — ${range}${tag48}${tagDef}${tagErr}`;
+    opt.dataset.supports48k = dev.supports_48k ? "1" : "0";
+    select.appendChild(opt);
+    if (preferred === null && dev.supports_48k) preferred = dev;
+    if (dev.is_default && dev.supports_48k) preferred = dev;
+  }
+  // Priorité : valeur sauvegardée si encore disponible, sinon préférée.
+  if (savedName && devices.some(d => d.name === savedName)) {
+    select.value = savedName;
+  } else if (preferred) {
+    select.value = preferred.name;
+  }
+  return select.value || null;
+}
+
+function refreshRxDeviceLabel() {
+  const label = document.getElementById("rx-device-label");
+  const select = document.getElementById("rx-device-select");
+  if (!label || !select) return;
+  const opt = select.options[select.selectedIndex];
+  label.textContent = opt && opt.value ? opt.textContent : "— aucune carte RX";
+}
+
+function refreshStartButtonFromRx() {
+  const select = document.getElementById("rx-device-select");
+  const btn = document.getElementById("btn-start");
+  if (!select || !btn) return;
+  const opt = select.options[select.selectedIndex];
+  const ok = !!(opt && opt.value && opt.dataset.supports48k === "1");
+  // Ne touche pas à btn-start si capture en cours (disabled via startCapture).
+  if (!document.getElementById("btn-stop").disabled) return;
+  btn.disabled = !ok;
+}
+
 async function loadDevices() {
-  const select = document.getElementById("device-select");
   const status = document.getElementById("status");
   if (!window.__TAURI__ || !window.__TAURI__.core) {
     status.textContent = "API Tauri indisponible";
@@ -203,39 +261,72 @@ async function loadDevices() {
   }
   const { invoke } = window.__TAURI__.core;
   try {
-    const devices = await invoke("list_audio_devices");
-    select.innerHTML = "";
-    if (devices.length === 0) {
-      const opt = document.createElement("option");
-      opt.textContent = "aucune carte son détectée";
-      select.appendChild(opt);
-      status.textContent = "aucune entrée";
-      status.style.color = "#ef5350";
-      return;
-    }
-    let preferred = null;
-    for (const dev of devices) {
-      const opt = document.createElement("option");
-      opt.value = dev.name;
-      const range = dev.max_sample_rate > 0
-        ? `${dev.min_sample_rate}–${dev.max_sample_rate} Hz`
-        : "?";
-      const tag48 = dev.supports_48k ? " ✓48k" : "";
-      const tagDef = dev.is_default ? " [default]" : "";
-      const tagErr = dev.error ? ` [${dev.error}]` : "";
-      opt.textContent = `${dev.friendly_name} — ${range}${tag48}${tagDef}${tagErr}`;
-      opt.dataset.supports48k = dev.supports_48k;
-      select.appendChild(opt);
-      if (preferred === null && dev.supports_48k) preferred = opt;
-      if (dev.is_default && dev.supports_48k) preferred = opt;
-    }
-    if (preferred) preferred.selected = true;
-    const n48 = devices.filter(d => d.supports_48k).length;
-    status.textContent = `${devices.length} entrée(s), ${n48} compat. 48 kHz`;
-    document.getElementById("btn-start").disabled = n48 === 0;
+    const [rxDevices, txDevices] = await Promise.all([
+      invoke("list_audio_devices"),
+      invoke("list_output_audio_devices"),
+    ]);
+    populateDeviceSelect("rx-device-select", rxDevices, currentSettings.rx_device);
+    populateDeviceSelect("tx-device-select", txDevices, currentSettings.tx_device);
+    const n48 = rxDevices.filter(d => d.supports_48k).length;
+    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX`;
+    refreshRxDeviceLabel();
+    refreshStartButtonFromRx();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
+  }
+}
+
+async function loadSettings() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    currentSettings = await invoke("get_settings");
+  } catch (err) {
+    console.error("get_settings", err);
+    currentSettings = { callsign: "", rx_device: "", tx_device: "" };
+  }
+  const call = document.getElementById("callsign-input");
+  if (call) call.value = currentSettings.callsign || "";
+}
+
+async function persistSettings() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const call = document.getElementById("callsign-input");
+  const rxSel = document.getElementById("rx-device-select");
+  const txSel = document.getElementById("tx-device-select");
+  currentSettings = {
+    callsign: (call && call.value || "").trim().toUpperCase(),
+    rx_device: rxSel ? rxSel.value || "" : "",
+    tx_device: txSel ? txSel.value || "" : "",
+  };
+  const statusEl = document.getElementById("settings-status");
+  try {
+    await invoke("save_settings", { settings: currentSettings });
+    if (statusEl) statusEl.textContent = `sauvegardé ${now()}`;
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `erreur : ${err}`;
+  }
+}
+
+function setupSettingsTab() {
+  const call = document.getElementById("callsign-input");
+  const rxSel = document.getElementById("rx-device-select");
+  const txSel = document.getElementById("tx-device-select");
+  if (call) {
+    call.addEventListener("change", persistSettings);
+    call.addEventListener("blur", persistSettings);
+  }
+  if (rxSel) {
+    rxSel.addEventListener("change", () => {
+      refreshRxDeviceLabel();
+      refreshStartButtonFromRx();
+      persistSettings();
+    });
+  }
+  if (txSel) {
+    txSel.addEventListener("change", persistSettings);
   }
 }
 
@@ -252,9 +343,14 @@ async function loadSaveDir() {
 
 async function startCapture() {
   const { invoke } = window.__TAURI__.core;
-  const select = document.getElementById("device-select");
-  const deviceName = select.value;
+  const select = document.getElementById("rx-device-select");
+  const deviceName = select ? select.value : "";
   const status = document.getElementById("status");
+  if (!deviceName) {
+    status.textContent = "sélectionner une carte RX dans Paramètres";
+    status.style.color = "#ef5350";
+    return;
+  }
   levelCount = 0;
   try {
     await invoke("start_capture", { deviceName });
@@ -262,7 +358,7 @@ async function startCapture() {
     status.style.color = "#ffb74d";
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
-    select.disabled = true;
+    if (select) select.disabled = true;
     logEvent("start", { device: deviceName });
   } catch (err) {
     status.textContent = `erreur start : ${err}`;
@@ -278,9 +374,10 @@ async function stopCapture() {
     await invoke("stop_capture");
     status.textContent = "arrêté";
     status.style.color = "#9ccc65";
-    document.getElementById("btn-start").disabled = false;
     document.getElementById("btn-stop").disabled = true;
-    document.getElementById("device-select").disabled = false;
+    const rxSel = document.getElementById("rx-device-select");
+    if (rxSel) rxSel.disabled = false;
+    refreshStartButtonFromRx();
     await refreshRawRecordingState();
     logEvent("stop", null);
   } catch (err) {
@@ -824,13 +921,17 @@ async function loadTxFile(file) {
   const img = new Image();
   img.onload = async () => {
     txState.sourceImage = img;
-    // Init des champs "libre" à la taille native.
-    txState.freeW = img.naturalWidth;
-    txState.freeH = img.naturalHeight;
-    const fw = document.getElementById("tx-free-w");
-    const fh = document.getElementById("tx-free-h");
-    if (fw) fw.value = txState.freeW;
-    if (fh) fh.value = txState.freeH;
+    // Ne reset freeW/H à la taille native QUE si on n'est pas déjà en mode
+    // "libre" — sinon on écrase la dimension choisie par l'utilisateur
+    // avant le drop, et la 1ère compression ignore son 800×600 manuel.
+    if (txState.resize !== "free") {
+      txState.freeW = img.naturalWidth;
+      txState.freeH = img.naturalHeight;
+      const fw = document.getElementById("tx-free-w");
+      const fh = document.getElementById("tx-free-h");
+      if (fw) fw.value = txState.freeW;
+      if (fh) fh.value = txState.freeH;
+    }
     document.getElementById("tx-drop-zone").hidden = true;
     const preview = document.getElementById("tx-preview");
     const previewImg = document.getElementById("tx-preview-img");
@@ -1011,6 +1112,8 @@ async function init() {
   setupTabs();
   setupLightbox();
   setupTxTab();
+  setupSettingsTab();
+  await loadSettings();
   await loadDevices();
   await loadSaveDir();
   wireEvents();

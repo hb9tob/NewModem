@@ -161,6 +161,66 @@ pub fn list_input_devices() -> Result<Vec<DeviceInfo>, Box<dyn std::error::Error
     Ok(out)
 }
 
+pub fn list_output_devices() -> Result<Vec<DeviceInfo>, Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+    let cards = alsa_card_descriptions();
+    let mut out = Vec::new();
+    for device in host.output_devices()? {
+        let name = match device.name() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !keep_device(&name) {
+            continue;
+        }
+        let is_default = default_name.as_deref() == Some(name.as_str());
+        let default_sample_rate = device
+            .default_output_config()
+            .map(|c| c.sample_rate().0)
+            .unwrap_or(0);
+        let (min_sample_rate, max_sample_rate, supports_48k, error) =
+            match device.supported_output_configs() {
+                Ok(iter) => {
+                    let mut min = u32::MAX;
+                    let mut max = 0u32;
+                    let mut has_48k = false;
+                    for cfg in iter {
+                        let lo = cfg.min_sample_rate().0;
+                        let hi = cfg.max_sample_rate().0;
+                        if lo < min {
+                            min = lo;
+                        }
+                        if hi > max {
+                            max = hi;
+                        }
+                        if (lo..=hi).contains(&TARGET_RATE) {
+                            has_48k = true;
+                        }
+                    }
+                    if max == 0 {
+                        (0, 0, false, Some("no supported config".into()))
+                    } else {
+                        (min, max, has_48k, None)
+                    }
+                }
+                Err(e) => (0, 0, false, Some(e.to_string())),
+            };
+        let friendly_name = friendly(&name, &cards);
+        out.push(DeviceInfo {
+            name,
+            friendly_name,
+            default_sample_rate,
+            min_sample_rate,
+            max_sample_rate,
+            supports_48k,
+            is_default,
+            error,
+        });
+    }
+    Ok(out)
+}
+
 /// Verify that a named device can be opened at 48 kHz; returns the actual
 /// sample-rate that will be used (target if accepted, else device default).
 #[allow(dead_code)]

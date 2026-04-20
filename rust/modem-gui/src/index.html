@@ -24,20 +24,16 @@
   <nav class="tab-bar">
     <button class="tab active" data-tab="rx">RX</button>
     <button class="tab" data-tab="tx">TX</button>
+    <button class="tab" data-tab="settings">Paramètres</button>
     <button class="tab" data-tab="info">Info</button>
   </nav>
   <main>
     <section id="tab-rx" class="tab-panel active rx-layout">
       <div class="rx-toolbar">
-        <label>
-          Carte son :
-          <select id="device-select">
-            <option>Chargement…</option>
-          </select>
-        </label>
         <button id="btn-start" disabled>Démarrer</button>
         <button id="btn-stop" disabled>Arrêter</button>
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
+        <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
       </div>
       <div id="current-info" class="rx-info">Aucun fichier reçu</div>
       <div id="current-image-wrap" class="rx-image-wrap">
@@ -112,6 +108,28 @@
           </div>
         </div>
       </aside>
+    </section>
+    <section id="tab-settings" class="tab-panel settings-layout">
+      <div class="settings-form">
+        <fieldset>
+          <legend>Indicatif</legend>
+          <input type="text" id="callsign-input" placeholder="HB9TOB" maxlength="12">
+          <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
+        </fieldset>
+        <fieldset>
+          <legend>Carte son réception (RX)</legend>
+          <select id="rx-device-select">
+            <option>Chargement…</option>
+          </select>
+        </fieldset>
+        <fieldset>
+          <legend>Carte son émission (TX)</legend>
+          <select id="tx-device-select">
+            <option>Chargement…</option>
+          </select>
+        </fieldset>
+        <div class="settings-status" id="settings-status">—</div>
+      </div>
     </section>
     <section id="tab-info" class="tab-panel">
       <ul id="event-log"></ul>
