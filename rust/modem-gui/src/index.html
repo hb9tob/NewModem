@@ -7,15 +7,6 @@
 </head>
 <body>
   <header class="top-bar">
-    <label>
-      Carte son :
-      <select id="device-select">
-        <option>Chargement…</option>
-      </select>
-    </label>
-    <button id="btn-start" disabled>Démarrer</button>
-    <button id="btn-stop" disabled>Arrêter</button>
-    <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
     <span id="save-dir-label" class="save-dir" title="Dossier de sauvegarde"></span>
     <span id="level-meter" class="level-meter">
       <span class="level-bar"><span id="level-fill"></span></span>
@@ -37,6 +28,17 @@
   </nav>
   <main>
     <section id="tab-rx" class="tab-panel active rx-layout">
+      <div class="rx-toolbar">
+        <label>
+          Carte son :
+          <select id="device-select">
+            <option>Chargement…</option>
+          </select>
+        </label>
+        <button id="btn-start" disabled>Démarrer</button>
+        <button id="btn-stop" disabled>Arrêter</button>
+        <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
+      </div>
       <div id="current-info" class="rx-info">Aucun fichier reçu</div>
       <div id="current-image-wrap" class="rx-image-wrap">
         <div class="rx-placeholder">En attente d'image…</div>

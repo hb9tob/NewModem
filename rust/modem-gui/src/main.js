@@ -749,6 +749,12 @@ async function runTxCompress() {
   if (!txState.sourceImage || !txState.sourceFile) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke, convertFileSrc } = window.__TAURI__.core;
+  // Resync defensif depuis le DOM : en cas de drift entre clic radio et
+  // cache JS (change event avalé, etc.), le DOM reste la source de vérité.
+  const checkedRadio = document.querySelector('input[name="tx-resize"]:checked');
+  if (checkedRadio && checkedRadio.value !== txState.resize) {
+    txState.resize = checkedRadio.value;
+  }
   const dims = txTargetDims();
   if (!dims) return;
   const seq = ++txState.compressSeq;
@@ -756,6 +762,12 @@ async function runTxCompress() {
   const previewEl = document.getElementById("tx-preview");
   if (previewEl) previewEl.classList.add("compressing");
   refreshTxPreview();
+  logEvent("tx_compress_start", {
+    resize: txState.resize,
+    target_w: dims.w,
+    target_h: dims.h,
+    quality: txState.quality,
+  });
   try {
     const result = await invoke("compress_image", {
       opts: {
@@ -771,6 +783,13 @@ async function runTxCompress() {
     txState.compressedUrl = url;
     const previewImg = document.getElementById("tx-preview-img");
     if (previewImg) previewImg.src = url;
+    logEvent("tx_compress_done", {
+      source_w: result.source_w,
+      source_h: result.source_h,
+      actual_w: result.actual_w,
+      actual_h: result.actual_h,
+      byte_len: result.byte_len,
+    });
   } catch (err) {
     if (seq === txState.compressSeq) {
       logEvent("tx_compress_error", { message: String(err) });

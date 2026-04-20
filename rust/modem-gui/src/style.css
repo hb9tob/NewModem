@@ -261,6 +261,73 @@ main {
 .rx-layout {
   position: relative;
 }
+.rx-toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.6rem 0.9rem;
+  background: #262626;
+  border-bottom: 1px solid #3a3a3a;
+  flex-wrap: wrap;
+}
+.rx-toolbar label {
+  font-size: 0.85rem;
+  color: #c0c0c0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.rx-toolbar select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 0.25rem 1.5rem 0.25rem 0.5rem;
+  min-width: 260px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><polygon points='0,0 10,0 5,6' fill='%23e0e0e0'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+}
+.rx-toolbar select option {
+  background: #1e1e1e;
+  color: #e0e0e0;
+}
+.rx-toolbar button {
+  background: #2d5a2d;
+  color: #e0e0e0;
+  border: 1px solid #3a7a3a;
+  border-radius: 3px;
+  padding: 0.3rem 0.9rem;
+  cursor: pointer;
+  font-family: inherit;
+}
+.rx-toolbar button:disabled {
+  background: #333;
+  border-color: #444;
+  color: #777;
+  cursor: not-allowed;
+}
+.rx-toolbar #btn-stop {
+  background: #5a2d2d;
+  border-color: #7a3a3a;
+}
+.rx-toolbar #btn-stop:disabled {
+  background: #333;
+  border-color: #444;
+}
+.rx-toolbar #btn-raw {
+  background: #2a3f5a;
+  border-color: #3a5a7a;
+  color: #b0d0f0;
+}
+.rx-toolbar #btn-raw.recording {
+  background: #7a3a3a;
+  border-color: #ff6060;
+  color: #ffe0e0;
+  animation: rec-pulse 1.2s ease-in-out infinite;
+}
 .rx-image-wrap {
   flex: 1;
   min-height: 0;
@@ -279,7 +346,7 @@ main {
 }
 .rx-constellation {
   position: absolute;
-  top: 44px;
+  bottom: 16px;
   right: 8px;
   width: 200px;
   height: 200px;
