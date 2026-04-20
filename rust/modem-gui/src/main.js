@@ -651,6 +651,11 @@ const txState = {
   txActive: false,
   // Blocs fontaine additionnels à générer sur TX more (% de la taille code).
   morePct: 10,
+  compressedBytes: null,
+  compressedUrl: null,
+  compressing: false,
+  compressTimer: null,
+  compressSeq: 0,
 };
 
 function refreshTxButtons() {
@@ -700,9 +705,11 @@ function txTargetDims() {
 function refreshTxPreview() {
   const info = document.getElementById("tx-preview-info");
   const srcSize = document.getElementById("tx-source-size");
+  const cmpSize = document.getElementById("tx-compressed-size");
   if (!txState.sourceImage) {
     if (info) info.textContent = "—";
     if (srcSize) srcSize.textContent = "—";
+    if (cmpSize) cmpSize.textContent = "—";
     return;
   }
   const natW = txState.sourceImage.naturalWidth;
@@ -712,12 +719,70 @@ function refreshTxPreview() {
     const resizePart = d.w === natW && d.h === natH
       ? `${natW}×${natH}`
       : `${natW}×${natH} → ${d.w}×${d.h}`;
-    info.textContent = `${resizePart} · q${txState.quality} · ${txState.mode}`;
+    const cmpPart = txState.compressing ? " · compression…" : "";
+    info.textContent = `${resizePart} · q${txState.quality} · ${txState.mode}${cmpPart}`;
   }
   if (srcSize) srcSize.textContent = txFormatBytes(txState.sourceSize);
+  if (cmpSize) {
+    if (txState.compressing && txState.compressedBytes == null) {
+      cmpSize.textContent = "compression…";
+    } else if (txState.compressedBytes != null) {
+      const ratio = txState.sourceSize > 0
+        ? ` (${(txState.compressedBytes / txState.sourceSize * 100).toFixed(1)}%)`
+        : "";
+      cmpSize.textContent = `${txFormatBytes(txState.compressedBytes)}${ratio}`;
+    } else {
+      cmpSize.textContent = "—";
+    }
+  }
 }
 
-function loadTxFile(file) {
+function scheduleTxCompress(delayMs = 300) {
+  if (txState.compressTimer) clearTimeout(txState.compressTimer);
+  txState.compressTimer = setTimeout(() => {
+    txState.compressTimer = null;
+    runTxCompress();
+  }, delayMs);
+}
+
+async function runTxCompress() {
+  if (!txState.sourceImage || !txState.sourceFile) return;
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke, convertFileSrc } = window.__TAURI__.core;
+  const dims = txTargetDims();
+  if (!dims) return;
+  const seq = ++txState.compressSeq;
+  txState.compressing = true;
+  refreshTxPreview();
+  try {
+    const result = await invoke("compress_image", {
+      opts: {
+        target_w: dims.w,
+        target_h: dims.h,
+        quality: txState.quality,
+      },
+    });
+    if (seq !== txState.compressSeq) return; // stale
+    txState.compressedBytes = result.byte_len;
+    // Cache-bust: le fichier est réécrit à chaque appel.
+    const url = `${convertFileSrc(result.preview_path)}?v=${Date.now()}`;
+    txState.compressedUrl = url;
+    const previewImg = document.getElementById("tx-preview-img");
+    if (previewImg) previewImg.src = url;
+  } catch (err) {
+    if (seq === txState.compressSeq) {
+      logEvent("tx_compress_error", { message: String(err) });
+    }
+  } finally {
+    if (seq === txState.compressSeq) {
+      txState.compressing = false;
+      refreshTxPreview();
+      refreshTxButtons();
+    }
+  }
+}
+
+async function loadTxFile(file) {
   if (!file || !file.type || !file.type.startsWith("image/")) {
     logEvent("tx_error", { message: `type non supporté: ${file && file.type}` });
     return;
@@ -729,10 +794,12 @@ function loadTxFile(file) {
   }
   txState.sourceFile = file;
   txState.sourceSize = file.size;
+  txState.compressedBytes = null;
+  txState.compressedUrl = null;
   const url = URL.createObjectURL(file);
   txState.sourceUrl = url;
   const img = new Image();
-  img.onload = () => {
+  img.onload = async () => {
     txState.sourceImage = img;
     // Init des champs "libre" à la taille native.
     txState.freeW = img.naturalWidth;
@@ -748,6 +815,15 @@ function loadTxFile(file) {
     preview.hidden = false;
     refreshTxPreview();
     refreshTxButtons();
+    // Envoie la source au backend pour compressions successives sans re-upload.
+    try {
+      const buf = await file.arrayBuffer();
+      const { invoke } = window.__TAURI__.core;
+      await invoke("set_tx_source", { bytes: Array.from(new Uint8Array(buf)) });
+      scheduleTxCompress(50);
+    } catch (err) {
+      logEvent("tx_error", { message: `upload source: ${err}` });
+    }
   };
   img.onerror = () => {
     logEvent("tx_error", { message: `impossible de charger ${file.name}` });
@@ -755,7 +831,7 @@ function loadTxFile(file) {
   img.src = url;
 }
 
-function resetTxFile() {
+async function resetTxFile() {
   if (txState.sourceUrl) {
     URL.revokeObjectURL(txState.sourceUrl);
     txState.sourceUrl = null;
@@ -763,6 +839,13 @@ function resetTxFile() {
   txState.sourceFile = null;
   txState.sourceImage = null;
   txState.sourceSize = 0;
+  txState.compressedBytes = null;
+  txState.compressedUrl = null;
+  txState.compressSeq++;
+  if (txState.compressTimer) {
+    clearTimeout(txState.compressTimer);
+    txState.compressTimer = null;
+  }
   const drop = document.getElementById("tx-drop-zone");
   const preview = document.getElementById("tx-preview");
   const previewImg = document.getElementById("tx-preview-img");
@@ -773,6 +856,12 @@ function resetTxFile() {
   if (fileInput) fileInput.value = "";
   refreshTxPreview();
   refreshTxButtons();
+  try {
+    const { invoke } = window.__TAURI__.core;
+    await invoke("clear_tx_source");
+  } catch {
+    // peu importe : le state JS est déjà réinitialisé.
+  }
 }
 
 function setupTxTab() {
@@ -821,6 +910,7 @@ function setupTxTab() {
       txState.resize = r.value;
       document.getElementById("tx-resize-free").hidden = r.value !== "free";
       refreshTxPreview();
+      scheduleTxCompress();
     });
   }
 
@@ -836,6 +926,7 @@ function setupTxTab() {
       freeH.value = txState.freeH;
     }
     refreshTxPreview();
+    if (txState.resize === "free") scheduleTxCompress();
   });
   freeH.addEventListener("input", () => {
     const v = parseInt(freeH.value, 10);
@@ -847,6 +938,7 @@ function setupTxTab() {
       freeW.value = txState.freeW;
     }
     refreshTxPreview();
+    if (txState.resize === "free") scheduleTxCompress();
   });
 
   const quality = document.getElementById("tx-quality");
@@ -854,6 +946,7 @@ function setupTxTab() {
     txState.quality = parseInt(quality.value, 10) || 0;
     document.getElementById("tx-quality-val").textContent = txState.quality;
     refreshTxPreview();
+    scheduleTxCompress();
   });
 
   // Boutons TX / Stop / TX more — handlers placeholder jusqu'au câblage

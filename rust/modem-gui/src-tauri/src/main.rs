@@ -3,10 +3,12 @@
 mod audio;
 mod audio_capture;
 mod rx_worker;
+mod tx_encode;
 
 use audio::{list_input_devices, DeviceInfo};
 use audio_capture::CaptureHandle;
 use rx_worker::{SharedWavSink, WavSink, WorkerHandle};
+use tx_encode::{compress_avif, CompressOpts};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +24,7 @@ struct AppState {
     session: Mutex<Option<CaptureSession>>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
+    tx_source: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 fn default_save_dir() -> PathBuf {
@@ -135,6 +138,55 @@ fn is_raw_recording(state: State<'_, AppState>) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+#[derive(serde::Serialize)]
+struct CompressResult {
+    preview_path: String,
+    source_w: u32,
+    source_h: u32,
+    actual_w: u32,
+    actual_h: u32,
+    byte_len: usize,
+}
+
+#[tauri::command]
+fn set_tx_source(bytes: Vec<u8>, state: State<'_, AppState>) -> Result<usize, String> {
+    let len = bytes.len();
+    let mut slot = state.tx_source.lock().map_err(|e| e.to_string())?;
+    *slot = Some(bytes);
+    Ok(len)
+}
+
+#[tauri::command]
+fn clear_tx_source(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state.tx_source.lock().map_err(|e| e.to_string())?;
+    *slot = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn compress_image(
+    opts: CompressOpts,
+    state: State<'_, AppState>,
+) -> Result<CompressResult, String> {
+    let source = {
+        let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
+        slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
+    };
+    let result = compress_avif(&source, &opts)?;
+    let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("tx_preview.avif");
+    std::fs::write(&path, &result.avif_bytes).map_err(|e| format!("write: {e}"))?;
+    Ok(CompressResult {
+        preview_path: path.to_string_lossy().into_owned(),
+        source_w: result.source_w,
+        source_h: result.source_h,
+        actual_w: result.actual_w,
+        actual_h: result.actual_h,
+        byte_len: result.byte_len,
+    })
+}
+
 #[tauri::command]
 fn get_save_dir(state: State<'_, AppState>) -> Result<String, String> {
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?;
@@ -160,6 +212,7 @@ fn main() {
                 session: Mutex::new(None),
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
                 wav_sink: Arc::new(Mutex::new(None)),
+                tx_source: Arc::new(Mutex::new(None)),
             });
             Ok(())
         })
@@ -172,6 +225,9 @@ fn main() {
             start_raw_recording,
             stop_raw_recording,
             is_raw_recording,
+            set_tx_source,
+            clear_tx_source,
+            compress_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
