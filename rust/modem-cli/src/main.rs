@@ -341,7 +341,13 @@ fn main() {
                         }
                     }
                 }
-                2 | 3 => match modem_core::rx_v2::rx_v2(&samples, &config) {
+                2 | 3 => {
+                    let decode_result = if frame_version == 3 {
+                        modem_core::rx_v2::rx_v3(&samples, &config)
+                    } else {
+                        modem_core::rx_v2::rx_v2(&samples, &config)
+                    };
+                    match decode_result {
                     Some(result) => {
                         eprintln!(
                             "Decoded: {} bytes, {}/{} LDPC blocks converged, {} segments, {} lost, sigma²={:.4}",
@@ -413,7 +419,8 @@ fn main() {
                         );
                         std::process::exit(1);
                     }
-                },
+                    }
+                }
                 v => {
                     eprintln!("Unsupported frame_version {v} (use 1, 2 or 3)");
                     std::process::exit(1);

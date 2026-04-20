@@ -44,6 +44,13 @@ pub struct RxV2Result {
     /// framing overhead rather than payload content). This is the metric
     /// the GUI should display as real decode progress.
     pub data_blocks_recovered: usize,
+    /// DATA codewords recovered, keyed by ESI. Empty if no AppHeader was
+    /// decoded (assembly then falls back to ESI-sort of whatever was
+    /// decoded — same fallback the single-pass path uses).
+    ///
+    /// Exposed so that `rx_v3` can merge per-window maps when sliding-window
+    /// decoding a v3 stream.
+    pub cw_bytes_map: HashMap<u32, Vec<u8>>,
 }
 
 /// Linear-interpolation resample of a float audio stream to compensate a
@@ -548,6 +555,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         1.0
     };
 
+    let data_blocks_recovered = cw_bytes.len();
     Some(RxV2Result {
         data: assembled,
         header: Some(decoded_header),
@@ -557,7 +565,135 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         segments_decoded,
         segments_lost,
         sigma2,
-        data_blocks_recovered: cw_bytes.len(),
+        data_blocks_recovered,
+        cw_bytes_map: cw_bytes,
+    })
+}
+
+/// Sliding-window batch decode of a v3 superframe.
+///
+/// A v3 stream carries a fresh preamble + protocol header before every
+/// periodic meta segment (see `frame::build_superframe_v3`). Rather than
+/// letting one global FFE track the entire transmission (the 57 %-on-HIGH
+/// failure mode of streaming v2), this function:
+///
+/// 1. Locates every preamble occurrence via `sync::find_all_preambles`.
+/// 2. For each window `[P_i .. P_{i+1})` (or `[P_last .. EOF]` for the
+///    last) it calls `rx_v2` as if that slice were a standalone v2
+///    transmission — re-acquiring timing, re-training the FFE, brute-force
+///    searching drift.
+/// 3. Merges the per-window `cw_bytes_map`s into one global ESI → bytes
+///    map (first-wins; a codeword appears in exactly one window anyway).
+/// 4. Assembles the payload from the merged map using `AppHeader.file_size`
+///    for truncation, just like `rx_v2_single`.
+///
+/// Returns `None` only if no preamble is found at all.
+pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
+    let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+        .ok()?;
+    let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+
+    let bb = demodulator::downmix(samples, config.center_freq_hz);
+    let mf = demodulator::matched_filter(&bb, &taps);
+
+    let mut positions = sync::find_all_preambles(&mf, sps, pitch, config.beta);
+    if positions.is_empty() {
+        return None;
+    }
+    positions.sort();
+
+    // Pre-roll & post-roll: enough context for the matched filter span on
+    // both sides so the first/last data symbols of the cycle aren't eaten
+    // by MF edge effects.
+    let margin = (RRC_SPAN_SYM + 4) * pitch;
+
+    let mut merged: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut app_hdr: Option<AppHeader> = None;
+    let mut hdr_any: Option<header::Header> = None;
+    let mut total_converged = 0usize;
+    let mut total_blocks = 0usize;
+    let mut segs_decoded = 0usize;
+    let mut segs_lost = 0usize;
+    let mut sigma2_sum = 0.0f64;
+    let mut sigma2_count = 0usize;
+
+    for (i, &p) in positions.iter().enumerate() {
+        let start = p.saturating_sub(margin).min(samples.len());
+        // End a few symbols INTO the next preamble so the last data segment
+        // of this cycle has MF post-roll context. The partial next preamble
+        // (~margin/pitch symbols) is negligible against the 256-sym preamble
+        // at the head, so find_preamble locks unambiguously on this cycle.
+        let end = if i + 1 < positions.len() {
+            (positions[i + 1] + margin).min(samples.len()).max(start + 1)
+        } else {
+            samples.len()
+        };
+        if end <= start + N_PREAMBLE * pitch {
+            continue;
+        }
+        let window = &samples[start..end];
+        let Some(r) = rx_v2(window, config) else {
+            continue;
+        };
+        for (esi, bytes) in r.cw_bytes_map.into_iter() {
+            merged.entry(esi).or_insert(bytes);
+        }
+        if app_hdr.is_none() {
+            app_hdr = r.app_header;
+        }
+        if hdr_any.is_none() {
+            hdr_any = r.header;
+        }
+        total_converged += r.converged_blocks;
+        total_blocks += r.total_blocks;
+        segs_decoded += r.segments_decoded;
+        segs_lost += r.segments_lost;
+        sigma2_sum += r.sigma2;
+        sigma2_count += 1;
+    }
+
+    // Assembly — same policy as rx_v2_single: truncate to file_size if we
+    // have an AppHeader, otherwise ESI-sorted concat of whatever decoded.
+    let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
+    let k_bytes = decoder.k() / 8;
+
+    let mut assembled: Vec<u8> = Vec::new();
+    if let Some(ref h) = app_hdr {
+        let n_source_cw = ((h.file_size as usize) + k_bytes - 1) / k_bytes;
+        for esi in 0..n_source_cw as u32 {
+            if let Some(bytes) = merged.get(&esi) {
+                assembled.extend_from_slice(bytes);
+            } else {
+                assembled.extend(std::iter::repeat(0u8).take(k_bytes));
+            }
+        }
+        assembled.truncate(h.file_size as usize);
+    } else {
+        let mut esis: Vec<u32> = merged.keys().cloned().collect();
+        esis.sort();
+        for esi in esis {
+            assembled.extend_from_slice(&merged[&esi]);
+        }
+    }
+
+    let sigma2 = if sigma2_count > 0 {
+        sigma2_sum / sigma2_count as f64
+    } else {
+        1.0
+    };
+    let data_blocks_recovered = merged.len();
+
+    Some(RxV2Result {
+        data: assembled,
+        header: hdr_any,
+        app_header: app_hdr,
+        converged_blocks: total_converged,
+        total_blocks,
+        segments_decoded: segs_decoded,
+        segments_lost: segs_lost,
+        sigma2,
+        data_blocks_recovered,
+        cw_bytes_map: merged,
     })
 }
 
@@ -715,6 +851,54 @@ mod tests {
             make_session_hash(data),
         );
         modulator::modulate(&symbols, sps, pitch, &taps, config.center_freq_hz)
+    }
+
+    fn tx_v3(data: &[u8], config: &ModemConfig, session_id: u32) -> Vec<f32> {
+        let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+            .expect("invalid profile");
+        let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+        let symbols = frame::build_superframe_v3(
+            data,
+            config,
+            session_id,
+            mime::BINARY,
+            make_session_hash(data),
+        );
+        modulator::modulate(&symbols, sps, pitch, &taps, config.center_freq_hz)
+    }
+
+    /// Loopback : TX v3 → RX v3 sliding-window. A payload large enough to
+    /// trigger at least one periodic meta cycle (i.e. at least one extra
+    /// preamble beyond the initial one) on the HIGH profile.
+    #[test]
+    fn loopback_v3_high_sliding_window() {
+        let config = profile_high();
+        // ~15 kB : assez pour déclencher plusieurs cycles meta périodiques.
+        let data: Vec<u8> = (0..15_000)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect();
+        let samples = tx_v3(&data, &config, 0x1234_5678);
+        let result = rx_v3(&samples, &config).expect("rx_v3 returned None");
+
+        eprintln!(
+            "V3 HIGH 15k : converged={}/{} segs={}/lost={} sigma²={:.4} data_cw={}",
+            result.converged_blocks,
+            result.total_blocks,
+            result.segments_decoded,
+            result.segments_lost,
+            result.sigma2,
+            result.data_blocks_recovered
+        );
+
+        assert!(
+            result.app_header.is_some(),
+            "AppHeader manquant — aucune fenêtre n'a décodé le meta"
+        );
+        assert_eq!(
+            &result.data[..data.len()],
+            &data[..],
+            "V3 loopback : données non identiques"
+        );
     }
 
     /// Diagnostic: MEGA (FTN τ=30/32) with a minimal v2 frame (1 data CW).

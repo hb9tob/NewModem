@@ -60,6 +60,78 @@ pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> 
     Some(best_fine)
 }
 
+/// Find every preamble occurrence in the matched-filtered signal (v3 stream).
+///
+/// Single coarse scan at `pitch` stride across the whole buffer, then
+/// non-max suppression: candidates above `threshold * global_max` are kept
+/// in order of descending magnitude, rejecting any that fall within
+/// `n_preamble * pitch / 2` of a higher-magnitude peak already accepted.
+/// Each survivor is fine-refined within ±pitch, same as `find_preamble`.
+///
+/// Returns sorted sample indices. Empty vec if no candidate clears the
+/// threshold (e.g. a noise-only buffer).
+pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f64) -> Vec<usize> {
+    let preamble_syms = preamble::make_preamble();
+    let n_pre = preamble_syms.len();
+    let max_start = mf.len().saturating_sub(n_pre * pitch);
+    if max_start == 0 {
+        return Vec::new();
+    }
+
+    let mut mags: Vec<(usize, f64)> = Vec::new();
+    let mut global_max = 0.0f64;
+    let mut start = 0usize;
+    while start <= max_start {
+        let mag = correlate_at(mf, &preamble_syms, start, pitch);
+        if mag > global_max {
+            global_max = mag;
+        }
+        mags.push((start, mag));
+        start += pitch;
+    }
+    if global_max <= 0.0 {
+        return Vec::new();
+    }
+
+    let threshold = 0.3 * global_max;
+    let min_sep = (n_pre * pitch) / 2;
+
+    let mut candidates: Vec<(usize, f64)> = mags
+        .into_iter()
+        .filter(|&(_, m)| m >= threshold)
+        .collect();
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut kept: Vec<usize> = Vec::new();
+    for (pos, _) in candidates {
+        let too_close = kept.iter().any(|&p| {
+            let d = if p > pos { p - pos } else { pos - p };
+            d < min_sep
+        });
+        if !too_close {
+            kept.push(pos);
+        }
+    }
+    kept.sort();
+
+    kept.into_iter()
+        .map(|coarse_pos| {
+            let fine_lo = coarse_pos.saturating_sub(pitch);
+            let fine_hi = (coarse_pos + pitch).min(max_start);
+            let mut best = coarse_pos;
+            let mut best_mag = correlate_at(mf, &preamble_syms, coarse_pos, pitch);
+            for s in fine_lo..=fine_hi {
+                let m = correlate_at(mf, &preamble_syms, s, pitch);
+                if m > best_mag {
+                    best_mag = m;
+                    best = s;
+                }
+            }
+            best
+        })
+        .collect()
+}
+
 /// Correlate mf at position `start` with preamble symbols at `pitch` spacing.
 #[inline]
 fn correlate_at(mf: &[Complex64], preamble: &[Complex64], start: usize, pitch: usize) -> f64 {

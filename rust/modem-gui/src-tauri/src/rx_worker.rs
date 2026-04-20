@@ -405,7 +405,20 @@ fn run_batch_decode(
 ) {
     let t0 = Instant::now();
     let config: ModemConfig = profile.to_config();
-    let result = rx_v2::rx_v2(&samples, &config);
+    // Dispatcher v2/v3 : on tente rx_v2 d'abord (chemin V2 sacré préservé).
+    // Si le header décodé indique version == 3, on re-joue en sliding-window
+    // pour récupérer les codewords qui traversent les préambules périodiques.
+    let initial = rx_v2::rx_v2(&samples, &config);
+    let is_v3 = initial
+        .as_ref()
+        .and_then(|r| r.header.as_ref())
+        .map(|h| h.version == 3)
+        .unwrap_or(false);
+    let result = if is_v3 {
+        rx_v2::rx_v3(&samples, &config).or(initial)
+    } else {
+        initial
+    };
     let elapsed_ms = t0.elapsed().as_millis();
     let sample_count = samples.len();
 
