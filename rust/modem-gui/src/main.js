@@ -61,22 +61,135 @@ function showCurrentFile(payload) {
   const info = document.getElementById("current-info");
   const wrap = document.getElementById("current-image-wrap");
   const mime = MIME_TYPES[payload.mime_type] || "application/octet-stream";
-  info.innerHTML = `
-    <div><strong>De :</strong> ${payload.callsign || "?"}</div>
-    <div><strong>Nom :</strong> ${payload.filename}</div>
-    <div><strong>Taille :</strong> ${payload.size} octets</div>
-    <div><strong>MIME :</strong> ${mime}</div>
-    <div><strong>σ² :</strong> ${payload.sigma2.toFixed(4)}</div>
-    <div><strong>Chemin :</strong> <code>${payload.saved_path}</code></div>
-  `;
+  info.innerHTML =
+    `<strong>De :</strong> ${payload.callsign || "?"} · ` +
+    `<strong>Nom :</strong> ${payload.filename} · ` +
+    `<strong>Taille :</strong> ${payload.size} o · ` +
+    `<strong>MIME :</strong> ${mime} · ` +
+    `<strong>σ² :</strong> ${payload.sigma2.toFixed(4)} · ` +
+    `<code>${payload.saved_path}</code>`;
   wrap.innerHTML = "";
   if (isImageMime(payload.mime_type)) {
     const { convertFileSrc } = window.__TAURI__.core;
+    const src = convertFileSrc(payload.saved_path);
     const img = document.createElement("img");
-    img.src = convertFileSrc(payload.saved_path);
+    img.src = src;
     img.alt = payload.filename;
+    img.dataset.src = src;
+    img.addEventListener("dblclick", () => openLightbox(src, payload.filename));
     wrap.appendChild(img);
   }
+}
+
+// ─────────────────────────────────────────────────── Lightbox (double-clic)
+// Affiche l'image plein écran avec zoom molette (jusqu'à 1:1 pixels natifs)
+// et pan au drag. Échap ou clic hors image pour fermer.
+const lightbox = {
+  viewEl: null,
+  imgEl: null,
+  natW: 0,
+  natH: 0,
+  minScale: 1,
+  scale: 1,
+  tx: 0,
+  ty: 0,
+  dragging: false,
+  lastX: 0,
+  lastY: 0,
+};
+
+function openLightbox(src, alt) {
+  lightbox.viewEl = document.getElementById("image-lightbox");
+  lightbox.imgEl = document.getElementById("image-lightbox-img");
+  if (!lightbox.viewEl || !lightbox.imgEl) return;
+  lightbox.imgEl.alt = alt || "";
+  lightbox.imgEl.onload = () => {
+    lightbox.natW = lightbox.imgEl.naturalWidth || 1;
+    lightbox.natH = lightbox.imgEl.naturalHeight || 1;
+    fitLightbox();
+  };
+  lightbox.imgEl.src = src;
+  lightbox.viewEl.hidden = false;
+}
+
+function closeLightbox() {
+  if (!lightbox.viewEl) return;
+  lightbox.viewEl.hidden = true;
+  lightbox.imgEl.src = "";
+}
+
+function applyLightboxTransform() {
+  const { imgEl, scale, tx, ty } = lightbox;
+  if (!imgEl) return;
+  imgEl.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+}
+
+function fitLightbox() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const fit = Math.min(vw / lightbox.natW, vh / lightbox.natH, 1);
+  // min = fit-to-screen (mais plafonné à 1 si l'image est plus petite que
+  // l'écran — pas de zoom out artificiel). max = 1 (1:1 pixel natif).
+  lightbox.minScale = fit;
+  lightbox.scale = fit;
+  lightbox.tx = (vw - lightbox.natW * fit) / 2;
+  lightbox.ty = (vh - lightbox.natH * fit) / 2;
+  applyLightboxTransform();
+}
+
+function zoomLightbox(delta, cx, cy) {
+  const prev = lightbox.scale;
+  const factor = Math.exp(-delta * 0.0015);
+  let next = prev * factor;
+  next = Math.max(lightbox.minScale, Math.min(1, next));
+  if (next === prev) return;
+  // Zoom centré sur la position curseur : point-sous-curseur reste fixe.
+  lightbox.tx = cx - (cx - lightbox.tx) * (next / prev);
+  lightbox.ty = cy - (cy - lightbox.ty) * (next / prev);
+  lightbox.scale = next;
+  applyLightboxTransform();
+}
+
+function setupLightbox() {
+  const view = document.getElementById("image-lightbox");
+  if (!view) return;
+  view.addEventListener("wheel", (ev) => {
+    if (view.hidden) return;
+    ev.preventDefault();
+    zoomLightbox(ev.deltaY, ev.clientX, ev.clientY);
+  }, { passive: false });
+  view.addEventListener("mousedown", (ev) => {
+    if (view.hidden) return;
+    lightbox.dragging = true;
+    lightbox.lastX = ev.clientX;
+    lightbox.lastY = ev.clientY;
+    view.classList.add("dragging");
+  });
+  window.addEventListener("mousemove", (ev) => {
+    if (!lightbox.dragging) return;
+    lightbox.tx += ev.clientX - lightbox.lastX;
+    lightbox.ty += ev.clientY - lightbox.lastY;
+    lightbox.lastX = ev.clientX;
+    lightbox.lastY = ev.clientY;
+    applyLightboxTransform();
+  });
+  window.addEventListener("mouseup", () => {
+    if (!lightbox.dragging) return;
+    lightbox.dragging = false;
+    view.classList.remove("dragging");
+  });
+  // Clic simple sur le fond (pas sur l'image) ferme. Double-clic ferme aussi.
+  view.addEventListener("click", (ev) => {
+    if (ev.target === view) closeLightbox();
+  });
+  view.addEventListener("dblclick", closeLightbox);
+  window.addEventListener("keydown", (ev) => {
+    if (view.hidden) return;
+    if (ev.key === "Escape") closeLightbox();
+  });
+  window.addEventListener("resize", () => {
+    if (!view.hidden) fitLightbox();
+  });
 }
 
 // ───────────────────────────────────────────────────── Device / control
@@ -328,10 +441,6 @@ function resetRxVisuals() {
   lastConstellation = [];
   const text = document.getElementById("v2-progress-text");
   if (text) text.textContent = "—";
-  const label = document.getElementById("progress-label");
-  if (label) label.textContent = "—";
-  const cinfo = document.getElementById("constellation-info");
-  if (cinfo) cinfo.textContent = "—";
   drawProgressBlocks();
   drawConstellation();
 }
@@ -356,15 +465,6 @@ function updateV2Progress(payload) {
   const sigmaStr = lastProgress.sigma2 != null ? lastProgress.sigma2.toFixed(3) : "?";
   const mini = document.getElementById("v2-progress-text");
   if (mini) mini.textContent = `${lastProgress.converged}/${lastProgress.expected} σ²=${sigmaStr}`;
-  const label = document.getElementById("progress-label");
-  if (label) {
-    const pct = lastProgress.expected > 0
-      ? (100 * lastProgress.converged / lastProgress.expected).toFixed(1)
-      : "0.0";
-    label.textContent = `${lastProgress.converged}/${lastProgress.expected} (${pct} %) — σ²=${sigmaStr}`;
-  }
-  const cinfo = document.getElementById("constellation-info");
-  if (cinfo) cinfo.textContent = `${lastConstellation.length} symboles récents`;
   drawProgressBlocks();
   drawConstellation();
 }
@@ -534,6 +634,7 @@ function wireEvents() {
 
 async function init() {
   setupTabs();
+  setupLightbox();
   await loadDevices();
   await loadSaveDir();
   wireEvents();

@@ -37,36 +37,26 @@
   </nav>
   <main>
     <section id="tab-rx" class="tab-panel active rx-layout">
-      <div class="rx-body">
-        <div class="rx-main panel">
-          <h2>Fichier courant</h2>
-          <div id="current-info">Aucun fichier reçu</div>
-          <div id="current-image-wrap"></div>
-        </div>
-        <aside class="rx-side panel">
-          <h2>Constellation</h2>
-          <canvas id="constellation-canvas" width="260" height="260"></canvas>
-          <div id="constellation-info" class="constellation-info">—</div>
-        </aside>
-      </div>
-      <div class="rx-progress-full">
-        <canvas id="progress-blocks" height="28"></canvas>
-        <div id="progress-label" class="progress-label">—</div>
-      </div>
+      <div id="current-info" class="rx-info">Aucun fichier reçu</div>
+      <div id="current-image-wrap" class="rx-image-wrap"></div>
     </section>
     <section id="tab-tx" class="tab-panel">
-      <div class="panel">
-        <h2>TX</h2>
-        <p class="tx-placeholder">Mode émission — à venir.</p>
-      </div>
     </section>
     <section id="tab-info" class="tab-panel">
-      <div class="panel">
-        <h2>Événements</h2>
-        <ul id="event-log"></ul>
-      </div>
+      <ul id="event-log"></ul>
     </section>
   </main>
+  <!-- Barre de progression globale en bas de fenêtre, quelques pixels. -->
+  <div id="rx-progress-bar" class="rx-progress-bar">
+    <canvas id="progress-blocks"></canvas>
+  </div>
+  <!-- Canvas constellation conservé (masqué) pour compatibilité JS. -->
+  <canvas id="constellation-canvas" width="260" height="260" hidden></canvas>
+  <!-- Lightbox image : plein écran + zoom jusqu'à 1:1. -->
+  <div id="image-lightbox" class="image-lightbox" hidden>
+    <div class="image-lightbox-hint">molette : zoom · drag : pan · Échap : fermer</div>
+    <img id="image-lightbox-img" alt="" />
+  </div>
   <script type="module" src="main.js"></script>
 </body>
 </html>
