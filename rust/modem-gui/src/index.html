@@ -40,7 +40,73 @@
       <div id="current-info" class="rx-info">Aucun fichier reçu</div>
       <div id="current-image-wrap" class="rx-image-wrap"></div>
     </section>
-    <section id="tab-tx" class="tab-panel">
+    <section id="tab-tx" class="tab-panel tx-layout">
+      <div class="tx-image-area">
+        <div id="tx-drop-zone" class="tx-drop-zone">
+          <p>Glisser une image ici<br>ou cliquer pour choisir…</p>
+          <input type="file" id="tx-file-input" accept="image/*" hidden>
+        </div>
+        <div id="tx-preview" class="tx-preview" hidden>
+          <img id="tx-preview-img" alt="">
+          <div class="tx-preview-overlay">
+            <span id="tx-preview-info">—</span>
+          </div>
+          <button id="tx-preview-reset" class="tx-preview-reset" title="Changer d'image">✕</button>
+        </div>
+      </div>
+      <aside class="tx-controls">
+        <fieldset>
+          <legend>Mode modem</legend>
+          <select id="tx-mode">
+            <option value="ULTRA">ULTRA — QPSK τ=1, LDPC 1/2</option>
+            <option value="ROBUST">ROBUST — QPSK τ=1, LDPC 3/4</option>
+            <option value="NORMAL">NORMAL — 8-PSK τ=1, LDPC 3/4</option>
+            <option value="HIGH" selected>HIGH — 16-APSK τ=1, LDPC 5/6</option>
+            <option value="MEGA">MEGA — 16-APSK τ=30/32, LDPC 3/4</option>
+          </select>
+        </fieldset>
+
+        <fieldset>
+          <legend>Redimensionnement</legend>
+          <label><input type="radio" name="tx-resize" value="none" checked> Aucun</label>
+          <label><input type="radio" name="tx-resize" value="1920x1024"> 1920 × 1024</label>
+          <label><input type="radio" name="tx-resize" value="800x600"> 800 × 600</label>
+          <label><input type="radio" name="tx-resize" value="free"> Libre</label>
+          <div id="tx-resize-free" class="tx-resize-free" hidden>
+            <input type="number" id="tx-free-w" min="16" step="1"> ×
+            <input type="number" id="tx-free-h" min="16" step="1"> px
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Qualité AVIF</legend>
+          <input type="range" id="tx-quality" min="0" max="100" value="1">
+          <div class="tx-quality-row">
+            <span>q = <span id="tx-quality-val">1</span></span>
+            <span class="tx-hint">AVIF 4:2:0 · speed 1</span>
+          </div>
+        </fieldset>
+
+        <div class="tx-size-info">
+          <div>Source : <span id="tx-source-size">—</span></div>
+          <div>Compressé : <span id="tx-compressed-size">— <em>(à câbler)</em></span></div>
+        </div>
+
+        <div class="tx-actions">
+          <div class="tx-actions-row">
+            <button id="tx-btn-tx" class="tx-btn tx-btn-primary" disabled>TX</button>
+            <button id="tx-btn-stop" class="tx-btn tx-btn-stop" disabled>Stop</button>
+          </div>
+          <div class="tx-actions-row">
+            <button id="tx-btn-more" class="tx-btn tx-btn-more" disabled>TX more</button>
+            <select id="tx-more-pct" class="tx-more-pct" title="Blocs fontaine additionnels (% de la taille du code)" disabled>
+              <option value="5">+5 %</option>
+              <option value="10" selected>+10 %</option>
+              <option value="20">+20 %</option>
+            </select>
+          </div>
+        </div>
+      </aside>
     </section>
     <section id="tab-info" class="tab-panel">
       <ul id="event-log"></ul>

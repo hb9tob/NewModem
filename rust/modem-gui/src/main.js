@@ -632,9 +632,269 @@ function wireEvents() {
   });
 }
 
+// ────────────────────────────────────────────────────────────── TX tab (GUI)
+// Le câblage backend (encodage AVIF, lancement TX, rendu audio) viendra
+// ensuite. Ici on gère uniquement : chargement fichier (picker + DnD),
+// dimensions cibles avec respect de l'aspect, état des contrôles.
+const txState = {
+  sourceFile: null,
+  sourceImage: null,
+  sourceSize: 0,
+  sourceUrl: null,
+  mode: "HIGH",
+  resize: "none",
+  freeW: 640,
+  freeH: 480,
+  // Défaut 1 volontairement : image horrible, force l'utilisateur à choisir.
+  quality: 1,
+  aspectLinked: true,
+  txActive: false,
+  // Blocs fontaine additionnels à générer sur TX more (% de la taille code).
+  morePct: 10,
+};
+
+function refreshTxButtons() {
+  const btnTx = document.getElementById("tx-btn-tx");
+  const btnStop = document.getElementById("tx-btn-stop");
+  const btnMore = document.getElementById("tx-btn-more");
+  const morePct = document.getElementById("tx-more-pct");
+  if (!btnTx) return;
+  const hasImage = !!txState.sourceImage;
+  btnTx.disabled = !hasImage || txState.txActive;
+  btnMore.disabled = !hasImage || txState.txActive;
+  btnStop.disabled = !txState.txActive;
+  if (morePct) morePct.disabled = !hasImage || txState.txActive;
+}
+
+function txFormatBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return `${n} o`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
+  return `${(n / 1024 / 1024).toFixed(2)} Mio`;
+}
+
+function txFitInto(w, h, maxW, maxH) {
+  const s = Math.min(maxW / w, maxH / h, 1);
+  return { w: Math.max(1, Math.round(w * s)), h: Math.max(1, Math.round(h * s)) };
+}
+
+function txTargetDims() {
+  const src = txState.sourceImage;
+  if (!src) return null;
+  const w = src.naturalWidth;
+  const h = src.naturalHeight;
+  switch (txState.resize) {
+    case "none":
+      return { w, h };
+    case "1920x1024":
+      return txFitInto(w, h, 1920, 1024);
+    case "800x600":
+      return txFitInto(w, h, 800, 600);
+    case "free":
+      return { w: txState.freeW, h: txState.freeH };
+    default:
+      return { w, h };
+  }
+}
+
+function refreshTxPreview() {
+  const info = document.getElementById("tx-preview-info");
+  const srcSize = document.getElementById("tx-source-size");
+  if (!txState.sourceImage) {
+    if (info) info.textContent = "—";
+    if (srcSize) srcSize.textContent = "—";
+    return;
+  }
+  const natW = txState.sourceImage.naturalWidth;
+  const natH = txState.sourceImage.naturalHeight;
+  const d = txTargetDims();
+  if (info) {
+    const resizePart = d.w === natW && d.h === natH
+      ? `${natW}×${natH}`
+      : `${natW}×${natH} → ${d.w}×${d.h}`;
+    info.textContent = `${resizePart} · q${txState.quality} · ${txState.mode}`;
+  }
+  if (srcSize) srcSize.textContent = txFormatBytes(txState.sourceSize);
+}
+
+function loadTxFile(file) {
+  if (!file || !file.type || !file.type.startsWith("image/")) {
+    logEvent("tx_error", { message: `type non supporté: ${file && file.type}` });
+    return;
+  }
+  // Libère l'ancien blob URL s'il existe.
+  if (txState.sourceUrl) {
+    URL.revokeObjectURL(txState.sourceUrl);
+    txState.sourceUrl = null;
+  }
+  txState.sourceFile = file;
+  txState.sourceSize = file.size;
+  const url = URL.createObjectURL(file);
+  txState.sourceUrl = url;
+  const img = new Image();
+  img.onload = () => {
+    txState.sourceImage = img;
+    // Init des champs "libre" à la taille native.
+    txState.freeW = img.naturalWidth;
+    txState.freeH = img.naturalHeight;
+    const fw = document.getElementById("tx-free-w");
+    const fh = document.getElementById("tx-free-h");
+    if (fw) fw.value = txState.freeW;
+    if (fh) fh.value = txState.freeH;
+    document.getElementById("tx-drop-zone").hidden = true;
+    const preview = document.getElementById("tx-preview");
+    const previewImg = document.getElementById("tx-preview-img");
+    previewImg.src = url;
+    preview.hidden = false;
+    refreshTxPreview();
+    refreshTxButtons();
+  };
+  img.onerror = () => {
+    logEvent("tx_error", { message: `impossible de charger ${file.name}` });
+  };
+  img.src = url;
+}
+
+function resetTxFile() {
+  if (txState.sourceUrl) {
+    URL.revokeObjectURL(txState.sourceUrl);
+    txState.sourceUrl = null;
+  }
+  txState.sourceFile = null;
+  txState.sourceImage = null;
+  txState.sourceSize = 0;
+  const drop = document.getElementById("tx-drop-zone");
+  const preview = document.getElementById("tx-preview");
+  const previewImg = document.getElementById("tx-preview-img");
+  const fileInput = document.getElementById("tx-file-input");
+  if (preview) preview.hidden = true;
+  if (drop) drop.hidden = false;
+  if (previewImg) previewImg.src = "";
+  if (fileInput) fileInput.value = "";
+  refreshTxPreview();
+  refreshTxButtons();
+}
+
+function setupTxTab() {
+  const drop = document.getElementById("tx-drop-zone");
+  const fileInput = document.getElementById("tx-file-input");
+  if (!drop || !fileInput) return;
+
+  drop.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files && fileInput.files[0]) loadTxFile(fileInput.files[0]);
+  });
+
+  // Drag-drop sur l'ensemble de la zone image (drop-zone OU preview), de
+  // façon à pouvoir remplacer l'image en la glissant dessus.
+  const area = document.querySelector(".tx-image-area");
+  const onDragOver = (ev) => {
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+    drop.classList.add("drag-over");
+  };
+  const onDragLeave = () => drop.classList.remove("drag-over");
+  const onDrop = (ev) => {
+    ev.preventDefault();
+    drop.classList.remove("drag-over");
+    const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+    if (file) loadTxFile(file);
+  };
+  area.addEventListener("dragover", onDragOver);
+  area.addEventListener("dragleave", onDragLeave);
+  area.addEventListener("drop", onDrop);
+
+  document.getElementById("tx-preview-reset").addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    resetTxFile();
+  });
+
+  document.getElementById("tx-mode").addEventListener("change", (ev) => {
+    txState.mode = ev.target.value;
+    refreshTxPreview();
+  });
+
+  const resizeRadios = document.querySelectorAll('input[name="tx-resize"]');
+  for (const r of resizeRadios) {
+    r.addEventListener("change", () => {
+      if (!r.checked) return;
+      txState.resize = r.value;
+      document.getElementById("tx-resize-free").hidden = r.value !== "free";
+      refreshTxPreview();
+    });
+  }
+
+  const freeW = document.getElementById("tx-free-w");
+  const freeH = document.getElementById("tx-free-h");
+  freeW.addEventListener("input", () => {
+    const v = parseInt(freeW.value, 10);
+    if (!Number.isFinite(v) || v < 1) return;
+    txState.freeW = v;
+    if (txState.aspectLinked && txState.sourceImage) {
+      const ar = txState.sourceImage.naturalHeight / txState.sourceImage.naturalWidth;
+      txState.freeH = Math.max(1, Math.round(v * ar));
+      freeH.value = txState.freeH;
+    }
+    refreshTxPreview();
+  });
+  freeH.addEventListener("input", () => {
+    const v = parseInt(freeH.value, 10);
+    if (!Number.isFinite(v) || v < 1) return;
+    txState.freeH = v;
+    if (txState.aspectLinked && txState.sourceImage) {
+      const ar = txState.sourceImage.naturalWidth / txState.sourceImage.naturalHeight;
+      txState.freeW = Math.max(1, Math.round(v * ar));
+      freeW.value = txState.freeW;
+    }
+    refreshTxPreview();
+  });
+
+  const quality = document.getElementById("tx-quality");
+  quality.addEventListener("input", () => {
+    txState.quality = parseInt(quality.value, 10) || 0;
+    document.getElementById("tx-quality-val").textContent = txState.quality;
+    refreshTxPreview();
+  });
+
+  // Boutons TX / Stop / TX more — handlers placeholder jusqu'au câblage
+  // backend. Les transitions d'état (txActive on/off) seront pilotées par
+  // les événements Tauri une fois la pipeline TX branchée.
+  document.getElementById("tx-btn-tx").addEventListener("click", () => {
+    logEvent("tx_click", {
+      action: "tx",
+      mode: txState.mode,
+      resize: txState.resize,
+      dims: txTargetDims(),
+      quality: txState.quality,
+      file: txState.sourceFile && txState.sourceFile.name,
+      note: "backend TX à câbler",
+    });
+  });
+  document.getElementById("tx-btn-stop").addEventListener("click", () => {
+    logEvent("tx_click", { action: "stop", note: "backend TX à câbler" });
+  });
+  document.getElementById("tx-btn-more").addEventListener("click", () => {
+    logEvent("tx_click", {
+      action: "tx_more",
+      mode: txState.mode,
+      resize: txState.resize,
+      dims: txTargetDims(),
+      quality: txState.quality,
+      more_pct: txState.morePct,
+      file: txState.sourceFile && txState.sourceFile.name,
+      note: "backend TX à câbler",
+    });
+  });
+  document.getElementById("tx-more-pct").addEventListener("change", (ev) => {
+    txState.morePct = parseInt(ev.target.value, 10) || 10;
+  });
+  refreshTxButtons();
+}
+
 async function init() {
   setupTabs();
   setupLightbox();
+  setupTxTab();
   await loadDevices();
   await loadSaveDir();
   wireEvents();
