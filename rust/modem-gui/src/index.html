@@ -38,7 +38,10 @@
   <main>
     <section id="tab-rx" class="tab-panel active rx-layout">
       <div id="current-info" class="rx-info">Aucun fichier reçu</div>
-      <div id="current-image-wrap" class="rx-image-wrap"></div>
+      <div id="current-image-wrap" class="rx-image-wrap">
+        <div class="rx-placeholder">En attente d'image…</div>
+      </div>
+      <canvas id="constellation-canvas" class="rx-constellation" width="260" height="260"></canvas>
     </section>
     <section id="tab-tx" class="tab-panel tx-layout">
       <div class="tx-image-area">
@@ -68,9 +71,9 @@
 
         <fieldset>
           <legend>Redimensionnement</legend>
-          <label><input type="radio" name="tx-resize" value="none" checked> Aucun</label>
+          <label><input type="radio" name="tx-resize" value="none"> Aucun</label>
           <label><input type="radio" name="tx-resize" value="1920x1024"> 1920 × 1024</label>
-          <label><input type="radio" name="tx-resize" value="800x600"> 800 × 600</label>
+          <label><input type="radio" name="tx-resize" value="800x600" checked> 800 × 600</label>
           <label><input type="radio" name="tx-resize" value="free"> Libre</label>
           <div id="tx-resize-free" class="tx-resize-free" hidden>
             <input type="number" id="tx-free-w" min="16" step="1"> ×
@@ -116,8 +119,6 @@
   <div id="rx-progress-bar" class="rx-progress-bar">
     <canvas id="progress-blocks"></canvas>
   </div>
-  <!-- Canvas constellation conservé (masqué) pour compatibilité JS. -->
-  <canvas id="constellation-canvas" width="260" height="260" hidden></canvas>
   <!-- Lightbox image : plein écran + zoom jusqu'à 1:1. -->
   <div id="image-lightbox" class="image-lightbox" hidden>
     <div class="image-lightbox-hint">molette : zoom · drag : pan · Échap : fermer</div>

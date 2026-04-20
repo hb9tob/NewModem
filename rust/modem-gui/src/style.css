@@ -258,6 +258,9 @@ main {
 .rx-info code {
   color: #9e9e9e;
 }
+.rx-layout {
+  position: relative;
+}
 .rx-image-wrap {
   flex: 1;
   min-height: 0;
@@ -267,6 +270,23 @@ main {
   background: #111;
   padding: 4px;
   overflow: hidden;
+}
+.rx-placeholder {
+  color: #555;
+  font-size: 0.9rem;
+  font-family: ui-monospace, monospace;
+  user-select: none;
+}
+.rx-constellation {
+  position: absolute;
+  top: 44px;
+  right: 8px;
+  width: 200px;
+  height: 200px;
+  border: 1px solid #3a3a3a;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 5;
+  border-radius: 3px;
 }
 .rx-image-wrap img {
   max-width: 100%;
@@ -299,6 +319,11 @@ main {
   overflow-y: auto;
   font-family: ui-monospace, monospace;
   font-size: 0.8rem;
+}
+#event-log:empty::before {
+  content: "Aucun événement — démarrer une capture RX ou charger une image TX.";
+  color: #666;
+  font-style: italic;
 }
 #event-log li {
   padding: 0.2rem 0;
@@ -365,6 +390,41 @@ main {
   max-height: 100%;
   object-fit: contain;
   user-select: none;
+}
+.tx-preview.compressing::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(156, 204, 101, 0.18) 0 14px,
+    rgba(30, 30, 30, 0.55) 14px 28px
+  );
+  background-size: 40px 40px;
+  animation: mire-scroll 1.4s linear infinite;
+  pointer-events: none;
+  z-index: 2;
+}
+.tx-preview.compressing::after {
+  content: "⏳ compression…";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0.5rem 1.2rem;
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid #9ccc65;
+  border-radius: 3px;
+  color: #9ccc65;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  z-index: 3;
+}
+@keyframes mire-scroll {
+  0%   { background-position: 0 0; }
+  100% { background-position: 40px 40px; }
 }
 .tx-preview-overlay {
   position: absolute;

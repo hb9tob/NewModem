@@ -642,7 +642,7 @@ const txState = {
   sourceSize: 0,
   sourceUrl: null,
   mode: "HIGH",
-  resize: "none",
+  resize: "800x600",
   freeW: 640,
   freeH: 480,
   // Défaut 1 volontairement : image horrible, force l'utilisateur à choisir.
@@ -753,6 +753,8 @@ async function runTxCompress() {
   if (!dims) return;
   const seq = ++txState.compressSeq;
   txState.compressing = true;
+  const previewEl = document.getElementById("tx-preview");
+  if (previewEl) previewEl.classList.add("compressing");
   refreshTxPreview();
   try {
     const result = await invoke("compress_image", {
@@ -776,6 +778,8 @@ async function runTxCompress() {
   } finally {
     if (seq === txState.compressSeq) {
       txState.compressing = false;
+      const el = document.getElementById("tx-preview");
+      if (el) el.classList.remove("compressing");
       refreshTxPreview();
       refreshTxButtons();
     }
