@@ -48,14 +48,13 @@ COLORS = {
 # ============================================================================
 
 def plot_frame_layout(path):
-    """Timeline symbolique d'une trame V3 HIGH (secondes, BOOT puis STEADY)."""
+    """Timeline symbolique d'une trame V3 HIGH (cadence constante T=4s)."""
     # Chronogramme idéal HIGH 1500 Bd, 16-APSK, LDPC 3/4 :
-    # syms/cw = 1152/4 = 288  → ~192 ms/CW à 1500 Bd
-    # data segment = 2 CW + pilots + marker ≈ 612 syms ≈ 408 ms
-    # meta segment = 1 CW + pilots + marker ≈ 322 syms ≈ 215 ms
-    # preamble+header = 256+96 = 352 syms ≈ 235 ms
-    # BOOT : meta tous les 5 data-segs → cycle ≈ 5·408 + 235 + 215 = 2.49 s
-    # STEADY : cycle ≈ 10·408 + 235 + 215 = 4.53 s
+    # 1 CW = 288 syms = 192 ms
+    # data segment (2 CW + marker + pilots) ≈ 500 ms
+    # meta segment (1 CW + marker + pilots) ≈ 280 ms
+    # preamble + header = 256 + 96 = 352 syms ≈ 235 ms
+    # cadence 4s → ~8 data-segs par cycle
 
     fig, ax = plt.subplots(figsize=(16, 4.2))
     t = 0.0
@@ -66,34 +65,21 @@ def plot_frame_layout(path):
         segs.append((t, dur, name, color, label))
         t += dur
 
-    # Cycle 0 (avec pré-existant)
-    push("PRE", COLORS["preamble"], 0.17, "")
-    push("HDR", COLORS["header"], 0.064, "")
-    push("MK", COLORS["marker"], 0.085, "")
-    push("META", COLORS["meta"], 0.192, "")
-    for _ in range(5):
-        push("MK", COLORS["marker"], 0.085, "")
-        push("DATA", COLORS["data"], 0.384, "")
+    def push_cycle(n_data):
+        push("PRE", COLORS["preamble"], 0.17)
+        push("HDR", COLORS["header"], 0.064)
+        push("MK", COLORS["marker"], 0.085)
+        push("META", COLORS["meta"], 0.192)
+        for _ in range(n_data):
+            push("MK", COLORS["marker"], 0.085)
+            push("DATA", COLORS["data"], 0.384)
 
-    # Cycle 1 BOOT — réinsertion V3
-    push("PRE", COLORS["preamble"], 0.17, "")
-    push("HDR", COLORS["header"], 0.064, "")
-    push("MK", COLORS["marker"], 0.085, "")
-    push("META", COLORS["meta"], 0.192, "")
-    for _ in range(5):
-        push("MK", COLORS["marker"], 0.085, "")
-        push("DATA", COLORS["data"], 0.384, "")
+    # 3 cycles identiques à cadence ~4s (HIGH)
+    push_cycle(8)
+    push_cycle(8)
+    push_cycle(8)
 
-    # Transition → steady (idéal. représenté par un cycle steady = 10 data segs)
-    push("PRE", COLORS["preamble"], 0.17, "")
-    push("HDR", COLORS["header"], 0.064, "")
-    push("MK", COLORS["marker"], 0.085, "")
-    push("META", COLORS["meta"], 0.192, "")
-    for _ in range(10):
-        push("MK", COLORS["marker"], 0.085, "")
-        push("DATA", COLORS["data"], 0.384, "")
-
-    push("runout", COLORS["runout"], 0.1, "")
+    push("runout", COLORS["runout"], 0.1)
 
     # Dessin
     y = 0.3
@@ -111,32 +97,21 @@ def plot_frame_layout(path):
                     ha="center", va="top", color="black", fontsize=7)
 
     total = t
-    # Annotations cycles
+    # Annotations cycles : 3 cycles identiques à ~4 s
     annot_y = y + h + 0.15
-    # Cycle 0 BOOT
-    c0_end = 0.17 + 0.064 + 0.085 + 0.192 + 5 * (0.085 + 0.384)
-    ax.annotate("", xy=(c0_end, annot_y), xytext=(0, annot_y),
-                arrowprops=dict(arrowstyle="<->", color="#2b7fbf"))
-    ax.text(c0_end / 2, annot_y + 0.05, "cycle 0 (BOOT, cadence 5)",
-            ha="center", fontsize=9, color="#2b7fbf")
-
-    c1_start = c0_end
-    c1_end = c0_end + 0.17 + 0.064 + 0.085 + 0.192 + 5 * (0.085 + 0.384)
-    ax.annotate("", xy=(c1_end, annot_y), xytext=(c1_start, annot_y),
-                arrowprops=dict(arrowstyle="<->", color="#2b7fbf"))
-    ax.text((c1_start + c1_end) / 2, annot_y + 0.05, "cycle 1 (BOOT)",
-            ha="center", fontsize=9, color="#2b7fbf")
-
-    c2_start = c1_end
-    c2_end = total - 0.1
-    ax.annotate("", xy=(c2_end, annot_y), xytext=(c2_start, annot_y),
-                arrowprops=dict(arrowstyle="<->", color="#bfa02b"))
-    ax.text((c2_start + c2_end) / 2, annot_y + 0.05, "cycle STEADY (cadence 10)",
-            ha="center", fontsize=9, color="#bfa02b")
+    cycle_dur = 0.17 + 0.064 + 0.085 + 0.192 + 8 * (0.085 + 0.384)
+    for i in range(3):
+        cs = i * cycle_dur
+        ce = cs + cycle_dur
+        ax.annotate("", xy=(ce, annot_y), xytext=(cs, annot_y),
+                    arrowprops=dict(arrowstyle="<->", color="#bfa02b"))
+        ax.text((cs + ce) / 2, annot_y + 0.05,
+                f"cycle {i} (T≈4 s, cadence constante)",
+                ha="center", fontsize=9, color="#bfa02b")
 
     # Réinsertion V3
-    ax.annotate("réinsertion V3\nPRE+HDR", xy=(c0_end + 0.08, y + h),
-                xytext=(c0_end + 0.3, y + h + 0.8),
+    ax.annotate("réinsertion V3\nPRE+HDR tous les 4 s", xy=(cycle_dur + 0.08, y + h),
+                xytext=(cycle_dur + 0.3, y + h + 0.8),
                 arrowprops=dict(arrowstyle="->", color="red"),
                 fontsize=9, color="red", ha="center")
 

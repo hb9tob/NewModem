@@ -7,7 +7,7 @@ use modem_core::types::AUDIO_RATE;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "nbfm-modem", about = "NBFM audio modem — WAV file TX/RX")]
+#[command(name = "nbfm-modem", about = "NBFM audio modem — WAV file TX/RX (V3 only)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,7 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Encode a file to a WAV audio signal
+    /// Encode a file to a WAV audio signal (V3 frame format).
     Tx {
         /// Input file to transmit
         #[arg(short, long)]
@@ -53,28 +53,22 @@ enum Commands {
         #[arg(long, default_value = "0.5")]
         vox: f64,
 
-        /// Frame format version: 1 = monolithic (legacy), 2 = segmented with
-        /// resync markers and periodic app headers (enables long-transmission
-        /// recovery and RaptorQ framing)
-        #[arg(long, default_value = "1")]
-        frame_version: u8,
-
-        /// v2 only: 32-bit session identifier (hex, random if omitted)
+        /// 32-bit session identifier (hex, random if omitted)
         #[arg(long)]
         session_id: Option<String>,
 
-        /// v2 only: original filename to embed in the payload envelope
-        /// (default = basename of --input, max 64 UTF-8 bytes)
+        /// Original filename to embed in the payload envelope (default = basename
+        /// of --input, max 64 UTF-8 bytes)
         #[arg(long)]
         filename: Option<String>,
 
-        /// v2 only: operator callsign (QRZ) to embed in the payload envelope
-        /// (required for v2, max 10 ASCII bytes). Example: HB9TOB.
+        /// Operator callsign (QRZ) to embed in the payload envelope (required,
+        /// max 10 ASCII bytes). Example: HB9TOB.
         #[arg(long)]
         callsign: Option<String>,
     },
 
-    /// Decode a WAV audio signal to a file
+    /// Decode a WAV audio signal to a file (V3 frame format).
     Rx {
         /// Input WAV file
         #[arg(short, long)]
@@ -88,8 +82,7 @@ enum Commands {
         #[arg(short, long, default_value = "NORMAL")]
         profile: String,
 
-        /// Override LDPC rate used at TX (required if TX used a non-default
-        /// rate for this profile): 1/2, 2/3, 3/4
+        /// Override LDPC rate used at TX
         #[arg(long)]
         ldpc_rate: Option<String>,
 
@@ -100,31 +93,13 @@ enum Commands {
         /// Override center frequency
         #[arg(long)]
         fc: Option<f64>,
-
-        /// Frame format version: 1 = monolithic (legacy), 2 = segmented with
-        /// resync markers. Default 1 for backward compat with existing WAVs.
-        #[arg(long, default_value = "1")]
-        frame_version: u8,
     },
 
-    /// Inspect a WAV file (detect preamble, show parameters)
+    /// Inspect a WAV file (samples, peak, RMS, duration)
     Info {
         /// Input WAV file
         #[arg(short, long)]
         input: PathBuf,
-    },
-
-    /// Replay a WAV through StreamReceiverV2 as if it were live audio.
-    /// Prints every StreamEventV2 with its wall-clock timestamp so the
-    /// state-machine behaviour on a given capture can be diagnosed off-line.
-    RxStream {
-        /// Input WAV file
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Chunk size in milliseconds (matches the live worker's batching).
-        #[arg(long, default_value = "500")]
-        chunk_ms: u64,
     },
 }
 
@@ -142,14 +117,12 @@ fn main() {
             beta,
             fc,
             vox,
-            frame_version,
             session_id,
             filename,
             callsign,
         } => {
             let mut config = parse_profile(&profile);
 
-            // Apply overrides
             if let Some(c) = constellation {
                 config.constellation = parse_constellation(&c);
             }
@@ -166,110 +139,90 @@ fn main() {
                 config.center_freq_hz = f;
             }
 
-            // Read input file
             let data = std::fs::read(&input).unwrap_or_else(|e| {
                 eprintln!("Error reading {}: {e}", input.display());
                 std::process::exit(1);
             });
 
-            eprintln!("TX v{}: {} bytes, profile={}, constellation={:?}, LDPC={:?}, Rs={} Bd, beta={}, fc={} Hz",
-                frame_version, data.len(), profile, config.constellation, config.ldpc_rate,
-                config.symbol_rate, config.beta, config.center_freq_hz);
+            eprintln!(
+                "TX v3: {} bytes, profile={}, constellation={:?}, LDPC={:?}, Rs={} Bd, beta={}, fc={} Hz",
+                data.len(),
+                profile,
+                config.constellation,
+                config.ldpc_rate,
+                config.symbol_rate,
+                config.beta,
+                config.center_freq_hz
+            );
 
-            // Generate audio
-            let samples = match frame_version {
-                1 => {
-                    if vox > 0.0 {
-                        modem_core::tx::tx_with_vox(&data, &config, vox)
-                    } else {
-                        modem_core::tx::tx(&data, &config)
-                    }
-                }
-                2 | 3 => {
-                    // Wrap user data in a payload envelope carrying filename +
-                    // callsign so the RX GUI can identify the transmitter and
-                    // the original file name even before decoding the content.
-                    let fname = filename
-                        .clone()
-                        .unwrap_or_else(|| infer_filename(&input));
-                    let qrz = callsign.clone().unwrap_or_else(|| {
-                        eprintln!(
-                            "TX v{frame_version} error: --callsign is required (e.g. HB9TOB)"
-                        );
-                        std::process::exit(1);
-                    });
-                    let envelope = modem_core::payload_envelope::PayloadEnvelope::new(
-                        &fname, &qrz, data.clone(),
-                    )
-                    .unwrap_or_else(|| {
-                        eprintln!(
-                            "TX v{} error: filename (len {}) / callsign (len {}) exceed size limits or contain NUL",
-                            frame_version,
-                            fname.len(),
-                            qrz.len()
-                        );
-                        std::process::exit(1);
-                    });
-                    let wire_payload = envelope.encode();
+            let fname = filename
+                .clone()
+                .unwrap_or_else(|| infer_filename(&input));
+            let qrz = callsign.clone().unwrap_or_else(|| {
+                eprintln!("TX error: --callsign is required (e.g. HB9TOB)");
+                std::process::exit(1);
+            });
+            let envelope = modem_core::payload_envelope::PayloadEnvelope::new(
+                &fname,
+                &qrz,
+                data.clone(),
+            )
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "TX error: filename (len {}) / callsign (len {}) exceed size limits or contain NUL",
+                    fname.len(),
+                    qrz.len()
+                );
+                std::process::exit(1);
+            });
+            let wire_payload = envelope.encode();
 
-                    let sid = parse_session_id(session_id.as_deref());
-                    let hash = content_hash_short(&wire_payload);
-                    let mime = infer_mime(&input);
-                    eprintln!(
-                        "TX v{}: session_id=0x{:08X}, callsign={}, filename={}, mime=0x{:02X}, hash=0x{:04X}",
-                        frame_version, sid, qrz, fname, mime, hash
-                    );
-                    let symbols = if frame_version == 3 {
-                        modem_core::frame::build_superframe_v3(
-                            &wire_payload, &config, sid, mime, hash,
-                        )
-                    } else {
-                        modem_core::frame::build_superframe_v2(
-                            &wire_payload, &config, sid, mime, hash,
-                        )
-                    };
-                    // Reuse TX modulation pipeline
-                    let (sps, pitch) = modem_core::rrc::check_integer_constraints(
-                        AUDIO_RATE,
-                        config.symbol_rate,
-                        config.tau,
-                    )
-                    .expect("invalid profile");
-                    let taps =
-                        modem_core::rrc::rrc_taps(config.beta, modem_core::types::RRC_SPAN_SYM, sps);
-                    let mut modulated = modem_core::modulator::modulate(
-                        &symbols,
-                        sps,
-                        pitch,
-                        &taps,
-                        config.center_freq_hz,
-                    );
-                    // Prepend VOX tone + silence if requested (same shape as tx_with_vox)
-                    if vox > 0.0 {
-                        let mut out = Vec::new();
-                        out.extend_from_slice(&modem_core::modulator::tone(
-                            config.center_freq_hz,
-                            vox,
-                            0.5,
-                        ));
-                        out.extend_from_slice(&modem_core::modulator::silence(0.05));
-                        out.append(&mut modulated);
-                        out.extend_from_slice(&modem_core::modulator::silence(0.1));
-                        out
-                    } else {
-                        modulated
-                    }
-                }
-                v => {
-                    eprintln!("Unsupported frame_version {v} (use 1, 2 or 3)");
-                    std::process::exit(1);
-                }
+            let sid = parse_session_id(session_id.as_deref());
+            let hash = content_hash_short(&wire_payload);
+            let mime = infer_mime(&input);
+            eprintln!(
+                "TX v3: session_id=0x{:08X}, callsign={}, filename={}, mime=0x{:02X}, hash=0x{:04X}",
+                sid, qrz, fname, mime, hash
+            );
+
+            let symbols = modem_core::frame::build_superframe_v3(
+                &wire_payload, &config, sid, mime, hash,
+            );
+
+            let (sps, pitch) = modem_core::rrc::check_integer_constraints(
+                AUDIO_RATE,
+                config.symbol_rate,
+                config.tau,
+            )
+            .expect("invalid profile");
+            let taps =
+                modem_core::rrc::rrc_taps(config.beta, modem_core::types::RRC_SPAN_SYM, sps);
+            let mut modulated = modem_core::modulator::modulate(
+                &symbols,
+                sps,
+                pitch,
+                &taps,
+                config.center_freq_hz,
+            );
+
+            let samples = if vox > 0.0 {
+                let mut out = Vec::new();
+                out.extend_from_slice(&modem_core::modulator::tone(
+                    config.center_freq_hz,
+                    vox,
+                    0.5,
+                ));
+                out.extend_from_slice(&modem_core::modulator::silence(0.05));
+                out.append(&mut modulated);
+                out.extend_from_slice(&modem_core::modulator::silence(0.1));
+                out
+            } else {
+                modulated
             };
 
             let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
             eprintln!("Generated {} samples ({:.2}s)", samples.len(), duration_s);
 
-            // Write WAV
             write_wav(&output, &samples);
             eprintln!("Written to {}", output.display());
         }
@@ -281,7 +234,6 @@ fn main() {
             ldpc_rate,
             rs,
             fc,
-            frame_version,
         } => {
             let mut config = parse_profile(&profile);
             if let Some(r) = ldpc_rate {
@@ -294,275 +246,82 @@ fn main() {
                 config.center_freq_hz = f;
             }
 
-            // Read WAV
             let samples = read_wav(&input);
             let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
             eprintln!(
-                "RX v{}: {} samples ({:.2}s) from {}",
-                frame_version,
+                "RX v3: {} samples ({:.2}s) from {}",
                 samples.len(),
                 duration_s,
                 input.display()
             );
 
-            match frame_version {
-                1 => {
-                    match modem_core::rx::rx(&samples, &config) {
-                        Some(result) => {
-                            eprintln!(
-                                "Decoded: {} bytes, {}/{} LDPC blocks converged, sigma²={:.4}",
-                                result.data.len(),
-                                result.converged_blocks,
-                                result.total_blocks,
-                                result.sigma2
-                            );
-                            if let Some(ref hdr) = result.header {
-                                eprintln!(
-                                    "Header: version={}, mode=0x{:02X}, frame={}, payload_len={}, flags=0x{:02X}",
-                                    hdr.version, hdr.mode_code, hdr.frame_counter,
-                                    hdr.payload_length, hdr.flags
-                                );
-                            }
-                            let payload_len = result
-                                .header
-                                .as_ref()
-                                .map(|h| h.payload_length as usize)
-                                .unwrap_or(result.data.len());
-                            let trimmed = &result.data[..payload_len.min(result.data.len())];
-                            std::fs::write(&output, trimmed).unwrap_or_else(|e| {
-                                eprintln!("Error writing {}: {e}", output.display());
-                                std::process::exit(1);
-                            });
-                            eprintln!("Written {} bytes to {}", trimmed.len(), output.display());
-                        }
-                        None => {
-                            eprintln!("RX failed: no preamble found or signal too short");
-                            std::process::exit(1);
-                        }
+            match modem_core::rx_v2::rx_v3(&samples, &config) {
+                Some(result) => {
+                    eprintln!(
+                        "Decoded: {} bytes, {}/{} LDPC blocks converged, {} segments, {} lost, sigma²={:.4}",
+                        result.data.len(),
+                        result.converged_blocks,
+                        result.total_blocks,
+                        result.segments_decoded,
+                        result.segments_lost,
+                        result.sigma2
+                    );
+                    if let Some(ref hdr) = result.header {
+                        let profile_name = modem_core::profile::ProfileIndex::from_u8(
+                            hdr.profile_index,
+                        )
+                        .map(|p| p.name())
+                        .unwrap_or("UNKNOWN");
+                        eprintln!(
+                            "Protocol header: version={}, mode=0x{:02X}, profile={} ({}), payload_len={}",
+                            hdr.version,
+                            hdr.mode_code,
+                            profile_name,
+                            hdr.profile_index,
+                            hdr.payload_length
+                        );
                     }
-                }
-                2 | 3 => {
-                    let decode_result = if frame_version == 3 {
-                        modem_core::rx_v2::rx_v3(&samples, &config)
+                    if let Some(ref ah) = result.app_header {
+                        eprintln!(
+                            "App header: session_id=0x{:08X}, file_size={}, K={}, T={}, mime=0x{:02X}, hash=0x{:04X}",
+                            ah.session_id, ah.file_size, ah.k_symbols, ah.t_bytes,
+                            ah.mime_type, ah.hash_short
+                        );
+                    }
+
+                    let envelope = modem_core::payload_envelope::PayloadEnvelope::decode_or_fallback(
+                        &result.data,
+                    );
+                    if envelope.version == 0 {
+                        eprintln!("Payload envelope: none (writing raw content)");
                     } else {
-                        modem_core::rx_v2::rx_v2(&samples, &config)
+                        eprintln!(
+                            "Payload envelope: v{}, from={}, filename={}, content_size={} B",
+                            envelope.version,
+                            envelope.callsign,
+                            envelope.filename,
+                            envelope.content.len()
+                        );
+                    }
+
+                    let to_write = if envelope.version == 0 {
+                        &result.data
+                    } else {
+                        &envelope.content
                     };
-                    match decode_result {
-                    Some(result) => {
-                        eprintln!(
-                            "Decoded: {} bytes, {}/{} LDPC blocks converged, {} segments, {} lost, sigma²={:.4}",
-                            result.data.len(),
-                            result.converged_blocks,
-                            result.total_blocks,
-                            result.segments_decoded,
-                            result.segments_lost,
-                            result.sigma2
-                        );
-                        if let Some(ref hdr) = result.header {
-                            let profile_name = modem_core::profile::ProfileIndex::from_u8(
-                                hdr.profile_index,
-                            )
-                            .map(|p| p.name())
-                            .unwrap_or("UNKNOWN");
-                            eprintln!(
-                                "Protocol header: version={}, mode=0x{:02X}, profile={} ({}), payload_len={}",
-                                hdr.version,
-                                hdr.mode_code,
-                                profile_name,
-                                hdr.profile_index,
-                                hdr.payload_length
-                            );
-                        }
-                        if let Some(ref ah) = result.app_header {
-                            eprintln!(
-                                "App header: session_id=0x{:08X}, file_size={}, K={}, T={}, mime=0x{:02X}, hash=0x{:04X}",
-                                ah.session_id, ah.file_size, ah.k_symbols, ah.t_bytes,
-                                ah.mime_type, ah.hash_short
-                            );
-                        }
-
-                        // Attempt to unwrap the payload envelope (v2 TX adds one
-                        // since the GUI RX phase). On legacy v2 transmissions
-                        // without envelope, decode_or_fallback returns an empty
-                        // envelope with the full buffer as content.
-                        let envelope = modem_core::payload_envelope::PayloadEnvelope::decode_or_fallback(
-                            &result.data,
-                        );
-                        if envelope.version == 0 {
-                            eprintln!(
-                                "Payload envelope: none (legacy v2, writing raw content)"
-                            );
-                        } else {
-                            eprintln!(
-                                "Payload envelope: v{}, from={}, filename={}, content_size={} B",
-                                envelope.version,
-                                envelope.callsign,
-                                envelope.filename,
-                                envelope.content.len()
-                            );
-                        }
-
-                        let to_write = if envelope.version == 0 {
-                            &result.data
-                        } else {
-                            &envelope.content
-                        };
-                        std::fs::write(&output, to_write).unwrap_or_else(|e| {
-                            eprintln!("Error writing {}: {e}", output.display());
-                            std::process::exit(1);
-                        });
-                        eprintln!("Written {} bytes to {}", to_write.len(), output.display());
-                    }
-                    None => {
-                        eprintln!(
-                            "RX v2 failed: no preamble found, wrong frame version, or signal too short"
-                        );
+                    std::fs::write(&output, to_write).unwrap_or_else(|e| {
+                        eprintln!("Error writing {}: {e}", output.display());
                         std::process::exit(1);
-                    }
-                    }
+                    });
+                    eprintln!("Written {} bytes to {}", to_write.len(), output.display());
                 }
-                v => {
-                    eprintln!("Unsupported frame_version {v} (use 1, 2 or 3)");
+                None => {
+                    eprintln!(
+                        "RX failed: no preamble found or signal too short"
+                    );
                     std::process::exit(1);
                 }
             }
-        }
-
-        Commands::RxStream { input, chunk_ms } => {
-            use modem_core::rx_stream_v2::{SessionEndReason, StreamEventV2, StreamReceiverV2};
-            let samples = read_wav(&input);
-            let sr = AUDIO_RATE as f64;
-            let duration_s = samples.len() as f64 / sr;
-            let chunk = ((chunk_ms as f64 / 1000.0) * sr) as usize;
-            eprintln!(
-                "RxStream: {} samples ({:.2}s), chunk={} samples ({}ms)",
-                samples.len(),
-                duration_s,
-                chunk,
-                chunk_ms
-            );
-            let mut rx = StreamReceiverV2::new();
-            let mut total_events = 0usize;
-            let mut max_feed_ms: u128 = 0;
-            let mut last_feed_ms: u128 = 0;
-            let mut first_streaming_feed_ms: Option<u128> = None;
-            let mut latest_constellation: Vec<[f32; 2]> = Vec::new();
-            for (k, batch) in samples.chunks(chunk).enumerate() {
-                let t_abs = (k * chunk) as f64 / sr;
-                let t0 = std::time::Instant::now();
-                let events = rx.feed(batch);
-                let dt = t0.elapsed().as_millis();
-                last_feed_ms = dt;
-                if dt > max_feed_ms {
-                    max_feed_ms = dt;
-                }
-                if rx.is_locked() && first_streaming_feed_ms.is_none() {
-                    first_streaming_feed_ms = Some(dt);
-                }
-                for ev in events {
-                    total_events += 1;
-                    match ev {
-                        StreamEventV2::PreambleDetected { profile } => {
-                            eprintln!("[{t_abs:7.2}s] PreambleDetected {:?}", profile);
-                        }
-                        StreamEventV2::HeaderDecoded {
-                            profile,
-                            mode_code,
-                            payload_length,
-                        } => {
-                            eprintln!(
-                                "[{t_abs:7.2}s] HeaderDecoded profile={:?} mode=0x{:02X} payload_length={}",
-                                profile, mode_code, payload_length
-                            );
-                        }
-                        StreamEventV2::MarkerSynced {
-                            seg_id,
-                            base_esi,
-                            is_meta,
-                        } => {
-                            eprintln!(
-                                "[{t_abs:7.2}s] MarkerSynced seg={} esi={} {}",
-                                seg_id,
-                                base_esi,
-                                if is_meta { "meta" } else { "data" }
-                            );
-                        }
-                        StreamEventV2::SignalLost => {
-                            eprintln!("[{t_abs:7.2}s] SignalLost");
-                        }
-                        StreamEventV2::SignalReacquired => {
-                            eprintln!("[{t_abs:7.2}s] SignalReacquired");
-                        }
-                        StreamEventV2::AppHeaderDecoded {
-                            session_id,
-                            file_size,
-                            mime_type,
-                            hash_short,
-                        } => {
-                            eprintln!(
-                                "[{t_abs:7.2}s] AppHeaderDecoded session=0x{:08X} size={} mime=0x{:02X} hash=0x{:04X}",
-                                session_id, file_size, mime_type, hash_short
-                            );
-                        }
-                        StreamEventV2::ProgressUpdate {
-                            blocks_converged,
-                            blocks_total,
-                            blocks_expected,
-                            sigma2,
-                            constellation_sample,
-                            ..
-                        } => {
-                            eprintln!(
-                                "[{t_abs:7.2}s] ProgressUpdate {}/{} data blocks (attempted={}), sigma2={:.4}",
-                                blocks_converged, blocks_expected, blocks_total, sigma2
-                            );
-                            latest_constellation = constellation_sample;
-                        }
-                        StreamEventV2::EnvelopeDecoded { filename, callsign } => {
-                            eprintln!(
-                                "[{t_abs:7.2}s] EnvelopeDecoded from={} filename={}",
-                                callsign, filename
-                            );
-                        }
-                        StreamEventV2::FileComplete {
-                            filename,
-                            callsign,
-                            mime_type,
-                            content,
-                            sigma2,
-                        } => {
-                            eprintln!(
-                                "[{t_abs:7.2}s] FileComplete from={} filename={} mime=0x{:02X} size={} sigma2={:.4}",
-                                callsign,
-                                filename,
-                                mime_type,
-                                content.len(),
-                                sigma2
-                            );
-                        }
-                        StreamEventV2::SessionEnd { reason } => {
-                            let r = match reason {
-                                SessionEndReason::Completed => "Completed",
-                                SessionEndReason::AbortTimeout => "AbortTimeout",
-                            };
-                            eprintln!("[{t_abs:7.2}s] SessionEnd reason={}", r);
-                        }
-                    }
-                }
-            }
-            eprintln!("done: {} events emitted", total_events);
-            eprintln!(
-                "feed_latency: first_streaming={:?}ms, last={}ms, max={}ms (chunk={}ms of audio)",
-                first_streaming_feed_ms, last_feed_ms, max_feed_ms, chunk_ms
-            );
-            // Dump the last-known constellation sample on stdout as JSON
-            // lines so it can be piped into an analysis script.
-            println!("{{\"constellation_sample\": [");
-            for (i, p) in latest_constellation.iter().enumerate() {
-                let comma = if i + 1 < latest_constellation.len() { "," } else { "" };
-                println!("  [{}, {}]{}", p[0], p[1], comma);
-            }
-            println!("]}}");
         }
 
         Commands::Info { input } => {
@@ -576,25 +335,6 @@ fn main() {
                 / samples.len() as f64)
                 .sqrt();
             println!("Peak: {:.4}, RMS: {:.4}", peak, rms);
-
-            // Try to detect preamble with each profile
-            for (name, config) in [
-                ("MEGA", profile::profile_mega()),
-                ("HIGH", profile::profile_high()),
-                ("NORMAL", profile::profile_normal()),
-                ("ROBUST", profile::profile_robust()),
-                ("ULTRA", profile::profile_ultra()),
-            ] {
-                match modem_core::rx::rx(&samples, &config) {
-                    Some(result) if result.total_blocks > 0 => {
-                        println!(
-                            "Profile {}: detected! {}/{} blocks OK, {} bytes decoded",
-                            name, result.converged_blocks, result.total_blocks, result.data.len()
-                        );
-                    }
-                    _ => {}
-                }
-            }
         }
     }
 }
@@ -633,7 +373,6 @@ fn infer_filename(path: &PathBuf) -> String {
         .and_then(|n| n.to_str())
         .map(|s| {
             if s.len() > modem_core::payload_envelope::MAX_FILENAME_BYTES {
-                // Keep the extension, truncate the stem to fit
                 let max = modem_core::payload_envelope::MAX_FILENAME_BYTES;
                 let (stem, ext) = s.rfind('.').map(|i| s.split_at(i)).unwrap_or((s, ""));
                 let keep = max.saturating_sub(ext.len());

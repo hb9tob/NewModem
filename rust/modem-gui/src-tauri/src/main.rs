@@ -62,6 +62,7 @@ fn save_settings(settings: Settings) -> Result<(), String> {
 #[tauri::command]
 fn start_capture(
     device_name: String,
+    profile: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -69,12 +70,21 @@ fn start_capture(
     if guard.is_some() {
         return Err("capture already running".into());
     }
+    let profile_idx = match profile.as_deref().unwrap_or("HIGH").to_uppercase().as_str() {
+        "MEGA" => modem_core::profile::ProfileIndex::Mega,
+        "HIGH" => modem_core::profile::ProfileIndex::High,
+        "NORMAL" => modem_core::profile::ProfileIndex::Normal,
+        "ROBUST" => modem_core::profile::ProfileIndex::Robust,
+        "ULTRA" => modem_core::profile::ProfileIndex::Ultra,
+        other => return Err(format!("unknown profile '{other}'")),
+    };
     let (capture, samples) = audio_capture::start(&device_name)?;
     let worker = rx_worker::spawn(
         samples,
         app.clone(),
         state.save_dir.clone(),
         state.wav_sink.clone(),
+        profile_idx,
     );
     *guard = Some(CaptureSession {
         capture,

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::app_header::{self, AppHeader};
 use crate::demodulator;
 use crate::ffe;
-use crate::frame::{self, HEADER_VERSION_V2, HEADER_VERSION_V3, V2_CODEWORDS_PER_SEGMENT};
+use crate::frame::{self, HEADER_VERSION_V3, V2_CODEWORDS_PER_SEGMENT};
 use crate::header;
 use crate::interleaver;
 use crate::ldpc::decoder::LdpcDecoder;
@@ -359,7 +359,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // the marker-based segment walker below).
     let header_syms = &corrected[N_PREAMBLE..N_PREAMBLE + header_sym_count];
     let decoded_header = header::decode_header_symbols(header_syms)?;
-    if decoded_header.version != HEADER_VERSION_V2 && decoded_header.version != HEADER_VERSION_V3 {
+    if decoded_header.version != HEADER_VERSION_V3 {
         return None;
     }
 
@@ -829,7 +829,7 @@ mod tests {
     use super::*;
     use crate::app_header::mime;
     use crate::modulator;
-    use crate::profile::{profile_high, profile_mega, profile_normal, profile_robust, profile_ultra};
+    use crate::profile::profile_high;
 
     fn make_session_hash(data: &[u8]) -> u16 {
         let mut h: u16 = 0;
@@ -837,20 +837,6 @@ mod tests {
             h = h.wrapping_mul(31).wrapping_add(b as u16);
         }
         h
-    }
-
-    fn tx_v2(data: &[u8], config: &ModemConfig, session_id: u32) -> Vec<f32> {
-        let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
-            .expect("invalid profile");
-        let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
-        let symbols = frame::build_superframe_v2(
-            data,
-            config,
-            session_id,
-            mime::BINARY,
-            make_session_hash(data),
-        );
-        modulator::modulate(&symbols, sps, pitch, &taps, config.center_freq_hz)
     }
 
     fn tx_v3(data: &[u8], config: &ModemConfig, session_id: u32) -> Vec<f32> {
@@ -868,12 +854,10 @@ mod tests {
     }
 
     /// Loopback : TX v3 → RX v3 sliding-window. A payload large enough to
-    /// trigger at least one periodic meta cycle (i.e. at least one extra
-    /// preamble beyond the initial one) on the HIGH profile.
+    /// trigger several periodic preamble reinsertions on the HIGH profile.
     #[test]
     fn loopback_v3_high_sliding_window() {
         let config = profile_high();
-        // ~15 kB : assez pour déclencher plusieurs cycles meta périodiques.
         let data: Vec<u8> = (0..15_000)
             .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
             .collect();
@@ -899,339 +883,5 @@ mod tests {
             &data[..],
             "V3 loopback : données non identiques"
         );
-    }
-
-    /// Diagnostic: MEGA (FTN τ=30/32) with a minimal v2 frame (1 data CW).
-    /// Isolates whether the v2 MEGA failure is about segment boundaries or
-    /// about the FTN pipeline in isolation.
-    #[test]
-    fn loopback_v2_mega_single_codeword() {
-        let config = profile_mega();
-        let data = vec![0x5Au8; 200]; // 1 codeword at r3/4 (k_bytes=216)
-        let samples = tx_v2(&data, &config, 0xCAFE_BEEF);
-        let result = rx_v2(&samples, &config).expect("RX v2 MEGA 1cw failed");
-        eprintln!(
-            "MEGA 1 CW : {}/{} converged, sigma²={:.4}, segments={}, lost={}",
-            result.converged_blocks,
-            result.total_blocks,
-            result.sigma2,
-            result.segments_decoded,
-            result.segments_lost
-        );
-    }
-
-    /// End-to-end test of the payload envelope: wrap a user file with
-    /// filename + callsign, push through v2 TX → RX, unwrap, compare.
-    #[test]
-    fn loopback_v2_with_payload_envelope() {
-        use crate::payload_envelope::PayloadEnvelope;
-        let config = profile_normal();
-        let user_content: Vec<u8> = (0..500).map(|i| (i * 7 + 3) as u8).collect();
-        let envelope =
-            PayloadEnvelope::new("photo.avif", "HB9TOB", user_content.clone())
-                .expect("envelope fits in size limits");
-        let wire_payload = envelope.encode();
-
-        let samples = tx_v2(&wire_payload, &config, 0xAABB_CCDD);
-        let result = rx_v2(&samples, &config).expect("RX v2 must decode");
-        assert_eq!(result.converged_blocks, result.total_blocks);
-
-        let decoded_env = PayloadEnvelope::decode(&result.data).expect("envelope must decode");
-        assert_eq!(decoded_env.filename, "photo.avif");
-        assert_eq!(decoded_env.callsign, "HB9TOB");
-        assert_eq!(decoded_env.content, user_content);
-    }
-
-    #[test]
-    fn loopback_v2_normal_small() {
-        let config = profile_normal();
-        let data = b"Hello v2 framing with resync markers!";
-        let samples = tx_v2(data, &config, 0xCAFEBABE);
-        let result = rx_v2(&samples, &config).expect("RX v2 failed");
-        assert_eq!(result.header.as_ref().unwrap().version, HEADER_VERSION_V2);
-        assert!(result.app_header.is_some(), "AppHeader should be recovered");
-        let ah = result.app_header.unwrap();
-        assert_eq!(ah.session_id, 0xCAFEBABE);
-        assert_eq!(ah.file_size, data.len() as u32);
-        assert_eq!(&result.data[..data.len()], data);
-    }
-
-    /// Late-start: throw away the first few seconds of the signal (as if the
-    /// RX tuned in after the start of transmission). The pre-acquisition
-    /// header decode must fail, but a correctly-placed meta segment periodic
-    /// repeat should still let at least the first few blocks recover once
-    /// we slide the RX start forward. This test just verifies the pipeline
-    /// doesn't crash on mis-started input (full late-recovery handling, where
-    /// the RX finds a *later* preamble-less meta anchor, is a phase 2.5 item).
-    #[test]
-    fn late_start_fails_gracefully() {
-        let config = profile_normal();
-        let data = vec![0xA5u8; 500];
-        let samples = tx_v2(&data, &config, 0xBAD_DECAF);
-        // Drop the first ~2 s of the signal (past the preamble).
-        let skip = (2.0 * AUDIO_RATE as f64) as usize;
-        if samples.len() > skip {
-            let result = rx_v2(&samples[skip..], &config);
-            // Either returns None (no preamble found) or returns with partial
-            // data — never panics.
-            if let Some(r) = result {
-                eprintln!(
-                    "late_start: {}/{} blocks, {} segs, sigma²={:.4}",
-                    r.converged_blocks, r.total_blocks, r.segments_decoded, r.sigma2
-                );
-            }
-        }
-    }
-
-    /// Resample `samples` to simulate a TCXO clock drift of `drift_ppm`
-    /// between TX and RX. Positive ppm = RX clock faster than TX clock, so
-    /// the effective received signal has fewer samples for the same duration
-    /// (RX consumes the TX waveform "faster than it was produced").
-    fn resample_drift(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
-        let ratio = 1.0 + drift_ppm * 1e-6;
-        let n_out = ((samples.len() as f64) / ratio) as usize;
-        let mut out = Vec::with_capacity(n_out);
-        for i in 0..n_out {
-            let t = i as f64 * ratio;
-            let idx = t.floor() as usize;
-            let frac = (t - idx as f64) as f32;
-            if idx + 1 < samples.len() {
-                out.push((1.0 - frac) * samples[idx] + frac * samples[idx + 1]);
-            } else if idx < samples.len() {
-                out.push(samples[idx]);
-            } else {
-                break;
-            }
-        }
-        out
-    }
-
-    /// Clock drift: simulate TCXO ppm mismatch between TX and RX. On long
-    /// transmissions this accumulates into symbol-level timing slip. The
-    /// sliding marker correlation must follow this drift segment after
-    /// segment, otherwise the RX drops subsequent markers once the slip
-    /// exceeds the narrow search window.
-    #[test]
-    fn clock_drift_10ppm_normal() {
-        let config = profile_normal();
-        let data: Vec<u8> = (0..5000).map(|i| ((i * 17) ^ 0x55) as u8).collect();
-        let samples = tx_v2(&data, &config, 0xC10C_0C10);
-        // 10 ppm drift — conservative TCXO-class drift
-        let drifted = resample_drift(&samples, 10.0);
-        let drift_samples = samples.len() as i64 - drifted.len() as i64;
-        let result = rx_v2(&drifted, &config).expect("rx_v2 should not fail on 10 ppm drift");
-        eprintln!(
-            "10 ppm drift ({} sample diff): {}/{} blocks OK, {} segs, σ²={:.4}",
-            drift_samples,
-            result.converged_blocks,
-            result.total_blocks,
-            result.segments_decoded,
-            result.sigma2
-        );
-        assert_eq!(
-            result.converged_blocks, result.total_blocks,
-            "10 ppm should be well within the narrow sliding window"
-        );
-    }
-
-    #[test]
-    fn clock_drift_50ppm_normal() {
-        let config = profile_normal();
-        let data: Vec<u8> = (0..5000).map(|i| ((i * 19) ^ 0xAA) as u8).collect();
-        let samples = tx_v2(&data, &config, 0xC0FFEE);
-        // 50 ppm drift — upper bound for a cheap non-stabilised crystal
-        let drifted = resample_drift(&samples, 50.0);
-        let drift_samples = samples.len() as i64 - drifted.len() as i64;
-        let result = rx_v2(&drifted, &config).expect("rx_v2 should survive 50 ppm drift");
-        eprintln!(
-            "50 ppm drift ({} sample diff): {}/{} blocks OK, {} segs, σ²={:.4}",
-            drift_samples,
-            result.converged_blocks,
-            result.total_blocks,
-            result.segments_decoded,
-            result.sigma2
-        );
-        // Allow a few lost blocks: with wider drift, later segments may slip
-        // past the narrow sliding window. Require ≥ 90% to catch regression
-        // while staying robust to implementation noise.
-        assert!(
-            result.converged_blocks * 10 >= result.total_blocks * 9,
-            "50 ppm drift lost too many blocks: {}/{}",
-            result.converged_blocks,
-            result.total_blocks
-        );
-    }
-
-    /// Squelch gap: zero-out a chunk in the middle of the signal (simulating
-    /// a squelch close). The RX should re-acquire markers after the gap and
-    /// still decode blocks that lie outside the zeroed region.
-    #[test]
-    fn squelch_gap_survives_sliding_corr() {
-        let config = profile_normal();
-        let data: Vec<u8> = (0..5000).map(|i| (i * 13) as u8).collect();
-        let samples = tx_v2(&data, &config, 0x5EC5E5);
-        let mut noisy = samples.clone();
-        // Zero out 300 ms (~450 symbols at 1500 Bd) near the middle — far
-        // enough past the header that several segments precede the gap.
-        let gap_start = noisy.len() / 3;
-        let gap_len = (0.3 * AUDIO_RATE as f64) as usize;
-        for s in noisy.iter_mut().skip(gap_start).take(gap_len) {
-            *s = 0.0;
-        }
-        let result = rx_v2(&noisy, &config).expect("RX should not fail totally");
-        // We expect SOME blocks to converge (those outside the gap), but not
-        // all. Fail the test only if nothing at all decoded.
-        assert!(
-            result.converged_blocks >= result.total_blocks / 2,
-            "squelch recovery too weak: only {}/{} blocks converged, {} segs decoded, {} lost",
-            result.converged_blocks,
-            result.total_blocks,
-            result.segments_decoded,
-            result.segments_lost
-        );
-        eprintln!(
-            "squelch gap: {}/{} blocks OK, {} segs decoded, {} lost, sigma²={:.4}",
-            result.converged_blocks,
-            result.total_blocks,
-            result.segments_decoded,
-            result.segments_lost,
-            result.sigma2
-        );
-    }
-
-    /// Stress test: loopback v2 with realistic payload volumes (10/25/50 kB)
-    /// across all 5 profiles. Exercises many segments, multiple meta-segment
-    /// injections (cadence boost→nominal switch), long DD-PLL tracking, larger
-    /// ESI ranges, and session_id_low non-wrap.
-    ///
-    /// Marked #[ignore] so regular `cargo test` stays fast; run explicitly:
-    ///   cargo test -p modem-core --release -- --ignored loopback_v2_stress
-    /// Ultimate frontier: 100 kB of random payload through MEGA (16-APSK
-    /// FTN τ=30/32, LDPC rate 3/4) — the hardest profile × largest volume.
-    /// ~210 s of signal, ~460 segments, ~46 meta-segment repeats.
-    ///
-    /// Exercises : adaptive FFE on long-duration FTN, sliding marker correlation
-    /// across hundreds of markers, per-segment pilot interpolation, DD-LMS
-    /// stability over long runs, base_ESI assembly across many codewords.
-    #[test]
-    #[ignore]
-    fn loopback_v2_100kb_mega_ultimate() {
-        let config = profile_mega();
-        let size = 100_000;
-        let data: Vec<u8> = (0..size)
-            .map(|i| ((i * 61 + (i >> 3) * 239) as u32 ^ 0xDEAD_BEEF) as u8)
-            .collect();
-        let samples = tx_v2(&data, &config, 0xFF00_AA55);
-        let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
-        eprintln!(
-            "MEGA 100 kB TX : {} samples ({:.1} s), {:.1} kbps raw audio",
-            samples.len(),
-            duration_s,
-            (samples.len() as f64 * 16.0 / 1000.0) / duration_s
-        );
-
-        let result = rx_v2(&samples, &config).expect("RX v2 should not fail");
-        let ah = result.app_header.as_ref().expect("AppHeader");
-        assert_eq!(ah.file_size as usize, size);
-        assert_eq!(
-            result.converged_blocks, result.total_blocks,
-            "MEGA 100 kB: {}/{} blocks converged, σ²={:.4}, {} segs OK / {} lost",
-            result.converged_blocks, result.total_blocks, result.sigma2,
-            result.segments_decoded, result.segments_lost
-        );
-        assert_eq!(
-            &result.data[..size],
-            &data[..],
-            "MEGA 100 kB: payload mismatch"
-        );
-        eprintln!(
-            "MEGA 100 kB RX : {}/{} blocks, {} segs, σ²={:.4}, net bitrate={:.0} bps",
-            result.converged_blocks,
-            result.total_blocks,
-            result.segments_decoded,
-            result.sigma2,
-            (size as f64 * 8.0) / duration_s
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn loopback_v2_stress_10_25_50_kb() {
-        let sizes = [10_000usize, 25_000, 50_000];
-        // Keep MEGA at the end — if it regresses we want other profiles to run
-        // first and isolate the failure mode.
-        let profiles: Vec<(&str, ModemConfig)> = vec![
-            ("ULTRA", profile_ultra()),
-            ("ROBUST", profile_robust()),
-            ("NORMAL", profile_normal()),
-            ("HIGH", profile_high()),
-            ("MEGA", profile_mega()),
-        ];
-
-        for size in sizes {
-            let data: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
-            for (name, config) in &profiles {
-                let samples = tx_v2(&data, config, 0xA1B2_C3D4);
-                let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
-                let result = rx_v2(&samples, config).unwrap_or_else(|| {
-                    panic!("{name} {size}B: rx_v2 returned None (duration {duration_s:.1}s)")
-                });
-                let ah = result
-                    .app_header
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("{name} {size}B: AppHeader missing"));
-                assert_eq!(ah.file_size as usize, size, "{name} {size}B: AppHeader.file_size");
-                assert_eq!(
-                    result.converged_blocks, result.total_blocks,
-                    "{name} {size}B: {}/{} blocks converged, sigma²={:.4}, segs={}/{} (ok/lost), duration={:.1}s",
-                    result.converged_blocks,
-                    result.total_blocks,
-                    result.sigma2,
-                    result.segments_decoded,
-                    result.segments_lost,
-                    duration_s,
-                );
-                assert_eq!(
-                    &result.data[..size],
-                    &data[..],
-                    "{name} {size}B: payload mismatch"
-                );
-                eprintln!(
-                    "{name:6} {size:>5}B : {}/{} blocks OK, {} segs, σ²={:.4}, {:.1}s",
-                    result.converged_blocks,
-                    result.total_blocks,
-                    result.segments_decoded,
-                    result.sigma2,
-                    duration_s,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn loopback_v2_818_bytes_all_profiles() {
-        let data: Vec<u8> = (0..818).map(|i| (i % 256) as u8).collect();
-        for (name, config) in [
-            ("MEGA", profile_mega()),
-            ("HIGH", profile_high()),
-            ("NORMAL", profile_normal()),
-            ("ROBUST", profile_robust()),
-            ("ULTRA", profile_ultra()),
-        ] {
-            let samples = tx_v2(&data, &config, 0xDEADBEEF);
-            let result = rx_v2(&samples, &config)
-                .unwrap_or_else(|| panic!("{name}: rx_v2 returned None"));
-            assert!(result.app_header.is_some(), "{name}: AppHeader missing");
-            assert_eq!(
-                result.converged_blocks, result.total_blocks,
-                "{name}: {}/{} blocks converged, sigma²={:.4}",
-                result.converged_blocks, result.total_blocks, result.sigma2
-            );
-            assert_eq!(
-                &result.data[..data.len()],
-                &data[..],
-                "{name}: data mismatch"
-            );
-        }
     }
 }

@@ -22,7 +22,6 @@ pub mod ldpc;
 
 pub mod modulator;
 pub mod frame;
-pub mod tx;
 
 pub mod demodulator;
 pub mod sync;
@@ -30,8 +29,4 @@ pub mod ffe;
 pub mod equalizer;
 pub mod pll;
 pub mod soft_demod;
-pub mod rx;
 pub mod rx_v2;
-pub mod rx_v2_stream;
-pub mod rx_stream;
-pub mod rx_stream_v2;

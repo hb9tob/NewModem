@@ -676,46 +676,12 @@ function wireEvents() {
       }
     });
   }
-  // Batch-on-buffer parallel decode: reuse showCurrentFile so the user sees
-  // the high-quality batch result alongside the streaming-pipeline save.
-  // The payload shape is compatible with showCurrentFile (callsign, filename,
-  // size, mime_type, sigma2, saved_path) plus extra batch-specific fields.
-  listen("batch_decode_complete", (event) => {
-    const p = event.payload || {};
-    logEvent("batch_decode_complete", {
-      profile: p.profile,
-      converged: `${p.converged_blocks}/${p.total_blocks}`,
-      data_recovered: p.data_blocks_recovered,
-      bytes: p.bytes_decoded,
-      sigma2: p.sigma2,
-      decode_ms: p.decode_ms,
-      sample_count: p.sample_count,
-    });
-    if (p.saved_path) {
-      showCurrentFile({
-        callsign: p.callsign,
-        filename: p.filename,
-        size: p.bytes_decoded,
-        mime_type: p.mime_type,
-        sigma2: p.sigma2,
-        saved_path: p.saved_path,
-      });
-    }
-  });
   listen("audio_level", (event) => {
     const p = event.payload;
     updateLevel(p.rms, p.peak, p.total_samples);
     noteAudioOverdrive(!!p.overdrive, p.crest_db);
   });
 
-  listen("v2_state", (event) => {
-    updateV2State(event.payload.state);
-    logEvent("v2_state", event.payload);
-  });
-  listen("v2_marker", (event) => {
-    updateV2Marker(event.payload);
-    logEvent("v2_marker", event.payload);
-  });
   listen("tx_plan", (ev) => {
     logEvent("tx_plan", ev.payload);
   });
@@ -728,9 +694,6 @@ function wireEvents() {
   listen("tx_error", (ev) => {
     onTxError(ev.payload);
   });
-  listen("v2_signal_lost", () => logEvent("v2_signal_lost", null));
-  listen("v2_signal_reacquired", () => logEvent("v2_signal_reacquired", null));
-  listen("v2_session_end", (event) => logEvent("v2_session_end", event.payload));
   listen("v2_progress", (event) => {
     updateV2Progress(event.payload);
     // Log the progress event WITHOUT the bitmap/constellation arrays,
