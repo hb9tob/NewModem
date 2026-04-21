@@ -515,13 +515,10 @@ fn scan_and_route(
 ) {
     let config = state.config.clone();
 
-    // Idle gate : cheap preamble probe (correlation peak / median ratio)
-    // before engaging the full rx_v3 pipeline. Skips FFE/LDPC on pure
-    // noise — required for permanent-listening mode to stay real-time.
-    if !state.session_active && !rx_v2::probe_preamble_present(&state.session_buffer, &config) {
-        return;
-    }
-
+    // Note : we used to gate rx_v3 in Idle with a cheap correlation probe,
+    // but the peak/median threshold proved too aggressive on OTA-attenuated
+    // signals (ULTRA / ROBUST / NORMAL failed to arm). The 10-s capture
+    // window already bounds CPU, so we just let rx_v3 handle detection.
     let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
         return;
     };

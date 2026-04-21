@@ -999,6 +999,40 @@ mod tests {
     }
 
     #[test]
+    fn probe_preamble_all_profiles() {
+        use crate::profile::{profile_normal, profile_robust, profile_ultra};
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(7)).collect();
+        for (name, cfg) in [
+            ("ultra", profile_ultra()),
+            ("robust", profile_robust()),
+            ("normal", profile_normal()),
+            ("high", profile_high()),
+        ] {
+            let samples = tx_v3(&data, &cfg, 0xFACE_0001);
+            assert!(
+                probe_preamble_present(&samples, &cfg),
+                "probe must detect preamble for profile {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_v3_all_profiles_small_payload() {
+        use crate::profile::{profile_normal, profile_robust, profile_ultra};
+        let data: Vec<u8> = (0..150).map(|i| (i as u8).wrapping_mul(11)).collect();
+        for (name, cfg) in [
+            ("ultra", profile_ultra()),
+            ("robust", profile_robust()),
+            ("normal", profile_normal()),
+        ] {
+            let samples = tx_v3(&data, &cfg, 0xFEED_0001);
+            let r = rx_v3(&samples, &cfg).unwrap_or_else(|| panic!("rx_v3 None for {name}"));
+            assert!(r.app_header.is_some(), "{name} : no AppHeader");
+            assert_eq!(&r.data[..data.len()], &data[..], "{name} : payload mismatch");
+        }
+    }
+
+    #[test]
     fn probe_preamble_rejects_noise() {
         let config = profile_high();
         // 2 s of deterministic noise — below the 10× peak/median gate.
