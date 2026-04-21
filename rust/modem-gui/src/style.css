@@ -258,6 +258,38 @@ main {
 .rx-info code {
   color: #9e9e9e;
 }
+.rx-fountain-status {
+  display: flex;
+  gap: 0.9rem;
+  align-items: baseline;
+  padding: 0.4rem 0.9rem;
+  background: #1c2f1c;
+  border-bottom: 1px solid #2f4a2f;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  color: #e0e0e0;
+}
+.rx-fountain-status .label {
+  color: #9ccc65;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.rx-fountain-status strong {
+  font-size: 1rem;
+  color: #ffffff;
+}
+.rx-fountain-pct {
+  color: #9ccc65;
+}
+.rx-fountain-session {
+  margin-left: auto;
+  color: #9e9e9e;
+  font-size: 0.75rem;
+}
+.rx-fountain-status[data-decoded="true"] {
+  background: #103318;
+  border-bottom-color: #2f7a3a;
+}
 .rx-layout {
   position: relative;
 }

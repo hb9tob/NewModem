@@ -629,21 +629,11 @@ fn scan_and_route(
                 cap_reached: outcome.cap_reached,
             },
         );
-        // Legacy v2_progress for existing UI (bitmap of received ESIs).
+        // Legacy v2_progress : cumulative bitmap from the disk-persistent
+        // store (not the sliding rx_v3 window, which would only show the
+        // last few seconds of ESIs and appear to "scroll").
         let sigma2 = result.sigma2;
         let expected = outcome.needed as usize;
-        let bitmap = if expected > 0 {
-            let mut bits = vec![0u8; (expected + 7) / 8];
-            for &esi in result.cw_bytes_map.keys() {
-                let i = esi as usize;
-                if i < expected {
-                    bits[i / 8] |= 1 << (i % 8);
-                }
-            }
-            bits
-        } else {
-            Vec::new()
-        };
         let _ = app.emit(
             "v2_progress",
             V2ProgressPayload {
@@ -651,7 +641,7 @@ fn scan_and_route(
                 blocks_total: result.total_blocks,
                 blocks_expected: expected,
                 sigma2,
-                converged_bitmap: bitmap,
+                converged_bitmap: outcome.seen_bitmap.clone(),
                 constellation_sample: Vec::new(),
             },
         );

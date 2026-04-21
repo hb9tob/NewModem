@@ -175,6 +175,11 @@ pub struct AcceptOutcome {
     pub cap_reached: bool,
     /// Decoded file (if RaptorQ converged on this packet).
     pub decoded: Option<DecodedFile>,
+    /// Cumulative bitmap over the K source ESIs : bit i = 1 iff ESI i has
+    /// been received at least once since this session was created. Covers
+    /// repair ESIs (index ≥ K) only up to the K-th bit — repair packets
+    /// contribute to the fountain decode but aren't part of the UI bar.
+    pub seen_bitmap: Vec<u8>,
 }
 
 /// Successfully decoded file, written on disk inside the session dir.
@@ -318,12 +323,14 @@ impl SessionStore {
 
         let unique_esis = state.seen.len() as u32;
         let needed = state.meta.k_symbols as u32;
+        let seen_bitmap = build_seen_bitmap(&state.seen, needed);
         let mut outcome = AcceptOutcome {
             accepted: accepted > 0,
             unique_esis,
             needed,
             cap_reached,
             decoded: None,
+            seen_bitmap,
         };
 
         // Attempt a fountain decode every time we added at least one packet
@@ -407,6 +414,22 @@ impl SessionStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+/// Pack the K-bit "source ESI seen" bitmap from the session's seen set.
+fn build_seen_bitmap(seen: &HashSet<u32>, k: u32) -> Vec<u8> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let bytes = ((k + 7) / 8) as usize;
+    let mut out = vec![0u8; bytes];
+    for &esi in seen {
+        if esi < k {
+            let i = esi as usize;
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
 }
 
 /// Map a MIME byte to a file extension for the decoded file.

@@ -662,8 +662,47 @@ function resetRxVisuals() {
   lastConstellation = [];
   const text = document.getElementById("v2-progress-text");
   if (text) text.textContent = "—";
+  hideFountainStatus();
   drawProgressBlocks();
   drawConstellation();
+}
+
+function hideFountainStatus() {
+  fountainState = { sessionId: null, received: 0, needed: 0, decoded: false, capReached: false };
+  const el = document.getElementById("rx-fountain-status");
+  if (el) el.hidden = true;
+}
+
+let fountainState = { sessionId: null, received: 0, needed: 0, decoded: false, capReached: false };
+
+function updateFountainStatus(partial) {
+  // Merge : null/undefined fields in `partial` leave the previous value in
+  // place. This matters for session_decoded (which may not re-send
+  // received / needed) and peek-re-announce paths.
+  const next = { ...fountainState };
+  for (const [k, v] of Object.entries(partial)) {
+    if (v !== null && v !== undefined) next[k] = v;
+  }
+  fountainState = next;
+  const el = document.getElementById("rx-fountain-status");
+  const counter = document.getElementById("rx-fountain-counter");
+  const pct = document.getElementById("rx-fountain-pct");
+  const sess = document.getElementById("rx-fountain-session");
+  if (!el || !counter || !pct || !sess) return;
+  el.hidden = false;
+  const k = next.needed || 0;
+  const r = next.received || 0;
+  counter.textContent = `${r} / ${k} blocs`;
+  const pctVal = k > 0 ? Math.min(100, Math.round((r * 100) / k)) : 0;
+  pct.textContent = next.decoded
+    ? "décodé ✓"
+    : next.capReached
+    ? `${pctVal} % (canal saturé)`
+    : `${pctVal} %`;
+  if (next.sessionId != null) {
+    sess.textContent = `session ${next.sessionId.toString(16).padStart(8, "0")}`;
+  }
+  el.dataset.decoded = next.decoded ? "true" : "false";
 }
 
 function updateV2Progress(payload) {
@@ -840,6 +879,13 @@ function wireEvents() {
       cap_reached: false,
       created_at: Math.floor(Date.now() / 1000),
     });
+    updateFountainStatus({
+      sessionId: p.session_id,
+      received: 0,
+      needed: p.k,
+      decoded: false,
+      capReached: false,
+    });
     logEvent("session_armed", p);
   });
   listen("session_progress", (event) => {
@@ -851,6 +897,13 @@ function wireEvents() {
       decoded: !!p.decoded,
       cap_reached: !!p.cap_reached,
     });
+    updateFountainStatus({
+      sessionId: p.session_id,
+      received: p.received,
+      needed: p.needed,
+      decoded: !!p.decoded,
+      capReached: !!p.cap_reached,
+    });
   });
   listen("session_decoded", (event) => {
     const p = event.payload || {};
@@ -859,6 +912,13 @@ function wireEvents() {
       decoded: true,
       filename: p.filename,
       callsign: p.callsign,
+    });
+    updateFountainStatus({
+      sessionId: p.session_id,
+      received: null,
+      needed: null,
+      decoded: true,
+      capReached: false,
     });
     logEvent("session_decoded", p);
   });
