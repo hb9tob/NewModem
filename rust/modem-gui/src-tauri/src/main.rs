@@ -297,6 +297,25 @@ fn tx_more(
 }
 
 #[tauri::command]
+fn list_sessions(state: State<'_, AppState>) -> Result<Vec<session_store::SessionMeta>, String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let store = session_store::SessionStore::new(&save_dir).map_err(|e| e.to_string())?;
+    Ok(store.list_all())
+}
+
+#[tauri::command]
+fn delete_session(session_id: u32, state: State<'_, AppState>) -> Result<(), String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let dir = save_dir
+        .join("sessions")
+        .join(format!("{session_id:08x}.session"));
+    if !dir.exists() {
+        return Err(format!("session {session_id:08x} absente"));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("rm {}: {e}", dir.display()))
+}
+
+#[tauri::command]
 fn tx_stop(state: State<'_, AppState>) -> Result<(), String> {
     let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
     if let Some(h) = tx_guard.take() {
@@ -405,6 +424,8 @@ fn main() {
             tx_more,
             tx_stop,
             tx_reset,
+            list_sessions,
+            delete_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -808,3 +808,112 @@ main {
   font-family: ui-monospace, monospace;
   pointer-events: none;
 }
+
+/* ─── Sessions tab ─── */
+.sessions-layout {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sessions-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.sessions-toolbar button {
+  padding: 4px 10px;
+}
+.sessions-count {
+  color: #888;
+  font-size: 0.85rem;
+}
+.sessions-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+}
+.sessions-table th,
+.sessions-table td {
+  border: 1px solid #3a3a3a;
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: middle;
+}
+.sessions-table th {
+  background: #2a2a2a;
+  color: #ddd;
+  font-weight: normal;
+}
+.sessions-table td.session-id {
+  font-family: ui-monospace, monospace;
+  color: #9fd0ff;
+}
+.sessions-table td.progress-cell {
+  min-width: 140px;
+}
+.progress-bar-bg {
+  display: inline-block;
+  width: 120px;
+  height: 10px;
+  background: #1a1a1a;
+  border: 1px solid #3a3a3a;
+  vertical-align: middle;
+  position: relative;
+}
+.progress-bar-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: #4a9fc7;
+}
+.progress-bar-fill.done {
+  background: #5fbf3f;
+}
+.progress-bar-fill.cap-warn {
+  background: #d1a04a;
+}
+.progress-bar-fill.cap-reached {
+  background: #d15f5f;
+}
+.status-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 2px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.status-chip.waiting { background: #3a3a3a; color: #ccc; }
+.status-chip.done { background: #2f5f2f; color: #c7ffc7; }
+.status-chip.cap-warn { background: #5f4a2a; color: #ffdca0; }
+.status-chip.cap-reached { background: #5f2a2a; color: #ffb0b0; }
+.sessions-empty {
+  color: #888;
+  text-align: center;
+  padding: 18px;
+  font-style: italic;
+}
+.sessions-hint {
+  color: #888;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+.sessions-hint code {
+  background: #1a1a1a;
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: #c0c0c0;
+}
+.btn-session-delete {
+  background: transparent;
+  border: 1px solid #6a2a2a;
+  color: #d88;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.btn-session-delete:hover {
+  background: #3a1a1a;
+}

@@ -24,6 +24,7 @@
   <nav class="tab-bar">
     <button class="tab active" data-tab="rx">RX</button>
     <button class="tab" data-tab="tx">TX</button>
+    <button class="tab" data-tab="sessions">Sessions</button>
     <button class="tab" data-tab="settings">Paramètres</button>
     <button class="tab" data-tab="info">Info</button>
   </nav>
@@ -133,6 +134,34 @@
           </select>
         </fieldset>
         <div class="settings-status" id="settings-status">—</div>
+      </div>
+    </section>
+    <section id="tab-sessions" class="tab-panel sessions-layout">
+      <div class="sessions-toolbar">
+        <button id="btn-sessions-refresh">Actualiser</button>
+        <span id="sessions-count" class="sessions-count">0 session</span>
+      </div>
+      <table class="sessions-table">
+        <thead>
+          <tr>
+            <th>Session</th>
+            <th>De</th>
+            <th>Fichier</th>
+            <th>Profil</th>
+            <th>Reçus / K</th>
+            <th>Progression</th>
+            <th>Statut</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="sessions-tbody">
+          <tr><td colspan="8" class="sessions-empty">Aucune session.</td></tr>
+        </tbody>
+      </table>
+      <div class="sessions-hint">
+        Les sessions sont conservées 24 h. Chaque dossier <code>&lt;save_dir&gt;/sessions/&lt;id&gt;.session/</code>
+        contient <code>meta.json</code>, <code>packets.blob</code> et <code>decoded.&lt;ext&gt;</code> si
+        le décodage a abouti.
       </div>
     </section>
     <section id="tab-info" class="tab-panel">

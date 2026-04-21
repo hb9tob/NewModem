@@ -50,10 +50,130 @@ function setupTabs() {
       const target = btn.dataset.tab;
       for (const b of tabs) b.classList.toggle("active", b === btn);
       for (const p of panels) p.classList.toggle("active", p.id === `tab-${target}`);
-      // Force canvas repaint when switching to RX (canvas sizes with CSS).
       if (target === "rx") redrawAll();
+      if (target === "sessions") refreshSessions();
     });
   }
+}
+
+// ────────────────────────────────────────── Sessions tab (RaptorQ)
+// Registry keyed by session_id (hex u32) — merged from :
+//  - backend list_sessions command on load / refresh / tab click
+//  - real-time session_armed / session_progress / session_decoded events
+const sessionRegistry = new Map();
+
+async function refreshSessions() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    const list = await invoke("list_sessions");
+    sessionRegistry.clear();
+    for (const meta of list) {
+      // The backend doesn't track "received / needed" in meta.json (that
+      // requires scanning the blob) — initialise from what we know, and let
+      // the next session_progress event fill in the live numbers.
+      sessionRegistry.set(meta.session_id, {
+        ...meta,
+        received: meta.decoded ? meta.k_symbols : 0,
+        cap_reached: false,
+      });
+    }
+    renderSessionsTable();
+  } catch (err) {
+    logEvent("sessions_refresh_error", { message: String(err) });
+  }
+}
+
+function upsertSession(partial) {
+  const id = partial.session_id;
+  const prev = sessionRegistry.get(id) || {};
+  sessionRegistry.set(id, { ...prev, ...partial });
+  renderSessionsTable();
+}
+
+function renderSessionsTable() {
+  const tbody = document.getElementById("sessions-tbody");
+  const countEl = document.getElementById("sessions-count");
+  if (!tbody) return;
+  const entries = Array.from(sessionRegistry.values()).sort(
+    (a, b) => (b.created_at || 0) - (a.created_at || 0)
+  );
+  countEl.textContent =
+    entries.length === 0 ? "0 session" : `${entries.length} session${entries.length > 1 ? "s" : ""}`;
+  if (entries.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="8" class="sessions-empty">Aucune session.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = entries.map(renderSessionRow).join("");
+  // Wire delete buttons (fresh nodes each render).
+  for (const btn of tbody.querySelectorAll(".btn-session-delete")) {
+    btn.addEventListener("click", async (ev) => {
+      const id = parseInt(ev.currentTarget.dataset.sid, 10);
+      if (!Number.isFinite(id)) return;
+      if (!confirm(`Supprimer la session ${id.toString(16).padStart(8, "0")} ?`)) {
+        return;
+      }
+      try {
+        const { invoke } = window.__TAURI__.core;
+        await invoke("delete_session", { sessionId: id });
+        sessionRegistry.delete(id);
+        renderSessionsTable();
+      } catch (err) {
+        logEvent("delete_session_error", { message: String(err) });
+      }
+    });
+  }
+}
+
+function renderSessionRow(s) {
+  const idHex = s.session_id.toString(16).padStart(8, "0");
+  const k = s.k_symbols || 0;
+  const received = s.received || 0;
+  const pct = k > 0 ? Math.min(100, Math.round((received * 100) / k)) : 0;
+  const ratio = k > 0 ? received / k : 0;
+  let fillClass = "";
+  let statusClass = "waiting";
+  let statusText = "attente";
+  if (s.decoded) {
+    fillClass = " done";
+    statusClass = "done";
+    statusText = "décodé";
+  } else if (s.cap_reached) {
+    fillClass = " cap-reached";
+    statusClass = "cap-reached";
+    statusText = "cap 3× atteint";
+  } else if (ratio >= 2.0) {
+    fillClass = " cap-warn";
+    statusClass = "cap-warn";
+    statusText = "canal dégradé";
+  }
+  const filename = s.filename || "—";
+  const callsign = s.callsign || "—";
+  const profile = s.profile || "—";
+  const widthPct = Math.min(100, (received * 100) / Math.max(k, 1));
+  return `
+    <tr>
+      <td class="session-id">${idHex}</td>
+      <td>${escapeHtml(callsign)}</td>
+      <td>${escapeHtml(filename)}</td>
+      <td>${escapeHtml(profile)}</td>
+      <td>${received} / ${k}</td>
+      <td class="progress-cell">
+        <span class="progress-bar-bg"><span class="progress-bar-fill${fillClass}" style="width:${widthPct}%"></span></span>
+        <span style="margin-left:8px;color:#888">${pct}%</span>
+      </td>
+      <td><span class="status-chip ${statusClass}">${statusText}</span></td>
+      <td><button class="btn-session-delete" data-sid="${s.session_id}" title="Supprimer le dossier session">✕</button></td>
+    </tr>`;
+}
+
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 // ───────────────────────────────────────────────────── Received-file panel
@@ -705,6 +825,42 @@ function wireEvents() {
       blocks_expected: p.blocks_expected,
       sigma2: p.sigma2,
     });
+  });
+  listen("session_armed", (event) => {
+    const p = event.payload || {};
+    upsertSession({
+      session_id: p.session_id,
+      k_symbols: p.k,
+      t_bytes: p.t,
+      file_size: p.file_size,
+      mime_type: p.mime_type,
+      profile: p.profile,
+      received: 0,
+      decoded: false,
+      cap_reached: false,
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    logEvent("session_armed", p);
+  });
+  listen("session_progress", (event) => {
+    const p = event.payload || {};
+    upsertSession({
+      session_id: p.session_id,
+      received: p.received,
+      k_symbols: p.needed,
+      decoded: !!p.decoded,
+      cap_reached: !!p.cap_reached,
+    });
+  });
+  listen("session_decoded", (event) => {
+    const p = event.payload || {};
+    upsertSession({
+      session_id: p.session_id,
+      decoded: true,
+      filename: p.filename,
+      callsign: p.callsign,
+    });
+    logEvent("session_decoded", p);
   });
 }
 
@@ -1377,7 +1533,11 @@ async function init() {
   document.getElementById("btn-stop").addEventListener("click", stopCapture);
   document.getElementById("btn-raw").addEventListener("click", toggleRawRecording);
   window.addEventListener("resize", redrawAll);
+  document
+    .getElementById("btn-sessions-refresh")
+    ?.addEventListener("click", refreshSessions);
   await refreshRawRecordingState();
+  await refreshSessions();
   resetRxVisuals();
   // #HB9TOB: tick périodique pour effacer le chip OVD si aucun batch overdrive
   // n'est arrivé depuis OVD_STICKY_MS (utile aussi quand la capture est arrêtée).
