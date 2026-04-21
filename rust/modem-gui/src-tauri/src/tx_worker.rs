@@ -123,20 +123,22 @@ pub fn estimate_total_blocks(
     Ok(wire.div_ceil(k_bytes) as u32)
 }
 
-/// Retrouve le binaire modem-cli à côté du binaire GUI courant. Même dir
-/// que le .exe Tauri en dev comme en release (siblings du même workspace
-/// cargo). Retourne None si introuvable.
+/// Retrouve le binaire modem-cli à côté du GUI. Priorité :
+///   1. `nbfm-modem-<TARGET_TRIPLE>[.exe]` — nom produit par le sidecar
+///      Tauri (`externalBin`), installé dans `/usr/bin/` par le .deb.
+///   2. `nbfm-modem[.exe]` — nom brut (dev workspace `target/release/`).
 fn locate_cli_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let name = if cfg!(windows) {
-        "nbfm-modem.exe"
-    } else {
-        "nbfm-modem"
-    };
-    let candidate = dir.join(name);
-    if candidate.exists() {
-        return Some(candidate);
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let triple = env!("TARGET_TRIPLE");
+    let sidecar = dir.join(format!("nbfm-modem-{triple}{ext}"));
+    if sidecar.exists() {
+        return Some(sidecar);
+    }
+    let bare = dir.join(format!("nbfm-modem{ext}"));
+    if bare.exists() {
+        return Some(bare);
     }
     None
 }

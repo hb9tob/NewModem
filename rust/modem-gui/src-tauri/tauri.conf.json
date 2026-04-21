@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "identifier": "org.hb9tob.nbfm-modem-gui",
   "build": {
-    "frontendDist": "../src"
+    "frontendDist": "../src",
+    "beforeBuildCommand": "cargo build --release -p modem-cli"
   },
   "app": {
     "withGlobalTauri": true,
@@ -28,6 +29,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "appimage", "nsis"],
+    "externalBin": ["binaries/nbfm-modem"],
     "category": "Utility",
     "shortDescription": "NBFM modem audio receiver",
     "longDescription": "GUI receiver for NBFM audio modem (amateur radio image transmission).",
