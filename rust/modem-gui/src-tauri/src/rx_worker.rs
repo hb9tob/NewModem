@@ -24,14 +24,13 @@
 //! stop/start du worker.
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use modem_core::app_header::AppHeader;
 use modem_core::header::Header;
 use modem_core::payload_envelope::PayloadEnvelope;
 use modem_core::profile::{ModemConfig, ProfileIndex};
-use modem_core::rx_v2::{self, RxV2Result};
+use modem_core::rx_v2;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+use crate::session_store::{self, SessionStore};
 
 type WavFileWriter = WavWriter<BufWriter<std::fs::File>>;
 
@@ -154,6 +155,36 @@ struct FileCompletePayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct SessionArmedPayload {
+    session_id: u32,
+    k: u32,
+    t: u8,
+    file_size: u32,
+    mime_type: u8,
+    profile: String,
+    session_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionProgressPayload {
+    session_id: u32,
+    received: u32,
+    needed: u32,
+    decoded: bool,
+    cap_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDecodedPayload {
+    session_id: u32,
+    session_dir: String,
+    decoded_path: String,
+    size: u32,
+    filename: Option<String>,
+    callsign: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ErrorPayload {
     message: String,
 }
@@ -215,20 +246,16 @@ pub fn spawn(
 /// per-batch overhead and bound the scan/tick frequency.
 const BATCH_TARGET_SAMPLES: usize = 24_000;
 
-/// Re-scan `find_all_preambles` at most every this many milliseconds.
+/// Re-scan `find_all_preambles` + route to store at most every this many ms.
 const SCAN_INTERVAL_MS: u64 = 1000;
 
-/// Light tick cadence (rx_v2 on the open trailing window) in milliseconds.
-const LIGHT_TICK_INTERVAL_MS: u64 = 1000;
-
-/// RMS threshold below which the channel is considered silent.
+/// RMS threshold below which we consider the channel silent (updates the
+/// last_audio_above_silence_at heuristic, informational only now that the
+/// session doesn't "close" on silence).
 const SILENCE_RMS_THRESHOLD: f32 = 0.005;
 
-/// Continuous silence duration required to trigger a session-end finalise.
-const SILENCE_TRIGGER_MS: u64 = 2000;
-
-/// Hard cap on session length to avoid unbounded CPU / memory growth when
-/// a squelch never closes cleanly.
+/// Trim the in-memory audio buffer after this many seconds of active
+/// session — the disk store is unaffected and retains all packets.
 const MAX_SESSION_SECONDS: u64 = 25 * 60;
 
 // ---------------------------------------------------------------------------
@@ -238,91 +265,51 @@ const MAX_SESSION_SECONDS: u64 = 25 * 60;
 struct WorkerState {
     config: ModemConfig,
     profile: ProfileIndex,
-    /// Accumulated audio since the first preamble we saw. Cleared on
-    /// session reset.
+    /// Accumulated audio for the current capture. Grown per batch ; trimmed
+    /// to ~2 s of pre-roll while idle so the buffer doesn't explode on pure
+    /// noise. Crossed captures are isolated (the store persists between
+    /// captures, the audio buffer doesn't).
     session_buffer: Vec<f32>,
-    /// Positions (in session_buffer, in samples) of preambles we have
-    /// already *finalised* — their window [P_i - margin .. P_{i+1} + margin]
-    /// was fully available and rx_v2 has been called once.
-    finalised_positions: HashSet<usize>,
-    /// Merged codewords keyed by ESI (first-wins policy).
-    accumulated: HashMap<u32, Vec<u8>>,
-    /// First decoded protocol header / app header. Kept for the whole session.
+    /// Disk-persistent store of decoded codewords, per session_id.
+    store: SessionStore,
+    /// session_ids already announced to the UI (emit `session_armed` once).
+    announced_sessions: HashSet<u32>,
+    /// Last `received` count emitted per session, for progress rate-limiting.
+    last_progress: std::collections::HashMap<u32, u32>,
+    /// First decoded protocol header, for legacy `header` event emission.
     header: Option<Header>,
-    app_header: Option<AppHeader>,
-    /// Last full list of preamble positions from the most recent scan.
-    last_positions: Vec<usize>,
-    /// Last provisional RxV2Result on the open trailing window — used to
-    /// derive `v2_progress` events between full-window finalisations.
-    last_light_result: Option<RxV2Result>,
-    /// Last-emitted `v2_progress.blocks_converged` value, for rate-limiting.
-    last_emitted_converged: usize,
     last_scan_at: Instant,
-    last_light_tick_at: Instant,
-    /// Last time audio RMS exceeded SILENCE_RMS_THRESHOLD. Used for the
-    /// silence-duration trigger.
     last_audio_above_silence_at: Instant,
-    /// True once we've seen at least one preamble — session is "active" and
-    /// the silence trigger is armed.
+    /// True once we've seen any signal — controls whether the max-duration
+    /// guard fires.
     session_active: bool,
     session_started_at: Instant,
-    /// True once file_complete has been emitted and the file saved, so we
-    /// don't save twice within one session.
-    file_saved: bool,
     total_samples: u64,
 }
 
 impl WorkerState {
-    fn new(profile: ProfileIndex) -> Self {
+    fn new(profile: ProfileIndex, store: SessionStore) -> Self {
         let now = Instant::now();
         Self {
             config: profile.to_config(),
             profile,
             session_buffer: Vec::new(),
-            finalised_positions: HashSet::new(),
-            accumulated: HashMap::new(),
+            store,
+            announced_sessions: HashSet::new(),
+            last_progress: std::collections::HashMap::new(),
             header: None,
-            app_header: None,
-            last_positions: Vec::new(),
-            last_light_result: None,
-            last_emitted_converged: 0,
             last_scan_at: now,
-            last_light_tick_at: now,
             last_audio_above_silence_at: now,
             session_active: false,
             session_started_at: now,
-            file_saved: false,
             total_samples: 0,
         }
     }
 
-    fn reset(&mut self) {
+    fn soft_reset_buffer(&mut self) {
         self.session_buffer.clear();
-        self.finalised_positions.clear();
-        self.accumulated.clear();
         self.header = None;
-        self.app_header = None;
-        self.last_positions.clear();
-        self.last_light_result = None;
-        self.last_emitted_converged = 0;
         self.session_active = false;
-        self.file_saved = false;
-    }
-
-    /// Total unique data codewords converged so far (approximation : we trust
-    /// that any byte sequence stored in `accumulated` is a converged codeword).
-    fn progress_converged(&self) -> usize {
-        self.accumulated.len()
-    }
-
-    fn progress_expected(&self) -> usize {
-        self.app_header
-            .as_ref()
-            .map(|ah| {
-                let k_bytes = ah.t_bytes.max(1) as usize;
-                ((ah.file_size as usize) + k_bytes - 1) / k_bytes
-            })
-            .unwrap_or(0)
     }
 }
 
@@ -341,7 +328,17 @@ fn run_worker(
     let _ = std::fs::remove_file(log_path());
     worker_log(&format!("[worker] start V3 profile={:?}", profile));
 
-    let mut state = WorkerState::new(profile);
+    // Initialise the disk-persistent session store. Expired sessions (> 24 h)
+    // are dropped on construction.
+    let sessions_root = save_dir.lock().map(|g| g.clone()).unwrap_or_default();
+    let store = match SessionStore::new(&sessions_root) {
+        Ok(s) => s,
+        Err(e) => {
+            worker_log(&format!("[worker] session store init failed: {e}"));
+            return;
+        }
+    };
+    let mut state = WorkerState::new(profile, store);
 
     while !stop.load(Ordering::Relaxed) {
         let first = match samples.recv_timeout(Duration::from_millis(200)) {
@@ -429,10 +426,9 @@ fn compute_audio_stats(batch: &[f32]) -> (f32, f32, f32) {
 }
 
 /// Runs periodically on every batch AND on idle timeouts. Handles :
-///  - find_all_preambles scan (throttled to SCAN_INTERVAL_MS)
-///  - main loop : finalise newly-closed windows via rx_v2
-///  - light tick (throttled to LIGHT_TICK_INTERVAL_MS)
-///  - silence trigger → session finalise
+///  - find_all_preambles + rx_v3 scan (throttled to SCAN_INTERVAL_MS)
+///  - routes decoded packets to the disk-persistent session store
+///  - max-duration guard on the in-memory audio buffer
 fn maintenance_tick(
     app: &AppHandle,
     save_dir: &Arc<Mutex<PathBuf>>,
@@ -440,73 +436,43 @@ fn maintenance_tick(
 ) {
     let now = Instant::now();
 
-    // --- 1. Preamble scan + close windows ---
     if now.duration_since(state.last_scan_at) >= Duration::from_millis(SCAN_INTERVAL_MS) {
         state.last_scan_at = now;
-        scan_and_finalise(app, state);
+        scan_and_route(app, save_dir, state);
     }
 
-    // --- 2. Light tick on the open trailing window ---
-    if state.session_active
-        && now.duration_since(state.last_light_tick_at)
-            >= Duration::from_millis(LIGHT_TICK_INTERVAL_MS)
-    {
-        state.last_light_tick_at = now;
-        light_tick(app, state);
-    }
-
-    // --- 3. Silence / max-duration → session end ---
+    // Buffer-length guard : if a session has been "active" (signal was seen)
+    // for more than MAX_SESSION_SECONDS without the user stopping, trim the
+    // audio buffer to avoid unbounded growth. The disk store is unaffected
+    // and keeps its packets.
     if state.session_active {
-        let silent_for = now.duration_since(state.last_audio_above_silence_at);
-        let max_session_reached = now
-            .duration_since(state.session_started_at)
-            >= Duration::from_secs(MAX_SESSION_SECONDS);
-        if silent_for >= Duration::from_millis(SILENCE_TRIGGER_MS) || max_session_reached {
-            worker_log(&format!(
-                "[worker] session end (silence={:?} max={})",
-                silent_for, max_session_reached
-            ));
-            finalise_session(app, save_dir, state);
+        let active_for = now.duration_since(state.session_started_at);
+        if active_for >= Duration::from_secs(MAX_SESSION_SECONDS) {
+            worker_log("[worker] audio buffer max duration reached, trimming");
+            state.soft_reset_buffer();
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Main decoding path : scan preambles + finalise closed windows
+// Main decoding path : rx_v3 scan → route decoded CWs to SessionStore
 // ---------------------------------------------------------------------------
 
-fn scan_and_finalise(app: &AppHandle, state: &mut WorkerState) {
+fn scan_and_route(
+    app: &AppHandle,
+    save_dir: &Arc<Mutex<PathBuf>>,
+    state: &mut WorkerState,
+) {
     let config = state.config.clone();
-
-    // Run a full rx_v3 scan on the whole session buffer to get preamble
-    // positions + fresh cw_bytes_map. rx_v3 re-decodes every window every
-    // time, which is overkill ; we still leverage it to keep this code
-    // simple and to guarantee parity with the CLI path. Dedup of window
-    // work happens implicitly because first-wins keeps the earliest bytes
-    // we already stored for each ESI.
     let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
         return;
     };
 
-    // Did we see at least one preamble ? If yes, the session becomes active.
-    // We track positions via last_light_result-style heuristics : the number
-    // of new distinct preambles between two scans tells us how many fresh
-    // events to emit.
-    let new_positions_count = estimate_preamble_count(&result);
-    if !state.session_active && new_positions_count > 0 {
+    // First signal → session_active : enables the max-duration guard.
+    if !state.session_active && (result.app_header.is_some() || !result.cw_bytes_map.is_empty()) {
         state.session_active = true;
         state.session_started_at = Instant::now();
         state.last_audio_above_silence_at = Instant::now();
-    }
-    if new_positions_count == 0 {
-        return;
-    }
-
-    // Emit a preamble event the first time we see any preamble at all, and
-    // again whenever the count increases (new cycle appeared).
-    let prev_count = state.last_positions.len();
-    state.last_positions.resize(new_positions_count, 0);
-    if new_positions_count > prev_count {
         let _ = app.emit(
             "preamble",
             PreamblePayload {
@@ -517,16 +483,7 @@ fn scan_and_finalise(app: &AppHandle, state: &mut WorkerState) {
         );
     }
 
-    // Merge results into the accumulator with first-wins semantics.
-    let mut new_data_blocks: usize = 0;
-    for (esi, bytes) in result.cw_bytes_map.iter() {
-        if !state.accumulated.contains_key(esi) {
-            state.accumulated.insert(*esi, bytes.clone());
-            new_data_blocks += 1;
-        }
-    }
-
-    // Capture header / app_header first time we see them.
+    // Legacy protocol header event (once per session).
     if state.header.is_none() {
         if let Some(h) = result.header.clone() {
             let _ = app.emit(
@@ -540,222 +497,156 @@ fn scan_and_finalise(app: &AppHandle, state: &mut WorkerState) {
             state.header = Some(h);
         }
     }
-    if state.app_header.is_none() {
-        if let Some(ah) = result.app_header.clone() {
-            let _ = app.emit(
-                "app_header",
-                AppHeaderPayload {
-                    session_id: ah.session_id,
-                    file_size: ah.file_size,
-                    mime_type: ah.mime_type,
-                    hash_short: ah.hash_short,
-                },
-            );
-            // Try to extract envelope as soon as we have the app_header
-            // (envelope filename/callsign lives in the data payload itself).
-            state.app_header = Some(ah);
-        }
-    }
 
-    // Emit a progress update if something meaningful changed.
-    if new_data_blocks > 0 {
-        emit_progress(app, state, &result);
-    }
-}
-
-/// Best-effort estimate of the number of preambles rx_v3 observed, derived
-/// from its result. We don't have direct access to the `positions` vec, but
-/// (total_blocks / cw_per_window) ≈ number of windows ; that's close enough
-/// for our "did the count change" heuristic.
-fn estimate_preamble_count(result: &RxV2Result) -> usize {
-    if result.segments_decoded + result.segments_lost == 0 {
-        return 0;
-    }
-    // Either the result has an AppHeader (at least one preamble locked and
-    // decoded the meta) or segments_decoded > 0 (at least one preamble's
-    // marker walk produced something). Both imply ≥ 1 preamble.
-    // For more precise counting we'd need rx_v3 to return positions ; for
-    // now we approximate by counting meta-like markers (segments_decoded
-    // per window ≈ 6-11).
-    1 + (result.segments_decoded / 11).max(0)
-}
-
-// ---------------------------------------------------------------------------
-// Light tick : rx_v2 on the open trailing window for provisional progress
-// ---------------------------------------------------------------------------
-
-fn light_tick(_app: &AppHandle, state: &mut WorkerState) {
-    // The light tick is already covered by scan_and_finalise above because
-    // rx_v3 redecodes the whole buffer (including the trailing open window)
-    // on every call. We keep a hook here for future optimisation where the
-    // main scan becomes incremental and only the trailing window is
-    // redecoded between scans.
-    let _ = state;
-}
-
-// ---------------------------------------------------------------------------
-// Session finalisation (silence / max-duration)
-// ---------------------------------------------------------------------------
-
-fn finalise_session(
-    app: &AppHandle,
-    save_dir: &Arc<Mutex<PathBuf>>,
-    state: &mut WorkerState,
-) {
-    // Last full decode on whatever we have accumulated.
-    let config = state.config.clone();
-    let final_result = rx_v2::rx_v3(&state.session_buffer, &config);
-
-    // Merge anything we may have missed on the last open window.
-    if let Some(ref r) = final_result {
-        for (esi, bytes) in r.cw_bytes_map.iter() {
-            state.accumulated.entry(*esi).or_insert_with(|| bytes.clone());
-        }
-        if state.header.is_none() {
-            state.header = r.header.clone();
-        }
-        if state.app_header.is_none() {
-            state.app_header = r.app_header.clone();
-        }
-    }
-
-    // Assemble payload from the accumulator using app_header.file_size for
-    // truncation, exactly like rx_v2::rx_v3 would.
-    let assembled = assemble_payload(state);
-    let sigma2 = final_result.as_ref().map(|r| r.sigma2).unwrap_or(1.0);
-
-    if assembled.is_empty() || state.file_saved {
-        // Nothing to save : reset and emit session_end anyway.
-        let _ = app.emit("session_end", ());
-        state.reset();
+    // Without an AppHeader we can't know which session the packets belong to.
+    let Some(ref ah) = result.app_header else {
         return;
-    }
+    };
 
-    let envelope = PayloadEnvelope::decode_or_fallback(&assembled);
-    let mime = state.app_header.as_ref().map(|ah| ah.mime_type).unwrap_or(0);
-    let (filename, callsign, content) = if envelope.version == 0 {
-        (
-            format!(
-                "decoded_{}.bin",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            ),
-            String::new(),
-            assembled.clone(),
-        )
-    } else {
+    // Announce the session once per session_id seen.
+    let is_new_session = !state.announced_sessions.contains(&ah.session_id);
+    if is_new_session {
+        state.announced_sessions.insert(ah.session_id);
+        let session_dir = state
+            .store
+            .root()
+            .join(format!("{:08x}.session", ah.session_id));
         let _ = app.emit(
-            "envelope",
-            EnvelopePayload {
-                filename: envelope.filename.clone(),
-                callsign: envelope.callsign.clone(),
+            "session_armed",
+            SessionArmedPayload {
+                session_id: ah.session_id,
+                k: ah.k_symbols as u32,
+                t: ah.t_bytes,
+                file_size: ah.file_size,
+                mime_type: ah.mime_type,
+                profile: profile_name(state.profile),
+                session_dir: session_dir.to_string_lossy().into_owned(),
             },
         );
-        (envelope.filename.clone(), envelope.callsign.clone(), envelope.content.clone())
-    };
-
-    let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
-    match save_file(&dir, &filename, &content) {
-        Ok(path) => {
-            state.file_saved = true;
-            let _ = app.emit(
-                "file_complete",
-                FileCompletePayload {
-                    filename,
-                    callsign,
-                    mime_type: mime,
-                    saved_path: path.to_string_lossy().into_owned(),
-                    sigma2,
-                    size: content.len(),
-                },
-            );
-        }
-        Err(e) => {
-            let _ = app.emit(
-                "error",
-                ErrorPayload {
-                    message: format!("save failed: {e}"),
-                },
-            );
-        }
+        // Also fire the legacy app_header event so existing UI keeps working.
+        let _ = app.emit(
+            "app_header",
+            AppHeaderPayload {
+                session_id: ah.session_id,
+                file_size: ah.file_size,
+                mime_type: ah.mime_type,
+                hash_short: ah.hash_short,
+            },
+        );
     }
 
-    let _ = app.emit("session_end", ());
-    state.reset();
-}
+    // Route the packets to the disk store.
+    let outcome = state
+        .store
+        .accept_packets(ah, state.profile, &result.cw_bytes_map);
 
-fn assemble_payload(state: &WorkerState) -> Vec<u8> {
-    let Some(ref ah) = state.app_header else {
-        let mut esis: Vec<u32> = state.accumulated.keys().cloned().collect();
-        esis.sort();
-        let mut out = Vec::new();
-        for esi in esis {
-            if let Some(bytes) = state.accumulated.get(&esi) {
-                out.extend_from_slice(bytes);
+    // Rate-limit : emit session_progress only when the received count
+    // actually moves or the decoded flag changes.
+    let last = state.last_progress.get(&ah.session_id).copied().unwrap_or(u32::MAX);
+    if outcome.unique_esis != last || outcome.decoded.is_some() {
+        state.last_progress.insert(ah.session_id, outcome.unique_esis);
+        let _ = app.emit(
+            "session_progress",
+            SessionProgressPayload {
+                session_id: ah.session_id,
+                received: outcome.unique_esis,
+                needed: outcome.needed,
+                decoded: outcome.decoded.is_some(),
+                cap_reached: outcome.cap_reached,
+            },
+        );
+        // Legacy v2_progress for existing UI (bitmap of received ESIs).
+        let sigma2 = result.sigma2;
+        let expected = outcome.needed as usize;
+        let bitmap = if expected > 0 {
+            let mut bits = vec![0u8; (expected + 7) / 8];
+            for &esi in result.cw_bytes_map.keys() {
+                let i = esi as usize;
+                if i < expected {
+                    bits[i / 8] |= 1 << (i % 8);
+                }
             }
-        }
-        return out;
-    };
-    // RaptorQ fountain decode — needs K source-equivalent packets.
-    if let Some(payload) =
-        modem_core::raptorq_codec::try_decode(&state.accumulated, ah.file_size, ah.t_bytes as u16)
-    {
-        return payload;
-    }
-    // Fallback : zero-padded ESI concatenation (partial file, better than nothing).
-    let k_bytes = ah.t_bytes.max(1) as usize;
-    let n_source_cw = ((ah.file_size as usize) + k_bytes - 1) / k_bytes;
-    let mut out: Vec<u8> = Vec::with_capacity(ah.file_size as usize);
-    for esi in 0..n_source_cw as u32 {
-        if let Some(bytes) = state.accumulated.get(&esi) {
-            out.extend_from_slice(bytes);
+            bits
         } else {
-            out.extend(std::iter::repeat(0u8).take(k_bytes));
+            Vec::new()
+        };
+        let _ = app.emit(
+            "v2_progress",
+            V2ProgressPayload {
+                blocks_converged: outcome.unique_esis as usize,
+                blocks_total: result.total_blocks,
+                blocks_expected: expected,
+                sigma2,
+                converged_bitmap: bitmap,
+                constellation_sample: Vec::new(),
+            },
+        );
+    }
+
+    // A freshly-decoded file : emit session_decoded, copy to save_dir root
+    // under the envelope filename, and emit the legacy file_complete event.
+    if let Some(df) = outcome.decoded {
+        if let Some(fname) = df.meta.filename.clone() {
+            let _ = app.emit(
+                "envelope",
+                EnvelopePayload {
+                    filename: fname.clone(),
+                    callsign: df.meta.callsign.clone().unwrap_or_default(),
+                },
+            );
         }
-    }
-    out.truncate(ah.file_size as usize);
-    out
-}
+        let _ = app.emit(
+            "session_decoded",
+            SessionDecodedPayload {
+                session_id: df.session_id,
+                session_dir: df.session_dir.to_string_lossy().into_owned(),
+                decoded_path: df.decoded_path.to_string_lossy().into_owned(),
+                size: df.payload.len() as u32,
+                filename: df.meta.filename.clone(),
+                callsign: df.meta.callsign.clone(),
+            },
+        );
 
-// ---------------------------------------------------------------------------
-// Progress emission helpers
-// ---------------------------------------------------------------------------
-
-fn emit_progress(app: &AppHandle, state: &mut WorkerState, result: &RxV2Result) {
-    let converged = state.progress_converged();
-    // Rate-limit : only emit if the count actually moved.
-    if converged == state.last_emitted_converged {
-        return;
-    }
-    state.last_emitted_converged = converged;
-
-    let expected = state.progress_expected();
-    let bitmap = if expected > 0 {
-        let mut bits = vec![0u8; (expected + 7) / 8];
-        for esi in state.accumulated.keys() {
-            let i = *esi as usize;
-            if i < expected {
-                bits[i / 8] |= 1 << (i % 8);
+        // Also copy the decoded content to the root save_dir using the
+        // envelope filename (keeps compat with the current UX where the
+        // user just finds the file in their downloads folder).
+        let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
+        let env = PayloadEnvelope::decode_or_fallback(&df.payload);
+        let (fname, callsign, content) = if env.version != 0 {
+            (env.filename.clone(), env.callsign.clone(), env.content.clone())
+        } else {
+            (
+                format!("decoded_{:08x}.bin", df.session_id),
+                String::new(),
+                df.payload.clone(),
+            )
+        };
+        match save_file(&dir, &fname, &content) {
+            Ok(path) => {
+                let _ = app.emit(
+                    "file_complete",
+                    FileCompletePayload {
+                        filename: fname,
+                        callsign,
+                        mime_type: df.meta.mime_type,
+                        saved_path: path.to_string_lossy().into_owned(),
+                        sigma2: result.sigma2,
+                        size: content.len(),
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!("save failed: {e}"),
+                    },
+                );
             }
         }
-        bits
-    } else {
-        Vec::new()
-    };
+    }
 
-    let _ = app.emit(
-        "v2_progress",
-        V2ProgressPayload {
-            blocks_converged: converged,
-            blocks_total: result.total_blocks,
-            blocks_expected: expected,
-            sigma2: result.sigma2,
-            converged_bitmap: bitmap,
-            constellation_sample: Vec::new(),
-        },
-    );
+    let _ = session_store::BLOB_WARN_RATIO; // keep the import visible for future UI use
 }
 
 // ---------------------------------------------------------------------------

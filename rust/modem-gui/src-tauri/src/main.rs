@@ -3,6 +3,7 @@
 mod audio;
 mod audio_capture;
 mod rx_worker;
+mod session_store;
 mod settings;
 mod tx_encode;
 mod tx_worker;
