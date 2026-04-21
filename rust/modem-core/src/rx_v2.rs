@@ -525,22 +525,32 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         segments_decoded += 1;
     }
 
-    // Assemble payload in ESI order, using the AppHeader's file_size to truncate.
+    // Assemble payload via RaptorQ fountain decoder.
+    // The AppHeader provides the OTI (file_size, t_bytes) ; we feed every
+    // converged CW as a (ESI, T bytes) packet to the decoder and keep the
+    // result once enough source/repair symbols are collected.
     let mut assembled: Vec<u8> = Vec::new();
     if let Some(ref h) = app_hdr {
-        let n_source_cw = ((h.file_size as usize) + k_bytes - 1) / k_bytes;
-        for esi in 0..n_source_cw as u32 {
-            if let Some(bytes) = cw_bytes.get(&esi) {
-                assembled.extend_from_slice(bytes);
-            } else {
-                assembled.extend(std::iter::repeat(0u8).take(k_bytes));
+        if let Some(payload) =
+            crate::raptorq_codec::try_decode(&cw_bytes, h.file_size, h.t_bytes as u16)
+        {
+            assembled = payload;
+        } else {
+            // Not enough packets collected : fall back to zero-padded ESI
+            // concatenation so that the user still gets a partial file
+            // (better than nothing for OTA debugging).
+            let n_source_cw = ((h.file_size as usize) + k_bytes - 1) / k_bytes;
+            for esi in 0..n_source_cw as u32 {
+                if let Some(bytes) = cw_bytes.get(&esi) {
+                    assembled.extend_from_slice(bytes);
+                } else {
+                    assembled.extend(std::iter::repeat(0u8).take(k_bytes));
+                }
             }
+            assembled.truncate(h.file_size as usize);
         }
-        assembled.truncate(h.file_size as usize);
     } else {
-        // No AppHeader recovered (all meta segments corrupted). Fall back to
-        // concatenating codewords in ascending ESI order and trust the
-        // protocol header's payload_length for truncation.
+        // No AppHeader recovered : fall back to ESI-sorted concat.
         let mut esis: Vec<u32> = cw_bytes.keys().cloned().collect();
         esis.sort();
         for esi in esis {
@@ -652,22 +662,29 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         sigma2_count += 1;
     }
 
-    // Assembly — same policy as rx_v2_single: truncate to file_size if we
-    // have an AppHeader, otherwise ESI-sorted concat of whatever decoded.
+    // Assembly — same policy as rx_v2_single: RaptorQ fountain decode from
+    // the merged ESI → bytes map, with zero-padded ESI fallback if the
+    // decoder doesn't have enough packets.
     let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
     let k_bytes = decoder.k() / 8;
 
     let mut assembled: Vec<u8> = Vec::new();
     if let Some(ref h) = app_hdr {
-        let n_source_cw = ((h.file_size as usize) + k_bytes - 1) / k_bytes;
-        for esi in 0..n_source_cw as u32 {
-            if let Some(bytes) = merged.get(&esi) {
-                assembled.extend_from_slice(bytes);
-            } else {
-                assembled.extend(std::iter::repeat(0u8).take(k_bytes));
+        if let Some(payload) =
+            crate::raptorq_codec::try_decode(&merged, h.file_size, h.t_bytes as u16)
+        {
+            assembled = payload;
+        } else {
+            let n_source_cw = ((h.file_size as usize) + k_bytes - 1) / k_bytes;
+            for esi in 0..n_source_cw as u32 {
+                if let Some(bytes) = merged.get(&esi) {
+                    assembled.extend_from_slice(bytes);
+                } else {
+                    assembled.extend(std::iter::repeat(0u8).take(k_bytes));
+                }
             }
+            assembled.truncate(h.file_size as usize);
         }
-        assembled.truncate(h.file_size as usize);
     } else {
         let mut esis: Vec<u32> = merged.keys().cloned().collect();
         esis.sort();

@@ -688,7 +688,6 @@ fn finalise_session(
 
 fn assemble_payload(state: &WorkerState) -> Vec<u8> {
     let Some(ref ah) = state.app_header else {
-        // No AppHeader yet : fall back to ESI-sorted concat.
         let mut esis: Vec<u32> = state.accumulated.keys().cloned().collect();
         esis.sort();
         let mut out = Vec::new();
@@ -699,6 +698,13 @@ fn assemble_payload(state: &WorkerState) -> Vec<u8> {
         }
         return out;
     };
+    // RaptorQ fountain decode — needs K source-equivalent packets.
+    if let Some(payload) =
+        modem_core::raptorq_codec::try_decode(&state.accumulated, ah.file_size, ah.t_bytes as u16)
+    {
+        return payload;
+    }
+    // Fallback : zero-padded ESI concatenation (partial file, better than nothing).
     let k_bytes = ah.t_bytes.max(1) as usize;
     let n_source_cw = ((ah.file_size as usize) + k_bytes - 1) / k_bytes;
     let mut out: Vec<u8> = Vec::with_capacity(ah.file_size as usize);

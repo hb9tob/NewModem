@@ -104,22 +104,30 @@ pub fn build_superframe_v3(
     let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
 
     let k_bytes = encoder.k() / 8;
-    let n_data_cw = (data.len() + k_bytes - 1) / k_bytes;
+
+    // RaptorQ fountain-layer encoding : produce K source + N_repair packets
+    // of exactly k_bytes each. Each packet becomes one LDPC codeword. ESI =
+    // linear position, reconstructed at RX from the marker's base_esi field.
+    let packets = crate::raptorq_codec::encode_packets(
+        data,
+        k_bytes as u16,
+        crate::raptorq_codec::REPAIR_PCT_DEFAULT,
+    );
+    let k_source = crate::raptorq_codec::k_from_payload(data.len(), k_bytes);
+    let n_data_cw = packets.len();
 
     let mut data_cw_syms: Vec<Vec<Complex64>> = Vec::with_capacity(n_data_cw);
-    for block_idx in 0..n_data_cw {
-        let start = block_idx * k_bytes;
-        let end = (start + k_bytes).min(data.len());
-        let mut block_bytes = vec![0u8; k_bytes];
-        block_bytes[..end - start].copy_from_slice(&data[start..end]);
-        let syms = encode_one_codeword(&block_bytes, &encoder, &interleave_perm, &constellation_);
+    for packet_bytes in &packets {
+        let syms = encode_one_codeword(packet_bytes, &encoder, &interleave_perm, &constellation_);
         data_cw_syms.push(syms);
     }
 
     let app_hdr = AppHeader {
         session_id,
         file_size: data.len() as u32,
-        k_symbols: n_data_cw as u16,
+        // k_symbols = RaptorQ K (source-symbol count = decode threshold).
+        // NOT the total number of packets emitted (which includes repair).
+        k_symbols: k_source.min(u16::MAX as usize) as u16,
         t_bytes: k_bytes as u8,
         mode_code: config.mode_code(),
         mime_type,

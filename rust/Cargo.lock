@@ -2360,6 +2360,7 @@ name = "modem-core"
 version = "0.1.0"
 dependencies = [
  "num-complex",
+ "raptorq",
  "thiserror 2.0.18",
 ]
 
@@ -3299,6 +3300,12 @@ checksum = "16abd0c1b639e9eb4d7c50c0b8100b0d0f849be2349829c740fe8e6eb4816429"
 dependencies = [
  "rand_core 0.5.1",
 ]
+
+[[package]]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "rav1e"

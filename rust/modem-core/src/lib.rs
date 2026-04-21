@@ -22,6 +22,7 @@ pub mod ldpc;
 
 pub mod modulator;
 pub mod frame;
+pub mod raptorq_codec;
 
 pub mod demodulator;
 pub mod sync;

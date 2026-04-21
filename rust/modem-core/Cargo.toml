@@ -7,3 +7,4 @@ description = "NBFM audio modem library — APSK/PSK/QPSK + LDPC WiMAX"
 [dependencies]
 num-complex = { workspace = true }
 thiserror = { workspace = true }
+raptorq = "2.0"
