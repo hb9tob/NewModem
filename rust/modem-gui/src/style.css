@@ -600,6 +600,16 @@ main {
 }
 .tx-controls select {
   width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 1.5rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><polygon points='0,0 10,0 5,6' fill='%23e0e0e0'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+}
+.tx-controls select option {
+  background: #1e1e1e;
+  color: #e0e0e0;
 }
 .tx-controls input[type="number"] {
   width: 78px;
@@ -725,6 +735,18 @@ main {
 }
 .tx-btn-warn:not(:disabled):hover {
   background: #7a6222 !important;
+}
+.tx-btn-compress {
+  display: block;
+  width: 100%;
+  margin: 0.3rem 0 0.6rem;
+  background: #2a3f5a;
+  border-color: #3a5a7a;
+  color: #b0d0f0;
+}
+.tx-btn-compress:not(:disabled):hover {
+  background: #3a5a7a;
+  color: #e0f0ff;
 }
 .tx-progress-text {
   font-family: ui-monospace, monospace;

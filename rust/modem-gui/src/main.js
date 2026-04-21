@@ -978,11 +978,19 @@ function refreshTxButtons() {
   const btnTx = document.getElementById("tx-btn-tx");
   const btnStop = document.getElementById("tx-btn-stop");
   const btnMore = document.getElementById("tx-btn-more");
+  const btnCompress = document.getElementById("tx-btn-compress");
   const morePct = document.getElementById("tx-more-pct");
   if (!btnTx) return;
   const hasImage = !!txState.sourceImage;
   const hasCompressed = txState.compressedBytes != null;
   const est = txState.estimate;
+  if (btnCompress) {
+    btnCompress.disabled =
+      !hasImage || txState.compressing || txState.txActive;
+    btnCompress.textContent = txState.compressing
+      ? "Compression…"
+      : "Recalculer la compression";
+  }
 
   // Validation stricte : interdire TX si payload > 100 ko ou durée > 5 min.
   const bytes = txState.compressedBytes || 0;
@@ -1157,6 +1165,12 @@ async function runTxCompress() {
     target_h: dims.h,
     quality: txState.quality,
   });
+  // Force le browser à peindre le loader avant de lancer invoke() : sans
+  // ce yield, la compression backend peut répondre avant le premier paint,
+  // la classe est retirée dans le finally, et l'utilisateur ne voit rien.
+  await new Promise((r) =>
+    requestAnimationFrame(() => requestAnimationFrame(r)),
+  );
   try {
     const result = await invoke("compress_image", {
       opts: {
@@ -1193,6 +1207,41 @@ async function runTxCompress() {
       refreshTxPreview();
       refreshTxButtons();
     }
+  }
+}
+
+// Charge un fichier depuis un chemin disque (drag-drop natif Tauri). Le
+// WebView n'expose pas File pour les fichiers droppés en mode natif, on
+// passe donc par le protocole asset:// via convertFileSrc pour récupérer
+// les bytes, puis on enveloppe dans un File.
+async function loadTxFileFromPath(path) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  try {
+    const { convertFileSrc } = window.__TAURI__.core;
+    const url = convertFileSrc(path);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const name = path.split(/[/\\]/).pop() || "image";
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    const mimeByExt = {
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      webp: "image/webp",
+      gif: "image/gif",
+      bmp: "image/bmp",
+      avif: "image/avif",
+      heic: "image/heic",
+      heif: "image/heif",
+    };
+    const type = blob.type && blob.type.startsWith("image/")
+      ? blob.type
+      : mimeByExt[ext] || "image/*";
+    const file = new File([blob], name, { type });
+    await loadTxFile(file);
+  } catch (err) {
+    logEvent("tx_error", { message: `drop read ${path}: ${err}` });
   }
 }
 
@@ -1294,24 +1343,22 @@ function setupTxTab() {
     if (fileInput.files && fileInput.files[0]) loadTxFile(fileInput.files[0]);
   });
 
-  // Drag-drop sur l'ensemble de la zone image (drop-zone OU preview), de
-  // façon à pouvoir remplacer l'image en la glissant dessus.
-  const area = document.querySelector(".tx-image-area");
-  const onDragOver = (ev) => {
-    ev.preventDefault();
-    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
-    drop.classList.add("drag-over");
-  };
-  const onDragLeave = () => drop.classList.remove("drag-over");
-  const onDrop = (ev) => {
-    ev.preventDefault();
-    drop.classList.remove("drag-over");
-    const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
-    if (file) loadTxFile(file);
-  };
-  area.addEventListener("dragover", onDragOver);
-  area.addEventListener("dragleave", onDragLeave);
-  area.addEventListener("drop", onDrop);
+  // Drag-drop : sur Linux/WebKitGTK les events HTML5 dragover/drop ne sont
+  // pas remontés de façon fiable (le WM intercepte). On passe par les
+  // events natifs Tauri v2 (dragDropEnabled:true dans tauri.conf.json),
+  // émis au niveau fenêtre.
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    const { listen } = window.__TAURI__.event;
+    const setOver = (on) => drop.classList.toggle("drag-over", on);
+    listen("tauri://drag-enter", () => setOver(true)).catch(() => {});
+    listen("tauri://drag-over", () => setOver(true)).catch(() => {});
+    listen("tauri://drag-leave", () => setOver(false)).catch(() => {});
+    listen("tauri://drag-drop", (ev) => {
+      setOver(false);
+      const paths = (ev && ev.payload && ev.payload.paths) || [];
+      if (paths.length > 0) loadTxFileFromPath(paths[0]);
+    }).catch(() => {});
+  }
 
   document.getElementById("tx-preview-reset").addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -1334,7 +1381,7 @@ function setupTxTab() {
       txState.resize = r.value;
       document.getElementById("tx-resize-free").hidden = r.value !== "free";
       refreshTxPreview();
-      scheduleTxCompress();
+      refreshTxButtons();
     });
   }
 
@@ -1350,7 +1397,6 @@ function setupTxTab() {
       freeH.value = txState.freeH;
     }
     refreshTxPreview();
-    if (txState.resize === "free") scheduleTxCompress();
   });
   freeH.addEventListener("input", () => {
     const v = parseInt(freeH.value, 10);
@@ -1362,7 +1408,6 @@ function setupTxTab() {
       freeW.value = txState.freeW;
     }
     refreshTxPreview();
-    if (txState.resize === "free") scheduleTxCompress();
   });
 
   const quality = document.getElementById("tx-quality");
@@ -1370,7 +1415,10 @@ function setupTxTab() {
     txState.quality = parseInt(quality.value, 10) || 0;
     document.getElementById("tx-quality-val").textContent = txState.quality;
     refreshTxPreview();
-    scheduleTxCompress();
+  });
+
+  document.getElementById("tx-btn-compress").addEventListener("click", () => {
+    runTxCompress();
   });
 
   document.getElementById("tx-btn-tx").addEventListener("click", txStart);
