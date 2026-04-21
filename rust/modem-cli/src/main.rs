@@ -68,6 +68,60 @@ enum Commands {
         callsign: Option<String>,
     },
 
+    /// Emit an additional burst of RaptorQ repair packets for an already-sent
+    /// file, using the same session_id and continuing ESIs after the previous
+    /// burst. The operator uses this when an RX vocally requests more packets.
+    TxMore {
+        /// Input file : must be the exact same bytes that were sent initially.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output WAV file
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Profile (must match initial burst)
+        #[arg(short, long, default_value = "NORMAL")]
+        profile: String,
+
+        /// Override constellation, LDPC, symbol rate, β, fc (as in `tx`).
+        #[arg(long)]
+        constellation: Option<String>,
+        #[arg(long)]
+        ldpc_rate: Option<String>,
+        #[arg(long)]
+        rs: Option<f64>,
+        #[arg(long)]
+        beta: Option<f64>,
+        #[arg(long)]
+        fc: Option<f64>,
+
+        /// VOX preamble duration (seconds, 0 to disable)
+        #[arg(long, default_value = "0.5")]
+        vox: f64,
+
+        /// Session ID (hex). If omitted, computed deterministically from the
+        /// file contents + profile, same as `tx` would — this is what lets
+        /// the RX tie this burst to the earlier one.
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// ESI of the first packet to emit. Typically = (esi_max already
+        /// sent) + 1. Reported by the GUI state or the caller.
+        #[arg(long)]
+        esi_start: u32,
+
+        /// Percentage of K (source-symbol count) to emit in this burst.
+        /// e.g. --pct 20 with K = 48 → 9 packets (one LDPC codeword each).
+        #[arg(long, default_value = "20")]
+        pct: u32,
+
+        #[arg(long)]
+        filename: Option<String>,
+        #[arg(long)]
+        callsign: Option<String>,
+    },
+
     /// Decode a WAV audio signal to a file (V3 frame format).
     Rx {
         /// Input WAV file
@@ -177,7 +231,17 @@ fn main() {
             });
             let wire_payload = envelope.encode();
 
-            let sid = parse_session_id(session_id.as_deref());
+            let profile_index = profile_index_of(&profile);
+            let sid = session_id
+                .as_deref()
+                .map(parse_explicit_session_id)
+                .unwrap_or_else(|| {
+                    modem_core::app_header::compute_session_id(
+                        &wire_payload,
+                        config.mode_code(),
+                        profile_index,
+                    )
+                });
             let hash = content_hash_short(&wire_payload);
             let mime = infer_mime(&input);
             eprintln!(
@@ -223,6 +287,130 @@ fn main() {
             let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
             eprintln!("Generated {} samples ({:.2}s)", samples.len(), duration_s);
 
+            write_wav(&output, &samples);
+            eprintln!("Written to {}", output.display());
+        }
+
+        Commands::TxMore {
+            input,
+            output,
+            profile,
+            constellation,
+            ldpc_rate,
+            rs,
+            beta,
+            fc,
+            vox,
+            session_id,
+            esi_start,
+            pct,
+            filename,
+            callsign,
+        } => {
+            let mut config = parse_profile(&profile);
+            if let Some(c) = constellation {
+                config.constellation = parse_constellation(&c);
+            }
+            if let Some(r) = ldpc_rate {
+                config.ldpc_rate = parse_ldpc_rate(&r);
+            }
+            if let Some(r) = rs {
+                config.symbol_rate = r;
+            }
+            if let Some(b) = beta {
+                config.beta = b;
+            }
+            if let Some(f) = fc {
+                config.center_freq_hz = f;
+            }
+            let data = std::fs::read(&input).unwrap_or_else(|e| {
+                eprintln!("Error reading {}: {e}", input.display());
+                std::process::exit(1);
+            });
+            let fname = filename.unwrap_or_else(|| infer_filename(&input));
+            let qrz = callsign.unwrap_or_else(|| {
+                eprintln!("tx-more error: --callsign required");
+                std::process::exit(1);
+            });
+            let envelope = modem_core::payload_envelope::PayloadEnvelope::new(
+                &fname, &qrz, data.clone(),
+            )
+            .unwrap_or_else(|| {
+                eprintln!("tx-more error: envelope too large");
+                std::process::exit(1);
+            });
+            let wire_payload = envelope.encode();
+
+            let profile_index = profile_index_of(&profile);
+            let sid = session_id
+                .as_deref()
+                .map(parse_explicit_session_id)
+                .unwrap_or_else(|| {
+                    modem_core::app_header::compute_session_id(
+                        &wire_payload,
+                        config.mode_code(),
+                        profile_index,
+                    )
+                });
+            let hash = content_hash_short(&wire_payload);
+            let mime = infer_mime(&input);
+
+            // K = source-symbol count ; count = K * pct / 100 packets.
+            let k_bytes = modem_core::profile::LdpcRate::k(config.ldpc_rate) / 8;
+            let k =
+                modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes) as u32;
+            let n_packets = (k * pct) / 100;
+            if n_packets == 0 {
+                eprintln!("tx-more: pct too small (K={k}, pct={pct}% → 0 packets)");
+                std::process::exit(1);
+            }
+            eprintln!(
+                "tx-more: session=0x{sid:08X}, K={k}, esi_start={esi_start}, count={n_packets} ({pct}%)"
+            );
+
+            let symbols = modem_core::frame::build_superframe_v3_range(
+                &wire_payload,
+                &config,
+                sid,
+                mime,
+                hash,
+                esi_start,
+                n_packets,
+            );
+            let (sps, pitch) = modem_core::rrc::check_integer_constraints(
+                AUDIO_RATE,
+                config.symbol_rate,
+                config.tau,
+            )
+            .expect("invalid profile");
+            let taps =
+                modem_core::rrc::rrc_taps(config.beta, modem_core::types::RRC_SPAN_SYM, sps);
+            let mut modulated = modem_core::modulator::modulate(
+                &symbols,
+                sps,
+                pitch,
+                &taps,
+                config.center_freq_hz,
+            );
+            let samples = if vox > 0.0 {
+                let mut out = Vec::new();
+                out.extend_from_slice(&modem_core::modulator::tone(
+                    config.center_freq_hz,
+                    vox,
+                    0.5,
+                ));
+                out.extend_from_slice(&modem_core::modulator::silence(0.05));
+                out.append(&mut modulated);
+                out.extend_from_slice(&modem_core::modulator::silence(0.1));
+                out
+            } else {
+                modulated
+            };
+            eprintln!(
+                "Generated {} samples ({:.2}s)",
+                samples.len(),
+                samples.len() as f64 / AUDIO_RATE as f64
+            );
             write_wav(&output, &samples);
             eprintln!("Written to {}", output.display());
         }
@@ -339,23 +527,22 @@ fn main() {
     }
 }
 
-fn parse_session_id(arg: Option<&str>) -> u32 {
-    match arg {
-        Some(s) => {
-            let cleaned = s.trim_start_matches("0x").trim_start_matches("0X");
-            u32::from_str_radix(cleaned, 16).unwrap_or_else(|_| {
-                eprintln!("Invalid session_id '{s}' (expected hex, e.g. 'DEADBEEF')");
-                std::process::exit(1);
-            })
-        }
-        None => {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            nanos ^ (std::process::id() as u32).wrapping_mul(2654435761)
-        }
+fn parse_explicit_session_id(s: &str) -> u32 {
+    let cleaned = s.trim_start_matches("0x").trim_start_matches("0X");
+    u32::from_str_radix(cleaned, 16).unwrap_or_else(|_| {
+        eprintln!("Invalid session_id '{s}' (expected hex, e.g. 'DEADBEEF')");
+        std::process::exit(1);
+    })
+}
+
+fn profile_index_of(name: &str) -> u8 {
+    match name.to_uppercase().as_str() {
+        "MEGA" => modem_core::profile::ProfileIndex::Mega as u8,
+        "HIGH" => modem_core::profile::ProfileIndex::High as u8,
+        "NORMAL" => modem_core::profile::ProfileIndex::Normal as u8,
+        "ROBUST" => modem_core::profile::ProfileIndex::Robust as u8,
+        "ULTRA" => modem_core::profile::ProfileIndex::Ultra as u8,
+        _ => 0xFF,
     }
 }
 

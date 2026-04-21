@@ -63,19 +63,58 @@ pub fn encode_packets(
     t_bytes: u16,
     repair_pct: u32,
 ) -> Vec<Vec<u8>> {
+    let k = k_from_payload(data.len(), t_bytes as usize) as u32;
+    let n_repair = (k * repair_pct) / 100;
+    encode_packets_range(data, t_bytes, 0, k + n_repair)
+}
+
+/// Encode `data` and return exactly the packets whose ESI fall in
+/// `[esi_start, esi_start + count)`.
+///
+/// Used to generate additional bursts after an initial TX : the operator
+/// clicks "More" with a target percentage, the caller computes `count =
+/// K * pct / 100` and passes `esi_start = esi_max_already_sent + 1`.
+///
+/// Both the initial and subsequent bursts must use the *same* `data` and
+/// `t_bytes` so that the RaptorQ source block stays identical ; any change
+/// → new session_id.
+pub fn encode_packets_range(
+    data: &[u8],
+    t_bytes: u16,
+    esi_start: u32,
+    count: u32,
+) -> Vec<Vec<u8>> {
+    if count == 0 {
+        return Vec::new();
+    }
     let t = t_bytes as usize;
-    let k = k_from_payload(data.len(), t);
+    let k = k_from_payload(data.len(), t) as u32;
 
     // Pad to exactly K·T so the encoder works on aligned input.
     let mut padded = data.to_vec();
-    padded.resize(k * t, 0u8);
+    padded.resize((k as usize) * t, 0u8);
 
     let oti = ObjectTransmissionInformation::with_defaults(padded.len() as u64, t_bytes);
     let encoder = Encoder::new(&padded, oti);
 
-    let n_repair = ((k as u32) * repair_pct) / 100;
-    let packets = encoder.get_encoded_packets(n_repair);
-    packets.into_iter().map(|p| p.data().to_vec()).collect()
+    // The raptorq crate produces K source packets + any number of repair
+    // packets. To obtain packets at arbitrary ESIs, we ask for enough repair
+    // so that the last required ESI is included, then filter.
+    let esi_end = esi_start + count; // exclusive
+    let n_repair_needed = esi_end.saturating_sub(k);
+    let all_packets = encoder.get_encoded_packets(n_repair_needed);
+
+    all_packets
+        .into_iter()
+        .skip(esi_start as usize)
+        .take(count as usize)
+        .map(|p| p.data().to_vec())
+        .collect()
+}
+
+/// Convenience : number of repair packets to emit for an initial burst.
+pub fn n_repair_default(k: u32) -> u32 {
+    (k * REPAIR_PCT_DEFAULT) / 100
 }
 
 /// Attempt to decode a payload from an ESI → bytes map.
@@ -151,5 +190,49 @@ mod tests {
             map.insert(esi as u32, p.clone());
         }
         assert!(try_decode(&map, data.len() as u32, t).is_none());
+    }
+
+    /// Multi-burst scenario : initial burst covers ESI 0..K+30% ; a second
+    /// "More" burst adds packets at ESI K+30%..K+50%. The receiver should
+    /// decode from the union.
+    #[test]
+    fn roundtrip_two_bursts_union() {
+        let data: Vec<u8> = (0..3000).map(|i| ((i * 37) ^ 0xA5) as u8).collect();
+        let t: u16 = 108;
+        let k = k_from_payload(data.len(), t as usize) as u32;
+
+        // Burst 1 : packets 0..K + K*30%
+        let b1 = encode_packets(&data, t, REPAIR_PCT_DEFAULT);
+        let b1_end = k + n_repair_default(k);
+        assert_eq!(b1.len() as u32, b1_end);
+
+        // Burst 2 : 20% more, starting right after burst 1.
+        let n_more = (k * 20) / 100;
+        let b2 = encode_packets_range(&data, t, b1_end, n_more);
+        assert_eq!(b2.len() as u32, n_more);
+
+        // Simulate loss : drop 20 % of burst 1, then recover via burst 2.
+        // Union must still exceed K packets so the fountain converges.
+        let mut map = HashMap::new();
+        let skip = (b1.len() * 20) / 100;
+        for (i, p) in b1.iter().enumerate().skip(skip) {
+            map.insert(i as u32, p.clone());
+        }
+        for (j, p) in b2.iter().enumerate() {
+            map.insert(b1_end + j as u32, p.clone());
+        }
+        assert!(map.len() as u32 >= k, "test setup must provide ≥ K packets");
+        let decoded = try_decode(&map, data.len() as u32, t)
+            .expect("burst union should decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn encode_range_is_deterministic() {
+        let data: Vec<u8> = (0..500).map(|i| i as u8).collect();
+        let t: u16 = 32;
+        let a = encode_packets_range(&data, t, 20, 5);
+        let b = encode_packets_range(&data, t, 20, 5);
+        assert_eq!(a, b, "same input → same packets at a given ESI");
     }
 }

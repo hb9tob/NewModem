@@ -901,4 +901,60 @@ mod tests {
             "V3 loopback : données non identiques"
         );
     }
+
+    /// Multi-burst scenario : an initial TX + a "More" TX with continuing ESIs
+    /// against the same session_id. The concatenated audio stream, fed as a
+    /// single input to rx_v3, must decode from the union of packets.
+    #[test]
+    fn loopback_v3_two_bursts_continuing_esi() {        use crate::app_header::mime;
+        use crate::ldpc::encoder::LdpcEncoder;
+        use crate::raptorq_codec;
+
+        let config = profile_high();
+        let data: Vec<u8> = (0..3_000)
+            .map(|i| ((i * 53) ^ 0x5A) as u8)
+            .collect();
+        let session = 0xA28C_CD81u32;
+        let hash = make_session_hash(&data);
+
+        // Burst 1 : K + 30 % repair
+        let k_bytes = LdpcEncoder::new(config.ldpc_rate).k() / 8;
+        let k = raptorq_codec::k_from_payload(data.len(), k_bytes) as u32;
+        let b1_count = k + raptorq_codec::n_repair_default(k);
+
+        let (sps, pitch) =
+            rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+                .expect("profile");
+        let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+
+        let syms1 = frame::build_superframe_v3_range(
+            &data, &config, session, mime::BINARY, hash, 0, b1_count,
+        );
+        let audio1 = modulator::modulate(&syms1, sps, pitch, &taps, config.center_freq_hz);
+
+        // Burst 2 : +20 % of K, ESI continuing after b1
+        let b2_count = (k * 20) / 100;
+        let syms2 = frame::build_superframe_v3_range(
+            &data, &config, session, mime::BINARY, hash, b1_count, b2_count,
+        );
+        let audio2 = modulator::modulate(&syms2, sps, pitch, &taps, config.center_freq_hz);
+
+        // Concaténer les deux bursts, ajouter 100 ms de silence entre.
+        let silence = vec![0.0f32; (AUDIO_RATE as f64 * 0.1) as usize];
+        let mut combined = audio1.clone();
+        combined.extend_from_slice(&silence);
+        combined.extend_from_slice(&audio2);
+
+        let result = rx_v3(&combined, &config).expect("rx_v3 should decode union");
+        let ah = result.app_header.as_ref().expect("AppHeader");
+        assert_eq!(ah.session_id, session);
+
+        eprintln!(
+            "V3 two-burst : K={k} b1={b1_count} b2={b2_count} \
+             data_cw_recovered={} bytes={}",
+            result.data_blocks_recovered,
+            result.data.len()
+        );
+        assert_eq!(&result.data[..data.len()], &data[..]);
+    }
 }

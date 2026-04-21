@@ -246,6 +246,55 @@ fn tx_start(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct TxMoreArgs {
+    mode: String,
+    callsign: String,
+    filename: String,
+    tx_device: String,
+    esi_start: u32,
+    pct: u32,
+}
+
+#[tauri::command]
+fn tx_more(
+    args: TxMoreArgs,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
+    if tx_guard.is_some() {
+        return Err("TX déjà en cours".into());
+    }
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let avif_path = save_dir.join("tx_preview.avif");
+    if !avif_path.exists() {
+        return Err(format!(
+            "preview AVIF absent ({}), recompresse une image avant TX",
+            avif_path.display()
+        ));
+    }
+    if args.callsign.trim().is_empty() {
+        return Err("indicatif vide (Paramètres → Indicatif)".into());
+    }
+    if args.tx_device.trim().is_empty() {
+        return Err("carte son TX non sélectionnée (Paramètres)".into());
+    }
+    let handle = tx_worker::spawn_more(
+        avif_path,
+        args.mode,
+        args.callsign.trim().to_uppercase(),
+        args.filename,
+        args.tx_device,
+        save_dir,
+        args.esi_start,
+        args.pct,
+        app,
+    );
+    *tx_guard = Some(handle);
+    Ok(())
+}
+
 #[tauri::command]
 fn tx_stop(state: State<'_, AppState>) -> Result<(), String> {
     let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
@@ -352,6 +401,7 @@ fn main() {
             compress_image,
             tx_estimate,
             tx_start,
+            tx_more,
             tx_stop,
             tx_reset,
         ])

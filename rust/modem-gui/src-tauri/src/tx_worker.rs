@@ -157,8 +157,6 @@ fn generate_wav_via_cli(
         .arg(output_wav)
         .arg("--profile")
         .arg(mode)
-        .arg("--frame-version")
-        .arg("3")
         .arg("--callsign")
         .arg(callsign)
         .arg("--filename")
@@ -169,6 +167,45 @@ fn generate_wav_via_cli(
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "modem-cli tx exit {:?} — {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn generate_wav_more_via_cli(
+    cli: &Path,
+    input_avif: &Path,
+    output_wav: &Path,
+    mode: &str,
+    callsign: &str,
+    filename: &str,
+    esi_start: u32,
+    pct: u32,
+) -> Result<(), String> {
+    let output = Command::new(cli)
+        .arg("tx-more")
+        .arg("--input")
+        .arg(input_avif)
+        .arg("--output")
+        .arg(output_wav)
+        .arg("--profile")
+        .arg(mode)
+        .arg("--callsign")
+        .arg(callsign)
+        .arg("--filename")
+        .arg(filename)
+        .arg("--esi-start")
+        .arg(esi_start.to_string())
+        .arg("--pct")
+        .arg(pct.to_string())
+        .output()
+        .map_err(|e| format!("spawn modem-cli tx-more: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "modem-cli tx-more exit {:?} — {}",
             output.status.code(),
             stderr.trim()
         ));
@@ -200,6 +237,105 @@ fn read_wav_samples(path: &Path) -> Result<Vec<f32>, String> {
             .samples::<f32>()
             .map(|s| s.unwrap_or(0.0))
             .collect()),
+    }
+}
+
+/// Burst variant : initial (`esi_start=None`) or "More" (`esi_start=Some,
+/// pct`). Both paths share `run_playback` for the cpal stream.
+pub fn spawn_more(
+    avif_path: PathBuf,
+    mode: String,
+    callsign: String,
+    filename: String,
+    device_name: String,
+    save_dir: PathBuf,
+    esi_start: u32,
+    pct: u32,
+    app: AppHandle,
+) -> TxHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let thread = thread::spawn(move || {
+        let Some(cli) = locate_cli_binary() else {
+            let _ = app.emit(
+                "tx_error",
+                TxErrorEvent {
+                    message: "binaire nbfm-modem introuvable à côté du GUI".to_string(),
+                },
+            );
+            return;
+        };
+        if !avif_path.exists() {
+            let _ = app.emit(
+                "tx_error",
+                TxErrorEvent {
+                    message: format!("AVIF absent : {}", avif_path.display()),
+                },
+            );
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&save_dir) {
+            let _ = app.emit(
+                "tx_error",
+                TxErrorEvent {
+                    message: format!("mkdir save_dir: {e}"),
+                },
+            );
+            return;
+        }
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let wav_path = save_dir.join(format!(
+            "tx-more-{ts}-{}-esi{esi_start}.wav",
+            mode.to_lowercase()
+        ));
+        if let Err(e) = generate_wav_more_via_cli(
+            &cli, &avif_path, &wav_path, &mode, &callsign, &filename, esi_start, pct,
+        ) {
+            let _ = app.emit("tx_error", TxErrorEvent { message: e });
+            return;
+        }
+        let samples = match read_wav_samples(&wav_path) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = app.emit("tx_error", TxErrorEvent { message: e });
+                return;
+            }
+        };
+        let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
+        let wav_str = wav_path.to_string_lossy().into_owned();
+        // total_blocks for the More burst is "roughly K * pct / 100" — we
+        // can't reconstruct K here without parsing the AVIF, so expose an
+        // approximation that the UI can tolerate (exact value is already in
+        // the CLI's stderr log for debug).
+        let total_blocks = 1u32; // UI will ignore the exact count for More bursts
+        let _ = app.emit(
+            "tx_plan",
+            TxPlanEvent {
+                duration_s,
+                total_blocks,
+                wire_bytes: 0,
+                wav_path: wav_str.clone(),
+                mode: mode.clone(),
+                callsign: callsign.clone(),
+                filename: filename.clone(),
+            },
+        );
+        run_playback(
+            &device_name,
+            samples,
+            total_blocks,
+            duration_s,
+            wav_str,
+            stop_thread,
+            app,
+        );
+    });
+    TxHandle {
+        stop,
+        thread: Some(thread),
     }
 }
 

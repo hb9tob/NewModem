@@ -20,6 +20,26 @@
 
 use crate::crc::crc16;
 
+/// Compute a deterministic 32-bit session identifier from the payload bytes
+/// and the transmission mode. Same (content, mode) → same session_id →
+/// RX reuses the same on-disk session folder across retransmissions (both
+/// initial and "More" bursts), accumulating packets seamlessly. Any change
+/// of content or mode → different session_id → different folder.
+///
+/// Uses FNV-1a 32-bit over the content, mixed with mode_code (8 bits) and
+/// profile_index (8 bits) so changing the modulation parameters rolls the
+/// session even if content is identical.
+pub fn compute_session_id(content: &[u8], mode_code: u8, profile_index: u8) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for &b in content {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h ^= (mode_code as u32) << 16;
+    h ^= (profile_index as u32) << 24;
+    h
+}
+
 /// Serialized size of one AppHeader, including trailing CRC16.
 pub const APP_HEADER_SIZE: usize = 17;
 

@@ -726,7 +726,11 @@ const txState = {
   aspectLinked: true,
   txActive: false,
   // Blocs fontaine additionnels à générer sur TX more (% de la taille code).
-  morePct: 10,
+  morePct: 20,
+  // État de la session TX en cours : conservé entre le TX initial et les
+  // bursts "More" successifs pour pouvoir continuer l'ESI sans recouvrir
+  // les packets déjà émis. Reset quand l'image ou le mode changent.
+  lastTx: null,  // { esiMax, mode }
   compressedBytes: null,
   compressedUrl: null,
   compressing: false,
@@ -778,7 +782,11 @@ function refreshTxButtons() {
     && !tooBig
     && !tooLong;
   btnTx.disabled = !canTx;
-  btnMore.disabled = !hasImage || txState.txActive;
+  // "More" disponible seulement après un TX initial réussi, et pas en TX actif.
+  // Reset du lastTx si le mode a changé par rapport à celui du TX initial.
+  const hasPriorTx =
+    txState.lastTx != null && txState.lastTx.mode === txState.mode;
+  btnMore.disabled = !hasImage || txState.txActive || !hasPriorTx;
   btnStop.disabled = !txState.txActive;
   if (morePct) morePct.disabled = !hasImage || txState.txActive;
 
@@ -991,6 +999,8 @@ async function loadTxFile(file) {
   const img = new Image();
   img.onload = async () => {
     txState.sourceImage = img;
+    // Nouvelle image → nouvelle session (session_id RaptorQ dépend du contenu).
+    txState.lastTx = null;
     // Ne reset freeW/H à la taille native QUE si on n'est pas déjà en mode
     // "libre" — sinon on écrase la dimension choisie par l'utilisateur
     // avant le drop, et la 1ère compression ignore son 800×600 manuel.
@@ -1094,8 +1104,11 @@ function setupTxTab() {
 
   document.getElementById("tx-mode").addEventListener("change", (ev) => {
     txState.mode = ev.target.value;
+    // Nouveau mode → nouvelle session (session_id RaptorQ dépend du mode).
+    txState.lastTx = null;
     refreshTxPreview();
     refreshTxEstimate();
+    refreshTxButtons();
   });
 
   const resizeRadios = document.querySelectorAll('input[name="tx-resize"]');
@@ -1146,14 +1159,9 @@ function setupTxTab() {
 
   document.getElementById("tx-btn-tx").addEventListener("click", txStart);
   document.getElementById("tx-btn-stop").addEventListener("click", txStop);
-  document.getElementById("tx-btn-more").addEventListener("click", () => {
-    logEvent("tx_click", {
-      action: "tx_more",
-      note: "code fontaine non-MVP, bouton placeholder",
-    });
-  });
+  document.getElementById("tx-btn-more").addEventListener("click", txMore);
   document.getElementById("tx-more-pct").addEventListener("change", (ev) => {
-    txState.morePct = parseInt(ev.target.value, 10) || 10;
+    txState.morePct = parseInt(ev.target.value, 10) || 20;
   });
   refreshTxButtons();
 }
@@ -1196,8 +1204,79 @@ async function txStart() {
         tx_device: currentSettings.tx_device || "",
       },
     });
+    // Après un TX initial, on mémorise l'état session pour activer "More".
+    // Le burst initial émet K + 30 % packets → ESI max = ceil(K * 1.3) - 1.
+    const k = computeK();
+    if (k) {
+      const emitted = Math.ceil(k * 1.3);
+      txState.lastTx = { mode: txState.mode, esiMax: emitted - 1 };
+    }
   } catch (err) {
     logEvent("tx_start_error", { message: String(err) });
+    txState.txActive = false;
+    refreshTxButtons();
+    await maybeRestartRx();
+  }
+}
+
+// K RaptorQ = max(4, ceil((payload + envelope) / T)). On approxime T via
+// total_blocks de l'estimation (qui le compte aussi). Si plus petit, on
+// force 4 (MIN_K côté backend).
+function computeK() {
+  const est = txState.estimate;
+  if (!est || !est.total_blocks) return null;
+  return Math.max(4, est.total_blocks);
+}
+
+async function txMore() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  if (txState.txActive) return;
+  if (!txState.lastTx || txState.lastTx.mode !== txState.mode) {
+    logEvent("tx_more_skipped", { reason: "pas de TX initial pour ce mode" });
+    return;
+  }
+  const k = computeK();
+  if (!k) {
+    logEvent("tx_more_skipped", { reason: "K inconnu (pas d'estimate)" });
+    return;
+  }
+  const pct = txState.morePct;
+  const count = Math.max(1, Math.floor((k * pct) / 100));
+  const esiStart = txState.lastTx.esiMax + 1;
+  const { invoke } = window.__TAURI__.core;
+  const rxStopBtn = document.getElementById("btn-stop");
+  const rxWasActive = rxStopBtn && !rxStopBtn.disabled;
+  if (rxWasActive) {
+    try {
+      await invoke("stop_capture");
+    } catch (err) {
+      logEvent("tx_pre_stop_error", { message: String(err) });
+    }
+  }
+  txState.restartRxAfter = rxWasActive;
+  txState.txActive = true;
+  txState.progress = null;
+  // On retient où on va tomber après ce burst (count packets à partir d'esiStart).
+  txState.lastTx = {
+    mode: txState.mode,
+    esiMax: esiStart + count - 1,
+  };
+  updateTxProgressText();
+  refreshTxButtons();
+  logEvent("tx_more_start", { pct, count, esi_start: esiStart, k });
+  try {
+    await invoke("tx_more", {
+      args: {
+        mode: txState.mode,
+        callsign: currentSettings.callsign || "",
+        filename: getTxFilename(),
+        tx_device: currentSettings.tx_device || "",
+        esi_start: esiStart,
+        pct: pct,
+      },
+    });
+  } catch (err) {
+    logEvent("tx_more_error", { message: String(err) });
     txState.txActive = false;
     refreshTxButtons();
     await maybeRestartRx();

@@ -99,19 +99,41 @@ pub fn build_superframe_v3(
     mime_type: u8,
     hash_short: u16,
 ) -> Vec<Complex64> {
+    let k_bytes = LdpcEncoder::new(config.ldpc_rate).k() / 8;
+    let k_source = crate::raptorq_codec::k_from_payload(data.len(), k_bytes) as u32;
+    let n_total = k_source + crate::raptorq_codec::n_repair_default(k_source);
+    build_superframe_v3_range(data, config, session_id, mime_type, hash_short, 0, n_total)
+}
+
+/// Emit a superframe carrying the RaptorQ packets in the range
+/// `[esi_start, esi_start + n_packets)`. Used both for the initial burst
+/// (esi_start = 0, n_packets = K + 30%) and for subsequent "More" bursts
+/// (esi_start = previous_max + 1, n_packets = K × user_pct / 100).
+///
+/// The AppHeader is identical across bursts of the same session so any RX
+/// that decoded a previous AppHeader can simply accumulate the new packets
+/// into the same fountain decoder.
+pub fn build_superframe_v3_range(
+    data: &[u8],
+    config: &ModemConfig,
+    session_id: u32,
+    mime_type: u8,
+    hash_short: u16,
+    esi_start: u32,
+    n_packets: u32,
+) -> Vec<Complex64> {
     let encoder = LdpcEncoder::new(config.ldpc_rate);
     let constellation_ = make_constellation(config);
     let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
 
     let k_bytes = encoder.k() / 8;
 
-    // RaptorQ fountain-layer encoding : produce K source + N_repair packets
-    // of exactly k_bytes each. Each packet becomes one LDPC codeword. ESI =
-    // linear position, reconstructed at RX from the marker's base_esi field.
-    let packets = crate::raptorq_codec::encode_packets(
+    // Generate exactly the packets asked for.
+    let packets = crate::raptorq_codec::encode_packets_range(
         data,
         k_bytes as u16,
-        crate::raptorq_codec::REPAIR_PCT_DEFAULT,
+        esi_start,
+        n_packets,
     );
     let k_source = crate::raptorq_codec::k_from_payload(data.len(), k_bytes);
     let n_data_cw = packets.len();
@@ -167,7 +189,7 @@ pub fn build_superframe_v3(
         let payload = MarkerPayload {
             seg_id,
             session_id_low,
-            base_esi: data_cursor as u32,
+            base_esi: esi_start + data_cursor as u32,
             flags: META_FLAG_BIT,
             reserved: 0,
         };
@@ -189,7 +211,7 @@ pub fn build_superframe_v3(
             let payload = MarkerPayload {
                 seg_id,
                 session_id_low,
-                base_esi: data_cursor as u32,
+                base_esi: esi_start + data_cursor as u32,
                 flags: META_FLAG_BIT,
                 reserved: 0,
             };
@@ -210,7 +232,7 @@ pub fn build_superframe_v3(
         let payload = MarkerPayload {
             seg_id,
             session_id_low,
-            base_esi: data_cursor as u32,
+            base_esi: esi_start + data_cursor as u32,
             flags: 0,
             reserved: 0,
         };
