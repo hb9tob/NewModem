@@ -263,11 +263,11 @@ const MAX_SESSION_SECONDS: u64 = 25 * 60;
 /// preamble already partially landing in this tick to still be detected.
 const PREROLL_SECONDS: usize = 2;
 
-/// While capturing, keep only this many seconds of trailing audio. Covers
-/// two V3 preamble periods (4 s each) + safety margin, so every codeword is
-/// still inside a window containing its anchoring preamble, but the buffer
-/// never grows past a bounded size and rx_v3 stays fast.
-const CAPTURE_WINDOW_SECONDS: usize = 10;
+/// While capturing, keep only this many seconds of trailing audio. Must
+/// cover at least 2 × V3 preamble period on the slowest profile (ULTRA
+/// emits one cycle every ~4.6 s). 15 s leaves comfortable margin for
+/// late-entry / marker jitter without letting rx_v3 grow unbounded.
+const CAPTURE_WINDOW_SECONDS: usize = 15;
 
 /// Fall back to Idle if no preamble has been seen for this long while
 /// Capturing — covers the case where the sender disappears mid-burst without
@@ -514,15 +514,34 @@ fn scan_and_route(
     state: &mut WorkerState,
 ) {
     let config = state.config.clone();
+    let buf_secs = state.session_buffer.len() as f64 / AUDIO_RATE as f64;
 
     // Note : we used to gate rx_v3 in Idle with a cheap correlation probe,
     // but the peak/median threshold proved too aggressive on OTA-attenuated
-    // signals (ULTRA / ROBUST / NORMAL failed to arm). The 10-s capture
-    // window already bounds CPU, so we just let rx_v3 handle detection.
+    // signals (ULTRA / ROBUST / NORMAL failed to arm). The capture window
+    // already bounds CPU, so we just let rx_v3 handle detection.
     let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
+        worker_log(&format!(
+            "[scan] active={} buf={:.1}s rx_v3=None",
+            state.session_active, buf_secs
+        ));
         return;
     };
     let eot_seen = result.eot_seen;
+    worker_log(&format!(
+        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} converged={}/{} segs={}/{}",
+        state.session_active,
+        buf_secs,
+        result.header.is_some(),
+        result.header.as_ref().map(|h| h.version).unwrap_or(0),
+        result.header.as_ref().map(|h| h.flags).unwrap_or(0),
+        result.app_header.is_some(),
+        result.cw_bytes_map.len(),
+        result.converged_blocks,
+        result.total_blocks,
+        result.segments_decoded,
+        result.segments_lost,
+    ));
 
     // First signal → session_active : enables the max-duration guard.
     if !state.session_active && (result.app_header.is_some() || !result.cw_bytes_map.is_empty()) {
