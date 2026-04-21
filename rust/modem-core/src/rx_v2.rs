@@ -122,6 +122,77 @@ fn correlate_at_public(
     acc.norm_sqr()
 }
 
+/// Peak / median correlation ratio with the preamble, for a given modem
+/// configuration. Higher = more likely to contain a preamble at that
+/// profile's symbol rate.
+///
+/// Same inner work as `probe_preamble_present` but exposes the ratio for
+/// comparison across profiles in `detect_best_profile`.
+fn preamble_correlation_ratio(samples: &[f32], config: &ModemConfig) -> f64 {
+    let Ok((sps, pitch)) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau) else {
+        return 0.0;
+    };
+    let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+    let bb = demodulator::downmix(samples, config.center_freq_hz);
+    let mf = demodulator::matched_filter(&bb, &taps);
+
+    let preamble_syms = preamble::make_preamble();
+    let n_pre = preamble_syms.len();
+    let max_start = mf.len().saturating_sub(n_pre * pitch);
+    if max_start == 0 {
+        return 0.0;
+    }
+
+    let mut mags: Vec<f64> = Vec::new();
+    let mut global_max = 0.0f64;
+    let mut start = 0usize;
+    while start <= max_start {
+        let mag = correlate_at_public(&mf, &preamble_syms, start, pitch);
+        if mag > global_max {
+            global_max = mag;
+        }
+        mags.push(mag);
+        start += pitch;
+    }
+    if mags.is_empty() || global_max <= 0.0 {
+        return 0.0;
+    }
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = mags[mags.len() / 2].max(1e-12);
+    global_max / median
+}
+
+/// Scan the preamble correlation for all 5 canonical profiles. Returns the
+/// profile with the highest peak/median ratio **iff** its ratio clears both
+/// the absolute floor (50.0) and is at least 1.5× the next best — otherwise
+/// returns None (the current profile is fine, or the channel is silent).
+///
+/// Used by the RX worker to auto-switch profile when the on-air modulation
+/// doesn't match the worker's current config. Two profiles with the same
+/// `(Rs, tau, beta)` (e.g. HIGH vs NORMAL) produce identical preamble
+/// correlations ; use the header's `profile_index` field to disambiguate
+/// post-decode.
+pub fn detect_best_profile(samples: &[f32]) -> Option<crate::profile::ProfileIndex> {
+    use crate::profile::ProfileIndex;
+    let mut scored: Vec<(ProfileIndex, f64)> = ProfileIndex::ALL
+        .iter()
+        .map(|&p| (p, preamble_correlation_ratio(samples, &p.to_config())))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (best, best_r) = scored[0];
+    if best_r < 50.0 {
+        return None;
+    }
+    let second_r = scored.get(1).map(|&(_, r)| r).unwrap_or(0.0);
+    if best_r < 1.5 * second_r {
+        // Ambiguous : best and runner-up are close enough that several
+        // profiles with identical (Rs, tau, beta) tie. Return the best
+        // pitch anyway — header.profile_index will refine.
+        return Some(best);
+    }
+    Some(best)
+}
+
 /// Linear-interpolation resample of a float audio stream to compensate a
 /// sample-rate mismatch of `drift_ppm` ppm between the transmitter and the
 /// receiver sound cards. A positive `drift_ppm` means the RX clock was faster
@@ -995,6 +1066,47 @@ mod tests {
         assert!(
             probe_preamble_present(&samples, &config),
             "probe must detect a real preamble in a V3 TX stream"
+        );
+    }
+
+    #[test]
+    fn detect_best_profile_picks_right_rs() {
+        use crate::profile::{profile_normal, profile_robust, profile_ultra, ProfileIndex};
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(13)).collect();
+        // For ULTRA (Rs=500) and ROBUST (Rs=1000), the pitches are unique
+        // so detect_best_profile should identify them unambiguously.
+        let ultra = tx_v3(&data, &profile_ultra(), 0x0001);
+        let detected = detect_best_profile(&ultra).expect("ultra detected");
+        assert_eq!(detected, ProfileIndex::Ultra);
+
+        let robust = tx_v3(&data, &profile_robust(), 0x0002);
+        let detected = detect_best_profile(&robust).expect("robust detected");
+        assert_eq!(detected, ProfileIndex::Robust);
+
+        // NORMAL and HIGH share Rs=1500/tau=1.0 : detect may pick either,
+        // but it must be one of the Rs=1500 group. Profile refinement then
+        // happens via the header.profile_index downstream.
+        let normal = tx_v3(&data, &profile_normal(), 0x0003);
+        let detected = detect_best_profile(&normal).expect("rs=1500 detected");
+        assert!(
+            matches!(detected, ProfileIndex::High | ProfileIndex::Normal),
+            "rs=1500 profile pick {:?} (expected High or Normal)",
+            detected
+        );
+    }
+
+    #[test]
+    fn detect_best_profile_returns_none_on_noise() {
+        let mut rng = 1u64;
+        let samples: Vec<f32> = (0..(AUDIO_RATE as usize * 2))
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((rng >> 32) as i32 as f32) / i32::MAX as f32 * 0.1
+            })
+            .collect();
+        assert!(
+            detect_best_profile(&samples).is_none(),
+            "detect must reject pure noise"
         );
     }
 

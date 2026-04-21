@@ -513,20 +513,59 @@ fn scan_and_route(
     save_dir: &Arc<Mutex<PathBuf>>,
     state: &mut WorkerState,
 ) {
-    let config = state.config.clone();
     let buf_secs = state.session_buffer.len() as f64 / AUDIO_RATE as f64;
 
-    // Note : we used to gate rx_v3 in Idle with a cheap correlation probe,
-    // but the peak/median threshold proved too aggressive on OTA-attenuated
-    // signals (ULTRA / ROBUST / NORMAL failed to arm). The capture window
-    // already bounds CPU, so we just let rx_v3 handle detection.
+    // Auto-detect profile in Idle : scan the 5 profiles' pitches and
+    // reconfigure if the on-air Rs / tau doesn't match our current config.
+    // This is crucial for permanent-listening mode since the RX can't know
+    // which profile the remote station is transmitting.
+    if !state.session_active {
+        if let Some(detected) = rx_v2::detect_best_profile(&state.session_buffer) {
+            if detected != state.profile {
+                worker_log(&format!(
+                    "[auto-profile] idle correlation picked {:?} (was {:?})",
+                    detected, state.profile
+                ));
+                state.profile = detected;
+                state.config = detected.to_config();
+                // Fall through : rx_v3 below will run with the new config.
+            }
+        }
+    }
+
+    let config = state.config.clone();
+
     let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
         worker_log(&format!(
-            "[scan] active={} buf={:.1}s rx_v3=None",
-            state.session_active, buf_secs
+            "[scan] active={} buf={:.1}s rx_v3=None profile={:?}",
+            state.session_active, buf_secs, state.profile
         ));
         return;
     };
+
+    // Refine profile from the Golay-decoded header (disambiguates profiles
+    // that share Rs/tau/beta — e.g. HIGH vs NORMAL — by reading their
+    // canonical profile_index byte). If a mismatch is found, switch and
+    // discard this result : it was decoded with the wrong data constellation.
+    if let Some(ref hdr) = result.header {
+        if let Some(hdr_profile) = modem_core::profile::ProfileIndex::from_u8(hdr.profile_index) {
+            if hdr_profile != state.profile {
+                worker_log(&format!(
+                    "[auto-profile] header says {:?} (was {:?})",
+                    hdr_profile, state.profile
+                ));
+                state.profile = hdr_profile;
+                state.config = hdr_profile.to_config();
+                state.header = None;
+                state.announced_sessions.clear();
+                let _ = app.emit(
+                    "profile_auto_detected",
+                    serde_json::json!({ "profile": profile_name(state.profile) }),
+                );
+                return;
+            }
+        }
+    }
     let eot_seen = result.eot_seen;
     worker_log(&format!(
         "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4}",
