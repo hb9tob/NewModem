@@ -162,33 +162,49 @@ fn preamble_correlation_ratio(samples: &[f32], config: &ModemConfig) -> f64 {
     global_max / median
 }
 
-/// Scan the preamble correlation for all 5 canonical profiles. Returns the
-/// profile with the highest peak/median ratio **iff** its ratio clears both
-/// the absolute floor (50.0) and is at least 1.5× the next best — otherwise
-/// returns None (the current profile is fine, or the channel is silent).
+/// Scan the preamble correlation for all 5 canonical profiles. Returns
+/// the profile to switch to — or `None` if the current one is fine.
 ///
-/// Used by the RX worker to auto-switch profile when the on-air modulation
-/// doesn't match the worker's current config. Two profiles with the same
-/// `(Rs, tau, beta)` (e.g. HIGH vs NORMAL) produce identical preamble
-/// correlations ; use the header's `profile_index` field to disambiguate
-/// post-decode.
-pub fn detect_best_profile(samples: &[f32]) -> Option<crate::profile::ProfileIndex> {
+/// Rules :
+/// - Returns `None` if the best ratio is below 50 (no signal).
+/// - Returns `None` if the `current` profile has a ratio ≥ 90 % of the
+///   best (no meaningful improvement ; avoids oscillating on ties
+///   between profiles sharing `(Rs, τ, β)` like HIGH vs NORMAL).
+/// - Returns `None` if the best beats the runner-up by less than 1.5×
+///   (ambiguous pitch region — let the header `profile_index` refine
+///   downstream rather than picking at random).
+/// - Otherwise returns `Some(best)`.
+///
+/// The caller passes its current `ProfileIndex` so ties between the
+/// current profile and another profile at identical pitch are treated
+/// as "no change".
+pub fn detect_best_profile(
+    samples: &[f32],
+    current: crate::profile::ProfileIndex,
+) -> Option<crate::profile::ProfileIndex> {
     use crate::profile::ProfileIndex;
-    let mut scored: Vec<(ProfileIndex, f64)> = ProfileIndex::ALL
+    let scored: Vec<(ProfileIndex, f64)> = ProfileIndex::ALL
         .iter()
         .map(|&p| (p, preamble_correlation_ratio(samples, &p.to_config())))
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let (best, best_r) = scored[0];
+    let mut sorted = scored.clone();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (best, best_r) = sorted[0];
     if best_r < 50.0 {
         return None;
     }
-    let second_r = scored.get(1).map(|&(_, r)| r).unwrap_or(0.0);
-    if best_r < 1.5 * second_r {
-        // Ambiguous : best and runner-up are close enough that several
-        // profiles with identical (Rs, tau, beta) tie. Return the best
-        // pitch anyway — header.profile_index will refine.
-        return Some(best);
+    let current_r = scored
+        .iter()
+        .find(|&&(p, _)| p == current)
+        .map(|&(_, r)| r)
+        .unwrap_or(0.0);
+    // Current profile is already as good as the best (within 10 %) : keep
+    // it, no switch needed. This is the decisive check that prevents
+    // oscillation on (Rs, τ, β) ties — current being one of the tied
+    // profiles has a ratio equal to best_r, so we stay put. The header's
+    // profile_index refines the exact profile downstream.
+    if current_r >= 0.9 * best_r {
+        return None;
     }
     Some(best)
 }
@@ -1073,30 +1089,40 @@ mod tests {
     fn detect_best_profile_picks_right_rs() {
         use crate::profile::{profile_normal, profile_robust, profile_ultra, ProfileIndex};
         let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(13)).collect();
-        // For ULTRA (Rs=500) and ROBUST (Rs=1000), the pitches are unique
-        // so detect_best_profile should identify them unambiguously.
+        // Worker is currently configured in HIGH ; TX emits ULTRA / ROBUST.
+        // Unique pitches → must trigger a switch.
         let ultra = tx_v3(&data, &profile_ultra(), 0x0001);
-        let detected = detect_best_profile(&ultra).expect("ultra detected");
+        let detected = detect_best_profile(&ultra, ProfileIndex::High).expect("ultra detected");
         assert_eq!(detected, ProfileIndex::Ultra);
 
         let robust = tx_v3(&data, &profile_robust(), 0x0002);
-        let detected = detect_best_profile(&robust).expect("robust detected");
+        let detected = detect_best_profile(&robust, ProfileIndex::High).expect("robust detected");
         assert_eq!(detected, ProfileIndex::Robust);
 
-        // NORMAL and HIGH share Rs=1500/tau=1.0 : detect may pick either,
-        // but it must be one of the Rs=1500 group. Profile refinement then
-        // happens via the header.profile_index downstream.
+        // NORMAL shares Rs/τ/β with HIGH. If the worker is already in HIGH,
+        // detect_best_profile must return None (no switch : let the header
+        // refine). Otherwise we'd oscillate HIGH ↔ NORMAL every tick.
         let normal = tx_v3(&data, &profile_normal(), 0x0003);
-        let detected = detect_best_profile(&normal).expect("rs=1500 detected");
+        let detected = detect_best_profile(&normal, ProfileIndex::High);
         assert!(
-            matches!(detected, ProfileIndex::High | ProfileIndex::Normal),
-            "rs=1500 profile pick {:?} (expected High or Normal)",
+            detected.is_none(),
+            "tied pitch HIGH↔NORMAL must not switch when current is HIGH, got {:?}",
+            detected
+        );
+
+        // Same burst but worker currently in ULTRA : should switch to the
+        // Rs=1500 group (picks the first of the tied profiles by ALL order).
+        let detected = detect_best_profile(&normal, ProfileIndex::Ultra);
+        assert!(
+            matches!(detected, Some(ProfileIndex::High) | Some(ProfileIndex::Normal)),
+            "from ULTRA on NORMAL burst, expected HIGH or NORMAL pick, got {:?}",
             detected
         );
     }
 
     #[test]
     fn detect_best_profile_returns_none_on_noise() {
+        use crate::profile::ProfileIndex;
         let mut rng = 1u64;
         let samples: Vec<f32> = (0..(AUDIO_RATE as usize * 2))
             .map(|_| {
@@ -1105,7 +1131,7 @@ mod tests {
             })
             .collect();
         assert!(
-            detect_best_profile(&samples).is_none(),
+            detect_best_profile(&samples, ProfileIndex::High).is_none(),
             "detect must reject pure noise"
         );
     }

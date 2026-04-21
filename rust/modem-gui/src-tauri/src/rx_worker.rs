@@ -520,16 +520,14 @@ fn scan_and_route(
     // This is crucial for permanent-listening mode since the RX can't know
     // which profile the remote station is transmitting.
     if !state.session_active {
-        if let Some(detected) = rx_v2::detect_best_profile(&state.session_buffer) {
-            if detected != state.profile {
-                worker_log(&format!(
-                    "[auto-profile] idle correlation picked {:?} (was {:?})",
-                    detected, state.profile
-                ));
-                state.profile = detected;
-                state.config = detected.to_config();
-                // Fall through : rx_v3 below will run with the new config.
-            }
+        if let Some(detected) = rx_v2::detect_best_profile(&state.session_buffer, state.profile) {
+            worker_log(&format!(
+                "[auto-profile] idle correlation picked {:?} (was {:?})",
+                detected, state.profile
+            ));
+            state.profile = detected;
+            state.config = detected.to_config();
+            // Fall through : rx_v3 below will run with the new config.
         }
     }
 
