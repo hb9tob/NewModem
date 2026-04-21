@@ -543,8 +543,21 @@ fn scan_and_route(
         result.segments_lost,
     ));
 
-    // First signal → session_active : enables the max-duration guard.
-    if !state.session_active && (result.app_header.is_some() || !result.cw_bytes_map.is_empty()) {
+    // Transition to Capturing as soon as a V3 protocol header is Golay-
+    // decoded. Requiring app_header (meta LDPC) would deadlock : the Idle
+    // buffer is trimmed to 2 s, which is too short to decode the meta CW
+    // (needs ~0.7 s post-preamble including pilots). Golay(24,12) with 3
+    // correctable bits per block is reliable enough to trust as a preamble
+    // confirmation ; once active, the buffer grows to CAPTURE_WINDOW_SECONDS
+    // and subsequent ticks will populate the meta.
+    let header_ok = result
+        .header
+        .as_ref()
+        .map(|h| h.version == modem_core::frame::HEADER_VERSION_V3)
+        .unwrap_or(false);
+    if !state.session_active
+        && (header_ok || result.app_header.is_some() || !result.cw_bytes_map.is_empty())
+    {
         state.session_active = true;
         state.session_started_at = Instant::now();
         state.last_audio_above_silence_at = Instant::now();
