@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Modem NBFM — Trame V3 & architecture RX V3</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem 6rem;
+    }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block;
+        font-size: 1rem;
+        font-weight: 400;
+        color: #666;
+        margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 {
+        margin-top: 1.8rem;
+        color: #444;
+    }
+    figure {
+        margin: 1.5rem 0;
+        padding: 0.8rem;
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    figure img {
+        width: 100%;
+        height: auto;
+        display: block;
+        border-radius: 3px;
+    }
+    figcaption {
+        font-size: 0.9rem;
+        color: #555;
+        margin-top: 0.6rem;
+        font-style: italic;
+    }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em;
+        border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e;
+        color: #dcdcaa;
+        padding: 1rem;
+        border-radius: 5px;
+        overflow-x: auto;
+        font-size: 0.85rem;
+    }
+    pre code {
+        background: transparent;
+        color: inherit;
+        padding: 0;
+    }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+        font-size: 0.93rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.5rem 0.7rem;
+        text-align: left;
+        vertical-align: top;
+    }
+    th {
+        background: var(--accent-soft);
+        color: var(--accent);
+    }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: #fff8f0;
+        margin: 1rem 0;
+        border-radius: 0 4px 4px 0;
+    }
+    .callout.info {
+        border-left-color: var(--accent);
+        background: var(--accent-soft);
+    }
+    nav.toc {
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 1rem 1.5rem;
+        margin: 1.5rem 0;
+        font-size: 0.95rem;
+    }
+    nav.toc ol {
+        margin: 0.4rem 0 0 1rem;
+        padding: 0;
+    }
+    nav.toc a {
+        color: var(--accent);
+        text-decoration: none;
+    }
+    nav.toc a:hover {
+        text-decoration: underline;
+    }
+    .meta {
+        color: #888;
+        font-size: 0.88rem;
+        margin-top: -0.3rem;
+    }
+    .tag {
+        display: inline-block;
+        padding: 0.1em 0.5em;
+        background: var(--accent);
+        color: white;
+        border-radius: 3px;
+        font-size: 0.75rem;
+        margin-right: 0.3rem;
+        letter-spacing: 0.5px;
+    }
+    .tag.v3 { background: #7f2bbf; }
+    .tag.rx { background: #bf5f2b; }
+    .tag.tx { background: #2bbf7f; }
+    .swatch {
+        display: inline-block;
+        width: 0.9em;
+        height: 0.9em;
+        border: 1px solid #333;
+        vertical-align: middle;
+        margin-right: 0.3em;
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Modem NBFM — Trame V3 &amp; architecture RX V3
+    <span class="sub">Documentation technique — 2026-04-21 — signal V3 réel analysé en bas de page</span>
+</h1>
+
+<p class="meta">
+    Sources : <code>rust/modem-core/src/frame.rs</code>,
+    <code>rust/modem-core/src/rx_v2.rs</code>,
+    <code>rust/modem-core/src/sync.rs</code>,
+    <code>rust/modem-core/src/marker.rs</code>,
+    <code>rust/modem-core/src/pilot.rs</code>,
+    <code>rust/modem-core/src/preamble.rs</code>.
+    <br>
+    Diagrammes générés par <code>study/v3_architecture_diagrams.py</code>.
+</p>
+
+<nav class="toc">
+    <strong>Sommaire</strong>
+    <ol>
+        <li><a href="#intro">Introduction — objectif de la V3</a></li>
+        <li><a href="#frame">Trame V3 et modulation de chaque champ</a></li>
+        <li><a href="#constellations">Constellations utilisées</a></li>
+        <li><a href="#rx">Architecture RX V3 — pipeline et boucles</a></li>
+        <li><a href="#pilots">Pilotes et leurs usages</a></li>
+        <li><a href="#real">Analyse d'un signal V3 réel</a></li>
+        <li><a href="#cli">CLI et tests de référence</a></li>
+    </ol>
+</nav>
+
+<!-- ======================================================================= -->
+<h2 id="intro">1. Introduction — objectif de la V3</h2>
+
+<p>
+    La <strong>V3 est un sur-ensemble additif de la V2</strong> côté TX, et un
+    <strong>décodeur en fenêtre glissante</strong> qui réutilise <code>rx_v2</code>
+    côté RX. L'objectif est unique : <em>late-entry</em> et robustesse au drift long
+    en transmission radio OTA. Un récepteur qui démarre en milieu de flux (ou qui a
+    perdu la synchro) peut se raccrocher au préambule périodique suivant sans tout
+    rater.
+</p>
+
+<p>
+    La seule différence binaire entre une trame V2 et V3 est :
+</p>
+<ul>
+    <li>un <code>hdr.version = 3</code> (au lieu de 2),</li>
+    <li>l'insertion d'un <strong>préambule 256 QPSK + header 96 QPSK</strong> avant
+        <em>chaque</em> meta-segment périodique (hors du premier, déjà en tête).</li>
+</ul>
+
+<div class="callout info">
+    Overhead mesuré : <strong>~2.7 %</strong> en profil HIGH steady
+    (352 symboles ré-insérés tous les ~13 s).
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="frame">2. Trame V3 et modulation de chaque champ</h2>
+
+<figure>
+    <img src="../results/doc_v3/v3_frame_layout.png"
+         alt="Timeline trame V3 HIGH avec champs colorés" />
+    <figcaption>
+        <strong>Fig. 1 —</strong> timeline approchée (HIGH, 1500 Bd) de deux cycles
+        BOOT (cadence meta = 5 data-segs) suivis d'un cycle STEADY (cadence 10).
+        La flèche rouge pointe la réinsertion <code>PREAMBLE + HEADER</code> typique
+        V3. Chaque couleur correspond à un champ de modulation distincte.
+    </figcaption>
+</figure>
+
+<table>
+    <thead>
+        <tr>
+            <th>Champ</th>
+            <th>Taille</th>
+            <th>Modulation</th>
+            <th>Contenu</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><span class="swatch" style="background:#2b7fbf"></span><strong>PREAMBLE</strong></td>
+            <td>256 syms</td>
+            <td>QPSK fixe<br>(seed 1234)</td>
+            <td>Séquence déterministe connue. Utilisée pour l'acquisition et l'entraînement FFE.</td>
+        </tr>
+        <tr>
+            <td><span class="swatch" style="background:#7fbf3f"></span><strong>HEADER v3</strong></td>
+            <td>96 syms</td>
+            <td>QPSK<br>Golay(24,12)×8</td>
+            <td>version (=3), payload_length, mode_code, flags.</td>
+        </tr>
+        <tr>
+            <td><span class="swatch" style="background:#bf5f2b"></span><strong>MARKER</strong></td>
+            <td>128 syms</td>
+            <td>QPSK</td>
+            <td>32 sync fixe + 96 ctrl Golay+CRC8 portant seg_id, session_id_low, base_esi, META_FLAG.</td>
+        </tr>
+        <tr>
+            <td><span class="swatch" style="background:#bfa02b"></span><strong>META segment</strong></td>
+            <td>1 CW LDPC</td>
+            <td>16-APSK<br>(LDPC 3/4)</td>
+            <td>AppHeader répliqué 4 fois : session_id, file_size, k_symbols, t_bytes, mode, mime, hash, CRC16.</td>
+        </tr>
+        <tr>
+            <td><span class="swatch" style="background:#8b2bbf"></span><strong>DATA segment</strong></td>
+            <td>2 CW LDPC</td>
+            <td>16-APSK<br>(configurable)</td>
+            <td>Payload utile (image, fichier). Entrelacé puis décodé LDPC à la volée.</td>
+        </tr>
+        <tr>
+            <td><span class="swatch" style="background:#2bbfaf"></span><strong>TDM pilots</strong></td>
+            <td>2 syms<br>par groupe de 32</td>
+            <td>QPSK<br>cycle π/2</td>
+            <td>Séquence connue continue sur tout le segment. Insérés tous les <code>D_SYMS=32</code> data-syms.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3>2.1 Zoom — structure interne d'un data segment</h3>
+
+<pre><code>┌─ MK ─┬── groupe 0 ────────┬── groupe 1 ────────┬── groupe 2 ────────┬ …
+│ 128  │ 32 data   │ 2 pil  │ 32 data   │ 2 pil  │ 32 data   │ 2 pil  │
+│ QPSK │ 16-APSK   │ QPSK   │ 16-APSK   │ QPSK   │ 16-APSK   │ QPSK   │
+└──────┴───────────┴────────┴───────────┴────────┴───────────┴────────┘
+                       ↑                     ↑
+                       └─── LS gain complexe par groupe (2 pilots) ──→
+                            phase unwrap → smooth → interp linéaire
+                            appliqué sur les 32 data-syms du groupe
+</code></pre>
+
+<p>
+    Constantes : <code>D_SYMS = 32</code>, <code>P_SYMS = 2</code>, cycle pilote
+    <code>pilot_symbol(n) = exp(j · (n mod 4) · π/2)</code>
+    (<code>pilot.rs:11-14</code>).
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="constellations">3. Constellations utilisées</h2>
+
+<figure>
+    <img src="../results/doc_v3/v3_constellations.png"
+         alt="QPSK, 16-APSK et TDM pilot constellations" />
+    <figcaption>
+        <strong>Fig. 2 —</strong> les trois constellations effectivement émises dans
+        une trame V3. QPSK sur cercle unité (préambule / header / marker), 16-APSK
+        DVB-S2 à deux anneaux (data + meta), et la séquence pilote TDM qui parcourt
+        cycliquement les 4 phases QPSK (flèches vertes).
+    </figcaption>
+</figure>
+
+<!-- ======================================================================= -->
+<h2 id="rx">4. Architecture RX V3 — pipeline et boucles de rétroaction</h2>
+
+<figure>
+    <img src="../results/doc_v3/v3_rx_block_diagram.png"
+         alt="Schéma bloc RX V3 avec boucles de rétroaction" />
+    <figcaption>
+        <strong>Fig. 3 —</strong> pipeline RX V3 complet. La boucle externe (bande
+        grise) traite chaque fenêtre glissante <code>[P_i − margin .. P_{i+1} +
+        margin]</code> comme une transmission V2 autonome. Trois boucles de
+        rétroaction internes : <span style="color:#7f2bbf">grid ppm (violet)</span>,
+        <span style="color:#bf5f2b">FFE LMS DD (orange)</span>,
+        <span style="color:#bf2b2b">marker narrow↔wide (rouge)</span>.
+    </figcaption>
+</figure>
+
+<h3>4.1 Étapes et éléments de trame utilisés</h3>
+
+<table>
+    <thead>
+        <tr>
+            <th>Étape RX</th>
+            <th>Fonction Rust</th>
+            <th>Élément de trame utilisé</th>
+            <th>Rôle</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>1. downmix</td>
+            <td><code>demodulator::downmix</code></td>
+            <td>—</td>
+            <td>Ramène le signal à la bande de base (e<sup>−j2πf<sub>c</sub>t</sup>).</td>
+        </tr>
+        <tr>
+            <td>2. matched filter</td>
+            <td><code>demodulator::matched_filter</code></td>
+            <td>—</td>
+            <td>Filtre RRC (β, span=12 syms, sps).</td>
+        </tr>
+        <tr>
+            <td>3. détection préambules</td>
+            <td><code>sync::find_all_preambles</code></td>
+            <td>PREAMBLE</td>
+            <td>Coarse scan pas <code>pitch</code>, threshold 0.3·max, NMS min_sep=128·pitch, fine refine ±pitch.</td>
+        </tr>
+        <tr>
+            <td>4.A grid ppm</td>
+            <td><code>rx_v2::rx_v2</code></td>
+            <td>—</td>
+            <td>Resample ±80 ppm par 20, refine ±10 par 5. Score = segs + 10·(converged/total)·total.</td>
+        </tr>
+        <tr>
+            <td>4.B.1 find_preamble</td>
+            <td><code>sync::find_preamble</code></td>
+            <td>PREAMBLE</td>
+            <td>Lock unique de la fenêtre courante.</td>
+        </tr>
+        <tr>
+            <td>4.B.2 FFE LS train</td>
+            <td><code>ffe::train_ffe_ls</code></td>
+            <td>PREAMBLE (256 syms)</td>
+            <td>Closed-form Gauss-Jordan sur matrice Hermitienne (n_ff≈8·sps+1).</td>
+        </tr>
+        <tr>
+            <td>4.B.3 FFE LMS train+DD</td>
+            <td><code>ffe::apply_ffe_lms_with_training</code></td>
+            <td>PREAMBLE puis slicer 16-APSK</td>
+            <td>TRAIN μ=0.10 sur préambule, puis DD μ=0.02. <strong>Boucle fermée : taps += μ·err·conj(x)</strong>.</td>
+        </tr>
+        <tr>
+            <td>4.B.4 Global gain LS</td>
+            <td>inline (<code>rx_v2.rs:342</code>)</td>
+            <td>PREAMBLE</td>
+            <td>Normalise amplitude + phase résiduelle.</td>
+        </tr>
+        <tr>
+            <td>4.B.5 decode header</td>
+            <td><code>header::decode_header_symbols</code></td>
+            <td>HEADER</td>
+            <td>Version ∈ {2,3}, sinon fenêtre rejetée.</td>
+        </tr>
+        <tr>
+            <td>4.B.6 marker walk</td>
+            <td><code>marker::find_sync_in_window</code><br><code>marker::decode_marker_at</code></td>
+            <td>MARKER (sync + ctrl)</td>
+            <td>Fenêtre de recherche NARROW=8 → WIDE=512 après 2 échecs consécutifs (récup. squelch).</td>
+        </tr>
+        <tr>
+            <td>4.B.7 track_segment</td>
+            <td><code>rx_v2::track_segment</code></td>
+            <td>TDM pilots</td>
+            <td>LS gain par groupe, phase unwrap, smooth 3-pt, interp linéaire, σ² sur résidu pilot.</td>
+        </tr>
+        <tr>
+            <td>4.B.8 LLR + LDPC</td>
+            <td><code>soft_demod::llr_maxlog</code><br><code>LdpcDecoder::decode_to_bytes</code></td>
+            <td>DATA / META segments</td>
+            <td>LLR max-log, déinterleave, LDPC 50 itérations.</td>
+        </tr>
+        <tr>
+            <td>5. merge</td>
+            <td>inline (<code>rx_v2.rs:638-640</code>)</td>
+            <td>—</td>
+            <td><strong>First-wins</strong> par ESI sur toutes les fenêtres.</td>
+        </tr>
+        <tr>
+            <td>6. assembly</td>
+            <td>inline (<code>rx_v2.rs:660-670</code>)</td>
+            <td>AppHeader.file_size</td>
+            <td>Parcours ESI 0..n_source_cw, zero-pad manquants, truncate.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3>4.2 Boucles de rétroaction actives</h3>
+
+<table>
+    <thead>
+        <tr>
+            <th>Boucle</th>
+            <th>Portée</th>
+            <th>Variable corrigée</th>
+            <th>Signal d'erreur</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><span class="tag" style="background:#7f2bbf">grid</span></td>
+            <td>per-window</td>
+            <td>drift ppm (resample audio)</td>
+            <td>score_result = segs_decodés + 10·conv_frac·total</td>
+        </tr>
+        <tr>
+            <td><span class="tag" style="background:#bf5f2b">LMS-DD</span></td>
+            <td>per-symbol</td>
+            <td>taps FFE T/2</td>
+            <td>ŝ − y (slicer 16-APSK en mode DD, μ=0.02)</td>
+        </tr>
+        <tr>
+            <td><span class="tag" style="background:#bf2b2b">marker</span></td>
+            <td>per-segment</td>
+            <td>position curseur</td>
+            <td>échecs consécutifs → élargir fenêtre de recherche</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout">
+    Le module <code>DdPll</code> est déclaré (<code>pll.rs</code>, α=0.05, β=α²/4)
+    mais <strong>pas actif</strong> dans <code>track_segment</code> : le paramètre
+    est <code>_pll</code> en underscore. Il est conservé pour la phase 3 (turbo-EQ
+    MEGA). Le tracking phase/amplitude actuel passe uniquement par les pilots TDM.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="pilots">5. Pilotes et leurs usages</h2>
+
+<p>
+    Le modem embarque <strong>cinq séquences connues</strong> exploitées à des
+    échelles différentes. Certaines servent à l'acquisition (préambule), d'autres
+    au tracking continu (pilots TDM), d'autres à la resynchronisation segment par
+    segment (marker sync).
+</p>
+
+<figure>
+    <img src="../results/doc_v3/v3_pilots_matrix.png"
+         alt="Matrice pilotes × modules RX" />
+    <figcaption>
+        <strong>Fig. 4 —</strong> matrice d'utilisation. En ligne : les cinq pilotes.
+        En colonne : les modules RX qui les consomment. ● = usage primaire,
+        ○ = usage secondaire. La répartition orthogonale illustre la séparation des
+        rôles : PREAMBLE acquisition, HEADER décodage protocole, MARKER resync,
+        TDM tracking.
+    </figcaption>
+</figure>
+
+<h3>5.1 Détail par pilote</h3>
+
+<table>
+    <thead>
+        <tr>
+            <th>Pilote</th>
+            <th>Longueur</th>
+            <th>Modulation</th>
+            <th>Usages RX principaux</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>PREAMBLE</strong></td>
+            <td>256 syms</td>
+            <td>QPSK fixe<br>(seed 1234)</td>
+            <td>
+                1. find_preamble + find_all_preambles (corr NMS)<br>
+                2. FFE LS-train (closed-form)<br>
+                3. FFE LMS train phase (μ=0.10)<br>
+                4. Global gain LS (amplitude + phase)<br>
+                5. V2 fallback : estimation drift ppm
+            </td>
+        </tr>
+        <tr>
+            <td><strong>HEADER v3</strong></td>
+            <td>96 syms</td>
+            <td>QPSK Golay(24,12)×8</td>
+            <td>version, payload_length, mode_code, flags (fenêtre dimensionnée).</td>
+        </tr>
+        <tr>
+            <td><strong>MARKER sync</strong></td>
+            <td>32 syms</td>
+            <td>QPSK fixe (32 phases hardcodées)</td>
+            <td>
+                1. find_sync_in_window (corrélation + NMS)<br>
+                2. local gain LS (rattrape drift FFE inter-segment)
+            </td>
+        </tr>
+        <tr>
+            <td><strong>MARKER ctrl</strong></td>
+            <td>96 syms</td>
+            <td>QPSK Golay + CRC8</td>
+            <td>
+                seg_id, session_id_low, base_esi, META_FLAG.<br>
+                Session lock → stop si session_id_low change.
+            </td>
+        </tr>
+        <tr>
+            <td><strong>TDM pilots</strong></td>
+            <td>2 syms / 32 data</td>
+            <td>QPSK cycle (0, π/2, π, 3π/2)</td>
+            <td>
+                1. LS gain complexe par groupe<br>
+                2. phase unwrap + smooth 3-pt<br>
+                3. interpolation linéaire per-sym (inv_gain)<br>
+                4. σ² résidu → estime sigma² pour LLR
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="real">6. Analyse d'un signal V3 réel</h2>
+
+<p>
+    Pour valider les diagrammes schématiques, les trois graphiques suivants sont
+    produits à partir d'un vrai flux V3 généré par le CLI :
+</p>
+
+<pre><code>./rust/target/release/nbfm-modem.exe tx \
+    --input /tmp/v3_ref.bin \
+    --output results/doc_v3/v3_ref_high.wav \
+    --profile HIGH --frame-version 3 --callsign HB9TOB \
+    --filename v3_ref.bin
+# → 10 kB payload, 25.39 s de WAV mono 48 kHz, 9 meta-cycles attendus</code></pre>
+
+<figure>
+    <img src="../results/doc_v3/v3_real_signal_spectrogram.png"
+         alt="Spectrogramme du signal V3 + préambules détectés" />
+    <figcaption>
+        <strong>Fig. 5 —</strong> spectrogramme du WAV V3 (HIGH, 10 kB de charge
+        utile). Les lignes rouges verticales marquent les <strong>5 positions
+        de préambule détectées</strong> par l'algorithme <code>find_all_preambles</code>.
+        Elles tombent à 0.00 s, 5.24 s, 10.47 s, 15.71 s, 20.94 s — espacement régulier
+        d'environ 5.23 s qui correspond exactement au cycle BOOT de cadence 5
+        à HIGH (5 data-segs × 2 CW × ~0.47 s + meta + preamble/header).
+    </figcaption>
+</figure>
+
+<figure>
+    <img src="../results/doc_v3/v3_real_signal_preamble_corr.png"
+         alt="Trace de corrélation préambule" />
+    <figcaption>
+        <strong>Fig. 6 —</strong> magnitude de la corrélation du signal matché avec
+        la séquence préambule déterministe, calculée au pas <code>pitch</code>
+        (scan brute-force). Les cinq pics dépassent le seuil 0.3·max et sont
+        conservés par la NMS (<code>min_sep = 128·pitch</code>) pour former la liste
+        <code>positions</code> qui pilote les fenêtres glissantes du RX V3.
+    </figcaption>
+</figure>
+
+<figure>
+    <img src="../results/doc_v3/v3_real_signal_constellation.png"
+         alt="Constellation mesurée" />
+    <figcaption>
+        <strong>Fig. 7 —</strong> à gauche, les 256 symboles du premier préambule
+        après matched-filter et gain LS : la constellation QPSK attendue sort proprement
+        à 4 points compacts (signal synthétique sans canal). À droite, un échantillon
+        des ~400 symboles suivants — mélange de 16-APSK (data), QPSK pilots (TDM) et
+        QPSK marker. Avant que <code>track_segment</code> applique la correction per-group,
+        la constellation apparaît mélangée ; l'équalisation FFE + le tracking pilote
+        la ramèneront à la grille 16-APSK idéale dessinée en Fig. 2.
+    </figcaption>
+</figure>
+
+<div class="callout info">
+    <strong>Points remarquables de l'analyse réelle :</strong><br>
+    • les 5 pics de corrélation confirment les <em>cinq</em> points de
+    resynchronisation utilisables par le RX V3 ;<br>
+    • le plancher de bruit de la corrélation est à ~50 unités contre ~315 aux pics,
+    soit un facteur 6 (~15 dB) de marge avant le seuil 0.3·max — même en canal
+    bruité OTA, la détection reste robuste ;<br>
+    • l'espacement constant 5.23 s matche la cadence BOOT prédite
+    (<code>V2_META_CADENCE_BOOT = 5</code>).
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="cli">7. CLI et test de référence</h2>
+
+<h3>7.1 Dispatch CLI V2 / V3</h3>
+
+<pre><code>// rust/modem-cli/src/main.rs
+
+// TX
+let symbols = if frame_version == 3 {
+    modem_core::frame::build_superframe_v3(&wire_payload, &config, sid, mime, hash)
+} else {
+    modem_core::frame::build_superframe_v2(&wire_payload, &config, sid, mime, hash)
+};
+
+// RX
+let decode_result = if frame_version == 3 {
+    modem_core::rx_v2::rx_v3(&samples, &config)
+} else {
+    modem_core::rx_v2::rx_v2(&samples, &config)
+};</code></pre>
+
+<p>
+    Le flag <code>--frame-version {1|2|3}</code> sélectionne la variante à la fois
+    au TX et au RX. La détection est <strong>explicite</strong> en CLI, pas
+    auto-sniffée sur le header. Côté code de décodage, <code>rx_v2</code> accepte
+    <code>HEADER_VERSION_V2 || HEADER_VERSION_V3</code>
+    (<code>rx_v2.rs:362</code>) ; il peut donc décoder le premier cycle d'un flux
+    V3, mais ratera les suivants faute de ré-ancrage périodique — d'où
+    l'existence de <code>rx_v3</code>.
+</p>
+
+<h3>7.2 Test de loopback</h3>
+
+<pre><code>// rust/modem-core/src/rx_v2.rs — tests module
+
+#[test]
+fn loopback_v3_high_sliding_window() {
+    let config = profile_high();
+    let data: Vec&lt;u8&gt; = (0..15_000)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+        .collect();
+    let samples = tx_v3(&amp;data, &amp;config, 0x1234_5678);
+    let result = rx_v3(&amp;samples, &amp;config).expect("rx_v3 returned None");
+
+    assert!(result.app_header.is_some(), "AppHeader manquant");
+    assert_eq!(&amp;result.data[..data.len()], &amp;data[..],
+               "V3 loopback : non bit-exact");
+}</code></pre>
+
+<p>
+    Résultat commité (<code>ab587bc</code>) : <strong>76/76 blocs convergés,
+    70/70 codewords, bit-exact</strong> sur 15 kB @ HIGH.
+</p>
+
+<!-- ======================================================================= -->
+<hr style="margin-top:4rem; border:none; border-top:1px solid var(--border);">
+<p class="meta">
+    Document généré le 2026-04-21. Pour régénérer les graphiques :
+    <code>/c/Users/tous/radioconda/python.exe study/v3_architecture_diagrams.py</code>.
+    Le WAV de référence est <code>results/doc_v3/v3_ref_high.wav</code> (créé par
+    <code>nbfm-modem tx --frame-version 3</code>).
+</p>
+
+</div>
+</body>
+</html>
