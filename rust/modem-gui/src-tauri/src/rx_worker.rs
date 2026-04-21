@@ -263,6 +263,17 @@ const MAX_SESSION_SECONDS: u64 = 25 * 60;
 /// preamble already partially landing in this tick to still be detected.
 const PREROLL_SECONDS: usize = 2;
 
+/// While capturing, keep only this many seconds of trailing audio. Covers
+/// two V3 preamble periods (4 s each) + safety margin, so every codeword is
+/// still inside a window containing its anchoring preamble, but the buffer
+/// never grows past a bounded size and rx_v3 stays fast.
+const CAPTURE_WINDOW_SECONDS: usize = 10;
+
+/// Fall back to Idle if no preamble has been seen for this long while
+/// Capturing — covers the case where the sender disappears mid-burst without
+/// sending an EOT.
+const PREAMBLE_SILENCE_TIMEOUT_S: u64 = 6;
+
 // ---------------------------------------------------------------------------
 // Worker state
 // ---------------------------------------------------------------------------
@@ -270,10 +281,9 @@ const PREROLL_SECONDS: usize = 2;
 struct WorkerState {
     config: ModemConfig,
     profile: ProfileIndex,
-    /// Accumulated audio for the current capture. Grown per batch ; trimmed
-    /// to ~2 s of pre-roll while idle so the buffer doesn't explode on pure
-    /// noise. Crossed captures are isolated (the store persists between
-    /// captures, the audio buffer doesn't).
+    /// Accumulated audio for the current capture. Rolled to PREROLL_SECONDS
+    /// while Idle (cheap noise buffer) ; bounded to CAPTURE_WINDOW_SECONDS
+    /// while Capturing so rx_v3 stays fast even on long salves.
     session_buffer: Vec<f32>,
     /// Disk-persistent store of decoded codewords, per session_id.
     store: SessionStore,
@@ -285,10 +295,13 @@ struct WorkerState {
     header: Option<Header>,
     last_scan_at: Instant,
     last_audio_above_silence_at: Instant,
-    /// True once we've seen any signal — controls whether the max-duration
-    /// guard fires.
+    /// True once we've seen a valid preamble — Idle vs Capturing phase flag.
     session_active: bool,
     session_started_at: Instant,
+    /// Last time a preamble was confirmed via rx_v3 (== last tick that
+    /// produced an app_header). Used to fall back to Idle when the sender
+    /// disappears mid-burst without sending EOT.
+    last_preamble_seen_at: Instant,
     total_samples: u64,
 }
 
@@ -307,6 +320,7 @@ impl WorkerState {
             last_audio_above_silence_at: now,
             session_active: false,
             session_started_at: now,
+            last_preamble_seen_at: now,
             total_samples: 0,
         }
     }
@@ -408,18 +422,19 @@ fn run_worker(
             state.last_audio_above_silence_at = Instant::now();
         }
 
-        // Append to the session buffer (only if the session is active or we
-        // want to give rx_v3 a chance to find a preamble anywhere in the
-        // recent past ; always appending is fine since we reset on session
-        // end. We keep a rolling 1-second head of pre-preamble audio while
-        // the session is inactive to avoid unbounded growth on pure noise.)
+        // Append + rolling trim. Idle = PREROLL_SECONDS (just enough for a
+        // preamble landing across batch boundaries). Capturing =
+        // CAPTURE_WINDOW_SECONDS (≥ 2 × V3 preamble period, bounds rx_v3 CPU).
         state.session_buffer.extend_from_slice(&batch);
-        if !state.session_active {
-            let keep = AUDIO_RATE as usize * 2; // 2 s of pre-roll
-            let len = state.session_buffer.len();
-            if len > keep {
-                state.session_buffer.drain(..len - keep);
-            }
+        let keep_secs = if state.session_active {
+            CAPTURE_WINDOW_SECONDS
+        } else {
+            PREROLL_SECONDS
+        };
+        let keep = AUDIO_RATE as usize * keep_secs;
+        let len = state.session_buffer.len();
+        if len > keep {
+            state.session_buffer.drain(..len - keep);
         }
 
         maintenance_tick(&app, &save_dir, &mut state);
@@ -463,10 +478,23 @@ fn maintenance_tick(
         scan_and_route(app, save_dir, state);
     }
 
-    // Buffer-length guard : if a session has been "active" (signal was seen)
-    // for more than MAX_SESSION_SECONDS without the user stopping, trim the
-    // audio buffer to avoid unbounded growth. The disk store is unaffected
-    // and keeps its packets.
+    // Preamble-silence fallback : if we're Capturing but haven't seen a
+    // confirmed preamble for PREAMBLE_SILENCE_TIMEOUT_S, the sender likely
+    // vanished mid-burst (no EOT received). Drop back to Idle so the next
+    // salve starts cleanly on a 2-s pre-roll rather than accumulating
+    // staleness.
+    if state.session_active {
+        let since_preamble = now.duration_since(state.last_preamble_seen_at);
+        if since_preamble >= Duration::from_secs(PREAMBLE_SILENCE_TIMEOUT_S) {
+            worker_log("[worker] preamble silence timeout, returning to Idle");
+            state.trim_buffer_to_preroll();
+        }
+    }
+
+    // Hard cap : if a session has been "active" for more than
+    // MAX_SESSION_SECONDS without the user stopping (stuck state, bug, etc.),
+    // trim the audio buffer defensively. The disk store is unaffected and
+    // keeps its packets.
     if state.session_active {
         let active_for = now.duration_since(state.session_started_at);
         if active_for >= Duration::from_secs(MAX_SESSION_SECONDS) {
@@ -486,6 +514,14 @@ fn scan_and_route(
     state: &mut WorkerState,
 ) {
     let config = state.config.clone();
+
+    // Idle gate : cheap preamble probe (correlation peak / median ratio)
+    // before engaging the full rx_v3 pipeline. Skips FFE/LDPC on pure
+    // noise — required for permanent-listening mode to stay real-time.
+    if !state.session_active && !rx_v2::probe_preamble_present(&state.session_buffer, &config) {
+        return;
+    }
+
     let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
         return;
     };
@@ -496,6 +532,7 @@ fn scan_and_route(
         state.session_active = true;
         state.session_started_at = Instant::now();
         state.last_audio_above_silence_at = Instant::now();
+        state.last_preamble_seen_at = Instant::now();
         let _ = app.emit(
             "preamble",
             PreamblePayload {
@@ -530,6 +567,9 @@ fn scan_and_route(
         }
         return;
     };
+    // A valid AppHeader decoded → a preamble is confirmed on-air. Reset the
+    // preamble-silence timer.
+    state.last_preamble_seen_at = Instant::now();
 
     // Announce the session once per session_id seen. If the session is
     // already decoded on disk (e.g. same file re-transmitted after an earlier

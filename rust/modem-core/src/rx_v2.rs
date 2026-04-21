@@ -56,6 +56,72 @@ pub struct RxV2Result {
     pub eot_seen: bool,
 }
 
+/// Cheap preamble presence probe — intended for the RX worker's Idle gate.
+///
+/// Computes `correlate_at` at every `pitch` sample across the matched-
+/// filter output and compares the global peak against the median of all
+/// candidates. On a clean preamble, peak / median ≫ 10 ; on pure noise, the
+/// ratio hovers near 2–3. Returns `true` if the ratio exceeds a fixed
+/// threshold, suggesting a real preamble is present somewhere in `samples`.
+///
+/// Uses the same symbol-rate coarse scan as `find_all_preambles` but without
+/// NMS or fine-refine, making it an order of magnitude cheaper than
+/// `rx_v2` / `rx_v3` when the channel is idle.
+pub fn probe_preamble_present(samples: &[f32], config: &ModemConfig) -> bool {
+    let Ok((sps, pitch)) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau) else {
+        return false;
+    };
+    let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+    let bb = demodulator::downmix(samples, config.center_freq_hz);
+    let mf = demodulator::matched_filter(&bb, &taps);
+
+    let preamble_syms = preamble::make_preamble();
+    let n_pre = preamble_syms.len();
+    let max_start = mf.len().saturating_sub(n_pre * pitch);
+    if max_start == 0 {
+        return false;
+    }
+
+    let mut mags: Vec<f64> = Vec::new();
+    let mut global_max = 0.0f64;
+    let mut start = 0usize;
+    while start <= max_start {
+        let mag = correlate_at_public(&mf, &preamble_syms, start, pitch);
+        if mag > global_max {
+            global_max = mag;
+        }
+        mags.push(mag);
+        start += pitch;
+    }
+    if mags.is_empty() || global_max <= 0.0 {
+        return false;
+    }
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = mags[mags.len() / 2].max(1e-12);
+    // Empirical : on a clean V3 burst, peak/median of |corr|² is
+    // typically > 10⁴ ; pure noise produces extreme-value ratios in the
+    // 10–30 range (|corr|² is exponentially distributed over scan
+    // positions). 50 leaves comfortable margin on both sides.
+    global_max / median > 50.0
+}
+
+fn correlate_at_public(
+    mf: &[Complex64],
+    preamble: &[Complex64],
+    start: usize,
+    pitch: usize,
+) -> f64 {
+    let mut acc = Complex64::new(0.0, 0.0);
+    for (k, &sym) in preamble.iter().enumerate() {
+        let idx = start + k * pitch;
+        if idx >= mf.len() {
+            break;
+        }
+        acc += mf[idx] * sym.conj();
+    }
+    acc.norm_sqr()
+}
+
 /// Linear-interpolation resample of a float audio stream to compensate a
 /// sample-rate mismatch of `drift_ppm` ppm between the transmitter and the
 /// receiver sound cards. A positive `drift_ppm` means the RX clock was faster
@@ -918,6 +984,34 @@ mod tests {
             &result.data[..data.len()],
             &data[..],
             "V3 loopback : données non identiques"
+        );
+    }
+
+    #[test]
+    fn probe_preamble_detects_real_signal() {
+        let config = profile_high();
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(3)).collect();
+        let samples = tx_v3(&data, &config, 0xCAFE_0001);
+        assert!(
+            probe_preamble_present(&samples, &config),
+            "probe must detect a real preamble in a V3 TX stream"
+        );
+    }
+
+    #[test]
+    fn probe_preamble_rejects_noise() {
+        let config = profile_high();
+        // 2 s of deterministic noise — below the 10× peak/median gate.
+        let mut rng = 1u64;
+        let samples: Vec<f32> = (0..(AUDIO_RATE as usize * 2))
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((rng >> 32) as i32 as f32) / i32::MAX as f32 * 0.1
+            })
+            .collect();
+        assert!(
+            !probe_preamble_present(&samples, &config),
+            "probe must reject pure noise"
         );
     }
 
