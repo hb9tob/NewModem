@@ -716,7 +716,7 @@ fn scan_and_route(
                 blocks_expected: expected,
                 sigma2,
                 converged_bitmap: outcome.seen_bitmap.clone(),
-                constellation_sample: Vec::new(),
+                constellation_sample: result.constellation_sample.clone(),
             },
         );
     }

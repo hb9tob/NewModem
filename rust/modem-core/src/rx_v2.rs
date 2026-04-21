@@ -54,6 +54,12 @@ pub struct RxV2Result {
     /// Any decoded header in this window (single-pass) or across windows
     /// (rx_v3) carried FLAG_EOT — the TX explicitly signalled end-of-burst.
     pub eot_seen: bool,
+    /// Sample of post-equalisation data symbols (Re, Im) from this window's
+    /// data segments. Meta segments are excluded (they're encoded with
+    /// the data constellation but appear only once per cycle, biasing the
+    /// scatter). Capped at ~500 points — the GUI displays them as a
+    /// scatter plot.
+    pub constellation_sample: Vec<[f32; 2]>,
 }
 
 /// Cheap preamble presence probe — intended for the RX worker's Idle gate.
@@ -541,6 +547,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let mut segments_lost: usize = 0;
     let mut sigma2_sum: f64 = 0.0;
     let mut sigma2_count: usize = 0;
+    const MAX_CONSTELLATION_POINTS: usize = 500;
+    let mut constellation_sample: Vec<[f32; 2]> = Vec::new();
 
     // Session: first valid marker we see locks session_id_low; later markers
     // with a different session_id_low indicate a session change → we stop
@@ -642,6 +650,23 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             continue;
         }
 
+        // Sample post-equalised DATA symbols for the constellation scatter
+        // plot. Meta segments are excluded (their content is the AppHeader
+        // replicated, would bias the cloud toward a subset of constellation
+        // points).
+        if !marker_payload.is_meta() && constellation_sample.len() < MAX_CONSTELLATION_POINTS {
+            let remaining = MAX_CONSTELLATION_POINTS - constellation_sample.len();
+            let step = (seg_data_syms.len() / remaining.max(1)).max(1);
+            for (i, sym) in seg_data_syms.iter().enumerate() {
+                if i % step == 0 {
+                    constellation_sample.push([sym.re as f32, sym.im as f32]);
+                    if constellation_sample.len() >= MAX_CONSTELLATION_POINTS {
+                        break;
+                    }
+                }
+            }
+        }
+
         // Use a per-segment sigma² estimate if available, else a reasonable default
         let sigma2_for_llr = if sigma2_count > 0 {
             (sigma2_sum / sigma2_count as f64).max(1e-6)
@@ -735,6 +760,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         data_blocks_recovered,
         cw_bytes_map: cw_bytes,
         eot_seen,
+        constellation_sample,
     })
 }
 
@@ -785,6 +811,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let mut sigma2_sum = 0.0f64;
     let mut sigma2_count = 0usize;
     let mut eot_seen = false;
+    let mut last_constellation: Vec<[f32; 2]> = Vec::new();
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -830,6 +857,12 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         sigma2_count += 1;
         if r.eot_seen {
             eot_seen = true;
+        }
+        // Keep only the most recent window's scatter — it reflects the
+        // current channel state, whereas stacking older windows would
+        // smear drift / FFO evolution across the display.
+        if !r.constellation_sample.is_empty() {
+            last_constellation = r.constellation_sample;
         }
     }
 
@@ -883,6 +916,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         data_blocks_recovered,
         cw_bytes_map: merged,
         eot_seen,
+        constellation_sample: last_constellation,
     })
 }
 
