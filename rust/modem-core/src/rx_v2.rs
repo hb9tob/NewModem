@@ -51,6 +51,9 @@ pub struct RxV2Result {
     /// Exposed so that `rx_v3` can merge per-window maps when sliding-window
     /// decoding a v3 stream.
     pub cw_bytes_map: HashMap<u32, Vec<u8>>,
+    /// Any decoded header in this window (single-pass) or across windows
+    /// (rx_v3) carried FLAG_EOT — the TX explicitly signalled end-of-burst.
+    pub eot_seen: bool,
 }
 
 /// Linear-interpolation resample of a float audio stream to compensate a
@@ -566,6 +569,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     };
 
     let data_blocks_recovered = cw_bytes.len();
+    let eot_seen = decoded_header.flags & header::FLAG_EOT != 0;
     Some(RxV2Result {
         data: assembled,
         header: Some(decoded_header),
@@ -577,6 +581,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         sigma2,
         data_blocks_recovered,
         cw_bytes_map: cw_bytes,
+        eot_seen,
     })
 }
 
@@ -626,6 +631,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let mut segs_lost = 0usize;
     let mut sigma2_sum = 0.0f64;
     let mut sigma2_count = 0usize;
+    let mut eot_seen = false;
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -649,7 +655,16 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
             merged.entry(esi).or_insert(bytes);
         }
         if app_hdr.is_none() {
-            app_hdr = r.app_header;
+            // Ignore EOT-only windows: their AppHeader carries file_size=0
+            // as a sentinel, which would poison the main-burst assembly.
+            let keep = r
+                .app_header
+                .as_ref()
+                .map(|ah| ah.file_size > 0)
+                .unwrap_or(false);
+            if keep {
+                app_hdr = r.app_header;
+            }
         }
         if hdr_any.is_none() {
             hdr_any = r.header;
@@ -660,6 +675,9 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         segs_lost += r.segments_lost;
         sigma2_sum += r.sigma2;
         sigma2_count += 1;
+        if r.eot_seen {
+            eot_seen = true;
+        }
     }
 
     // Assembly — same policy as rx_v2_single: RaptorQ fountain decode from
@@ -711,6 +729,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         sigma2,
         data_blocks_recovered,
         cw_bytes_map: merged,
+        eot_seen,
     })
 }
 
@@ -900,6 +919,42 @@ mod tests {
             &data[..],
             "V3 loopback : données non identiques"
         );
+    }
+
+    /// End-of-transmission marker : a main burst followed by a short EOT
+    /// frame must (a) decode normally, (b) expose `eot_seen = true` so the
+    /// RX worker can trim its in-memory buffer without waiting on silence.
+    #[test]
+    fn loopback_v3_high_with_eot_marker() {
+        let config = profile_high();
+        let data: Vec<u8> = (0..2_000)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        let session = 0xCAFE_BABEu32;
+        let (sps, pitch) =
+            rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+                .expect("profile");
+        let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+        let main_syms = frame::build_superframe_v3(
+            &data, &config, session, crate::app_header::mime::BINARY, make_session_hash(&data),
+        );
+        let main_audio = crate::modulator::modulate(&main_syms, sps, pitch, &taps, config.center_freq_hz);
+        let eot_syms = frame::build_eot_frame(&config, session);
+        let eot_audio = crate::modulator::modulate(&eot_syms, sps, pitch, &taps, config.center_freq_hz);
+
+        let silence = vec![0.0f32; (AUDIO_RATE as f64 * 0.2) as usize];
+        let mut combined = main_audio;
+        combined.extend_from_slice(&silence);
+        combined.extend_from_slice(&eot_audio);
+
+        let result = rx_v3(&combined, &config).expect("rx_v3 should decode main + EOT");
+        assert!(result.eot_seen, "EOT frame must set eot_seen");
+        let ah = result.app_header.as_ref().expect("AppHeader from main burst");
+        assert_eq!(ah.session_id, session);
+        // The main burst's real file_size must win despite the EOT's zero
+        // marker being present in a later window.
+        assert_eq!(ah.file_size as usize, data.len());
+        assert_eq!(&result.data[..data.len()], &data[..]);
     }
 
     /// Multi-burst scenario : an initial TX + a "More" TX with continuing ESIs

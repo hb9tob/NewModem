@@ -362,6 +362,32 @@ impl SessionStore {
         outcome
     }
 
+    /// If the session `session_id` is already decoded on disk, load the
+    /// decoded payload + meta from disk and return it. Returns `None` if the
+    /// session doesn't exist, isn't decoded yet, or the decoded file is
+    /// missing from disk.
+    ///
+    /// Used to re-emit `session_decoded` / `file_complete` when a fresh
+    /// capture episode starts over a session that was already completed in a
+    /// previous episode (e.g. same file re-transmitted by the operator).
+    pub fn peek_decoded(&mut self, ah: &AppHeader, profile: ProfileIndex) -> Option<DecodedFile> {
+        self.ensure_session(ah, profile);
+        let state = self.sessions.get(&ah.session_id)?;
+        if !state.meta.decoded {
+            return None;
+        }
+        let ext = mime_ext(state.meta.mime_type);
+        let decoded_path = state.dir.join(format!("decoded.{ext}"));
+        let payload = fs::read(&decoded_path).ok()?;
+        Some(DecodedFile {
+            session_id: state.meta.session_id,
+            session_dir: state.dir.clone(),
+            decoded_path,
+            payload,
+            meta: state.meta.clone(),
+        })
+    }
+
     /// Read all sessions currently on disk (for UI listing / debug).
     pub fn list_all(&self) -> Vec<SessionMeta> {
         let mut out = Vec::new();
@@ -483,6 +509,57 @@ mod tests {
             let outcome = store.accept_packets(&ah, ProfileIndex::High, &map);
             assert!(outcome.decoded.is_some(), "must decode after persistence reload");
         }
+    }
+
+    #[test]
+    fn peek_decoded_returns_stored_payload_for_decoded_session() {
+        let save = tmp_dir("peek");
+        let t: u16 = 16;
+        let data: Vec<u8> = (0..80).map(|i| (i as u8).wrapping_mul(11)).collect();
+        let packets = raptorq_codec::encode_packets(&data, t, 30);
+        let k = raptorq_codec::k_from_payload(data.len(), t as usize) as u32;
+        let ah = sample_ah(data.len() as u32, k as u16, t as u8);
+
+        // First : feed K packets, session decodes.
+        {
+            let mut store = SessionStore::new(&save).unwrap();
+            let mut map = HashMap::new();
+            for (i, p) in packets.iter().take(k as usize).enumerate() {
+                map.insert(i as u32, p.clone());
+            }
+            let outcome = store.accept_packets(&ah, ProfileIndex::High, &map);
+            assert!(outcome.decoded.is_some(), "must decode at K packets");
+        }
+
+        // Second : a fresh store over the same folder finds the decoded
+        // session on disk ; peek_decoded must return it without requiring
+        // any new packets.
+        {
+            let mut store = SessionStore::new(&save).unwrap();
+            let df = store.peek_decoded(&ah, ProfileIndex::High).expect("must peek");
+            assert_eq!(df.session_id, ah.session_id);
+            assert_eq!(&df.payload[..data.len()], &data[..]);
+            assert!(df.meta.decoded);
+        }
+    }
+
+    #[test]
+    fn peek_decoded_returns_none_before_decode() {
+        let save = tmp_dir("peek_pending");
+        let t: u16 = 16;
+        let data: Vec<u8> = (0..80).map(|i| (i as u8).wrapping_mul(9)).collect();
+        let packets = raptorq_codec::encode_packets(&data, t, 30);
+        let k = raptorq_codec::k_from_payload(data.len(), t as usize) as u32;
+        let ah = sample_ah(data.len() as u32, k as u16, t as u8);
+        let mut store = SessionStore::new(&save).unwrap();
+        // Feed only K/2 packets — not enough to decode.
+        let mut map = HashMap::new();
+        for (i, p) in packets.iter().take((k / 2) as usize).enumerate() {
+            map.insert(i as u32, p.clone());
+        }
+        let outcome = store.accept_packets(&ah, ProfileIndex::High, &map);
+        assert!(outcome.decoded.is_none());
+        assert!(store.peek_decoded(&ah, ProfileIndex::High).is_none());
     }
 
     #[test]

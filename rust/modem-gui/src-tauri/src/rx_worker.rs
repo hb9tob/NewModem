@@ -258,6 +258,11 @@ const SILENCE_RMS_THRESHOLD: f32 = 0.005;
 /// session — the disk store is unaffected and retains all packets.
 const MAX_SESSION_SECONDS: u64 = 25 * 60;
 
+/// Amount of audio kept in the in-memory buffer after a burst ends (EOT
+/// received, or fountain decode succeeded). Leaves enough context for a new
+/// preamble already partially landing in this tick to still be detected.
+const PREROLL_SECONDS: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Worker state
 // ---------------------------------------------------------------------------
@@ -310,6 +315,23 @@ impl WorkerState {
         self.session_buffer.clear();
         self.header = None;
         self.session_active = false;
+        self.announced_sessions.clear();
+    }
+
+    /// Keep only the last `PREROLL_SECONDS` of audio in the in-memory buffer.
+    /// Called when the current burst has ended (EOT or fountain decode) so
+    /// that subsequent rx_v3 scans don't re-process a growing trailing tail,
+    /// but a leading edge of a new preamble that might already be landing in
+    /// this tick isn't lost.
+    fn trim_buffer_to_preroll(&mut self) {
+        let keep = AUDIO_RATE as usize * PREROLL_SECONDS;
+        let len = self.session_buffer.len();
+        if len > keep {
+            self.session_buffer.drain(..len - keep);
+        }
+        self.header = None;
+        self.session_active = false;
+        self.announced_sessions.clear();
     }
 }
 
@@ -467,6 +489,7 @@ fn scan_and_route(
     let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
         return;
     };
+    let eot_seen = result.eot_seen;
 
     // First signal → session_active : enables the max-duration guard.
     if !state.session_active && (result.app_header.is_some() || !result.cw_bytes_map.is_empty()) {
@@ -499,11 +522,19 @@ fn scan_and_route(
     }
 
     // Without an AppHeader we can't know which session the packets belong to.
+    // We still honour the EOT flag if it was set — it tells us the TX ended
+    // this burst, so we can free the in-memory audio buffer right away.
     let Some(ref ah) = result.app_header else {
+        if eot_seen {
+            state.trim_buffer_to_preroll();
+        }
         return;
     };
 
-    // Announce the session once per session_id seen.
+    // Announce the session once per session_id seen. If the session is
+    // already decoded on disk (e.g. same file re-transmitted after an earlier
+    // successful reception), re-emit session_decoded + file_complete from
+    // the stored payload so the UI surfaces it again.
     let is_new_session = !state.announced_sessions.contains(&ah.session_id);
     if is_new_session {
         state.announced_sessions.insert(ah.session_id);
@@ -533,6 +564,9 @@ fn scan_and_route(
                 hash_short: ah.hash_short,
             },
         );
+        if let Some(df) = state.store.peek_decoded(ah, state.profile) {
+            emit_decoded_file(app, save_dir, &df, result.sigma2);
+        }
     }
 
     // Route the packets to the disk store.
@@ -585,68 +619,87 @@ fn scan_and_route(
 
     // A freshly-decoded file : emit session_decoded, copy to save_dir root
     // under the envelope filename, and emit the legacy file_complete event.
+    let just_decoded = outcome.decoded.is_some();
     if let Some(df) = outcome.decoded {
-        if let Some(fname) = df.meta.filename.clone() {
-            let _ = app.emit(
-                "envelope",
-                EnvelopePayload {
-                    filename: fname.clone(),
-                    callsign: df.meta.callsign.clone().unwrap_or_default(),
-                },
-            );
-        }
-        let _ = app.emit(
-            "session_decoded",
-            SessionDecodedPayload {
-                session_id: df.session_id,
-                session_dir: df.session_dir.to_string_lossy().into_owned(),
-                decoded_path: df.decoded_path.to_string_lossy().into_owned(),
-                size: df.payload.len() as u32,
-                filename: df.meta.filename.clone(),
-                callsign: df.meta.callsign.clone(),
-            },
-        );
+        emit_decoded_file(app, save_dir, &df, result.sigma2);
+    }
 
-        // Also copy the decoded content to the root save_dir using the
-        // envelope filename (keeps compat with the current UX where the
-        // user just finds the file in their downloads folder).
-        let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
-        let env = PayloadEnvelope::decode_or_fallback(&df.payload);
-        let (fname, callsign, content) = if env.version != 0 {
-            (env.filename.clone(), env.callsign.clone(), env.content.clone())
-        } else {
-            (
-                format!("decoded_{:08x}.bin", df.session_id),
-                String::new(),
-                df.payload.clone(),
-            )
-        };
-        match save_file(&dir, &fname, &content) {
-            Ok(path) => {
-                let _ = app.emit(
-                    "file_complete",
-                    FileCompletePayload {
-                        filename: fname,
-                        callsign,
-                        mime_type: df.meta.mime_type,
-                        saved_path: path.to_string_lossy().into_owned(),
-                        sigma2: result.sigma2,
-                        size: content.len(),
-                    },
-                );
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "error",
-                    ErrorPayload {
-                        message: format!("save failed: {e}"),
-                    },
-                );
-            }
-        }
+    // Free the in-memory audio buffer as soon as the TX signalled EOT or the
+    // fountain decoder converged : keeps rx_v3 fast, avoids accumulating a
+    // growing trailing tail that drags the worker off real-time.
+    if eot_seen || just_decoded {
+        state.trim_buffer_to_preroll();
     }
 
     let _ = session_store::BLOB_WARN_RATIO; // keep the import visible for future UI use
+}
+
+/// Emit the `envelope` + `session_decoded` + `file_complete` events for a
+/// decoded session and drop the envelope content in the root save_dir under
+/// the sender's filename. Shared between the fresh-decode path and the
+/// re-announce path (peek_decoded on a session that was already decoded in a
+/// previous capture episode).
+fn emit_decoded_file(
+    app: &AppHandle,
+    save_dir: &Arc<Mutex<PathBuf>>,
+    df: &session_store::DecodedFile,
+    sigma2: f64,
+) {
+    if let Some(fname) = df.meta.filename.clone() {
+        let _ = app.emit(
+            "envelope",
+            EnvelopePayload {
+                filename: fname,
+                callsign: df.meta.callsign.clone().unwrap_or_default(),
+            },
+        );
+    }
+    let _ = app.emit(
+        "session_decoded",
+        SessionDecodedPayload {
+            session_id: df.session_id,
+            session_dir: df.session_dir.to_string_lossy().into_owned(),
+            decoded_path: df.decoded_path.to_string_lossy().into_owned(),
+            size: df.payload.len() as u32,
+            filename: df.meta.filename.clone(),
+            callsign: df.meta.callsign.clone(),
+        },
+    );
+
+    let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
+    let env = PayloadEnvelope::decode_or_fallback(&df.payload);
+    let (fname, callsign, content) = if env.version != 0 {
+        (env.filename.clone(), env.callsign.clone(), env.content.clone())
+    } else {
+        (
+            format!("decoded_{:08x}.bin", df.session_id),
+            String::new(),
+            df.payload.clone(),
+        )
+    };
+    match save_file(&dir, &fname, &content) {
+        Ok(path) => {
+            let _ = app.emit(
+                "file_complete",
+                FileCompletePayload {
+                    filename: fname,
+                    callsign,
+                    mime_type: df.meta.mime_type,
+                    saved_path: path.to_string_lossy().into_owned(),
+                    sigma2,
+                    size: content.len(),
+                },
+            );
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "error",
+                ErrorPayload {
+                    message: format!("save failed: {e}"),
+                },
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

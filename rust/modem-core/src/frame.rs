@@ -12,7 +12,7 @@
 
 use crate::app_header::{self, AppHeader};
 use crate::constellation::{self, Constellation};
-use crate::header::{self, Header, FLAG_LAST};
+use crate::header::{self, Header, FLAG_EOT, FLAG_LAST};
 use crate::interleaver;
 use crate::ldpc::encoder::LdpcEncoder;
 use crate::marker::{self, MarkerPayload, META_FLAG_BIT};
@@ -263,6 +263,77 @@ pub fn build_superframe_v3_range(
     all_symbols
 }
 
+/// Build a minimal end-of-transmission frame.
+///
+/// Layout : preamble + header(FLAG_LAST|FLAG_EOT) + 1 meta segment (AppHeader
+/// pointing at `session_id`, data fields zeroed) + pilot runout. No data
+/// codewords.
+///
+/// The RX sees this as a normal V3 window whose header carries `FLAG_EOT` and
+/// whose data segment count is zero. It can trim its in-memory buffer without
+/// waiting on the silence timeout, and the already-persistent packet store on
+/// disk is untouched (session_id is the same as the main burst).
+pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> {
+    let encoder = LdpcEncoder::new(config.ldpc_rate);
+    let constellation_ = make_constellation(config);
+    let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
+    let k_bytes = encoder.k() / 8;
+
+    let preamble_syms = preamble::make_preamble();
+    let mut hdr = Header::from_config(config, 0, 0, FLAG_LAST | FLAG_EOT);
+    hdr.version = HEADER_VERSION_V3;
+    let header_syms = header::encode_header_symbols(&hdr);
+
+    let app_hdr = AppHeader {
+        session_id,
+        file_size: 0,
+        k_symbols: 0,
+        t_bytes: k_bytes as u8,
+        mode_code: config.mode_code(),
+        mime_type: 0,
+        hash_short: 0,
+    };
+    let meta_payload_bytes = app_header::encode_meta_payload(&app_hdr, k_bytes);
+    let meta_syms = encode_one_codeword(
+        &meta_payload_bytes,
+        &encoder,
+        &interleave_perm,
+        &constellation_,
+    );
+
+    let mut all_symbols: Vec<Complex64> = Vec::new();
+    all_symbols.extend_from_slice(&preamble_syms);
+    all_symbols.extend_from_slice(&header_syms);
+
+    let payload = MarkerPayload {
+        seg_id: 0,
+        session_id_low: (session_id & 0xFF) as u8,
+        base_esi: 0,
+        flags: META_FLAG_BIT,
+        reserved: 0,
+    };
+    all_symbols.extend(marker::make_marker(&payload));
+    let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
+    all_symbols.extend(with_pilots);
+
+    let n_extra_pilot_groups = 4;
+    for eg in 0..n_extra_pilot_groups {
+        for k in 0..crate::types::D_SYMS {
+            all_symbols.push(runout_filler_symbol(eg * crate::types::D_SYMS + k));
+        }
+        let pilots = pilot::pilots_for_group(eg);
+        all_symbols.extend_from_slice(&pilots);
+    }
+    let runout_len = 24;
+    for k in 0..runout_len {
+        all_symbols.push(runout_filler_symbol(
+            n_extra_pilot_groups * crate::types::D_SYMS + k,
+        ));
+    }
+
+    all_symbols
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +354,24 @@ mod tests {
         let hdr = header::decode_header_symbols(header_syms).expect("header should decode");
         assert_eq!(hdr.version, HEADER_VERSION_V3);
         assert_eq!(hdr.payload_length, 200);
+    }
+
+    #[test]
+    fn eot_frame_carries_eot_flag_in_header() {
+        let config = profile_normal();
+        let symbols = build_eot_frame(&config, 0xDEAD_BEEF);
+        let header_syms = &symbols[256..256 + 96];
+        let hdr = header::decode_header_symbols(header_syms).expect("header decodes");
+        assert_eq!(hdr.version, HEADER_VERSION_V3);
+        assert!(
+            hdr.flags & FLAG_EOT != 0,
+            "EOT frame must carry FLAG_EOT (flags=0x{:02X})",
+            hdr.flags
+        );
+        assert_eq!(
+            hdr.payload_length, 0,
+            "EOT carries no payload codewords"
+        );
     }
 
     #[test]

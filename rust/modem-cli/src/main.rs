@@ -268,6 +268,14 @@ fn main() {
                 &taps,
                 config.center_freq_hz,
             );
+            let eot_symbols = modem_core::frame::build_eot_frame(&config, sid);
+            let mut eot_modulated = modem_core::modulator::modulate(
+                &eot_symbols,
+                sps,
+                pitch,
+                &taps,
+                config.center_freq_hz,
+            );
 
             let samples = if vox > 0.0 {
                 let mut out = Vec::new();
@@ -278,10 +286,15 @@ fn main() {
                 ));
                 out.extend_from_slice(&modem_core::modulator::silence(0.05));
                 out.append(&mut modulated);
+                out.extend_from_slice(&modem_core::modulator::silence(0.2));
+                out.append(&mut eot_modulated);
                 out.extend_from_slice(&modem_core::modulator::silence(0.1));
                 out
             } else {
-                modulated
+                let mut out = modulated;
+                out.extend_from_slice(&modem_core::modulator::silence(0.2));
+                out.append(&mut eot_modulated);
+                out
             };
 
             let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
@@ -392,6 +405,14 @@ fn main() {
                 &taps,
                 config.center_freq_hz,
             );
+            let eot_symbols = modem_core::frame::build_eot_frame(&config, sid);
+            let mut eot_modulated = modem_core::modulator::modulate(
+                &eot_symbols,
+                sps,
+                pitch,
+                &taps,
+                config.center_freq_hz,
+            );
             let samples = if vox > 0.0 {
                 let mut out = Vec::new();
                 out.extend_from_slice(&modem_core::modulator::tone(
@@ -401,10 +422,15 @@ fn main() {
                 ));
                 out.extend_from_slice(&modem_core::modulator::silence(0.05));
                 out.append(&mut modulated);
+                out.extend_from_slice(&modem_core::modulator::silence(0.2));
+                out.append(&mut eot_modulated);
                 out.extend_from_slice(&modem_core::modulator::silence(0.1));
                 out
             } else {
-                modulated
+                let mut out = modulated;
+                out.extend_from_slice(&modem_core::modulator::silence(0.2));
+                out.append(&mut eot_modulated);
+                out
             };
             eprintln!(
                 "Generated {} samples ({:.2}s)",
