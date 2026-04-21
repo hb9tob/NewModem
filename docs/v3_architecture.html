@@ -187,7 +187,9 @@
     <ol>
         <li><a href="#intro">Introduction — objectif de la V3</a></li>
         <li><a href="#frame">Trame V3 et modulation de chaque champ</a></li>
+        <li><a href="#rates">Débits : symbol rate constant, modulation variable</a></li>
         <li><a href="#constellations">Constellations utilisées</a></li>
+        <li><a href="#fields">Contenu binaire de HDR, MK et META</a></li>
         <li><a href="#rx">Architecture RX V3 — pipeline et boucles</a></li>
         <li><a href="#pilots">Pilotes et leurs usages</a></li>
         <li><a href="#real">Analyse d'un signal V3 réel</a></li>
@@ -284,6 +286,115 @@
     </tbody>
 </table>
 
+<!-- ======================================================================= -->
+<h2 id="rates">2bis. Débits : symbol rate constant, modulation variable</h2>
+
+<p>
+    <strong>Point crucial :</strong> le symbol rate est fixe pour toute la durée
+    de la trame V3 (en profil HIGH : 1500 Bd). Il n'y a <em>aucun changement de
+    vitesse</em> au milieu du flux. Tous les symboles sont concaténés dans un
+    seul <code>Vec&lt;Complex64&gt;</code> par <code>build_superframe_v3</code>, puis
+    modulés d'un bloc (upsample, RRC, décalage à <code>center_freq_hz</code>).
+</p>
+
+<p>
+    Ce qui change d'un champ à l'autre, c'est la <strong>constellation</strong>
+    et donc le nombre de bits par symbole :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Champ</th>
+            <th>Constellation</th>
+            <th>bits/sym</th>
+            <th>Débit sur l'air</th>
+            <th>FEC</th>
+            <th>Débit utile</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>PREAMBLE</td>
+            <td>QPSK fixe</td>
+            <td>2</td>
+            <td>3000 b/s</td>
+            <td>—</td>
+            <td>— (séquence connue)</td>
+        </tr>
+        <tr>
+            <td>HEADER v3</td>
+            <td>QPSK</td>
+            <td>2</td>
+            <td>3000 b/s</td>
+            <td>Golay(24,12) = rate 1/2</td>
+            <td>1500 b/s info</td>
+        </tr>
+        <tr>
+            <td>MARKER ctrl</td>
+            <td>QPSK</td>
+            <td>2</td>
+            <td>3000 b/s</td>
+            <td>Golay(24,12) = rate 1/2</td>
+            <td>1500 b/s info</td>
+        </tr>
+        <tr>
+            <td>TDM pilots</td>
+            <td>QPSK cycle</td>
+            <td>2</td>
+            <td>3000 b/s</td>
+            <td>—</td>
+            <td>— (séquence connue)</td>
+        </tr>
+        <tr>
+            <td>META / DATA (HIGH)</td>
+            <td>16-APSK</td>
+            <td>4</td>
+            <td>6000 b/s</td>
+            <td>LDPC rate 3/4</td>
+            <td>4500 b/s info</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout info">
+    <strong>Conséquence pratique :</strong> le RX n'a jamais à changer de
+    fréquence d'échantillonnage, de RRC ou de filtre entre les champs. Le
+    matched-filter et le tracking sont identiques partout. Seul le <em>slicer</em>
+    change de table de constellation selon la position dans la trame (ce qui se
+    fait sans latence, juste une table lookup différente par zone). Côté TX
+    c'est encore plus simple : un seul <code>modulator::modulate(&amp;all_symbols,
+    config)</code> traite l'ensemble.
+</div>
+
+<p>Les autres profils varient uniquement <strong>data+meta</strong> :</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>Symbol rate</th>
+            <th>Constellation data</th>
+            <th>LDPC rate</th>
+            <th>Débit utile data</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td>HIGH</td><td>1500 Bd</td><td>16-APSK</td><td>3/4</td><td>4500 b/s</td></tr>
+        <tr><td>NORMAL</td><td>1200 Bd</td><td>16-APSK</td><td>2/3</td><td>3200 b/s</td></tr>
+        <tr><td>ROBUST</td><td>900 Bd</td><td>8-PSK</td><td>1/2</td><td>1350 b/s</td></tr>
+        <tr><td>ULTRA</td><td>600 Bd</td><td>QPSK</td><td>1/2</td><td>600 b/s</td></tr>
+        <tr><td>MEGA (FTN)</td><td>1600 Bd (τ=30/32)</td><td>16-APSK</td><td>3/4</td><td>~4800 b/s</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Pour chaque profil, le symbol rate est <strong>fixé à la configuration</strong>
+    (<code>config.symbol_rate</code>) — il est strictement constant durant toute
+    une transmission. La V3 ne change rien à cela : elle se contente d'insérer
+    des préambules QPSK supplémentaires, qui sortent eux aussi au même symbol rate.
+</p>
+
 <h3>2.1 Zoom — structure interne d'un data segment</h3>
 
 <pre><code>┌─ MK ─┬── groupe 0 ────────┬── groupe 1 ────────┬── groupe 2 ────────┬ …
@@ -315,6 +426,75 @@
         cycliquement les 4 phases QPSK (flèches vertes).
     </figcaption>
 </figure>
+
+<!-- ======================================================================= -->
+<h2 id="fields">3bis. Contenu binaire de HDR, MK et META</h2>
+
+<figure>
+    <img src="../results/doc_v3/v3_field_layouts.png"
+         alt="Layouts binaires HDR, MK ctrl, META" />
+    <figcaption>
+        <strong>Fig. 3 —</strong> layout byte-par-byte de chaque champ protocolaire.
+        <strong>HEADER</strong> (12 B → Golay → 96 QPSK) porte l'identification
+        de la transmission et du profil. <strong>MARKER ctrl</strong> (12 B → Golay →
+        96 QPSK, précédé de 32 sync fixes) porte seg_id / session / base_esi.
+        <strong>META</strong> réplique l'<em>AppHeader</em> (17 B) 4 fois dans un codeword
+        LDPC, suivi de zero-padding — un seul CRC16 valide sur les 4 suffit.
+        Valeurs d'exemple : session 0x4C2D0D68, file_size 10240 B, HIGH, mime=binary.
+    </figcaption>
+</figure>
+
+<h3>3bis.1 HEADER protocole (12 B)</h3>
+<table>
+    <thead><tr><th>Offset</th><th>Champ</th><th>Taille</th><th>Rôle</th></tr></thead>
+    <tbody>
+        <tr><td>0-1</td><td>magic</td><td>2 B</td><td>0xCAFE, signature fixe</td></tr>
+        <tr><td>2</td><td>version</td><td>1 B</td><td>2 = V2, <strong>3 = V3</strong></td></tr>
+        <tr><td>3</td><td>mode_code</td><td>1 B</td><td>constellation + rate (sanity)</td></tr>
+        <tr><td>4-5</td><td>frame_counter</td><td>2 B</td><td>V3 : toujours 0</td></tr>
+        <tr><td>6-7</td><td>payload_length</td><td>2 B</td><td>file_size (info basse)</td></tr>
+        <tr><td>8</td><td>flags</td><td>1 B</td><td>bit 0 = FLAG_LAST (V3 : toujours 1)</td></tr>
+        <tr><td>9</td><td>freq_offset</td><td>1 B</td><td>center_freq_hz / 10</td></tr>
+        <tr><td>10</td><td>profile_index</td><td>1 B</td><td>profil canonique (HIGH=1, NORMAL=2…)</td></tr>
+        <tr><td>11</td><td>CRC8</td><td>1 B</td><td>CCITT sur les 11 octets précédents</td></tr>
+    </tbody>
+</table>
+
+<h3>3bis.2 MARKER ctrl (12 B) — précédé de 32 sync QPSK fixes</h3>
+<table>
+    <thead><tr><th>Offset</th><th>Champ</th><th>Taille</th><th>Rôle</th></tr></thead>
+    <tbody>
+        <tr><td>0-1</td><td>seg_id</td><td>2 B</td><td>compteur segment (wrap 65536)</td></tr>
+        <tr><td>2</td><td>session_id_low</td><td>1 B</td><td>LSB du session_id, pour session lock</td></tr>
+        <tr><td>3-5</td><td>base_esi</td><td>3 B (24 bits)</td><td>ESI du 1er codeword du segment</td></tr>
+        <tr><td>6</td><td>flags</td><td>1 B</td><td>bit 0 = META_FLAG (1 = meta, 0 = data)</td></tr>
+        <tr><td>7-10</td><td>reserved</td><td>4 B</td><td>0, extensions futures</td></tr>
+        <tr><td>11</td><td>CRC8</td><td>1 B</td><td>CCITT sur les 11 octets précédents</td></tr>
+    </tbody>
+</table>
+
+<h3>3bis.3 META — AppHeader répliqué × 4 dans un CW LDPC</h3>
+<table>
+    <thead><tr><th>Offset</th><th>Champ</th><th>Taille</th><th>Rôle</th></tr></thead>
+    <tbody>
+        <tr><td>0-3</td><td>session_id</td><td>4 B</td><td>32 bits full, clé merge multi-round</td></tr>
+        <tr><td>4-7</td><td>file_size</td><td>4 B</td><td><strong>pilote l'assembly RX</strong> (truncate)</td></tr>
+        <tr><td>8-9</td><td>k_symbols</td><td>2 B</td><td>RaptorQ source symbol count (phase 2.5)</td></tr>
+        <tr><td>10</td><td>t_bytes</td><td>1 B</td><td>RaptorQ symbol size (table lookup)</td></tr>
+        <tr><td>11</td><td>mode_code</td><td>1 B</td><td>redondance sanity du header</td></tr>
+        <tr><td>12</td><td>mime_type</td><td>1 B</td><td>0=bin, 1=text, 2=avif, 3=jpeg, 4=png</td></tr>
+        <tr><td>13-14</td><td>hash_short</td><td>2 B</td><td>content hash tronqué (intégrité)</td></tr>
+        <tr><td>15-16</td><td>CRC16</td><td>2 B</td><td>CCITT-FALSE sur les 15 octets précédents</td></tr>
+    </tbody>
+</table>
+<p>
+    Les 4 copies sont stockées linéairement dans l'info payload du codeword
+    META : <code>[#0 17B][#1 17B][#2 17B][#3 17B][zero-pad jusqu'à k_bytes]</code>.
+    Pour HIGH (LDPC rate 3/4, <code>n=1152 k=864</code>) le k_bytes utile est
+    <strong>108 B</strong>, donc 68 B d'AppHeader + 40 B de zéros.
+    À la réception, <code>decode_meta_payload</code> parcourt les copies et
+    retourne la première dont le CRC16 valide.
+</p>
 
 <!-- ======================================================================= -->
 <h2 id="rx">4. Architecture RX V3 — pipeline et boucles de rétroaction</h2>

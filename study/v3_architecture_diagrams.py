@@ -446,6 +446,191 @@ def plot_rx_block_diagram(path):
 
 
 # ============================================================================
+# 3.5 FIELD LAYOUTS — byte-level content of HDR / MK ctrl / META (AppHeader ×4)
+# ============================================================================
+
+def plot_field_layouts(path):
+    """Représentation byte-par-byte des contenus HDR, MK ctrl et META."""
+
+    # Champs (label, bytes, couleur, valeur exemple)
+    hdr_fields = [
+        ("magic\n0xCAFE",        2, "#5b8fd1", "CA FE"),
+        ("version",              1, "#2b7fbf", "03"),
+        ("mode_code",            1, "#3fa1c7", "41"),
+        ("frame_counter",        2, "#5fb7d1", "00 00"),
+        ("payload_length",       2, "#7fbfd1", "0A 00"),
+        ("flags",                1, "#9fcfd1", "01"),
+        ("freq_offset",          1, "#bfdfd1", "4C"),
+        ("profile_index",        1, "#cfe7d1", "01"),
+        ("CRC8",                 1, "#d15f5f", "A7"),
+    ]
+    mk_fields = [
+        ("seg_id",               2, "#bf5f2b", "00 03"),
+        ("session_id_low",       1, "#cf7f4f", "68"),
+        ("base_esi (24b)",       3, "#dfa06f", "00 00 10"),
+        ("flags\n(bit0=META)",   1, "#efc08f", "01"),
+        ("reserved",             4, "#c0c0c0", "00 00 00 00"),
+        ("CRC8",                 1, "#d15f5f", "5E"),
+    ]
+    app_hdr_fields = [
+        ("session_id",           4, "#bfa02b", "4C 2D 0D 68"),
+        ("file_size",            4, "#cfb04b", "00 00 28 00"),
+        ("k_symbols",            2, "#dfc06b", "00 60"),
+        ("t_bytes",              1, "#efcf8b", "6C"),
+        ("mode_code",            1, "#efd7a3", "41"),
+        ("mime_type",            1, "#efe0bb", "00"),
+        ("hash_short",           2, "#f7ecc8", "6C A8"),
+        ("CRC16",                2, "#d15f5f", "C3 21"),
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+    def draw_bytes(ax, fields, title, subtitle, total_label, start_x=0.5, byte_w=0.9):
+        """Dessine une bande d'octets étiquetée."""
+        x = start_x
+        y = 1.2
+        h = 1.2
+        for label, n_bytes, color, example in fields:
+            w = n_bytes * byte_w
+            rect = Rectangle((x, y), w, h, facecolor=color, edgecolor="black", linewidth=1.0)
+            ax.add_patch(rect)
+            # Label dedans
+            ax.text(x + w / 2, y + h * 0.63, label, ha="center", va="center",
+                    fontsize=9, weight="bold")
+            # Taille (B) dedans
+            ax.text(x + w / 2, y + h * 0.22, f"{n_bytes} B",
+                    ha="center", va="center", fontsize=8, color="#333333")
+            # Exemple dessous
+            ax.text(x + w / 2, y - 0.25, example, ha="center", va="top",
+                    fontsize=7, family="monospace", color="#555555")
+            x += w
+
+        total_b = sum(n for _, n, _, _ in fields)
+        # Bracket total
+        ax.annotate("", xy=(start_x, y + h + 0.2), xytext=(x, y + h + 0.2),
+                    arrowprops=dict(arrowstyle="<->", color="black", lw=1))
+        ax.text((start_x + x) / 2, y + h + 0.38, total_label,
+                ha="center", fontsize=9, weight="bold", color="#333333")
+
+        ax.set_xlim(0, max(x + 0.5, 14))
+        ax.set_ylim(-1.0, y + h + 0.9)
+        ax.set_title(f"{title}\n{subtitle}",
+                     fontsize=11, weight="bold", loc="left", pad=10)
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    # HEADER protocole
+    draw_bytes(
+        axes[0], hdr_fields,
+        "HEADER protocole (12 octets)",
+        "→ Golay(24,12) × 8 blocs → 192 bits codés → 96 symboles QPSK  "
+        "(FEC robuste, décodable sans aucun pilote autre que PREAMBLE)",
+        "12 B = 96 info bits",
+    )
+    # Ajout : chaîne TX → RX à droite
+    axes[0].text(13.5, 1.8,
+                 "→ 96 QPSK syms\n(exp(j·(π/4 + q·π/2)))",
+                 fontsize=9, color="#2b7fbf", weight="bold",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#eef6ff",
+                           edgecolor="#2b7fbf"))
+
+    # MARKER ctrl
+    draw_bytes(
+        axes[1], mk_fields,
+        "MARKER ctrl (12 octets)  —  précédé de 32 sync syms QPSK fixes",
+        "→ Golay(24,12) × 8 → 192 bits → 96 QPSK ctrl  |  total marker = 32 sync + 96 ctrl = 128 syms",
+        "12 B = 96 info bits",
+    )
+    axes[1].text(13.5, 1.8,
+                 "→ 128 QPSK syms\n(32 sync + 96 ctrl)",
+                 fontsize=9, color="#bf5f2b", weight="bold",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff0e8",
+                           edgecolor="#bf5f2b"))
+
+    # META (AppHeader × 4 copies)
+    # Draw 4 copies side by side + zero pad
+    ax = axes[2]
+    y = 1.2
+    h = 1.2
+    x = 0.5
+    byte_w = 0.16  # plus petit car 17 B × 4 = 68 B
+
+    # Draw 4 copies
+    copy_colors_alpha = [1.0, 0.85, 0.7, 0.55]
+    for copy_idx in range(4):
+        copy_start = x
+        for label, n_bytes, color, example in app_hdr_fields:
+            w = n_bytes * byte_w
+            alpha = copy_colors_alpha[copy_idx]
+            rect = Rectangle((x, y), w, h, facecolor=color, edgecolor="black",
+                             linewidth=0.8, alpha=alpha)
+            ax.add_patch(rect)
+            if copy_idx == 0 and w > 0.3:  # label uniquement sur 1ère copie
+                short_label = label.split("\n")[0].replace("_", " ")[:10]
+                ax.text(x + w / 2, y + h * 0.55, short_label,
+                        ha="center", va="center", fontsize=6.5, weight="bold")
+                ax.text(x + w / 2, y + h * 0.22, f"{n_bytes}",
+                        ha="center", va="center", fontsize=6, color="#333333")
+            x += w
+        # Label copy
+        copy_w = 17 * byte_w
+        ax.text(copy_start + copy_w / 2, y + h + 0.2,
+                f"copie #{copy_idx}",
+                ha="center", fontsize=8, weight="bold", color="#666666")
+        if copy_idx == 0:
+            ax.text(copy_start + copy_w / 2, y - 0.3,
+                    "17 B (AppHeader + CRC16)",
+                    ha="center", fontsize=7, style="italic", color="#666666")
+
+    # Zero-pad
+    pad_w = 30 * byte_w  # illustratif
+    rect = Rectangle((x, y), pad_w, h, facecolor="#f0f0f0", edgecolor="black",
+                     linewidth=0.8, hatch="//")
+    ax.add_patch(rect)
+    ax.text(x + pad_w / 2, y + h * 0.5, "zero-pad",
+            ha="center", va="center", fontsize=8, color="#666666")
+    ax.text(x + pad_w / 2, y - 0.3,
+            "jusqu'à k_bytes (HIGH k=108 B)",
+            ha="center", fontsize=7, style="italic", color="#666666")
+    x += pad_w
+
+    # Total bracket
+    total_x_end = x
+    ax.annotate("", xy=(0.5, y + h + 0.7), xytext=(total_x_end, y + h + 0.7),
+                arrowprops=dict(arrowstyle="<->", color="black", lw=1))
+    ax.text((0.5 + total_x_end) / 2, y + h + 0.9,
+            "Meta CW info payload (HIGH : 108 B = 4 × 17 + 40 pad)",
+            ha="center", fontsize=9, weight="bold")
+
+    ax.set_xlim(0, max(total_x_end + 0.5, 14))
+    ax.set_ylim(-1.2, y + h + 1.5)
+    ax.set_title(
+        "META segment — AppHeader REPLIQUÉ ×4 dans un codeword LDPC\n"
+        "→ encode LDPC(n,k) → interleave → 16-APSK (config) — décodable si ≥1 CRC16 OK sur les 4 copies",
+        fontsize=11, weight="bold", loc="left", pad=10,
+    )
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.text(13.5, 1.8,
+            "→ 1 CW LDPC\n→ syms 16-APSK",
+            fontsize=9, color="#bfa02b", weight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff9e0",
+                      edgecolor="#bfa02b"))
+
+    # Legend with byte-level fields of AppHeader
+    legend_text = (
+        "Champs AppHeader : session_id 4B | file_size 4B | k_symbols 2B | "
+        "t_bytes 1B | mode_code 1B | mime_type 1B | hash_short 2B | CRC16 2B"
+    )
+    fig.text(0.5, 0.01, legend_text, ha="center", fontsize=8,
+             style="italic", color="#555555")
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close()
+
+
+# ============================================================================
 # 4. PILOTS × MODULES matrix
 # ============================================================================
 
@@ -727,6 +912,9 @@ def main():
 
     plot_constellations(os.path.join(OUT_DIR, "v3_constellations.png"))
     print("  OK v3_constellations.png")
+
+    plot_field_layouts(os.path.join(OUT_DIR, "v3_field_layouts.png"))
+    print("  OK v3_field_layouts.png")
 
     plot_rx_block_diagram(os.path.join(OUT_DIR, "v3_rx_block_diagram.png"))
     print("  OK v3_rx_block_diagram.png")
