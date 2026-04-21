@@ -529,7 +529,7 @@ fn scan_and_route(
     };
     let eot_seen = result.eot_seen;
     worker_log(&format!(
-        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} converged={}/{} segs={}/{}",
+        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4}",
         state.session_active,
         buf_secs,
         result.header.is_some(),
@@ -541,6 +541,7 @@ fn scan_and_route(
         result.total_blocks,
         result.segments_decoded,
         result.segments_lost,
+        result.sigma2,
     ));
 
     // Transition to Capturing as soon as a V3 protocol header is Golay-
@@ -570,6 +571,13 @@ fn scan_and_route(
                 offset_seconds: 0.0,
             },
         );
+    }
+    // Any V3 header seen counts as a live preamble. Update the silence
+    // timer even when the meta LDPC hasn't converged yet, otherwise we
+    // drop back to Idle mid-burst on hard-SNR profiles (16-APSK R3/4) and
+    // trash the buffer we've been accumulating.
+    if header_ok {
+        state.last_preamble_seen_at = Instant::now();
     }
 
     // Legacy protocol header event (once per session).
