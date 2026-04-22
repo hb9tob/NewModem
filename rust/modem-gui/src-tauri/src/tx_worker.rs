@@ -21,6 +21,7 @@ use cpal::{SampleFormat, SampleRate};
 use hound::{SampleFormat as WavFmt, WavReader};
 use modem_core::{
     profile::{self, ModemConfig},
+    raptorq_codec::{k_from_payload, n_repair_default},
     types::AUDIO_RATE,
 };
 use serde::Serialize;
@@ -90,37 +91,74 @@ pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
     }
 }
 
-/// Estimation rapide (helper pour les garde-fous UI côté JS) : durée en
-/// secondes à partir de la taille payload (octets AVIF) + mode + longueur
-/// filename/callsign. Inclut le surcoût d'envelope (2 + filename + 1 +
-/// callsign + 1) et l'arrondi à la frontière codeword LDPC. Ne construit
-/// pas les symboles — purement arithmétique.
+/// Per-profile transmission plan, derived purely from arithmetic (no symbol
+/// synthesis). Computed before any TX to pre-populate the UI buttons and
+/// progress bars, and to surface the RaptorQ fountain math to the user.
+pub struct TxPlan {
+    /// Number of LDPC codewords required at RX to reconstruct the payload
+    /// (the RaptorQ "K" source-symbol count). The RX must accumulate at
+    /// least this many unique ESIs before `try_decode` succeeds.
+    pub k_source: u32,
+    /// Number of codewords the initial TX burst actually emits (K + default
+    /// repair ≈ 30 %). The progress bar counts up to here.
+    pub n_initial: u32,
+    /// Seconds of audio needed to transmit `n_initial` codewords at this
+    /// profile's net bitrate. Includes pilot + LDPC overhead.
+    pub duration_s_initial: f64,
+    /// Seconds of audio needed just for `k_source` codewords — the minimum
+    /// theoretical time before RX could decode if no packet was ever lost.
+    pub duration_s_k: f64,
+    /// Seconds per one additional codeword at this profile — used by the UI
+    /// to convert "+N% More" to a duration estimate.
+    pub seconds_per_cw: f64,
+}
+
+/// Compute the transmission plan for a given payload + profile. Includes the
+/// RaptorQ fountain overhead so the surface displayed to the user matches
+/// what actually goes on air.
+pub fn tx_plan(
+    payload_bytes: usize,
+    mode_name: &str,
+    callsign_len: usize,
+    filename_len: usize,
+) -> Result<TxPlan, String> {
+    let config = parse_profile(mode_name)?;
+    let envelope_overhead = 2 + filename_len + 1 + callsign_len + 1;
+    let wire = payload_bytes + envelope_overhead;
+    let k_bytes = config.ldpc_rate.k() / 8;
+    let k_source = k_from_payload(wire, k_bytes) as u32;
+    let n_initial = k_source + n_repair_default(k_source);
+    let bits_per_cw = (k_bytes as f64) * 8.0;
+    let seconds_per_cw = bits_per_cw / config.net_bitrate();
+    Ok(TxPlan {
+        k_source,
+        n_initial,
+        duration_s_initial: seconds_per_cw * (n_initial as f64),
+        duration_s_k: seconds_per_cw * (k_source as f64),
+        seconds_per_cw,
+    })
+}
+
+/// Legacy API kept for `tx_estimate` callers that want a single scalar.
+/// Returns the *actual* on-air duration (K + repair), matching what
+/// the progress bar will count up against.
 pub fn estimate_duration_s(
     payload_bytes: usize,
     mode_name: &str,
     callsign_len: usize,
     filename_len: usize,
 ) -> Result<f64, String> {
-    let config = parse_profile(mode_name)?;
-    let envelope_overhead = 2 + filename_len + 1 + callsign_len + 1;
-    let wire = payload_bytes + envelope_overhead;
-    let k_bytes = config.ldpc_rate.k() / 8;
-    let padded = wire.div_ceil(k_bytes) * k_bytes;
-    let bits = (padded as f64) * 8.0;
-    Ok(bits / config.net_bitrate())
+    Ok(tx_plan(payload_bytes, mode_name, callsign_len, filename_len)?.duration_s_initial)
 }
 
+/// Legacy API : total blocks emitted by the initial burst (= K + repair).
 pub fn estimate_total_blocks(
     payload_bytes: usize,
     mode_name: &str,
     callsign_len: usize,
     filename_len: usize,
 ) -> Result<u32, String> {
-    let config = parse_profile(mode_name)?;
-    let envelope_overhead = 2 + filename_len + 1 + callsign_len + 1;
-    let wire = payload_bytes + envelope_overhead;
-    let k_bytes = config.ldpc_rate.k() / 8;
-    Ok(wire.div_ceil(k_bytes) as u32)
+    Ok(tx_plan(payload_bytes, mode_name, callsign_len, filename_len)?.n_initial)
 }
 
 /// Retrouve le binaire modem-cli à côté du GUI. Priorité :

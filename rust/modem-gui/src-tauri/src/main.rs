@@ -181,8 +181,21 @@ struct CompressResult {
 
 #[derive(serde::Serialize)]
 struct TxEstimate {
+    /// Durée audio pour émettre n_initial (K + repair). Valeur de référence
+    /// pour la barre de progression et le garde-fou "TX > 5 min".
     duration_s: f64,
+    /// Nombre total de blocs émis par le burst initial (= K + repair).
     total_blocks: u32,
+    /// Blocs RaptorQ nécessaires au décodage (K source-symbols).
+    k_source: u32,
+    /// Blocs réellement émis par le TX initial (= K + repair, redondant avec
+    /// total_blocks mais explicite pour l'UI).
+    n_initial: u32,
+    /// Durée minimale théorique si zéro paquet n'était perdu (K seul).
+    duration_s_k: f64,
+    /// Durée d'un codeword, utilisé côté UI pour dériver la durée "+N%" du
+    /// bouton More.
+    seconds_per_cw: f64,
 }
 
 #[tauri::command]
@@ -192,13 +205,14 @@ fn tx_estimate(
     callsign: String,
     filename: String,
 ) -> Result<TxEstimate, String> {
-    let duration_s =
-        tx_worker::estimate_duration_s(payload_bytes, &mode, callsign.len(), filename.len())?;
-    let total_blocks =
-        tx_worker::estimate_total_blocks(payload_bytes, &mode, callsign.len(), filename.len())?;
+    let plan = tx_worker::tx_plan(payload_bytes, &mode, callsign.len(), filename.len())?;
     Ok(TxEstimate {
-        duration_s,
-        total_blocks,
+        duration_s: plan.duration_s_initial,
+        total_blocks: plan.n_initial,
+        k_source: plan.k_source,
+        n_initial: plan.n_initial,
+        duration_s_k: plan.duration_s_k,
+        seconds_per_cw: plan.seconds_per_cw,
     })
 }
 

@@ -1034,6 +1034,7 @@ function refreshTxButtons() {
   const hasPriorTx =
     txState.lastTx != null && txState.lastTx.mode === txState.mode;
   btnMore.disabled = !hasImage || txState.txActive || !hasPriorTx;
+  btnMore.title = moreButtonTitle();
   btnStop.disabled = !txState.txActive;
   if (morePct) morePct.disabled = !hasImage || txState.txActive;
 
@@ -1049,10 +1050,10 @@ function refreshTxButtons() {
     btnTx.title = `durée estimée ${fmtSeconds(dur)} dépasse la limite 5 min`;
   } else if (warn) {
     btnTx.textContent = `TX ⚠ ${fmtSeconds(dur)}`;
-    btnTx.title = `transmission longue (> 2 min) — durée estimée ${fmtSeconds(dur)}, ${est.total_blocks} blocs`;
+    btnTx.title = txButtonTitle(est, dur, true);
   } else if (est) {
     btnTx.textContent = `TX (${fmtSeconds(dur)})`;
-    btnTx.title = `durée estimée ${fmtSeconds(dur)}, ${est.total_blocks} blocs`;
+    btnTx.title = txButtonTitle(est, dur, false);
   } else {
     btnTx.textContent = "TX";
     btnTx.title = "";
@@ -1065,6 +1066,33 @@ function txFormatBytes(n) {
   if (n < 1024) return `${n} o`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
   return `${(n / 1024 / 1024).toFixed(2)} Mio`;
+}
+
+// Tooltip du bouton TX : durée, N émis, K requis, seuil K.
+function txButtonTitle(est, dur, longTx) {
+  if (!est) return "";
+  const base = longTx ? `transmission longue (> 2 min) — durée ` : `durée `;
+  const k = est.k_source;
+  const n = est.n_initial ?? est.total_blocks;
+  const parts = [`${base}${dur}, ${n} blocs émis`];
+  if (k != null && k !== n) {
+    parts.push(`K=${k} nécessaires au décodage`);
+  }
+  if (est.duration_s_k != null) {
+    parts.push(`seuil ${fmtSeconds(est.duration_s_k)} si aucune perte`);
+  }
+  return parts.join(" · ");
+}
+
+// Tooltip du bouton More : blocs additionnels, durée attendue.
+function moreButtonTitle() {
+  const est = txState.estimate;
+  if (!est || !est.k_source || !est.seconds_per_cw) {
+    return `émettre +${txState.morePct} % de blocs RaptorQ`;
+  }
+  const count = Math.max(1, Math.floor((est.k_source * txState.morePct) / 100));
+  const dur = est.seconds_per_cw * count;
+  return `+${count} blocs (${txState.morePct}% de K=${est.k_source}) · ~${fmtSeconds(dur)}`;
 }
 
 function txFitInto(w, h, maxW, maxH) {
@@ -1525,6 +1553,7 @@ function setupTxTab() {
   document.getElementById("tx-btn-more").addEventListener("click", txMore);
   document.getElementById("tx-more-pct").addEventListener("change", (ev) => {
     txState.morePct = parseInt(ev.target.value, 10) || 20;
+    refreshTxButtons(); // refresh le title moreButtonTitle avec le nouveau pct
   });
   refreshTxButtons();
 }
@@ -1582,13 +1611,15 @@ async function txStart() {
   }
 }
 
-// K RaptorQ = max(4, ceil((payload + envelope) / T)). On approxime T via
-// total_blocks de l'estimation (qui le compte aussi). Si plus petit, on
-// force 4 (MIN_K côté backend).
+// K RaptorQ = nombre de codewords source nécessaires au décodage.
+// Fourni directement par le backend via l'estimate (k_source), ou approximé
+// via total_blocks pour compatibilité avec un backend antérieur.
 function computeK() {
   const est = txState.estimate;
-  if (!est || !est.total_blocks) return null;
-  return Math.max(4, est.total_blocks);
+  if (!est) return null;
+  if (est.k_source != null) return Math.max(4, est.k_source);
+  if (est.total_blocks != null) return Math.max(4, est.total_blocks);
+  return null;
 }
 
 async function txMore() {
@@ -1669,16 +1700,25 @@ function updateTxProgressText() {
   const txt = document.getElementById("tx-progress-text");
   if (!txt) return;
   const p = txState.progress;
+  const est = txState.estimate;
   if (!p) {
-    if (txState.estimate) {
-      txt.textContent = `— / ${txState.estimate.total_blocks} blocs · durée ~${fmtSeconds(txState.estimate.duration_s)}`;
+    if (est) {
+      // K = blocs nécessaires au décodage (RaptorQ source), N = émis (K + repair).
+      // Afficher les deux aide l'utilisateur à comprendre pourquoi la durée
+      // dépasse le strict minimum et combien de marge le repair lui donne.
+      const k = est.k_source != null ? est.k_source : est.total_blocks;
+      const n = est.n_initial != null ? est.n_initial : est.total_blocks;
+      const dur = fmtSeconds(est.duration_s);
+      const durK = est.duration_s_k != null ? ` (seuil K : ${fmtSeconds(est.duration_s_k)})` : "";
+      txt.textContent = `— / ${n} blocs · ${k} nécessaires · durée ~${dur}${durK}`;
     } else {
       txt.textContent = "—";
     }
     return;
   }
+  const kTail = est && est.k_source != null ? ` · K=${est.k_source}` : "";
   txt.textContent =
-    `TX ${p.blocks_sent} / ${p.total_blocks} blocs · ${fmtSeconds(p.elapsed_s)} / ${fmtSeconds(p.duration_s)}`;
+    `TX ${p.blocks_sent} / ${p.total_blocks} blocs${kTail} · ${fmtSeconds(p.elapsed_s)} / ${fmtSeconds(p.duration_s)}`;
 }
 
 function onTxProgress(payload) {
