@@ -49,6 +49,22 @@ impl Constellation {
             .collect()
     }
 
+    /// Nearest-neighbor hard decision for a single received symbol. Returns
+    /// the closest constellation point (as a reference symbol), not its index.
+    /// Used as the `decision` argument by `DdPll::derotate_and_update`.
+    pub fn hard_decision(&self, y: Complex64) -> Complex64 {
+        let mut best = self.points[0];
+        let mut best_d2 = (y - best).norm_sqr();
+        for &s in self.points.iter().skip(1) {
+            let d2 = (y - s).norm_sqr();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = s;
+            }
+        }
+        best
+    }
+
     /// Convert symbol indices to bits (MSB first per symbol).
     pub fn symbols_to_bits(&self, indices: &[usize]) -> Vec<u8> {
         let mut bits = Vec::with_capacity(indices.len() * self.bits_per_sym);

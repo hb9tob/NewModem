@@ -194,7 +194,7 @@ pub fn build_superframe_v3_range(
             reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));
-        let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
+        let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms, &config.pilot_pattern);
         elapsed_since_preamble_sym += marker::MARKER_LEN + with_pilots.len();
         all_symbols.extend(with_pilots);
         seg_id = seg_id.wrapping_add(1);
@@ -216,7 +216,7 @@ pub fn build_superframe_v3_range(
                 reserved: 0,
             };
             all_symbols.extend(marker::make_marker(&payload));
-            let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
+            let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms, &config.pilot_pattern);
             let pilots_len = with_pilots.len();
             all_symbols.extend(with_pilots);
             seg_id = seg_id.wrapping_add(1);
@@ -237,7 +237,7 @@ pub fn build_superframe_v3_range(
             reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));
-        let (with_pilots, _) = pilot::interleave_data_pilots(&seg_data);
+        let (with_pilots, _) = pilot::interleave_data_pilots(&seg_data, &config.pilot_pattern);
         elapsed_since_preamble_sym += marker::MARKER_LEN + with_pilots.len();
         all_symbols.extend(with_pilots);
 
@@ -246,17 +246,18 @@ pub fn build_superframe_v3_range(
     }
 
     let n_extra_pilot_groups = 4;
+    let d_syms = config.pilot_pattern.d_syms;
     for eg in 0..n_extra_pilot_groups {
-        for k in 0..crate::types::D_SYMS {
-            all_symbols.push(runout_filler_symbol(eg * crate::types::D_SYMS + k));
+        for k in 0..d_syms {
+            all_symbols.push(runout_filler_symbol(eg * d_syms + k));
         }
-        let pilots = pilot::pilots_for_group(eg);
+        let pilots = pilot::pilots_for_group(eg, &config.pilot_pattern);
         all_symbols.extend_from_slice(&pilots);
     }
     let runout_len = 24;
     for k in 0..runout_len {
         all_symbols.push(runout_filler_symbol(
-            n_extra_pilot_groups * crate::types::D_SYMS + k,
+            n_extra_pilot_groups * d_syms + k,
         ));
     }
 
@@ -313,21 +314,22 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
         reserved: 0,
     };
     all_symbols.extend(marker::make_marker(&payload));
-    let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms);
+    let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms, &config.pilot_pattern);
     all_symbols.extend(with_pilots);
 
     let n_extra_pilot_groups = 4;
+    let d_syms = config.pilot_pattern.d_syms;
     for eg in 0..n_extra_pilot_groups {
-        for k in 0..crate::types::D_SYMS {
-            all_symbols.push(runout_filler_symbol(eg * crate::types::D_SYMS + k));
+        for k in 0..d_syms {
+            all_symbols.push(runout_filler_symbol(eg * d_syms + k));
         }
-        let pilots = pilot::pilots_for_group(eg);
+        let pilots = pilot::pilots_for_group(eg, &config.pilot_pattern);
         all_symbols.extend_from_slice(&pilots);
     }
     let runout_len = 24;
     for k in 0..runout_len {
         all_symbols.push(runout_filler_symbol(
-            n_extra_pilot_groups * crate::types::D_SYMS + k,
+            n_extra_pilot_groups * d_syms + k,
         ));
     }
 

@@ -92,6 +92,37 @@ impl LdpcRate {
     }
 }
 
+/// TDM pilot pattern: one group = `d_syms` data + `p_syms` QPSK pilots.
+///
+/// Historically this was a global constant (`types::D_SYMS` = 32, `P_SYMS` = 2).
+/// It is now a per-profile knob so low-rate profiles can densify pilots and
+/// get a finer phase tracking grid without paying the overhead on higher-rate
+/// profiles where the standard spacing is already well inside Nyquist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PilotPattern {
+    pub d_syms: usize,
+    pub p_syms: usize,
+}
+
+impl PilotPattern {
+    /// 32 data + 2 pilots per group — v3 default, used by HIGH/NORMAL/MEGA/ROBUST.
+    pub const fn default_v3() -> Self {
+        Self { d_syms: 32, p_syms: 2 }
+    }
+
+    /// 16 data + 2 pilots per group — densified, specific to ULTRA (Rs=500 Bd)
+    /// to double the pilot sampling rate on a profile where the 68 ms gap of
+    /// the default pattern aliases sub-Nyquist drift components.
+    pub const fn dense_ultra() -> Self {
+        Self { d_syms: 16, p_syms: 2 }
+    }
+
+    /// Total symbols per group (data + pilots).
+    pub const fn group_sz(&self) -> usize {
+        self.d_syms + self.p_syms
+    }
+}
+
 /// Full modem configuration.
 #[derive(Clone, Debug)]
 pub struct ModemConfig {
@@ -103,6 +134,8 @@ pub struct ModemConfig {
     pub center_freq_hz: f64,
     /// APSK gamma (only used for Apsk16, default 2.85)
     pub apsk_gamma: f64,
+    /// TDM pilot pattern. Profile-specific so ULTRA can densify.
+    pub pilot_pattern: PilotPattern,
 }
 
 /// Canonical profile identifier.
@@ -177,7 +210,9 @@ impl ModemConfig {
     /// Net data rate in bits/s (after LDPC + pilot overhead).
     pub fn net_bitrate(&self) -> f64 {
         let gross = self.symbol_rate * self.constellation.bits_per_sym() as f64 * self.tau;
-        let pilot_eff = D_SYMS_F / (D_SYMS_F + P_SYMS_F);
+        let d = self.pilot_pattern.d_syms as f64;
+        let p = self.pilot_pattern.p_syms as f64;
+        let pilot_eff = d / (d + p);
         gross * self.ldpc_rate.rate() * pilot_eff
     }
 
@@ -191,6 +226,10 @@ impl ModemConfig {
     }
 
     /// Decode a mode_code byte.
+    ///
+    /// The mode_code does not carry the pilot pattern — it's reconstructed via
+    /// `ProfileIndex::to_config()` in the real RX path. This helper assumes
+    /// the v3 default pattern; it's used for header-level round-trip tests only.
     pub fn from_mode_code(code: u8, beta: f64, tau: f64, center_freq_hz: f64) -> Option<Self> {
         let c = ConstellationType::from_code((code >> 6) & 0x03)?;
         let l = LdpcRate::from_code((code >> 4) & 0x03)?;
@@ -203,12 +242,10 @@ impl ModemConfig {
             tau,
             center_freq_hz,
             apsk_gamma: 2.85,
+            pilot_pattern: PilotPattern::default_v3(),
         })
     }
 }
-
-const D_SYMS_F: f64 = crate::types::D_SYMS as f64;
-const P_SYMS_F: f64 = crate::types::P_SYMS as f64;
 
 /// Known symbol rates (index -> rate).
 const SYMBOL_RATES: [(u8, f64); 7] = [
@@ -247,6 +284,7 @@ pub fn profile_mega() -> ModemConfig {
         tau: 30.0 / 32.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        pilot_pattern: PilotPattern::default_v3(),
     }
 }
 
@@ -259,6 +297,7 @@ pub fn profile_high() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        pilot_pattern: PilotPattern::default_v3(),
     }
 }
 
@@ -271,6 +310,7 @@ pub fn profile_normal() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        pilot_pattern: PilotPattern::default_v3(),
     }
 }
 
@@ -283,6 +323,7 @@ pub fn profile_robust() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        pilot_pattern: PilotPattern::default_v3(),
     }
 }
 
@@ -295,6 +336,7 @@ pub fn profile_ultra() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        pilot_pattern: PilotPattern::dense_ultra(),
     }
 }
 
@@ -320,5 +362,28 @@ mod tests {
         let rate = cfg.net_bitrate();
         // 8PSK 1500 Bd rate 1/2: 1500 * 3 * 0.5 * (32/34) ≈ 2117 bps
         assert!((rate - 2117.6).abs() < 5.0, "rate = {rate}");
+    }
+
+    #[test]
+    fn ultra_uses_dense_pilot_pattern() {
+        // ULTRA is the only profile that densifies its pilot layout. Everything
+        // else keeps the v3 default (32/2). This test guards that invariant —
+        // a regression would silently halve ULTRA's drift tracking bandwidth.
+        assert_eq!(profile_ultra().pilot_pattern, PilotPattern::dense_ultra());
+        for cfg in [profile_mega(), profile_high(), profile_normal(), profile_robust()] {
+            assert_eq!(
+                cfg.pilot_pattern,
+                PilotPattern::default_v3(),
+                "non-ULTRA profile should use default_v3 pattern",
+            );
+        }
+    }
+
+    #[test]
+    fn net_bitrate_ultra_dense_pattern() {
+        let cfg = profile_ultra();
+        let rate = cfg.net_bitrate();
+        // QPSK 500 Bd rate 1/2 dense pilots (16/2): 500 * 2 * 0.5 * (16/18) ≈ 444 bps
+        assert!((rate - 444.4).abs() < 1.0, "rate = {rate}");
     }
 }

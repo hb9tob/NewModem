@@ -28,7 +28,7 @@ use crate::profile::ModemConfig;
 use crate::rrc::{self, rrc_taps};
 use crate::soft_demod;
 use crate::sync;
-use crate::types::{Complex64, AUDIO_RATE, D_SYMS, N_PREAMBLE, P_SYMS, RRC_SPAN_SYM};
+use crate::types::{Complex64, AUDIO_RATE, N_PREAMBLE, RRC_SPAN_SYM};
 
 /// Result of decoding a v2 superframe.
 pub struct RxV2Result {
@@ -383,8 +383,10 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
                 // on the last segment is fine for drift estimation.
                 let n_cw = if p.is_meta() { 1 } else { V2_CODEWORDS_PER_SEGMENT };
                 let data_sym_count = n_cw * syms_per_cw;
-                let n_pilot_groups = (data_sym_count + D_SYMS - 1) / D_SYMS;
-                let seg_sym_len = data_sym_count + n_pilot_groups * P_SYMS;
+                let d_syms = config.pilot_pattern.d_syms;
+                let p_syms = config.pilot_pattern.p_syms;
+                let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
+                let seg_sym_len = data_sym_count + n_pilot_groups * p_syms;
                 cursor = pos + MARKER_LEN + seg_sym_len;
             }
             None => cursor += MARKER_LEN,
@@ -413,13 +415,15 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
     let (last_pos, _) = *markers.last().unwrap();
     let actual_total: i64 = last_pos as i64 - first_pos as i64;
     let mut expected_total: i64 = 0;
+    let d_syms = config.pilot_pattern.d_syms;
+    let p_syms = config.pilot_pattern.p_syms;
     // Distance from markers[i] to markers[i+1] is MARKER_LEN + segment(markers[i])
     for i in 0..markers.len() - 1 {
         let (_, m) = markers[i];
         let n_cw = if m { 1 } else { V2_CODEWORDS_PER_SEGMENT };
         let data_sym_count = n_cw * syms_per_cw;
-        let n_pilot_groups = (data_sym_count + D_SYMS - 1) / D_SYMS;
-        expected_total += (MARKER_LEN + data_sym_count + n_pilot_groups * P_SYMS) as i64;
+        let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
+        expected_total += (MARKER_LEN + data_sym_count + n_pilot_groups * p_syms) as i64;
     }
     if expected_total <= 0 {
         return None;
@@ -628,8 +632,10 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             V2_CODEWORDS_PER_SEGMENT
         };
         let data_sym_count = n_cw * syms_per_cw;
-        let n_pilot_groups = (data_sym_count + D_SYMS - 1) / D_SYMS;
-        let seg_sym_len = data_sym_count + n_pilot_groups * P_SYMS;
+        let d_syms = config.pilot_pattern.d_syms;
+        let p_syms = config.pilot_pattern.p_syms;
+        let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
+        let seg_sym_len = data_sym_count + n_pilot_groups * p_syms;
 
         if cursor + seg_sym_len > data_region.len() {
             break;
@@ -638,6 +644,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
 
         let seg_data_syms = track_segment(
             seg_syms_raw,
+            &config.pilot_pattern,
             &mut pll,
             &constellation,
             &mut sigma2_sum,
@@ -920,41 +927,50 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     })
 }
 
-/// Pilot-aided complex-gain (magnitude + phase) interpolation on one segment.
+/// Pilot-aided complex-gain (magnitude + phase) interpolation on one segment,
+/// optionally followed by a decision-directed PLL refinement on QPSK profiles.
 ///
-/// Uses the same approach as the v1 `rx::rx` pipeline that proved robust for
-/// MEGA FTN on OTA: per-group complex LS gain, unwrap phase, 3-point smooth,
-/// linear interpolate the complex gain per symbol, apply its inverse.
+/// The pilot pass uses the same approach as the v1 `rx::rx` pipeline that proved
+/// robust for MEGA FTN on OTA: per-group complex LS gain, unwrap phase, 3-point
+/// smooth, linear interpolate the complex gain per symbol, apply its inverse.
 ///
 /// Pilot group indexing within a segment restarts at 0 (matches the TX
 /// per-segment call to `pilot::interleave_data_pilots`).
 ///
-/// Sigma² residuals at pilot positions (post-correction) are accumulated in-place.
+/// Sigma² residuals at pilot positions (post pilot-correction, pre DD-PLL) are
+/// accumulated in-place — they reflect the quality of the pilot-only estimate
+/// and remain a sound input to the LDPC LLR scaler.
 ///
-/// The `_pll` parameter is kept for API compatibility and may be used later
-/// for inter-pilot decision-directed refinement, but the current implementation
-/// relies only on pilot-based interpolation to avoid decision-noise amplification
-/// on FTN profiles where 16-APSK decisions are marginal.
+/// On QPSK profiles (ULTRA, ROBUST) a second pass applies a decision-directed
+/// second-order PLL symbol-by-symbol to the extracted data vector. This picks
+/// up sub-pilot-spacing drift (residual ppm after `grid_ppm`, short-term phase
+/// noise) that the linear inter-pilot interpolation aliases. It is gated on
+/// `bits_per_sym == 2` because QPSK decisions are reliable enough at typical
+/// operating SNR (no feedback amplification of decision noise), whereas on
+/// 16-APSK (FTN) the decisions are too marginal and would hurt more than help.
 fn track_segment(
     seg_syms: &[Complex64],
-    _pll: &mut DdPll,
-    _constellation: &crate::constellation::Constellation,
+    pattern: &crate::profile::PilotPattern,
+    pll: &mut DdPll,
+    constellation: &crate::constellation::Constellation,
     sigma2_sum: &mut f64,
     sigma2_count: &mut usize,
 ) -> Vec<Complex64> {
-    let group_sz = D_SYMS + P_SYMS;
+    let d_syms = pattern.d_syms;
+    let p_syms = pattern.p_syms;
+    let group_sz = d_syms + p_syms;
     let n_groups = seg_syms.len() / group_sz;
 
-    // Per-group complex gain (LS fit of 2 known pilot symbols onto received)
+    // Per-group complex gain (LS fit of `p_syms` known pilots onto received)
     let mut pilot_gains: Vec<(usize, Complex64)> = Vec::with_capacity(n_groups);
     for g in 0..n_groups {
         let offset = g * group_sz;
-        let pilot_start = offset + D_SYMS;
-        let pilot_end = pilot_start + P_SYMS;
-        let pilots_tx = pilot::pilots_for_group(g);
+        let pilot_start = offset + d_syms;
+        let pilot_end = pilot_start + p_syms;
+        let pilots_tx = pilot::pilots_for_group(g, pattern);
         let mut num = Complex64::new(0.0, 0.0);
         let mut den = 0.0f64;
-        for k in 0..P_SYMS {
+        for k in 0..p_syms {
             num += seg_syms[pilot_start + k] * pilots_tx[k].conj();
             den += pilots_tx[k].norm_sqr();
         }
@@ -971,7 +987,7 @@ fn track_segment(
         return seg_syms
             .iter()
             .enumerate()
-            .filter(|(i, _)| i % group_sz < D_SYMS)
+            .filter(|(i, _)| i % group_sz < d_syms)
             .map(|(_, &s)| s)
             .collect();
     }
@@ -1028,19 +1044,32 @@ fn track_segment(
     let mut data_syms: Vec<Complex64> = Vec::new();
     for (i, &y_raw) in seg_syms.iter().enumerate() {
         let inner = i % group_sz;
-        let is_pilot = inner >= D_SYMS;
+        let is_pilot = inner >= d_syms;
         let (mag, phase) = interp(i);
         let inv_gain = Complex64::from_polar(1.0 / mag.max(1e-6), -phase);
         let y_corrected = y_raw * inv_gain;
 
         if is_pilot {
             let group = i / group_sz;
-            let pilots_tx = pilot::pilots_for_group(group);
-            let expected = pilots_tx[inner - D_SYMS];
+            let pilots_tx = pilot::pilots_for_group(group, pattern);
+            let expected = pilots_tx[inner - d_syms];
             *sigma2_sum += (y_corrected - expected).norm_sqr();
             *sigma2_count += 1;
         } else {
             data_syms.push(y_corrected);
+        }
+    }
+
+    // Second pass: decision-directed PLL refinement on QPSK profiles only.
+    // Pilot-interp has already centered the segment near θ=0, so the PLL only
+    // tracks the intra-segment residual (small-angle, fast convergence). On
+    // 8-PSK / 16-APSK we skip this pass — the decision noise on those
+    // constellations would amplify more than the PLL removes.
+    if constellation.bits_per_sym == 2 {
+        pll.reset();
+        for y in data_syms.iter_mut() {
+            let d = constellation.hard_decision(*y);
+            *y = pll.derotate_and_update(*y, d);
         }
     }
 
@@ -1202,6 +1231,37 @@ mod tests {
             assert!(r.app_header.is_some(), "{name} : no AppHeader");
             assert_eq!(&r.data[..data.len()], &data[..], "{name} : payload mismatch");
         }
+    }
+
+    /// Loopback : ULTRA with the dense 16/2 pattern + DD-PLL QPSK refinement
+    /// on a payload big enough to span several data segments and at least one
+    /// periodic preamble reinsertion. Guards against regressions in the
+    /// pattern-aware sizing/indexing and confirms the DD-PLL second pass
+    /// doesn't hurt decode on a clean channel.
+    #[test]
+    fn loopback_v3_ultra_medium_payload() {
+        use crate::profile::profile_ultra;
+        let cfg = profile_ultra();
+        let data: Vec<u8> = (0..800)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        let samples = tx_v3(&data, &cfg, 0xC001_ABCD);
+        let r = rx_v3(&samples, &cfg).expect("rx_v3 None for ULTRA medium");
+        eprintln!(
+            "V3 ULTRA 800B : converged={}/{} segs={}/lost={} sigma²={:.4} data_cw={}",
+            r.converged_blocks,
+            r.total_blocks,
+            r.segments_decoded,
+            r.segments_lost,
+            r.sigma2,
+            r.data_blocks_recovered
+        );
+        assert!(r.app_header.is_some(), "ULTRA : no AppHeader");
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "ULTRA medium loopback : payload mismatch",
+        );
     }
 
     #[test]
