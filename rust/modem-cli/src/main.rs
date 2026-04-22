@@ -66,6 +66,12 @@ enum Commands {
         /// max 10 ASCII bytes). Example: HB9TOB.
         #[arg(long)]
         callsign: Option<String>,
+
+        /// RaptorQ repair percentage on top of K for the initial burst
+        /// (0..=200). 0 emits exactly K codewords (zero margin, RX must
+        /// recover every packet). Default 30.
+        #[arg(long, default_value = "30")]
+        repair_pct: u32,
     },
 
     /// Emit an additional burst of RaptorQ repair packets for an already-sent
@@ -113,8 +119,15 @@ enum Commands {
 
         /// Percentage of K (source-symbol count) to emit in this burst.
         /// e.g. --pct 20 with K = 48 → 9 packets (one LDPC codeword each).
+        /// Ignored when `--count` is provided.
         #[arg(long, default_value = "20")]
         pct: u32,
+
+        /// Exact number of additional packets to emit. When set, overrides
+        /// `--pct`. Useful when the RX reports a specific shortage ("I'm
+        /// missing 5 blocks") — no more thinking in percentages.
+        #[arg(long)]
+        count: Option<u32>,
 
         #[arg(long)]
         filename: Option<String>,
@@ -174,6 +187,7 @@ fn main() {
             session_id,
             filename,
             callsign,
+            repair_pct,
         } => {
             let mut config = parse_profile(&profile);
 
@@ -249,8 +263,17 @@ fn main() {
                 sid, qrz, fname, mime, hash
             );
 
-            let symbols = modem_core::frame::build_superframe_v3(
-                &wire_payload, &config, sid, mime, hash,
+            let k_bytes_for_plan =
+                modem_core::ldpc::encoder::LdpcEncoder::new(config.ldpc_rate).k() / 8;
+            let k_src =
+                modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes_for_plan)
+                    as u32;
+            let n_total = k_src + (k_src * repair_pct) / 100;
+            eprintln!(
+                "TX v3: K={k_src}, repair_pct={repair_pct}, n_total={n_total} packets"
+            );
+            let symbols = modem_core::frame::build_superframe_v3_range(
+                &wire_payload, &config, sid, mime, hash, 0, n_total,
             );
 
             let (sps, pitch) = modem_core::rrc::check_integer_constraints(
@@ -317,6 +340,7 @@ fn main() {
             session_id,
             esi_start,
             pct,
+            count,
             filename,
             callsign,
         } => {
@@ -368,17 +392,23 @@ fn main() {
             let hash = content_hash_short(&wire_payload);
             let mime = infer_mime(&input);
 
-            // K = source-symbol count ; count = K * pct / 100 packets.
+            // K = source-symbol count. Packet count = explicit `count` if
+            // provided, else derived from `pct`. The explicit path is what the
+            // GUI uses now (user picks "+N blocs" directly); the percentage
+            // path is kept for backwards-compat and CLI scripting.
             let k_bytes = modem_core::profile::LdpcRate::k(config.ldpc_rate) / 8;
             let k =
                 modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes) as u32;
-            let n_packets = (k * pct) / 100;
+            let n_packets = match count {
+                Some(c) => c,
+                None => (k * pct) / 100,
+            };
             if n_packets == 0 {
-                eprintln!("tx-more: pct too small (K={k}, pct={pct}% → 0 packets)");
+                eprintln!("tx-more: empty burst (K={k}, pct={pct}%, count={count:?})");
                 std::process::exit(1);
             }
             eprintln!(
-                "tx-more: session=0x{sid:08X}, K={k}, esi_start={esi_start}, count={n_packets} ({pct}%)"
+                "tx-more: session=0x{sid:08X}, K={k}, esi_start={esi_start}, count={n_packets}"
             );
 
             let symbols = modem_core::frame::build_superframe_v3_range(

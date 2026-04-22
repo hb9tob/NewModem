@@ -113,21 +113,22 @@ pub struct TxPlan {
     pub seconds_per_cw: f64,
 }
 
-/// Compute the transmission plan for a given payload + profile. Includes the
-/// RaptorQ fountain overhead so the surface displayed to the user matches
-/// what actually goes on air.
+/// Compute the transmission plan for a given payload + profile + chosen
+/// RaptorQ repair percentage. Includes the fountain overhead so the surface
+/// displayed to the user matches what actually goes on air.
 pub fn tx_plan(
     payload_bytes: usize,
     mode_name: &str,
     callsign_len: usize,
     filename_len: usize,
+    repair_pct: u32,
 ) -> Result<TxPlan, String> {
     let config = parse_profile(mode_name)?;
     let envelope_overhead = 2 + filename_len + 1 + callsign_len + 1;
     let wire = payload_bytes + envelope_overhead;
     let k_bytes = config.ldpc_rate.k() / 8;
     let k_source = k_from_payload(wire, k_bytes) as u32;
-    let n_initial = k_source + n_repair_default(k_source);
+    let n_initial = k_source + (k_source * repair_pct) / 100;
     let bits_per_cw = (k_bytes as f64) * 8.0;
     let seconds_per_cw = bits_per_cw / config.net_bitrate();
     Ok(TxPlan {
@@ -139,27 +140,6 @@ pub fn tx_plan(
     })
 }
 
-/// Legacy API kept for `tx_estimate` callers that want a single scalar.
-/// Returns the *actual* on-air duration (K + repair), matching what
-/// the progress bar will count up against.
-pub fn estimate_duration_s(
-    payload_bytes: usize,
-    mode_name: &str,
-    callsign_len: usize,
-    filename_len: usize,
-) -> Result<f64, String> {
-    Ok(tx_plan(payload_bytes, mode_name, callsign_len, filename_len)?.duration_s_initial)
-}
-
-/// Legacy API : total blocks emitted by the initial burst (= K + repair).
-pub fn estimate_total_blocks(
-    payload_bytes: usize,
-    mode_name: &str,
-    callsign_len: usize,
-    filename_len: usize,
-) -> Result<u32, String> {
-    Ok(tx_plan(payload_bytes, mode_name, callsign_len, filename_len)?.n_initial)
-}
 
 /// Retrouve le binaire modem-cli à côté du GUI. Priorité :
 ///   1. `nbfm-modem-<TARGET_TRIPLE>[.exe]` — nom produit par le sidecar
@@ -188,6 +168,7 @@ fn generate_wav_via_cli(
     mode: &str,
     callsign: &str,
     filename: &str,
+    repair_pct: u32,
 ) -> Result<(), String> {
     let output = Command::new(cli)
         .arg("tx")
@@ -201,6 +182,8 @@ fn generate_wav_via_cli(
         .arg(callsign)
         .arg("--filename")
         .arg(filename)
+        .arg("--repair-pct")
+        .arg(repair_pct.to_string())
         .output()
         .map_err(|e| format!("spawn modem-cli: {e}"))?;
     if !output.status.success() {
@@ -222,7 +205,7 @@ fn generate_wav_more_via_cli(
     callsign: &str,
     filename: &str,
     esi_start: u32,
-    pct: u32,
+    count: u32,
 ) -> Result<(), String> {
     let output = Command::new(cli)
         .arg("tx-more")
@@ -238,8 +221,8 @@ fn generate_wav_more_via_cli(
         .arg(filename)
         .arg("--esi-start")
         .arg(esi_start.to_string())
-        .arg("--pct")
-        .arg(pct.to_string())
+        .arg("--count")
+        .arg(count.to_string())
         .output()
         .map_err(|e| format!("spawn modem-cli tx-more: {e}"))?;
     if !output.status.success() {
@@ -290,7 +273,7 @@ pub fn spawn_more(
     device_name: String,
     save_dir: PathBuf,
     esi_start: u32,
-    pct: u32,
+    count: u32,
     app: AppHandle,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -332,7 +315,7 @@ pub fn spawn_more(
             mode.to_lowercase()
         ));
         if let Err(e) = generate_wav_more_via_cli(
-            &cli, &avif_path, &wav_path, &mode, &callsign, &filename, esi_start, pct,
+            &cli, &avif_path, &wav_path, &mode, &callsign, &filename, esi_start, count,
         ) {
             let _ = app.emit("tx_error", TxErrorEvent { message: e });
             return;
@@ -386,6 +369,7 @@ pub fn spawn(
     filename: String,
     device_name: String,
     save_dir: PathBuf,
+    repair_pct: u32,
     app: AppHandle,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -421,14 +405,19 @@ pub fn spawn(
                 return;
             }
         };
-        let total_blocks =
-            match estimate_total_blocks(payload_bytes, &mode, callsign.len(), filename.len()) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = app.emit("tx_error", TxErrorEvent { message: e });
-                    return;
-                }
-            };
+        let total_blocks = match tx_plan(
+            payload_bytes,
+            &mode,
+            callsign.len(),
+            filename.len(),
+            repair_pct,
+        ) {
+            Ok(p) => p.n_initial,
+            Err(e) => {
+                let _ = app.emit("tx_error", TxErrorEvent { message: e });
+                return;
+            }
+        };
 
         if let Err(e) = std::fs::create_dir_all(&save_dir) {
             let _ = app.emit(
@@ -445,9 +434,9 @@ pub fn spawn(
             .unwrap_or(0);
         let wav_path = save_dir.join(format!("tx-{ts}-{}.wav", mode.to_lowercase()));
 
-        if let Err(e) =
-            generate_wav_via_cli(&cli, &avif_path, &wav_path, &mode, &callsign, &filename)
-        {
+        if let Err(e) = generate_wav_via_cli(
+            &cli, &avif_path, &wav_path, &mode, &callsign, &filename, repair_pct,
+        ) {
             let _ = app.emit("tx_error", TxErrorEvent { message: e });
             return;
         }

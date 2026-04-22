@@ -204,8 +204,15 @@ fn tx_estimate(
     mode: String,
     callsign: String,
     filename: String,
+    repair_pct: Option<u32>,
 ) -> Result<TxEstimate, String> {
-    let plan = tx_worker::tx_plan(payload_bytes, &mode, callsign.len(), filename.len())?;
+    let plan = tx_worker::tx_plan(
+        payload_bytes,
+        &mode,
+        callsign.len(),
+        filename.len(),
+        repair_pct.unwrap_or(30),
+    )?;
     Ok(TxEstimate {
         duration_s: plan.duration_s_initial,
         total_blocks: plan.n_initial,
@@ -222,6 +229,10 @@ struct TxStartArgs {
     callsign: String,
     filename: String,
     tx_device: String,
+    /// RaptorQ repair-pct chosen in the GUI (0, 5, 10, 20, 30, 50, 100...).
+    /// Defaults to 30 when the caller omits it.
+    #[serde(default)]
+    repair_pct: Option<u32>,
 }
 
 #[tauri::command]
@@ -255,6 +266,7 @@ fn tx_start(
         args.filename,
         args.tx_device,
         save_dir,
+        args.repair_pct.unwrap_or(30),
         app,
     );
     *tx_guard = Some(handle);
@@ -268,7 +280,10 @@ struct TxMoreArgs {
     filename: String,
     tx_device: String,
     esi_start: u32,
-    pct: u32,
+    /// Exact number of additional blocks to emit. The UI picks it directly
+    /// (dropdown / free input) — no more percentage conversion, so "I'm
+    /// missing 5 blocks" translates 1:1 to `count = 5`.
+    count: u32,
 }
 
 #[tauri::command]
@@ -295,6 +310,9 @@ fn tx_more(
     if args.tx_device.trim().is_empty() {
         return Err("carte son TX non sélectionnée (Paramètres)".into());
     }
+    if args.count == 0 {
+        return Err("choisir un nombre de blocs > 0".into());
+    }
     let handle = tx_worker::spawn_more(
         avif_path,
         args.mode,
@@ -303,7 +321,7 @@ fn tx_more(
         args.tx_device,
         save_dir,
         args.esi_start,
-        args.pct,
+        args.count,
         app,
     );
     *tx_guard = Some(handle);

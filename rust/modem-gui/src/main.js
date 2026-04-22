@@ -942,6 +942,14 @@ const txState = {
   // Vitesse encodeur AVIF, 1..=10. 6 = équilibré (quelques secondes sur un
   // SP7), 1 = max compression/très lent, 10 = rapide mais fichier plus gros.
   speed: 6,
+  // % de blocs repair RaptorQ ajoutés au burst initial (0, 5, 10, 20, 30,
+  // 50, 100). 30 = défaut historique. 0 = strict K, utile quand on cherche
+  // à tester la marge de décodage sans redondance.
+  repairPct: 30,
+  // Nombre de blocs à émettre en "More" burst (valeur exacte, pas un %).
+  // L'user choisit depuis un select discret ou saisit via l'input libre.
+  // L'user cas d'usage typique : "il me manque 5 blocs" → count = 5.
+  moreCount: 5,
   aspectLinked: true,
   txActive: false,
   // Blocs fontaine additionnels à générer sur TX more (% de la taille code).
@@ -994,7 +1002,9 @@ function refreshTxButtons() {
   const btnStop = document.getElementById("tx-btn-stop");
   const btnMore = document.getElementById("tx-btn-more");
   const btnCompress = document.getElementById("tx-btn-compress");
-  const morePct = document.getElementById("tx-more-pct");
+  const repairPct = document.getElementById("tx-repair-pct");
+  const moreCount = document.getElementById("tx-more-count");
+  const moreCountCustom = document.getElementById("tx-more-count-custom");
   if (!btnTx) return;
   const hasImage = !!txState.sourceImage;
   const hasCompressed = txState.compressedBytes != null;
@@ -1036,7 +1046,12 @@ function refreshTxButtons() {
   btnMore.disabled = !hasImage || txState.txActive || !hasPriorTx;
   btnMore.title = moreButtonTitle();
   btnStop.disabled = !txState.txActive;
-  if (morePct) morePct.disabled = !hasImage || txState.txActive;
+  if (repairPct) repairPct.disabled = !hasImage || txState.txActive;
+  if (moreCount) moreCount.disabled = !hasImage || txState.txActive;
+  if (moreCountCustom) {
+    moreCountCustom.disabled = !hasImage || txState.txActive;
+    moreCountCustom.hidden = moreCount ? moreCount.value !== "custom" : true;
+  }
 
   // Libellé + couleur du bouton TX selon l'état.
   if (txState.txActive) {
@@ -1087,12 +1102,12 @@ function txButtonTitle(est, dur, longTx) {
 // Tooltip du bouton More : blocs additionnels, durée attendue.
 function moreButtonTitle() {
   const est = txState.estimate;
-  if (!est || !est.k_source || !est.seconds_per_cw) {
-    return `émettre +${txState.morePct} % de blocs RaptorQ`;
+  const count = computeMoreCount();
+  if (!est || !est.seconds_per_cw) {
+    return `émettre +${count} blocs RaptorQ`;
   }
-  const count = Math.max(1, Math.floor((est.k_source * txState.morePct) / 100));
   const dur = est.seconds_per_cw * count;
-  return `+${count} blocs (${txState.morePct}% de K=${est.k_source}) · ~${fmtSeconds(dur)}`;
+  return `+${count} blocs · ~${fmtSeconds(dur)}`;
 }
 
 function txFitInto(w, h, maxW, maxH) {
@@ -1188,6 +1203,7 @@ async function refreshTxEstimate() {
       mode: txState.mode,
       callsign: currentSettings.callsign || "HB9XXX",
       filename: getTxFilename(),
+      repairPct: txState.repairPct,
     });
     txState.estimate = est;
   } catch (err) {
@@ -1551,10 +1567,44 @@ function setupTxTab() {
   document.getElementById("tx-btn-tx").addEventListener("click", txStart);
   document.getElementById("tx-btn-stop").addEventListener("click", txStop);
   document.getElementById("tx-btn-more").addEventListener("click", txMore);
-  document.getElementById("tx-more-pct").addEventListener("change", (ev) => {
-    txState.morePct = parseInt(ev.target.value, 10) || 20;
-    refreshTxButtons(); // refresh le title moreButtonTitle avec le nouveau pct
-  });
+  const repairPctEl = document.getElementById("tx-repair-pct");
+  if (repairPctEl) {
+    repairPctEl.value = String(txState.repairPct);
+    repairPctEl.addEventListener("change", (ev) => {
+      txState.repairPct = parseInt(ev.target.value, 10);
+      if (!Number.isFinite(txState.repairPct) || txState.repairPct < 0) {
+        txState.repairPct = 30;
+      }
+      // Refresh estimate : la durée et N dépendent de ce %.
+      refreshTxEstimate().catch(() => {});
+      refreshTxButtons();
+    });
+  }
+
+  const moreCountEl = document.getElementById("tx-more-count");
+  const moreCountCustomEl = document.getElementById("tx-more-count-custom");
+  if (moreCountEl) {
+    moreCountEl.addEventListener("change", () => {
+      if (moreCountEl.value === "custom") {
+        if (moreCountCustomEl) {
+          moreCountCustomEl.hidden = false;
+          moreCountCustomEl.focus();
+        }
+      } else {
+        if (moreCountCustomEl) moreCountCustomEl.hidden = true;
+        const v = parseInt(moreCountEl.value, 10);
+        if (Number.isFinite(v) && v > 0) txState.moreCount = v;
+      }
+      refreshTxButtons();
+    });
+  }
+  if (moreCountCustomEl) {
+    moreCountCustomEl.addEventListener("input", () => {
+      const v = parseInt(moreCountCustomEl.value, 10);
+      if (Number.isFinite(v) && v > 0) txState.moreCount = v;
+      refreshTxButtons();
+    });
+  }
   refreshTxButtons();
 }
 
@@ -1594,13 +1644,15 @@ async function txStart() {
         callsign: currentSettings.callsign || "",
         filename: getTxFilename(),
         tx_device: currentSettings.tx_device || "",
+        repair_pct: txState.repairPct,
       },
     });
     // Après un TX initial, on mémorise l'état session pour activer "More".
-    // Le burst initial émet K + 30 % packets → ESI max = ceil(K * 1.3) - 1.
+    // Le burst initial émet K + (repair_pct %) packets → ESI max = ceil(K * (1 + p/100)) - 1.
     const k = computeK();
     if (k) {
-      const emitted = Math.ceil(k * 1.3);
+      const factor = 1 + (txState.repairPct || 0) / 100;
+      const emitted = Math.ceil(k * factor);
       txState.lastTx = { mode: txState.mode, esiMax: emitted - 1 };
     }
   } catch (err) {
@@ -1622,6 +1674,21 @@ function computeK() {
   return null;
 }
 
+// Nombre de blocs additionnels à émettre en "More" burst. Soit la valeur
+// discrète du select (1, 2, 5, 10, 20, 50), soit la valeur de l'input libre
+// quand l'user a sélectionné "+n…".
+function computeMoreCount() {
+  const sel = document.getElementById("tx-more-count");
+  if (!sel) return txState.moreCount || 5;
+  if (sel.value === "custom") {
+    const custom = document.getElementById("tx-more-count-custom");
+    const v = parseInt(custom && custom.value, 10);
+    return Number.isFinite(v) && v > 0 ? v : (txState.moreCount || 5);
+  }
+  const v = parseInt(sel.value, 10);
+  return Number.isFinite(v) && v > 0 ? v : (txState.moreCount || 5);
+}
+
 async function txMore() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   if (txState.txActive) return;
@@ -1629,13 +1696,11 @@ async function txMore() {
     logEvent("tx_more_skipped", { reason: "pas de TX initial pour ce mode" });
     return;
   }
-  const k = computeK();
-  if (!k) {
-    logEvent("tx_more_skipped", { reason: "K inconnu (pas d'estimate)" });
+  const count = computeMoreCount();
+  if (!count || count < 1) {
+    logEvent("tx_more_skipped", { reason: "count invalide" });
     return;
   }
-  const pct = txState.morePct;
-  const count = Math.max(1, Math.floor((k * pct) / 100));
   const esiStart = txState.lastTx.esiMax + 1;
   const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
@@ -1657,7 +1722,7 @@ async function txMore() {
   };
   updateTxProgressText();
   refreshTxButtons();
-  logEvent("tx_more_start", { pct, count, esi_start: esiStart, k });
+  logEvent("tx_more_start", { count, esi_start: esiStart });
   try {
     await invoke("tx_more", {
       args: {
@@ -1666,7 +1731,7 @@ async function txMore() {
         filename: getTxFilename(),
         tx_device: currentSettings.tx_device || "",
         esi_start: esiStart,
-        pct: pct,
+        count: count,
       },
     });
   } catch (err) {
