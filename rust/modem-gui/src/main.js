@@ -761,20 +761,43 @@ function drawProgressBlocks() {
   const w = canvas.width;
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
-  const { bitmap, expected } = lastProgress;
+  const { bitmap, expected, converged } = lastProgress;
   if (!expected || expected <= 0) {
     ctx.fillStyle = "#3a1a1a";
     ctx.fillRect(0, 0, w, h);
     return;
   }
+  // Stratégie "fountain fill" : le code RaptorQ n'a pas besoin de récupérer
+  // les ESIs manquants exactement — il suffit de K blocs au total. On
+  // affiche donc la bitmap réelle (positions ESI effectivement reçues),
+  // puis on "bouche les trous" dès que `converged` dépasse le nombre de
+  // bits à 1 dans [0..expected) : les ESIs > expected (venus par More ou
+  // par repair) ne sont pas perdus, ils repeignent le premier trou rouge.
   const bw = w / expected;
-  for (let i = 0; i < expected; i++) {
-    let converged = false;
-    if (bitmap) {
+  const slotConverged = new Array(expected).fill(false);
+  let filled = 0;
+  if (bitmap) {
+    for (let i = 0; i < expected; i++) {
       const byte = bitmap[i >> 3] || 0;
-      converged = ((byte >> (i & 7)) & 1) !== 0;
+      if (((byte >> (i & 7)) & 1) !== 0) {
+        slotConverged[i] = true;
+        filled++;
+      }
     }
-    ctx.fillStyle = converged ? "#9ccc65" : "#c62828";
+  }
+  // Surplus = blocs reçus au-delà de ce que la bitmap locale peut montrer.
+  // Comble les trous de gauche à droite.
+  let surplus = Math.max(0, (converged || 0) - filled);
+  if (surplus > 0) {
+    for (let i = 0; i < expected && surplus > 0; i++) {
+      if (!slotConverged[i]) {
+        slotConverged[i] = true;
+        surplus--;
+      }
+    }
+  }
+  for (let i = 0; i < expected; i++) {
+    ctx.fillStyle = slotConverged[i] ? "#9ccc65" : "#c62828";
     ctx.fillRect(Math.floor(i * bw), 0, Math.max(1, Math.ceil(bw) - 1), h);
   }
 }
