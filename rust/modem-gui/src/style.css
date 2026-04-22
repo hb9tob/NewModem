@@ -658,6 +658,10 @@ main {
   color: #777;
   font-style: italic;
 }
+.tx-size-info .tx-stale {
+  color: #ffb74d;
+  font-style: italic;
+}
 .tx-actions {
   margin-top: auto;
   display: flex;

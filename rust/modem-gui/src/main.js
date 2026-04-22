@@ -952,6 +952,13 @@ const txState = {
   compressing: false,
   compressTimer: null,
   compressSeq: 0,
+  // True quand un paramètre (quality / resize / dimensions libres) a été
+  // modifié depuis la dernière compression réussie. Pilote l'indicateur
+  // "obsolète" + le style warn du bouton Recalculer.
+  compressDirty: false,
+  // Garde anti-réentrance : drop ignoré pendant qu'un chargement d'image
+  // est en cours (évite deux loadTxFileFromPath en parallèle).
+  loading: false,
   // Estimation calculée par le backend après chaque compression ou
   // changement de mode ; pilote l'activation du bouton TX et l'affichage
   // "durée estimée · nb blocs".
@@ -960,6 +967,11 @@ const txState = {
   progress: null,
   restartRxAfter: false,
 };
+
+// Chaîne de promesses pour sérialiser les compressions AVIF. Sans ça, un drop
+// d'image pendant qu'une compression tourne lance un 2e encodeur ravif speed-1
+// en parallèle — assez pour saturer la RAM et geler KDE sur les grosses images.
+let _compressChain = Promise.resolve();
 
 // Limites du transport (spec utilisateur) : interdit > 100 ko ou > 5 min,
 // warning > 2 min. Sous ces seuils, TX est activé normalement.
@@ -987,9 +999,17 @@ function refreshTxButtons() {
   if (btnCompress) {
     btnCompress.disabled =
       !hasImage || txState.compressing || txState.txActive;
-    btnCompress.textContent = txState.compressing
-      ? "Compression…"
-      : "Recalculer la compression";
+    if (txState.compressing) {
+      btnCompress.textContent = "Compression…";
+    } else if (txState.compressDirty) {
+      btnCompress.textContent = "⚠ Recalculer la compression";
+    } else {
+      btnCompress.textContent = "Recalculer la compression";
+    }
+    btnCompress.classList.toggle(
+      "tx-btn-warn",
+      txState.compressDirty && !txState.compressing,
+    );
   }
 
   // Validation stricte : interdire TX si payload > 100 ko ou durée > 5 min.
@@ -1092,13 +1112,17 @@ function refreshTxPreview() {
   if (cmpSize) {
     if (txState.compressing && txState.compressedBytes == null) {
       cmpSize.textContent = "compression…";
+      cmpSize.classList.remove("tx-stale");
     } else if (txState.compressedBytes != null) {
       const ratio = txState.sourceSize > 0
         ? ` (${(txState.compressedBytes / txState.sourceSize * 100).toFixed(1)}%)`
         : "";
-      cmpSize.textContent = `${txFormatBytes(txState.compressedBytes)}${ratio}`;
+      const staleTag = txState.compressDirty ? " · obsolète" : "";
+      cmpSize.textContent = `${txFormatBytes(txState.compressedBytes)}${ratio}${staleTag}`;
+      cmpSize.classList.toggle("tx-stale", txState.compressDirty);
     } else {
       cmpSize.textContent = "—";
+      cmpSize.classList.remove("tx-stale");
     }
   }
 }
@@ -1142,7 +1166,18 @@ async function refreshTxEstimate() {
   refreshTxPreview();
 }
 
-async function runTxCompress() {
+function runTxCompress() {
+  // Sérialise via _compressChain : on enchaîne la nouvelle compression après
+  // celle qui est en cours, au lieu de laisser ravif tourner deux fois en
+  // parallèle (cf. _compressChain supra).
+  const chained = _compressChain
+    .then(() => _runTxCompressImpl())
+    .catch((err) => logEvent("tx_compress_chain_error", { message: String(err) }));
+  _compressChain = chained;
+  return chained;
+}
+
+async function _runTxCompressImpl() {
   if (!txState.sourceImage || !txState.sourceFile) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke, convertFileSrc } = window.__TAURI__.core;
@@ -1159,6 +1194,7 @@ async function runTxCompress() {
   const previewEl = document.getElementById("tx-preview");
   if (previewEl) previewEl.classList.add("compressing");
   refreshTxPreview();
+  refreshTxButtons();
   logEvent("tx_compress_start", {
     resize: txState.resize,
     target_w: dims.w,
@@ -1184,6 +1220,9 @@ async function runTxCompress() {
     // Cache-bust: le fichier est réécrit à chaque appel.
     const url = `${convertFileSrc(result.preview_path)}?v=${Date.now()}`;
     txState.compressedUrl = url;
+    // Les paramètres actuels correspondent à la nouvelle compression : on peut
+    // effacer l'indicateur "obsolète".
+    txState.compressDirty = false;
     const previewImg = document.getElementById("tx-preview-img");
     if (previewImg) previewImg.src = url;
     logEvent("tx_compress_done", {
@@ -1210,38 +1249,64 @@ async function runTxCompress() {
   }
 }
 
-// Charge un fichier depuis un chemin disque (drag-drop natif Tauri). Le
-// WebView n'expose pas File pour les fichiers droppés en mode natif, on
-// passe donc par le protocole asset:// via convertFileSrc pour récupérer
-// les bytes, puis on enveloppe dans un File.
+// Charge un fichier depuis un chemin disque (drag-drop natif Tauri). Le backend
+// lit lui-même les bytes via set_tx_source_from_path : on évite complètement
+// la sérialisation JSON-array via IPC qui, sur une grosse image, allouait
+// ~10× la taille du fichier côté JS + côté Rust et pouvait faire geler KDE.
 async function loadTxFileFromPath(path) {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  // Anti-réentrance : ignore les drops successifs pendant qu'un chargement
+  // ou une compression est en cours.
+  if (txState.loading) {
+    logEvent("tx_drop_ignored", { message: "chargement déjà en cours", path });
+    return;
+  }
+  txState.loading = true;
+  const { convertFileSrc, invoke } = window.__TAURI__.core;
+  const url = convertFileSrc(path);
+  const name = path.split(/[/\\]/).pop() || "image";
   try {
-    const { convertFileSrc } = window.__TAURI__.core;
-    const url = convertFileSrc(path);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const blob = await res.blob();
-    const name = path.split(/[/\\]/).pop() || "image";
-    const ext = (name.split(".").pop() || "").toLowerCase();
-    const mimeByExt = {
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      webp: "image/webp",
-      gif: "image/gif",
-      bmp: "image/bmp",
-      avif: "image/avif",
-      heic: "image/heic",
-      heif: "image/heif",
-    };
-    const type = blob.type && blob.type.startsWith("image/")
-      ? blob.type
-      : mimeByExt[ext] || "image/*";
-    const file = new File([blob], name, { type });
-    await loadTxFile(file);
+    // Upload par chemin (pas de bytes via IPC).
+    const size = await invoke("set_tx_source_from_path", { path });
+    // Charge aussi l'image en preview via asset://. L'ancien blob URL
+    // (si issu d'un picker précédent) est libéré.
+    if (txState.sourceUrl) {
+      URL.revokeObjectURL(txState.sourceUrl);
+      txState.sourceUrl = null;
+    }
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error(`image load failed: ${path}`));
+      img.src = url;
+    });
+    txState.sourceFile = { name, size };
+    txState.sourceImage = img;
+    txState.sourceSize = size;
+    txState.compressedBytes = null;
+    txState.compressedUrl = null;
+    txState.compressDirty = false;
+    txState.lastTx = null;
+    if (txState.resize !== "free") {
+      txState.freeW = img.naturalWidth;
+      txState.freeH = img.naturalHeight;
+      const fw = document.getElementById("tx-free-w");
+      const fh = document.getElementById("tx-free-h");
+      if (fw) fw.value = txState.freeW;
+      if (fh) fh.value = txState.freeH;
+    }
+    document.getElementById("tx-drop-zone").hidden = true;
+    const preview = document.getElementById("tx-preview");
+    const previewImg = document.getElementById("tx-preview-img");
+    if (previewImg) previewImg.src = url;
+    if (preview) preview.hidden = false;
+    refreshTxPreview();
+    refreshTxButtons();
+    scheduleTxCompress(50);
   } catch (err) {
-    logEvent("tx_error", { message: `drop read ${path}: ${err}` });
+    logEvent("tx_error", { message: `drop ${path}: ${err}` });
+  } finally {
+    txState.loading = false;
   }
 }
 
@@ -1259,6 +1324,7 @@ async function loadTxFile(file) {
   txState.sourceSize = file.size;
   txState.compressedBytes = null;
   txState.compressedUrl = null;
+  txState.compressDirty = false;
   const url = URL.createObjectURL(file);
   txState.sourceUrl = url;
   const img = new Image();
@@ -1310,6 +1376,7 @@ async function resetTxFile() {
   txState.sourceSize = 0;
   txState.compressedBytes = null;
   txState.compressedUrl = null;
+  txState.compressDirty = false;
   txState.compressSeq++;
   if (txState.compressTimer) {
     clearTimeout(txState.compressTimer);
@@ -1374,14 +1441,21 @@ function setupTxTab() {
     refreshTxButtons();
   });
 
+  const markCompressDirty = () => {
+    if (txState.compressedBytes != null && !txState.compressDirty) {
+      txState.compressDirty = true;
+    }
+    refreshTxPreview();
+    refreshTxButtons();
+  };
+
   const resizeRadios = document.querySelectorAll('input[name="tx-resize"]');
   for (const r of resizeRadios) {
     r.addEventListener("change", () => {
       if (!r.checked) return;
       txState.resize = r.value;
       document.getElementById("tx-resize-free").hidden = r.value !== "free";
-      refreshTxPreview();
-      refreshTxButtons();
+      markCompressDirty();
     });
   }
 
@@ -1396,7 +1470,7 @@ function setupTxTab() {
       txState.freeH = Math.max(1, Math.round(v * ar));
       freeH.value = txState.freeH;
     }
-    refreshTxPreview();
+    markCompressDirty();
   });
   freeH.addEventListener("input", () => {
     const v = parseInt(freeH.value, 10);
@@ -1407,14 +1481,14 @@ function setupTxTab() {
       txState.freeW = Math.max(1, Math.round(v * ar));
       freeW.value = txState.freeW;
     }
-    refreshTxPreview();
+    markCompressDirty();
   });
 
   const quality = document.getElementById("tx-quality");
   quality.addEventListener("input", () => {
     txState.quality = parseInt(quality.value, 10) || 0;
     document.getElementById("tx-quality-val").textContent = txState.quality;
-    refreshTxPreview();
+    markCompressDirty();
   });
 
   document.getElementById("tx-btn-compress").addEventListener("click", () => {

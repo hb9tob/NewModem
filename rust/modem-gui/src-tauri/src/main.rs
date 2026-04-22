@@ -343,6 +343,22 @@ fn set_tx_source(bytes: Vec<u8>, state: State<'_, AppState>) -> Result<usize, St
     Ok(len)
 }
 
+// Path-based variant used by the drag-drop code path. Passing the raw bytes
+// through IPC (set_tx_source) forces JSON-array serialization of the whole
+// image, which allocates ~10× the file size between JS and Rust and was
+// enough to OOM-freeze the desktop on large drops.
+#[tauri::command]
+fn set_tx_source_from_path(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let len = bytes.len();
+    let mut slot = state.tx_source.lock().map_err(|e| e.to_string())?;
+    *slot = Some(bytes);
+    Ok(len)
+}
+
 #[tauri::command]
 fn clear_tx_source(state: State<'_, AppState>) -> Result<(), String> {
     let mut slot = state.tx_source.lock().map_err(|e| e.to_string())?;
@@ -417,6 +433,7 @@ fn main() {
             stop_raw_recording,
             is_raw_recording,
             set_tx_source,
+            set_tx_source_from_path,
             clear_tx_source,
             compress_image,
             tx_estimate,
