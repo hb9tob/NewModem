@@ -835,7 +835,19 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
             continue;
         }
         let window = &samples[start..end];
-        let Some(r) = rx_v2(window, config) else {
+        // rx_v2_single, NOT the rx_v2 grid_ppm wrapper. In streaming, the
+        // buffer grows progressively between ticks; during the ramp-up the
+        // first pass is often below the "99% clean" threshold (too few
+        // segments), so rx_v2 falls into a 13× matched_filter ppm sweep
+        // EVERY TICK. On low-Rs profiles (ULTRA Rs=500), the buffer holds
+        // only 1-2 segments in 15 s, so it NEVER reaches 99% clean on a
+        // partial buffer — the sweep runs forever.
+        //
+        // rx_v2_single is enough: FFE re-trains on each preamble, marker-
+        // slide absorbs short-term drift. The full CLI path (nbfm-modem rx)
+        // still uses rx_v2 with sweep for static files where drift is
+        // cumulative over minutes.
+        let Some(r) = rx_v2_single(window, config) else {
             continue;
         };
         for (esi, bytes) in r.cw_bytes_map.into_iter() {
