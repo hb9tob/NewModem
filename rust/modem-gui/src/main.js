@@ -692,7 +692,16 @@ function updateFountainStatus(partial) {
   el.hidden = false;
   const k = next.needed || 0;
   const r = next.received || 0;
-  counter.textContent = `${r} / ${k} blocs`;
+  // Ne cap pas le "reçu" à K — l'utilisateur a le droit de voir qu'il a
+  // déjà avalé plus de blocs que le strict minimum (repair compris).
+  // "Manquants" ne peut pas descendre en négatif : c'est max(0, K - R).
+  const missing = Math.max(0, k - r);
+  const missingTail = next.decoded
+    ? ""
+    : missing > 0
+    ? ` · manque ${missing}`
+    : ` · manque 0 (décodable)`;
+  counter.textContent = `${r} / ${k} blocs${missingTail}`;
   const pctVal = k > 0 ? Math.min(100, Math.round((r * 100) / k)) : 0;
   pct.textContent = next.decoded
     ? "décodé ✓"
