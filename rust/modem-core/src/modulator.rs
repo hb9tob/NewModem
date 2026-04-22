@@ -9,15 +9,18 @@ use crate::types::{Complex64, AUDIO_RATE, PEAK_NORMALIZE};
 /// Modulate complex symbols to passband audio samples.
 ///
 /// Pipeline:
-/// 1. Place symbols at `pitch`-sample intervals (FTN or Nyquist)
-/// 2. Convolve with RRC pulse shape
-/// 3. Upmix to `center_freq_hz`
-/// 4. Peak-normalize to `PEAK_NORMALIZE`
+/// 1. Polyphase-shape: each symbol scatters its contribution across
+///    `taps.len()` samples starting at index `k * pitch`. Mathematically
+///    equivalent to upsample-then-convolve, but skips the `pitch-1` zero
+///    multiplications per symbol — a ~96× speedup on ULTRA (sps=96).
+/// 2. Upmix to `center_freq_hz` via an incremental oscillator (one complex
+///    multiply per sample instead of a fresh sin/cos).
+/// 3. Peak-normalize to `PEAK_NORMALIZE`.
 ///
 /// Returns real-valued passband samples at `AUDIO_RATE`.
 pub fn modulate(
     symbols: &[Complex64],
-    sps: usize,
+    _sps: usize,
     pitch: usize,
     taps: &[f64],
     center_freq_hz: f64,
@@ -26,25 +29,33 @@ pub fn modulate(
         return Vec::new();
     }
 
-    // 1. Upsample: place symbols at pitch-sample intervals
     let total_len = (symbols.len() - 1) * pitch + taps.len();
-    let mut up = vec![Complex64::new(0.0, 0.0); total_len];
+
+    // 1. Polyphase pulse shaping: accumulate each symbol * taps at its
+    //    upsampled position. Equivalent to upsample-then-convolve, but drops
+    //    the 0-valued samples between symbols (which dominate the sparse
+    //    signal at sps=96 under Nyquist).
+    let mut baseband = vec![Complex64::new(0.0, 0.0); total_len];
     for (k, &sym) in symbols.iter().enumerate() {
-        up[k * pitch] = sym;
+        let base = k * pitch;
+        for (t, &tap) in taps.iter().enumerate() {
+            baseband[base + t] += sym * tap;
+        }
     }
 
-    // 2. Convolve with RRC (mode "full", then truncate to total_len)
-    let baseband = convolve_truncate(&up, taps, total_len);
-
-    // 3. Upmix to passband: Re(baseband * exp(j * 2π * fc * t))
-    let mut passband = Vec::with_capacity(baseband.len());
-    for (i, &bb) in baseband.iter().enumerate() {
-        let phase = 2.0 * PI * center_freq_hz * i as f64 / AUDIO_RATE as f64;
-        let carrier = Complex64::new(phase.cos(), phase.sin());
+    // 2. Upmix to passband: Re(baseband * exp(j * 2π * fc * t)).
+    //    Incremental oscillator: carrier[i+1] = carrier[i] * step, where
+    //    step = exp(j·ω). One sin/cos upfront instead of per-sample.
+    let phase_inc = 2.0 * PI * center_freq_hz / AUDIO_RATE as f64;
+    let step = Complex64::new(phase_inc.cos(), phase_inc.sin());
+    let mut carrier = Complex64::new(1.0, 0.0);
+    let mut passband: Vec<f32> = Vec::with_capacity(baseband.len());
+    for &bb in &baseband {
         passband.push((bb * carrier).re as f32);
+        carrier *= step;
     }
 
-    // 4. Peak normalize
+    // 3. Peak normalize.
     let peak = passband.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
     if peak > 0.0 {
         let scale = PEAK_NORMALIZE / peak;
@@ -54,27 +65,6 @@ pub fn modulate(
     }
 
     passband
-}
-
-/// Convolve complex signal with real taps, return first `out_len` samples.
-fn convolve_truncate(signal: &[Complex64], taps: &[f64], out_len: usize) -> Vec<Complex64> {
-    let n = signal.len();
-    let m = taps.len();
-    let full_len = n + m - 1;
-    let len = out_len.min(full_len);
-    let mut out = vec![Complex64::new(0.0, 0.0); len];
-
-    for i in 0..len {
-        let mut acc = Complex64::new(0.0, 0.0);
-        let j_start = if i >= m { i - m + 1 } else { 0 };
-        let j_end = i.min(n - 1);
-        for j in j_start..=j_end {
-            acc += signal[j] * taps[i - j];
-        }
-        out[i] = acc;
-    }
-
-    out
 }
 
 /// Generate a CW tone (for VOX preamble or marker).
