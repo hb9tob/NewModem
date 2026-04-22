@@ -835,14 +835,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
             continue;
         }
         let window = &samples[start..end];
-        // Use rx_v2_single, NOT the grid_ppm wrapper: each window is only a
-        // few seconds long (one V3 preamble period), the per-window FFE
-        // re-training already absorbs short-term drift, and the ppm sweep
-        // (13 × matched_filter) blew up CPU in streaming (~40 G ops/tick on
-        // a 15 s ULTRA buffer, impossible to hold real-time on a SP7). The
-        // full-file ppm sweep is still run in the CLI `rx_v2` path, where
-        // the caller knows the input is static.
-        let Some(r) = rx_v2_single(window, config) else {
+        let Some(r) = rx_v2(window, config) else {
             continue;
         };
         for (esi, bytes) in r.cw_bytes_map.into_iter() {
