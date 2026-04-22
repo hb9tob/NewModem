@@ -634,10 +634,22 @@ main {
   font-size: 0.8rem;
   color: #c0c0c0;
 }
-#tx-quality-val {
+#tx-quality-val,
+#tx-speed-val {
   font-family: ui-monospace, monospace;
   color: #9ccc65;
   font-weight: bold;
+}
+.tx-speed-label {
+  display: block;
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+  color: #c0c0c0;
+}
+.tx-speed-label .tx-hint {
+  display: block;
+  font-size: 0.72rem;
+  margin-top: 0.15rem;
 }
 .tx-hint {
   color: #9e9e9e;

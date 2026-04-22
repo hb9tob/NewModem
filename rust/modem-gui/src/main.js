@@ -939,6 +939,9 @@ const txState = {
   freeH: 480,
   // Défaut 1 volontairement : image horrible, force l'utilisateur à choisir.
   quality: 1,
+  // Vitesse encodeur AVIF, 1..=10. 6 = équilibré (quelques secondes sur un
+  // SP7), 1 = max compression/très lent, 10 = rapide mais fichier plus gros.
+  speed: 6,
   aspectLinked: true,
   txActive: false,
   // Blocs fontaine additionnels à générer sur TX more (% de la taille code).
@@ -1200,6 +1203,7 @@ async function _runTxCompressImpl() {
     target_w: dims.w,
     target_h: dims.h,
     quality: txState.quality,
+    speed: txState.speed,
   });
   // Force le browser à peindre le loader avant de lancer invoke() : sans
   // ce yield, la compression backend peut répondre avant le premier paint,
@@ -1213,6 +1217,7 @@ async function _runTxCompressImpl() {
         target_w: dims.w,
         target_h: dims.h,
         quality: txState.quality,
+        speed: txState.speed,
       },
     });
     if (seq !== txState.compressSeq) return; // stale
@@ -1488,6 +1493,26 @@ function setupTxTab() {
   quality.addEventListener("input", () => {
     txState.quality = parseInt(quality.value, 10) || 0;
     document.getElementById("tx-quality-val").textContent = txState.quality;
+    markCompressDirty();
+  });
+
+  const speed = document.getElementById("tx-speed");
+  const speedVal = document.getElementById("tx-speed-val");
+  const speedHint = document.getElementById("tx-speed-hint");
+  const speedLabel = (v) => {
+    if (v <= 2) return "très lent · meilleure compression";
+    if (v <= 4) return "lent · bonne compression";
+    if (v <= 6) return "équilibré";
+    if (v <= 8) return "rapide · fichier plus gros";
+    return "très rapide · fichier + gros";
+  };
+  speed.value = String(txState.speed);
+  speedVal.textContent = String(txState.speed);
+  speedHint.textContent = speedLabel(txState.speed);
+  speed.addEventListener("input", () => {
+    txState.speed = parseInt(speed.value, 10) || 6;
+    speedVal.textContent = String(txState.speed);
+    speedHint.textContent = speedLabel(txState.speed);
     markCompressDirty();
   });
 

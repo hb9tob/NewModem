@@ -91,7 +91,16 @@
           <input type="range" id="tx-quality" min="0" max="100" value="1">
           <div class="tx-quality-row">
             <span>q = <span id="tx-quality-val">1</span></span>
-            <span class="tx-hint">AVIF 4:2:0 · speed 1</span>
+            <span class="tx-hint">AVIF 4:2:0</span>
+          </div>
+          <label class="tx-speed-label" for="tx-speed">
+            Vitesse encodeur
+            <span class="tx-hint">1 = max compression/lent · 10 = rapide/moins bon</span>
+          </label>
+          <input type="range" id="tx-speed" min="1" max="10" value="6">
+          <div class="tx-quality-row">
+            <span>speed = <span id="tx-speed-val">6</span></span>
+            <span class="tx-hint" id="tx-speed-hint">équilibré</span>
           </div>
         </fieldset>
 
