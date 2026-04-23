@@ -615,19 +615,18 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
 
         cursor += MARKER_LEN;
 
-        // Segment length: meta is always 1 CW; data uses V2_CODEWORDS_PER_SEGMENT
-        // except on the last data segment (which may hold fewer CWs if the
-        // total codeword count doesn't divide evenly). The cap requires the
-        // AppHeader — this works because TX emits the meta segment first.
+        // Segment length: meta is always 1 CW; data segments always carry
+        // V2_CODEWORDS_PER_SEGMENT codewords (TX guarantees this except on
+        // the very last data segment of a burst when the total count is
+        // odd — CRC + marker re-sync on the next iteration handle the
+        // resulting 1-CW-of-garbage read safely).
+        //
+        // The previous K-based clamp was wrong for any segment with
+        // base_esi ≥ K : it dropped half the repair codewords of the
+        // initial burst, and ~all codewords of a TX-more burst (whose
+        // ESIs are always beyond K).
         let n_cw = if marker_payload.is_meta() {
             1
-        } else if let Some(ref ah) = app_hdr {
-            let total_data_cw =
-                (((ah.file_size as usize) + k_bytes - 1) / k_bytes) as u32;
-            let remaining = total_data_cw.saturating_sub(marker_payload.base_esi);
-            V2_CODEWORDS_PER_SEGMENT
-                .min(remaining as usize)
-                .max(1)
         } else {
             V2_CODEWORDS_PER_SEGMENT
         };
