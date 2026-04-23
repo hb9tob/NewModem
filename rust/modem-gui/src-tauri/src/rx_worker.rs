@@ -723,15 +723,20 @@ fn scan_and_route(
 
     // A freshly-decoded file : emit session_decoded, copy to save_dir root
     // under the envelope filename, and emit the legacy file_complete event.
-    let just_decoded = outcome.decoded.is_some();
     if let Some(df) = outcome.decoded {
         emit_decoded_file(app, save_dir, &df, result.sigma2);
     }
 
-    // Free the in-memory audio buffer as soon as the TX signalled EOT or the
-    // fountain decoder converged : keeps rx_v3 fast, avoids accumulating a
-    // growing trailing tail that drags the worker off real-time.
-    if eot_seen || just_decoded {
+    // Free the in-memory audio buffer only once the TX explicitly signalled
+    // EOT. The older `just_decoded` trigger pre-dates the EOT frame : at the
+    // time, early trim was the cheapest way to keep rx_v3 fast after a
+    // decode. With EOT in place it becomes harmful — on a repair-padded
+    // burst (pct > 0), convergence fires at K while the tail repair packets
+    // are still on the wire, and the 2-s preroll usually strips the last
+    // periodic preamble so those tail ESIs never get latched in the next
+    // scan. CAPTURE_WINDOW_SECONDS (15 s) is already the hard cap, so
+    // dropping the early trim costs at most one slightly-slower scan.
+    if eot_seen {
         state.trim_buffer_to_preroll();
     }
 
