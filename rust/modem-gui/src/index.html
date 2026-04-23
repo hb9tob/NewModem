@@ -37,6 +37,20 @@
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
         <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
       </div>
+      <div id="capture-submit-prompt" class="capture-submit-prompt" hidden>
+        <div class="csp-line">
+          <strong>Capture terminée</strong>
+          <span id="csp-meta" class="csp-meta">—</span>
+        </div>
+        <div class="csp-line">
+          <input type="text" id="csp-notes" placeholder="Notes optionnelles (ex: relais HB9F, S9, QSB léger…)">
+        </div>
+        <div class="csp-line csp-actions">
+          <span id="csp-status" class="csp-status">—</span>
+          <button type="button" id="csp-submit">Soumettre au collecteur</button>
+          <button type="button" id="csp-dismiss" class="csp-dismiss">Ignorer</button>
+        </div>
+      </div>
       <div id="rx-fountain-status" class="rx-fountain-status" hidden>
         <span class="label">RaptorQ</span>
         <strong id="rx-fountain-counter">— / —</strong>
@@ -199,6 +213,18 @@
             </div>
           </div>
           <div id="ptt-status" class="ptt-status">—</div>
+        </fieldset>
+        <fieldset>
+          <legend>Collecteur de sondages (Phase D)</legend>
+          <label class="ptt-row">
+            URL :
+            <input type="url" id="collector-url" placeholder="https://hb9tob-modem.duckdns.org">
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Si renseigné, à la fin de chaque capture brute le GUI propose
+            de soumettre le WAV + l'event log au serveur. Vide = pas de
+            soumission, prompt désactivé.
+          </p>
         </fieldset>
         <div class="settings-status" id="settings-status">—</div>
       </div>

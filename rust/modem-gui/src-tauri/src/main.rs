@@ -2,6 +2,7 @@
 
 mod audio;
 mod audio_capture;
+mod collector_client;
 mod ptt;
 mod rx_worker;
 mod session_store;
@@ -233,6 +234,16 @@ fn is_raw_recording(state: State<'_, AppState>) -> Result<bool, String> {
         .lock()
         .map(|g| g.is_some())
         .unwrap_or(false))
+}
+
+/// Submit a finished raw capture to the Phase D collector. URL et HMAC
+/// sont gérés dans `collector_client`. Async parce que reqwest l'est ;
+/// Tauri 2 sait gérer async commands.
+#[tauri::command]
+async fn submit_capture(
+    args: collector_client::SubmitCaptureArgs,
+) -> Result<collector_client::SubmitResult, String> {
+    collector_client::submit(args).await
 }
 
 #[derive(serde::Serialize)]
@@ -549,6 +560,7 @@ fn main() {
             start_raw_recording,
             stop_raw_recording,
             is_raw_recording,
+            submit_capture,
             set_tx_source,
             set_tx_source_from_path,
             clear_tx_source,

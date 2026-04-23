@@ -26,6 +26,10 @@ pub struct Settings {
     /// (≤ 0). Renseignée par l'onglet Canal (cascade ATT). Gain appliqué :
     /// `10^(att/20)`. Défaut : 0 dB (pas d'atténuation).
     pub tx_attenuation_db: f32,
+    /// URL de base du collector Phase D (ex: `https://hb9tob-modem.duckdns.org`).
+    /// Si vide, le prompt post-capture brute n'apparaît pas et la
+    /// soumission est désactivée pour la session.
+    pub collector_url: String,
 }
 
 impl Default for Settings {
@@ -41,6 +45,7 @@ impl Default for Settings {
             ptt_rts_tx_high: true,
             ptt_dtr_tx_high: true,
             tx_attenuation_db: 0.0,
+            collector_url: String::new(),
         }
     }
 }

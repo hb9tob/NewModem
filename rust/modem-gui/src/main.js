@@ -22,7 +22,16 @@ function now() {
   return new Date().toLocaleTimeString();
 }
 
+// Event log : on garde aussi un buffer mémoire pour pouvoir le sérialiser
+// et le pousser au collecteur Phase D au moment d'une soumission. Cap à
+// 500 entrées comme la liste DOM.
+const eventLogBuffer = [];
+
 function logEvent(name, data) {
+  const tsMs = Date.now();
+  eventLogBuffer.push({ ts_ms: tsMs, name, data: data ?? null });
+  while (eventLogBuffer.length > 500) eventLogBuffer.shift();
+
   const log = document.getElementById("event-log");
   if (!log) return;
   const li = document.createElement("li");
@@ -347,6 +356,8 @@ let currentSettings = {
   ptt_use_dtr: false,
   ptt_rts_tx_high: true,
   ptt_dtr_tx_high: true,
+  tx_attenuation_db: 0,
+  collector_url: "",
 };
 
 function populateDeviceSelect(selectId, devices, savedName) {
@@ -441,11 +452,14 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
+      tx_attenuation_db: 0, collector_url: "",
     };
   }
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
   applyPttSettingsToUI();
+  const colUrl = document.getElementById("collector-url");
+  if (colUrl) colUrl.value = currentSettings.collector_url || "";
 }
 
 function applyPttSettingsToUI() {
@@ -535,9 +549,11 @@ async function persistSettings() {
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
   readPttFormIntoSettings();
+  const colUrl = document.getElementById("collector-url");
   currentSettings.callsign = (call && call.value || "").trim().toUpperCase();
   currentSettings.rx_device = rxSel ? rxSel.value || "" : "";
   currentSettings.tx_device = txSel ? txSel.value || "" : "";
+  if (colUrl) currentSettings.collector_url = (colUrl.value || "").trim();
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -588,6 +604,11 @@ function setupSettingsTab() {
   });
   document.querySelectorAll('input[name="ptt-rts-pol"], input[name="ptt-dtr-pol"]')
     .forEach(r => r.addEventListener("change", persistSettings));
+  const colUrl = document.getElementById("collector-url");
+  if (colUrl) {
+    colUrl.addEventListener("change", persistSettings);
+    colUrl.addEventListener("blur", persistSettings);
+  }
 }
 
 async function loadSaveDir() {
@@ -677,6 +698,7 @@ async function toggleRawRecording() {
       const info = await invoke("stop_raw_recording");
       setRawButtonState(false);
       logEvent("raw_recording_stopped", info);
+      maybeOfferCaptureSubmit(info);
     } else {
       const path = await invoke("start_raw_recording");
       setRawButtonState(true);
@@ -685,6 +707,106 @@ async function toggleRawRecording() {
   } catch (err) {
     logEvent("raw_recording_error", { message: String(err) });
   }
+}
+
+// ─────────────────────────────────────────── Submit capture (Phase D)
+// Si l'utilisateur a renseigné une URL collecteur dans Paramètres, on
+// affiche un panneau juste après la fin d'une capture brute pour proposer
+// la soumission. Sinon, rien — on ne submit qu'à la demande explicite.
+let pendingCapture = null;
+
+function maybeOfferCaptureSubmit(captureInfo) {
+  const url = (currentSettings.collector_url || "").trim();
+  const panel = document.getElementById("capture-submit-prompt");
+  if (!panel) return;
+  if (!url) {
+    panel.hidden = true;
+    pendingCapture = null;
+    return;
+  }
+  pendingCapture = captureInfo;
+  panel.hidden = false;
+  panel.classList.remove("busy", "success", "error");
+  const meta = document.getElementById("csp-meta");
+  if (meta) {
+    const sizeMb = (captureInfo.samples * 4 / (1024 * 1024)).toFixed(1);
+    meta.textContent = `${captureInfo.duration_sec.toFixed(1)} s · ~${sizeMb} MB · ${captureInfo.path}`;
+  }
+  const status = document.getElementById("csp-status");
+  if (status) status.textContent = `prêt à soumettre vers ${url}`;
+  const submit = document.getElementById("csp-submit");
+  const dismiss = document.getElementById("csp-dismiss");
+  if (submit) submit.disabled = false;
+  if (dismiss) dismiss.disabled = false;
+  const notes = document.getElementById("csp-notes");
+  if (notes) notes.value = "";
+}
+
+async function submitPendingCapture() {
+  if (!pendingCapture) return;
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const panel = document.getElementById("capture-submit-prompt");
+  const status = document.getElementById("csp-status");
+  const submit = document.getElementById("csp-submit");
+  const dismiss = document.getElementById("csp-dismiss");
+  const notesEl = document.getElementById("csp-notes");
+  const notes = (notesEl && notesEl.value || "").trim() || null;
+  if (panel) panel.classList.add("busy");
+  if (submit) submit.disabled = true;
+  if (dismiss) dismiss.disabled = true;
+  if (status) status.textContent = "envoi en cours…";
+  try {
+    const result = await invoke("submit_capture", {
+      args: {
+        wav_path: pendingCapture.path,
+        callsign: currentSettings.callsign || "",
+        collector_url: (currentSettings.collector_url || "").trim(),
+        profile: currentProfile || null,
+        notes,
+        event_log_json: JSON.stringify(eventLogBuffer),
+      },
+    });
+    panel.classList.remove("busy");
+    panel.classList.add("success");
+    const base = (currentSettings.collector_url || "").replace(/\/+$/, "");
+    const fullUrl = base + (result.url || "");
+    if (status) {
+      status.innerHTML = `envoyé : <a href="${escapeHtml(fullUrl)}" target="_blank">${escapeHtml(result.folder)}</a> ` +
+        `(${(result.bytes_uploaded / (1024 * 1024)).toFixed(1)} MB)`;
+    }
+    if (dismiss) {
+      dismiss.disabled = false;
+      dismiss.textContent = "Fermer";
+    }
+    logEvent("capture_submit_ok", { folder: result.folder, bytes: result.bytes_uploaded });
+    pendingCapture = null;
+  } catch (err) {
+    panel.classList.remove("busy");
+    panel.classList.add("error");
+    if (status) status.textContent = `erreur : ${err}`;
+    if (submit) submit.disabled = false;
+    if (dismiss) dismiss.disabled = false;
+    logEvent("capture_submit_error", { message: String(err) });
+  }
+}
+
+function dismissCapturePrompt() {
+  const panel = document.getElementById("capture-submit-prompt");
+  if (panel) {
+    panel.hidden = true;
+    panel.classList.remove("busy", "success", "error");
+  }
+  const dismiss = document.getElementById("csp-dismiss");
+  if (dismiss) dismiss.textContent = "Ignorer";
+  pendingCapture = null;
+}
+
+function setupCaptureSubmitPanel() {
+  const submit = document.getElementById("csp-submit");
+  const dismiss = document.getElementById("csp-dismiss");
+  if (submit) submit.addEventListener("click", submitPendingCapture);
+  if (dismiss) dismiss.addEventListener("click", dismissCapturePrompt);
 }
 
 let levelCount = 0;
@@ -2165,6 +2287,7 @@ async function init() {
   setupLightbox();
   setupTxTab();
   setupSettingsTab();
+  setupCaptureSubmitPanel();
   await loadSettings();
   setupChannelTab();
   await loadDevices();
