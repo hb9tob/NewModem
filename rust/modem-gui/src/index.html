@@ -129,30 +129,35 @@
         <div class="tx-actions">
           <div class="tx-actions-row">
             <button id="tx-btn-tx" class="tx-btn tx-btn-primary" disabled>TX</button>
-            <select id="tx-repair-pct" class="tx-more-pct" title="Redondance RaptorQ ajoutée au burst initial (K + repair)" disabled>
-              <option value="0">+0 %</option>
-              <option value="5">+5 %</option>
-              <option value="10">+10 %</option>
-              <option value="20">+20 %</option>
-              <option value="30" selected>+30 %</option>
-              <option value="50">+50 %</option>
-              <option value="100">+100 %</option>
-            </select>
+            <input type="number" id="tx-repair-pct" class="tx-more-pct"
+                   list="tx-repair-pct-presets" min="0" max="200" step="5" value="30"
+                   title="Redondance RaptorQ ajoutée au burst initial (K + repair)" disabled>
+            <span class="tx-unit">% repair</span>
+            <datalist id="tx-repair-pct-presets">
+              <option value="0"></option>
+              <option value="5"></option>
+              <option value="10"></option>
+              <option value="20"></option>
+              <option value="30"></option>
+              <option value="50"></option>
+              <option value="100"></option>
+            </datalist>
             <button id="tx-btn-stop" class="tx-btn tx-btn-stop" disabled>Stop</button>
           </div>
           <div class="tx-actions-row">
             <button id="tx-btn-more" class="tx-btn tx-btn-more" disabled>TX more</button>
-            <select id="tx-more-count" class="tx-more-pct" title="Nombre de blocs additionnels à émettre (exact)" disabled>
-              <option value="1">+1</option>
-              <option value="2">+2</option>
-              <option value="5" selected>+5</option>
-              <option value="10">+10</option>
-              <option value="20">+20</option>
-              <option value="50">+50</option>
-              <option value="custom">+n…</option>
-            </select>
-            <input type="number" id="tx-more-count-custom" min="1" max="999" step="1" value="5"
-                   class="tx-more-count-custom" title="Nombre exact de blocs" hidden>
+            <input type="number" id="tx-more-count" class="tx-more-pct"
+                   list="tx-more-count-presets" min="1" max="999" step="1" value="5"
+                   title="Nombre de blocs additionnels à émettre (exact)" disabled>
+            <span class="tx-unit">blocs</span>
+            <datalist id="tx-more-count-presets">
+              <option value="1"></option>
+              <option value="2"></option>
+              <option value="5"></option>
+              <option value="10"></option>
+              <option value="20"></option>
+              <option value="50"></option>
+            </datalist>
           </div>
           <div id="tx-progress-text" class="tx-progress-text">—</div>
         </div>

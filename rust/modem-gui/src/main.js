@@ -1298,7 +1298,6 @@ function refreshTxButtons() {
   const btnCompress = document.getElementById("tx-btn-compress");
   const repairPct = document.getElementById("tx-repair-pct");
   const moreCount = document.getElementById("tx-more-count");
-  const moreCountCustom = document.getElementById("tx-more-count-custom");
   if (!btnTx) return;
   const hasImage = !!txState.sourceImage;
   const hasCompressed = txState.compressedBytes != null;
@@ -1342,10 +1341,6 @@ function refreshTxButtons() {
   btnStop.disabled = !txState.txActive;
   if (repairPct) repairPct.disabled = !hasImage || txState.txActive;
   if (moreCount) moreCount.disabled = !hasImage || txState.txActive;
-  if (moreCountCustom) {
-    moreCountCustom.disabled = !hasImage || txState.txActive;
-    moreCountCustom.hidden = moreCount ? moreCount.value !== "custom" : true;
-  }
 
   // Libellé + couleur du bouton TX selon l'état.
   if (txState.txActive) {
@@ -1876,28 +1871,15 @@ function setupTxTab() {
   }
 
   const moreCountEl = document.getElementById("tx-more-count");
-  const moreCountCustomEl = document.getElementById("tx-more-count-custom");
   if (moreCountEl) {
-    moreCountEl.addEventListener("change", () => {
-      if (moreCountEl.value === "custom") {
-        if (moreCountCustomEl) {
-          moreCountCustomEl.hidden = false;
-          moreCountCustomEl.focus();
-        }
-      } else {
-        if (moreCountCustomEl) moreCountCustomEl.hidden = true;
-        const v = parseInt(moreCountEl.value, 10);
-        if (Number.isFinite(v) && v > 0) txState.moreCount = v;
-      }
-      refreshTxButtons();
-    });
-  }
-  if (moreCountCustomEl) {
-    moreCountCustomEl.addEventListener("input", () => {
-      const v = parseInt(moreCountCustomEl.value, 10);
+    moreCountEl.value = String(txState.moreCount || 5);
+    const onMoreChange = () => {
+      const v = parseInt(moreCountEl.value, 10);
       if (Number.isFinite(v) && v > 0) txState.moreCount = v;
       refreshTxButtons();
-    });
+    };
+    moreCountEl.addEventListener("input", onMoreChange);
+    moreCountEl.addEventListener("change", onMoreChange);
   }
   refreshTxButtons();
 }
@@ -1968,18 +1950,12 @@ function computeK() {
   return null;
 }
 
-// Nombre de blocs additionnels à émettre en "More" burst. Soit la valeur
-// discrète du select (1, 2, 5, 10, 20, 50), soit la valeur de l'input libre
-// quand l'user a sélectionné "+n…".
+// Nombre de blocs additionnels à émettre en "More" burst. Lu directement
+// depuis l'input numérique (presets via datalist, saisie libre tolérée).
 function computeMoreCount() {
-  const sel = document.getElementById("tx-more-count");
-  if (!sel) return txState.moreCount || 5;
-  if (sel.value === "custom") {
-    const custom = document.getElementById("tx-more-count-custom");
-    const v = parseInt(custom && custom.value, 10);
-    return Number.isFinite(v) && v > 0 ? v : (txState.moreCount || 5);
-  }
-  const v = parseInt(sel.value, 10);
+  const el = document.getElementById("tx-more-count");
+  if (!el) return txState.moreCount || 5;
+  const v = parseInt(el.value, 10);
   return Number.isFinite(v) && v > 0 ? v : (txState.moreCount || 5);
 }
 
