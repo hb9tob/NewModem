@@ -281,7 +281,7 @@
             <td><span class="swatch" style="background:#2bbfaf"></span><strong>TDM pilots</strong></td>
             <td>2 syms<br>par groupe de 32</td>
             <td>QPSK<br>cycle π/2</td>
-            <td>Séquence connue continue sur tout le segment. Insérés tous les <code>D_SYMS=32</code> data-syms.</td>
+            <td>Séquence connue continue sur tout le segment. Insérés tous les <code>d_syms=32</code> data-syms en HIGH/NORMAL/ROBUST/MEGA, et tous les <code>d_syms=16</code> en <strong>ULTRA</strong> (pilotes densifiés, voir §2.2).</td>
         </tr>
     </tbody>
 </table>
@@ -367,26 +367,45 @@
     config)</code> traite l'ensemble.
 </div>
 
-<p>Les autres profils varient uniquement <strong>data+meta</strong> :</p>
+<p>Les autres profils varient <strong>data+meta</strong> et, pour ULTRA seul,
+    le motif pilote :</p>
 
 <table>
     <thead>
         <tr>
             <th>Profil</th>
-            <th>Symbol rate</th>
+            <th>Symbol rate effectif</th>
             <th>Constellation data</th>
             <th>LDPC rate</th>
+            <th>Pilotes (D/P)</th>
             <th>Débit utile data</th>
         </tr>
     </thead>
     <tbody>
-        <tr><td>HIGH</td><td>1500 Bd</td><td>16-APSK</td><td>3/4</td><td>4500 b/s</td></tr>
-        <tr><td>NORMAL</td><td>1200 Bd</td><td>16-APSK</td><td>2/3</td><td>3200 b/s</td></tr>
-        <tr><td>ROBUST</td><td>900 Bd</td><td>8-PSK</td><td>1/2</td><td>1350 b/s</td></tr>
-        <tr><td>ULTRA</td><td>600 Bd</td><td>QPSK</td><td>1/2</td><td>600 b/s</td></tr>
-        <tr><td>MEGA (FTN)</td><td>1600 Bd (τ=30/32)</td><td>16-APSK</td><td>3/4</td><td>~4800 b/s</td></tr>
+        <tr><td>ULTRA</td><td>500 Bd</td><td>QPSK</td><td>1/2</td><td><strong>16/2</strong> dense</td><td>444 b/s</td></tr>
+        <tr><td>ROBUST</td><td>1000 Bd</td><td>QPSK</td><td>1/2</td><td>32/2</td><td>941 b/s</td></tr>
+        <tr><td>NORMAL</td><td>1500 Bd</td><td>8-PSK</td><td>1/2</td><td>32/2</td><td>2117 b/s</td></tr>
+        <tr><td>HIGH</td><td>1500 Bd</td><td>16-APSK</td><td>3/4</td><td>32/2</td><td>4234 b/s</td></tr>
+        <tr><td>MEGA (FTN)</td><td>1600 Bd (Rs=1500, τ=30/32)</td><td>16-APSK</td><td>3/4</td><td>32/2</td><td>4517 b/s</td></tr>
     </tbody>
 </table>
+
+<p>
+    Formule : <code>Débit utile = Rs<sub>eff</sub> × bits/sym × R<sub>LDPC</sub>
+    × D/(D+P)</code>. Pour MEGA, <code>Rs<sub>eff</sub> = Rs/τ = 1500 / (30/32) =
+    1600&nbsp;sps</code> car la FTN espace les symboles de <code>pitch=30</code>
+    samples (au lieu de 32) à <code>sps=32</code> — la bande RRC reste celle de
+    1500 Bd, on dense au-dessus de Nyquist (ISI rattrapée par FSE+DD-PLL côté
+    RX).
+</p>
+
+<div class="callout">
+    <strong>Note :</strong> la fonction Rust <code>ModemConfig::net_bitrate()</code>
+    multiplie par <code>τ</code> (au lieu de diviser) — elle sous-estime donc
+    MEGA d'environ 12 % (3969 b/s reportés vs 4517 b/s physiques). Utilisée
+    pour la barre de progression GUI uniquement, l'écart se traduit par une
+    durée annoncée légèrement plus longue que la réalité.
+</div>
 
 <p>
     Pour chaque profil, le symbol rate est <strong>fixé à la configuration</strong>
@@ -395,7 +414,7 @@
     des préambules QPSK supplémentaires, qui sortent eux aussi au même symbol rate.
 </p>
 
-<h3>2.1 Zoom — structure interne d'un data segment</h3>
+<h3>2.1 Zoom — structure interne d'un data segment (HIGH/NORMAL/ROBUST/MEGA)</h3>
 
 <pre><code>┌─ MK ─┬── groupe 0 ────────┬── groupe 1 ────────┬── groupe 2 ────────┬ …
 │ 128  │ 32 data   │ 2 pil  │ 32 data   │ 2 pil  │ 32 data   │ 2 pil  │
@@ -408,10 +427,61 @@
 </code></pre>
 
 <p>
-    Constantes : <code>D_SYMS = 32</code>, <code>P_SYMS = 2</code>, cycle pilote
+    Constantes par défaut : <code>d_syms = 32</code>, <code>p_syms = 2</code>
+    (<code>PilotPattern::default_v3</code>), cycle pilote
     <code>pilot_symbol(n) = exp(j · (n mod 4) · π/2)</code>
-    (<code>pilot.rs:11-14</code>).
+    (<code>pilot.rs:11-14</code>). À <code>Rs = 1500&nbsp;Bd</code>, l'écart
+    entre deux groupes pilotes est <code>34/1500 ≈ 22.7&nbsp;ms</code>.
 </p>
+
+<h3>2.2 Cas particulier ULTRA — pilotes densifiés (16/2)</h3>
+
+<p>
+    ULTRA tourne à <strong>500 Bd / QPSK</strong>, ce qui rend l'écart pilote
+    par défaut très long en temps : à 500 Bd, un groupe de 34 syms = <strong>68
+    ms</strong>. Cet espacement aliase les composantes sub-Nyquist du drift
+    horloge sound-card (mesuré à -16 ppm avec dérive thermique ±5 ppm sur 180 s),
+    et la boucle de tracking décroche en milieu de segment long.
+</p>
+
+<p>
+    Solution mise en place : un motif pilote dédié
+    <code>PilotPattern::dense_ultra</code> à <strong>16 data + 2 pilots</strong>,
+    soit un groupe pilote tous les <strong>36 ms</strong> à 500 Bd. La bande de
+    suivi du gain complexe est doublée, au prix d'un overhead pilote qui passe
+    de <code>32/34&nbsp;≈&nbsp;94.1 %</code> à <code>16/18&nbsp;≈&nbsp;88.9 %</code>
+    (5 % de débit utile en moins, largement compensés par la convergence
+    décodeur).
+</p>
+
+<pre><code>┌─ MK ─┬─ groupe 0 ──┬─ groupe 1 ──┬─ groupe 2 ──┬─ groupe 3 ──┬ …  (ULTRA)
+│ 128  │ 16 data │2p│ 16 data │2p│ 16 data │2p│ 16 data │2p│
+│ QPSK │ QPSK    │  │ QPSK    │  │ QPSK    │  │ QPSK    │  │
+└──────┴─────────┴──┴─────────┴──┴─────────┴──┴─────────┴──┘
+            ↑           ↑           ↑           ↑
+            36 ms entre deux groupes pilotes consécutifs
+            (vs 68 ms si on avait gardé le motif 32/2 par défaut)
+</code></pre>
+
+<p>
+    L'invariant est garanti par un test unitaire
+    (<code>profile.rs:368&nbsp;ultra_uses_dense_pilot_pattern</code>) : tout
+    autre profil que ULTRA <em>doit</em> rester sur <code>default_v3</code>.
+    Le pattern est transporté implicitement via le <code>profile_index</code>
+    (header octet 10) — il n'est pas dans le <code>mode_code</code>, donc le
+    RX reconstruit le bon pattern à partir du profil annoncé.
+</p>
+
+<div class="callout info">
+    <strong>Conséquence pour la trame complète :</strong> ULTRA a la même
+    structure de champs que les autres profils (préambule + header + marker +
+    meta/data segments), mais avec deux particularités&nbsp;:
+    <ul style="margin-top: 0.4rem;">
+        <li>tous les data-syms sont en QPSK (LDPC 1/2),</li>
+        <li>les groupes pilotes sont insérés deux fois plus souvent dans
+            chaque segment (motif 16/2).</li>
+    </ul>
+</div>
 
 <!-- ======================================================================= -->
 <h2 id="constellations">3. Constellations utilisées</h2>

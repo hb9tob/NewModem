@@ -615,7 +615,8 @@ def plot_pilots_matrix(path):
         "HEADER (96 QPSK Golay)",
         "MARKER sync (32 QPSK fixe)",
         "MARKER ctrl (96 QPSK Golay)",
-        "TDM pilots (2/32 QPSK)",
+        "TDM pilots 2/32 QPSK\n(HIGH/NORMAL/ROBUST/MEGA)",
+        "TDM pilots 2/16 QPSK\n(ULTRA, dense)",
     ]
     modules = [
         "find_all_preambles",
@@ -641,12 +642,14 @@ def plot_pilots_matrix(path):
     usage[2, 6] = 2   # MARKER sync → local gain
     usage[3, 7] = 2   # MARKER ctrl → decode_marker
     usage[3, 8] = 2   # MARKER ctrl → session lock
-    usage[4, 9] = 2   # TDM → track_segment
-    usage[4, 10] = 2  # TDM → σ²
+    usage[4, 9] = 2   # TDM 2/32 → track_segment
+    usage[4, 10] = 2  # TDM 2/32 → σ²
+    usage[5, 9] = 2   # TDM 2/16 → track_segment (même rôle, cadence ×2)
+    usage[5, 10] = 2  # TDM 2/16 → σ²
     # Some secondary usages
     usage[0, 10] = 1  # PREAMBLE peut aussi servir à estim σ² fallback
 
-    fig, ax = plt.subplots(figsize=(14, 4.5))
+    fig, ax = plt.subplots(figsize=(14, 5.2))
     im = ax.imshow(usage, cmap="YlGnBu", aspect="auto", vmin=0, vmax=2)
     ax.set_xticks(range(len(modules)))
     ax.set_xticklabels(modules, rotation=35, ha="right", fontsize=9)
