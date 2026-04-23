@@ -114,7 +114,9 @@ cargo build -p modem-cli --release
 ```
 
 **OTA TX example** — encode an image into a WAV, then play the WAV
-through the radio's audio input (PTT triggered by VOX preamble) :
+through the radio's audio input. PTT is triggered by the VOX preamble
+when using the CLI directly ; the GUI also supports serial RTS/DTR PTT
+(see [README.md](README.md#configuration-ptt-série-rtsdtr)) :
 
 ```bash
 ./target/release/nbfm-modem tx \
