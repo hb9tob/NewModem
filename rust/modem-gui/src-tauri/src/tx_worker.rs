@@ -333,11 +333,7 @@ pub fn spawn_more(
         };
         let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
         let wav_str = wav_path.to_string_lossy().into_owned();
-        // total_blocks for the More burst is "roughly K * pct / 100" — we
-        // can't reconstruct K here without parsing the AVIF, so expose an
-        // approximation that the UI can tolerate (exact value is already in
-        // the CLI's stderr log for debug).
-        let total_blocks = 1u32; // UI will ignore the exact count for More bursts
+        let total_blocks = count;
         let _ = app.emit(
             "tx_plan",
             TxPlanEvent {

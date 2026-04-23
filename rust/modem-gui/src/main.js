@@ -1924,11 +1924,13 @@ async function txStart() {
       },
     });
     // Après un TX initial, on mémorise l'état session pour activer "More".
-    // Le burst initial émet K + (repair_pct %) packets → ESI max = ceil(K * (1 + p/100)) - 1.
+    // Le burst initial émet K + floor(K * pct / 100) packets (cf. CLI
+    // main.rs, division entière Rust). Doit matcher à l'unité près pour
+    // éviter un trou ESI entre l'initial et le premier More.
     const k = computeK();
     if (k) {
-      const factor = 1 + (txState.repairPct || 0) / 100;
-      const emitted = Math.ceil(k * factor);
+      const pct = txState.repairPct || 0;
+      const emitted = k + Math.floor((k * pct) / 100);
       txState.lastTx = { mode: txState.mode, esiMax: emitted - 1 };
     }
   } catch (err) {
