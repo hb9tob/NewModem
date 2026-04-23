@@ -134,6 +134,74 @@ suivante, OTA).
 | **A** | Cascade ATT (TX manuel + RX placeholder) | ✅ livré |
 | **B** | Sondeur : chirp 100-2700 Hz + multi-tone + PN + EVM par profil modem | planifié |
 | **C** | Rapport HTML + JSON + WAV brut, export ZIP ou 7Z, `mailto:` préremplis | planifié |
+| **D** | Soumission au collecteur VPS (HMAC + multipart) | ✅ squelette + prompt post-capture livrés |
 
 Phase B/C respecteront le même découpage TX/RX strict : côté TX, bouton
 "Lancer sondage" ; côté RX, détection automatique, analyse, graphiques.
+
+---
+
+## Soumission au collecteur — Phase D
+
+Quand un serveur collecteur est configuré (voir
+[`rust/newmodem-collector/`](../newmodem-collector/) et
+[DEPLOY_DEBIAN13.md](../newmodem-collector/DEPLOY_DEBIAN13.md)), le GUI
+peut pousser ses captures pour analyse offline et visualisation
+collective via le serveur web.
+
+### Configuration
+
+**Paramètres → Collecteur de sondages (Phase D)**
+
+- **URL** : URL HTTPS du serveur, sans suffixe (ex :
+  `https://hb9tob-modem.duckdns.org`). Vide = soumission désactivée.
+
+Le secret HMAC partagé doit être identique des deux côtés. Il est lu au
+build via `include_str!("../secret.txt")` (fichier gitignoré). Pour le
+poser :
+
+```bash
+openssl rand -hex 32 > rust/newmodem-collector/secret.txt
+cp rust/newmodem-collector/secret.txt rust/modem-gui/src-tauri/secret.txt
+# Puis rebuild GUI ET serveur — tout secret différent fait rejeter le POST.
+```
+
+Si `secret.txt` est absent au build, `build.rs` génère un placeholder
+`000…` qui passe la compilation mais fait échouer toute soumission
+(message explicite côté GUI). Tu peux donc cloner et builder sans avoir
+le vrai secret — la soumission est juste désactivée.
+
+### Flux : prompt post-capture brute
+
+Après chaque clic sur **⏹ arrêter capture** dans l'onglet RX :
+
+1. Si l'URL collecteur est renseignée, un panneau bleu apparaît au-dessus
+   du compteur RaptorQ avec :
+   - durée de la capture, taille estimée, chemin du WAV ;
+   - champ libre **Notes** (ex : "relais HB9F, S9, QSB léger") ;
+   - boutons **Soumettre au collecteur** / **Ignorer**.
+2. Sur **Soumettre** : POST multipart vers `<URL>/api/v1/sondage` avec
+   le WAV, l'event log JSON (toutes les lignes de l'onglet Info) et un
+   `metadata.json` (callsign, profil détecté, gui_version, timestamp,
+   notes). Headers HMAC : `X-Newmodem-Signature` (HMAC-SHA256 de
+   `callsign | timestamp | sha256(metadata || report)`) et
+   `X-Newmodem-Timestamp`.
+3. Réponse OK → panneau passe en vert avec lien cliquable
+   `<URL>/sondage/<date>/<folder>` qui ouvre le détail dans le
+   navigateur.
+4. Erreur → panneau rouge, message d'erreur, bouton Soumettre réactivé.
+
+Si l'URL est vide, aucun prompt n'apparaît et le bouton ⏹ se comporte
+comme avant (juste arrêt + finalisation du WAV local).
+
+### Données stockées côté serveur
+
+```
+/var/lib/newmodem-collector/reports/<YYYY-MM-DD>/<callsign>_<HHMMSS>_<short_hash>/
+  metadata.json   ← callsign, profil, notes, gui_version, timestamp
+  report.json     ← event log sérialisé (toutes les lignes onglet Info)
+  capture.wav     ← audio brut 48 kHz mono
+```
+
+Aucune base de données : l'admin gère par `rm -rf`. La page d'index web
+glob ce répertoire à chaque requête.
