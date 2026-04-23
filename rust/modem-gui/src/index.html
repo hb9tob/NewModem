@@ -25,6 +25,7 @@
     <button class="tab active" data-tab="rx">RX</button>
     <button class="tab" data-tab="tx">TX</button>
     <button class="tab" data-tab="sessions">Sessions</button>
+    <button class="tab" data-tab="channel">Canal</button>
     <button class="tab" data-tab="settings">Paramètres</button>
     <button class="tab" data-tab="info">Info</button>
   </nav>
@@ -162,6 +163,43 @@
             <option>Chargement…</option>
           </select>
         </fieldset>
+        <fieldset>
+          <legend>PTT (RTS/DTR sur port série)</legend>
+          <label class="ptt-row">
+            <input type="checkbox" id="ptt-enabled">
+            Activer la commande PTT
+          </label>
+          <div id="ptt-config" class="ptt-config" hidden>
+            <label class="ptt-row">
+              Port :
+              <select id="ptt-port-select">
+                <option value="">— aucun port —</option>
+              </select>
+              <button type="button" id="ptt-port-refresh" class="ptt-refresh" title="Rafraîchir la liste des ports série">↻</button>
+            </label>
+            <div class="ptt-line">
+              <label class="ptt-row">
+                <input type="checkbox" id="ptt-use-rts" checked>
+                Utiliser RTS — niveau en émission :
+              </label>
+              <label><input type="radio" name="ptt-rts-pol" value="high" checked> Haut (+)</label>
+              <label><input type="radio" name="ptt-rts-pol" value="low"> Bas (−)</label>
+            </div>
+            <div class="ptt-line">
+              <label class="ptt-row">
+                <input type="checkbox" id="ptt-use-dtr">
+                Utiliser DTR — niveau en émission :
+              </label>
+              <label><input type="radio" name="ptt-dtr-pol" value="high" checked> Haut (+)</label>
+              <label><input type="radio" name="ptt-dtr-pol" value="low"> Bas (−)</label>
+            </div>
+            <div class="tx-hint">
+              En réception les lignes prennent la polarité inverse. Délai
+              PTT⇄audio : 200 ms.
+            </div>
+          </div>
+          <div id="ptt-status" class="ptt-status">—</div>
+        </fieldset>
         <div class="settings-status" id="settings-status">—</div>
       </div>
     </section>
@@ -191,6 +229,77 @@
         Les sessions sont conservées 24 h. Chaque dossier <code>&lt;save_dir&gt;/sessions/&lt;id&gt;.session/</code>
         contient <code>meta.json</code>, <code>packets.blob</code> et <code>decoded.&lt;ext&gt;</code> si
         le décodage a abouti.
+      </div>
+    </section>
+    <section id="tab-channel" class="tab-panel channel-layout">
+      <div class="channel-form">
+        <div class="channel-col channel-tx">
+          <h3 class="channel-col-title">Émission (TX)</h3>
+          <fieldset>
+            <legend>Atténuation appliquée à ma TX</legend>
+            <p class="tx-hint">
+              Réduit le niveau du WAV transmis avant la carte son. Gain
+              appliqué : <span id="att-gain-info">×1.000 (0 dB)</span>.
+            </p>
+            <div class="channel-att-row">
+              <input type="range" id="att-slider" min="-30" max="0" step="0.5" value="0">
+              <input type="number" id="att-input" min="-30" max="0" step="0.5" value="0">
+              <span class="tx-hint">dB</span>
+              <button type="button" id="att-reset" class="ptt-refresh" title="Remettre à 0 dB">0 dB</button>
+            </div>
+            <div class="channel-status" id="att-status">—</div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Rapports reçus (oral)</legend>
+            <p class="tx-hint">
+              Atténuation annoncée par les correspondants lors du QSO
+              (négatif = "trop fort, baisse de N dB"). La médiane peut être
+              appliquée à ma TX d'un clic.
+            </p>
+            <div class="cascade-add">
+              <input type="text" id="cascade-call" placeholder="HB9XYZ" maxlength="12">
+              <input type="number" id="cascade-db" placeholder="-5" step="0.5">
+              <span class="tx-hint">dB</span>
+              <button type="button" id="cascade-add">Ajouter</button>
+            </div>
+            <table class="cascade-table">
+              <thead>
+                <tr><th>Indicatif</th><th>dB</th><th></th></tr>
+              </thead>
+              <tbody id="cascade-tbody">
+                <tr><td colspan="3" class="cascade-empty">Aucun rapport.</td></tr>
+              </tbody>
+            </table>
+            <div class="cascade-summary">
+              <span>Médiane : <strong id="cascade-median">—</strong></span>
+              <span>Moyenne : <strong id="cascade-mean">—</strong></span>
+              <button type="button" id="cascade-apply" disabled>Appliquer la médiane</button>
+              <button type="button" id="cascade-clear" class="cascade-clear">Vider</button>
+            </div>
+          </fieldset>
+        </div>
+
+        <div class="channel-col channel-rx">
+          <h3 class="channel-col-title">Réception (RX)</h3>
+          <fieldset class="channel-rx-recommend">
+            <legend>Atténuation recommandée</legend>
+            <div class="channel-recommend-value" id="rx-recommend-value">—</div>
+            <p class="tx-hint">
+              Valeur à communiquer à la station émettrice. Mesure automatique
+              en phase B (sondeur de canal).
+            </p>
+          </fieldset>
+
+          <fieldset class="channel-future">
+            <legend>Sondeur de canal — phase B (à venir)</legend>
+            <p class="tx-hint">
+              Trame de test (chirp + multi-tone + PN + EVM par profil) pour
+              estimer la réponse du canal et choisir le mode optimal. Le rapport
+              (HTML + JSON + WAV brut) sera exportable en ZIP/7Z.
+            </p>
+          </fieldset>
+        </div>
       </div>
     </section>
     <section id="tab-info" class="tab-panel">

@@ -33,6 +33,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
+use crate::ptt::{SharedPtt, PTT_GUARD_MS};
+
 #[derive(Serialize, Clone)]
 pub struct TxPlanEvent {
     pub duration_s: f64,
@@ -274,6 +276,8 @@ pub fn spawn_more(
     save_dir: PathBuf,
     esi_start: u32,
     count: u32,
+    attenuation_db: f32,
+    ptt: SharedPtt,
     app: AppHandle,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -352,7 +356,9 @@ pub fn spawn_more(
             total_blocks,
             duration_s,
             wav_str,
+            attenuation_db,
             stop_thread,
+            ptt,
             app,
         );
     });
@@ -370,6 +376,8 @@ pub fn spawn(
     device_name: String,
     save_dir: PathBuf,
     repair_pct: u32,
+    attenuation_db: f32,
+    ptt: SharedPtt,
     app: AppHandle,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -471,7 +479,9 @@ pub fn spawn(
             total_blocks,
             duration_s,
             wav_str,
+            attenuation_db,
             stop_thread,
+            ptt,
             app,
         );
     });
@@ -481,15 +491,57 @@ pub fn spawn(
     }
 }
 
+/// Bascule la PTT sur la polarité TX. Best-effort : si l'écriture sur le
+/// port échoue (câble débranché en cours de session…) on log et on continue,
+/// le worker n'a pas vocation à interrompre la transmission pour ça.
+fn ptt_engage(ptt: &SharedPtt) -> bool {
+    let mut g = match ptt.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(ctrl) = g.as_mut() else { return false };
+    match ctrl.set_tx() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[ptt] set_tx: {e}");
+            false
+        }
+    }
+}
+
+fn ptt_release(ptt: &SharedPtt) {
+    let mut g = match ptt.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(ctrl) = g.as_mut() {
+        if let Err(e) = ctrl.set_rx() {
+            eprintln!("[ptt] set_rx: {e}");
+        }
+    }
+}
+
 fn run_playback(
     device_name: &str,
-    samples: Vec<f32>,
+    mut samples: Vec<f32>,
     total_blocks: u32,
     duration_s: f64,
     wav_path: String,
+    attenuation_db: f32,
     stop: Arc<AtomicBool>,
+    ptt: SharedPtt,
     app: AppHandle,
 ) {
+    // Applique l'atténuation de la cascade ATT (onglet Canal). Clamp à
+    // [-60, 0] dB par sécurité — au-delà ça ne sert à rien et un signe
+    // positif inattendu saturerait la carte son.
+    let att_db = attenuation_db.clamp(-60.0, 0.0);
+    if att_db < 0.0 {
+        let gain = 10f32.powf(att_db / 20.0);
+        for s in samples.iter_mut() {
+            *s *= gain;
+        }
+    }
     let total_samples = samples.len();
 
     let host = cpal::default_host();
@@ -607,7 +659,17 @@ fn run_playback(
             return;
         }
     };
+    // PTT : on bascule en émission AVANT d'ouvrir le flux audio, et on
+    // attend 200 ms pour laisser le temps au transceiver de commuter.
+    let ptt_engaged = ptt_engage(&ptt);
+    if ptt_engaged {
+        thread::sleep(Duration::from_millis(PTT_GUARD_MS));
+    }
+
     if let Err(e) = stream.play() {
+        if ptt_engaged {
+            ptt_release(&ptt);
+        }
         let _ = app.emit(
             "tx_error",
             TxErrorEvent {
@@ -658,6 +720,11 @@ fn run_playback(
     }
 
     drop(stream);
+    // 200 ms de silence avant de relâcher la PTT, puis bascule RX.
+    if ptt_engaged {
+        thread::sleep(Duration::from_millis(PTT_GUARD_MS));
+        ptt_release(&ptt);
+    }
     let _ = app.emit(
         "tx_complete",
         TxCompleteEvent {

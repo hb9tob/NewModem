@@ -2,6 +2,7 @@
 
 mod audio;
 mod audio_capture;
+mod ptt;
 mod rx_worker;
 mod session_store;
 mod settings;
@@ -9,6 +10,7 @@ mod tx_encode;
 mod tx_worker;
 
 use audio::{list_input_devices, list_output_devices, DeviceInfo};
+use ptt::SharedPtt;
 use settings::Settings;
 use tx_worker::TxHandle;
 use audio_capture::CaptureHandle;
@@ -17,7 +19,7 @@ use tx_encode::{compress_avif, CompressOpts};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 struct CaptureSession {
     capture: CaptureHandle,
@@ -31,6 +33,15 @@ struct AppState {
     wav_sink: SharedWavSink,
     tx_source: Arc<Mutex<Option<Vec<u8>>>>,
     tx_handle: Mutex<Option<TxHandle>>,
+    ptt: SharedPtt,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct PttStatusEvent {
+    /// "ok" : port ouvert, lignes en RX. "off" : désactivée par config.
+    /// "error" : ouverture échouée — `message` détaille.
+    state: &'static str,
+    message: String,
 }
 
 fn default_save_dir() -> PathBuf {
@@ -56,8 +67,63 @@ fn get_settings() -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(settings: Settings) -> Result<(), String> {
-    settings::save(&settings)
+fn save_settings(
+    settings: Settings,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    settings::save(&settings)?;
+    let status = compute_ptt_status(&state.ptt, &settings);
+    let _ = app.emit("ptt_status", status);
+    Ok(())
+}
+
+fn compute_ptt_status(slot: &SharedPtt, settings: &Settings) -> PttStatusEvent {
+    match ptt::refresh(slot, settings) {
+        Ok(Some(msg)) => PttStatusEvent {
+            state: "ok",
+            message: msg,
+        },
+        Ok(None) => PttStatusEvent {
+            state: "off",
+            message: "PTT désactivée".to_string(),
+        },
+        Err(e) => PttStatusEvent {
+            state: "error",
+            message: format!("PTT indisponible : {e}"),
+        },
+    }
+}
+
+#[tauri::command]
+fn list_serial_ports() -> Vec<String> {
+    ptt::list_ports()
+}
+
+#[tauri::command]
+fn ptt_status(state: State<'_, AppState>) -> PttStatusEvent {
+    let settings = settings::load();
+    if !settings.ptt_enabled {
+        return PttStatusEvent {
+            state: "off",
+            message: "PTT désactivée".to_string(),
+        };
+    }
+    let active = state
+        .ptt
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.port_name().to_string()));
+    match active {
+        Some(name) => PttStatusEvent {
+            state: "ok",
+            message: format!("PTT prête sur {name}"),
+        },
+        None => PttStatusEvent {
+            state: "error",
+            message: "PTT configurée mais port indisponible".to_string(),
+        },
+    }
 }
 
 #[tauri::command]
@@ -259,6 +325,7 @@ fn tx_start(
     if args.tx_device.trim().is_empty() {
         return Err("carte son TX non sélectionnée (Paramètres)".into());
     }
+    let attenuation_db = settings::load().tx_attenuation_db;
     let handle = tx_worker::spawn(
         avif_path,
         args.mode,
@@ -267,6 +334,8 @@ fn tx_start(
         args.tx_device,
         save_dir,
         args.repair_pct.unwrap_or(30),
+        attenuation_db,
+        state.ptt.clone(),
         app,
     );
     *tx_guard = Some(handle);
@@ -313,6 +382,7 @@ fn tx_more(
     if args.count == 0 {
         return Err("choisir un nombre de blocs > 0".into());
     }
+    let attenuation_db = settings::load().tx_attenuation_db;
     let handle = tx_worker::spawn_more(
         avif_path,
         args.mode,
@@ -322,6 +392,8 @@ fn tx_more(
         save_dir,
         args.esi_start,
         args.count,
+        attenuation_db,
+        state.ptt.clone(),
         app,
     );
     *tx_guard = Some(handle);
@@ -443,18 +515,31 @@ fn main() {
 
     tauri::Builder::default()
         .setup(move |app| {
+            let ptt: SharedPtt = Arc::new(Mutex::new(None));
+            // Tentative d'ouverture du port PTT au démarrage. Si KO, on émet
+            // un événement et on laisse `ptt` à None pour la session — l'UI
+            // peut toujours rouvrir via Paramètres → save_settings.
+            let startup_settings = settings::load();
+            let status = compute_ptt_status(&ptt, &startup_settings);
+            if status.state == "error" {
+                eprintln!("[ptt] {}", status.message);
+            }
+            let _ = app.handle().emit("ptt_status", status);
             app.manage(AppState {
                 session: Mutex::new(None),
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
                 wav_sink: Arc::new(Mutex::new(None)),
                 tx_source: Arc::new(Mutex::new(None)),
                 tx_handle: Mutex::new(None),
+                ptt,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
+            list_serial_ports,
+            ptt_status,
             get_settings,
             save_settings,
             start_capture,

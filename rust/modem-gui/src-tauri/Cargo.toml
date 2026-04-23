@@ -22,3 +22,4 @@ hound = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 ravif = { version = "0.11", default-features = false, features = ["threading"] }
 rgb = "0.8"
+serialport = "4"

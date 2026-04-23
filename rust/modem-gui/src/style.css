@@ -842,6 +842,269 @@ main {
   font-style: italic;
   margin-top: 0.4rem;
 }
+.ptt-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: #e0e0e0;
+  margin: 0.25rem 0;
+}
+.ptt-row select {
+  flex: 1;
+  width: auto;
+}
+.ptt-config {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.4rem;
+}
+.ptt-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+}
+.ptt-line label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.ptt-refresh {
+  background: #2a2a2a;
+  border: 1px solid #555;
+  color: #e0e0e0;
+  border-radius: 3px;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.ptt-refresh:hover {
+  background: #383838;
+}
+.ptt-status {
+  font-size: 0.8rem;
+  margin-top: 0.4rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 3px;
+  background: #1e1e1e;
+  border: 1px solid #3a3a3a;
+}
+.ptt-status.ok {
+  color: #9ccc65;
+  border-color: #4a6a30;
+}
+.ptt-status.error {
+  color: #ef5350;
+  border-color: #6a3030;
+}
+.ptt-status.off {
+  color: #9e9e9e;
+}
+
+/* ─────────── Onglet Canal (cascade ATT + futur sondeur) */
+.channel-layout {
+  padding: 1rem 1.5rem;
+  overflow-y: auto;
+}
+.channel-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 1rem;
+  max-width: 1100px;
+}
+.channel-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 4px;
+}
+.channel-tx {
+  background: rgba(156, 204, 101, 0.04);
+  border-left: 3px solid #9ccc65;
+}
+.channel-rx {
+  background: rgba(255, 183, 77, 0.04);
+  border-left: 3px solid #ffb74d;
+}
+.channel-col-title {
+  margin: 0;
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #c5c5c5;
+}
+.channel-tx .channel-col-title {
+  color: #9ccc65;
+}
+.channel-rx .channel-col-title {
+  color: #ffb74d;
+}
+.channel-recommend-value {
+  font-size: 2.2rem;
+  font-family: ui-monospace, monospace;
+  color: #ffb74d;
+  text-align: center;
+  padding: 0.6rem 0;
+  letter-spacing: 0.04em;
+}
+.channel-rx-recommend {
+  background: rgba(0, 0, 0, 0.15);
+}
+.channel-form fieldset {
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  padding: 0.7rem 1rem;
+  margin: 0;
+}
+.channel-form legend {
+  color: #9ccc65;
+  font-size: 0.85rem;
+  padding: 0 0.4rem;
+  letter-spacing: 0.02em;
+}
+.channel-form .tx-hint {
+  display: block;
+  margin: 0 0 0.5rem;
+  font-size: 0.82rem;
+  color: #9e9e9e;
+  line-height: 1.4;
+}
+.channel-att-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.channel-att-row input[type="range"] {
+  flex: 1;
+}
+.channel-att-row input[type="number"] {
+  width: 5rem;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 0.25rem 0.4rem;
+  font-family: ui-monospace, monospace;
+}
+.channel-status {
+  font-size: 0.78rem;
+  color: #9e9e9e;
+  font-style: italic;
+  margin-top: 0.4rem;
+}
+.cascade-add {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.6rem;
+}
+.cascade-add input[type="text"] {
+  flex: 1;
+  max-width: 8rem;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 0.25rem 0.4rem;
+  font-family: ui-monospace, monospace;
+  text-transform: uppercase;
+}
+.cascade-add input[type="number"] {
+  width: 5rem;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 0.25rem 0.4rem;
+  font-family: ui-monospace, monospace;
+}
+.cascade-add button {
+  background: #2a2a2a;
+  border: 1px solid #555;
+  color: #e0e0e0;
+  border-radius: 3px;
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+}
+.cascade-add button:hover {
+  background: #383838;
+}
+.cascade-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+.cascade-table th,
+.cascade-table td {
+  text-align: left;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid #2a2a2a;
+}
+.cascade-table th {
+  color: #9e9e9e;
+  font-weight: normal;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.cascade-table td:nth-child(2) {
+  font-family: ui-monospace, monospace;
+  color: #ffb74d;
+}
+.cascade-empty {
+  text-align: center !important;
+  color: #6a6a6a;
+  font-style: italic;
+}
+.cascade-row-del {
+  background: transparent;
+  border: none;
+  color: #ef5350;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0 0.3rem;
+}
+.cascade-row-del:hover {
+  color: #ff7961;
+}
+.cascade-summary {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+.cascade-summary strong {
+  color: #ffb74d;
+  font-family: ui-monospace, monospace;
+}
+.cascade-summary button {
+  background: #2a2a2a;
+  border: 1px solid #555;
+  color: #e0e0e0;
+  border-radius: 3px;
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+  margin-left: auto;
+}
+.cascade-summary button:hover:not(:disabled) {
+  background: #383838;
+}
+.cascade-summary button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.cascade-clear {
+  margin-left: 0 !important;
+}
+.channel-future {
+  opacity: 0.65;
+}
 
 /* Lightbox fullscreen avec zoom. */
 .image-lightbox {

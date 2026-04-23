@@ -52,7 +52,29 @@ function setupTabs() {
       for (const p of panels) p.classList.toggle("active", p.id === `tab-${target}`);
       if (target === "rx") redrawAll();
       if (target === "sessions") refreshSessions();
+      if (target === "channel") stopRxAndTxForChannelTab();
     });
+  }
+}
+
+// Onglet Canal : on coupe RX et TX en cours en entrant. Le réglage
+// d'atténuation s'applique au prochain TX, et un RX qui tourne pendant
+// qu'on bidouille le slider risque de se faire saturer par notre propre
+// signal de test plus tard (phase B).
+async function stopRxAndTxForChannelTab() {
+  const stopBtn = document.getElementById("btn-stop");
+  const txStopBtn = document.getElementById("tx-btn-stop");
+  const rxRunning = stopBtn && !stopBtn.disabled;
+  const txRunning = txStopBtn && !txStopBtn.disabled;
+  if (rxRunning) {
+    try { await stopCapture(); } catch (err) {
+      logEvent("channel_tab_stop_rx_error", { message: String(err) });
+    }
+  }
+  if (txRunning) {
+    try { await txStop(); } catch (err) {
+      logEvent("channel_tab_stop_tx_error", { message: String(err) });
+    }
   }
 }
 
@@ -315,7 +337,17 @@ function setupLightbox() {
 // ─────────────────────────────────────────── Settings / device selection
 // Les deux cartes son (RX/TX) + l'indicatif vivent dans l'onglet Paramètres
 // et sont persistés via les commandes Tauri get_settings / save_settings.
-let currentSettings = { callsign: "", rx_device: "", tx_device: "" };
+let currentSettings = {
+  callsign: "",
+  rx_device: "",
+  tx_device: "",
+  ptt_enabled: false,
+  ptt_port: "",
+  ptt_use_rts: true,
+  ptt_use_dtr: false,
+  ptt_rts_tx_high: true,
+  ptt_dtr_tx_high: true,
+};
 
 function populateDeviceSelect(selectId, devices, savedName) {
   const select = document.getElementById(selectId);
@@ -404,10 +436,96 @@ async function loadSettings() {
     currentSettings = await invoke("get_settings");
   } catch (err) {
     console.error("get_settings", err);
-    currentSettings = { callsign: "", rx_device: "", tx_device: "" };
+    currentSettings = {
+      callsign: "", rx_device: "", tx_device: "",
+      ptt_enabled: false, ptt_port: "",
+      ptt_use_rts: true, ptt_use_dtr: false,
+      ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
+    };
   }
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
+  applyPttSettingsToUI();
+}
+
+function applyPttSettingsToUI() {
+  const en = document.getElementById("ptt-enabled");
+  const cfg = document.getElementById("ptt-config");
+  const rts = document.getElementById("ptt-use-rts");
+  const dtr = document.getElementById("ptt-use-dtr");
+  if (en) en.checked = !!currentSettings.ptt_enabled;
+  if (cfg) cfg.hidden = !currentSettings.ptt_enabled;
+  if (rts) rts.checked = !!currentSettings.ptt_use_rts;
+  if (dtr) dtr.checked = !!currentSettings.ptt_use_dtr;
+  const rtsPol = currentSettings.ptt_rts_tx_high ? "high" : "low";
+  const dtrPol = currentSettings.ptt_dtr_tx_high ? "high" : "low";
+  document.querySelectorAll('input[name="ptt-rts-pol"]').forEach(r => {
+    r.checked = (r.value === rtsPol);
+  });
+  document.querySelectorAll('input[name="ptt-dtr-pol"]').forEach(r => {
+    r.checked = (r.value === dtrPol);
+  });
+}
+
+async function loadSerialPorts() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const sel = document.getElementById("ptt-port-select");
+  if (!sel) return;
+  let ports = [];
+  try {
+    ports = await invoke("list_serial_ports");
+  } catch (err) {
+    console.error("list_serial_ports", err);
+  }
+  const saved = currentSettings.ptt_port || "";
+  sel.innerHTML = "";
+  if (ports.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "— aucun port détecté —";
+    sel.appendChild(opt);
+  } else {
+    if (saved && !ports.includes(saved)) {
+      // Conserve la valeur sauvegardée même absente, pour la rendre visible.
+      const opt = document.createElement("option");
+      opt.value = saved;
+      opt.textContent = `${saved} (introuvable)`;
+      sel.appendChild(opt);
+    }
+    for (const name of ports) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    sel.value = saved || ports[0];
+  }
+}
+
+function readPttFormIntoSettings() {
+  const en = document.getElementById("ptt-enabled");
+  const port = document.getElementById("ptt-port-select");
+  const rts = document.getElementById("ptt-use-rts");
+  const dtr = document.getElementById("ptt-use-dtr");
+  const rtsHigh = document.querySelector('input[name="ptt-rts-pol"]:checked');
+  const dtrHigh = document.querySelector('input[name="ptt-dtr-pol"]:checked');
+  currentSettings.ptt_enabled = !!(en && en.checked);
+  currentSettings.ptt_port = port ? (port.value || "") : "";
+  currentSettings.ptt_use_rts = !!(rts && rts.checked);
+  currentSettings.ptt_use_dtr = !!(dtr && dtr.checked);
+  currentSettings.ptt_rts_tx_high = !rtsHigh || rtsHigh.value === "high";
+  currentSettings.ptt_dtr_tx_high = !dtrHigh || dtrHigh.value === "high";
+}
+
+function renderPttStatus(payload) {
+  const el = document.getElementById("ptt-status");
+  if (!el) return;
+  const state = (payload && payload.state) || "off";
+  const msg = (payload && payload.message) || "—";
+  el.classList.remove("ok", "error", "off");
+  el.classList.add(state);
+  el.textContent = msg;
 }
 
 async function persistSettings() {
@@ -416,11 +534,10 @@ async function persistSettings() {
   const call = document.getElementById("callsign-input");
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
-  currentSettings = {
-    callsign: (call && call.value || "").trim().toUpperCase(),
-    rx_device: rxSel ? rxSel.value || "" : "",
-    tx_device: txSel ? txSel.value || "" : "",
-  };
+  readPttFormIntoSettings();
+  currentSettings.callsign = (call && call.value || "").trim().toUpperCase();
+  currentSettings.rx_device = rxSel ? rxSel.value || "" : "";
+  currentSettings.tx_device = txSel ? txSel.value || "" : "";
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -452,6 +569,25 @@ function setupSettingsTab() {
   if (txSel) {
     txSel.addEventListener("change", persistSettings);
   }
+  // PTT widgets : enable/disable + persist.
+  const pttEn = document.getElementById("ptt-enabled");
+  const pttCfg = document.getElementById("ptt-config");
+  if (pttEn) {
+    pttEn.addEventListener("change", () => {
+      if (pttCfg) pttCfg.hidden = !pttEn.checked;
+      persistSettings();
+    });
+  }
+  const pttRefresh = document.getElementById("ptt-port-refresh");
+  if (pttRefresh) pttRefresh.addEventListener("click", loadSerialPorts);
+  const pttPort = document.getElementById("ptt-port-select");
+  if (pttPort) pttPort.addEventListener("change", persistSettings);
+  ["ptt-use-rts", "ptt-use-dtr"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", persistSettings);
+  });
+  document.querySelectorAll('input[name="ptt-rts-pol"], input[name="ptt-dtr-pol"]')
+    .forEach(r => r.addEventListener("change", persistSettings));
 }
 
 async function loadSaveDir() {
@@ -884,6 +1020,10 @@ function wireEvents() {
   });
   listen("tx_error", (ev) => {
     onTxError(ev.payload);
+  });
+  listen("ptt_status", (ev) => {
+    renderPttStatus(ev.payload);
+    logEvent("ptt_status", ev.payload);
   });
   listen("v2_progress", (event) => {
     updateV2Progress(event.payload);
@@ -1864,14 +2004,179 @@ async function onTxError(payload) {
   await maybeRestartRx();
 }
 
+// ─────────────────────────────────────────── Onglet Canal (cascade ATT)
+// Phase A : un seul réglage persistant (tx_attenuation_db dans Settings),
+// alimenté soit à la main par le slider, soit par la médiane d'une liste
+// de feedbacks reçus en QSO. Liste cascade : session JS uniquement.
+let cascadeFeedback = [];
+
+function attGainStr(db) {
+  const lin = Math.pow(10, db / 20);
+  return `×${lin.toFixed(3)} (${db.toFixed(1)} dB)`;
+}
+
+function clampAttDb(v) {
+  if (!Number.isFinite(v)) return 0;
+  if (v > 0) return 0;
+  if (v < -30) return -30;
+  return v;
+}
+
+function syncAttUi(db) {
+  const slider = document.getElementById("att-slider");
+  const input = document.getElementById("att-input");
+  const info = document.getElementById("att-gain-info");
+  if (slider) slider.value = String(db);
+  if (input) input.value = String(db);
+  if (info) info.textContent = attGainStr(db);
+}
+
+async function applyAttenuation(db, source) {
+  const v = clampAttDb(db);
+  currentSettings.tx_attenuation_db = v;
+  syncAttUi(v);
+  const status = document.getElementById("att-status");
+  try {
+    if (window.__TAURI__ && window.__TAURI__.core) {
+      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
+    }
+    if (status) {
+      status.textContent = source
+        ? `${source} → ${v.toFixed(1)} dB sauvegardé ${now()}`
+        : `${v.toFixed(1)} dB sauvegardé ${now()}`;
+    }
+  } catch (err) {
+    if (status) status.textContent = `erreur : ${err}`;
+  }
+}
+
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function mean(values) {
+  if (values.length === 0) return null;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function renderCascade() {
+  const tbody = document.getElementById("cascade-tbody");
+  const medEl = document.getElementById("cascade-median");
+  const meanEl = document.getElementById("cascade-mean");
+  const apply = document.getElementById("cascade-apply");
+  if (!tbody) return;
+  if (cascadeFeedback.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="3" class="cascade-empty">Aucun rapport.</td></tr>`;
+    if (medEl) medEl.textContent = "—";
+    if (meanEl) meanEl.textContent = "—";
+    if (apply) apply.disabled = true;
+    return;
+  }
+  tbody.innerHTML = cascadeFeedback
+    .map((row, i) =>
+      `<tr><td>${escapeHtml(row.call)}</td><td>${row.db.toFixed(1)}</td>` +
+      `<td><button class="cascade-row-del" data-idx="${i}" title="Supprimer">✕</button></td></tr>`
+    )
+    .join("");
+  for (const btn of tbody.querySelectorAll(".cascade-row-del")) {
+    btn.addEventListener("click", (ev) => {
+      const idx = Number(ev.currentTarget.dataset.idx);
+      if (Number.isFinite(idx)) {
+        cascadeFeedback.splice(idx, 1);
+        renderCascade();
+      }
+    });
+  }
+  const vals = cascadeFeedback.map(r => r.db);
+  if (medEl) medEl.textContent = `${median(vals).toFixed(1)} dB`;
+  if (meanEl) meanEl.textContent = `${mean(vals).toFixed(1)} dB`;
+  if (apply) apply.disabled = false;
+}
+
+function setupChannelTab() {
+  const slider = document.getElementById("att-slider");
+  const input = document.getElementById("att-input");
+  const reset = document.getElementById("att-reset");
+  const initialDb = clampAttDb(Number(currentSettings.tx_attenuation_db) || 0);
+  syncAttUi(initialDb);
+  if (slider) {
+    slider.addEventListener("input", () => {
+      const v = clampAttDb(Number(slider.value));
+      syncAttUi(v);
+    });
+    slider.addEventListener("change", () => {
+      applyAttenuation(Number(slider.value), "slider");
+    });
+  }
+  if (input) {
+    input.addEventListener("change", () => {
+      applyAttenuation(Number(input.value), "saisie");
+    });
+  }
+  if (reset) {
+    reset.addEventListener("click", () => applyAttenuation(0, "reset"));
+  }
+  const callInput = document.getElementById("cascade-call");
+  const dbInput = document.getElementById("cascade-db");
+  const addBtn = document.getElementById("cascade-add");
+  const applyBtn = document.getElementById("cascade-apply");
+  const clearBtn = document.getElementById("cascade-clear");
+  function addCascadeEntry() {
+    const call = (callInput && callInput.value || "").trim().toUpperCase();
+    const db = Number(dbInput && dbInput.value);
+    if (!Number.isFinite(db)) return;
+    cascadeFeedback.push({ call: call || "?", db });
+    if (callInput) callInput.value = "";
+    if (dbInput) dbInput.value = "";
+    if (callInput) callInput.focus();
+    renderCascade();
+  }
+  if (addBtn) addBtn.addEventListener("click", addCascadeEntry);
+  for (const el of [callInput, dbInput]) {
+    if (!el) continue;
+    el.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        addCascadeEntry();
+      }
+    });
+  }
+  if (applyBtn) {
+    applyBtn.addEventListener("click", () => {
+      const vals = cascadeFeedback.map(r => r.db);
+      const m = median(vals);
+      if (m !== null) applyAttenuation(m, "médiane cascade");
+    });
+  }
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      cascadeFeedback = [];
+      renderCascade();
+    });
+  }
+  renderCascade();
+}
+
 async function init() {
   setupTabs();
   setupLightbox();
   setupTxTab();
   setupSettingsTab();
   await loadSettings();
+  setupChannelTab();
   await loadDevices();
+  await loadSerialPorts();
   await loadSaveDir();
+  // Affiche l'état initial de la PTT (calculé par le backend au setup).
+  try {
+    const st = await window.__TAURI__.core.invoke("ptt_status");
+    renderPttStatus(st);
+  } catch (err) {
+    console.error("ptt_status", err);
+  }
   wireEvents();
   document.getElementById("btn-start").addEventListener("click", startCapture);
   document.getElementById("btn-stop").addEventListener("click", stopCapture);
