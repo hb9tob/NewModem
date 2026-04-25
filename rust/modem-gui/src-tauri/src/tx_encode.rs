@@ -2,6 +2,7 @@ use image::imageops::FilterType;
 use ravif::{Encoder, Img};
 use rgb::FromSlice;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 #[derive(Debug, Deserialize)]
 pub struct CompressOpts {
@@ -14,6 +15,10 @@ pub struct CompressOpts {
     /// freeze the GUI on modest CPUs.
     #[serde(default)]
     pub speed: Option<u8>,
+    /// Source déjà AVIF : on émet les bytes tels quels, sans décodage ni
+    /// ré-encodage. La sélection se fait côté JS au moment du drop.
+    #[serde(default)]
+    pub passthrough: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,7 +31,50 @@ pub struct CompressedImage {
     pub byte_len: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CompressedFile {
+    pub zst_bytes: Vec<u8>,
+    pub source_len: usize,
+    pub byte_len: usize,
+}
+
+/// Compresse un fichier arbitraire sans perte avec zstd niveau 22 (max).
+/// Choisi pour son ratio proche de xz mais ~5-10× plus rapide. Sur le canal
+/// NBFM lent, l'overhead d'encodage est négligeable face au temps gagné en
+/// secondes-de-canal.
+pub fn compress_zstd(source_bytes: &[u8]) -> Result<CompressedFile, String> {
+    let mut out = Vec::with_capacity(source_bytes.len() / 2);
+    let mut enc = zstd::Encoder::new(&mut out, 22).map_err(|e| format!("zstd init: {e}"))?;
+    enc.write_all(source_bytes)
+        .map_err(|e| format!("zstd write: {e}"))?;
+    enc.finish().map_err(|e| format!("zstd finish: {e}"))?;
+    let byte_len = out.len();
+    Ok(CompressedFile {
+        zst_bytes: out,
+        source_len: source_bytes.len(),
+        byte_len,
+    })
+}
+
 pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<CompressedImage, String> {
+    // Passthrough : la source est déjà un AVIF (drop direct dans la GUI),
+    // on ne touche pas aux bytes — pas de ré-encodage, donc pas de perte
+    // ni de cycles CPU. Les dimensions sont lues via le header.
+    if opts.passthrough {
+        let (src_w, src_h) = image::load_from_memory(source_bytes)
+            .map(|i| (i.width(), i.height()))
+            .map_err(|e| format!("avif header: {e}"))?;
+        let byte_len = source_bytes.len();
+        return Ok(CompressedImage {
+            avif_bytes: source_bytes.to_vec(),
+            source_w: src_w,
+            source_h: src_h,
+            actual_w: src_w,
+            actual_h: src_h,
+            byte_len,
+        });
+    }
+
     let img = image::load_from_memory(source_bytes).map_err(|e| format!("decode: {e}"))?;
     let (src_w, src_h) = (img.width(), img.height());
 

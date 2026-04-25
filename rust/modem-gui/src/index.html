@@ -66,8 +66,8 @@
     <section id="tab-tx" class="tab-panel tx-layout">
       <div class="tx-image-area">
         <div id="tx-drop-zone" class="tx-drop-zone">
-          <p>Glisser une image ici<br>ou cliquer pour choisir…</p>
-          <input type="file" id="tx-file-input" accept="image/*" hidden>
+          <p>Glisser une image ou un fichier ici<br>ou cliquer pour choisir…</p>
+          <input type="file" id="tx-file-input" hidden>
         </div>
         <div id="tx-preview" class="tx-preview" hidden>
           <img id="tx-preview-img" alt="">
@@ -103,9 +103,9 @@
 
         <fieldset>
           <legend>Qualité AVIF</legend>
-          <input type="range" id="tx-quality" min="0" max="100" value="1">
+          <input type="range" id="tx-quality" min="0" max="100" value="10">
           <div class="tx-quality-row">
-            <span>q = <span id="tx-quality-val">1</span></span>
+            <span>q = <span id="tx-quality-val">10</span></span>
             <span class="tx-hint">AVIF 4:2:0</span>
           </div>
           <label class="tx-speed-label" for="tx-speed">
@@ -124,13 +124,17 @@
           <div>Compressé : <span id="tx-compressed-size">—</span></div>
         </div>
 
+        <div id="tx-passthrough-hint" class="tx-passthrough-hint" hidden>
+          AVIF natif → passthrough (pas de ré-encodage)
+        </div>
+
         <button id="tx-btn-compress" class="tx-btn tx-btn-compress" disabled>Recalculer la compression</button>
 
         <div class="tx-actions">
           <div class="tx-actions-row">
             <button id="tx-btn-tx" class="tx-btn tx-btn-primary" disabled>TX</button>
             <input type="number" id="tx-repair-pct" class="tx-more-pct"
-                   list="tx-repair-pct-presets" min="0" max="200" step="5" value="30"
+                   list="tx-repair-pct-presets" min="0" max="200" step="5" value="5"
                    title="Redondance RaptorQ ajoutée au burst initial (K + repair)" disabled>
             <span class="tx-unit">% repair</span>
             <datalist id="tx-repair-pct-presets">
@@ -342,8 +346,8 @@
     <canvas id="progress-blocks"></canvas>
   </div>
   <!-- Lightbox image : plein écran + zoom jusqu'à 1:1. -->
-  <div id="image-lightbox" class="image-lightbox" hidden>
-    <div class="image-lightbox-hint">molette : zoom · drag : pan · Échap : fermer</div>
+  <div id="image-lightbox" class="image-lightbox" tabindex="-1" hidden>
+    <div class="image-lightbox-hint">a/q ou +/− ou molette : zoom (jusqu'à 8×) · 0 : ajuster · flèches ou drag : pan · Échap : fermer</div>
     <img id="image-lightbox-img" alt="" />
   </div>
   <script type="module" src="main.js"></script>

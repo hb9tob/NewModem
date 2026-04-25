@@ -786,17 +786,36 @@ fn emit_decoded_file(
             df.payload.clone(),
         )
     };
-    match save_file(&dir, &fname, &content) {
+    // Si la payload est zstd-compressée (cas "fichier non-image"), on la
+    // décompresse avant écriture. Le filename de l'envelope est l'original
+    // (sans suffixe `.zst`), donc on écrit tel quel.
+    let (final_content, final_mime) = if df.meta.mime_type == modem_core::app_header::mime::ZSTD {
+        match zstd::stream::decode_all(content.as_slice()) {
+            Ok(decoded) => (decoded, modem_core::app_header::mime::BINARY),
+            Err(e) => {
+                let _ = app.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!("zstd decode: {e}"),
+                    },
+                );
+                return;
+            }
+        }
+    } else {
+        (content, df.meta.mime_type)
+    };
+    match save_file(&dir, &fname, &final_content) {
         Ok(path) => {
             let _ = app.emit(
                 "file_complete",
                 FileCompletePayload {
                     filename: fname,
                     callsign,
-                    mime_type: df.meta.mime_type,
+                    mime_type: final_mime,
                     saved_path: path.to_string_lossy().into_owned(),
                     sigma2,
-                    size: content.len(),
+                    size: final_content.len(),
                 },
             );
         }

@@ -53,6 +53,9 @@ pub mod mime {
     pub const IMAGE_AVIF: u8 = 2;
     pub const IMAGE_JPEG: u8 = 3;
     pub const IMAGE_PNG: u8 = 4;
+    /// Payload zstd-compressé (cas "fichier quelconque"). Le RX décompresse
+    /// puis sauve avec le filename de l'envelope, sans suffixe `.zst`.
+    pub const ZSTD: u8 = 5;
 }
 
 /// Parsed session-level header.

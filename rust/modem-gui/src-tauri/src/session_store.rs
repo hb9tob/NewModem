@@ -440,6 +440,9 @@ fn mime_ext(mime: u8) -> &'static str {
         mime::IMAGE_AVIF => "avif",
         mime::IMAGE_JPEG => "jpg",
         mime::IMAGE_PNG => "png",
+        // ZSTD : utilisé pour le fichier intermédiaire avant décompression ;
+        // le fichier final écrit côté GUI prend le filename du sender.
+        mime::ZSTD => "zst",
         _ => "bin",
     }
 }

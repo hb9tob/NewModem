@@ -640,6 +640,16 @@ main {
   color: #9ccc65;
   font-weight: bold;
 }
+.tx-passthrough-hint {
+  margin-top: 0.4rem;
+  padding: 4px 8px;
+  background: rgba(156, 204, 101, 0.12);
+  border: 1px solid #4a7b1f;
+  border-radius: 3px;
+  color: #c5e1a5;
+  font-size: 0.78rem;
+  text-align: center;
+}
 .tx-speed-label {
   display: block;
   margin-top: 0.6rem;
@@ -1206,6 +1216,8 @@ main {
 }
 .image-lightbox img {
   position: absolute;
+  top: 0;
+  left: 0;
   transform-origin: 0 0;
   user-select: none;
   -webkit-user-drag: none;

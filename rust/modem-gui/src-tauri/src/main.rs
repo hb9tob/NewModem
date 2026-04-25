@@ -16,7 +16,7 @@ use settings::Settings;
 use tx_worker::TxHandle;
 use audio_capture::CaptureHandle;
 use rx_worker::{SharedWavSink, WavSink, WorkerHandle};
-use tx_encode::{compress_avif, CompressOpts};
+use tx_encode::{compress_avif, compress_zstd, CompressOpts};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +33,10 @@ struct AppState {
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     tx_source: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Chemin de la payload prête à émettre (`tx_preview.avif` ou
+    /// `tx_preview.zst`). Renseigné par compress_image / compress_file_zstd.
+    /// `tx_start` lit ce chemin pour piloter le CLI.
+    tx_payload_path: Arc<Mutex<Option<PathBuf>>>,
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
 }
@@ -323,11 +327,16 @@ fn tx_start(
         return Err("TX déjà en cours".into());
     }
     let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
-    let avif_path = save_dir.join("tx_preview.avif");
-    if !avif_path.exists() {
+    let payload_path = state
+        .tx_payload_path
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "aucune payload prête (compresse d'abord)".to_string())?;
+    if !payload_path.exists() {
         return Err(format!(
-            "preview AVIF absent ({}), recompresse une image avant TX",
-            avif_path.display()
+            "payload absent ({}), recompresse avant TX",
+            payload_path.display()
         ));
     }
     if args.callsign.trim().is_empty() {
@@ -338,7 +347,7 @@ fn tx_start(
     }
     let attenuation_db = settings::load().tx_attenuation_db;
     let handle = tx_worker::spawn(
-        avif_path,
+        payload_path,
         args.mode,
         args.callsign.trim().to_uppercase(),
         args.filename,
@@ -377,11 +386,16 @@ fn tx_more(
         return Err("TX déjà en cours".into());
     }
     let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
-    let avif_path = save_dir.join("tx_preview.avif");
-    if !avif_path.exists() {
+    let payload_path = state
+        .tx_payload_path
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "aucune payload prête (compresse d'abord)".to_string())?;
+    if !payload_path.exists() {
         return Err(format!(
-            "preview AVIF absent ({}), recompresse une image avant TX",
-            avif_path.display()
+            "payload absent ({}), recompresse avant TX",
+            payload_path.display()
         ));
     }
     if args.callsign.trim().is_empty() {
@@ -395,7 +409,7 @@ fn tx_more(
     }
     let attenuation_db = settings::load().tx_attenuation_db;
     let handle = tx_worker::spawn_more(
-        avif_path,
+        payload_path,
         args.mode,
         args.callsign.trim().to_uppercase(),
         args.filename,
@@ -478,6 +492,9 @@ fn set_tx_source_from_path(
 fn clear_tx_source(state: State<'_, AppState>) -> Result<(), String> {
     let mut slot = state.tx_source.lock().map_err(|e| e.to_string())?;
     *slot = None;
+    if let Ok(mut p) = state.tx_payload_path.lock() {
+        *p = None;
+    }
     Ok(())
 }
 
@@ -495,12 +512,46 @@ fn compress_image(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("tx_preview.avif");
     std::fs::write(&path, &result.avif_bytes).map_err(|e| format!("write: {e}"))?;
+    if let Ok(mut p) = state.tx_payload_path.lock() {
+        *p = Some(path.clone());
+    }
     Ok(CompressResult {
         preview_path: path.to_string_lossy().into_owned(),
         source_w: result.source_w,
         source_h: result.source_h,
         actual_w: result.actual_w,
         actual_h: result.actual_h,
+        byte_len: result.byte_len,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct CompressFileResult {
+    preview_path: String,
+    source_len: usize,
+    byte_len: usize,
+}
+
+/// Compresse la source (chargée via set_tx_source_from_path) en zstd niveau
+/// max et écrit le résultat dans `tx_preview.zst`. Pour les fichiers non-image
+/// (texte, archives, etc.) où on veut une transmission sans perte.
+#[tauri::command]
+fn compress_file_zstd(state: State<'_, AppState>) -> Result<CompressFileResult, String> {
+    let source = {
+        let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
+        slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
+    };
+    let result = compress_zstd(&source)?;
+    let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("tx_preview.zst");
+    std::fs::write(&path, &result.zst_bytes).map_err(|e| format!("write: {e}"))?;
+    if let Ok(mut p) = state.tx_payload_path.lock() {
+        *p = Some(path.clone());
+    }
+    Ok(CompressFileResult {
+        preview_path: path.to_string_lossy().into_owned(),
+        source_len: result.source_len,
         byte_len: result.byte_len,
     })
 }
@@ -525,6 +576,7 @@ fn main() {
     let _ = std::fs::create_dir_all(&save_dir);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let ptt: SharedPtt = Arc::new(Mutex::new(None));
             // Tentative d'ouverture du port PTT au démarrage. Si KO, on émet
@@ -541,6 +593,7 @@ fn main() {
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
                 wav_sink: Arc::new(Mutex::new(None)),
                 tx_source: Arc::new(Mutex::new(None)),
+                tx_payload_path: Arc::new(Mutex::new(None)),
                 tx_handle: Mutex::new(None),
                 ptt,
             });
@@ -565,6 +618,7 @@ fn main() {
             set_tx_source_from_path,
             clear_tx_source,
             compress_image,
+            compress_file_zstd,
             tx_estimate,
             tx_start,
             tx_more,

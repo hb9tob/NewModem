@@ -639,6 +639,7 @@ fn infer_mime(path: &PathBuf) -> u8 {
         Some("jpg") | Some("jpeg") => mime::IMAGE_JPEG,
         Some("png") => mime::IMAGE_PNG,
         Some("txt") | Some("md") => mime::TEXT,
+        Some("zst") => mime::ZSTD,
         _ => mime::BINARY,
     }
 }
