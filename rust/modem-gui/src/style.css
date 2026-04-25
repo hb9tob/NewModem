@@ -490,6 +490,22 @@ main {
   object-fit: contain;
   user-select: none;
 }
+/* Bande perforée 8 voies affichée à la place de l'image quand on transmet
+   un fichier non-image. Les trous représentent les vrais bytes du nom de
+   fichier (ASCII), défilement SMIL pour la rétro-vibe. */
+.tx-file-tape {
+  position: absolute;
+  inset: 8% 4%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  filter: drop-shadow(0 4px 14px rgba(0, 0, 0, 0.5));
+}
+.tx-file-tape svg {
+  width: 100%;
+  height: 100%;
+}
 .tx-preview.compressing::before {
   content: "";
   position: absolute;

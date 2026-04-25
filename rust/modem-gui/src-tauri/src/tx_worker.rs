@@ -116,8 +116,12 @@ pub struct TxPlan {
 }
 
 /// Compute the transmission plan for a given payload + profile + chosen
-/// RaptorQ repair percentage. Includes the fountain overhead so the surface
-/// displayed to the user matches what actually goes on air.
+/// RaptorQ repair percentage. Inclut tous les overheads de trame (préambule,
+/// header, meta, markers, pilotes, runout, EOT, plus les réinsertions
+/// périodiques toutes les `V3_PREAMBLE_PERIOD_S`) pour que la durée affichée
+/// dans l'UI matche ce qui passe réellement à l'antenne. Les valeurs précises
+/// sortent de `frame::superframe_total_symbols` + `frame::eot_frame_symbols`,
+/// qui miroitent à l'identique le builder de trame.
 pub fn tx_plan(
     payload_bytes: usize,
     mode_name: &str,
@@ -131,13 +135,27 @@ pub fn tx_plan(
     let k_bytes = config.ldpc_rate.k() / 8;
     let k_source = k_from_payload(wire, k_bytes) as u32;
     let n_initial = k_source + (k_source * repair_pct) / 100;
+    // Asymptote payload-only : utile pour l'estimation marginale "+N blocs".
     let bits_per_cw = (k_bytes as f64) * 8.0;
     let seconds_per_cw = bits_per_cw / config.net_bitrate();
+
+    // Durée réelle = symboles totaux du superframe + symboles EOT, divisés par
+    // le débit symbole. Capture les réinsertions périodiques (très lourdes en
+    // ULTRA où une réinsertion par segment) et tous les overheads structurels.
+    let total_syms_initial =
+        modem_core::frame::superframe_total_symbols(&config, n_initial)
+            + modem_core::frame::eot_frame_symbols(&config);
+    let duration_s_initial = total_syms_initial as f64 / config.symbol_rate;
+    // Pour duration_s_k : durée jusqu'au K-ième codeword, sans EOT (le RX
+    // peut décoder dès K reçus, avant l'EOT).
+    let duration_s_k =
+        modem_core::frame::superframe_total_symbols(&config, k_source) as f64
+            / config.symbol_rate;
     Ok(TxPlan {
         k_source,
         n_initial,
-        duration_s_initial: seconds_per_cw * (n_initial as f64),
-        duration_s_k: seconds_per_cw * (k_source as f64),
+        duration_s_initial,
+        duration_s_k,
         seconds_per_cw,
     })
 }

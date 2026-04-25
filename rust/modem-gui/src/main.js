@@ -1856,6 +1856,61 @@ function isImageFilename(name) {
   return IMAGE_EXTS.has(lower.slice(dot + 1));
 }
 
+// Génère un visuel de bande perforée 8 voies à partir du nom de fichier (les
+// trous représentent les bytes ASCII réels). Défilement SMIL en boucle pour
+// la rétro-vibe — pure décoration, aucune sémantique modem. Placé à la place
+// de l'image en mode fichier.
+function renderFileTape(filename) {
+  const container = document.getElementById("tx-file-tape");
+  if (!container) return;
+  const COL_W = 24;
+  const ROW_Y = [16, 38, 60, 88, 110, 132, 154, 176];
+  const SPROCKET_Y = 99;
+  const TAPE_H = 192;
+  // 30 octets pour un défilement bouclable même sur fichiers à nom court.
+  // Si filename plus court, on le répète ; si plus long, on le tronque.
+  const N_BYTES = 30;
+  const src = filename || "fichier.bin";
+  const bytes = [];
+  for (let i = 0; i < N_BYTES; i++) {
+    bytes.push(src.charCodeAt(i % src.length) & 0xff);
+  }
+  const TAPE_W = N_BYTES * COL_W;
+  const holes = [];
+  for (let i = 0; i < N_BYTES; i++) {
+    const b = bytes[i];
+    const x = i * COL_W + COL_W / 2;
+    holes.push(`<circle cx="${x}" cy="${SPROCKET_Y}" r="2.5" fill="#1a0e05"/>`);
+    for (let bit = 0; bit < 8; bit++) {
+      if ((b >> (7 - bit)) & 1) {
+        holes.push(`<circle cx="${x}" cy="${ROW_Y[bit]}" r="5.5" fill="#1a0e05"/>`);
+      }
+    }
+  }
+  const holesSvg = holes.join("");
+  container.innerHTML = `
+    <svg viewBox="0 0 ${TAPE_W} ${TAPE_H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="tape-edge" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#5a3a18" stop-opacity="0.55"/>
+          <stop offset="0.04" stop-color="#5a3a18" stop-opacity="0"/>
+          <stop offset="0.96" stop-color="#5a3a18" stop-opacity="0"/>
+          <stop offset="1" stop-color="#5a3a18" stop-opacity="0.55"/>
+        </linearGradient>
+      </defs>
+      <rect x="0" y="0" width="${TAPE_W}" height="${TAPE_H}" fill="#c9a574"/>
+      <g>
+        ${holesSvg}
+        <g transform="translate(${TAPE_W} 0)">${holesSvg}</g>
+        <animateTransform attributeName="transform" type="translate"
+                          from="0 0" to="${-TAPE_W} 0" dur="9s"
+                          repeatCount="indefinite"/>
+      </g>
+      <rect x="0" y="0" width="${TAPE_W}" height="${TAPE_H}" fill="url(#tape-edge)"/>
+    </svg>
+  `;
+}
+
 // État unique des contrôles AVIF (resize / qualité / vitesse) : verrouillés
 // quand la source est déjà un AVIF (passthrough) OU pas une image (zstd).
 // Dans les deux cas, ces contrôles n'ont aucun effet sur les bytes émis.
@@ -1877,6 +1932,14 @@ function applyTxModeUI() {
   }
   const previewImg = document.getElementById("tx-preview-img");
   if (previewImg) previewImg.style.display = file ? "none" : "";
+  const tape = document.getElementById("tx-file-tape");
+  if (tape) {
+    tape.hidden = !file;
+    if (file) {
+      const name = (txState.sourceFile && txState.sourceFile.name) || "fichier.bin";
+      renderFileTape(name);
+    }
+  }
   const ids = ["tx-quality", "tx-speed", "tx-free-w", "tx-free-h"];
   for (const id of ids) {
     const el = document.getElementById(id);

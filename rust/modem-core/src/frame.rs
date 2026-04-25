@@ -264,6 +264,81 @@ pub fn build_superframe_v3_range(
     all_symbols
 }
 
+/// Symbol count produit par `build_superframe_v3` pour `n_data_cw` codewords
+/// payload, hors trame EOT. Utilisé par `tx_plan` pour estimer la durée TX
+/// réelle (incluant préambule, header, meta, markers, pilotes, runout et les
+/// réinsertions périodiques toutes les `V3_PREAMBLE_PERIOD_S`). `net_bitrate`
+/// seul ne capture que le payload utile.
+///
+/// Précis au symbole près — miroir exact de la logique de
+/// `build_superframe_v3_range`. Adapte automatiquement à la densité pilote
+/// du profil (ULTRA = 16d/2p, autres = 32d/2p) et au nombre de bits par
+/// symbole de la constellation.
+pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
+    let n_data_cw = n_data_cw as usize;
+    let bits_per_sym = config.constellation.bits_per_sym();
+    // n() = 2304 (constant pour tous les rates LDPC)
+    let cw_data_syms = config.ldpc_rate.n() / bits_per_sym;
+    let pp = &config.pilot_pattern;
+    let d = pp.d_syms;
+    let p = pp.p_syms;
+    let pilots_for = |data_syms: usize| -> usize {
+        if data_syms == 0 {
+            return 0;
+        }
+        let n_groups = (data_syms + d - 1) / d;
+        n_groups * p
+    };
+    let cw_with_pilots = cw_data_syms + pilots_for(cw_data_syms);
+    let two_cw_with_pilots = 2 * cw_data_syms + pilots_for(2 * cw_data_syms);
+    let header_syms = 96; // QPSK + Golay : 192 bits → 96 symboles, fixe
+    let marker = marker::MARKER_LEN;
+
+    // Préambule + header + meta initial.
+    let mut total = crate::types::N_PREAMBLE + header_syms + marker + cw_with_pilots;
+    let mut elapsed = marker + cw_with_pilots;
+    let preamble_period_sym = (V3_PREAMBLE_PERIOD_S * config.symbol_rate) as usize;
+
+    let mut data_cursor = 0;
+    while data_cursor < n_data_cw {
+        if elapsed >= preamble_period_sym {
+            // Réinsertion : pré + hdr + nouveau meta.
+            total += crate::types::N_PREAMBLE + header_syms + marker + cw_with_pilots;
+            elapsed = marker + cw_with_pilots;
+            continue;
+        }
+        let cw_take = V2_CODEWORDS_PER_SEGMENT.min(n_data_cw - data_cursor);
+        let seg_with_pilots = if cw_take == 2 {
+            two_cw_with_pilots
+        } else {
+            cw_with_pilots
+        };
+        total += marker + seg_with_pilots;
+        elapsed += marker + seg_with_pilots;
+        data_cursor += cw_take;
+    }
+
+    // Runout : 4 groupes (d_syms fillers + p_syms pilotes) + 24 fillers finaux.
+    total += 4 * (d + p) + 24;
+    total
+}
+
+/// Symbol count d'une trame EOT (`build_eot_frame`) : préambule + header
+/// + 1 meta segment + runout, sans codewords payload.
+pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
+    let bits_per_sym = config.constellation.bits_per_sym();
+    let cw_data_syms = config.ldpc_rate.n() / bits_per_sym;
+    let pp = &config.pilot_pattern;
+    let n_groups = (cw_data_syms + pp.d_syms - 1) / pp.d_syms;
+    let cw_with_pilots = cw_data_syms + n_groups * pp.p_syms;
+    crate::types::N_PREAMBLE
+        + 96
+        + marker::MARKER_LEN
+        + cw_with_pilots
+        + 4 * (pp.d_syms + pp.p_syms)
+        + 24
+}
+
 /// Build a minimal end-of-transmission frame.
 ///
 /// Layout : preamble + header(FLAG_LAST|FLAG_EOT) + 1 meta segment (AppHeader
@@ -374,6 +449,70 @@ mod tests {
             hdr.payload_length, 0,
             "EOT carries no payload codewords"
         );
+    }
+
+    #[test]
+    fn superframe_total_symbols_matches_build() {
+        // Pour chaque profil, le helper doit retourner exactement le même
+        // nombre de symboles que build_superframe_v3, sinon les estimations
+        // de durée TX dériveraient. Plusieurs tailles de payload pour
+        // exercer les chemins (réinsertion périodique, dernier segment partiel).
+        // n_data_cw = k_source + n_repair_default(k_source), comme le fait
+        // build_superframe_v3 sous le capot.
+        use crate::profile::{
+            profile_high, profile_mega, profile_normal, profile_robust, profile_ultra,
+        };
+        let profiles: &[(&str, ModemConfig)] = &[
+            ("ULTRA", profile_ultra()),
+            ("ROBUST", profile_robust()),
+            ("NORMAL", profile_normal()),
+            ("HIGH", profile_high()),
+            ("MEGA", profile_mega()),
+        ];
+        let payload_sizes = [50usize, 500, 5000];
+        for (name, config) in profiles {
+            for &size in &payload_sizes {
+                let data = vec![0xA5u8; size];
+                let actual_symbols =
+                    build_superframe_v3(&data, config, 0xDEAD_BEEF, mime::BINARY, 0x1234);
+                let k_bytes = config.ldpc_rate.k() / 8;
+                let k_source = crate::raptorq_codec::k_from_payload(size, k_bytes) as u32;
+                let n_total = k_source + crate::raptorq_codec::n_repair_default(k_source);
+                let predicted = superframe_total_symbols(config, n_total);
+                assert_eq!(
+                    actual_symbols.len(),
+                    predicted,
+                    "{name} payload={size}B: helper {predicted} ≠ build {} \
+                     (n_total={n_total})",
+                    actual_symbols.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eot_frame_symbols_matches_build() {
+        use crate::profile::{
+            profile_high, profile_mega, profile_normal, profile_robust, profile_ultra,
+        };
+        for config in [
+            profile_ultra(),
+            profile_robust(),
+            profile_normal(),
+            profile_high(),
+            profile_mega(),
+        ] {
+            let actual = build_eot_frame(&config, 0xDEAD_BEEF);
+            let predicted = eot_frame_symbols(&config);
+            assert_eq!(
+                actual.len(),
+                predicted,
+                "EOT mismatch (constellation={:?}, pattern d={}/p={})",
+                config.constellation,
+                config.pilot_pattern.d_syms,
+                config.pilot_pattern.p_syms
+            );
+        }
     }
 
     #[test]
