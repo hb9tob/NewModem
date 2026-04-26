@@ -204,6 +204,50 @@ impl ProfileIndex {
         Self::High,
         Self::Mega,
     ];
+
+    /// Preamble family used by this profile on the wire. The split is
+    /// driven by `(sps, β)` — profiles that share both end up in the same
+    /// family and emit the same preamble sequence ; the header's
+    /// `profile_index` byte still disambiguates them downstream.
+    pub fn preamble_family(self) -> crate::preamble::PreambleFamily {
+        use crate::preamble::PreambleFamily;
+        match self {
+            Self::Normal | Self::High | Self::Mega => PreambleFamily::A,
+            Self::Robust => PreambleFamily::B,
+            Self::Ultra => PreambleFamily::C,
+        }
+    }
+
+    /// Default profile to assume after the FFT gate identifies a family
+    /// but before the protocol header refines the exact index. Within
+    /// family A the canonical anchor is NORMAL (the ProfileIndex byte
+    /// in the Golay-decoded header switches to HIGH or MEGA on demand) ;
+    /// families B and C have a single profile each.
+    pub fn anchor_for_family(family: crate::preamble::PreambleFamily) -> Self {
+        use crate::preamble::PreambleFamily;
+        match family {
+            PreambleFamily::A => Self::Normal,
+            PreambleFamily::B => Self::Robust,
+            PreambleFamily::C => Self::Ultra,
+        }
+    }
+}
+
+impl ModemConfig {
+    /// Preamble family this config emits / expects. Routed through the
+    /// matching `(symbol_rate, β)` pair so configs built outside of the
+    /// canonical profiles still pick a sensible family. Falls back to
+    /// `PreambleFamily::A` for unknown combinations (matches the legacy
+    /// behaviour before the family split).
+    pub fn preamble_family(&self) -> crate::preamble::PreambleFamily {
+        use crate::preamble::PreambleFamily;
+        let rs = self.symbol_rate.round() as u32;
+        match rs {
+            r if r >= 1200 => PreambleFamily::A, // 1500 Bd group
+            r if r >= 750 => PreambleFamily::B,  // 1000 Bd group
+            _ => PreambleFamily::C,              // 500 Bd group
+        }
+    }
 }
 
 impl ModemConfig {

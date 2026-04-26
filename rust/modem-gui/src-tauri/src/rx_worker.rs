@@ -544,55 +544,54 @@ fn scan_and_route(
         sum / state.session_buffer.len() as f64
     };
 
-    // [perf] Phase-2a — preamble-presence FFT probe gate. Run in Idle only :
-    // when the worker is already in a session, the buffer is full of signal
+    // [perf] Phase-2a/b — preamble-presence FFT probe gate. Runs in Idle only :
+    // when the worker is already in a session the buffer is full of signal
     // by construction and the probe would always fire. Cost ≈ 25-30 ms vs
-    // the ~1000 ms of the full pipeline below ; saves an order of magnitude
-    // when the channel is silent or carrying band noise without preamble
-    // structure.
+    // ~1000 ms for the full legacy pipeline.
     //
-    // The probe is a presence detector, not a profile classifier — a positive
-    // result only means "the spectral signature of one of the 4 unique
-    // (sps, β) preamble templates is above noise floor". The actual profile
-    // selection still happens in `detect_best_profile` immediately below.
+    // Distinct preamble sequences per `(sps, β)` family (Phase 2b — A: 32/0.20,
+    // B: 48/0.25, C: 96/0.25) let the gate ALSO classify the on-air family in
+    // a single pass. We use that family directly to pick a sensible anchor
+    // profile, replacing `detect_best_profile` (~720 ms) entirely. Within
+    // family A the (NORMAL/HIGH/MEGA) ambiguity is resolved by the protocol
+    // header's `profile_index` byte — handled in the existing post-decode
+    // refinement block below.
     let mut t_probe_us: u128 = 0;
     let mut probe_ratio: f64 = 0.0;
-    let mut probe_label: &'static str = "";
+    let mut probe_label: &'static str = "-";
     if !state.session_active && !state.session_buffer.is_empty() {
         let probe = modem_core::gate::PreambleProbe::for_buf_len(state.session_buffer.len());
         let t0 = Instant::now();
         let r = probe.check(&state.session_buffer);
         t_probe_us = t0.elapsed().as_micros();
         probe_ratio = r.max_ratio;
-        probe_label = r.best_template;
+        probe_label = r.best_family.name();
         if !r.passes(modem_core::gate::PROBE_THRESHOLD) {
             worker_log(&format!(
-                "[scan] active=false buf={:.1}s gated profile={:?} rms_sqr={:.6} t_probe_us={} probe_ratio={:.1} (<{})",
-                buf_secs, state.profile, rms_sqr, t_probe_us, probe_ratio, modem_core::gate::PROBE_THRESHOLD,
+                "[scan] active=false buf={:.1}s gated profile={:?} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} (<{})",
+                buf_secs, state.profile, rms_sqr, t_probe_us, probe_label, probe_ratio, modem_core::gate::PROBE_THRESHOLD,
             ));
             return;
         }
-    }
-
-    // Auto-detect profile in Idle : scan the 5 profiles' pitches and
-    // reconfigure if the on-air Rs / tau doesn't match our current config.
-    // This is crucial for permanent-listening mode since the RX can't know
-    // which profile the remote station is transmitting.
-    let mut t_detect_us: u128 = 0;
-    if !state.session_active {
-        let t0 = Instant::now();
-        let detected = rx_v2::detect_best_profile(&state.session_buffer, state.profile);
-        t_detect_us = t0.elapsed().as_micros();
-        if let Some(detected) = detected {
+        // Gate fired : align state.profile to the family anchor when the
+        // current config doesn't already belong to the detected family.
+        // Header refinement (post-decode) handles intra-family ambiguity.
+        if state.profile.preamble_family() != r.best_family {
+            let anchor = ProfileIndex::anchor_for_family(r.best_family);
             worker_log(&format!(
-                "[auto-profile] idle correlation picked {:?} (was {:?})",
-                detected, state.profile
+                "[auto-profile] gate picked family {:?} → anchor {:?} (was {:?})",
+                r.best_family, anchor, state.profile
             ));
-            state.profile = detected;
-            state.config = detected.to_config();
-            // Fall through : rx_v3 below will run with the new config.
+            state.profile = anchor;
+            state.config = anchor.to_config();
         }
     }
+
+    // `t_detect_us` retained in the [scan] log for compatibility with
+    // existing baseline captures ; phase-2b removes detect_best_profile
+    // from the path so this is always 0 unless a future revision restores
+    // a per-tick classifier here.
+    let t_detect_us: u128 = 0;
 
     let config = state.config.clone();
 

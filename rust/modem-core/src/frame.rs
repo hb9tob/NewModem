@@ -190,7 +190,7 @@ pub fn build_superframe_v3_range(
 
     // Pre-encode the preamble + protocol header bundle inserted before each
     // periodic meta. Same content every time → encode once, reuse.
-    let preamble_syms = preamble::make_preamble();
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
     let mut hdr = Header::from_config(config, 0, data.len() as u16, FLAG_LAST);
     hdr.version = HEADER_VERSION_V3;
     let header_syms = header::encode_header_symbols(&hdr);
@@ -382,7 +382,7 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
     let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
     let k_bytes = encoder.k() / 8;
 
-    let preamble_syms = preamble::make_preamble();
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
     let mut hdr = Header::from_config(config, 0, 0, FLAG_LAST | FLAG_EOT);
     hdr.version = HEADER_VERSION_V3;
     let header_syms = header::encode_header_symbols(&hdr);

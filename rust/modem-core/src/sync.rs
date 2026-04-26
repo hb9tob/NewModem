@@ -2,9 +2,7 @@
 //!
 //! Port de rx_matched_and_timing() lignes 458-543.
 
-use crate::preamble;
-use crate::rrc::rrc_taps;
-use crate::types::{Complex64, N_PREAMBLE, RRC_SPAN_SYM};
+use crate::types::Complex64;
 
 /// Find preamble position in the matched-filtered signal.
 ///
@@ -13,9 +11,17 @@ use crate::types::{Complex64, N_PREAMBLE, RRC_SPAN_SYM};
 ///    only the symbol-rate samples of the preamble. O(n/pitch * 256).
 /// 2. Fine: refine within ±pitch/2 around the coarse peak.
 ///
+/// `preamble_syms` is the family-specific reference sequence — the caller
+/// resolves it from the receive config via `make_preamble_for(family)`.
+///
 /// Returns the index of the correlation peak (= first symbol position).
-pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> Option<usize> {
-    let preamble_syms = preamble::make_preamble();
+pub fn find_preamble(
+    mf: &[Complex64],
+    preamble_syms: &[Complex64],
+    _sps: usize,
+    pitch: usize,
+    _beta: f64,
+) -> Option<usize> {
     let n_pre = preamble_syms.len(); // 256
 
     // After matched filter, the preamble symbols appear as RC pulses at
@@ -35,7 +41,7 @@ pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> 
     let coarse_step = pitch;
     let mut start = 0;
     while start <= max_start {
-        let mag = correlate_at(mf, &preamble_syms, start, pitch);
+        let mag = correlate_at(mf, preamble_syms, start, pitch);
         if mag > best_mag {
             best_mag = mag;
             best_coarse = start;
@@ -50,7 +56,7 @@ pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> 
     let mut best_fine_mag = best_mag;
 
     for s in fine_lo..=fine_hi {
-        let mag = correlate_at(mf, &preamble_syms, s, pitch);
+        let mag = correlate_at(mf, preamble_syms, s, pitch);
         if mag > best_fine_mag {
             best_fine_mag = mag;
             best_fine = s;
@@ -70,7 +76,13 @@ pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> 
 ///
 /// Returns sorted sample indices. Empty vec if no candidate clears the
 /// threshold (e.g. a noise-only buffer).
-pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f64) -> Vec<usize> {
+pub fn find_all_preambles(
+    mf: &[Complex64],
+    preamble_syms: &[Complex64],
+    _sps: usize,
+    pitch: usize,
+    _beta: f64,
+) -> Vec<usize> {
     // [perf] Optional instrumentation gated by `MODEM_PERF=1`. Splits
     // `find_all_preambles` into its 3 sub-stages (coarse scan, NMS,
     // fine refine) and dumps elapsed µs per call to stderr. See
@@ -78,7 +90,6 @@ pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f6
     let perf_on = perf_trace_enabled();
     let t_total = if perf_on { Some(std::time::Instant::now()) } else { None };
 
-    let preamble_syms = preamble::make_preamble();
     let n_pre = preamble_syms.len();
     let max_start = mf.len().saturating_sub(n_pre * pitch);
     if max_start == 0 {
@@ -96,7 +107,7 @@ pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f6
     let mut global_max = 0.0f64;
     let mut start = 0usize;
     while start <= max_start {
-        let mag = correlate_at(mf, &preamble_syms, start, pitch);
+        let mag = correlate_at(mf, preamble_syms, start, pitch);
         if mag > global_max {
             global_max = mag;
         }
@@ -146,9 +157,9 @@ pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f6
             let fine_lo = coarse_pos.saturating_sub(pitch);
             let fine_hi = (coarse_pos + pitch).min(max_start);
             let mut best = coarse_pos;
-            let mut best_mag = correlate_at(mf, &preamble_syms, coarse_pos, pitch);
+            let mut best_mag = correlate_at(mf, preamble_syms, coarse_pos, pitch);
             for s in fine_lo..=fine_hi {
-                let m = correlate_at(mf, &preamble_syms, s, pitch);
+                let m = correlate_at(mf, preamble_syms, s, pitch);
                 if m > best_mag {
                     best_mag = m;
                     best = s;

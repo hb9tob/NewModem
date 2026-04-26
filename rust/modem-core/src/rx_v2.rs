@@ -95,7 +95,7 @@ pub fn probe_preamble_present(samples: &[f32], config: &ModemConfig) -> bool {
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let preamble_syms = preamble::make_preamble();
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
     let n_pre = preamble_syms.len();
     let max_start = mf.len().saturating_sub(n_pre * pitch);
     if max_start == 0 {
@@ -156,7 +156,7 @@ fn preamble_correlation_ratio(samples: &[f32], config: &ModemConfig) -> f64 {
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let preamble_syms = preamble::make_preamble();
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
     let n_pre = preamble_syms.len();
     let max_start = mf.len().saturating_sub(n_pre * pitch);
     if max_start == 0 {
@@ -342,14 +342,14 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
 
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
-    let sync_pos = sync::find_preamble(&mf, sps, pitch, config.beta)?;
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
     let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
     let pitch_fse = pitch / d_fse;
     let sps_fse = sps / d_fse;
     let tau_eff = pitch_fse as f64 / sps_fse as f64;
     let mut n_ff = if tau_eff >= 0.99 { 8 * sps_fse + 1 } else { 4 * sps_fse + 1 };
     if n_ff % 2 == 0 { n_ff += 1; }
-    let preamble_syms = preamble::make_preamble();
     let training_positions: Vec<usize> = (0..N_PREAMBLE).map(|k| fse_start + k * pitch_fse).collect();
     let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
     let half = n_ff / 2;
@@ -460,7 +460,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let sync_pos = sync::find_preamble(&mf, sps, pitch, config.beta)?;
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
 
     // Decimate + LS-trained FFE on preamble (same as rx.rs prelude)
     let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
@@ -476,7 +477,6 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         n_ff += 1;
     }
 
-    let preamble_syms = preamble::make_preamble();
     let header_sym_count = 96;
 
     let training_positions: Vec<usize> = (0..N_PREAMBLE)
@@ -837,7 +837,8 @@ pub fn rx_v3_after(
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let mut positions = sync::find_all_preambles(&mf, sps, pitch, config.beta);
+    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let mut positions = sync::find_all_preambles(&mf, &preamble_syms, sps, pitch, config.beta);
     if positions.is_empty() {
         return None;
     }
