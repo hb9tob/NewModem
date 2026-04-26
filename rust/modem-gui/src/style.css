@@ -1424,6 +1424,8 @@ main {
   gap: 0.6rem;
   overflow-y: auto;
   padding-right: 0.3rem;
+  flex: 1;
+  min-height: 0;
 }
 .history-empty {
   color: #6a6a6a;
@@ -1439,6 +1441,7 @@ main {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
 }
 .history-tx .history-card { border-left: 2px solid #9ccc65; }
 .history-rx .history-card { border-left: 2px solid #ffb74d; }
