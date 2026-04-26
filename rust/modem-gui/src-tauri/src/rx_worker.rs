@@ -303,6 +303,13 @@ struct WorkerState {
     /// disappears mid-burst without sending EOT.
     last_preamble_seen_at: Instant,
     total_samples: u64,
+    /// Absolute offset (in capture samples since worker start) of the
+    /// most recent CLOSED preamble window already decoded. The next scan
+    /// passes `skip_until = last_closed_abs - buffer_start_abs` to
+    /// `rx_v3_after`, so closed windows aren't re-decoded each tick. Reset
+    /// on profile switch / soft buffer reset / preroll trim. None = no
+    /// closed window decoded yet (start, or after reset).
+    last_closed_preamble_abs: Option<u64>,
 }
 
 impl WorkerState {
@@ -322,6 +329,7 @@ impl WorkerState {
             session_started_at: now,
             last_preamble_seen_at: now,
             total_samples: 0,
+            last_closed_preamble_abs: None,
         }
     }
 
@@ -330,6 +338,7 @@ impl WorkerState {
         self.header = None;
         self.session_active = false;
         self.announced_sessions.clear();
+        self.last_closed_preamble_abs = None;
     }
 
     /// Keep only the last `PREROLL_SECONDS` of audio in the in-memory buffer.
@@ -346,6 +355,7 @@ impl WorkerState {
         self.header = None;
         self.session_active = false;
         self.announced_sessions.clear();
+        self.last_closed_preamble_abs = None;
     }
 }
 
@@ -533,10 +543,25 @@ fn scan_and_route(
 
     let config = state.config.clone();
 
-    let Some(mut result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
+    // Compute the relative skip offset : closed windows already decoded in
+    // earlier ticks are at absolute offsets ≤ `last_closed_preamble_abs`.
+    // Translate to a buffer-relative position so `rx_v3_after` can drop
+    // those preambles without re-running the (expensive) per-window decode.
+    let buf_start_abs = state
+        .total_samples
+        .saturating_sub(state.session_buffer.len() as u64);
+    let skip_rel = match state.last_closed_preamble_abs {
+        Some(abs) if abs > buf_start_abs => {
+            // +1 to exclude the watermark itself (we've already decoded it).
+            (abs - buf_start_abs + 1) as usize
+        }
+        _ => 0,
+    };
+
+    let Some(mut result) = rx_v2::rx_v3_after(&state.session_buffer, &config, skip_rel) else {
         worker_log(&format!(
-            "[scan] active={} buf={:.1}s rx_v3=None profile={:?}",
-            state.session_active, buf_secs, state.profile
+            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} skip_rel={}",
+            state.session_active, buf_secs, state.profile, skip_rel
         ));
         return;
     };
@@ -562,6 +587,10 @@ fn scan_and_route(
                 state.config = hdr_profile.to_config();
                 state.header = None;
                 state.announced_sessions.clear();
+                // The closed-window watermark was computed under the wrong
+                // profile (different Rs/pitch can shift detected positions).
+                // Drop it so the re-decode below scans everything fresh.
+                state.last_closed_preamble_abs = None;
                 let _ = app.emit(
                     "profile_auto_detected",
                     serde_json::json!({ "profile": profile_name(state.profile) }),
@@ -591,6 +620,16 @@ fn scan_and_route(
                 }
             }
         }
+    }
+    // Advance the closed-window watermark so the next tick passes
+    // `skip_until = last_closed_abs + 1` to rx_v3_after and avoids
+    // re-decoding the same closed windows. Only update when rx_v3 actually
+    // saw a closed window in this scan ; if positions.len() < 2 here, the
+    // value is None and we leave the watermark untouched (next scan will
+    // see the same 1 preamble plus any new one and treat the older one
+    // as closed).
+    if let Some(rel) = result.last_closed_preamble_offset {
+        state.last_closed_preamble_abs = Some(buf_start_abs + rel as u64);
     }
     let eot_seen = result.eot_seen;
     worker_log(&format!(

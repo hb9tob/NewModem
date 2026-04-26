@@ -60,6 +60,15 @@ pub struct RxV2Result {
     /// scatter). Capped at ~500 points — the GUI displays them as a
     /// scatter plot.
     pub constellation_sample: Vec<[f32; 2]>,
+    /// Offset (in samples, relative to the input slice) of the last preamble
+    /// whose window was fully closed and decoded by `rx_v3` in this call.
+    /// Callers that maintain a sliding capture buffer can persist this
+    /// position (translated to absolute samples) and skip re-decoding the
+    /// same closed windows on subsequent ticks.
+    /// `None` for `rx_v2_single` results (single window, no concept of
+    /// "closed vs open"), or for `rx_v3` calls where fewer than 2 preambles
+    /// were found (no closed window to mark done).
+    pub last_closed_preamble_offset: Option<usize>,
 }
 
 /// Cheap preamble presence probe — intended for the RX worker's Idle gate.
@@ -767,6 +776,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         cw_bytes_map: cw_bytes,
         eot_seen,
         constellation_sample,
+        last_closed_preamble_offset: None,
     })
 }
 
@@ -789,6 +799,22 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
 ///
 /// Returns `None` only if no preamble is found at all.
 pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
+    rx_v3_after(samples, config, 0)
+}
+
+/// Same as `rx_v3` but skip every preamble whose detected offset is strictly
+/// less than `skip_until` (in samples, relative to `samples`). Allows a
+/// caller maintaining a rolling capture buffer to mark closed windows as
+/// done and avoid re-decoding them on every tick — critical for slow
+/// profiles like ULTRA where each `rx_v2` pass costs several hundred ms
+/// and the buffer can hold 2-3 closed windows at any time.
+///
+/// When `skip_until = 0`, behaves exactly like `rx_v3`.
+pub fn rx_v3_after(
+    samples: &[f32],
+    config: &ModemConfig,
+    skip_until: usize,
+) -> Option<RxV2Result> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
@@ -801,6 +827,15 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         return None;
     }
     positions.sort();
+    // Caller-driven cache : drop preambles already processed in earlier
+    // ticks. The last surviving "closed" position will be reported in the
+    // result so the caller can advance its watermark.
+    if skip_until > 0 {
+        positions.retain(|&p| p >= skip_until);
+        if positions.is_empty() {
+            return None;
+        }
+    }
 
     // Pre-roll & post-roll: enough context for the matched filter span on
     // both sides so the first/last data symbols of the cycle aren't eaten
@@ -928,6 +963,15 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     };
     let data_blocks_recovered = merged.len();
 
+    // Closed window watermark : positions kept after `skip_until` filter,
+    // all but the last one were treated as closed (had a P_{i+1} after).
+    // The last closed = positions[len-2] when len ≥ 2.
+    let last_closed_preamble_offset = if positions.len() >= 2 {
+        Some(positions[positions.len() - 2])
+    } else {
+        None
+    };
+
     Some(RxV2Result {
         data: assembled,
         header: hdr_any,
@@ -941,6 +985,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         cw_bytes_map: merged,
         eot_seen,
         constellation_sample: last_constellation,
+        last_closed_preamble_offset,
     })
 }
 
