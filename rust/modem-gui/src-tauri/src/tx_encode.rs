@@ -57,20 +57,21 @@ pub fn compress_zstd(source_bytes: &[u8]) -> Result<CompressedFile, String> {
 }
 
 pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<CompressedImage, String> {
-    // Passthrough : la source est déjà un AVIF (drop direct dans la GUI),
-    // on ne touche pas aux bytes — pas de ré-encodage, donc pas de perte
-    // ni de cycles CPU. Les dimensions sont lues via le header.
+    // Passthrough : la source est déjà un AVIF (drop direct ou relayage
+    // depuis l'historique). On ne touche pas aux bytes — pas de ré-encodage,
+    // donc pas de perte ni de cycles CPU. On ne décode pas l'AVIF côté Rust
+    // pour lire les dimensions (le crate `image` n'a pas la feature `avif`
+    // activée — ça ferait crasher le passthrough silencieusement). Les
+    // dimensions remontées au frontend sont celles passées dans `opts`,
+    // que le JS a déjà obtenues en chargeant l'image via `<Image>`.
     if opts.passthrough {
-        let (src_w, src_h) = image::load_from_memory(source_bytes)
-            .map(|i| (i.width(), i.height()))
-            .map_err(|e| format!("avif header: {e}"))?;
         let byte_len = source_bytes.len();
         return Ok(CompressedImage {
             avif_bytes: source_bytes.to_vec(),
-            source_w: src_w,
-            source_h: src_h,
-            actual_w: src_w,
-            actual_h: src_h,
+            source_w: opts.target_w,
+            source_h: opts.target_h,
+            actual_w: opts.target_w,
+            actual_h: opts.target_h,
             byte_len,
         });
     }
