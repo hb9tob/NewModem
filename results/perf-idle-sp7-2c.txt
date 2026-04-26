@@ -1,0 +1,17 @@
+[perf_idle] buffer = 96000 samples = 2 s @ 48000 Hz
+[perf_idle] noise   = white Gaussian, RMS = -40 dBFS (typical idle floor)
+[perf_idle] iters   = 60
+
+[perf_idle] actual rms_sqr = 9.999999e-5  (rms = 0.0100)
+
+detect_best_profile      N= 60  median=36614 µs (  36 ms)   p95=43407 µs (  43 ms)   max=44673 µs (  44 ms)   mean= 37497 µs
+rx_v3_after[Normal]      N= 60  median=24033 µs (  24 ms)   p95=26837 µs (  26 ms)   max=27730 µs (  27 ms)   mean= 24253 µs
+rx_v3_after[High]        N= 60  median=23333 µs (  23 ms)   p95=27202 µs (  27 ms)   max=36819 µs (  36 ms)   mean= 23759 µs
+rx_v3_after[Mega]        N= 60  median=32764 µs (  32 ms)   p95=36204 µs (  36 ms)   max=37407 µs (  37 ms)   mean= 33020 µs
+rx_v3_after[Ultra]       N= 60  median=22402 µs (  22 ms)   p95=24409 µs (  24 ms)   max=25795 µs (  25 ms)   mean= 22380 µs
+rx_v3_after[Robust]      N= 60  median= 8272 µs (   8 ms)   p95= 9607 µs (   9 ms)   max= 9925 µs (   9 ms)   mean=  8402 µs
+legacy idle tick         N= 60  median=59442 µs (  59 ms)   p95=62935 µs (  62 ms)   max=71334 µs (  71 ms)   mean= 59727 µs
+fft probe (noise)        N= 60  median= 1574 µs (   1 ms)   p95= 2101 µs (   2 ms)   max= 2206 µs (   2 ms)   mean=  1639 µs
+                          → noise ratio=22.0 (threshold=100), gate=BLOCK
+new idle tick            N= 60  median= 1577 µs (   1 ms)   p95= 2062 µs (   2 ms)   max= 2158 µs (   2 ms)   mean=  1651 µs
+[perf_idle] sanity : NORMAL preamble injected → probe ratio=4001.3 (threshold=100), family=A

@@ -9,3 +9,4 @@ num-complex = { workspace = true }
 thiserror = { workspace = true }
 raptorq = "2.0"
 realfft = "3"
+rustfft = "6"

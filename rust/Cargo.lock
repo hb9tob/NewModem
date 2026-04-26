@@ -2807,6 +2807,7 @@ dependencies = [
  "num-complex",
  "raptorq",
  "realfft",
+ "rustfft",
  "thiserror 2.0.18",
 ]
 
