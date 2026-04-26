@@ -1,0 +1,13 @@
+[perf_idle] buffer = 96000 samples = 2 s @ 48000 Hz
+[perf_idle] noise   = white Gaussian, RMS = -40 dBFS (typical idle floor)
+[perf_idle] iters   = 60
+
+[perf_idle] actual rms_sqr = 9.999999e-5  (rms = 0.0100)
+
+detect_best_profile      N= 60  median=716496 µs ( 716 ms)   p95=724915 µs ( 724 ms)   max=731992 µs ( 731 ms)   mean=716964 µs
+rx_v3_after[Normal]      N= 60  median=283382 µs ( 283 ms)   p95=310004 µs ( 310 ms)   max=316478 µs ( 316 ms)   mean=285297 µs
+rx_v3_after[High]        N= 60  median=280955 µs ( 280 ms)   p95=286511 µs ( 286 ms)   max=288286 µs ( 288 ms)   mean=281700 µs
+rx_v3_after[Mega]        N= 60  median=204327 µs ( 204 ms)   p95=210025 µs ( 210 ms)   max=216452 µs ( 216 ms)   mean=205037 µs
+rx_v3_after[Ultra]       N= 60  median=1097893 µs (1097 ms)   p95=1117562 µs (1117 ms)   max=1119744 µs (1119 ms)   mean=1098401 µs
+rx_v3_after[Robust]      N= 60  median=348883 µs ( 348 ms)   p95=352493 µs ( 352 ms)   max=357135 µs ( 357 ms)   mean=348885 µs
+combined idle tick       N= 60  median=1003135 µs (1003 ms)   p95=1017607 µs (1017 ms)   max=1024774 µs (1024 ms)   mean=1005015 µs

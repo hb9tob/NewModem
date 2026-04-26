@@ -71,13 +71,27 @@ pub fn find_preamble(mf: &[Complex64], sps: usize, pitch: usize, _beta: f64) -> 
 /// Returns sorted sample indices. Empty vec if no candidate clears the
 /// threshold (e.g. a noise-only buffer).
 pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f64) -> Vec<usize> {
+    // [perf] Optional instrumentation gated by `MODEM_PERF=1`. Splits
+    // `find_all_preambles` into its 3 sub-stages (coarse scan, NMS,
+    // fine refine) and dumps elapsed µs per call to stderr. See
+    // plans/perf-rx-idle-surface-pro-7.md (Phase 1).
+    let perf_on = perf_trace_enabled();
+    let t_total = if perf_on { Some(std::time::Instant::now()) } else { None };
+
     let preamble_syms = preamble::make_preamble();
     let n_pre = preamble_syms.len();
     let max_start = mf.len().saturating_sub(n_pre * pitch);
     if max_start == 0 {
+        if perf_on {
+            eprintln!(
+                "[perf find_all_preambles] empty buf_len={} pitch={} n_pre={}",
+                mf.len(), pitch, n_pre
+            );
+        }
         return Vec::new();
     }
 
+    let t_coarse = if perf_on { Some(std::time::Instant::now()) } else { None };
     let mut mags: Vec<(usize, f64)> = Vec::new();
     let mut global_max = 0.0f64;
     let mut start = 0usize;
@@ -89,17 +103,27 @@ pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f6
         mags.push((start, mag));
         start += pitch;
     }
+    let coarse_us = t_coarse.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+    let n_coarse = mags.len();
     if global_max <= 0.0 {
+        if perf_on {
+            eprintln!(
+                "[perf find_all_preambles] zero buf_len={} pitch={} n_coarse={} coarse_us={}",
+                mf.len(), pitch, n_coarse, coarse_us
+            );
+        }
         return Vec::new();
     }
 
     let threshold = 0.3 * global_max;
     let min_sep = (n_pre * pitch) / 2;
 
+    let t_nms = if perf_on { Some(std::time::Instant::now()) } else { None };
     let mut candidates: Vec<(usize, f64)> = mags
         .into_iter()
         .filter(|&(_, m)| m >= threshold)
         .collect();
+    let n_above_thr = candidates.len();
     candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut kept: Vec<usize> = Vec::new();
@@ -113,8 +137,11 @@ pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f6
         }
     }
     kept.sort();
+    let nms_us = t_nms.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+    let n_kept = kept.len();
 
-    kept.into_iter()
+    let t_fine = if perf_on { Some(std::time::Instant::now()) } else { None };
+    let out: Vec<usize> = kept.into_iter()
         .map(|coarse_pos| {
             let fine_lo = coarse_pos.saturating_sub(pitch);
             let fine_hi = (coarse_pos + pitch).min(max_start);
@@ -129,7 +156,34 @@ pub fn find_all_preambles(mf: &[Complex64], _sps: usize, pitch: usize, _beta: f6
             }
             best
         })
-        .collect()
+        .collect();
+    let fine_us = t_fine.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+
+    if let Some(t0) = t_total {
+        eprintln!(
+            "[perf find_all_preambles] buf_len={} pitch={} n_coarse={} n_above_thr={} n_kept={} coarse_us={} nms_us={} fine_us={} total_us={}",
+            mf.len(),
+            pitch,
+            n_coarse,
+            n_above_thr,
+            n_kept,
+            coarse_us,
+            nms_us,
+            fine_us,
+            t0.elapsed().as_micros(),
+        );
+    }
+    out
+}
+
+/// One-time read of the `MODEM_PERF` env var. Returns `true` when set to
+/// `"1"`. Used by hot-path instrumentation to skip syscall overhead per call.
+/// To remove once Phase 1 calibration captures are in
+/// `results/perf-idle-sp7-*.txt` and the constants in Phase 2 are set.
+fn perf_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MODEM_PERF").map(|v| v == "1").unwrap_or(false))
 }
 
 /// Correlate mf at position `start` with preamble symbols at `pitch` spacing.

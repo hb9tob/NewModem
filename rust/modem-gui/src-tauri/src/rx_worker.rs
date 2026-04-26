@@ -528,12 +528,32 @@ fn scan_and_route(
 ) {
     let buf_secs = state.session_buffer.len() as f64 / AUDIO_RATE as f64;
 
+    // [perf] Phase-1 instrumentation : track ms spent per scan in the two
+    // dominant cost-driver functions (detect_best_profile, rx_v3_after) and
+    // the buffer's mean-squared energy. Always-on (Instant calls are cheap),
+    // logged on the existing `[scan]` lines. Used to calibrate the Phase-2
+    // energy gate. See plans/perf-rx-idle-surface-pro-7.md.
+    let rms_sqr: f64 = if state.session_buffer.is_empty() {
+        0.0
+    } else {
+        let sum: f64 = state
+            .session_buffer
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        sum / state.session_buffer.len() as f64
+    };
+
     // Auto-detect profile in Idle : scan the 5 profiles' pitches and
     // reconfigure if the on-air Rs / tau doesn't match our current config.
     // This is crucial for permanent-listening mode since the RX can't know
     // which profile the remote station is transmitting.
+    let mut t_detect_us: u128 = 0;
     if !state.session_active {
-        if let Some(detected) = rx_v2::detect_best_profile(&state.session_buffer, state.profile) {
+        let t0 = Instant::now();
+        let detected = rx_v2::detect_best_profile(&state.session_buffer, state.profile);
+        t_detect_us = t0.elapsed().as_micros();
+        if let Some(detected) = detected {
             worker_log(&format!(
                 "[auto-profile] idle correlation picked {:?} (was {:?})",
                 detected, state.profile
@@ -561,10 +581,13 @@ fn scan_and_route(
         _ => 0,
     };
 
-    let Some(mut result) = rx_v2::rx_v3_after(&state.session_buffer, &config, skip_rel) else {
+    let t_rx_v3_start = Instant::now();
+    let rx_v3_opt = rx_v2::rx_v3_after(&state.session_buffer, &config, skip_rel);
+    let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
+    let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
-            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} skip_rel={}",
-            state.session_active, buf_secs, state.profile, skip_rel
+            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} skip_rel={} rms_sqr={:.6} t_detect_us={} t_rx_v3_us={}",
+            state.session_active, buf_secs, state.profile, skip_rel, rms_sqr, t_detect_us, t_rx_v3_us
         ));
         return;
     };
@@ -636,7 +659,7 @@ fn scan_and_route(
     }
     let eot_seen = result.eot_seen;
     worker_log(&format!(
-        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4}",
+        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4} rms_sqr={:.6} t_detect_us={} t_rx_v3_us={}",
         state.session_active,
         buf_secs,
         result.header.is_some(),
@@ -649,6 +672,9 @@ fn scan_and_route(
         result.segments_decoded,
         result.segments_lost,
         result.sigma2,
+        rms_sqr,
+        t_detect_us,
+        t_rx_v3_us,
     ));
 
     // Transition to Capturing as soon as a V3 protocol header is Golay-
