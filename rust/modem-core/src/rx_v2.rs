@@ -1372,6 +1372,45 @@ mod tests {
         assert_eq!(&result.data[..data.len()], &data[..]);
     }
 
+    /// Régression : NORMAL et HIGH partagent (Rs, tau, beta) → la corrélation
+    /// préambule ne peut pas les distinguer. Si le worker démarre en HIGH
+    /// par défaut et le TX émet en NORMAL, le 1er `rx_v3` décode quand même
+    /// le header Golay (96 sym QPSK fixés indépendants de la constellation
+    /// data) qui révèle le bon profil. Le worker doit alors re-décoder sur
+    /// le même buffer avec le bon profil — sinon la 1ère superframe (~4 s
+    /// en NORMAL) est perdue, comme observé OTA (ESIs 0..5 manquants sur
+    /// session 2dc17ae3).
+    #[test]
+    fn rx_v3_normal_decoded_with_high_config_exposes_profile_index() {
+        use crate::app_header::mime;
+        use crate::profile::{profile_high, profile_normal, ProfileIndex};
+        let normal = profile_normal();
+        let data: Vec<u8> = (0..2000)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        let session = 0xABCD_EF12u32;
+        let samples = tx_v3(&data, &normal, session);
+
+        // 1er essai : config HIGH (mauvais profil mais même Rs/tau/beta).
+        // Le header Golay doit malgré tout décoder et exposer profile_index = NORMAL.
+        let r1 = rx_v3(&samples, &profile_high()).expect("rx_v3 None with HIGH config");
+        let hdr = r1.header.as_ref().expect("Golay header should decode");
+        let hdr_profile =
+            ProfileIndex::from_u8(hdr.profile_index).expect("profile_index valid");
+        assert_eq!(
+            hdr_profile,
+            ProfileIndex::Normal,
+            "header doit révéler que TX émet en NORMAL"
+        );
+
+        // 2ème essai : config NORMAL → décode complet.
+        let r2 = rx_v3(&samples, &normal).expect("rx_v3 None with NORMAL config");
+        assert!(r2.app_header.is_some());
+        assert_eq!(&r2.data[..data.len()], &data[..]);
+        // Sanity : le payload décodé avec le bon profil restitue les bytes.
+        let _ = mime::BINARY;
+    }
+
     /// Régression : un burst avec `n_total` impair et zéro marge repair (cas
     /// observé OTA en HIGH avec K=19, repair_pct=0) doit récupérer le tout
     /// dernier codeword. Avant fix : le TX écrit 1 CW dans le segment final,

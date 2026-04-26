@@ -533,7 +533,7 @@ fn scan_and_route(
 
     let config = state.config.clone();
 
-    let Some(result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
+    let Some(mut result) = rx_v2::rx_v3(&state.session_buffer, &config) else {
         worker_log(&format!(
             "[scan] active={} buf={:.1}s rx_v3=None profile={:?}",
             state.session_active, buf_secs, state.profile
@@ -543,13 +543,19 @@ fn scan_and_route(
 
     // Refine profile from the Golay-decoded header (disambiguates profiles
     // that share Rs/tau/beta — e.g. HIGH vs NORMAL — by reading their
-    // canonical profile_index byte). If a mismatch is found, switch and
-    // discard this result : it was decoded with the wrong data constellation.
+    // canonical profile_index byte). On mismatch, switch the worker config
+    // and immediately re-run rx_v3 on the SAME buffer with the corrected
+    // profile, so the codewords just walked over with the wrong data
+    // constellation are recovered. Without this re-decode, the in-memory
+    // buffer is still in Idle trim mode (PREROLL = 2 s), so by the next
+    // 1-Hz scan tick the leading edge of the 1st superframe is gone — the
+    // user sees ESI 0..N missing, exactly the failure mode reported on
+    // NORMAL OTA captures.
     if let Some(ref hdr) = result.header {
         if let Some(hdr_profile) = modem_core::profile::ProfileIndex::from_u8(hdr.profile_index) {
             if hdr_profile != state.profile {
                 worker_log(&format!(
-                    "[auto-profile] header says {:?} (was {:?})",
+                    "[auto-profile] header says {:?} (was {:?}), re-decoding window",
                     hdr_profile, state.profile
                 ));
                 state.profile = hdr_profile;
@@ -560,7 +566,29 @@ fn scan_and_route(
                     "profile_auto_detected",
                     serde_json::json!({ "profile": profile_name(state.profile) }),
                 );
-                return;
+                let new_config = state.config.clone();
+                match rx_v2::rx_v3(&state.session_buffer, &new_config) {
+                    Some(refresh) => {
+                        // Defensive : if the fresh header still claims a
+                        // different profile, give up rather than loop.
+                        let still_mismatched = refresh
+                            .header
+                            .as_ref()
+                            .and_then(|h| {
+                                modem_core::profile::ProfileIndex::from_u8(h.profile_index)
+                            })
+                            .map(|p| p != state.profile)
+                            .unwrap_or(false);
+                        if still_mismatched {
+                            worker_log(
+                                "[auto-profile] still mismatched after re-decode, giving up",
+                            );
+                            return;
+                        }
+                        result = refresh;
+                    }
+                    None => return,
+                }
             }
         }
     }
