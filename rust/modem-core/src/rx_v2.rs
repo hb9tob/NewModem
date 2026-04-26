@@ -60,6 +60,11 @@ pub struct RxV2Result {
     /// scatter). Capped at ~500 points — the GUI displays them as a
     /// scatter plot.
     pub constellation_sample: Vec<[f32; 2]>,
+    /// Pilot LS smoothed phases (radians) per decoded data segment in
+    /// this window, in temporal order. Meta segments are excluded. The GUI
+    /// concatenates these into a phase-vs-position plot to diagnose drift
+    /// or phase noise that the linear pilot interpolation can't track.
+    pub pilot_phase_segments: Vec<Vec<f32>>,
     /// Offset (in samples, relative to the input slice) of the last preamble
     /// whose window was fully closed and decoded by `rx_v3` in this call.
     /// Callers that maintain a sliding capture buffer can persist this
@@ -562,6 +567,10 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let mut sigma2_count: usize = 0;
     const MAX_CONSTELLATION_POINTS: usize = 500;
     let mut constellation_sample: Vec<[f32; 2]> = Vec::new();
+    // Pilot LS smoothed phases per data segment, in temporal order. Meta
+    // segments are excluded — their phase trace would alias onto the data
+    // plot at a different cadence (1 CW vs 2 CW per segment).
+    let mut pilot_phase_segments: Vec<Vec<f32>> = Vec::new();
 
     // Session: first valid marker we see locks session_id_low; later markers
     // with a different session_id_low indicate a session change → we stop
@@ -650,7 +659,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         }
         let seg_syms_raw = &data_region[cursor..cursor + seg_sym_len];
 
-        let seg_data_syms = track_segment(
+        let (seg_data_syms, seg_pilot_phases) = track_segment(
             seg_syms_raw,
             &config.pilot_pattern,
             &mut pll,
@@ -663,6 +672,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         if seg_data_syms.len() < n_cw * syms_per_cw {
             segments_lost += 1;
             continue;
+        }
+
+        // Pilot phase trace per DATA segment for the GUI drift diagnostic.
+        if !marker_payload.is_meta() && !seg_pilot_phases.is_empty() {
+            pilot_phase_segments.push(seg_pilot_phases);
         }
 
         // Sample post-equalised DATA symbols for the constellation scatter
@@ -776,6 +790,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         cw_bytes_map: cw_bytes,
         eot_seen,
         constellation_sample,
+        pilot_phase_segments,
         last_closed_preamble_offset: None,
     })
 }
@@ -853,6 +868,7 @@ pub fn rx_v3_after(
     let mut sigma2_count = 0usize;
     let mut eot_seen = false;
     let mut last_constellation: Vec<[f32; 2]> = Vec::new();
+    let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -923,6 +939,11 @@ pub fn rx_v3_after(
         if !r.constellation_sample.is_empty() {
             last_constellation = r.constellation_sample;
         }
+        // Same logic for the pilot phase trace : the GUI shows the most
+        // recent window so the operator can watch drift evolve tick by tick.
+        if !r.pilot_phase_segments.is_empty() {
+            last_pilot_phases = r.pilot_phase_segments;
+        }
     }
 
     // Assembly — same policy as rx_v2_single: RaptorQ fountain decode from
@@ -985,6 +1006,7 @@ pub fn rx_v3_after(
         cw_bytes_map: merged,
         eot_seen,
         constellation_sample: last_constellation,
+        pilot_phase_segments: last_pilot_phases,
         last_closed_preamble_offset,
     })
 }
@@ -1017,7 +1039,7 @@ fn track_segment(
     constellation: &crate::constellation::Constellation,
     sigma2_sum: &mut f64,
     sigma2_count: &mut usize,
-) -> Vec<Complex64> {
+) -> (Vec<Complex64>, Vec<f32>) {
     let d_syms = pattern.d_syms;
     let p_syms = pattern.p_syms;
     let group_sz = d_syms + p_syms;
@@ -1046,12 +1068,13 @@ fn track_segment(
 
     let n_p = pilot_gains.len();
     if n_p == 0 {
-        return seg_syms
+        let data: Vec<Complex64> = seg_syms
             .iter()
             .enumerate()
             .filter(|(i, _)| i % group_sz < d_syms)
             .map(|(_, &s)| s)
             .collect();
+        return (data, Vec::new());
     }
 
     // Unwrap phase sequence
@@ -1135,7 +1158,8 @@ fn track_segment(
         }
     }
 
-    data_syms
+    let phases_f32: Vec<f32> = phases_smooth.iter().map(|&p| p as f32).collect();
+    (data_syms, phases_f32)
 }
 
 #[cfg(test)]

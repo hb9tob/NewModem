@@ -1146,15 +1146,18 @@ let lastProgress = {
   sigma2: null,
 };
 let lastConstellation = [];
+let lastPilotPhases = [];
 
 function resetRxVisuals() {
   lastProgress = { bitmap: null, expected: 0, converged: 0, sigma2: null };
   lastConstellation = [];
+  lastPilotPhases = [];
   const text = document.getElementById("v2-progress-text");
   if (text) text.textContent = "—";
   hideFountainStatus();
   drawProgressBlocks();
   drawConstellation();
+  drawPilotPhase();
 }
 
 function hideFountainStatus() {
@@ -1220,17 +1223,22 @@ function updateV2Progress(payload) {
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
     : [];
+  lastPilotPhases = Array.isArray(payload.pilot_phase_segments)
+    ? payload.pilot_phase_segments
+    : [];
 
   const sigmaStr = lastProgress.sigma2 != null ? lastProgress.sigma2.toFixed(3) : "?";
   const mini = document.getElementById("v2-progress-text");
   if (mini) mini.textContent = `${lastProgress.converged}/${lastProgress.expected} σ²=${sigmaStr}`;
   drawProgressBlocks();
   drawConstellation();
+  drawPilotPhase();
 }
 
 function redrawAll() {
   drawProgressBlocks();
   drawConstellation();
+  drawPilotPhase();
 }
 
 function drawProgressBlocks() {
@@ -1334,6 +1342,122 @@ function drawConstellation() {
     ctx.arc(x, y, 2.2, 0, 2 * Math.PI);
     ctx.fill();
   }
+}
+
+function drawPilotPhase() {
+  const canvas = document.getElementById("pilot-phase-canvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // Match canvas pixel size to CSS for crisp lines.
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  if (
+    canvas.width !== Math.round(rect.width * dpr) ||
+    canvas.height !== Math.round(rect.height * dpr)
+  ) {
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+  }
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const segments = lastPilotPhases;
+  const total = segments.reduce((acc, s) => acc + s.length, 0);
+  if (!segments.length || total < 2) {
+    // Idle baseline + label
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = "#666";
+    ctx.font = `${10 * dpr}px monospace`;
+    ctx.fillText("phase pilote (rad) — en attente", 6 * dpr, 14 * dpr);
+    return;
+  }
+
+  // Re-anchor each segment to its first sample so the plot shows
+  // INTRA-SEGMENT drift only (between-segment jumps come from pilot
+  // interp restart + DD-PLL reset, which would dominate the y-range).
+  const anchored = segments.map((seg) => {
+    const a0 = seg[0] || 0;
+    return seg.map((p) => p - a0);
+  });
+
+  let ymin = Infinity;
+  let ymax = -Infinity;
+  for (const seg of anchored) {
+    for (const v of seg) {
+      if (v < ymin) ymin = v;
+      if (v > ymax) ymax = v;
+    }
+  }
+  if (!isFinite(ymin) || !isFinite(ymax)) return;
+  const span = ymax - ymin;
+  const pad = span > 1e-6 ? span * 0.15 : 0.05;
+  ymin -= pad;
+  ymax += pad;
+  const yRange = ymax - ymin;
+
+  // Zero line + horizontal grid
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.lineWidth = 1 * dpr;
+  for (let i = 1; i < 4; i++) {
+    const y = (i * h) / 4;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+  // Zero baseline (rad = 0)
+  const yZero = h - ((0 - ymin) / yRange) * h;
+  if (yZero >= 0 && yZero <= h) {
+    ctx.strokeStyle = "#4a4a4a";
+    ctx.beginPath();
+    ctx.moveTo(0, yZero);
+    ctx.lineTo(w, yZero);
+    ctx.stroke();
+  }
+
+  // Walk each segment as a polyline. Alternate stroke colour per segment
+  // so the user can count them and see where pilot interp restarts.
+  const colours = ["rgba(129, 212, 250, 0.95)", "rgba(255, 183, 77, 0.95)"];
+  let xCursor = 0;
+  const pxPerSample = total > 1 ? w / (total - 1) : 0;
+  for (let s = 0; s < anchored.length; s++) {
+    const seg = anchored[s];
+    if (seg.length === 0) continue;
+    ctx.strokeStyle = colours[s % colours.length];
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.beginPath();
+    for (let i = 0; i < seg.length; i++) {
+      const x = (xCursor + i) * pxPerSample;
+      const y = h - ((seg[i] - ymin) / yRange) * h;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    xCursor += seg.length;
+    // Vertical separator at segment boundary (skip on the very last)
+    if (s < anchored.length - 1) {
+      const xb = xCursor * pxPerSample;
+      ctx.strokeStyle = "#3a3a3a";
+      ctx.lineWidth = 1 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(xb, 0);
+      ctx.lineTo(xb, h);
+      ctx.stroke();
+    }
+  }
+
+  // Y-range label
+  ctx.fillStyle = "#888";
+  ctx.font = `${10 * dpr}px monospace`;
+  const halfRangeMrad = ((yRange * 1000) / 2).toFixed(0);
+  ctx.fillText(
+    `±${halfRangeMrad} mrad · ${segments.length} seg`,
+    6 * dpr,
+    14 * dpr
+  );
 }
 
 function wireEvents() {

@@ -142,6 +142,9 @@ struct V2ProgressPayload {
     sigma2: f64,
     converged_bitmap: Vec<u8>,
     constellation_sample: Vec<[f32; 2]>,
+    /// Pilot LS smoothed phases per data segment (radians) for the most
+    /// recent decoded window. Empty if no segment was decoded yet.
+    pilot_phase_segments: Vec<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -784,6 +787,7 @@ fn scan_and_route(
                 sigma2,
                 converged_bitmap: outcome.seen_bitmap.clone(),
                 constellation_sample: result.constellation_sample.clone(),
+                pilot_phase_segments: result.pilot_phase_segments.clone(),
             },
         );
     }

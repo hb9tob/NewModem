@@ -387,6 +387,17 @@ main {
   z-index: 5;
   border-radius: 3px;
 }
+.rx-pilot-phase {
+  position: absolute;
+  bottom: 16px;
+  left: 8px;
+  width: calc(100% - 232px);
+  height: 100px;
+  border: 1px solid #3a3a3a;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 5;
+  border-radius: 3px;
+}
 .rx-image-wrap img {
   max-width: 100%;
   max-height: 100%;
