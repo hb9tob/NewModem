@@ -1371,4 +1371,51 @@ mod tests {
         );
         assert_eq!(&result.data[..data.len()], &data[..]);
     }
+
+    /// Régression : un burst avec `n_total` impair et zéro marge repair (cas
+    /// observé OTA en HIGH avec K=19, repair_pct=0) doit récupérer le tout
+    /// dernier codeword. Avant fix : le TX écrit 1 CW dans le segment final,
+    /// le RX en attend 2 + pilotes, le runout ne couvre pas le delta → break
+    /// au-delà du buffer et l'ESI final est perdu. RaptorQ ne converge plus.
+    #[test]
+    fn loopback_v3_high_odd_n_total_recovers_last_block() {
+        use crate::app_header::mime;
+        use crate::ldpc::encoder::LdpcEncoder;
+        use crate::raptorq_codec;
+        let config = profile_high();
+        let k_bytes = LdpcEncoder::new(config.ldpc_rate).k() / 8;
+        // 4003 B → K = ceil(4003/216) = 19 (impair). Avec n_packets = K et
+        // repair_pct = 0, n_total = 19 reproduit exactement la session ratée.
+        let data: Vec<u8> = (0..4003)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        let k = raptorq_codec::k_from_payload(data.len(), k_bytes) as u32;
+        assert_eq!(k % 2, 1, "test setup : K doit être impair pour reproduire le bug");
+        let session = 0xDEAD_C0FFu32;
+        let hash = make_session_hash(&data);
+
+        let (sps, pitch) =
+            rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+                .expect("profile");
+        let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+        let syms = frame::build_superframe_v3_range(
+            &data, &config, session, mime::BINARY, hash, 0, k,
+        );
+        let audio = modulator::modulate(&syms, sps, pitch, &taps, config.center_freq_hz);
+
+        let result = rx_v3(&audio, &config).expect("rx_v3 None");
+        let ah = result.app_header.as_ref().expect("AppHeader");
+        eprintln!(
+            "V3 HIGH odd-K=19 : data_cw_recovered={}/{} bytes={}",
+            result.data_blocks_recovered,
+            ah.k_symbols,
+            result.data.len()
+        );
+        assert!(
+            result.data_blocks_recovered >= ah.k_symbols as usize,
+            "K={} mais seulement {} CWs récupérés — segment final perdu",
+            ah.k_symbols, result.data_blocks_recovered,
+        );
+        assert_eq!(&result.data[..data.len()], &data[..]);
+    }
 }

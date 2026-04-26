@@ -21,7 +21,7 @@ use cpal::{SampleFormat, SampleRate};
 use hound::{SampleFormat as WavFmt, WavReader};
 use modem_core::{
     profile::{self, ModemConfig},
-    raptorq_codec::{k_from_payload, n_repair_default},
+    raptorq_codec::k_from_payload,
     types::AUDIO_RATE,
 };
 use serde::Serialize;
@@ -134,7 +134,11 @@ pub fn tx_plan(
     let wire = payload_bytes + envelope_overhead;
     let k_bytes = config.ldpc_rate.k() / 8;
     let k_source = k_from_payload(wire, k_bytes) as u32;
-    let n_initial = k_source + (k_source * repair_pct) / 100;
+    // Aligner sur ce que build_superframe_v3_range va réellement émettre :
+    // si n_initial brut est impair, le builder l'arrondit pour que le
+    // dernier data segment soit complet (sinon le RX perd ce CW final).
+    let n_initial =
+        modem_core::frame::effective_packet_count(k_source + (k_source * repair_pct) / 100);
     // Asymptote payload-only : utile pour l'estimation marginale "+N blocs".
     let bits_per_cw = (k_bytes as f64) * 8.0;
     let seconds_per_cw = bits_per_cw / config.net_bitrate();

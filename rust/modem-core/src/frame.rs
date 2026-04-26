@@ -28,6 +28,27 @@ pub const HEADER_VERSION_V3: u8 = 3;
 /// segment durations roughly to 0.77 s at 16-APSK / 1 s at 8PSK / 2.3 s at QPSK.
 pub const V2_CODEWORDS_PER_SEGMENT: usize = 2;
 
+/// Round `n_packets` up to the smallest count that fills every data segment
+/// completely (multiple of `V2_CODEWORDS_PER_SEGMENT`).
+///
+/// The TX walks data in segments of `V2_CODEWORDS_PER_SEGMENT` codewords ; the
+/// RX always reads that many CW + their pilots when stepping past a marker.
+/// If the caller asks for an odd `n_packets` (e.g. `repair_pct = 0` and K odd,
+/// observed OTA), the final segment would carry only 1 CW while the RX still
+/// reads 2 — the trailing runout (~160 sym) doesn't cover the missing CW, so
+/// `cursor + seg_sym_len > data_region.len()` triggers the `break` and the
+/// last segment is dropped. Always emitting an even number of packets keeps
+/// every segment full.
+///
+/// Multi-burst callers (`tx-more`) must use this helper to compute the
+/// `esi_start` of the next burst : if burst 1 was asked for N packets, it
+/// actually emitted `effective_packet_count(N)`, and burst 2 must start at
+/// that ESI to avoid duplication or gaps.
+pub fn effective_packet_count(n_packets: u32) -> u32 {
+    let m = V2_CODEWORDS_PER_SEGMENT as u32;
+    n_packets.div_ceil(m) * m
+}
+
 /// v3 target period between periodic preamble+header insertions, in seconds.
 /// The builder inserts PRE+HDR+META at the next segment boundary after this
 /// many elapsed seconds since the previous preamble.
@@ -128,6 +149,10 @@ pub fn build_superframe_v3_range(
 
     let k_bytes = encoder.k() / 8;
 
+    // Round up to V2_CODEWORDS_PER_SEGMENT so the final data segment is full ;
+    // see `effective_packet_count` for the rationale (TX/RX size mismatch on
+    // partial segments). For an even `n_packets` this is a no-op.
+    let n_packets = effective_packet_count(n_packets);
     // Generate exactly the packets asked for.
     let packets = crate::raptorq_codec::encode_packets_range(
         data,
@@ -275,7 +300,9 @@ pub fn build_superframe_v3_range(
 /// du profil (ULTRA = 16d/2p, autres = 32d/2p) et au nombre de bits par
 /// symbole de la constellation.
 pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
-    let n_data_cw = n_data_cw as usize;
+    // Same rounding the builder applies — keeps duration estimates accurate
+    // when callers pass an odd K (e.g. `repair_pct = 0`).
+    let n_data_cw = effective_packet_count(n_data_cw) as usize;
     let bits_per_sym = config.constellation.bits_per_sym();
     // n() = 2304 (constant pour tous les rates LDPC)
     let cw_data_syms = config.ldpc_rate.n() / bits_per_sym;

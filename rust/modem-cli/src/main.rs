@@ -268,7 +268,11 @@ fn main() {
             let k_src =
                 modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes_for_plan)
                     as u32;
-            let n_total = k_src + (k_src * repair_pct) / 100;
+            // n_total arrondi pour que le dernier data segment soit toujours
+            // complet ; sinon le RX perd ce CW final (cf. effective_packet_count).
+            let n_total = modem_core::frame::effective_packet_count(
+                k_src + (k_src * repair_pct) / 100,
+            );
             eprintln!(
                 "TX v3: K={k_src}, repair_pct={repair_pct}, n_total={n_total} packets"
             );
@@ -399,14 +403,17 @@ fn main() {
             let k_bytes = modem_core::profile::LdpcRate::k(config.ldpc_rate) / 8;
             let k =
                 modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes) as u32;
-            let n_packets = match count {
+            let n_packets_raw = match count {
                 Some(c) => c,
                 None => (k * pct) / 100,
             };
-            if n_packets == 0 {
+            if n_packets_raw == 0 {
                 eprintln!("tx-more: empty burst (K={k}, pct={pct}%, count={count:?})");
                 std::process::exit(1);
             }
+            // Voir effective_packet_count : on arrondit pour ne jamais laisser
+            // un segment partiel en fin de burst.
+            let n_packets = modem_core::frame::effective_packet_count(n_packets_raw);
             eprintln!(
                 "tx-more: session=0x{sid:08X}, K={k}, esi_start={esi_start}, count={n_packets}"
             );
