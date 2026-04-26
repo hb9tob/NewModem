@@ -210,7 +210,7 @@ fn main() {
     }
     let r = probe.check(&sig);
     println!(
-        "[perf_idle] sanity : NORMAL preamble injected → probe ratio={:.1} (threshold={}), family={:?}",
-        r.max_ratio, PROBE_THRESHOLD, r.best_family,
+        "[perf_idle] sanity : NORMAL preamble injected → probe ratio={:.1} (threshold={}), anchor={:?}",
+        r.max_ratio, PROBE_THRESHOLD, r.best_anchor,
     );
 }

@@ -51,25 +51,27 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use crate::modulator;
 use crate::preamble::{self, PreambleFamily};
+use crate::profile::ProfileIndex;
 use crate::rrc::rrc_taps;
 use crate::types::{AUDIO_RATE, DATA_CENTER_HZ, N_PREAMBLE, RRC_SPAN_SYM};
 
-/// One pre-computed FFT(template) per `PreambleFamily`. The receiver
-/// runs a single rFFT(audio) and 3 spectral multiplications + iFFTs to
-/// classify the on-air family — replacing the 5-profile sweep through
-/// `detect_best_profile` (~720 ms) with one ~25 ms call.
+/// One pre-computed FFT(template) per anchor profile. The receiver runs a
+/// single rFFT(audio) and one spectral multiply + iFFT per template to
+/// classify the on-air signal's anchor profile — replacing the 5-profile
+/// sweep through `detect_best_profile` (~720 ms) with one ~25 ms call.
 ///
-/// Each entry : `(family, sps, pitch, β)`. The `(sps, pitch, β)` triple
-/// builds the matching template from `preamble::make_preamble_for(family)`
-/// via `modulator::modulate(...)`.
-const PROBE_TEMPLATES: &[(PreambleFamily, usize, usize, f64)] = &[
-    // Family A : (sps=32, β=0.20). NORMAL has pitch=30 (FTN τ=30/32) ;
-    // HIGH/MEGA have pitch=32. We use pitch=32 here — its cross-pitch
-    // correlation with a NORMAL signal is still well above PROBE_THRESHOLD,
-    // and the gate only needs presence/family classification.
-    (PreambleFamily::A, 32, 32, 0.20),
-    (PreambleFamily::B, 48, 48, 0.25),
-    (PreambleFamily::C, 96, 96, 0.25),
+/// Each entry : `(family, sps, pitch, β, anchor)`. Family A splits into
+/// **two** templates because its profiles disagree on pitch :
+///   - NORMAL/HIGH share `(sps=32, pitch=32, β=0.20)` — Nyquist τ=1.0.
+///   - MEGA is FTN with τ=30/32 → `(sps=32, pitch=30, β=0.20)`.
+/// Without that split, find_all_preambles downstream looks for pulses at
+/// the wrong spacing for whichever sub-profile didn't get the anchor, and
+/// the drift over 256 symbols (≈ 512 samples) destroys the correlation.
+const PROBE_TEMPLATES: &[(PreambleFamily, usize, usize, f64, ProfileIndex)] = &[
+    (PreambleFamily::A, 32, 32, 0.20, ProfileIndex::Normal), // NORMAL/HIGH (header refines)
+    (PreambleFamily::A, 32, 30, 0.20, ProfileIndex::Mega),   // FTN τ=30/32
+    (PreambleFamily::B, 48, 48, 0.25, ProfileIndex::Robust),
+    (PreambleFamily::C, 96, 96, 0.25, ProfileIndex::Ultra),
 ];
 
 /// Default peak²/mean² ratio above which the probe declares a preamble
@@ -85,21 +87,30 @@ pub struct PreambleProbe {
     /// One conjugated spectrum per `PROBE_TEMPLATES` entry.
     /// Length = `fft_len/2 + 1`.
     templates: Vec<Vec<Complex32>>,
-    families: Vec<PreambleFamily>,
+    anchors: Vec<ProfileIndex>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
     /// Best peak²/mean² ratio observed across all templates.
     pub max_ratio: f64,
-    /// Family of the template that produced `max_ratio`. The gate
-    /// classifies on-air signals into one of `PreambleFamily::{A, B, C}` ;
-    /// downstream code uses this to pick a default `ProfileIndex` (via
-    /// `ProfileIndex::anchor_for_family()`) and lets the protocol header
-    /// refine within the family.
-    pub best_family: PreambleFamily,
-    /// All templates' ratios, in declaration order (A, B, C).
-    pub per_family_ratio: Vec<f64>,
+    /// Anchor `ProfileIndex` of the template that produced `max_ratio`.
+    /// Downstream code uses this to set the worker's profile directly
+    /// (`scan_and_route` in `rx_worker.rs`) ; the protocol header still
+    /// refines NORMAL→HIGH within the same pitch later in the pipeline.
+    pub best_anchor: ProfileIndex,
+    /// All templates' ratios, in declaration order — matches
+    /// `PROBE_TEMPLATES` (Normal, Mega, Robust, Ultra at the time of
+    /// writing).
+    pub per_template_ratio: Vec<f64>,
+}
+
+impl ProbeResult {
+    /// Convenience : preamble family of `best_anchor`. Useful for log
+    /// formatting and backwards-compat callers that grouped by family.
+    pub fn best_family(&self) -> PreambleFamily {
+        self.best_anchor.preamble_family()
+    }
 }
 
 impl ProbeResult {
@@ -137,8 +148,8 @@ impl PreambleProbe {
         let inverse = planner.plan_fft_inverse(fft_len);
 
         let mut templates = Vec::with_capacity(PROBE_TEMPLATES.len());
-        let mut families = Vec::with_capacity(PROBE_TEMPLATES.len());
-        for &(family, sps, pitch, beta) in PROBE_TEMPLATES {
+        let mut anchors = Vec::with_capacity(PROBE_TEMPLATES.len());
+        for &(family, sps, pitch, beta, anchor) in PROBE_TEMPLATES {
             let pre_syms = preamble::make_preamble_for(family);
             let taps = rrc_taps(beta, RRC_SPAN_SYM, sps);
             // Reuse the production modulator so the template matches what
@@ -168,7 +179,7 @@ impl PreambleProbe {
                 *c = c.conj();
             }
             templates.push(spec);
-            families.push(family);
+            anchors.push(anchor);
         }
 
         PreambleProbe {
@@ -176,12 +187,12 @@ impl PreambleProbe {
             forward,
             inverse,
             templates,
-            families,
+            anchors,
         }
     }
 
     pub fn fft_len(&self) -> usize { self.fft_len }
-    pub fn families(&self) -> &[PreambleFamily] { &self.families }
+    pub fn anchors(&self) -> &[ProfileIndex] { &self.anchors }
 
     /// Run the probe against `samples`. Cost per call ≈ 1 forward rFFT
     /// + N_TEMPLATES × (mul + inverse rFFT + |y|² scan).
@@ -204,9 +215,9 @@ impl PreambleProbe {
         let mut work_spec = vec![Complex32::new(0.0, 0.0); spec_len];
         let mut output = vec![0.0f32; self.fft_len];
 
-        let mut per_family_ratio = Vec::with_capacity(self.templates.len());
+        let mut per_template_ratio = Vec::with_capacity(self.templates.len());
         let mut best_ratio = 0.0f64;
-        let mut best_family = self.families[0];
+        let mut best_anchor = self.anchors[0];
 
         for (idx, template_spec) in self.templates.iter().enumerate() {
             for ((s, &a), &t) in work_spec
@@ -231,17 +242,17 @@ impl PreambleProbe {
             }
             let mean_sqr = sum_sqr / output.len() as f64;
             let ratio = if mean_sqr > 0.0 { max_sqr / mean_sqr } else { 0.0 };
-            per_family_ratio.push(ratio);
+            per_template_ratio.push(ratio);
             if ratio > best_ratio {
                 best_ratio = ratio;
-                best_family = self.families[idx];
+                best_anchor = self.anchors[idx];
             }
         }
 
         ProbeResult {
             max_ratio: best_ratio,
-            best_family,
-            per_family_ratio,
+            best_anchor,
+            per_template_ratio,
         }
     }
 }
@@ -341,17 +352,13 @@ mod tests {
         assert!(
             r.max_ratio < PROBE_THRESHOLD,
             "noise ratio {:.1} should be < threshold {} (best={:?})",
-            r.max_ratio, PROBE_THRESHOLD, r.best_family
+            r.max_ratio, PROBE_THRESHOLD, r.best_anchor
         );
     }
 
     #[test]
     fn high_snr_preamble_detected_per_profile() {
         let probe = PreambleProbe::new(96000);
-        // For each profile, inject a clean preamble and check that the
-        // probe fires above threshold. With distinct preambles per family
-        // the gate also classifies the on-air family correctly (verified
-        // in `family_classification_matches_profile` below).
         for profile in [
             ProfileIndex::Normal,
             ProfileIndex::High,
@@ -368,34 +375,36 @@ mod tests {
             let r = probe.check(&buf);
             assert!(
                 r.passes(PROBE_THRESHOLD),
-                "profile {:?} : ratio {:.0} should clear threshold {} (best={:?}, ratios={:?})",
-                profile, r.max_ratio, PROBE_THRESHOLD, r.best_family, r.per_family_ratio,
+                "profile {:?} : ratio {:.0} should clear threshold {} (anchor={:?}, ratios={:?})",
+                profile, r.max_ratio, PROBE_THRESHOLD, r.best_anchor, r.per_template_ratio,
             );
         }
     }
 
     #[test]
-    fn family_classification_matches_profile() {
-        // With distinct preamble sequences per family, the gate should
-        // classify the on-air signal into the correct PreambleFamily for
-        // every profile. This is what enables skipping the 5-profile
-        // sweep through `detect_best_profile` post-2b.
+    fn anchor_classification_matches_profile() {
+        // With distinct preamble sequences per family AND a per-pitch
+        // template within family A, the gate should classify the on-air
+        // signal into the correct anchor for every profile :
+        //   - NORMAL/HIGH share pitch=32 → anchor NORMAL (header refines).
+        //   - MEGA has pitch=30 (FTN τ=30/32) → its own anchor.
+        //   - ROBUST and ULTRA have unique (sps, β) → unambiguous.
         let probe = PreambleProbe::new(96000);
         for (profile, expected) in [
-            (ProfileIndex::Normal, PreambleFamily::A),
-            (ProfileIndex::High,   PreambleFamily::A),
-            (ProfileIndex::Mega,   PreambleFamily::A),
-            (ProfileIndex::Robust, PreambleFamily::B),
-            (ProfileIndex::Ultra,  PreambleFamily::C),
+            (ProfileIndex::Normal, ProfileIndex::Normal),
+            (ProfileIndex::High,   ProfileIndex::Normal), // header → HIGH downstream
+            (ProfileIndex::Mega,   ProfileIndex::Mega),
+            (ProfileIndex::Robust, ProfileIndex::Robust),
+            (ProfileIndex::Ultra,  ProfileIndex::Ultra),
         ] {
             let buf = buffer_with_preamble(
                 96000, profile, 5000, 0.5, 0.0001, 0xCAFE,
             );
             let r = probe.check(&buf);
             assert_eq!(
-                r.best_family, expected,
-                "profile {:?} : expected family {:?}, got {:?}, ratios={:?}",
-                profile, expected, r.best_family, r.per_family_ratio,
+                r.best_anchor, expected,
+                "profile {:?} : expected anchor {:?}, got {:?}, ratios={:?}",
+                profile, expected, r.best_anchor, r.per_template_ratio,
             );
         }
     }
@@ -461,6 +470,6 @@ mod tests {
         let p1 = PreambleProbe::for_buf_len(96000);
         let p2 = PreambleProbe::for_buf_len(96000);
         assert!(std::ptr::eq(p1, p2));
-        assert_eq!(p1.families().len(), PROBE_TEMPLATES.len());
+        assert_eq!(p1.anchors().len(), PROBE_TEMPLATES.len());
     }
 }

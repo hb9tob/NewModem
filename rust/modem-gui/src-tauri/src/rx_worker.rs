@@ -558,14 +558,14 @@ fn scan_and_route(
     // refinement block below.
     let mut t_probe_us: u128 = 0;
     let mut probe_ratio: f64 = 0.0;
-    let mut probe_label: &'static str = "-";
+    let mut probe_label: String = String::from("-");
     if !state.session_active && !state.session_buffer.is_empty() {
         let probe = modem_core::gate::PreambleProbe::for_buf_len(state.session_buffer.len());
         let t0 = Instant::now();
         let r = probe.check(&state.session_buffer);
         t_probe_us = t0.elapsed().as_micros();
         probe_ratio = r.max_ratio;
-        probe_label = r.best_family.name();
+        probe_label = format!("{:?}", r.best_anchor);
         if !r.passes(modem_core::gate::PROBE_THRESHOLD) {
             worker_log(&format!(
                 "[scan] active=false buf={:.1}s gated profile={:?} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} (<{})",
@@ -573,17 +573,19 @@ fn scan_and_route(
             ));
             return;
         }
-        // Gate fired : align state.profile to the family anchor when the
-        // current config doesn't already belong to the detected family.
-        // Header refinement (post-decode) handles intra-family ambiguity.
-        if state.profile.preamble_family() != r.best_family {
-            let anchor = ProfileIndex::anchor_for_family(r.best_family);
+        // Gate fired with an anchor profile. Switch state.profile when
+        // ours doesn't match — except keep HIGH if the gate said NORMAL
+        // (same pitch=32 family A, header still refines NORMAL→HIGH).
+        let want_anchor = r.best_anchor;
+        let already_aligned = state.profile == want_anchor
+            || (state.profile == ProfileIndex::High && want_anchor == ProfileIndex::Normal);
+        if !already_aligned {
             worker_log(&format!(
-                "[auto-profile] gate picked family {:?} → anchor {:?} (was {:?})",
-                r.best_family, anchor, state.profile
+                "[auto-profile] gate picked anchor {:?} (was {:?})",
+                want_anchor, state.profile
             ));
-            state.profile = anchor;
-            state.config = anchor.to_config();
+            state.profile = want_anchor;
+            state.config = want_anchor.to_config();
         }
     }
 
