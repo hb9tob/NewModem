@@ -56,6 +56,11 @@ pub struct Settings {
     /// Nombre de blocs additionnels pour TX more (1..).
     #[serde(default = "default_tx_more_count")]
     pub tx_more_count: u32,
+    /// Taille maximale de l'historique TX (nombre de fichiers conservés
+    /// dans `<save_dir>/tx_history/`). Défaut 100. Au-delà, les plus
+    /// anciens sont purgés à chaque archivage.
+    #[serde(default = "default_tx_history_max")]
+    pub tx_history_max: u32,
 }
 
 fn default_tx_quality() -> u32 {
@@ -90,6 +95,10 @@ fn default_tx_more_count() -> u32 {
     5
 }
 
+fn default_tx_history_max() -> u32 {
+    100
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -112,6 +121,7 @@ impl Default for Settings {
             tx_free_h: default_tx_free_h(),
             tx_speed: default_tx_speed(),
             tx_more_count: default_tx_more_count(),
+            tx_history_max: default_tx_history_max(),
         }
     }
 }

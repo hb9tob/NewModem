@@ -70,6 +70,7 @@ function setupTabs() {
       for (const p of panels) p.classList.toggle("active", p.id === `tab-${target}`);
       if (target === "rx") redrawAll();
       if (target === "sessions") refreshSessions();
+      if (target === "history") refreshHistory();
       if (target === "channel") stopRxAndTxForChannelTab();
     });
   }
@@ -619,6 +620,7 @@ async function loadSettings() {
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
       tx_speed: 6, tx_more_count: 5,
+      tx_history_max: 100,
     };
   }
   const call = document.getElementById("callsign-input");
@@ -626,6 +628,8 @@ async function loadSettings() {
   applyPttSettingsToUI();
   const colUrl = document.getElementById("collector-url");
   if (colUrl) colUrl.value = currentSettings.collector_url || "";
+  const histMax = document.getElementById("tx-history-max-input");
+  if (histMax) histMax.value = String(currentSettings.tx_history_max ?? 100);
   applyTxSettingsToUI();
 }
 
@@ -768,10 +772,15 @@ async function persistSettings() {
   const txSel = document.getElementById("tx-device-select");
   readPttFormIntoSettings();
   const colUrl = document.getElementById("collector-url");
+  const histMax = document.getElementById("tx-history-max-input");
   currentSettings.callsign = (call && call.value || "").trim().toUpperCase();
   currentSettings.rx_device = rxSel ? rxSel.value || "" : "";
   currentSettings.tx_device = txSel ? txSel.value || "" : "";
   if (colUrl) currentSettings.collector_url = (colUrl.value || "").trim();
+  if (histMax) {
+    const v = parseInt(histMax.value, 10);
+    if (Number.isFinite(v) && v >= 10) currentSettings.tx_history_max = v;
+  }
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -826,6 +835,11 @@ function setupSettingsTab() {
   if (colUrl) {
     colUrl.addEventListener("change", persistSettings);
     colUrl.addEventListener("blur", persistSettings);
+  }
+  const histMax = document.getElementById("tx-history-max-input");
+  if (histMax) {
+    histMax.addEventListener("change", persistSettings);
+    histMax.addEventListener("blur", persistSettings);
   }
 }
 
@@ -1436,6 +1450,13 @@ function wireEvents() {
       capReached: false,
     });
     logEvent("session_decoded", p);
+    // Refresh la colonne RX de l'onglet Historique. Léger : un read_dir +
+    // parsing du meta.json de chaque session.
+    refreshHistory().catch(() => {});
+  });
+  listen("tx_archived", () => {
+    // Émis par tx_worker::archive_payload au lancement de chaque émission.
+    refreshHistory().catch(() => {});
   });
 }
 
@@ -2677,12 +2698,192 @@ function setupChannelTab() {
   renderCascade();
 }
 
+// ─────────────────────────────────────────── Onglet Historique
+// Vue unifiée TX (fichiers émis, archivés au lancement de chaque tx_start)
+// et RX (sessions décodées). Bouton "↻ Renvoyer" sur chaque vignette pour
+// le mode radio-secours : recharger un fichier dans l'onglet TX et le
+// propager plus loin sur le réseau.
+
+function setupHistoryTab() {
+  document
+    .getElementById("btn-history-refresh")
+    ?.addEventListener("click", refreshHistory);
+}
+
+async function refreshHistory() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    const [tx, rx] = await Promise.all([
+      invoke("list_tx_history"),
+      invoke("list_rx_history"),
+    ]);
+    renderHistoryColumn(tx, "tx");
+    renderHistoryColumn(rx, "rx");
+    const cnt = document.getElementById("history-count");
+    if (cnt) cnt.textContent = `TX ${tx.length} · RX ${rx.length}`;
+  } catch (err) {
+    logEvent("history_error", { message: String(err) });
+  }
+}
+
+function renderHistoryColumn(items, kind) {
+  const list = document.getElementById(`history-${kind}-list`);
+  if (!list) return;
+  list.innerHTML = "";
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = kind === "tx" ? "Aucun fichier émis." : "Aucun fichier reçu.";
+    list.appendChild(empty);
+    return;
+  }
+  const { convertFileSrc } = window.__TAURI__.core;
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = "history-card";
+
+    // Vignette (image ou icône fichier).
+    const thumb = document.createElement("div");
+    thumb.className = "history-card-thumb";
+    const previewPath = kind === "tx" ? item.file_path : item.preview_path;
+    if (item.is_image) {
+      const img = document.createElement("img");
+      img.alt = item.filename;
+      img.src = convertFileSrc(previewPath);
+      img.addEventListener("dblclick", () =>
+        openLightbox(convertFileSrc(previewPath), item.filename),
+      );
+      thumb.addEventListener("click", () =>
+        openLightbox(convertFileSrc(previewPath), item.filename),
+      );
+      thumb.appendChild(img);
+    } else {
+      const icon = document.createElement("div");
+      icon.className = "file-icon";
+      icon.textContent = "📄";
+      thumb.appendChild(icon);
+      const fname = document.createElement("div");
+      fname.className = "file-name";
+      fname.textContent = item.filename;
+      thumb.appendChild(fname);
+      thumb.style.cursor = "default";
+    }
+    card.appendChild(thumb);
+
+    // Bandeau metadata.
+    const meta = document.createElement("div");
+    meta.className = "history-card-meta";
+    const row1 = document.createElement("div");
+    row1.className = "row";
+    const fname = document.createElement("span");
+    fname.className = "filename";
+    fname.title = item.filename;
+    fname.textContent = item.filename;
+    row1.appendChild(fname);
+    const mode = document.createElement("span");
+    mode.className = "mode";
+    mode.textContent = item.mode;
+    row1.appendChild(mode);
+    meta.appendChild(row1);
+    const row2 = document.createElement("div");
+    row2.className = "row";
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = formatTimestamp(item.timestamp);
+    row2.appendChild(ts);
+    if (kind === "rx" && item.callsign) {
+      const cs = document.createElement("span");
+      cs.className = "callsign";
+      cs.textContent = item.callsign;
+      row2.appendChild(cs);
+    }
+    const sz = document.createElement("span");
+    sz.className = "size";
+    sz.textContent = formatBytes(item.size_bytes);
+    row2.appendChild(sz);
+    meta.appendChild(row2);
+    card.appendChild(meta);
+
+    // Actions : ↻ Renvoyer (TX & RX = relayage radio-secours) + 🗑 Supprimer.
+    const actions = document.createElement("div");
+    actions.className = "history-card-actions";
+    const relayBtn = document.createElement("button");
+    relayBtn.className = "btn-relay";
+    relayBtn.textContent = kind === "tx" ? "↻ Renvoyer" : "↻ Relayer";
+    relayBtn.title =
+      kind === "tx"
+        ? "Recharger ce fichier dans l'onglet TX"
+        : "Relayer ce fichier reçu (radio-secours)";
+    const relayPath = kind === "tx" ? item.file_path : item.relay_path;
+    relayBtn.addEventListener("click", () => relayHistoryItem(relayPath));
+    actions.appendChild(relayBtn);
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-delete";
+    delBtn.textContent = "🗑";
+    delBtn.title = "Supprimer cette entrée";
+    delBtn.addEventListener("click", () => {
+      const label = item.filename || "cette entrée";
+      if (!confirm(`Supprimer ${label} de l'historique ?`)) return;
+      const key = kind === "tx" ? item.file_path : item.session_id;
+      deleteHistoryItem(kind, key);
+    });
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+
+    list.appendChild(card);
+  }
+}
+
+async function relayHistoryItem(absolutePath) {
+  // Bascule sur l'onglet TX puis recharge le fichier comme un drag-drop.
+  const txBtn = document.querySelector('.tab-bar .tab[data-tab="tx"]');
+  if (txBtn) txBtn.click();
+  try {
+    await loadTxFileFromPath(absolutePath);
+  } catch (err) {
+    logEvent("history_relay_error", { path: absolutePath, message: String(err) });
+  }
+}
+
+async function deleteHistoryItem(kind, key) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    await invoke("delete_history_item", { kind, key });
+    await refreshHistory();
+  } catch (err) {
+    logEvent("history_delete_error", { kind, key, message: String(err) });
+    alert(`Suppression impossible : ${err}`);
+  }
+}
+
+function formatTimestamp(unixSeconds) {
+  if (!unixSeconds) return "—";
+  const d = new Date(unixSeconds * 1000);
+  return d.toLocaleString("fr-CH", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatBytes(n) {
+  if (!n || n < 1024) return `${n || 0} o`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
+  return `${(n / (1024 * 1024)).toFixed(2)} Mio`;
+}
+
 async function init() {
   setupTabs();
   setupLightbox();
   setupTxTab();
   setupSettingsTab();
   setupCaptureSubmitPanel();
+  setupHistoryTab();
   await loadSettings();
   setupChannelTab();
   await loadDevices();

@@ -348,7 +348,19 @@ fn tx_start(
     if args.tx_device.trim().is_empty() {
         return Err("carte son TX non sélectionnée (Paramètres)".into());
     }
-    let attenuation_db = settings::load().tx_attenuation_db;
+    let cfg = settings::load();
+    let attenuation_db = cfg.tx_attenuation_db;
+    let history_max = cfg.tx_history_max;
+    let repair_pct = args.repair_pct.unwrap_or(30);
+    tx_worker::archive_payload(
+        &save_dir,
+        &payload_path,
+        &args.mode,
+        &args.filename,
+        repair_pct,
+        history_max,
+        &app,
+    );
     let handle = tx_worker::spawn(
         payload_path,
         args.mode,
@@ -356,7 +368,7 @@ fn tx_start(
         args.filename,
         args.tx_device,
         save_dir,
-        args.repair_pct.unwrap_or(30),
+        repair_pct,
         attenuation_db,
         state.ptt.clone(),
         app,
@@ -445,6 +457,216 @@ fn delete_session(session_id: u32, state: State<'_, AppState>) -> Result<(), Str
         return Err(format!("session {session_id:08x} absente"));
     }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("rm {}: {e}", dir.display()))
+}
+
+// ─────────────────────────────────────────── Onglet Historique
+//
+// Vue unifiée des fichiers TX (archivés au lancement de chaque émission par
+// `tx_worker::archive_payload`) et RX (sessions décodées par session_store).
+// Sert le mode radio-secours : un opérateur reçoit un fichier et peut le
+// re-émettre d'un clic pour le propager plus loin sur le réseau.
+
+#[derive(serde::Serialize)]
+struct TxHistoryItem {
+    timestamp: i64,
+    mode: String,
+    mime_type: u8,
+    filename: String,
+    file_path: String,
+    is_image: bool,
+    size_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RxHistoryItem {
+    session_id: String,
+    timestamp: i64,
+    callsign: Option<String>,
+    filename: String,
+    /// Chemin pour la vignette (asset:// affichable). Toujours pointé sur le
+    /// fichier décompressé/affichable s'il existe (sinon le decoded.<ext>
+    /// brut du session_dir).
+    preview_path: String,
+    /// Chemin à passer à `set_tx_source_from_path` pour relayer (radio-secours).
+    /// AVIF → `decoded.avif` (passthrough bit-à-bit) ; sinon copie root.
+    relay_path: String,
+    is_image: bool,
+    size_bytes: u64,
+    mode: String,
+    mime_type: u8,
+}
+
+#[derive(serde::Deserialize)]
+struct TxHistoryMetaRead {
+    timestamp: i64,
+    mode: String,
+    mime_type: u8,
+    filename: String,
+}
+
+#[tauri::command]
+fn list_tx_history(state: State<'_, AppState>) -> Result<Vec<TxHistoryItem>, String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let dir = save_dir.join("tx_history");
+    let mut items: Vec<TxHistoryItem> = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(items), // dossier absent = historique vide, pas une erreur
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+        if !ext.eq_ignore_ascii_case("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(meta) = serde_json::from_str::<TxHistoryMetaRead>(&raw) else { continue };
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // Trouve le fichier source jumeau (avif/zst/bin) — pas forcément même
+        // extension que celle déduite du mime_type, on parcourt le dossier.
+        let mut payload_path: Option<PathBuf> = None;
+        for sib in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = sib.path();
+            if p.file_stem().and_then(|s| s.to_str()) == Some(&stem)
+                && p.extension().and_then(|s| s.to_str())
+                    .map(|e| !e.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+            {
+                payload_path = Some(p);
+                break;
+            }
+        }
+        let Some(payload) = payload_path else { continue };
+        let size_bytes = payload.metadata().map(|m| m.len()).unwrap_or(0);
+        let is_image =
+            meta.mime_type == modem_core::app_header::mime::IMAGE_AVIF
+                || meta.mime_type == modem_core::app_header::mime::IMAGE_JPEG
+                || meta.mime_type == modem_core::app_header::mime::IMAGE_PNG;
+        items.push(TxHistoryItem {
+            timestamp: meta.timestamp,
+            mode: meta.mode,
+            mime_type: meta.mime_type,
+            filename: meta.filename,
+            file_path: payload.to_string_lossy().into_owned(),
+            is_image,
+            size_bytes,
+        });
+    }
+    items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(items)
+}
+
+#[tauri::command]
+fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let store = session_store::SessionStore::new(&save_dir).map_err(|e| e.to_string())?;
+    let mut items: Vec<RxHistoryItem> = Vec::new();
+    for meta in store.list_all().into_iter().filter(|m| m.decoded) {
+        let session_dir = save_dir
+            .join("sessions")
+            .join(format!("{:08x}.session", meta.session_id));
+        let mime = meta.mime_type;
+        let is_image = mime == modem_core::app_header::mime::IMAGE_AVIF
+            || mime == modem_core::app_header::mime::IMAGE_JPEG
+            || mime == modem_core::app_header::mime::IMAGE_PNG;
+        let display_filename = meta.filename.clone().unwrap_or_else(|| {
+            format!("session-{:08x}.bin", meta.session_id)
+        });
+        let root_copy = save_dir.join(&display_filename);
+        let decoded_ext = match mime {
+            x if x == modem_core::app_header::mime::IMAGE_AVIF => "avif",
+            x if x == modem_core::app_header::mime::IMAGE_JPEG => "jpg",
+            x if x == modem_core::app_header::mime::IMAGE_PNG => "png",
+            x if x == modem_core::app_header::mime::TEXT => "txt",
+            x if x == modem_core::app_header::mime::ZSTD => "zst",
+            _ => "bin",
+        };
+        let decoded_session = session_dir.join(format!("decoded.{decoded_ext}"));
+        // Preview : copie root si présente (peut être décompressée), sinon
+        // version brute du session_dir.
+        let preview = if root_copy.exists() {
+            root_copy.clone()
+        } else {
+            decoded_session.clone()
+        };
+        // Relay : préserve la fidélité bit-à-bit pour AVIF (passthrough TX).
+        // Pour ZST et autres : prend la version décompressée root pour que
+        // le pipeline TX ré-encode proprement.
+        let relay = if mime == modem_core::app_header::mime::IMAGE_AVIF
+            && decoded_session.exists()
+        {
+            decoded_session.clone()
+        } else if root_copy.exists() {
+            root_copy.clone()
+        } else {
+            decoded_session.clone()
+        };
+        if !preview.exists() {
+            continue;
+        }
+        let size_bytes = preview.metadata().map(|m| m.len()).unwrap_or(0);
+        items.push(RxHistoryItem {
+            session_id: format!("{:08x}", meta.session_id),
+            timestamp: meta.created_at as i64,
+            callsign: meta.callsign,
+            filename: display_filename,
+            preview_path: preview.to_string_lossy().into_owned(),
+            relay_path: relay.to_string_lossy().into_owned(),
+            is_image,
+            size_bytes,
+            mode: meta.profile,
+            mime_type: mime,
+        });
+    }
+    items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(items)
+}
+
+#[tauri::command]
+fn delete_history_item(
+    kind: String,
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    match kind.as_str() {
+        "tx" => {
+            let path = PathBuf::from(&key);
+            // Garde-fou : doit être dans <save_dir>/tx_history/.
+            let history_dir = save_dir.join("tx_history");
+            if !path.starts_with(&history_dir) {
+                return Err("chemin hors tx_history/".into());
+            }
+            // Supprime le fichier + son metadata jumeau (.json).
+            let _ = std::fs::remove_file(&path);
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let meta = history_dir.join(format!("{stem}.json"));
+                let _ = std::fs::remove_file(&meta);
+            }
+            Ok(())
+        }
+        "rx" => {
+            // key = session_id hex 8 chars.
+            let session_id = u32::from_str_radix(&key, 16)
+                .map_err(|e| format!("session_id invalide '{key}': {e}"))?;
+            let dir = save_dir
+                .join("sessions")
+                .join(format!("{session_id:08x}.session"));
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| format!("rm {}: {e}", dir.display()))?;
+            }
+            // Supprime aussi la copie root si on retrouve le filename via meta.
+            // Best-effort : on ne lit plus le meta.json (déjà rm'd) — on laisse
+            // la copie root en place si l'utilisateur l'a déjà déplacée ou
+            // copiée ailleurs, c'est plus prudent que d'effacer à l'aveugle.
+            Ok(())
+        }
+        other => Err(format!("kind inconnu '{other}' (tx|rx)")),
+    }
 }
 
 #[tauri::command]
@@ -629,6 +851,9 @@ fn main() {
             tx_reset,
             list_sessions,
             delete_session,
+            list_tx_history,
+            list_rx_history,
+            delete_history_item,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

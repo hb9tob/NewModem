@@ -805,3 +805,125 @@ fn write_out_u16(out: &mut [u16], channels: usize, samples: &[f32], pos: &Atomic
     }
     pos.fetch_add(n, Ordering::Relaxed);
 }
+
+/// Archive le fichier payload TX dans `<save_dir>/tx_history/` au moment où
+/// l'utilisateur lance une émission. Garantit que l'historique TX trace
+/// toute tentative, y compris celles coupées en cours (PTT relâché, erreur
+/// audio). Émet `tx_archived` au frontend, et purge les plus anciens si on
+/// dépasse `max_items`.
+///
+/// `payload_path` doit pointer sur un fichier existant (`tx_preview.avif` ou
+/// `tx_preview.zst`). `filename` est le nom original choisi par l'utilisateur,
+/// préservé tel quel dans le metadata pour l'affichage de la vignette.
+pub fn archive_payload(
+    save_dir: &Path,
+    payload_path: &Path,
+    mode: &str,
+    filename: &str,
+    repair_pct: u32,
+    max_items: u32,
+    app: &AppHandle,
+) {
+    let history_dir = save_dir.join("tx_history");
+    if let Err(e) = std::fs::create_dir_all(&history_dir) {
+        eprintln!("[tx_history] mkdir {:?}: {e}", history_dir);
+        return;
+    }
+    let ext = payload_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bin");
+    let mime_type: u8 = match ext {
+        "avif" => modem_core::app_header::mime::IMAGE_AVIF,
+        "zst" => modem_core::app_header::mime::ZSTD,
+        _ => modem_core::app_header::mime::BINARY,
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let safe = sanitize_filename(filename);
+    let stem = format!("{ts}-{safe}");
+    let archive_path = history_dir.join(format!("{stem}.{ext}"));
+    let meta_path = history_dir.join(format!("{stem}.json"));
+
+    if let Err(e) = std::fs::copy(payload_path, &archive_path) {
+        eprintln!("[tx_history] copy {:?}: {e}", payload_path);
+        return;
+    }
+    let meta = serde_json::json!({
+        "timestamp": ts,
+        "mode": mode,
+        "mime_type": mime_type,
+        "filename": filename,
+        "repair_pct": repair_pct,
+    });
+    if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
+        eprintln!("[tx_history] write meta {:?}: {e}", meta_path);
+    }
+    purge_history(&history_dir, max_items);
+    let _ = app.emit("tx_archived", ());
+}
+
+/// Limite le dossier `tx_history/` à `max_items` triplets fichier+json. Trie
+/// les `.json` par mtime descendant et supprime les plus anciens (avec leur
+/// fichier source jumeau).
+fn purge_history(history_dir: &Path, max_items: u32) {
+    let max = max_items.max(1) as usize;
+    let mut metas: Vec<(SystemTime, PathBuf)> = match std::fs::read_dir(history_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+            })
+            .filter_map(|e| {
+                let m = e.metadata().ok()?.modified().ok()?;
+                Some((m, e.path()))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if metas.len() <= max {
+        return;
+    }
+    metas.sort_by(|a, b| b.0.cmp(&a.0)); // plus récent d'abord
+    for (_, json_path) in metas.into_iter().skip(max) {
+        if let Some(stem) = json_path.file_stem().and_then(|s| s.to_str()) {
+            if let Some(parent) = json_path.parent() {
+                for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                    let p = entry.path();
+                    if p.file_stem().and_then(|s| s.to_str()) == Some(stem) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sanitize un nom de fichier pour le système de fichiers : remplace les
+/// caractères réservés Windows/Linux par `_`, tronque à 80 caractères pour
+/// laisser de la place au préfixe timestamp + extension.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        return "fichier".to_string();
+    }
+    if trimmed.len() > 80 {
+        trimmed.chars().take(80).collect()
+    } else {
+        trimmed
+    }
+}

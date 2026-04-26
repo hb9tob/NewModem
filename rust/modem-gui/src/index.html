@@ -25,6 +25,7 @@
     <button class="tab active" data-tab="rx">RX</button>
     <button class="tab" data-tab="tx">TX</button>
     <button class="tab" data-tab="sessions">Sessions</button>
+    <button class="tab" data-tab="history">Historique</button>
     <button class="tab" data-tab="channel">Canal</button>
     <button class="tab" data-tab="settings">Paramètres</button>
     <button class="tab" data-tab="info">Info</button>
@@ -236,6 +237,17 @@
             soumission, prompt désactivé.
           </p>
         </fieldset>
+        <fieldset>
+          <legend>Historique TX</legend>
+          <label class="ptt-row">
+            Nombre maximum de fichiers conservés :
+            <input type="number" id="tx-history-max-input" min="10" step="10" value="100">
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Au-delà, les plus anciens sont purgés à chaque nouvelle émission.
+            Stocké sous <code>&lt;save_dir&gt;/tx_history/</code>.
+          </p>
+        </fieldset>
         <div class="settings-status" id="settings-status">—</div>
       </div>
     </section>
@@ -265,6 +277,26 @@
         Les sessions sont conservées 24 h. Chaque dossier <code>&lt;save_dir&gt;/sessions/&lt;id&gt;.session/</code>
         contient <code>meta.json</code>, <code>packets.blob</code> et <code>decoded.&lt;ext&gt;</code> si
         le décodage a abouti.
+      </div>
+    </section>
+    <section id="tab-history" class="tab-panel history-layout">
+      <div class="history-toolbar">
+        <button id="btn-history-refresh">Actualiser</button>
+        <span id="history-count" class="history-count">—</span>
+      </div>
+      <div class="history-grid">
+        <div class="history-col history-tx">
+          <h3 class="history-col-title">Émis (TX)</h3>
+          <div id="history-tx-list" class="history-list">
+            <div class="history-empty">Aucun fichier émis.</div>
+          </div>
+        </div>
+        <div class="history-col history-rx">
+          <h3 class="history-col-title">Reçus (RX)</h3>
+          <div id="history-rx-list" class="history-list">
+            <div class="history-empty">Aucun fichier reçu.</div>
+          </div>
+        </div>
       </div>
     </section>
     <section id="tab-channel" class="tab-panel channel-layout">
