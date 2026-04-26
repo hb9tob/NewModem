@@ -825,7 +825,8 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         // of this cycle has MF post-roll context. The partial next preamble
         // (~margin/pitch symbols) is negligible against the 256-sym preamble
         // at the head, so find_preamble locks unambiguously on this cycle.
-        let end = if i + 1 < positions.len() {
+        let is_closed = i + 1 < positions.len();
+        let end = if is_closed {
             (positions[i + 1] + margin).min(samples.len()).max(start + 1)
         } else {
             samples.len()
@@ -834,7 +835,24 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
             continue;
         }
         let window = &samples[start..end];
-        let Some(r) = rx_v2(window, config) else {
+        // Drift grid search (rx_v2 wrapper) costs up to 13 extra rx_v2_single
+        // passes when the decode isn't clean. On the OPEN window (last in
+        // this scan, no following preamble yet), the decode is by construction
+        // incomplete — not because of drift but because the burst is still
+        // in flight, so segments past the buffer end are missing and `clean`
+        // never trips. Running the full grid there wastes O(13) decodes per
+        // tick, which is the dominant cost on slow profiles (ULTRA at 500 Bd
+        // can spend several seconds per tick re-running the same drift sweep).
+        // Skip the grid for the open window — drift would only matter if the
+        // closed-window decodes had to compensate, and they still get the
+        // full search. By the next scan tick this window will be closed
+        // (a new preamble appeared) and gets the full treatment.
+        let r_opt = if is_closed {
+            rx_v2(window, config)
+        } else {
+            rx_v2_single(window, config)
+        };
+        let Some(r) = r_opt else {
             continue;
         };
         for (esi, bytes) in r.cw_bytes_map.into_iter() {
