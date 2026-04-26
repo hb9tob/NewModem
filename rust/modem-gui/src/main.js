@@ -1353,7 +1353,12 @@ function wireEvents() {
       logEvent(name, event.payload);
       if (name === "file_complete") {
         showCurrentFile(event.payload);
-        revealReceivedFile(event.payload.saved_path);
+        // Reveal-in-folder uniquement pour les fichiers non-image. Pour
+        // les images on a déjà la preview dans l'onglet RX + l'historique,
+        // ouvrir le dossier serait intrusif (vol de focus).
+        if (!isImageMime(event.payload.mime_type)) {
+          revealReceivedFile(event.payload.saved_path);
+        }
       }
       if (name === "header" && event.payload && event.payload.profile) {
         noteProfileFromHeader(event.payload.profile);

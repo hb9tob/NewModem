@@ -565,9 +565,6 @@ fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, Str
     let store = session_store::SessionStore::new(&save_dir).map_err(|e| e.to_string())?;
     let mut items: Vec<RxHistoryItem> = Vec::new();
     for meta in store.list_all().into_iter().filter(|m| m.decoded) {
-        let session_dir = save_dir
-            .join("sessions")
-            .join(format!("{:08x}.session", meta.session_id));
         let mime = meta.mime_type;
         let is_image = mime == modem_core::app_header::mime::IMAGE_AVIF
             || mime == modem_core::app_header::mime::IMAGE_JPEG
@@ -576,37 +573,19 @@ fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, Str
             format!("session-{:08x}.bin", meta.session_id)
         });
         let root_copy = save_dir.join(&display_filename);
-        let decoded_ext = match mime {
-            x if x == modem_core::app_header::mime::IMAGE_AVIF => "avif",
-            x if x == modem_core::app_header::mime::IMAGE_JPEG => "jpg",
-            x if x == modem_core::app_header::mime::IMAGE_PNG => "png",
-            x if x == modem_core::app_header::mime::TEXT => "txt",
-            x if x == modem_core::app_header::mime::ZSTD => "zst",
-            _ => "bin",
-        };
-        let decoded_session = session_dir.join(format!("decoded.{decoded_ext}"));
-        // Preview : copie root si présente (peut être décompressée), sinon
-        // version brute du session_dir.
-        let preview = if root_copy.exists() {
-            root_copy.clone()
-        } else {
-            decoded_session.clone()
-        };
-        // Relay : préserve la fidélité bit-à-bit pour AVIF (passthrough TX).
-        // Pour ZST et autres : prend la version décompressée root pour que
-        // le pipeline TX ré-encode proprement.
-        let relay = if mime == modem_core::app_header::mime::IMAGE_AVIF
-            && decoded_session.exists()
-        {
-            decoded_session.clone()
-        } else if root_copy.exists() {
-            root_copy.clone()
-        } else {
-            decoded_session.clone()
-        };
-        if !preview.exists() {
+        // Preview ET relay : on utilise toujours la copie root écrite par
+        // rx_worker::emit_decoded_file. C'est la SEULE version contenant le
+        // fichier extrait de la PayloadEnvelope (= AVIF/PNG/ZSTD pur). Le
+        // fichier `decoded.<ext>` du session_dir contient l'envelope brute
+        // (header + content) et n'est pas exploitable directement comme
+        // image ou comme payload TX.
+        if !root_copy.exists() {
+            // Session décodée mais copie root absente (cleanup manuel ou
+            // sessions héritées d'une version antérieure) — on l'ignore.
             continue;
         }
+        let preview = root_copy.clone();
+        let relay = root_copy.clone();
         let size_bytes = preview.metadata().map(|m| m.len()).unwrap_or(0);
         items.push(RxHistoryItem {
             session_id: format!("{:08x}", meta.session_id),
