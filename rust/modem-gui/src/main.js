@@ -1041,16 +1041,15 @@ function setupCaptureSubmitPanel() {
   if (dismiss) dismiss.addEventListener("click", dismissCapturePrompt);
 }
 
-let levelCount = 0;
-function updateLevel(rms, peak, totalSamples) {
-  levelCount += 1;
+function updateLevel(rms, peak, _totalSamples) {
   const fill = document.getElementById("level-fill");
   const text = document.getElementById("level-text");
   const db = rms > 1e-6 ? 20 * Math.log10(rms) : -120;
   const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
   fill.style.width = `${pct}%`;
-  const samplesK = (totalSamples / 1000).toFixed(0);
-  text.textContent = `${db.toFixed(1)} dB (peak ${peak.toFixed(2)}) #${levelCount} ${samplesK}k`;
+  const dbStr = db.toFixed(1).padStart(6, " ");
+  const peakStr = peak.toFixed(2).padStart(4, " ");
+  text.textContent = `${dbStr} dB · peak ${peakStr}`;
 }
 
 // #HB9TOB: durée d'affichage rouge du chip OVD après dernière détection.
@@ -1058,25 +1057,8 @@ function updateLevel(rms, peak, totalSamples) {
 // overdrive. Voir OVERDRIVE_* côté Rust pour le seuil de détection.
 const OVD_STICKY_MS = 5000;
 
-// #HB9TOB: PAPR de référence audio-passband par profil (peak/RMS, dB), à
-// calibrer empiriquement sur des captures clean ; affiché à côté du chip OVD
-// pour comparer la mesure courante. La détection d'overdrive utilise un seuil
-// unique côté Rust (OVERDRIVE_CREST_GATE_DB), pas cette table.
-//   - HIGH/MEGA (16-APSK, 2 anneaux) : calibré 2026-04-19 sur OTA MEGA
-//     (capture-1776547952 etc.) p50 ≈ 9.48 dB
-//   - ULTRA/ROBUST/NORMAL : valeurs provisoires à confirmer sur capture clean
-//     du profil correspondant
-const PAPR_REF_DB = {
-  ULTRA: 8.5,
-  ROBUST: 8.5,
-  NORMAL: 8.5,
-  HIGH: 9.5,
-  MEGA: 9.5,
-};
-
 let lastOverdriveMs = 0;
 let lastCrestDb = NaN;
-let currentProfile = null;
 
 function refreshOverdriveChip() {
   const chip = document.getElementById("ovd-chip");
@@ -1089,37 +1071,13 @@ function refreshOverdriveChip() {
   }
 }
 
-function refreshPaprInfo() {
-  const elt = document.getElementById("papr-info");
-  if (!elt) return;
-  const ref = currentProfile && PAPR_REF_DB[currentProfile] != null
-    ? PAPR_REF_DB[currentProfile]
-    : null;
-  const measuredStr = Number.isFinite(lastCrestDb) && lastCrestDb > 0
-    ? `${lastCrestDb.toFixed(1)}` : "—";
-  const refStr = ref != null ? `${ref.toFixed(1)}` : "—";
-  const profileTag = currentProfile ? ` ${currentProfile}` : "";
-  elt.textContent = `PAPR ${measuredStr} / réf ${refStr} dB${profileTag}`;
-  // Souligne en orange si on est franchement sous la référence (≥ 1 dB de
-  // compression). Indication visuelle complémentaire au chip rouge.
-  const warn = ref != null
-    && Number.isFinite(lastCrestDb)
-    && lastCrestDb > 0
-    && lastCrestDb < ref - 1.0;
-  elt.classList.toggle("papr-warn", warn);
-}
-
 function noteAudioOverdrive(overdrive, crestDb) {
   if (Number.isFinite(crestDb)) lastCrestDb = crestDb;
   if (overdrive) lastOverdriveMs = Date.now();
   refreshOverdriveChip();
-  refreshPaprInfo();
 }
 
-function noteProfileFromHeader(profileStr) {
-  currentProfile = (profileStr || "").toUpperCase() || null;
-  refreshPaprInfo();
-}
+function noteProfileFromHeader(_profileStr) {}
 
 function updateV2State(state) {
   const chip = document.getElementById("v2-state-chip");
@@ -1135,7 +1093,9 @@ function updateV2State(state) {
 function updateV2Marker(payload) {
   const info = document.getElementById("v2-marker-info");
   const kind = payload.is_meta ? "meta" : "data";
-  info.textContent = `seg=${payload.seg_id} esi=${payload.base_esi} ${kind}`;
+  const seg = String(payload.seg_id).padStart(2, " ");
+  const esi = String(payload.base_esi).padStart(4, " ");
+  info.textContent = `seg=${seg} esi=${esi} ${kind}`;
 }
 
 // ─────────────────────────────── Per-block progress + constellation state
@@ -1227,9 +1187,15 @@ function updateV2Progress(payload) {
     ? payload.pilot_phase_segments
     : [];
 
-  const sigmaStr = lastProgress.sigma2 != null ? lastProgress.sigma2.toFixed(3) : "?";
+  const sigmaStr = lastProgress.sigma2 != null
+    ? lastProgress.sigma2.toFixed(3).padStart(6, " ")
+    : "     ?";
   const mini = document.getElementById("v2-progress-text");
-  if (mini) mini.textContent = `${lastProgress.converged}/${lastProgress.expected} σ²=${sigmaStr}`;
+  if (mini) {
+    const c = String(lastProgress.converged).padStart(3, " ");
+    const e = String(lastProgress.expected).padStart(3, " ");
+    mini.textContent = `${c}/${e} σ²=${sigmaStr}`;
+  }
   drawProgressBlocks();
   drawConstellation();
   drawPilotPhase();

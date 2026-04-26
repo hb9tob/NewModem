@@ -997,7 +997,88 @@ fn sanitize_filename(name: &str) -> String {
 fn save_file(dir: &Path, filename: &str, content: &[u8]) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let safe = sanitize_filename(filename);
-    let path = dir.join(&safe);
+    let path = unique_path(dir, &safe);
     std::fs::write(&path, content)?;
     Ok(path)
+}
+
+/// Renvoie un chemin libre dans `dir` : si `filename` existe déjà, suffixe
+/// `(1)`, `(2)`, ... avant l'extension, jusqu'à 9999. Au-delà (cas
+/// pathologique), tombe sur un suffixe timestamp pour garantir l'unicité
+/// sans jamais écraser une réception précédente.
+fn unique_path(dir: &Path, filename: &str) -> PathBuf {
+    let candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let p = Path::new(filename);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
+    let ext = p.extension().and_then(|s| s.to_str());
+    for n in 1..=9999u32 {
+        let alt = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = dir.join(&alt);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let alt = match ext {
+        Some(e) => format!("{stem}_{ts}.{e}"),
+        None => format!("{stem}_{ts}"),
+    };
+    dir.join(alt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_path;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nbfm_unique_path_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn returns_filename_when_dir_empty() {
+        let dir = tmp_dir("empty");
+        let p = unique_path(&dir, "photo.jpg");
+        assert_eq!(p, dir.join("photo.jpg"));
+    }
+
+    #[test]
+    fn appends_suffix_when_file_exists() {
+        let dir = tmp_dir("exists");
+        fs::write(dir.join("photo.jpg"), b"a").unwrap();
+        let p = unique_path(&dir, "photo.jpg");
+        assert_eq!(p, dir.join("photo (1).jpg"));
+    }
+
+    #[test]
+    fn increments_until_free() {
+        let dir = tmp_dir("increments");
+        fs::write(dir.join("photo.jpg"), b"a").unwrap();
+        fs::write(dir.join("photo (1).jpg"), b"b").unwrap();
+        fs::write(dir.join("photo (2).jpg"), b"c").unwrap();
+        let p = unique_path(&dir, "photo.jpg");
+        assert_eq!(p, dir.join("photo (3).jpg"));
+    }
+
+    #[test]
+    fn handles_no_extension() {
+        let dir = tmp_dir("noext");
+        fs::write(dir.join("readme"), b"a").unwrap();
+        let p = unique_path(&dir, "readme");
+        assert_eq!(p, dir.join("readme (1)"));
+    }
 }
