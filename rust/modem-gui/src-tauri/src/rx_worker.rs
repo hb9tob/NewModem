@@ -544,6 +544,36 @@ fn scan_and_route(
         sum / state.session_buffer.len() as f64
     };
 
+    // [perf] Phase-2a — preamble-presence FFT probe gate. Run in Idle only :
+    // when the worker is already in a session, the buffer is full of signal
+    // by construction and the probe would always fire. Cost ≈ 25-30 ms vs
+    // the ~1000 ms of the full pipeline below ; saves an order of magnitude
+    // when the channel is silent or carrying band noise without preamble
+    // structure.
+    //
+    // The probe is a presence detector, not a profile classifier — a positive
+    // result only means "the spectral signature of one of the 4 unique
+    // (sps, β) preamble templates is above noise floor". The actual profile
+    // selection still happens in `detect_best_profile` immediately below.
+    let mut t_probe_us: u128 = 0;
+    let mut probe_ratio: f64 = 0.0;
+    let mut probe_label: &'static str = "";
+    if !state.session_active && !state.session_buffer.is_empty() {
+        let probe = modem_core::gate::PreambleProbe::for_buf_len(state.session_buffer.len());
+        let t0 = Instant::now();
+        let r = probe.check(&state.session_buffer);
+        t_probe_us = t0.elapsed().as_micros();
+        probe_ratio = r.max_ratio;
+        probe_label = r.best_template;
+        if !r.passes(modem_core::gate::PROBE_THRESHOLD) {
+            worker_log(&format!(
+                "[scan] active=false buf={:.1}s gated profile={:?} rms_sqr={:.6} t_probe_us={} probe_ratio={:.1} (<{})",
+                buf_secs, state.profile, rms_sqr, t_probe_us, probe_ratio, modem_core::gate::PROBE_THRESHOLD,
+            ));
+            return;
+        }
+    }
+
     // Auto-detect profile in Idle : scan the 5 profiles' pitches and
     // reconfigure if the on-air Rs / tau doesn't match our current config.
     // This is crucial for permanent-listening mode since the RX can't know
@@ -586,8 +616,8 @@ fn scan_and_route(
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
-            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} skip_rel={} rms_sqr={:.6} t_detect_us={} t_rx_v3_us={}",
-            state.session_active, buf_secs, state.profile, skip_rel, rms_sqr, t_detect_us, t_rx_v3_us
+            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} skip_rel={} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
+            state.session_active, buf_secs, state.profile, skip_rel, rms_sqr, t_probe_us, probe_label, probe_ratio, t_detect_us, t_rx_v3_us
         ));
         return;
     };
@@ -659,7 +689,7 @@ fn scan_and_route(
     }
     let eot_seen = result.eot_seen;
     worker_log(&format!(
-        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4} rms_sqr={:.6} t_detect_us={} t_rx_v3_us={}",
+        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
         state.session_active,
         buf_secs,
         result.header.is_some(),
@@ -673,6 +703,9 @@ fn scan_and_route(
         result.segments_lost,
         result.sigma2,
         rms_sqr,
+        t_probe_us,
+        probe_label,
+        probe_ratio,
         t_detect_us,
         t_rx_v3_us,
     ));

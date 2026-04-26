@@ -21,6 +21,7 @@
 //!
 //! See plans/perf-rx-idle-surface-pro-7.md.
 
+use modem_core::gate::{PreambleProbe, PROBE_THRESHOLD};
 use modem_core::profile::ProfileIndex;
 use modem_core::rx_v2;
 use modem_core::types::AUDIO_RATE;
@@ -139,7 +140,7 @@ fn main() {
     }
 
     // 3) Combined : detect + rx_v3 (NORMAL) — what scan_and_route does in
-    //    Idle each tick.
+    //    Idle each tick BEFORE the FFT probe gate (Phase 2a).
     let mut t_combo = Vec::with_capacity(N_ITERS);
     let cfg = ProfileIndex::Normal.to_config();
     for _ in 0..N_ITERS {
@@ -148,5 +149,68 @@ fn main() {
         let _ = rx_v2::rx_v3_after(&buf, &cfg, 0);
         t_combo.push(t0.elapsed().as_micros());
     }
-    report("combined idle tick", t_combo);
+    report("legacy idle tick", t_combo);
+
+    // 4) FFT preamble probe (Phase 2a). Force probe construction now so
+    //    its one-shot ~5 ms FFT plan/template build doesn't pollute the
+    //    measurements below.
+    let probe = PreambleProbe::for_buf_len(n_samples);
+    let _ = probe.check(&buf);  // warm-up
+
+    let mut t_probe = Vec::with_capacity(N_ITERS);
+    let mut last_ratio = 0.0f64;
+    for _ in 0..N_ITERS {
+        let t0 = Instant::now();
+        let r = probe.check(&buf);
+        t_probe.push(t0.elapsed().as_micros());
+        last_ratio = r.max_ratio;
+    }
+    report("fft probe (noise)", t_probe);
+    println!(
+        "                          → noise ratio={:.1} (threshold={}), gate={}",
+        last_ratio,
+        PROBE_THRESHOLD,
+        if last_ratio >= PROBE_THRESHOLD { "PASS (false positive!)" } else { "BLOCK" },
+    );
+
+    // 5) Probe + (skip pipeline if blocked) — what the new scan_and_route
+    //    does in Idle. On pure noise the probe blocks → tick cost = probe
+    //    cost only.
+    let mut t_new_tick = Vec::with_capacity(N_ITERS);
+    for _ in 0..N_ITERS {
+        let t0 = Instant::now();
+        let r = probe.check(&buf);
+        if r.passes(PROBE_THRESHOLD) {
+            // Would fall through to detect + rx_v3 here ; on noise it
+            // never triggers, so the cost stays at the probe alone.
+            let _ = rx_v2::detect_best_profile(&buf, ProfileIndex::Normal);
+            let _ = rx_v2::rx_v3_after(&buf, &cfg, 0);
+        }
+        t_new_tick.push(t0.elapsed().as_micros());
+    }
+    report("new idle tick", t_new_tick);
+
+    // 6) Probe-positive case : inject a clean preamble and verify the
+    //    probe fires (sanity check on the bench, not a perf number).
+    let mut sig = buf.clone();
+    let pre_syms = modem_core::preamble::make_preamble();
+    let cfg_n = ProfileIndex::Normal.to_config();
+    let sps = (AUDIO_RATE as f64 / cfg_n.symbol_rate) as usize;
+    let pitch = (sps as f64 * cfg_n.tau).round() as usize;
+    let taps = modem_core::rrc::rrc_taps(cfg_n.beta, modem_core::types::RRC_SPAN_SYM, sps);
+    let template = modem_core::modulator::modulate(
+        &pre_syms, sps, pitch, &taps,
+        modem_core::types::DATA_CENTER_HZ,
+    );
+    let inject_at = 5000usize;
+    for (i, &t) in template.iter().enumerate() {
+        if inject_at + i < sig.len() {
+            sig[inject_at + i] += t * 0.5;
+        }
+    }
+    let r = probe.check(&sig);
+    println!(
+        "[perf_idle] sanity : NORMAL preamble injected → probe ratio={:.1} (threshold={}), label={}",
+        r.max_ratio, PROBE_THRESHOLD, r.best_template,
+    );
 }
