@@ -1363,21 +1363,26 @@ function drawPilotPhase() {
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
+  // Reserve a 56-px gutter on the left for the Y-axis labels so the
+  // mrad scale stays readable even on a narrow window.
+  const gutter = 56 * dpr;
+  const plotX0 = gutter;
+  const plotW = w - gutter;
+
   const segments = lastPilotPhases;
   const total = segments.reduce((acc, s) => acc + s.length, 0);
   if (!segments.length || total < 2) {
-    // Idle baseline + label
     ctx.fillStyle = "#1a1a1a";
     ctx.fillRect(0, 0, w, h);
-    ctx.fillStyle = "#666";
-    ctx.font = `${10 * dpr}px monospace`;
-    ctx.fillText("phase pilote (rad) — en attente", 6 * dpr, 14 * dpr);
+    ctx.fillStyle = "#888";
+    ctx.font = `bold ${13 * dpr}px monospace`;
+    ctx.fillText("phase pilote — en attente", 8 * dpr, 18 * dpr);
     return;
   }
 
   // Re-anchor each segment to its first sample so the plot shows
   // INTRA-SEGMENT drift only (between-segment jumps come from pilot
-  // interp restart + DD-PLL reset, which would dominate the y-range).
+  // interp restart, which would dominate the y-range).
   const anchored = segments.map((seg) => {
     const a0 = seg[0] || 0;
     return seg.map((p) => p - a0);
@@ -1393,27 +1398,64 @@ function drawPilotPhase() {
   }
   if (!isFinite(ymin) || !isFinite(ymax)) return;
   const span = ymax - ymin;
-  const pad = span > 1e-6 ? span * 0.15 : 0.05;
-  ymin -= pad;
-  ymax += pad;
+  // Floor the range so a near-flat trace doesn't get blown up to ±1 mrad
+  // and look noisy for nothing. 50 mrad minimum spread.
+  const minHalf = 0.05;
+  if (span < 2 * minHalf) {
+    const center = (ymax + ymin) / 2;
+    ymin = center - minHalf;
+    ymax = center + minHalf;
+  } else {
+    const pad = span * 0.15;
+    ymin -= pad;
+    ymax += pad;
+  }
   const yRange = ymax - ymin;
 
-  // Zero line + horizontal grid
+  // Background panel for the plot area.
+  ctx.fillStyle = "rgba(0,0,0,0.0)"; // canvas already dark
+  ctx.fillRect(plotX0, 0, plotW, h);
+
+  // Y-axis ticks : 5 levels from ymin to ymax with mrad labels.
   ctx.strokeStyle = "#2a2a2a";
+  ctx.fillStyle = "#aaa";
+  ctx.font = `${11 * dpr}px monospace`;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
   ctx.lineWidth = 1 * dpr;
-  for (let i = 1; i < 4; i++) {
-    const y = (i * h) / 4;
+  const nTicks = 5;
+  for (let i = 0; i <= nTicks; i++) {
+    const t = i / nTicks;
+    const y = h - t * h;
+    const valRad = ymin + t * yRange;
+    const valMrad = valRad * 1000;
     ctx.beginPath();
-    ctx.moveTo(0, y);
+    ctx.moveTo(plotX0, y);
     ctx.lineTo(w, y);
     ctx.stroke();
+    const lbl = Math.abs(valMrad) < 10
+      ? valMrad.toFixed(1)
+      : valMrad.toFixed(0);
+    ctx.fillText(`${lbl}`, plotX0 - 4 * dpr, y);
   }
-  // Zero baseline (rad = 0)
+  // Y-axis label
+  ctx.save();
+  ctx.translate(14 * dpr, h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#888";
+  ctx.font = `${11 * dpr}px monospace`;
+  ctx.fillText("phase (mrad)", 0, 0);
+  ctx.restore();
+
+  // Zero baseline highlighted
   const yZero = h - ((0 - ymin) / yRange) * h;
   if (yZero >= 0 && yZero <= h) {
-    ctx.strokeStyle = "#4a4a4a";
+    ctx.strokeStyle = "#5a5a5a";
+    ctx.lineWidth = 1.5 * dpr;
     ctx.beginPath();
-    ctx.moveTo(0, yZero);
+    ctx.moveTo(plotX0, yZero);
     ctx.lineTo(w, yZero);
     ctx.stroke();
   }
@@ -1422,42 +1464,49 @@ function drawPilotPhase() {
   // so the user can count them and see where pilot interp restarts.
   const colours = ["rgba(129, 212, 250, 0.95)", "rgba(255, 183, 77, 0.95)"];
   let xCursor = 0;
-  const pxPerSample = total > 1 ? w / (total - 1) : 0;
+  const pxPerSample = total > 1 ? plotW / (total - 1) : 0;
   for (let s = 0; s < anchored.length; s++) {
     const seg = anchored[s];
     if (seg.length === 0) continue;
     ctx.strokeStyle = colours[s % colours.length];
-    ctx.lineWidth = 1.5 * dpr;
+    ctx.lineWidth = 2 * dpr;
     ctx.beginPath();
     for (let i = 0; i < seg.length; i++) {
-      const x = (xCursor + i) * pxPerSample;
+      const x = plotX0 + (xCursor + i) * pxPerSample;
       const y = h - ((seg[i] - ymin) / yRange) * h;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
     ctx.stroke();
     xCursor += seg.length;
-    // Vertical separator at segment boundary (skip on the very last)
     if (s < anchored.length - 1) {
-      const xb = xCursor * pxPerSample;
-      ctx.strokeStyle = "#3a3a3a";
+      const xb = plotX0 + xCursor * pxPerSample;
+      ctx.strokeStyle = "#444";
       ctx.lineWidth = 1 * dpr;
+      ctx.setLineDash([4 * dpr, 3 * dpr]);
       ctx.beginPath();
       ctx.moveTo(xb, 0);
       ctx.lineTo(xb, h);
       ctx.stroke();
+      ctx.setLineDash([]);
     }
   }
 
-  // Y-range label
-  ctx.fillStyle = "#888";
-  ctx.font = `${10 * dpr}px monospace`;
-  const halfRangeMrad = ((yRange * 1000) / 2).toFixed(0);
-  ctx.fillText(
-    `±${halfRangeMrad} mrad · ${segments.length} seg`,
-    6 * dpr,
-    14 * dpr
-  );
+  // Header overlay : range, segments count, σ² (if available), implied SNR.
+  const rangeMrad = (yRange * 1000).toFixed(0);
+  const sigma2 = lastProgress.sigma2;
+  let header = `±${(rangeMrad / 2).toFixed(0)} mrad · ${segments.length} seg`;
+  if (sigma2 != null && sigma2 > 0) {
+    const snrDb = (-10 * Math.log10(sigma2)).toFixed(1);
+    header += ` · σ²=${sigma2.toFixed(3)} (${snrDb} dB)`;
+  }
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(plotX0, 0, plotW, 22 * dpr);
+  ctx.fillStyle = "#e0e0e0";
+  ctx.font = `bold ${12 * dpr}px monospace`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(header, plotX0 + 6 * dpr, 4 * dpr);
 }
 
 function wireEvents() {
