@@ -50,6 +50,9 @@ struct PttStatusEvent {
 }
 
 fn default_save_dir() -> PathBuf {
+    if let Some(root) = settings::portable_root() {
+        return root.join("nbfm-rx");
+    }
     dirs::download_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))

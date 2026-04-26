@@ -116,7 +116,24 @@ impl Default for Settings {
     }
 }
 
+/// Mode portable : si un fichier marqueur `portable.txt` est posé à côté
+/// de l'exécutable GUI, tout le state (settings, captures RX, sessions)
+/// est confiné dans `<exe_dir>/data/`. Sinon `None` et on retombe sur les
+/// chemins OS standards (`%APPDATA%`, `~/Downloads`).
+pub fn portable_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if dir.join("portable.txt").exists() {
+        Some(dir.join("data"))
+    } else {
+        None
+    }
+}
+
 fn settings_path() -> PathBuf {
+    if let Some(root) = portable_root() {
+        return root.join("settings.json");
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nbfm-modem-gui")

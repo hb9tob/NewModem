@@ -1,5 +1,6 @@
 __pycache__/
 rust/target/
+dist/
 # HMAC partagé GUI ↔ collector — généré localement, jamais commit.
 rust/newmodem-collector/secret.txt
 rust/modem-gui/src-tauri/secret.txt
