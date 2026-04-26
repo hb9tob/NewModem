@@ -68,7 +68,10 @@ function setupTabs() {
       const target = btn.dataset.tab;
       for (const b of tabs) b.classList.toggle("active", b === btn);
       for (const p of panels) p.classList.toggle("active", p.id === `tab-${target}`);
-      if (target === "rx") redrawAll();
+      if (target === "rx") {
+        redrawAll();
+        tryAutoStartCapture().catch((err) => console.error("auto-start RX", err));
+      }
       if (target === "sessions") refreshSessions();
       if (target === "history") refreshHistory();
       if (target === "channel") stopRxAndTxForChannelTab();
@@ -864,7 +867,6 @@ async function startCapture() {
     status.style.color = "#ef5350";
     return;
   }
-  levelCount = 0;
   try {
     await invoke("start_capture", { deviceName });
     status.textContent = "capture en cours";
@@ -878,6 +880,20 @@ async function startCapture() {
     status.style.color = "#ef5350";
     logEvent("error", { message: String(err) });
   }
+}
+
+// Démarre la capture RX si elle n'est pas déjà en cours, qu'aucune TX
+// n'occupe la chaîne audio, et qu'une carte RX valide est sélectionnée.
+// Appelé au démarrage de l'app et au retour sur l'onglet RX.
+async function tryAutoStartCapture() {
+  const stopBtn = document.getElementById("btn-stop");
+  const startBtn = document.getElementById("btn-start");
+  const txStopBtn = document.getElementById("tx-btn-stop");
+  if (!stopBtn || !startBtn) return;
+  if (!stopBtn.disabled) return;
+  if (txStopBtn && !txStopBtn.disabled) return;
+  if (startBtn.disabled) return;
+  await startCapture();
 }
 
 async function stopCapture() {
@@ -3054,6 +3070,8 @@ async function init() {
   // #HB9TOB: tick périodique pour effacer le chip OVD si aucun batch overdrive
   // n'est arrivé depuis OVD_STICKY_MS (utile aussi quand la capture est arrêtée).
   setInterval(refreshOverdriveChip, 200);
+  // Démarre la capture RX automatiquement si une carte est configurée.
+  await tryAutoStartCapture();
 }
 
 if (document.readyState === "loading") {
