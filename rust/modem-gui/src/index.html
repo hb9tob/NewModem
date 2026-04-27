@@ -188,6 +188,30 @@
           </select>
         </fieldset>
         <fieldset>
+          <legend>Mode RX (avancé)</legend>
+          <label class="ptt-row">
+            <input type="checkbox" id="rx-force-mode">
+            Forcer un profil (désactive l'auto-détection)
+          </label>
+          <label class="ptt-row">
+            Profil forcé :
+            <select id="rx-forced-profile" disabled>
+              <option value="ULTRA">ULTRA</option>
+              <option value="ROBUST">ROBUST</option>
+              <option value="NORMAL">NORMAL</option>
+              <option value="HIGH" selected>HIGH</option>
+              <option value="MEGA">MEGA</option>
+              <option value="HIGH+" class="experimental-option">⚠ HIGH+ [EXPÉRIMENTAL]</option>
+              <option value="FAST" class="experimental-option">⚠ FAST [EXPÉRIMENTAL]</option>
+            </select>
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Verrouille le décodeur sur ce profil. Indispensable pour
+            recevoir HIGH+ ou FAST (hors auto-détection). Prend effet au
+            prochain démarrage de la capture.
+          </p>
+        </fieldset>
+        <fieldset>
           <legend>Carte son émission (TX)</legend>
           <select id="tx-device-select">
             <option>Chargement…</option>

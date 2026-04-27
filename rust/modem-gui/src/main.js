@@ -524,6 +524,11 @@ let currentSettings = {
   tx_free_h: 600,
   tx_speed: 6,
   tx_more_count: 5,
+  /// Si true, le profil RX est verrouillé sur rx_forced_profile et
+  /// l'auto-détection est désactivée. Indispensable pour recevoir
+  /// HIGH+ ou FAST (hors PROBE_TEMPLATES).
+  rx_force_mode: false,
+  rx_forced_profile: "HIGH",
 };
 
 function populateDeviceSelect(selectId, devices, savedName) {
@@ -629,11 +634,22 @@ async function loadSettings() {
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
   applyPttSettingsToUI();
+  applyRxForceSettingsToUI();
   const colUrl = document.getElementById("collector-url");
   if (colUrl) colUrl.value = currentSettings.collector_url || "";
   const histMax = document.getElementById("tx-history-max-input");
   if (histMax) histMax.value = String(currentSettings.tx_history_max ?? 100);
   applyTxSettingsToUI();
+}
+
+function applyRxForceSettingsToUI() {
+  const cb = document.getElementById("rx-force-mode");
+  const sel = document.getElementById("rx-forced-profile");
+  if (cb) cb.checked = !!currentSettings.rx_force_mode;
+  if (sel) {
+    sel.value = currentSettings.rx_forced_profile || "HIGH";
+    sel.disabled = !currentSettings.rx_force_mode;
+  }
 }
 
 // Synchronise tous les paramètres TX persistés vers txState et l'UI. Appelé
@@ -836,6 +852,23 @@ function setupSettingsTab() {
   });
   document.querySelectorAll('input[name="ptt-rts-pol"], input[name="ptt-dtr-pol"]')
     .forEach(r => r.addEventListener("change", persistSettings));
+
+  // RX force-mode : enable/disable du select et persistance.
+  const rxForce = document.getElementById("rx-force-mode");
+  const rxForcedSel = document.getElementById("rx-forced-profile");
+  if (rxForce) {
+    rxForce.addEventListener("change", () => {
+      currentSettings.rx_force_mode = rxForce.checked;
+      if (rxForcedSel) rxForcedSel.disabled = !rxForce.checked;
+      persistSettings();
+    });
+  }
+  if (rxForcedSel) {
+    rxForcedSel.addEventListener("change", () => {
+      currentSettings.rx_forced_profile = rxForcedSel.value;
+      persistSettings();
+    });
+  }
   const colUrl = document.getElementById("collector-url");
   if (colUrl) {
     colUrl.addEventListener("change", persistSettings);
@@ -869,14 +902,20 @@ async function startCapture() {
     status.style.color = "#ef5350";
     return;
   }
+  const forced = !!currentSettings.rx_force_mode;
+  // Si forcé, on passe le profil choisi ; sinon HIGH (anchor par défaut,
+  // l'auto-détection le raffinera).
+  const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
   try {
-    await invoke("start_capture", { deviceName });
-    status.textContent = "capture en cours";
+    await invoke("start_capture", { deviceName, profile, forced });
+    status.textContent = forced
+      ? `capture en cours (mode forcé : ${profile})`
+      : "capture en cours";
     status.style.color = "#ffb74d";
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
     if (select) select.disabled = true;
-    logEvent("start", { device: deviceName });
+    logEvent("start", { device: deviceName, profile, forced });
   } catch (err) {
     status.textContent = `erreur start : ${err}`;
     status.style.color = "#ef5350";
