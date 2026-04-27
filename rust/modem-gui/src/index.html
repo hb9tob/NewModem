@@ -37,6 +37,22 @@
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
         <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
       </div>
+      <div class="rx-force-bar">
+        <label>
+          <input type="checkbox" id="rx-force-mode">
+          Forcer un profil
+        </label>
+        <select id="rx-forced-profile" disabled>
+          <option value="ULTRA">ULTRA</option>
+          <option value="ROBUST">ROBUST</option>
+          <option value="NORMAL">NORMAL</option>
+          <option value="HIGH" selected>HIGH</option>
+          <option value="MEGA">MEGA</option>
+          <option value="HIGH+" class="experimental-option">⚠ HIGH+ [EXPÉRIMENTAL]</option>
+          <option value="FAST" class="experimental-option">⚠ FAST [EXPÉRIMENTAL]</option>
+        </select>
+        <span class="rx-force-hint">prend effet au prochain ▶ Démarrer</span>
+      </div>
       <div id="capture-submit-prompt" class="capture-submit-prompt" hidden>
         <div class="csp-line">
           <strong>Capture terminée</strong>
@@ -186,30 +202,6 @@
           <select id="rx-device-select">
             <option>Chargement…</option>
           </select>
-        </fieldset>
-        <fieldset>
-          <legend>Mode RX (avancé)</legend>
-          <label class="ptt-row">
-            <input type="checkbox" id="rx-force-mode">
-            Forcer un profil (désactive l'auto-détection)
-          </label>
-          <label class="ptt-row">
-            Profil forcé :
-            <select id="rx-forced-profile" disabled>
-              <option value="ULTRA">ULTRA</option>
-              <option value="ROBUST">ROBUST</option>
-              <option value="NORMAL">NORMAL</option>
-              <option value="HIGH" selected>HIGH</option>
-              <option value="MEGA">MEGA</option>
-              <option value="HIGH+" class="experimental-option">⚠ HIGH+ [EXPÉRIMENTAL]</option>
-              <option value="FAST" class="experimental-option">⚠ FAST [EXPÉRIMENTAL]</option>
-            </select>
-          </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
-            Verrouille le décodeur sur ce profil. Indispensable pour
-            recevoir HIGH+ ou FAST (hors auto-détection). Prend effet au
-            prochain démarrage de la capture.
-          </p>
         </fieldset>
         <fieldset>
           <legend>Carte son émission (TX)</legend>
