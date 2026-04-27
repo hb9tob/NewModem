@@ -81,10 +81,18 @@ pub fn make_constellation(config: &ModemConfig) -> Constellation {
         ConstellationType::Qpsk => constellation::qpsk_gray(),
         ConstellationType::Psk8 => constellation::psk8_gray(),
         ConstellationType::Apsk16 => constellation::apsk16_dvbs2(config.apsk_gamma),
+        ConstellationType::Apsk32 => {
+            constellation::apsk32_dvbs2(config.apsk_gamma, config.apsk_gamma2)
+        }
     }
 }
 
 /// Encode one LDPC codeword from raw info bytes (same logic as `build_superframe`).
+///
+/// Quand `encoder.n()` n'est pas divisible par `constellation.bits_per_sym`
+/// (cas 32-APSK : 2304 % 5 = 4), le codeword est paddé de zéros jusqu'au
+/// prochain multiple. Le bit de padding est récupéré et écarté au RX
+/// avant décodage LDPC. `interleave_perm` doit être de longueur paddée.
 fn encode_one_codeword(
     info_bytes: &[u8],
     encoder: &LdpcEncoder,
@@ -98,7 +106,15 @@ fn encode_one_codeword(
         }
     }
     let codeword = encoder.encode(&info_bits);
-    let interleaved = interleaver::apply_permutation(&codeword, interleave_perm);
+    let padded_n = interleave_perm.len();
+    let cw_padded = if padded_n == codeword.len() {
+        codeword
+    } else {
+        let mut buf = vec![0u8; padded_n];
+        buf[..codeword.len()].copy_from_slice(&codeword);
+        buf
+    };
+    let interleaved = interleaver::apply_permutation(&cw_padded, interleave_perm);
     constellation.map_bits(&interleaved)
 }
 
@@ -145,7 +161,10 @@ pub fn build_superframe_v3_range(
 ) -> Vec<Complex64> {
     let encoder = LdpcEncoder::new(config.ldpc_rate);
     let constellation_ = make_constellation(config);
-    let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
+    let interleave_perm = interleaver::interleave_table(
+        interleaver::padded_cw_bits(encoder.n(), config.constellation),
+        config.constellation,
+    );
 
     let k_bytes = encoder.k() / 8;
 
@@ -304,8 +323,11 @@ pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
     // when callers pass an odd K (e.g. `repair_pct = 0`).
     let n_data_cw = effective_packet_count(n_data_cw) as usize;
     let bits_per_sym = config.constellation.bits_per_sym();
-    // n() = 2304 (constant pour tous les rates LDPC)
-    let cw_data_syms = config.ldpc_rate.n() / bits_per_sym;
+    // n() = 2304 (constant pour tous les rates LDPC). Si bits_per_sym ne
+    // divise pas n() (cas Apsk32 : 2304 % 5 = 4), le builder padde au
+    // prochain multiple → on doit refléter la même ronde ici.
+    let padded_n = interleaver::padded_cw_bits(config.ldpc_rate.n(), config.constellation);
+    let cw_data_syms = padded_n / bits_per_sym;
     let pp = &config.pilot_pattern;
     let d = pp.d_syms;
     let p = pp.p_syms;
@@ -379,7 +401,10 @@ pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
 pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> {
     let encoder = LdpcEncoder::new(config.ldpc_rate);
     let constellation_ = make_constellation(config);
-    let interleave_perm = interleaver::interleave_table(encoder.n(), config.constellation);
+    let interleave_perm = interleaver::interleave_table(
+        interleaver::padded_cw_bits(encoder.n(), config.constellation),
+        config.constellation,
+    );
     let k_bytes = encoder.k() / 8;
 
     let preamble_syms = preamble::make_preamble_for(config.preamble_family());

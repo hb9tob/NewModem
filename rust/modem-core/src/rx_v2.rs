@@ -338,7 +338,11 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
     let constellation = frame::make_constellation(config);
     let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
     let bps = config.constellation.bits_per_sym();
-    let syms_per_cw = decoder.n() / bps;
+    // Si decoder.n() n'est pas divisible par bps (cas Apsk32 : 2304 % 5),
+    // le TX padde le codeword au prochain multiple → on alloue les symboles
+    // en conséquence et on droppe les LLRs de padding avant le décodage LDPC.
+    let padded_n = interleaver::padded_cw_bits(decoder.n(), config.constellation);
+    let syms_per_cw = padded_n / bps;
 
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
@@ -455,7 +459,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
     let constellation = frame::make_constellation(config);
     let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
-    let deinterleave_perm = interleaver::deinterleave_table(decoder.n(), config.constellation);
+    let padded_n_v2 = interleaver::padded_cw_bits(decoder.n(), config.constellation);
+    let deinterleave_perm = interleaver::deinterleave_table(padded_n_v2, config.constellation);
 
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
@@ -548,7 +553,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let data_region = &corrected[data_region_start..];
 
     let bps = config.constellation.bits_per_sym();
-    let syms_per_cw = decoder.n() / bps;
+    // Si decoder.n() n'est pas divisible par bps (cas Apsk32 : 2304 % 5),
+    // le TX padde le codeword au prochain multiple → on alloue les symboles
+    // en conséquence et on droppe les LLRs de padding avant le décodage LDPC.
+    let padded_n = interleaver::padded_cw_bits(decoder.n(), config.constellation);
+    let syms_per_cw = padded_n / bps;
     let k_bytes = decoder.k() / 8;
 
     let pll_alpha = 0.05f64;
@@ -708,7 +717,10 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             let cw_syms = &seg_data_syms[off..off + syms_per_cw];
             let llr = soft_demod::llr_maxlog(cw_syms, &constellation, sigma2_for_llr);
             let llr_deint = interleaver::apply_permutation_f32(&llr, &deinterleave_perm);
-            let (info_bytes, converged) = decoder.decode_to_bytes(&llr_deint);
+            // Drop des LLRs de padding (bits ajoutés en TX pour aligner sur
+            // bits_per_sym) — ils sont en queue après deinterleave.
+            let llr_for_ldpc = &llr_deint[..decoder.n()];
+            let (info_bytes, converged) = decoder.decode_to_bytes(llr_for_ldpc);
             let bytes = info_bytes[..k_bytes].to_vec();
 
             total_blocks += 1;
@@ -1318,6 +1330,23 @@ mod tests {
             assert!(r.app_header.is_some(), "{name} : no AppHeader");
             assert_eq!(&r.data[..data.len()], &data[..], "{name} : payload mismatch");
         }
+    }
+
+    /// Loopback HIGH+ (32-APSK 1500 Bd β=0.20 LDPC 3/4) : valide
+    /// l'enchaînement constellation Apsk32 + interleaver 5-bit +
+    /// soft demap + LDPC 3/4 sur canal idéal.
+    #[test]
+    fn loopback_v3_high_plus_small_payload() {
+        let cfg = crate::profile::profile_high_plus();
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(13)).collect();
+        let samples = tx_v3(&data, &cfg, 0xBABE_5005);
+        let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH+");
+        assert!(r.app_header.is_some(), "HIGH+ : no AppHeader");
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "HIGH+ loopback : payload mismatch",
+        );
     }
 
     /// Loopback : ULTRA with the dense 16/2 pattern + DD-PLL QPSK refinement

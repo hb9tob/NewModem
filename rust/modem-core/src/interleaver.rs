@@ -18,12 +18,26 @@
 
 use crate::profile::ConstellationType;
 
+/// Bit count après padding au prochain multiple de `bits_per_sym`.
+///
+/// Utile quand la longueur de codeword LDPC (ex. 2304) n'est pas
+/// divisible par `bits_per_sym` (ex. 5 pour Apsk32 : 2304 % 5 = 4 → on
+/// padde à 2305 = 5×461). Le bit de padding est mis à 0 au TX et
+/// supprimé au RX avant décodage LDPC.
+pub fn padded_cw_bits(n: usize, ct: ConstellationType) -> usize {
+    let bps = ct.bits_per_sym();
+    n.div_ceil(bps) * bps
+}
+
 /// Column permutation for each constellation type.
 fn column_permutation(ct: ConstellationType) -> &'static [usize] {
     match ct {
         ConstellationType::Qpsk => &[0, 1],
         ConstellationType::Psk8 => &[2, 1, 0],
         ConstellationType::Apsk16 => &[3, 1, 2, 0],
+        // 32-APSK : identité, conforme au défaut gr-dvbs2 pour
+        // MOD_32APSK (interleaver_bb_impl.cc ligne 247, /* 01234 */).
+        ConstellationType::Apsk32 => &[0, 1, 2, 3, 4],
     }
 }
 

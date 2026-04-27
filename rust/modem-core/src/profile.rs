@@ -11,6 +11,9 @@ pub enum ConstellationType {
     Qpsk,
     Psk8,
     Apsk16,
+    /// 32-APSK DVB-S2 (4+12+16). EXPERIMENTAL — pas couvert par
+    /// l'auto-détection du gate, utilisable seulement en mode forcé RX.
+    Apsk32,
 }
 
 impl ConstellationType {
@@ -19,6 +22,7 @@ impl ConstellationType {
             Self::Qpsk => 2,
             Self::Psk8 => 3,
             Self::Apsk16 => 4,
+            Self::Apsk32 => 5,
         }
     }
 
@@ -28,6 +32,7 @@ impl ConstellationType {
             Self::Qpsk => 0,
             Self::Psk8 => 1,
             Self::Apsk16 => 2,
+            Self::Apsk32 => 3,
         }
     }
 
@@ -36,6 +41,7 @@ impl ConstellationType {
             0 => Some(Self::Qpsk),
             1 => Some(Self::Psk8),
             2 => Some(Self::Apsk16),
+            3 => Some(Self::Apsk32),
             _ => None,
         }
     }
@@ -132,8 +138,12 @@ pub struct ModemConfig {
     pub beta: f64,
     pub tau: f64,
     pub center_freq_hz: f64,
-    /// APSK gamma (only used for Apsk16, default 2.85)
+    /// APSK gamma (Apsk16 : R2/R1, default 2.85 ; Apsk32 : R2/R1, ex.
+    /// 2.84 pour rate 3/4). Pour Qpsk/Psk8 : ignoré.
     pub apsk_gamma: f64,
+    /// 2nd APSK gamma — utilisé uniquement par Apsk32 (R3/R1, ex. 5.27
+    /// pour rate 3/4). Pour les autres constellations : ignoré (laisser à 0.0).
+    pub apsk_gamma2: f64,
     /// TDM pilot pattern. Profile-specific so ULTRA can densify.
     pub pilot_pattern: PilotPattern,
 }
@@ -155,6 +165,9 @@ pub enum ProfileIndex {
     Normal = 2,
     High = 3,
     Mega = 4,
+    /// EXPERIMENTAL — 32-APSK 1500 Bd β=0.20 LDPC 3/4. Hors auto-détection,
+    /// utilisable uniquement quand le RX est en mode forcé.
+    HighPlus = 5,
 }
 
 impl ProfileIndex {
@@ -171,6 +184,7 @@ impl ProfileIndex {
             2 => Some(Self::Normal),
             3 => Some(Self::High),
             4 => Some(Self::Mega),
+            5 => Some(Self::HighPlus),
             _ => None,
         }
     }
@@ -183,6 +197,7 @@ impl ProfileIndex {
             Self::Normal => profile_normal(),
             Self::High => profile_high(),
             Self::Mega => profile_mega(),
+            Self::HighPlus => profile_high_plus(),
         }
     }
 
@@ -193,17 +208,28 @@ impl ProfileIndex {
             Self::Normal => "NORMAL",
             Self::High => "HIGH",
             Self::Mega => "MEGA",
+            Self::HighPlus => "HIGH+",
         }
     }
 
-    /// All profile indices in canonical order.
-    pub const ALL: [Self; 5] = [
+    /// All profile indices in canonical order. EXPERIMENTAL profiles
+    /// (HighPlus, ...) sont inclus pour permettre leur sélection en mode
+    /// forcé, mais ils ne participent PAS à l'auto-détection (cf.
+    /// `is_experimental`).
+    pub const ALL: [Self; 6] = [
         Self::Ultra,
         Self::Robust,
         Self::Normal,
         Self::High,
         Self::Mega,
+        Self::HighPlus,
     ];
+
+    /// `true` pour les profils expérimentaux qui doivent être exclus de
+    /// l'auto-détection (gate FFT). Utilisable seulement en mode forcé RX.
+    pub fn is_experimental(self) -> bool {
+        matches!(self, Self::HighPlus)
+    }
 
     /// Preamble family used by this profile on the wire. The split is
     /// driven by `(sps, β)` — profiles that share both end up in the same
@@ -212,7 +238,9 @@ impl ProfileIndex {
     pub fn preamble_family(self) -> crate::preamble::PreambleFamily {
         use crate::preamble::PreambleFamily;
         match self {
-            Self::Normal | Self::High | Self::Mega => PreambleFamily::A,
+            // HighPlus partage (sps=32, pitch=32, β=0.20) avec famille A —
+            // même préambule que NORMAL/HIGH/MEGA, distinction par mode forcé.
+            Self::Normal | Self::High | Self::Mega | Self::HighPlus => PreambleFamily::A,
             Self::Robust => PreambleFamily::B,
             Self::Ultra => PreambleFamily::C,
         }
@@ -286,6 +314,7 @@ impl ModemConfig {
             tau,
             center_freq_hz,
             apsk_gamma: 2.85,
+            apsk_gamma2: 0.0,
             pilot_pattern: PilotPattern::default_v3(),
         })
     }
@@ -328,6 +357,7 @@ pub fn profile_mega() -> ModemConfig {
         tau: 30.0 / 32.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
         pilot_pattern: PilotPattern::default_v3(),
     }
 }
@@ -341,6 +371,7 @@ pub fn profile_high() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
         pilot_pattern: PilotPattern::default_v3(),
     }
 }
@@ -354,6 +385,7 @@ pub fn profile_normal() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
         pilot_pattern: PilotPattern::default_v3(),
     }
 }
@@ -367,6 +399,7 @@ pub fn profile_robust() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
         pilot_pattern: PilotPattern::default_v3(),
     }
 }
@@ -380,7 +413,28 @@ pub fn profile_ultra() -> ModemConfig {
         tau: 1.0,
         center_freq_hz: DATA_CENTER_HZ,
         apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
         pilot_pattern: PilotPattern::dense_ultra(),
+    }
+}
+
+/// EXPERIMENTAL — HIGH+ : 32-APSK 1500 Bd β=0.20 LDPC 3/4.
+///
+/// Diffère uniquement de HIGH par la constellation (16-APSK → 32-APSK).
+/// Tout le reste est strictement identique pour isoler la variable.
+/// Rayons γ1=2.84, γ2=5.27 = DVB-S2 Table 10 EN 302 307-1 pour rate 3/4.
+/// Net brut : 1500 × 5 × 0.75 × (32/34) ≈ 5294 bps (vs ~4235 pour HIGH).
+pub fn profile_high_plus() -> ModemConfig {
+    ModemConfig {
+        constellation: ConstellationType::Apsk32,
+        ldpc_rate: LdpcRate::R3_4,
+        symbol_rate: 1500.0,
+        beta: 0.20,
+        tau: 1.0,
+        center_freq_hz: DATA_CENTER_HZ,
+        apsk_gamma: 2.84,
+        apsk_gamma2: 5.27,
+        pilot_pattern: PilotPattern::default_v3(),
     }
 }
 
