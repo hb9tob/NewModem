@@ -1561,3 +1561,20 @@ main {
 .history-rx .history-card-actions .btn-relay:hover {
   background: #3a2a1a;
 }
+
+/* Profils expérimentaux : badge rouge bien visible */
+.experimental-option {
+  color: #ff6b4a;
+  font-weight: bold;
+  background: #2a1a14;
+}
+.experimental-warn {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: #3a1a14;
+  border: 1px solid #ff6b4a;
+  border-radius: 4px;
+  color: #ffb89e;
+  font-size: 0.85rem;
+  line-height: 1.3;
+}

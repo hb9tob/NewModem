@@ -685,6 +685,8 @@ function applyTxSettingsToUI() {
   }
   const freeWrap = document.getElementById("tx-resize-free");
   if (freeWrap) freeWrap.hidden = resize !== "free";
+
+  refreshTxExperimentalWarn();
 }
 
 function applyPttSettingsToUI() {
@@ -1704,6 +1706,13 @@ function fmtSeconds(s) {
   return `${m}:${String(r).padStart(2, "0")}`;
 }
 
+function refreshTxExperimentalWarn() {
+  const warn = document.getElementById("tx-experimental-warn");
+  if (!warn) return;
+  const isExp = txState.mode === "HIGH+" || txState.mode === "FAST";
+  warn.hidden = !isExp;
+}
+
 function refreshTxButtons() {
   const btnTx = document.getElementById("tx-btn-tx");
   const btnStop = document.getElementById("tx-btn-stop");
@@ -2348,6 +2357,7 @@ function setupTxTab() {
     refreshTxPreview();
     refreshTxEstimate();
     refreshTxButtons();
+    refreshTxExperimentalWarn();
   });
 
   const markCompressDirty = () => {
