@@ -1,6 +1,8 @@
-//! Constellations: QPSK Gray, 8PSK Gray, 16-APSK DVB-S2 (4,12).
+//! Constellations: QPSK Gray, 8PSK Gray, 16-APSK DVB-S2 (4,12), 32-APSK DVB-S2 (4,12,16).
 //!
-//! Port exact de modem_apsk16_ftn_bench.py lignes 30-245.
+//! 16-APSK : port de modem_apsk16_ftn_bench.py lignes 30-245.
+//! 32-APSK : ETSI EN 302 307-1 §5.4.4 Figure 12, table reprise de
+//! gr-dvbs2 (drmpeg) modulator_bc_impl.cc lignes 171-202.
 //! Toutes normalisées Es = 1.
 
 use std::f64::consts::PI;
@@ -163,6 +165,90 @@ pub fn apsk16_dvbs2(gamma: f64) -> Constellation {
     }
 }
 
+/// 32-APSK (4, 12, 16) DVB-S2, normalised Es = 1.
+///
+/// `gamma1 = R2 / R1`, `gamma2 = R3 / R1`. Table 10 EN 302 307-1 :
+/// rate 3/4 → γ1=2.84, γ2=5.27 ; rate 5/6 → γ1=2.64, γ2=4.64.
+///
+/// Bit-label → point mapping per Figure 12 of EN 302 307-1, transcribed
+/// from the gr-dvbs2 reference implementation (m_32apsk array, indices
+/// 0..31 = 5-bit binary labels).
+pub fn apsk32_dvbs2(gamma1: f64, gamma2: f64) -> Constellation {
+    assert!(gamma1 > 1.0 && gamma2 > gamma1, "expected 1 < gamma1 < gamma2");
+
+    // Per Figure 12: ring designator R1 (inner, 4 pts), R2 (middle, 12 pts),
+    // R3 (outer, 16 pts). Index = 5-bit label (binary, MSB first).
+    #[derive(Clone, Copy)]
+    enum Ring {
+        R1,
+        R2,
+        R3,
+    }
+    use Ring::*;
+    const PI: f64 = std::f64::consts::PI;
+    let def: [(Ring, f64); 32] = [
+        (R2, PI / 4.0),         //  0  00000
+        (R2, 5.0 * PI / 12.0),  //  1  00001
+        (R2, -PI / 4.0),        //  2  00010
+        (R2, -5.0 * PI / 12.0), //  3  00011
+        (R2, 3.0 * PI / 4.0),   //  4  00100
+        (R2, 7.0 * PI / 12.0),  //  5  00101
+        (R2, -3.0 * PI / 4.0),  //  6  00110
+        (R2, -7.0 * PI / 12.0), //  7  00111
+        (R3, PI / 8.0),         //  8  01000
+        (R3, 3.0 * PI / 8.0),   //  9  01001
+        (R3, -PI / 4.0),        // 10  01010
+        (R3, -PI / 2.0),        // 11  01011
+        (R3, 3.0 * PI / 4.0),   // 12  01100
+        (R3, PI / 2.0),         // 13  01101
+        (R3, -7.0 * PI / 8.0),  // 14  01110
+        (R3, -5.0 * PI / 8.0),  // 15  01111
+        (R2, PI / 12.0),        // 16  10000
+        (R1, PI / 4.0),         // 17  10001
+        (R2, -PI / 12.0),       // 18  10010
+        (R1, -PI / 4.0),        // 19  10011
+        (R2, 11.0 * PI / 12.0), // 20  10100
+        (R1, 3.0 * PI / 4.0),   // 21  10101
+        (R2, -11.0 * PI / 12.0),// 22  10110
+        (R1, -3.0 * PI / 4.0),  // 23  10111
+        (R3, 0.0),              // 24  11000
+        (R3, PI / 4.0),         // 25  11001
+        (R3, -PI / 8.0),        // 26  11010
+        (R3, -3.0 * PI / 8.0),  // 27  11011
+        (R3, 7.0 * PI / 8.0),   // 28  11100
+        (R3, 5.0 * PI / 8.0),   // 29  11101
+        (R3, PI),               // 30  11110
+        (R3, -3.0 * PI / 4.0),  // 31  11111
+    ];
+
+    // Raw radii with R1=1, then normalise so Es = 1.
+    // Es = (4*R1² + 12*R2² + 16*R3²) / 32 = (R1² + 3*R2² + 4*R3²) / 8.
+    let r1_raw = 1.0;
+    let r2_raw = gamma1;
+    let r3_raw = gamma2;
+    let r0 = (8.0 / (r1_raw * r1_raw + 3.0 * r2_raw * r2_raw + 4.0 * r3_raw * r3_raw)).sqrt();
+    let r1 = r1_raw * r0;
+    let r2 = r2_raw * r0;
+    let r3 = r3_raw * r0;
+
+    let mut points = Vec::with_capacity(32);
+    for &(ring, angle) in &def {
+        let r = match ring {
+            R1 => r1,
+            R2 => r2,
+            R3 => r3,
+        };
+        points.push(Complex64::new(r * angle.cos(), r * angle.sin()));
+    }
+
+    let bit_map = make_bit_map(32, 5);
+    Constellation {
+        points,
+        bits_per_sym: 5,
+        bit_map,
+    }
+}
+
 fn make_bit_map(n_points: usize, bits_per_sym: usize) -> Vec<Vec<u8>> {
     (0..n_points)
         .map(|i| {
@@ -224,6 +310,96 @@ mod tests {
         // All 16 symbols
         let bits: Vec<u8> = (0..16u8)
             .flat_map(|i| (0..4).rev().map(move |k| (i >> k) & 1))
+            .collect();
+        let syms = c.map_bits(&bits);
+        let idx = c.slice_nearest(&syms);
+        let bits_out = c.symbols_to_bits(&idx);
+        assert_eq!(bits, bits_out);
+    }
+
+    #[test]
+    fn apsk32_es_unity() {
+        let c = apsk32_dvbs2(2.84, 5.27);
+        assert_eq!(c.points.len(), 32);
+        assert_eq!(c.bits_per_sym, 5);
+        let es: f64 = c.points.iter().map(|p| p.norm_sqr()).sum::<f64>() / c.points.len() as f64;
+        assert!((es - 1.0).abs() < 1e-10, "Es = {es}");
+    }
+
+    #[test]
+    fn apsk32_three_rings() {
+        // Vérifie qu'on a bien 4 points sur R1, 12 sur R2, 16 sur R3.
+        let c = apsk32_dvbs2(2.84, 5.27);
+        let mut radii: Vec<f64> = c.points.iter().map(|p| p.norm()).collect();
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Plus petits 4 = R1, suivants 12 = R2, derniers 16 = R3.
+        let r1 = radii[0];
+        let r2 = radii[4];
+        let r3 = radii[16];
+        // Tous les points de chaque anneau ont le même rayon.
+        for k in 0..4 {
+            assert!((radii[k] - r1).abs() < 1e-10, "R1 #{k} radius mismatch");
+        }
+        for k in 4..16 {
+            assert!((radii[k] - r2).abs() < 1e-10, "R2 #{k} radius mismatch");
+        }
+        for k in 16..32 {
+            assert!((radii[k] - r3).abs() < 1e-10, "R3 #{k} radius mismatch");
+        }
+        // Ratios DVB-S2 rate 3/4.
+        assert!((r2 / r1 - 2.84).abs() < 1e-10, "γ1 mismatch: {}", r2 / r1);
+        assert!((r3 / r1 - 5.27).abs() < 1e-10, "γ2 mismatch: {}", r3 / r1);
+    }
+
+    #[test]
+    fn apsk32_dvbs2_reference_points() {
+        // Vecteurs de référence : pour rate 3/4 (γ1=2.84, γ2=5.27),
+        // après normalisation Es=1, R1=r0, R2=2.84·r0, R3=5.27·r0
+        // avec r0 = sqrt(8/(1 + 3·2.84² + 4·5.27²)).
+        let c = apsk32_dvbs2(2.84, 5.27);
+        let r0 = (8.0_f64 / (1.0 + 3.0 * 2.84 * 2.84 + 4.0 * 5.27 * 5.27)).sqrt();
+        let r1 = r0;
+        let r2 = 2.84 * r0;
+        let r3 = 5.27 * r0;
+        let pi = std::f64::consts::PI;
+
+        // Index 17 (10001) → R1 à π/4.
+        let p17 = c.points[0b10001];
+        let exp17 = Complex64::new(r1 * (pi / 4.0).cos(), r1 * (pi / 4.0).sin());
+        assert!((p17 - exp17).norm() < 1e-10);
+
+        // Index 0 (00000) → R2 à π/4.
+        let p0 = c.points[0b00000];
+        let exp0 = Complex64::new(r2 * (pi / 4.0).cos(), r2 * (pi / 4.0).sin());
+        assert!((p0 - exp0).norm() < 1e-10);
+
+        // Index 24 (11000) → R3 à 0.
+        let p24 = c.points[0b11000];
+        let exp24 = Complex64::new(r3, 0.0);
+        assert!((p24 - exp24).norm() < 1e-10);
+
+        // Index 13 (01101) → R3 à π/2.
+        let p13 = c.points[0b01101];
+        let exp13 = Complex64::new(0.0, r3);
+        assert!((p13 - exp13).norm() < 1e-10);
+    }
+
+    #[test]
+    fn apsk32_distinct_points() {
+        let c = apsk32_dvbs2(2.84, 5.27);
+        for i in 0..32 {
+            for j in (i + 1)..32 {
+                let d = (c.points[i] - c.points[j]).norm();
+                assert!(d > 1e-6, "points {i} and {j} are identical");
+            }
+        }
+    }
+
+    #[test]
+    fn apsk32_roundtrip() {
+        let c = apsk32_dvbs2(2.84, 5.27);
+        let bits: Vec<u8> = (0..32u8)
+            .flat_map(|i| (0..5).rev().map(move |k| (i >> k) & 1))
             .collect();
         let syms = c.map_bits(&bits);
         let idx = c.slice_nearest(&syms);
