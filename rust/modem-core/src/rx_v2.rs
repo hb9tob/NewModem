@@ -1332,6 +1332,22 @@ mod tests {
         }
     }
 
+    /// Loopback FAST (16-APSK 1714 Bd β=0.15 LDPC 3/4) : valide
+    /// l'enchaînement sps=28 + β=0.15 + RRC + sync préambule + LDPC.
+    #[test]
+    fn loopback_v3_fast_small_payload() {
+        let cfg = crate::profile::profile_fast();
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(17)).collect();
+        let samples = tx_v3(&data, &cfg, 0xFA57_0001);
+        let r = rx_v3(&samples, &cfg).expect("rx_v3 None for FAST");
+        assert!(r.app_header.is_some(), "FAST : no AppHeader");
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "FAST loopback : payload mismatch",
+        );
+    }
+
     /// Loopback HIGH+ (32-APSK 1500 Bd β=0.20 LDPC 3/4) : valide
     /// l'enchaînement constellation Apsk32 + interleaver 5-bit +
     /// soft demap + LDPC 3/4 sur canal idéal.

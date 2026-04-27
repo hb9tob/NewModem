@@ -168,6 +168,9 @@ pub enum ProfileIndex {
     /// EXPERIMENTAL — 32-APSK 1500 Bd β=0.20 LDPC 3/4. Hors auto-détection,
     /// utilisable uniquement quand le RX est en mode forcé.
     HighPlus = 5,
+    /// EXPERIMENTAL — 16-APSK 1714 Bd β=0.15 LDPC 3/4. Hors auto-détection,
+    /// utilisable uniquement quand le RX est en mode forcé.
+    Fast = 6,
 }
 
 impl ProfileIndex {
@@ -185,6 +188,7 @@ impl ProfileIndex {
             3 => Some(Self::High),
             4 => Some(Self::Mega),
             5 => Some(Self::HighPlus),
+            6 => Some(Self::Fast),
             _ => None,
         }
     }
@@ -198,6 +202,7 @@ impl ProfileIndex {
             Self::High => profile_high(),
             Self::Mega => profile_mega(),
             Self::HighPlus => profile_high_plus(),
+            Self::Fast => profile_fast(),
         }
     }
 
@@ -209,26 +214,28 @@ impl ProfileIndex {
             Self::High => "HIGH",
             Self::Mega => "MEGA",
             Self::HighPlus => "HIGH+",
+            Self::Fast => "FAST",
         }
     }
 
     /// All profile indices in canonical order. EXPERIMENTAL profiles
-    /// (HighPlus, ...) sont inclus pour permettre leur sélection en mode
+    /// (HighPlus, Fast) sont inclus pour permettre leur sélection en mode
     /// forcé, mais ils ne participent PAS à l'auto-détection (cf.
     /// `is_experimental`).
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Ultra,
         Self::Robust,
         Self::Normal,
         Self::High,
         Self::Mega,
         Self::HighPlus,
+        Self::Fast,
     ];
 
     /// `true` pour les profils expérimentaux qui doivent être exclus de
     /// l'auto-détection (gate FFT). Utilisable seulement en mode forcé RX.
     pub fn is_experimental(self) -> bool {
-        matches!(self, Self::HighPlus)
+        matches!(self, Self::HighPlus | Self::Fast)
     }
 
     /// Preamble family used by this profile on the wire. The split is
@@ -243,6 +250,10 @@ impl ProfileIndex {
             Self::Normal | Self::High | Self::Mega | Self::HighPlus => PreambleFamily::A,
             Self::Robust => PreambleFamily::B,
             Self::Ultra => PreambleFamily::C,
+            // Fast a (sps=28, β=0.15), unique. Réutilise les symboles
+            // QPSK de famille A — la distinction est faite par mode forcé,
+            // pas par l'auto-détection. Le RRC est shaping-spécifique.
+            Self::Fast => PreambleFamily::A,
         }
     }
 
@@ -321,7 +332,10 @@ impl ModemConfig {
 }
 
 /// Known symbol rates (index -> rate).
-const SYMBOL_RATES: [(u8, f64); 7] = [
+///
+/// Rate à idx 7 = `AUDIO_RATE / 28` ≈ 1714.286 Bd, utilisé par le profil
+/// expérimental FAST. Choisi pour donner sps=28 entier à 48 kHz.
+const SYMBOL_RATES: [(u8, f64); 8] = [
     (0, 500.0),
     (1, 600.0),
     (2, 750.0),
@@ -329,6 +343,7 @@ const SYMBOL_RATES: [(u8, f64); 7] = [
     (4, 1200.0),
     (5, 1500.0),
     (6, 2000.0),
+    (7, 48_000.0 / 28.0),
 ];
 
 fn symbol_rate_index(rs: f64) -> u8 {
@@ -415,6 +430,27 @@ pub fn profile_ultra() -> ModemConfig {
         apsk_gamma: 2.85,
         apsk_gamma2: 0.0,
         pilot_pattern: PilotPattern::dense_ultra(),
+    }
+}
+
+/// EXPERIMENTAL — FAST : 16-APSK Rs=48000/28≈1714.3 Bd β=0.15 LDPC 3/4.
+///
+/// Diffère de HIGH par le couple (Rs, β) : Rs↑ pour pousser le débit,
+/// β↓ pour resserrer le spectre et garder la BW dans le plateau NBFM.
+/// Bande occupée à β=0.15 : 1971 Hz centrée sur 1100 Hz (114–2086 Hz).
+/// SPS=28 entier à 48 kHz par construction du symbol_rate.
+/// Net brut : 1714.3 × 4 × 0.75 × (32/34) ≈ 4840 bps (vs ~4235 pour HIGH).
+pub fn profile_fast() -> ModemConfig {
+    ModemConfig {
+        constellation: ConstellationType::Apsk16,
+        ldpc_rate: LdpcRate::R3_4,
+        symbol_rate: 48_000.0 / 28.0,
+        beta: 0.15,
+        tau: 1.0,
+        center_freq_hz: DATA_CENTER_HZ,
+        apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
+        pilot_pattern: PilotPattern::default_v3(),
     }
 }
 
