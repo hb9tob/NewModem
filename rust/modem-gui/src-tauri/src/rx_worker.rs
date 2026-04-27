@@ -223,17 +223,25 @@ impl WorkerHandle {
     }
 }
 
+/// Démarre un worker RX.
+///
+/// Si `forced=true`, le profil RX est verrouillé sur `profile` :
+/// - le gate FFT (auto-détection famille) est bypass complet,
+/// - la post-décode header refine est bypass aussi.
+/// C'est obligatoire pour décoder les profils EXPERIMENTAL (HIGH+, FAST)
+/// qui ne sont pas dans `PROBE_TEMPLATES` et ne s'auto-détectent pas.
 pub fn spawn(
     samples: Receiver<Vec<f32>>,
     app: AppHandle,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
+    forced: bool,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        run_worker(samples, app, save_dir, wav_sink, profile, stop_thread);
+        run_worker(samples, app, save_dir, wav_sink, profile, forced, stop_thread);
     });
     WorkerHandle {
         stop,
@@ -284,6 +292,10 @@ const PREAMBLE_SILENCE_TIMEOUT_S: u64 = 6;
 struct WorkerState {
     config: ModemConfig,
     profile: ProfileIndex,
+    /// `true` quand le profil RX est verrouillé par l'utilisateur (UI :
+    /// "Forcer un profil"). Désactive l'auto-détection (gate FFT) et la
+    /// post-décode header refine. Indispensable pour HIGH+/FAST.
+    forced: bool,
     /// Accumulated audio for the current capture. Rolled to PREROLL_SECONDS
     /// while Idle (cheap noise buffer) ; bounded to CAPTURE_WINDOW_SECONDS
     /// while Capturing so rx_v3 stays fast even on long salves.
@@ -316,11 +328,12 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(profile: ProfileIndex, store: SessionStore) -> Self {
+    fn new(profile: ProfileIndex, forced: bool, store: SessionStore) -> Self {
         let now = Instant::now();
         Self {
             config: profile.to_config(),
             profile,
+            forced,
             session_buffer: Vec::new(),
             store,
             announced_sessions: HashSet::new(),
@@ -372,10 +385,14 @@ fn run_worker(
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
+    forced: bool,
     stop: Arc<AtomicBool>,
 ) {
     let _ = std::fs::remove_file(log_path());
-    worker_log(&format!("[worker] start V3 profile={:?}", profile));
+    worker_log(&format!(
+        "[worker] start V3 profile={:?} forced={}",
+        profile, forced
+    ));
 
     // Initialise the disk-persistent session store. Expired sessions (> 24 h)
     // are dropped on construction.
@@ -387,7 +404,7 @@ fn run_worker(
             return;
         }
     };
-    let mut state = WorkerState::new(profile, store);
+    let mut state = WorkerState::new(profile, forced, store);
 
     while !stop.load(Ordering::Relaxed) {
         let first = match samples.recv_timeout(Duration::from_millis(200)) {
@@ -559,7 +576,7 @@ fn scan_and_route(
     let mut t_probe_us: u128 = 0;
     let mut probe_ratio: f64 = 0.0;
     let mut probe_label: String = String::from("-");
-    if !state.session_active && !state.session_buffer.is_empty() {
+    if !state.forced && !state.session_active && !state.session_buffer.is_empty() {
         let probe = modem_core::gate::PreambleProbe::for_buf_len(state.session_buffer.len());
         let t0 = Instant::now();
         let r = probe.check(&state.session_buffer);
@@ -588,6 +605,9 @@ fn scan_and_route(
             state.config = want_anchor.to_config();
         }
     }
+    // En mode forcé : pas de gate FFT (les profils EXPERIMENTAL ne sont pas
+    // dans PROBE_TEMPLATES), pas de squelch sur préambule. rx_v3 fera son
+    // propre find_preamble en aval — sur du bruit pur il sort vite (None).
 
     // `t_detect_us` retained in the [scan] log for compatibility with
     // existing baseline captures ; phase-2b removes detect_best_profile
@@ -633,48 +653,65 @@ fn scan_and_route(
     // 1-Hz scan tick the leading edge of the 1st superframe is gone — the
     // user sees ESI 0..N missing, exactly the failure mode reported on
     // NORMAL OTA captures.
-    if let Some(ref hdr) = result.header {
+    if !state.forced {
+        if let Some(ref hdr) = result.header {
+            if let Some(hdr_profile) =
+                modem_core::profile::ProfileIndex::from_u8(hdr.profile_index)
+            {
+                if hdr_profile != state.profile {
+                    worker_log(&format!(
+                        "[auto-profile] header says {:?} (was {:?}), re-decoding window",
+                        hdr_profile, state.profile
+                    ));
+                    state.profile = hdr_profile;
+                    state.config = hdr_profile.to_config();
+                    state.header = None;
+                    state.announced_sessions.clear();
+                    // The closed-window watermark was computed under the
+                    // wrong profile (different Rs/pitch can shift detected
+                    // positions). Drop it so the re-decode below scans
+                    // everything fresh.
+                    state.last_closed_preamble_abs = None;
+                    let _ = app.emit(
+                        "profile_auto_detected",
+                        serde_json::json!({ "profile": profile_name(state.profile) }),
+                    );
+                    let new_config = state.config.clone();
+                    match rx_v2::rx_v3(&state.session_buffer, &new_config) {
+                        Some(refresh) => {
+                            // Defensive : if the fresh header still claims a
+                            // different profile, give up rather than loop.
+                            let still_mismatched = refresh
+                                .header
+                                .as_ref()
+                                .and_then(|h| {
+                                    modem_core::profile::ProfileIndex::from_u8(h.profile_index)
+                                })
+                                .map(|p| p != state.profile)
+                                .unwrap_or(false);
+                            if still_mismatched {
+                                worker_log(
+                                    "[auto-profile] still mismatched after re-decode, giving up",
+                                );
+                                return;
+                            }
+                            result = refresh;
+                        }
+                        None => return,
+                    }
+                }
+            }
+        }
+    } else if let Some(ref hdr) = result.header {
+        // Mode forcé : on ne switche PAS le profil, mais on logue les
+        // discordances pour aider au debug ("le pair envoie HIGH alors qu'on
+        // est forcé sur HIGH+").
         if let Some(hdr_profile) = modem_core::profile::ProfileIndex::from_u8(hdr.profile_index) {
             if hdr_profile != state.profile {
                 worker_log(&format!(
-                    "[auto-profile] header says {:?} (was {:?}), re-decoding window",
+                    "[forced] header says {:?}, mode forcé sur {:?} → décodage attendu invalide",
                     hdr_profile, state.profile
                 ));
-                state.profile = hdr_profile;
-                state.config = hdr_profile.to_config();
-                state.header = None;
-                state.announced_sessions.clear();
-                // The closed-window watermark was computed under the wrong
-                // profile (different Rs/pitch can shift detected positions).
-                // Drop it so the re-decode below scans everything fresh.
-                state.last_closed_preamble_abs = None;
-                let _ = app.emit(
-                    "profile_auto_detected",
-                    serde_json::json!({ "profile": profile_name(state.profile) }),
-                );
-                let new_config = state.config.clone();
-                match rx_v2::rx_v3(&state.session_buffer, &new_config) {
-                    Some(refresh) => {
-                        // Defensive : if the fresh header still claims a
-                        // different profile, give up rather than loop.
-                        let still_mismatched = refresh
-                            .header
-                            .as_ref()
-                            .and_then(|h| {
-                                modem_core::profile::ProfileIndex::from_u8(h.profile_index)
-                            })
-                            .map(|p| p != state.profile)
-                            .unwrap_or(false);
-                        if still_mismatched {
-                            worker_log(
-                                "[auto-profile] still mismatched after re-decode, giving up",
-                            );
-                            return;
-                        }
-                        result = refresh;
-                    }
-                    None => return,
-                }
             }
         }
     }

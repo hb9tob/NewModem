@@ -138,6 +138,7 @@ fn ptt_status(state: State<'_, AppState>) -> PttStatusEvent {
 fn start_capture(
     device_name: String,
     profile: Option<String>,
+    forced: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -151,8 +152,18 @@ fn start_capture(
         "NORMAL" => modem_core::profile::ProfileIndex::Normal,
         "ROBUST" => modem_core::profile::ProfileIndex::Robust,
         "ULTRA" => modem_core::profile::ProfileIndex::Ultra,
+        // EXPERIMENTAL : seulement utilisable si forced=true.
+        "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
+        "FAST" => modem_core::profile::ProfileIndex::Fast,
         other => return Err(format!("unknown profile '{other}'")),
     };
+    let forced = forced.unwrap_or(false);
+    if profile_idx.is_experimental() && !forced {
+        return Err(format!(
+            "profil '{}' est expérimental, requiert forced=true",
+            profile_idx.name()
+        ));
+    }
     let (capture, samples) = audio_capture::start(&device_name)?;
     let worker = rx_worker::spawn(
         samples,
@@ -160,6 +171,7 @@ fn start_capture(
         state.save_dir.clone(),
         state.wav_sink.clone(),
         profile_idx,
+        forced,
     );
     *guard = Some(CaptureSession {
         capture,
