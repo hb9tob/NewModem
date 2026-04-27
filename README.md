@@ -29,19 +29,30 @@ mode data — voir [rapport canal](rapport_canal_nbfm.html).
 Design single-carrier inspiré du modem QO-100 d'EA4GPZ (HSMODEM), avec
 LDPC WiMAX 2304 (LNMS) et chaîne RX FSE T/2 + DD-PLL + soft demap LLR.
 
-Cinq profils sélectionnables (`rust/modem-core/src/profile.rs`) :
+Sept profils sélectionnables (`rust/modem-core/src/profile.rs`) — cinq
+stables auto-détectés et deux expérimentaux qui demandent un mode forcé
+côté RX :
 
-| Profil | Constellation | Rs (Bd) | β | τ | LDPC |
-|---|---|---|---|---|---|
-| ULTRA  | QPSK     | 500  | 0.25 | 1.0   | 1/2 |
-| ROBUST | QPSK     | 1000 | 0.25 | 1.0   | 1/2 |
-| NORMAL | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 |
-| HIGH   | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 |
-| MEGA   | 16-APSK  | 1500 | 0.20 | 30/32 | 3/4 |
+| Profil | Constellation | Rs (Bd) | β | τ | LDPC | Net brut |
+|---|---|---|---|---|---|---|
+| ULTRA  | QPSK     | 500  | 0.25 | 1.0   | 1/2 | ~444 bps |
+| ROBUST | QPSK     | 1000 | 0.25 | 1.0   | 1/2 | ~941 bps |
+| NORMAL | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 | ~2 117 bps |
+| HIGH   | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 | ~4 235 bps |
+| MEGA   | 16-APSK  | 1500 | 0.20 | 30/32 | 3/4 | ~3 971 bps |
+| **HIGH+** ⚠ | **32-APSK DVB-S2** | 1500 | 0.20 | 1.0 | 3/4 | **~5 294 bps** |
+| **FAST** ⚠  | 16-APSK | **1714** (sps=28) | **0.15** | 1.0 | 3/4 | **~4 840 bps** |
 
 Le sweet spot **Rs=1500 Bd, β=0.20** tient dans la BW utile NBFM ; MEGA
 ajoute du FTN (τ<1) pour pousser le débit. Voir [rapport modem SC](rapport_modem.html)
 et [rapport 16-APSK + FTN](rapport_apsk16_ftn.html).
+
+⚠ **Profils expérimentaux HIGH+ et FAST** — validés OTA à 100 % sur
+relais NBFM dans nos tests. Hors auto-détection : le pair RX doit
+activer "Forcer un profil" dans l'onglet RX et choisir le même mode.
+HIGH+ utilise la constellation 32-APSK DVB-S2 (rayons γ1=2.84, γ2=5.27
+pour LDPC 3/4 — table 10 ETSI EN 302 307-1). FAST resserre β et pousse
+Rs pour gagner ~14 % vs HIGH sans changer la constellation.
 
 ### Simulateur de canal
 
@@ -220,19 +231,30 @@ Single-carrier design inspired by EA4GPZ's QO-100 modem (HSMODEM), with
 WiMAX 2304 LDPC (LNMS) and an RX chain built on FSE T/2 + DD-PLL + soft
 LLR demap.
 
-Five selectable profiles (`rust/modem-core/src/profile.rs`):
+Seven selectable profiles (`rust/modem-core/src/profile.rs`) — five
+stable ones with auto-detection plus two experimental that require
+forced-mode RX:
 
-| Profile | Constellation | Rs (Bd) | β | τ | LDPC |
-|---|---|---|---|---|---|
-| ULTRA  | QPSK     | 500  | 0.25 | 1.0   | 1/2 |
-| ROBUST | QPSK     | 1000 | 0.25 | 1.0   | 1/2 |
-| NORMAL | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 |
-| HIGH   | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 |
-| MEGA   | 16-APSK  | 1500 | 0.20 | 30/32 | 3/4 |
+| Profile | Constellation | Rs (Bd) | β | τ | LDPC | Net |
+|---|---|---|---|---|---|---|
+| ULTRA  | QPSK     | 500  | 0.25 | 1.0   | 1/2 | ~444 bps |
+| ROBUST | QPSK     | 1000 | 0.25 | 1.0   | 1/2 | ~941 bps |
+| NORMAL | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 | ~2,117 bps |
+| HIGH   | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 | ~4,235 bps |
+| MEGA   | 16-APSK  | 1500 | 0.20 | 30/32 | 3/4 | ~3,971 bps |
+| **HIGH+** ⚠ | **32-APSK DVB-S2** | 1500 | 0.20 | 1.0 | 3/4 | **~5,294 bps** |
+| **FAST** ⚠  | 16-APSK | **1714** (sps=28) | **0.15** | 1.0 | 3/4 | **~4,840 bps** |
 
 The **Rs=1500 Bd, β=0.20** sweet spot fits inside the NBFM audio plateau;
 MEGA layers FTN (τ<1) on top to push throughput. See
 [SC modem report](rapport_modem.html) and [16-APSK + FTN report](rapport_apsk16_ftn.html).
+
+⚠ **Experimental profiles HIGH+ and FAST** — validated OTA at 100 % on
+NBFM repeaters in our tests. Excluded from auto-detection: the RX peer
+must enable "Forcer un profil" in the RX tab and pick the same mode.
+HIGH+ uses the DVB-S2 32-APSK constellation (radii γ1=2.84, γ2=5.27 for
+LDPC 3/4 — table 10 in ETSI EN 302 307-1). FAST tightens β and bumps Rs
+to gain ~14 % over HIGH without changing the constellation.
 
 ### Channel simulator
 
