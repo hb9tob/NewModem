@@ -605,6 +605,10 @@ fn profile_index_of(name: &str) -> u8 {
         "NORMAL" => modem_core::profile::ProfileIndex::Normal as u8,
         "ROBUST" => modem_core::profile::ProfileIndex::Robust as u8,
         "ULTRA" => modem_core::profile::ProfileIndex::Ultra as u8,
+        // EXPERIMENTAL — pas dans l'auto-détection RX, le pair doit forcer
+        // le mode pour les recevoir.
+        "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus as u8,
+        "FAST" => modem_core::profile::ProfileIndex::Fast as u8,
         _ => 0xFF,
     }
 }
@@ -658,8 +662,16 @@ fn parse_profile(name: &str) -> ModemConfig {
         "NORMAL" => profile::profile_normal(),
         "ROBUST" => profile::profile_robust(),
         "ULTRA" => profile::profile_ultra(),
+        // EXPERIMENTAL — hors auto-détection RX. Le pair doit utiliser
+        // le même profil forcé pour décoder.
+        "HIGH+" | "HIGHPLUS" => profile::profile_high_plus(),
+        "FAST" => profile::profile_fast(),
         _ => {
-            eprintln!("Unknown profile '{}'. Available: MEGA, HIGH, NORMAL, ROBUST, ULTRA", name);
+            eprintln!(
+                "Unknown profile '{}'. Stable: MEGA, HIGH, NORMAL, ROBUST, ULTRA. \
+                 Experimental (forced-mode only): HIGH+, FAST",
+                name
+            );
             std::process::exit(1);
         }
     }
@@ -670,8 +682,12 @@ fn parse_constellation(s: &str) -> ConstellationType {
         "qpsk" => ConstellationType::Qpsk,
         "8psk" => ConstellationType::Psk8,
         "16apsk" | "16-apsk" | "apsk16" => ConstellationType::Apsk16,
+        "32apsk" | "32-apsk" | "apsk32" => ConstellationType::Apsk32,
         _ => {
-            eprintln!("Unknown constellation '{}'. Available: qpsk, 8psk, 16apsk", s);
+            eprintln!(
+                "Unknown constellation '{}'. Available: qpsk, 8psk, 16apsk, 32apsk",
+                s
+            );
             std::process::exit(1);
         }
     }
