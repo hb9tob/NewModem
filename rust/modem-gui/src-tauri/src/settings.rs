@@ -38,8 +38,10 @@ pub struct Settings {
     /// Défaut 5 : redondance modeste, l'utilisateur monte au besoin.
     #[serde(default = "default_tx_repair_pct")]
     pub tx_repair_pct: u32,
-    /// Mode modem sélectionné dans la fenêtre TX (ULTRA / ROBUST / NORMAL /
-    /// HIGH / MEGA). Défaut HIGH (correspond à l'option HTML cochée).
+    /// Mode modem sélectionné dans la fenêtre TX. Profils standards :
+    /// ULTRA / ROBUST / NORMAL / HIGH / HIGH56 / HIGH+. Profils
+    /// expérimentaux (visibles si `experimental_modes_enabled`) :
+    /// MEGA / FAST / HIGH++ / HIGH+56. Défaut HIGH56.
     #[serde(default = "default_tx_mode")]
     pub tx_mode: String,
     /// Choix de redimensionnement (`none`, `1920x1024`, `800x600`, `free`).
@@ -61,6 +63,22 @@ pub struct Settings {
     /// anciens sont purgés à chaque archivage.
     #[serde(default = "default_tx_history_max")]
     pub tx_history_max: u32,
+    /// Verrouillage RX sur un profil donné (bypass auto-détection du
+    /// gate FFT). Indispensable pour décoder les profils expérimentaux
+    /// (MEGA, FAST, HIGH++, HIGH+56) qui ne sont pas dans
+    /// `PROBE_TEMPLATES`. Défaut false.
+    #[serde(default)]
+    pub rx_force_mode: bool,
+    /// Profil à forcer côté RX quand `rx_force_mode = true`. Ignoré
+    /// sinon. Défaut HIGH56 (le profil standard recommandé).
+    #[serde(default = "default_rx_forced_profile")]
+    pub rx_forced_profile: String,
+    /// Affiche/masque les profils expérimentaux dans les combos TX et
+    /// RX et l'option « Forcer un profil » au démarrage. Défaut false :
+    /// l'utilisateur découvre l'application avec uniquement les profils
+    /// standards exposés. Activable via Paramètres.
+    #[serde(default)]
+    pub experimental_modes_enabled: bool,
 }
 
 fn default_tx_quality() -> u32 {
@@ -72,7 +90,11 @@ fn default_tx_repair_pct() -> u32 {
 }
 
 fn default_tx_mode() -> String {
-    "HIGH".to_string()
+    "HIGH56".to_string()
+}
+
+fn default_rx_forced_profile() -> String {
+    "HIGH56".to_string()
 }
 
 fn default_tx_resize() -> String {
@@ -122,6 +144,9 @@ impl Default for Settings {
             tx_speed: default_tx_speed(),
             tx_more_count: default_tx_more_count(),
             tx_history_max: default_tx_history_max(),
+            rx_force_mode: false,
+            rx_forced_profile: default_rx_forced_profile(),
+            experimental_modes_enabled: false,
         }
     }
 }

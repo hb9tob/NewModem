@@ -37,7 +37,7 @@
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
         <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
       </div>
-      <div class="rx-force-bar">
+      <div class="rx-force-bar" id="rx-force-bar" hidden>
         <label>
           <input type="checkbox" id="rx-force-mode">
           Forcer un profil
@@ -46,12 +46,12 @@
           <option value="ULTRA">ULTRA</option>
           <option value="ROBUST">ROBUST</option>
           <option value="NORMAL">NORMAL</option>
-          <option value="HIGH" selected>HIGH</option>
+          <option value="HIGH">HIGH</option>
           <option value="HIGH+">HIGH+</option>
+          <option value="HIGH56" selected>HIGH56</option>
           <option value="MEGA" class="experimental-option">⚠ MEGA [EXPÉRIMENTAL]</option>
           <option value="FAST" class="experimental-option">⚠ FAST [EXPÉRIMENTAL]</option>
           <option value="HIGH++" class="experimental-option">⚠ HIGH++ [EXPÉRIMENTAL]</option>
-          <option value="HIGH56" class="experimental-option">⚠ HIGH56 [EXPÉRIMENTAL]</option>
           <option value="HIGH+56" class="experimental-option">⚠ HIGH+56 [EXPÉRIMENTAL]</option>
         </select>
         <span class="rx-force-hint">prend effet au prochain ▶ Démarrer</span>
@@ -105,12 +105,12 @@
             <option value="ULTRA">ULTRA — QPSK τ=1, LDPC 1/2 — 444 bps</option>
             <option value="ROBUST">ROBUST — QPSK τ=1, LDPC 1/2 — 941 bps</option>
             <option value="NORMAL">NORMAL — 8-PSK τ=1, LDPC 1/2 — 2118 bps</option>
-            <option value="HIGH" selected>HIGH — 16-APSK τ=1, LDPC 3/4 — 4235 bps</option>
+            <option value="HIGH">HIGH — 16-APSK τ=1, LDPC 3/4 — 4235 bps</option>
+            <option value="HIGH56" selected>HIGH56 — 16-APSK τ=1, LDPC 5/6 — 4706 bps</option>
             <option value="HIGH+">HIGH+ — 32-APSK τ=1, LDPC 3/4 — 5294 bps</option>
             <option value="MEGA" class="experimental-option">⚠ MEGA — 16-APSK τ=30/32, LDPC 3/4 — 3971 bps [EXPÉRIMENTAL]</option>
             <option value="FAST" class="experimental-option">⚠ FAST — 16-APSK Rs=1714 β=0.15, LDPC 3/4 — 4840 bps [EXPÉRIMENTAL]</option>
             <option value="HIGH++" class="experimental-option">⚠ HIGH++ — 64-APSK τ=1, LDPC 3/4 — 6000 bps [EXPÉRIMENTAL]</option>
-            <option value="HIGH56" class="experimental-option">⚠ HIGH56 — 16-APSK τ=1, LDPC 5/6 — 4706 bps [EXPÉRIMENTAL]</option>
             <option value="HIGH+56" class="experimental-option">⚠ HIGH+56 — 32-APSK τ=1, LDPC 5/6 — 5882 bps [EXPÉRIMENTAL]</option>
           </select>
           <div id="tx-experimental-warn" class="experimental-warn" hidden>
@@ -273,6 +273,19 @@
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
             Au-delà, les plus anciens sont purgés à chaque nouvelle émission.
             Stocké sous <code>&lt;save_dir&gt;/tx_history/</code>.
+          </p>
+        </fieldset>
+        <fieldset>
+          <legend>Modes expérimentaux</legend>
+          <label class="ptt-row">
+            <input type="checkbox" id="experimental-modes-enabled">
+            Activer les modes expérimentaux
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Affiche les profils marqués ⚠ dans les combos TX et RX (MEGA,
+            FAST, HIGH++, HIGH+56), et l'option « Forcer un profil » au
+            démarrage RX. Ces modes ne sont décodables que par un pair
+            sur la même version de l'appli en mode forcé.
           </p>
         </fieldset>
         <div class="settings-status" id="settings-status">—</div>

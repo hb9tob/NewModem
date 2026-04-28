@@ -518,7 +518,7 @@ let currentSettings = {
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
-  tx_mode: "HIGH",
+  tx_mode: "HIGH56",
   tx_resize: "800x600",
   tx_free_w: 800,
   tx_free_h: 600,
@@ -526,9 +526,15 @@ let currentSettings = {
   tx_more_count: 5,
   /// Si true, le profil RX est verrouillé sur rx_forced_profile et
   /// l'auto-détection est désactivée. Indispensable pour recevoir
-  /// MEGA, FAST, HIGH++, HIGH56 ou HIGH+56 (hors PROBE_TEMPLATES).
+  /// MEGA, FAST, HIGH++ ou HIGH+56 (hors PROBE_TEMPLATES).
   rx_force_mode: false,
-  rx_forced_profile: "HIGH",
+  rx_forced_profile: "HIGH56",
+  /// Si true, les profils expérimentaux apparaissent dans les combos TX
+  /// et RX et l'UI « Forcer un profil » devient visible au démarrage.
+  /// Si false (défaut) : combos filtrés sur les profils standards
+  /// (ULTRA / ROBUST / NORMAL / HIGH / HIGH56 / HIGH+) et la barre
+  /// rx-force-bar est masquée.
+  experimental_modes_enabled: false,
 };
 
 function populateDeviceSelect(selectId, devices, savedName) {
@@ -635,6 +641,7 @@ async function loadSettings() {
   if (call) call.value = currentSettings.callsign || "";
   applyPttSettingsToUI();
   applyRxForceSettingsToUI();
+  applyExperimentalModesToUI();
   const colUrl = document.getElementById("collector-url");
   if (colUrl) colUrl.value = currentSettings.collector_url || "";
   const histMax = document.getElementById("tx-history-max-input");
@@ -647,8 +654,38 @@ function applyRxForceSettingsToUI() {
   const sel = document.getElementById("rx-forced-profile");
   if (cb) cb.checked = !!currentSettings.rx_force_mode;
   if (sel) {
-    sel.value = currentSettings.rx_forced_profile || "HIGH";
+    sel.value = currentSettings.rx_forced_profile || "HIGH56";
     sel.disabled = !currentSettings.rx_force_mode;
+  }
+}
+
+/// Applique l'état du toggle « Activer les modes expérimentaux » :
+/// - met à jour la case à cocher des paramètres
+/// - masque/affiche les options .experimental-option dans tous les combos
+/// - masque/affiche la barre « Forcer un profil » de l'onglet RX
+/// Si l'utilisateur désactive le toggle alors que rx_force_mode est ON,
+/// on désactive le mode forcé pour éviter de rester verrouillé sur un
+/// profil expérimental sans pouvoir y accéder.
+function applyExperimentalModesToUI() {
+  const enabled = !!currentSettings.experimental_modes_enabled;
+  const cb = document.getElementById("experimental-modes-enabled");
+  if (cb) cb.checked = enabled;
+
+  document.querySelectorAll(".experimental-option").forEach((opt) => {
+    opt.hidden = !enabled;
+    opt.disabled = !enabled;
+  });
+
+  const forceBar = document.getElementById("rx-force-bar");
+  if (forceBar) forceBar.hidden = !enabled;
+
+  if (!enabled && currentSettings.rx_force_mode) {
+    currentSettings.rx_force_mode = false;
+    const forceCb = document.getElementById("rx-force-mode");
+    const forceSel = document.getElementById("rx-forced-profile");
+    if (forceCb) forceCb.checked = false;
+    if (forceSel) forceSel.disabled = true;
+    persistSettings();
   }
 }
 
@@ -663,7 +700,7 @@ function applyTxSettingsToUI() {
   const mc = intOr(currentSettings.tx_more_count, 5);
   const fw = intOr(currentSettings.tx_free_w, 800);
   const fh = intOr(currentSettings.tx_free_h, 600);
-  const mode = currentSettings.tx_mode || "HIGH";
+  const mode = currentSettings.tx_mode || "HIGH56";
   const resize = currentSettings.tx_resize || "800x600";
 
   txState.quality = q;
@@ -878,6 +915,14 @@ function setupSettingsTab() {
   if (histMax) {
     histMax.addEventListener("change", persistSettings);
     histMax.addEventListener("blur", persistSettings);
+  }
+  const expEnabled = document.getElementById("experimental-modes-enabled");
+  if (expEnabled) {
+    expEnabled.addEventListener("change", () => {
+      currentSettings.experimental_modes_enabled = expEnabled.checked;
+      applyExperimentalModesToUI();
+      persistSettings();
+    });
   }
 }
 

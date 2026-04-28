@@ -284,17 +284,19 @@ impl ProfileIndex {
     /// `true` pour les profils expérimentaux qui doivent être exclus de
     /// l'auto-détection (gate FFT). Utilisable seulement en mode forcé RX.
     ///
-    /// MEGA basculé en expérimental 2026-04-28 : son débit théorique
-    /// (3971 bps) est inférieur à HIGH (4235) malgré sa complexité FTN
-    /// τ=30/32 — HIGH+ (32-APSK validé OTA HB9MM) le remplace dans la
-    /// hiérarchie standard.
+    /// Évolutions 2026-04-28 :
+    /// - MEGA basculé expérimental : débit théorique (3971 bps) inférieur
+    ///   à HIGH (4235) malgré complexité FTN τ=30/32. HIGH+ (32-APSK
+    ///   validé OTA HB9MM) remplace MEGA dans la hiérarchie standard.
+    /// - HIGH56 promu standard : meilleur compromis vitesse / robustesse
+    ///   sur HB9MM (4706 bps avec 16-APSK, marge SNR confortable). Devient
+    ///   le profil **par défaut** côté GUI.
     pub fn is_experimental(self) -> bool {
         matches!(
             self,
             Self::Mega
                 | Self::Fast
                 | Self::HighPlusPlus
-                | Self::HighFiveSix
                 | Self::HighPlusFiveSix
         )
     }
