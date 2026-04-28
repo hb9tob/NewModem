@@ -1365,6 +1365,38 @@ mod tests {
         );
     }
 
+    /// Loopback HIGH⁵⁶ (16-APSK 1500 Bd β=0.20 LDPC 5/6) : valide
+    /// la matrice LDPC 5/6 IEEE 802.16e dans le pipeline complet.
+    #[test]
+    fn loopback_v3_high_5_6_small_payload() {
+        let cfg = crate::profile::profile_high_5_6();
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(7)).collect();
+        let samples = tx_v3(&data, &cfg, 0xC0DE_0056);
+        let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH56");
+        assert!(r.app_header.is_some(), "HIGH56 : no AppHeader");
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "HIGH56 loopback : payload mismatch",
+        );
+    }
+
+    /// Loopback HIGH+⁵⁶ (32-APSK 1500 Bd β=0.20 LDPC 5/6) : valide la
+    /// matrice LDPC 5/6 sur la constellation 32-APSK.
+    #[test]
+    fn loopback_v3_high_plus_5_6_small_payload() {
+        let cfg = crate::profile::profile_high_plus_5_6();
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(19)).collect();
+        let samples = tx_v3(&data, &cfg, 0xC0DE_5656);
+        let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH+56");
+        assert!(r.app_header.is_some(), "HIGH+56 : no AppHeader");
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "HIGH+56 loopback : payload mismatch",
+        );
+    }
+
     /// Loopback HIGH+ (32-APSK 1500 Bd β=0.20 LDPC 3/4) : valide
     /// l'enchaînement constellation Apsk32 + interleaver 5-bit +
     /// soft demap + LDPC 3/4 sur canal idéal.

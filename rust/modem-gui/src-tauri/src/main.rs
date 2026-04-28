@@ -156,6 +156,8 @@ fn start_capture(
         "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
         "FAST" => modem_core::profile::ProfileIndex::Fast,
         "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
+        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix,
+        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix,
         other => return Err(format!("unknown profile '{other}'")),
     };
     let forced = forced.unwrap_or(false);

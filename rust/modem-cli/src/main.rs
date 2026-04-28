@@ -610,6 +610,8 @@ fn profile_index_of(name: &str) -> u8 {
         "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus as u8,
         "FAST" => modem_core::profile::ProfileIndex::Fast as u8,
         "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus as u8,
+        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix as u8,
+        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix as u8,
         _ => 0xFF,
     }
 }
@@ -668,10 +670,12 @@ fn parse_profile(name: &str) -> ModemConfig {
         "HIGH+" | "HIGHPLUS" => profile::profile_high_plus(),
         "FAST" => profile::profile_fast(),
         "HIGH++" | "HIGHPLUSPLUS" => profile::profile_high_plus_plus(),
+        "HIGH56" | "HIGH-56" => profile::profile_high_5_6(),
+        "HIGH+56" | "HIGHPLUS56" => profile::profile_high_plus_5_6(),
         _ => {
             eprintln!(
-                "Unknown profile '{}'. Stable: MEGA, HIGH, NORMAL, ROBUST, ULTRA. \
-                 Experimental (forced-mode only): HIGH+, FAST, HIGH++",
+                "Unknown profile '{}'. Stable: ULTRA, ROBUST, NORMAL, HIGH, HIGH+. \
+                 Experimental (forced-mode only): MEGA, FAST, HIGH++, HIGH56, HIGH+56",
                 name
             );
             std::process::exit(1);

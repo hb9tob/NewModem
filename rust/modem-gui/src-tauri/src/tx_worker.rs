@@ -89,12 +89,14 @@ pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
         "NORMAL" => Ok(profile::profile_normal()),
         "ROBUST" => Ok(profile::profile_robust()),
         "ULTRA" => Ok(profile::profile_ultra()),
-        // EXPERIMENTAL — décodable seulement par un pair en mode forcé sur
-        // le même profil. Cf. profile.rs::profile_high_plus / profile_fast /
-        // profile_high_plus_plus.
+        // HIGH+ promu standard depuis 2026-04-28 (validé OTA HB9MM).
         "HIGH+" | "HIGHPLUS" => Ok(profile::profile_high_plus()),
+        // EXPERIMENTAL — décodable seulement par un pair en mode forcé sur
+        // le même profil.
         "FAST" => Ok(profile::profile_fast()),
         "HIGH++" | "HIGHPLUSPLUS" => Ok(profile::profile_high_plus_plus()),
+        "HIGH56" | "HIGH-56" => Ok(profile::profile_high_5_6()),
+        "HIGH+56" | "HIGHPLUS56" => Ok(profile::profile_high_plus_5_6()),
         _ => Err(format!("unknown profile '{name}'")),
     }
 }

@@ -67,6 +67,11 @@ pub enum LdpcRate {
     R1_2,
     R2_3,
     R3_4,
+    /// 5/6 = 0.8333. Matrice IEEE 802.16e (RPTU alist), k=1920, n=2304.
+    /// Utilisé par les profils HIGH⁵⁶ et HIGH+⁵⁶ (expérimentaux) pour
+    /// gratter +11 % de débit vs leurs équivalents 3/4 — au prix de
+    /// ~0.7 dB de marge LDPC en moins.
+    R5_6,
 }
 
 impl LdpcRate {
@@ -76,6 +81,7 @@ impl LdpcRate {
             Self::R1_2 => 0.5,
             Self::R2_3 => 2.0 / 3.0,
             Self::R3_4 => 0.75,
+            Self::R5_6 => 5.0 / 6.0,
         }
     }
 
@@ -85,6 +91,7 @@ impl LdpcRate {
             Self::R1_2 => 1152,
             Self::R2_3 => 1536,
             Self::R3_4 => 1728,
+            Self::R5_6 => 1920,
         }
     }
 
@@ -99,6 +106,7 @@ impl LdpcRate {
             Self::R1_2 => 0,
             Self::R2_3 => 1,
             Self::R3_4 => 2,
+            Self::R5_6 => 3,
         }
     }
 
@@ -107,6 +115,7 @@ impl LdpcRate {
             0 => Some(Self::R1_2),
             1 => Some(Self::R2_3),
             2 => Some(Self::R3_4),
+            3 => Some(Self::R5_6),
             _ => None,
         }
     }
@@ -184,8 +193,8 @@ pub enum ProfileIndex {
     Normal = 2,
     High = 3,
     Mega = 4,
-    /// EXPERIMENTAL — 32-APSK 1500 Bd β=0.20 LDPC 3/4. Hors auto-détection,
-    /// utilisable uniquement quand le RX est en mode forcé.
+    /// 32-APSK 1500 Bd β=0.20 LDPC 3/4. Profil **standard** depuis OTA
+    /// HB9MM 2026-04 (validé en pratique, équivalent débit/marge à HIGH).
     HighPlus = 5,
     /// EXPERIMENTAL — 16-APSK 1714 Bd β=0.15 LDPC 3/4. Hors auto-détection,
     /// utilisable uniquement quand le RX est en mode forcé.
@@ -193,6 +202,12 @@ pub enum ProfileIndex {
     /// EXPERIMENTAL — 64-APSK DVB-S2X 1500 Bd β=0.20 LDPC 3/4. Hors
     /// auto-détection, utilisable uniquement quand le RX est en mode forcé.
     HighPlusPlus = 7,
+    /// EXPERIMENTAL — 16-APSK 1500 Bd β=0.20 LDPC **5/6**. +11 % de débit
+    /// vs HIGH (4706 vs 4235 bps) au prix de ~0.7 dB de marge.
+    HighFiveSix = 8,
+    /// EXPERIMENTAL — 32-APSK 1500 Bd β=0.20 LDPC **5/6**. +11 % de débit
+    /// vs HIGH+ (5882 vs 5294 bps) au prix de ~0.7 dB de marge.
+    HighPlusFiveSix = 9,
 }
 
 impl ProfileIndex {
@@ -212,6 +227,8 @@ impl ProfileIndex {
             5 => Some(Self::HighPlus),
             6 => Some(Self::Fast),
             7 => Some(Self::HighPlusPlus),
+            8 => Some(Self::HighFiveSix),
+            9 => Some(Self::HighPlusFiveSix),
             _ => None,
         }
     }
@@ -227,6 +244,8 @@ impl ProfileIndex {
             Self::HighPlus => profile_high_plus(),
             Self::Fast => profile_fast(),
             Self::HighPlusPlus => profile_high_plus_plus(),
+            Self::HighFiveSix => profile_high_5_6(),
+            Self::HighPlusFiveSix => profile_high_plus_5_6(),
         }
     }
 
@@ -240,14 +259,16 @@ impl ProfileIndex {
             Self::HighPlus => "HIGH+",
             Self::Fast => "FAST",
             Self::HighPlusPlus => "HIGH++",
+            Self::HighFiveSix => "HIGH56",
+            Self::HighPlusFiveSix => "HIGH+56",
         }
     }
 
     /// All profile indices in canonical order. EXPERIMENTAL profiles
-    /// (HighPlus, Fast, HighPlusPlus) sont inclus pour permettre leur
-    /// sélection en mode forcé, mais ils ne participent PAS à
-    /// l'auto-détection (cf. `is_experimental`).
-    pub const ALL: [Self; 8] = [
+    /// (Mega, Fast, HighPlusPlus, HighFiveSix, HighPlusFiveSix) sont
+    /// inclus pour permettre leur sélection en mode forcé, mais ne
+    /// participent PAS à l'auto-détection (cf. `is_experimental`).
+    pub const ALL: [Self; 10] = [
         Self::Ultra,
         Self::Robust,
         Self::Normal,
@@ -256,12 +277,26 @@ impl ProfileIndex {
         Self::HighPlus,
         Self::Fast,
         Self::HighPlusPlus,
+        Self::HighFiveSix,
+        Self::HighPlusFiveSix,
     ];
 
     /// `true` pour les profils expérimentaux qui doivent être exclus de
     /// l'auto-détection (gate FFT). Utilisable seulement en mode forcé RX.
+    ///
+    /// MEGA basculé en expérimental 2026-04-28 : son débit théorique
+    /// (3971 bps) est inférieur à HIGH (4235) malgré sa complexité FTN
+    /// τ=30/32 — HIGH+ (32-APSK validé OTA HB9MM) le remplace dans la
+    /// hiérarchie standard.
     pub fn is_experimental(self) -> bool {
-        matches!(self, Self::HighPlus | Self::Fast | Self::HighPlusPlus)
+        matches!(
+            self,
+            Self::Mega
+                | Self::Fast
+                | Self::HighPlusPlus
+                | Self::HighFiveSix
+                | Self::HighPlusFiveSix
+        )
     }
 
     /// Preamble family used by this profile on the wire. The split is
@@ -271,12 +306,17 @@ impl ProfileIndex {
     pub fn preamble_family(self) -> crate::preamble::PreambleFamily {
         use crate::preamble::PreambleFamily;
         match self {
-            // HighPlus / HighPlusPlus partagent (sps=32, pitch=32, β=0.20)
-            // avec famille A — même préambule que NORMAL/HIGH/MEGA,
-            // distinction par mode forcé.
-            Self::Normal | Self::High | Self::Mega | Self::HighPlus | Self::HighPlusPlus => {
-                PreambleFamily::A
-            }
+            // HighPlus / HighPlusPlus / HighFiveSix / HighPlusFiveSix
+            // partagent (sps=32, pitch=32, β=0.20) avec famille A — même
+            // préambule que NORMAL/HIGH/MEGA, distinction par mode_code et
+            // profile_index.
+            Self::Normal
+            | Self::High
+            | Self::Mega
+            | Self::HighPlus
+            | Self::HighPlusPlus
+            | Self::HighFiveSix
+            | Self::HighPlusFiveSix => PreambleFamily::A,
             Self::Robust => PreambleFamily::B,
             Self::Ultra => PreambleFamily::C,
             // Fast a (sps=28, β=0.15), unique. Réutilise les symboles
@@ -558,6 +598,51 @@ pub fn profile_high_plus() -> ModemConfig {
     ModemConfig {
         constellation: ConstellationType::Apsk32,
         ldpc_rate: LdpcRate::R3_4,
+        symbol_rate: 1500.0,
+        beta: 0.20,
+        tau: 1.0,
+        center_freq_hz: DATA_CENTER_HZ,
+        apsk_gamma: 2.84,
+        apsk_gamma2: 5.27,
+        apsk_gamma3: 0.0,
+        pilot_pattern: PilotPattern::default_v3(),
+    }
+}
+
+/// EXPERIMENTAL — HIGH⁵⁶ : 16-APSK 1500 Bd β=0.20 **LDPC 5/6**.
+///
+/// Diffère uniquement de HIGH par le rate LDPC (3/4 → 5/6). Tout le reste
+/// strictement identique pour isoler la variable.
+/// Net brut : 1500 × 4 × (5/6) × (32/34) ≈ 4706 bps (vs ~4235 pour HIGH).
+/// Marge LDPC ~0.7 dB plus serrée. Sur HB9MM le canal est largement
+/// au-dessus du seuil pour HIGH 3/4, donc HIGH⁵⁶ est probablement
+/// décodable sans pertes — à valider OTA.
+pub fn profile_high_5_6() -> ModemConfig {
+    ModemConfig {
+        constellation: ConstellationType::Apsk16,
+        ldpc_rate: LdpcRate::R5_6,
+        symbol_rate: 1500.0,
+        beta: 0.20,
+        tau: 1.0,
+        center_freq_hz: DATA_CENTER_HZ,
+        apsk_gamma: 2.85,
+        apsk_gamma2: 0.0,
+        apsk_gamma3: 0.0,
+        pilot_pattern: PilotPattern::default_v3(),
+    }
+}
+
+/// EXPERIMENTAL — HIGH+⁵⁶ : 32-APSK 1500 Bd β=0.20 **LDPC 5/6**.
+///
+/// Diffère uniquement de HIGH+ par le rate LDPC (3/4 → 5/6). Tout le reste
+/// strictement identique pour isoler la variable.
+/// Net brut : 1500 × 5 × (5/6) × (32/34) ≈ 5882 bps (vs ~5294 pour HIGH+).
+/// 32-APSK déjà tendu en 3/4 sur HB9MM ; HIGH+⁵⁶ est plus marginal et
+/// son intérêt dépendra de la vraie marge SNR du relais.
+pub fn profile_high_plus_5_6() -> ModemConfig {
+    ModemConfig {
+        constellation: ConstellationType::Apsk32,
+        ldpc_rate: LdpcRate::R5_6,
         symbol_rate: 1500.0,
         beta: 0.20,
         tau: 1.0,
