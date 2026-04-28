@@ -100,6 +100,53 @@ pub fn make_preamble_for(family: PreambleFamily) -> Vec<Complex64> {
     }
 }
 
+/// Build the family preamble scaled by `config.preamble_amplitude()`.
+///
+/// Pour la plupart des profils l'amplitude est 1.0 → équivalent strict à
+/// `make_preamble_for(family)`. Pour Apsk64 (HIGH++) le QPSK unitaire est
+/// multiplié par R4 pour atterrir sur les 4 points outer-ring de la
+/// constellation (indices 0/1/2/3 de la Table 13e EN 302 307-2),
+/// garantissant la continuité d'échelle FFE/LMS preamble→data.
+///
+/// Le TX et le RX appellent tous deux cette fonction → l'échelle est
+/// cohérente sans renégociation.
+pub fn make_preamble_for_config(config: &crate::profile::ModemConfig) -> Vec<Complex64> {
+    let base = make_preamble_for(config.preamble_family());
+    let amp = config.training_amplitude();
+    if (amp - 1.0).abs() < 1e-9 {
+        return base;
+    }
+    base.into_iter().map(|s| s * amp).collect()
+}
+
+/// Séquence de « guard interval LMS » insérée entre préambule QPSK et
+/// header pour que le FFE adapte au mu_train sur la constellation data
+/// avant de basculer en DD.
+///
+/// Pour les profils non-Apsk64 : Vec vide (le préambule QPSK et la
+/// transition DD-on-data-constellation suffisaient — c'est le
+/// comportement historique).
+///
+/// Pour Apsk64 (HIGH++) : 64 symboles balayant **chaque point de la
+/// constellation 4+12+20+28 exactement une fois** (indices 0..63 dans
+/// l'ordre canonique de la Table 13e). LMS voit toutes les amplitudes
+/// (R1..R4) et tous les angles avant la première CW data, donc le meta
+/// CW arrive sur un FFE déjà adapté à la densité.
+///
+/// La séquence est déterministe et se reconstitue identiquement TX↔RX.
+pub fn make_lms_warmup_for_config(config: &crate::profile::ModemConfig) -> Vec<Complex64> {
+    let n = config.lms_warmup_syms();
+    if n == 0 {
+        return Vec::new();
+    }
+    let constellation = crate::frame::make_constellation(config);
+    // Sweep canonique : indice 0..n (mod 64). Pour HIGH++ avec n=64 →
+    // chaque point exactement une fois, dans l'ordre de la table.
+    (0..n)
+        .map(|k| constellation.points[k % constellation.points.len()])
+        .collect()
+}
+
 fn family_a() -> &'static Vec<Complex64> {
     static V: OnceLock<Vec<Complex64>> = OnceLock::new();
     V.get_or_init(make_preamble)

@@ -155,6 +155,7 @@ fn start_capture(
         // EXPERIMENTAL : seulement utilisable si forced=true.
         "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
         "FAST" => modem_core::profile::ProfileIndex::Fast,
+        "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
         other => return Err(format!("unknown profile '{other}'")),
     };
     let forced = forced.unwrap_or(false);

@@ -84,6 +84,11 @@ pub fn make_constellation(config: &ModemConfig) -> Constellation {
         ConstellationType::Apsk32 => {
             constellation::apsk32_dvbs2(config.apsk_gamma, config.apsk_gamma2)
         }
+        ConstellationType::Apsk64 => constellation::apsk64_dvbs2x(
+            config.apsk_gamma,
+            config.apsk_gamma2,
+            config.apsk_gamma3,
+        ),
     }
 }
 
@@ -209,13 +214,18 @@ pub fn build_superframe_v3_range(
 
     // Pre-encode the preamble + protocol header bundle inserted before each
     // periodic meta. Same content every time → encode once, reuse.
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
+    // Guard interval LMS : balaie tous les points 64-APSK pour pré-adapter
+    // le FFE à la densité de la constellation avant le 1er CW data. Vide
+    // pour les autres profils (compat).
+    let warmup_syms = preamble::make_lms_warmup_for_config(config);
     let mut hdr = Header::from_config(config, 0, data.len() as u16, FLAG_LAST);
     hdr.version = HEADER_VERSION_V3;
     let header_syms = header::encode_header_symbols(&hdr);
 
     let mut all_symbols: Vec<Complex64> = Vec::new();
     all_symbols.extend_from_slice(&preamble_syms);
+    all_symbols.extend_from_slice(&warmup_syms);
     all_symbols.extend_from_slice(&header_syms);
 
     let session_id_low = (session_id & 0xFF) as u8;
@@ -250,6 +260,7 @@ pub fn build_superframe_v3_range(
         // codeword alignment (every data segment = whole CWs).
         if elapsed_since_preamble_sym >= preamble_period_sym {
             all_symbols.extend_from_slice(&preamble_syms);
+            all_symbols.extend_from_slice(&warmup_syms);
             all_symbols.extend_from_slice(&header_syms);
 
             let payload = MarkerPayload {
@@ -342,17 +353,20 @@ pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
     let two_cw_with_pilots = 2 * cw_data_syms + pilots_for(2 * cw_data_syms);
     let header_syms = 96; // QPSK + Golay : 192 bits → 96 symboles, fixe
     let marker = marker::MARKER_LEN;
+    // Guard interval LMS (HIGH++ uniquement, sinon 0). Inséré entre
+    // préambule et header à chaque (re)anchoring.
+    let warmup_syms = config.lms_warmup_syms();
 
-    // Préambule + header + meta initial.
-    let mut total = crate::types::N_PREAMBLE + header_syms + marker + cw_with_pilots;
+    // Préambule + warmup + header + meta initial.
+    let mut total = crate::types::N_PREAMBLE + warmup_syms + header_syms + marker + cw_with_pilots;
     let mut elapsed = marker + cw_with_pilots;
     let preamble_period_sym = (V3_PREAMBLE_PERIOD_S * config.symbol_rate) as usize;
 
     let mut data_cursor = 0;
     while data_cursor < n_data_cw {
         if elapsed >= preamble_period_sym {
-            // Réinsertion : pré + hdr + nouveau meta.
-            total += crate::types::N_PREAMBLE + header_syms + marker + cw_with_pilots;
+            // Réinsertion : pré + warmup + hdr + nouveau meta.
+            total += crate::types::N_PREAMBLE + warmup_syms + header_syms + marker + cw_with_pilots;
             elapsed = marker + cw_with_pilots;
             continue;
         }
@@ -381,6 +395,7 @@ pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
     let n_groups = (cw_data_syms + pp.d_syms - 1) / pp.d_syms;
     let cw_with_pilots = cw_data_syms + n_groups * pp.p_syms;
     crate::types::N_PREAMBLE
+        + config.lms_warmup_syms()
         + 96
         + marker::MARKER_LEN
         + cw_with_pilots
@@ -407,7 +422,8 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
     );
     let k_bytes = encoder.k() / 8;
 
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
+    let warmup_syms = preamble::make_lms_warmup_for_config(config);
     let mut hdr = Header::from_config(config, 0, 0, FLAG_LAST | FLAG_EOT);
     hdr.version = HEADER_VERSION_V3;
     let header_syms = header::encode_header_symbols(&hdr);
@@ -431,6 +447,7 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
 
     let mut all_symbols: Vec<Complex64> = Vec::new();
     all_symbols.extend_from_slice(&preamble_syms);
+    all_symbols.extend_from_slice(&warmup_syms);
     all_symbols.extend_from_slice(&header_syms);
 
     let payload = MarkerPayload {

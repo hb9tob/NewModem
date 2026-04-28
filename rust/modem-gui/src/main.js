@@ -526,7 +526,7 @@ let currentSettings = {
   tx_more_count: 5,
   /// Si true, le profil RX est verrouillé sur rx_forced_profile et
   /// l'auto-détection est désactivée. Indispensable pour recevoir
-  /// HIGH+ ou FAST (hors PROBE_TEMPLATES).
+  /// HIGH+, FAST ou HIGH++ (hors PROBE_TEMPLATES).
   rx_force_mode: false,
   rx_forced_profile: "HIGH",
 };
@@ -1748,7 +1748,7 @@ function fmtSeconds(s) {
 function refreshTxExperimentalWarn() {
   const warn = document.getElementById("tx-experimental-warn");
   if (!warn) return;
-  const isExp = txState.mode === "HIGH+" || txState.mode === "FAST";
+  const isExp = txState.mode === "HIGH+" || txState.mode === "FAST" || txState.mode === "HIGH++";
   warn.hidden = !isExp;
 }
 

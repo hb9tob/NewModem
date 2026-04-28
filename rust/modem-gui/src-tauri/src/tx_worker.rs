@@ -90,9 +90,11 @@ pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
         "ROBUST" => Ok(profile::profile_robust()),
         "ULTRA" => Ok(profile::profile_ultra()),
         // EXPERIMENTAL — décodable seulement par un pair en mode forcé sur
-        // le même profil. Cf. profile.rs::profile_high_plus / profile_fast.
+        // le même profil. Cf. profile.rs::profile_high_plus / profile_fast /
+        // profile_high_plus_plus.
         "HIGH+" | "HIGHPLUS" => Ok(profile::profile_high_plus()),
         "FAST" => Ok(profile::profile_fast()),
+        "HIGH++" | "HIGHPLUSPLUS" => Ok(profile::profile_high_plus_plus()),
         _ => Err(format!("unknown profile '{name}'")),
     }
 }

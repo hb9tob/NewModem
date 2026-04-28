@@ -95,7 +95,7 @@ pub fn probe_preamble_present(samples: &[f32], config: &ModemConfig) -> bool {
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
     let n_pre = preamble_syms.len();
     let max_start = mf.len().saturating_sub(n_pre * pitch);
     if max_start == 0 {
@@ -156,7 +156,7 @@ fn preamble_correlation_ratio(samples: &[f32], config: &ModemConfig) -> f64 {
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
     let n_pre = preamble_syms.len();
     let max_start = mf.len().saturating_sub(n_pre * pitch);
     if max_start == 0 {
@@ -203,8 +203,13 @@ pub fn detect_best_profile(
     current: crate::profile::ProfileIndex,
 ) -> Option<crate::profile::ProfileIndex> {
     use crate::profile::ProfileIndex;
+    // Exclude experimental profiles (HIGH+, FAST, HIGH++) from auto-detect
+    // — they're forced-only on the RX side. Including them in the sweep
+    // would let a tie-broken pick land on an experimental profile that
+    // the worker isn't authorised to switch into.
     let scored: Vec<(ProfileIndex, f64)> = ProfileIndex::ALL
         .iter()
+        .filter(|p| !p.is_experimental())
         .map(|&p| (p, preamble_correlation_ratio(samples, &p.to_config())))
         .collect();
     let mut sorted = scored.clone();
@@ -346,7 +351,7 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
 
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
     let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
     let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
     let pitch_fse = pitch / d_fse;
@@ -465,7 +470,9 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
+    let warmup_syms = preamble::make_lms_warmup_for_config(config);
+    let warmup_len = warmup_syms.len();
     let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
 
     // Decimate + LS-trained FFE on preamble (same as rx.rs prelude)
@@ -501,11 +508,20 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // stream. This absorbs FTN ISI tails that the finite LS-trained FFE leaves
     // as residuals (critical for MEGA; harmless for other profiles since the
     // DD slicer is very reliable at high SNR).
-    let preamble_training: Vec<(usize, Complex64)> = preamble_syms
+    //
+    // Pour les profils Apsk64 (HIGH++), on prolonge la phase d'entraînement
+    // avec un guard interval LMS de `warmup_len` symboles connus balayant
+    // toute la constellation 64-APSK (cf. `make_lms_warmup_for_config`).
+    // LMS adapte sur la densité réelle des données AVANT le 1er CW meta,
+    // qui n'est plus la première rencontre du switch DD-on-64APSK.
+    let mut preamble_training: Vec<(usize, Complex64)> = preamble_syms
         .iter()
         .enumerate()
         .map(|(k, &s)| (k, s))
         .collect();
+    for (k, &s) in warmup_syms.iter().enumerate() {
+        preamble_training.push((N_PREAMBLE + k, s));
+    }
     let mu_train = 0.10;
     let mu_dd = 0.02;
     let (all_rx_syms, _final_taps) = ffe::apply_ffe_lms_with_training(
@@ -519,7 +535,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         mu_train,
         mu_dd,
     );
-    if all_rx_syms.len() < N_PREAMBLE + header_sym_count {
+    if all_rx_syms.len() < N_PREAMBLE + warmup_len + header_sym_count {
         return None;
     }
 
@@ -542,14 +558,15 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // Protocol header (v2 or v3 — same structure ; v3 only adds periodic
     // preamble+header insertions before each meta segment, transparent to
     // the marker-based segment walker below).
-    let header_syms = &corrected[N_PREAMBLE..N_PREAMBLE + header_sym_count];
+    let header_start = N_PREAMBLE + warmup_len;
+    let header_syms = &corrected[header_start..header_start + header_sym_count];
     let decoded_header = header::decode_header_symbols(header_syms)?;
     if decoded_header.version != HEADER_VERSION_V3 {
         return None;
     }
 
     // Walk data region segment by segment
-    let data_region_start = N_PREAMBLE + header_sym_count;
+    let data_region_start = header_start + header_sym_count;
     let data_region = &corrected[data_region_start..];
 
     let bps = config.constellation.bits_per_sym();
@@ -849,7 +866,7 @@ pub fn rx_v3_after(
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
 
-    let preamble_syms = preamble::make_preamble_for(config.preamble_family());
+    let preamble_syms = preamble::make_preamble_for_config(config);
     let mut positions = sync::find_all_preambles(&mf, &preamble_syms, sps, pitch, config.beta);
     if positions.is_empty() {
         return None;
@@ -1362,6 +1379,37 @@ mod tests {
             &r.data[..data.len()],
             &data[..],
             "HIGH+ loopback : payload mismatch",
+        );
+    }
+
+    /// Loopback HIGH++ (64-APSK DVB-S2X 4+12+20+28, 1500 Bd β=0.20
+    /// LDPC 3/4, pilotes 16/2 + guard interval LMS 64 syms).
+    ///
+    /// Validation bout-en-bout : AppHeader décode, payload réassemblé
+    /// bit-exact. L'enchaînement constellation Apsk64 + interleaver 6-bit
+    /// + soft demap + LDPC 3/4 fonctionne sur canal idéal grâce à la
+    /// densification pilote (16/2 vs 32/2 par défaut) qui divise par 2 la
+    /// variance du tracking phase intra-segment — la marge LDPC 64-APSK
+    /// est ~3× plus serrée que 32-APSK, le tracking pilote 32/2 standard
+    /// laissait σ²≈0.011 ce qui plafonnait les CW à 70 % de convergence.
+    /// Avec 16/2 : σ²≈0.005, 100 % convergence sur loopback.
+    /// 2304 % 6 = 0 → pas de padding bits (contrairement à HIGH+).
+    #[test]
+    fn loopback_v3_high_plus_plus_small_payload() {
+        let cfg = crate::profile::profile_high_plus_plus();
+        let data: Vec<u8> = (0..1500).map(|i| (i as u8).wrapping_mul(11)).collect();
+        let samples = tx_v3(&data, &cfg, 0xCAFE_F00D);
+        let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH++");
+        eprintln!(
+            "HIGH++ loopback : converged={}/{} segs={}/lost={} sigma²={:.6} data_cw={} app_hdr={}",
+            r.converged_blocks, r.total_blocks, r.segments_decoded, r.segments_lost,
+            r.sigma2, r.data_blocks_recovered, r.app_header.is_some(),
+        );
+        assert!(r.app_header.is_some(), "HIGH++ : no AppHeader");
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "HIGH++ loopback : payload mismatch",
         );
     }
 
