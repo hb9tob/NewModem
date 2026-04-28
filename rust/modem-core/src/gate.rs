@@ -62,14 +62,16 @@ use crate::types::{AUDIO_RATE, DATA_CENTER_HZ, N_PREAMBLE, RRC_SPAN_SYM};
 ///
 /// Each entry : `(family, sps, pitch, β, anchor)`. Family A splits into
 /// **two** templates because its profiles disagree on pitch :
-///   - NORMAL/HIGH share `(sps=32, pitch=32, β=0.20)` — Nyquist τ=1.0.
-///   - MEGA is FTN with τ=30/32 → `(sps=32, pitch=30, β=0.20)`.
+///   - NORMAL/HIGH/HIGH+ partagent `(sps=32, pitch=32, β=0.20)` — Nyquist τ=1.0,
+///     header refine ensuite Normal → High → HighPlus.
 /// Without that split, find_all_preambles downstream looks for pulses at
 /// the wrong spacing for whichever sub-profile didn't get the anchor, and
 /// the drift over 256 symbols (≈ 512 samples) destroys the correlation.
+///
+/// MEGA (FTN τ=30/32, pitch=30) basculé expérimental 2026-04-28 → retiré
+/// du gate ; reste accessible en mode forcé RX.
 const PROBE_TEMPLATES: &[(PreambleFamily, usize, usize, f64, ProfileIndex)] = &[
-    (PreambleFamily::A, 32, 32, 0.20, ProfileIndex::Normal), // NORMAL/HIGH (header refines)
-    (PreambleFamily::A, 32, 30, 0.20, ProfileIndex::Mega),   // FTN τ=30/32
+    (PreambleFamily::A, 32, 32, 0.20, ProfileIndex::Normal), // NORMAL/HIGH/HIGH+ (header refines)
     (PreambleFamily::B, 48, 48, 0.25, ProfileIndex::Robust),
     (PreambleFamily::C, 96, 96, 0.25, ProfileIndex::Ultra),
 ];
@@ -362,7 +364,7 @@ mod tests {
         for profile in [
             ProfileIndex::Normal,
             ProfileIndex::High,
-            ProfileIndex::Mega,
+            ProfileIndex::HighPlus,
             ProfileIndex::Robust,
             ProfileIndex::Ultra,
         ] {
@@ -386,16 +388,17 @@ mod tests {
         // With distinct preamble sequences per family AND a per-pitch
         // template within family A, the gate should classify the on-air
         // signal into the correct anchor for every profile :
-        //   - NORMAL/HIGH share pitch=32 → anchor NORMAL (header refines).
-        //   - MEGA has pitch=30 (FTN τ=30/32) → its own anchor.
+        //   - NORMAL/HIGH/HIGH+ share pitch=32 → anchor NORMAL (header refines).
         //   - ROBUST and ULTRA have unique (sps, β) → unambiguous.
+        // MEGA (FTN pitch=30) basculé expérimental → plus dans PROBE_TEMPLATES,
+        // décodable seulement en mode forcé.
         let probe = PreambleProbe::new(96000);
         for (profile, expected) in [
-            (ProfileIndex::Normal, ProfileIndex::Normal),
-            (ProfileIndex::High,   ProfileIndex::Normal), // header → HIGH downstream
-            (ProfileIndex::Mega,   ProfileIndex::Mega),
-            (ProfileIndex::Robust, ProfileIndex::Robust),
-            (ProfileIndex::Ultra,  ProfileIndex::Ultra),
+            (ProfileIndex::Normal,   ProfileIndex::Normal),
+            (ProfileIndex::High,     ProfileIndex::Normal), // header → HIGH downstream
+            (ProfileIndex::HighPlus, ProfileIndex::Normal), // header → HIGH+ downstream
+            (ProfileIndex::Robust,   ProfileIndex::Robust),
+            (ProfileIndex::Ultra,    ProfileIndex::Ultra),
         ] {
             let buf = buffer_with_preamble(
                 96000, profile, 5000, 0.5, 0.0001, 0xCAFE,
