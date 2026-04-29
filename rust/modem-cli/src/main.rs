@@ -268,8 +268,8 @@ fn main() {
             let k_src =
                 modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes_for_plan)
                     as u32;
-            // n_total arrondi pour que le dernier data segment soit toujours
-            // complet ; sinon le RX perd ce CW final (cf. effective_packet_count).
+            // n_total rounded so the last data segment is always complete;
+            // otherwise the RX loses that final CW (cf. effective_packet_count).
             let n_total = modem_core::frame::effective_packet_count(
                 k_src + (k_src * repair_pct) / 100,
             );
@@ -411,8 +411,8 @@ fn main() {
                 eprintln!("tx-more: empty burst (K={k}, pct={pct}%, count={count:?})");
                 std::process::exit(1);
             }
-            // Voir effective_packet_count : on arrondit pour ne jamais laisser
-            // un segment partiel en fin de burst.
+            // See effective_packet_count: rounded so a partial segment is
+            // never left dangling at the end of a burst.
             let n_packets = modem_core::frame::effective_packet_count(n_packets_raw);
             eprintln!(
                 "tx-more: session=0x{sid:08X}, K={k}, esi_start={esi_start}, count={n_packets}"
@@ -605,8 +605,8 @@ fn profile_index_of(name: &str) -> u8 {
         "NORMAL" => modem_core::profile::ProfileIndex::Normal as u8,
         "ROBUST" => modem_core::profile::ProfileIndex::Robust as u8,
         "ULTRA" => modem_core::profile::ProfileIndex::Ultra as u8,
-        // EXPERIMENTAL — pas dans l'auto-détection RX, le pair doit forcer
-        // le mode pour les recevoir.
+        // EXPERIMENTAL - not in RX auto-detection; the peer must force the
+        // mode to receive them.
         "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus as u8,
         "FAST" => modem_core::profile::ProfileIndex::Fast as u8,
         "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus as u8,
@@ -665,8 +665,8 @@ fn parse_profile(name: &str) -> ModemConfig {
         "NORMAL" => profile::profile_normal(),
         "ROBUST" => profile::profile_robust(),
         "ULTRA" => profile::profile_ultra(),
-        // EXPERIMENTAL — hors auto-détection RX. Le pair doit utiliser
-        // le même profil forcé pour décoder.
+        // EXPERIMENTAL - outside RX auto-detection. The peer must use the
+        // same forced profile to decode.
         "HIGH+" | "HIGHPLUS" => profile::profile_high_plus(),
         "FAST" => profile::profile_fast(),
         "HIGH++" | "HIGHPLUSPLUS" => profile::profile_high_plus_plus(),
