@@ -75,8 +75,27 @@ function setupTabs() {
       if (target === "sessions") refreshSessions();
       if (target === "history") refreshHistory();
       if (target === "channel") stopRxAndTxForChannelTab();
+      if (target === "settings") refreshSettingsRxWarn();
     });
   }
+}
+
+// Onglet Paramètres : si le RX tourne, le worker a déjà ouvert la carte son
+// RX et ne lira un changement de device qu'au prochain démarrage. On ne coupe
+// PAS automatiquement (l'utilisateur peut juste consulter l'onglet) — on
+// affiche une bannière qui propose d'arrêter le RX, et on désactive le select
+// RX device pour empêcher une modification fantôme (on ne touche pas aux
+// autres champs : pré-emphase, TX device, indicatif… restent modifiables).
+function refreshSettingsRxWarn() {
+  const stopBtn = document.getElementById("btn-stop");
+  const warn = document.getElementById("settings-rx-warn");
+  const stopRxBtn = document.getElementById("settings-stop-rx-btn");
+  const rxSel = document.getElementById("rx-device-select");
+  if (!warn) return;
+  const rxRunning = !!(stopBtn && !stopBtn.disabled);
+  warn.hidden = !rxRunning;
+  if (stopRxBtn) stopRxBtn.disabled = !rxRunning;
+  if (rxSel) rxSel.disabled = rxRunning;
 }
 
 // Onglet Canal : on coupe RX et TX en cours en entrant. Le réglage
@@ -515,6 +534,7 @@ let currentSettings = {
   ptt_rts_tx_high: true,
   ptt_dtr_tx_high: true,
   tx_attenuation_db: 0,
+  tx_preemphasis_enabled: false,
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
@@ -629,7 +649,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -646,6 +666,8 @@ async function loadSettings() {
   if (colUrl) colUrl.value = currentSettings.collector_url || "";
   const histMax = document.getElementById("tx-history-max-input");
   if (histMax) histMax.value = String(currentSettings.tx_history_max ?? 100);
+  const preemph = document.getElementById("tx-preemphasis-enabled");
+  if (preemph) preemph.checked = !!currentSettings.tx_preemphasis_enabled;
   applyTxSettingsToUI();
 }
 
@@ -839,6 +861,8 @@ async function persistSettings() {
     const v = parseInt(histMax.value, 10);
     if (Number.isFinite(v) && v >= 10) currentSettings.tx_history_max = v;
   }
+  const preemph = document.getElementById("tx-preemphasis-enabled");
+  if (preemph) currentSettings.tx_preemphasis_enabled = !!preemph.checked;
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -869,6 +893,21 @@ function setupSettingsTab() {
   }
   if (txSel) {
     txSel.addEventListener("change", persistSettings);
+  }
+  const preemph = document.getElementById("tx-preemphasis-enabled");
+  if (preemph) preemph.addEventListener("change", persistSettings);
+  const stopRxBtn = document.getElementById("settings-stop-rx-btn");
+  if (stopRxBtn) {
+    stopRxBtn.addEventListener("click", async () => {
+      stopRxBtn.disabled = true;
+      try {
+        await stopCapture();
+      } catch (err) {
+        logEvent("settings_stop_rx_error", { message: String(err) });
+      }
+      // stopCapture rappelle refreshSettingsRxWarn, donc l'état UI sera
+      // re-synchronisé (bannière cachée, select RX ré-activé).
+    });
   }
   // PTT widgets : enable/disable + persist.
   const pttEn = document.getElementById("ptt-enabled");
@@ -960,6 +999,7 @@ async function startCapture() {
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
     if (select) select.disabled = true;
+    refreshSettingsRxWarn();
     logEvent("start", { device: deviceName, profile, forced });
   } catch (err) {
     status.textContent = `erreur start : ${err}`;
@@ -993,6 +1033,7 @@ async function stopCapture() {
     const rxSel = document.getElementById("rx-device-select");
     if (rxSel) rxSel.disabled = false;
     refreshStartButtonFromRx();
+    refreshSettingsRxWarn();
     await refreshRawRecordingState();
     logEvent("stop", null);
   } catch (err) {

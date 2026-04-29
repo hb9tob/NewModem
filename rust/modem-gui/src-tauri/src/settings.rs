@@ -26,6 +26,15 @@ pub struct Settings {
     /// (≤ 0). Renseignée par l'onglet Canal (cascade ATT). Gain appliqué :
     /// `10^(att/20)`. Défaut : 0 dB (pas d'atténuation).
     pub tx_attenuation_db: f32,
+    /// Si vrai, applique une pré-emphase NBFM +6 dB/octave (shelf
+    /// τ₁ = 750 µs / τ₂ = 75 µs, breakpoints ~212 Hz et ~2.12 kHz) au WAV
+    /// avant envoi à la carte son. Utile pour compenser une chaîne audio
+    /// TX qui dé-emphase trop fort, ou pour retrouver la pente attendue
+    /// par un transceiver dont la pré-emphase interne serait absente. Le
+    /// signal filtré est re-normalisé à pic 0.9 pour éviter l'écrêtage
+    /// de la carte son. Défaut : false.
+    #[serde(default)]
+    pub tx_preemphasis_enabled: bool,
     /// URL de base du collector Phase D (ex: `https://hb9tob-modem.duckdns.org`).
     /// Si vide, le prompt post-capture brute n'apparaît pas et la
     /// soumission est désactivée pour la session.
@@ -134,6 +143,7 @@ impl Default for Settings {
             ptt_rts_tx_high: true,
             ptt_dtr_tx_high: true,
             tx_attenuation_db: 0.0,
+            tx_preemphasis_enabled: false,
             collector_url: String::new(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),

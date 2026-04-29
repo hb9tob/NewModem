@@ -1165,6 +1165,38 @@ main {
   flex-direction: column;
   gap: 0.5rem;
 }
+.settings-warn {
+  background: rgba(255, 167, 38, 0.10);
+  border: 1px solid #ffa726;
+  border-radius: 4px;
+  padding: 0.6rem 0.9rem;
+  margin: 0 0 0.8rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+.settings-warn-text {
+  flex: 1;
+  color: #ffd180;
+  font-size: 0.9rem;
+}
+.settings-warn button {
+  background: #ef5350;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.settings-warn button:hover:not(:disabled) {
+  background: #f56e6b;
+}
+.settings-warn button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 .capture-submit-prompt.busy {
   opacity: 0.7;
   pointer-events: none;

@@ -198,6 +198,13 @@
     </section>
     <section id="tab-settings" class="tab-panel settings-layout">
       <div class="settings-form">
+        <div id="settings-rx-warn" class="settings-warn" hidden>
+          <span class="settings-warn-text">
+            ⚠ Le RX est en cours. Pour modifier la carte son ou la
+            pré-emphase, il faut d'abord arrêter la réception.
+          </span>
+          <button type="button" id="settings-stop-rx-btn">Arrêter le RX</button>
+        </div>
         <fieldset>
           <legend>Indicatif</legend>
           <input type="text" id="callsign-input" placeholder="HB9TOB" maxlength="12">
@@ -214,6 +221,16 @@
           <select id="tx-device-select">
             <option>Chargement…</option>
           </select>
+          <label class="ptt-row" style="margin-top: 0.5rem;">
+            <input type="checkbox" id="tx-preemphasis-enabled">
+            Pré-emphase NBFM +6 dB/oct (τ = 750 µs)
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Boost des aigus dès ~212 Hz (~+13 dB à 1 kHz, ~+18 dB à 2.7 kHz,
+            plateau +20 dB). Le signal est re-normalisé après filtrage pour
+            ne pas écrêter la carte son. À activer si la chaîne audio TX
+            n'effectue pas elle-même la pré-emphase.
+          </p>
         </fieldset>
         <fieldset>
           <legend>PTT (RTS/DTR sur port série)</legend>
