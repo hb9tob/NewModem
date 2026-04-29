@@ -60,16 +60,16 @@ use crate::types::{AUDIO_RATE, DATA_CENTER_HZ, N_PREAMBLE, RRC_SPAN_SYM};
 /// classify the on-air signal's anchor profile — replacing the 5-profile
 /// sweep through `detect_best_profile` (~720 ms) with one ~25 ms call.
 ///
-/// Each entry : `(family, sps, pitch, β, anchor)`. Family A splits into
-/// **two** templates because its profiles disagree on pitch :
-///   - NORMAL/HIGH/HIGH+ partagent `(sps=32, pitch=32, β=0.20)` — Nyquist τ=1.0,
-///     header refine ensuite Normal → High → HighPlus.
+/// Each entry: `(family, sps, pitch, beta, anchor)`. Family A splits into
+/// **two** templates because its profiles disagree on pitch:
+///   - NORMAL/HIGH/HIGH+ share `(sps=32, pitch=32, beta=0.20)` -- Nyquist
+///     tau=1.0, the header then refines Normal -> High -> HighPlus.
 /// Without that split, find_all_preambles downstream looks for pulses at
 /// the wrong spacing for whichever sub-profile didn't get the anchor, and
-/// the drift over 256 symbols (≈ 512 samples) destroys the correlation.
+/// the drift over 256 symbols (~512 samples) destroys the correlation.
 ///
-/// MEGA (FTN τ=30/32, pitch=30) basculé expérimental 2026-04-28 → retiré
-/// du gate ; reste accessible en mode forcé RX.
+/// MEGA (FTN tau=30/32, pitch=30) was switched to experimental 2026-04-28
+/// -> removed from the gate; still accessible via RX forced-mode.
 const PROBE_TEMPLATES: &[(PreambleFamily, usize, usize, f64, ProfileIndex)] = &[
     (PreambleFamily::A, 32, 32, 0.20, ProfileIndex::Normal), // NORMAL/HIGH/HIGH+ (header refines)
     (PreambleFamily::B, 48, 48, 0.25, ProfileIndex::Robust),
@@ -388,10 +388,10 @@ mod tests {
         // With distinct preamble sequences per family AND a per-pitch
         // template within family A, the gate should classify the on-air
         // signal into the correct anchor for every profile :
-        //   - NORMAL/HIGH/HIGH+ share pitch=32 → anchor NORMAL (header refines).
-        //   - ROBUST and ULTRA have unique (sps, β) → unambiguous.
-        // MEGA (FTN pitch=30) basculé expérimental → plus dans PROBE_TEMPLATES,
-        // décodable seulement en mode forcé.
+        //   - NORMAL/HIGH/HIGH+ share pitch=32 -> anchor NORMAL (header refines).
+        //   - ROBUST and ULTRA have unique (sps, beta) -> unambiguous.
+        // MEGA (FTN pitch=30) switched to experimental -> no longer in
+        // PROBE_TEMPLATES, decodable only via forced mode.
         let probe = PreambleProbe::new(96000);
         for (profile, expected) in [
             (ProfileIndex::Normal,   ProfileIndex::Normal),

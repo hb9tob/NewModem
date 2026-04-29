@@ -1,13 +1,13 @@
 //! Constellations: QPSK Gray, 8PSK Gray, 16-APSK DVB-S2 (4,12), 32-APSK DVB-S2 (4,12,16),
 //! 64-APSK DVB-S2X (4,12,20,28).
 //!
-//! 16-APSK : port de modem_apsk16_ftn_bench.py lignes 30-245.
-//! 32-APSK : ETSI EN 302 307-1 §5.4.4 Figure 12, table reprise de
-//! gr-dvbs2 (drmpeg) modulator_bc_impl.cc lignes 171-202.
-//! 64-APSK : ETSI EN 302 307-2 V1.4.1 §5.4.5 Tables 13e (mapping) et
-//! 13f (rayons) — pas de port SDR de référence (gr-dvbs2/rx/acm
-//! n'implémentent pas ce layout, vérifié 2026-04).
-//! Toutes normalisées Es = 1.
+//! 16-APSK: port of modem_apsk16_ftn_bench.py lines 30-245.
+//! 32-APSK: ETSI EN 302 307-1 sec. 5.4.4 Figure 12, table taken from
+//! gr-dvbs2 (drmpeg) modulator_bc_impl.cc lines 171-202.
+//! 64-APSK: ETSI EN 302 307-2 V1.4.1 sec. 5.4.5 Tables 13e (mapping) and
+//! 13f (radii) -- no reference SDR port (gr-dvbs2/rx/acm do not
+//! implement this layout, verified 2026-04).
+//! All normalised to Es = 1.
 
 use std::f64::consts::PI;
 
@@ -255,15 +255,15 @@ pub fn apsk32_dvbs2(gamma1: f64, gamma2: f64) -> Constellation {
 
 /// 64-APSK (4+12+20+28) DVB-S2X, normalised Es = 1.
 ///
-/// `gamma1 = R2/R1`, `gamma2 = R3/R1`, `gamma3 = R4/R1`. La norme
-/// EN 302 307-2 V1.4.1 Table 13f publie un seul jeu de rayons pour ce
-/// layout, pour LDPC 11/15 (≈0.733) : γ1=2.4, γ2=4.3, γ3=7.0. Pas de
-/// jeu officiel pour LDPC 3/4 dans ce layout — voir profile_high_plus_plus.
+/// `gamma1 = R2/R1`, `gamma2 = R3/R1`, `gamma3 = R4/R1`. The
+/// EN 302 307-2 V1.4.1 Table 13f publishes a single radius set for this
+/// layout, for LDPC 11/15 (~0.733): gamma1=2.4, gamma2=4.3, gamma3=7.0.
+/// No official set for LDPC 3/4 in this layout -- see profile_high_plus_plus.
 ///
-/// Bit-label → point mapping per Table 13e of EN 302 307-2 V1.4.1.
-/// Aucun port SDR de référence (gr-dvbs2/rx/acm n'implémentent pas
-/// ce layout, vérifié 2026-04). Angles donnés en fractions de π,
-/// transcrits littéralement de la table normative.
+/// Bit-label -> point mapping per Table 13e of EN 302 307-2 V1.4.1.
+/// No reference SDR port (gr-dvbs2/rx/acm do not implement this layout,
+/// verified 2026-04). Angles given as fractions of pi, transcribed
+/// literally from the normative table.
 pub fn apsk64_dvbs2x(gamma1: f64, gamma2: f64, gamma3: f64) -> Constellation {
     assert!(
         gamma1 > 1.0 && gamma2 > gamma1 && gamma3 > gamma2,
@@ -279,9 +279,9 @@ pub fn apsk64_dvbs2x(gamma1: f64, gamma2: f64, gamma3: f64) -> Constellation {
     }
     use Ring::*;
 
-    // Chaque entrée : (anneau, num, den) — angle = num · π / den.
-    // Transcription directe d'EN 302 307-2 Table 13e ; index = label
-    // 6 bits binaire MSB-first (« xxxxpq »).
+    // Each entry: (ring, num, den) -- angle = num * pi / den.
+    // Direct transcription of EN 302 307-2 Table 13e; index = 6-bit
+    // binary label MSB-first ("xxxxpq").
     const DEF: [(Ring, u32, u32); 64] = [
         (R4,  1,  4), //  0  000000
         (R4,  7,  4), //  1  000001
@@ -349,7 +349,7 @@ pub fn apsk64_dvbs2x(gamma1: f64, gamma2: f64, gamma3: f64) -> Constellation {
         (R2,  5,  4), // 63  111111
     ];
 
-    // Rayons bruts avec R1=1, puis normalisation Es=1.
+    // Raw radii with R1=1, then Es=1 normalisation.
     // Es = (4·R1² + 12·R2² + 20·R3² + 28·R4²) / 64
     //    = (R1² + 3·R2² + 5·R3² + 7·R4²) / 16
     let r1_raw = 1.0_f64;
@@ -466,15 +466,15 @@ mod tests {
 
     #[test]
     fn apsk32_three_rings() {
-        // Vérifie qu'on a bien 4 points sur R1, 12 sur R2, 16 sur R3.
+        // Verify we have 4 points on R1, 12 on R2, 16 on R3.
         let c = apsk32_dvbs2(2.84, 5.27);
         let mut radii: Vec<f64> = c.points.iter().map(|p| p.norm()).collect();
         radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        // Plus petits 4 = R1, suivants 12 = R2, derniers 16 = R3.
+        // Smallest 4 = R1, next 12 = R2, last 16 = R3.
         let r1 = radii[0];
         let r2 = radii[4];
         let r3 = radii[16];
-        // Tous les points de chaque anneau ont le même rayon.
+        // Every point on a ring has the same radius.
         for k in 0..4 {
             assert!((radii[k] - r1).abs() < 1e-10, "R1 #{k} radius mismatch");
         }
@@ -485,15 +485,15 @@ mod tests {
             assert!((radii[k] - r3).abs() < 1e-10, "R3 #{k} radius mismatch");
         }
         // Ratios DVB-S2 rate 3/4.
-        assert!((r2 / r1 - 2.84).abs() < 1e-10, "γ1 mismatch: {}", r2 / r1);
-        assert!((r3 / r1 - 5.27).abs() < 1e-10, "γ2 mismatch: {}", r3 / r1);
+        assert!((r2 / r1 - 2.84).abs() < 1e-10, "gamma1 mismatch: {}", r2 / r1);
+        assert!((r3 / r1 - 5.27).abs() < 1e-10, "gamma2 mismatch: {}", r3 / r1);
     }
 
     #[test]
     fn apsk32_dvbs2_reference_points() {
-        // Vecteurs de référence : pour rate 3/4 (γ1=2.84, γ2=5.27),
-        // après normalisation Es=1, R1=r0, R2=2.84·r0, R3=5.27·r0
-        // avec r0 = sqrt(8/(1 + 3·2.84² + 4·5.27²)).
+        // Reference vectors: for rate 3/4 (gamma1=2.84, gamma2=5.27),
+        // after Es=1 normalisation, R1=r0, R2=2.84*r0, R3=5.27*r0
+        // with r0 = sqrt(8/(1 + 3*2.84^2 + 4*5.27^2)).
         let c = apsk32_dvbs2(2.84, 5.27);
         let r0 = (8.0_f64 / (1.0 + 3.0 * 2.84 * 2.84 + 4.0 * 5.27 * 5.27)).sqrt();
         let r1 = r0;
@@ -501,22 +501,22 @@ mod tests {
         let r3 = 5.27 * r0;
         let pi = std::f64::consts::PI;
 
-        // Index 17 (10001) → R1 à π/4.
+        // Index 17 (10001) -> R1 at pi/4.
         let p17 = c.points[0b10001];
         let exp17 = Complex64::new(r1 * (pi / 4.0).cos(), r1 * (pi / 4.0).sin());
         assert!((p17 - exp17).norm() < 1e-10);
 
-        // Index 0 (00000) → R2 à π/4.
+        // Index 0 (00000) -> R2 at pi/4.
         let p0 = c.points[0b00000];
         let exp0 = Complex64::new(r2 * (pi / 4.0).cos(), r2 * (pi / 4.0).sin());
         assert!((p0 - exp0).norm() < 1e-10);
 
-        // Index 24 (11000) → R3 à 0.
+        // Index 24 (11000) -> R3 at 0.
         let p24 = c.points[0b11000];
         let exp24 = Complex64::new(r3, 0.0);
         assert!((p24 - exp24).norm() < 1e-10);
 
-        // Index 13 (01101) → R3 à π/2.
+        // Index 13 (01101) -> R3 at pi/2.
         let p13 = c.points[0b01101];
         let exp13 = Complex64::new(0.0, r3);
         assert!((p13 - exp13).norm() < 1e-10);
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn apsk64_four_rings() {
-        // Vérifie qu'on a bien 4 points sur R1, 12 sur R2, 20 sur R3, 28 sur R4.
+        // Verify we have 4 points on R1, 12 on R2, 20 on R3, 28 on R4.
         let c = apsk64_dvbs2x(2.4, 4.3, 7.0);
         let mut radii: Vec<f64> = c.points.iter().map(|p| p.norm()).collect();
         radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -577,16 +577,16 @@ mod tests {
             assert!((radii[k] - r4).abs() < 1e-10, "R4 #{k} radius mismatch");
         }
         // Ratios DVB-S2X 4+12+20+28 (Table 13f, MODCOD 64APSK 11/15).
-        assert!((r2 / r1 - 2.4).abs() < 1e-10, "γ1 mismatch: {}", r2 / r1);
-        assert!((r3 / r1 - 4.3).abs() < 1e-10, "γ2 mismatch: {}", r3 / r1);
-        assert!((r4 / r1 - 7.0).abs() < 1e-10, "γ3 mismatch: {}", r4 / r1);
+        assert!((r2 / r1 - 2.4).abs() < 1e-10, "gamma1 mismatch: {}", r2 / r1);
+        assert!((r3 / r1 - 4.3).abs() < 1e-10, "gamma2 mismatch: {}", r3 / r1);
+        assert!((r4 / r1 - 7.0).abs() < 1e-10, "gamma3 mismatch: {}", r4 / r1);
     }
 
     #[test]
     fn apsk64_dvbs2x_reference_points() {
-        // Vecteurs de référence : pour rate 11/15 (γ1=2.4, γ2=4.3, γ3=7.0),
-        // après normalisation Es=1, R1=r0, R2=2.4·r0, R3=4.3·r0, R4=7.0·r0
-        // avec r0 = sqrt(16 / (1 + 3·2.4² + 5·4.3² + 7·7.0²)).
+        // Reference vectors: for rate 11/15 (gamma1=2.4, gamma2=4.3, gamma3=7.0),
+        // after Es=1 normalisation, R1=r0, R2=2.4*r0, R3=4.3*r0, R4=7.0*r0
+        // with r0 = sqrt(16 / (1 + 3*2.4^2 + 5*4.3^2 + 7*7.0^2)).
         let c = apsk64_dvbs2x(2.4, 4.3, 7.0);
         let r0 = (16.0_f64 / (1.0 + 3.0 * 2.4 * 2.4 + 5.0 * 4.3 * 4.3 + 7.0 * 7.0 * 7.0)).sqrt();
         let r1 = r0;
@@ -595,30 +595,30 @@ mod tests {
         let r4 = 7.0 * r0;
         let pi = std::f64::consts::PI;
 
-        // Index 12 (001100) → R1 à π/4.
+        // Index 12 (001100) -> R1 at pi/4.
         let p12 = c.points[0b001100];
         let exp12 = Complex64::new(r1 * (pi / 4.0).cos(), r1 * (pi / 4.0).sin());
-        assert!((p12 - exp12).norm() < 1e-10, "idx 12 R1 π/4");
+        assert!((p12 - exp12).norm() < 1e-10, "idx 12 R1 pi/4");
 
-        // Index 28 (011100) → R2 à π/12.
+        // Index 28 (011100) -> R2 at pi/12.
         let p28 = c.points[0b011100];
         let exp28 = Complex64::new(r2 * (pi / 12.0).cos(), r2 * (pi / 12.0).sin());
-        assert!((p28 - exp28).norm() < 1e-10, "idx 28 R2 π/12");
+        assert!((p28 - exp28).norm() < 1e-10, "idx 28 R2 pi/12");
 
-        // Index 24 (011000) → R3 à π/20.
+        // Index 24 (011000) -> R3 at pi/20.
         let p24 = c.points[0b011000];
         let exp24 = Complex64::new(r3 * (pi / 20.0).cos(), r3 * (pi / 20.0).sin());
-        assert!((p24 - exp24).norm() < 1e-10, "idx 24 R3 π/20");
+        assert!((p24 - exp24).norm() < 1e-10, "idx 24 R3 pi/20");
 
-        // Index 0 (000000) → R4 à π/4.
+        // Index 0 (000000) -> R4 at pi/4.
         let p0 = c.points[0b000000];
         let exp0 = Complex64::new(r4 * (pi / 4.0).cos(), r4 * (pi / 4.0).sin());
-        assert!((p0 - exp0).norm() < 1e-10, "idx 0 R4 π/4");
+        assert!((p0 - exp0).norm() < 1e-10, "idx 0 R4 pi/4");
 
-        // Index 8 (001000) → R4 à π/28 (rayon le plus serré sur R4, idx canonique en haut).
+        // Index 8 (001000) -> R4 at pi/28 (tightest angle on R4, canonical idx at top).
         let p8 = c.points[0b001000];
         let exp8 = Complex64::new(r4 * (pi / 28.0).cos(), r4 * (pi / 28.0).sin());
-        assert!((p8 - exp8).norm() < 1e-10, "idx 8 R4 π/28");
+        assert!((p8 - exp8).norm() < 1e-10, "idx 8 R4 pi/28");
     }
 
     #[test]

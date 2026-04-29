@@ -18,12 +18,12 @@
 
 use crate::profile::ConstellationType;
 
-/// Bit count après padding au prochain multiple de `bits_per_sym`.
+/// Bit count after padding to the next multiple of `bits_per_sym`.
 ///
-/// Utile quand la longueur de codeword LDPC (ex. 2304) n'est pas
-/// divisible par `bits_per_sym` (ex. 5 pour Apsk32 : 2304 % 5 = 4 → on
-/// padde à 2305 = 5×461). Le bit de padding est mis à 0 au TX et
-/// supprimé au RX avant décodage LDPC.
+/// Useful when an LDPC codeword length (e.g. 2304) is not divisible by
+/// `bits_per_sym` (e.g. 5 for Apsk32: 2304 % 5 = 4 -> we pad to
+/// 2305 = 5x461). The padding bit is set to 0 at TX and removed at RX
+/// before LDPC decoding.
 pub fn padded_cw_bits(n: usize, ct: ConstellationType) -> usize {
     let bps = ct.bits_per_sym();
     n.div_ceil(bps) * bps
@@ -35,18 +35,18 @@ fn column_permutation(ct: ConstellationType) -> &'static [usize] {
         ConstellationType::Qpsk => &[0, 1],
         ConstellationType::Psk8 => &[2, 1, 0],
         ConstellationType::Apsk16 => &[3, 1, 2, 0],
-        // 32-APSK : identité, conforme au défaut gr-dvbs2 pour
-        // MOD_32APSK (interleaver_bb_impl.cc ligne 247, /* 01234 */).
+        // 32-APSK: identity, matching gr-dvbs2 default for MOD_32APSK
+        // (interleaver_bb_impl.cc line 247, /* 01234 */).
         ConstellationType::Apsk32 => &[0, 1, 2, 3, 4],
-        // 64-APSK 4+12+20+28 : pas de port SDR de référence
-        // (gr-dvbs2/rx/acm n'implémentent pas ce layout). EN 302 307-2
-        // V1.4.1 §5.3.3 spécifie le BICM par MODCOD ; faute de table
-        // exacte transcrite, on adopte la permutation par renversement
-        // [5,4,3,2,1,0] (même heuristique que 8PSK) qui place les bits
-        // parité LDPC sur les LSB du label (quadrant), bien protégés
-        // par la séparation π/2 entre quadrants — les bits MSB
-        // (sélection anneau/secteur, plus exigeants) reçoivent les bits
-        // systématiques LDPC plus fiables.
+        // 64-APSK 4+12+20+28: no reference SDR port available (gr-dvbs2/
+        // rx/acm do not implement this layout). EN 302 307-2 V1.4.1
+        // sec. 5.3.3 specifies BICM per MODCOD; lacking an exact
+        // transcribed table, we adopt the reversal permutation
+        // [5,4,3,2,1,0] (same heuristic as 8PSK) which places the LDPC
+        // parity bits on the label LSBs (quadrant), well protected by
+        // the pi/2 separation between quadrants -- the MSBs (ring/
+        // sector selection, more demanding) receive the more reliable
+        // LDPC systematic bits.
         ConstellationType::Apsk64 => &[5, 4, 3, 2, 1, 0],
     }
 }

@@ -53,10 +53,10 @@ pub fn effective_packet_count(n_packets: u32) -> u32 {
 /// The builder inserts PRE+HDR+META at the next segment boundary after this
 /// many elapsed seconds since the previous preamble.
 ///
-/// Tradeoff : short period → short sliding-window RX fenêtres (better drift
+/// Tradeoff: short period -> short sliding-window RX windows (better drift
 /// tolerance, faster late-entry) at the cost of a higher overhead. 4 s is a
-/// compromise that gives ~9 % overhead at HIGH and ~2 % at ULTRA, while
-/// keeping RX windows ≤ 8 s across all profiles.
+/// compromise that gives ~9% overhead at HIGH and ~2% at ULTRA, while
+/// keeping RX windows <= 8 s across all profiles.
 ///
 /// Because insertion only happens at a data-segment boundary (and each segment
 /// is always a whole number of LDPC codewords), the `PRE+HDR+META` block is
@@ -94,10 +94,10 @@ pub fn make_constellation(config: &ModemConfig) -> Constellation {
 
 /// Encode one LDPC codeword from raw info bytes (same logic as `build_superframe`).
 ///
-/// Quand `encoder.n()` n'est pas divisible par `constellation.bits_per_sym`
-/// (cas 32-APSK : 2304 % 5 = 4), le codeword est paddé de zéros jusqu'au
-/// prochain multiple. Le bit de padding est récupéré et écarté au RX
-/// avant décodage LDPC. `interleave_perm` doit être de longueur paddée.
+/// When `encoder.n()` isn't divisible by `constellation.bits_per_sym`
+/// (32-APSK case: 2304 % 5 = 4), the codeword is zero-padded to the next
+/// multiple. The padding bit is recovered and discarded at RX before LDPC
+/// decoding. `interleave_perm` must be of the padded length.
 fn encode_one_codeword(
     info_bytes: &[u8],
     encoder: &LdpcEncoder,
@@ -215,9 +215,9 @@ pub fn build_superframe_v3_range(
     // Pre-encode the preamble + protocol header bundle inserted before each
     // periodic meta. Same content every time → encode once, reuse.
     let preamble_syms = preamble::make_preamble_for_config(config);
-    // Guard interval LMS : balaie tous les points 64-APSK pour pré-adapter
-    // le FFE à la densité de la constellation avant le 1er CW data. Vide
-    // pour les autres profils (compat).
+    // LMS guard interval: sweeps every 64-APSK point so the FFE pre-adapts
+    // to the constellation density before the first data CW. Empty for
+    // other profiles (compat).
     let warmup_syms = preamble::make_lms_warmup_for_config(config);
     let mut hdr = Header::from_config(config, 0, data.len() as u16, FLAG_LAST);
     hdr.version = HEADER_VERSION_V3;
@@ -319,24 +319,24 @@ pub fn build_superframe_v3_range(
     all_symbols
 }
 
-/// Symbol count produit par `build_superframe_v3` pour `n_data_cw` codewords
-/// payload, hors trame EOT. Utilisé par `tx_plan` pour estimer la durée TX
-/// réelle (incluant préambule, header, meta, markers, pilotes, runout et les
-/// réinsertions périodiques toutes les `V3_PREAMBLE_PERIOD_S`). `net_bitrate`
-/// seul ne capture que le payload utile.
+/// Symbol count produced by `build_superframe_v3` for `n_data_cw` payload
+/// codewords, excluding the EOT frame. Used by `tx_plan` to estimate real
+/// TX duration (including preamble, header, meta, markers, pilots, runout,
+/// and the periodic re-insertions every `V3_PREAMBLE_PERIOD_S`).
+/// `net_bitrate` alone only captures the useful payload.
 ///
-/// Précis au symbole près — miroir exact de la logique de
-/// `build_superframe_v3_range`. Adapte automatiquement à la densité pilote
-/// du profil (ULTRA = 16d/2p, autres = 32d/2p) et au nombre de bits par
-/// symbole de la constellation.
+/// Symbol-accurate -- exact mirror of the logic in
+/// `build_superframe_v3_range`. Automatically adapts to the profile's
+/// pilot density (ULTRA = 16d/2p, others = 32d/2p) and to the
+/// constellation's bits-per-symbol.
 pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
     // Same rounding the builder applies — keeps duration estimates accurate
     // when callers pass an odd K (e.g. `repair_pct = 0`).
     let n_data_cw = effective_packet_count(n_data_cw) as usize;
     let bits_per_sym = config.constellation.bits_per_sym();
-    // n() = 2304 (constant pour tous les rates LDPC). Si bits_per_sym ne
-    // divise pas n() (cas Apsk32 : 2304 % 5 = 4), le builder padde au
-    // prochain multiple → on doit refléter la même ronde ici.
+    // n() = 2304 (constant across all LDPC rates). If bits_per_sym does
+    // not divide n() (Apsk32 case: 2304 % 5 = 4), the builder pads to the
+    // next multiple -> we must mirror the same rounding here.
     let padded_n = interleaver::padded_cw_bits(config.ldpc_rate.n(), config.constellation);
     let cw_data_syms = padded_n / bits_per_sym;
     let pp = &config.pilot_pattern;
@@ -351,13 +351,13 @@ pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
     };
     let cw_with_pilots = cw_data_syms + pilots_for(cw_data_syms);
     let two_cw_with_pilots = 2 * cw_data_syms + pilots_for(2 * cw_data_syms);
-    let header_syms = 96; // QPSK + Golay : 192 bits → 96 symboles, fixe
+    let header_syms = 96; // QPSK + Golay: 192 bits -> 96 symbols, fixed
     let marker = marker::MARKER_LEN;
-    // Guard interval LMS (HIGH++ uniquement, sinon 0). Inséré entre
-    // préambule et header à chaque (re)anchoring.
+    // LMS guard interval (HIGH++ only, otherwise 0). Inserted between
+    // preamble and header at each (re-)anchoring.
     let warmup_syms = config.lms_warmup_syms();
 
-    // Préambule + warmup + header + meta initial.
+    // Preamble + warmup + header + initial meta.
     let mut total = crate::types::N_PREAMBLE + warmup_syms + header_syms + marker + cw_with_pilots;
     let mut elapsed = marker + cw_with_pilots;
     let preamble_period_sym = (V3_PREAMBLE_PERIOD_S * config.symbol_rate) as usize;
@@ -365,7 +365,7 @@ pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
     let mut data_cursor = 0;
     while data_cursor < n_data_cw {
         if elapsed >= preamble_period_sym {
-            // Réinsertion : pré + warmup + hdr + nouveau meta.
+            // Re-insertion: pre + warmup + hdr + new meta.
             total += crate::types::N_PREAMBLE + warmup_syms + header_syms + marker + cw_with_pilots;
             elapsed = marker + cw_with_pilots;
             continue;
@@ -381,13 +381,13 @@ pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
         data_cursor += cw_take;
     }
 
-    // Runout : 4 groupes (d_syms fillers + p_syms pilotes) + 24 fillers finaux.
+    // Runout: 4 groups (d_syms fillers + p_syms pilots) + 24 final fillers.
     total += 4 * (d + p) + 24;
     total
 }
 
-/// Symbol count d'une trame EOT (`build_eot_frame`) : préambule + header
-/// + 1 meta segment + runout, sans codewords payload.
+/// Symbol count for an EOT frame (`build_eot_frame`): preamble + header
+/// + 1 meta segment + runout, without payload codewords.
 pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
     let bits_per_sym = config.constellation.bits_per_sym();
     let cw_data_syms = config.ldpc_rate.n() / bits_per_sym;
@@ -522,12 +522,12 @@ mod tests {
 
     #[test]
     fn superframe_total_symbols_matches_build() {
-        // Pour chaque profil, le helper doit retourner exactement le même
-        // nombre de symboles que build_superframe_v3, sinon les estimations
-        // de durée TX dériveraient. Plusieurs tailles de payload pour
-        // exercer les chemins (réinsertion périodique, dernier segment partiel).
-        // n_data_cw = k_source + n_repair_default(k_source), comme le fait
-        // build_superframe_v3 sous le capot.
+        // For each profile, the helper must return exactly the same
+        // symbol count as build_superframe_v3, otherwise TX duration
+        // estimates would drift. Several payload sizes exercise the
+        // paths (periodic re-insertion, final partial segment).
+        // n_data_cw = k_source + n_repair_default(k_source), as
+        // build_superframe_v3 does under the hood.
         use crate::profile::{
             profile_high, profile_mega, profile_normal, profile_robust, profile_ultra,
         };
@@ -551,7 +551,7 @@ mod tests {
                 assert_eq!(
                     actual_symbols.len(),
                     predicted,
-                    "{name} payload={size}B: helper {predicted} ≠ build {} \
+                    "{name} payload={size}B: helper {predicted} != build {} \
                      (n_total={n_total})",
                     actual_symbols.len()
                 );

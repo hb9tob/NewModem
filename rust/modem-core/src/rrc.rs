@@ -1,7 +1,7 @@
 //! Root Raised Cosine (RRC) pulse shaping.
 //!
-//! Port exact de modem_apsk16_ftn_bench.py lignes 266-354.
-//! Forme standard (Proakis), normalisée en énergie.
+//! Exact port of modem_apsk16_ftn_bench.py lines 266-354.
+//! Standard form (Proakis), energy-normalised.
 
 use std::f64::consts::PI;
 
@@ -51,7 +51,7 @@ pub fn check_integer_constraints(audio_rate: u32, symbol_rate: f64, tau: f64) ->
     let sps_float = audio_rate as f64 / symbol_rate;
     if (sps_float - sps_float.round()).abs() > 1e-9 {
         return Err(format!(
-            "SPS non entier: AUDIO_RATE ({audio_rate}) / symbol_rate ({symbol_rate}) = {sps_float}"
+            "non-integer SPS: AUDIO_RATE ({audio_rate}) / symbol_rate ({symbol_rate}) = {sps_float}"
         ));
     }
     let sps = sps_float.round() as usize;
@@ -59,7 +59,7 @@ pub fn check_integer_constraints(audio_rate: u32, symbol_rate: f64, tau: f64) ->
     let pitch_float = tau * sps as f64;
     if (pitch_float - pitch_float.round()).abs() > 1e-9 {
         return Err(format!(
-            "tau*SPS non entier: tau={tau}, SPS={sps}, tau*SPS = {pitch_float}"
+            "non-integer tau*SPS: tau={tau}, SPS={sps}, tau*SPS = {pitch_float}"
         ));
     }
     let pitch = pitch_float.round() as usize;

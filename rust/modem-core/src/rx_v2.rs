@@ -343,9 +343,9 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<f64> {
     let constellation = frame::make_constellation(config);
     let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
     let bps = config.constellation.bits_per_sym();
-    // Si decoder.n() n'est pas divisible par bps (cas Apsk32 : 2304 % 5),
-    // le TX padde le codeword au prochain multiple → on alloue les symboles
-    // en conséquence et on droppe les LLRs de padding avant le décodage LDPC.
+    // If decoder.n() isn't divisible by bps (Apsk32 case: 2304 % 5),
+    // the TX pads the codeword to the next multiple -> we allocate the
+    // symbols accordingly and drop the padding LLRs before LDPC decoding.
     let padded_n = interleaver::padded_cw_bits(decoder.n(), config.constellation);
     let syms_per_cw = padded_n / bps;
 
@@ -509,11 +509,12 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // as residuals (critical for MEGA; harmless for other profiles since the
     // DD slicer is very reliable at high SNR).
     //
-    // Pour les profils Apsk64 (HIGH++), on prolonge la phase d'entraînement
-    // avec un guard interval LMS de `warmup_len` symboles connus balayant
-    // toute la constellation 64-APSK (cf. `make_lms_warmup_for_config`).
-    // LMS adapte sur la densité réelle des données AVANT le 1er CW meta,
-    // qui n'est plus la première rencontre du switch DD-on-64APSK.
+    // For Apsk64 profiles (HIGH++), we extend the training phase with
+    // an LMS guard interval of `warmup_len` known symbols sweeping the
+    // entire 64-APSK constellation (cf. `make_lms_warmup_for_config`).
+    // LMS adapts on the actual data density BEFORE the first meta CW,
+    // which is then no longer the first encounter of the DD switch on
+    // 64-APSK.
     let mut preamble_training: Vec<(usize, Complex64)> = preamble_syms
         .iter()
         .enumerate()
@@ -570,9 +571,9 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let data_region = &corrected[data_region_start..];
 
     let bps = config.constellation.bits_per_sym();
-    // Si decoder.n() n'est pas divisible par bps (cas Apsk32 : 2304 % 5),
-    // le TX padde le codeword au prochain multiple → on alloue les symboles
-    // en conséquence et on droppe les LLRs de padding avant le décodage LDPC.
+    // If decoder.n() isn't divisible by bps (Apsk32 case: 2304 % 5),
+    // the TX pads the codeword to the next multiple -> we allocate the
+    // symbols accordingly and drop the padding LLRs before LDPC decoding.
     let padded_n = interleaver::padded_cw_bits(decoder.n(), config.constellation);
     let syms_per_cw = padded_n / bps;
     let k_bytes = decoder.k() / 8;
@@ -734,8 +735,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             let cw_syms = &seg_data_syms[off..off + syms_per_cw];
             let llr = soft_demod::llr_maxlog(cw_syms, &constellation, sigma2_for_llr);
             let llr_deint = interleaver::apply_permutation_f32(&llr, &deinterleave_perm);
-            // Drop des LLRs de padding (bits ajoutés en TX pour aligner sur
-            // bits_per_sym) — ils sont en queue après deinterleave.
+            // Drop the padding LLRs (bits added on TX to align on
+            // bits_per_sym) -- they sit at the tail after deinterleave.
             let llr_for_ldpc = &llr_deint[..decoder.n()];
             let (info_bytes, converged) = decoder.decode_to_bytes(llr_for_ldpc);
             let bytes = info_bytes[..k_bytes].to_vec();
@@ -1244,12 +1245,12 @@ mod tests {
 
         assert!(
             result.app_header.is_some(),
-            "AppHeader manquant — aucune fenêtre n'a décodé le meta"
+            "AppHeader missing -- no window decoded the meta"
         );
         assert_eq!(
             &result.data[..data.len()],
             &data[..],
-            "V3 loopback : données non identiques"
+            "V3 loopback: data mismatch"
         );
     }
 
@@ -1349,83 +1350,83 @@ mod tests {
         }
     }
 
-    /// Loopback FAST (16-APSK 1714 Bd β=0.15 LDPC 3/4) : valide
-    /// l'enchaînement sps=28 + β=0.15 + RRC + sync préambule + LDPC.
+    /// Loopback FAST (16-APSK 1714 Bd beta=0.15 LDPC 3/4): exercises
+    /// the sps=28 + beta=0.15 + RRC + preamble sync + LDPC chain.
     #[test]
     fn loopback_v3_fast_small_payload() {
         let cfg = crate::profile::profile_fast();
         let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(17)).collect();
         let samples = tx_v3(&data, &cfg, 0xFA57_0001);
         let r = rx_v3(&samples, &cfg).expect("rx_v3 None for FAST");
-        assert!(r.app_header.is_some(), "FAST : no AppHeader");
+        assert!(r.app_header.is_some(), "FAST: no AppHeader");
         assert_eq!(
             &r.data[..data.len()],
             &data[..],
-            "FAST loopback : payload mismatch",
+            "FAST loopback: payload mismatch",
         );
     }
 
-    /// Loopback HIGH⁵⁶ (16-APSK 1500 Bd β=0.20 LDPC 5/6) : valide
-    /// la matrice LDPC 5/6 IEEE 802.16e dans le pipeline complet.
+    /// Loopback HIGH56 (16-APSK 1500 Bd beta=0.20 LDPC 5/6): exercises
+    /// the IEEE 802.16e LDPC 5/6 matrix in the complete pipeline.
     #[test]
     fn loopback_v3_high_5_6_small_payload() {
         let cfg = crate::profile::profile_high_5_6();
         let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(7)).collect();
         let samples = tx_v3(&data, &cfg, 0xC0DE_0056);
         let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH56");
-        assert!(r.app_header.is_some(), "HIGH56 : no AppHeader");
+        assert!(r.app_header.is_some(), "HIGH56: no AppHeader");
         assert_eq!(
             &r.data[..data.len()],
             &data[..],
-            "HIGH56 loopback : payload mismatch",
+            "HIGH56 loopback: payload mismatch",
         );
     }
 
-    /// Loopback HIGH+⁵⁶ (32-APSK 1500 Bd β=0.20 LDPC 5/6) : valide la
-    /// matrice LDPC 5/6 sur la constellation 32-APSK.
+    /// Loopback HIGH+56 (32-APSK 1500 Bd beta=0.20 LDPC 5/6): exercises
+    /// the LDPC 5/6 matrix on the 32-APSK constellation.
     #[test]
     fn loopback_v3_high_plus_5_6_small_payload() {
         let cfg = crate::profile::profile_high_plus_5_6();
         let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(19)).collect();
         let samples = tx_v3(&data, &cfg, 0xC0DE_5656);
         let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH+56");
-        assert!(r.app_header.is_some(), "HIGH+56 : no AppHeader");
+        assert!(r.app_header.is_some(), "HIGH+56: no AppHeader");
         assert_eq!(
             &r.data[..data.len()],
             &data[..],
-            "HIGH+56 loopback : payload mismatch",
+            "HIGH+56 loopback: payload mismatch",
         );
     }
 
-    /// Loopback HIGH+ (32-APSK 1500 Bd β=0.20 LDPC 3/4) : valide
-    /// l'enchaînement constellation Apsk32 + interleaver 5-bit +
-    /// soft demap + LDPC 3/4 sur canal idéal.
+    /// Loopback HIGH+ (32-APSK 1500 Bd beta=0.20 LDPC 3/4): exercises
+    /// the Apsk32 constellation + 5-bit interleaver + soft demap +
+    /// LDPC 3/4 chain on an ideal channel.
     #[test]
     fn loopback_v3_high_plus_small_payload() {
         let cfg = crate::profile::profile_high_plus();
         let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(13)).collect();
         let samples = tx_v3(&data, &cfg, 0xBABE_5005);
         let r = rx_v3(&samples, &cfg).expect("rx_v3 None for HIGH+");
-        assert!(r.app_header.is_some(), "HIGH+ : no AppHeader");
+        assert!(r.app_header.is_some(), "HIGH+: no AppHeader");
         assert_eq!(
             &r.data[..data.len()],
             &data[..],
-            "HIGH+ loopback : payload mismatch",
+            "HIGH+ loopback: payload mismatch",
         );
     }
 
-    /// Loopback HIGH++ (64-APSK DVB-S2X 4+12+20+28, 1500 Bd β=0.20
-    /// LDPC 3/4, pilotes 16/2 + guard interval LMS 64 syms).
+    /// Loopback HIGH++ (64-APSK DVB-S2X 4+12+20+28, 1500 Bd
+    /// beta=0.20 LDPC 3/4, 16/2 pilots + 64-sym LMS guard interval).
     ///
-    /// Validation bout-en-bout : AppHeader décode, payload réassemblé
-    /// bit-exact. L'enchaînement constellation Apsk64 + interleaver 6-bit
-    /// + soft demap + LDPC 3/4 fonctionne sur canal idéal grâce à la
-    /// densification pilote (16/2 vs 32/2 par défaut) qui divise par 2 la
-    /// variance du tracking phase intra-segment — la marge LDPC 64-APSK
-    /// est ~3× plus serrée que 32-APSK, le tracking pilote 32/2 standard
-    /// laissait σ²≈0.011 ce qui plafonnait les CW à 70 % de convergence.
-    /// Avec 16/2 : σ²≈0.005, 100 % convergence sur loopback.
-    /// 2304 % 6 = 0 → pas de padding bits (contrairement à HIGH+).
+    /// End-to-end validation: AppHeader decodes, payload reassembled
+    /// bit-exact. The Apsk64 + 6-bit interleaver + soft demap +
+    /// LDPC 3/4 chain works on an ideal channel thanks to the pilot
+    /// densification (16/2 vs the default 32/2), which halves the
+    /// intra-segment phase tracking variance -- the 64-APSK LDPC
+    /// margin is ~3x tighter than 32-APSK; the standard 32/2 pilot
+    /// tracking left sigma^2~=0.011 which capped CW convergence at
+    /// 70%. With 16/2: sigma^2~=0.005, 100% convergence on loopback.
+    /// 2304 % 6 = 0 -> no padding bits (unlike HIGH+).
     #[test]
     fn loopback_v3_high_plus_plus_small_payload() {
         let cfg = crate::profile::profile_high_plus_plus();
@@ -1566,7 +1567,7 @@ mod tests {
         );
         let audio2 = modulator::modulate(&syms2, sps, pitch, &taps, config.center_freq_hz);
 
-        // Concaténer les deux bursts, ajouter 100 ms de silence entre.
+        // Concatenate the two bursts, add 100 ms of silence between.
         let silence = vec![0.0f32; (AUDIO_RATE as f64 * 0.1) as usize];
         let mut combined = audio1.clone();
         combined.extend_from_slice(&silence);
@@ -1577,7 +1578,7 @@ mod tests {
         assert_eq!(ah.session_id, session);
 
         eprintln!(
-            "V3 two-burst : K={k} b1={b1_count} b2={b2_count} \
+            "V3 two-burst: K={k} b1={b1_count} b2={b2_count} \
              data_cw_recovered={} bytes={}",
             result.data_blocks_recovered,
             result.data.len()
@@ -1585,14 +1586,15 @@ mod tests {
         assert_eq!(&result.data[..data.len()], &data[..]);
     }
 
-    /// Régression : NORMAL et HIGH partagent (Rs, tau, beta) → la corrélation
-    /// préambule ne peut pas les distinguer. Si le worker démarre en HIGH
-    /// par défaut et le TX émet en NORMAL, le 1er `rx_v3` décode quand même
-    /// le header Golay (96 sym QPSK fixés indépendants de la constellation
-    /// data) qui révèle le bon profil. Le worker doit alors re-décoder sur
-    /// le même buffer avec le bon profil — sinon la 1ère superframe (~4 s
-    /// en NORMAL) est perdue, comme observé OTA (ESIs 0..5 manquants sur
-    /// session 2dc17ae3).
+    /// Regression: NORMAL and HIGH share (Rs, tau, beta) -> the
+    /// preamble correlation cannot tell them apart. If the worker
+    /// starts on HIGH by default and the TX emits NORMAL, the first
+    /// `rx_v3` still decodes the Golay header (96 fixed QPSK symbols
+    /// independent of the data constellation), which exposes the
+    /// correct profile. The worker must then re-decode the same buffer
+    /// with the correct profile -- otherwise the first superframe
+    /// (~4 s in NORMAL) is lost, as observed OTA (ESIs 0..5 missing
+    /// on session 2dc17ae3).
     #[test]
     fn rx_v3_normal_decoded_with_high_config_exposes_profile_index() {
         use crate::app_header::mime;
@@ -1604,8 +1606,8 @@ mod tests {
         let session = 0xABCD_EF12u32;
         let samples = tx_v3(&data, &normal, session);
 
-        // 1er essai : config HIGH (mauvais profil mais même Rs/tau/beta).
-        // Le header Golay doit malgré tout décoder et exposer profile_index = NORMAL.
+        // 1st attempt: HIGH config (wrong profile but same Rs/tau/beta).
+        // The Golay header must still decode and expose profile_index = NORMAL.
         let r1 = rx_v3(&samples, &profile_high()).expect("rx_v3 None with HIGH config");
         let hdr = r1.header.as_ref().expect("Golay header should decode");
         let hdr_profile =
@@ -1613,22 +1615,23 @@ mod tests {
         assert_eq!(
             hdr_profile,
             ProfileIndex::Normal,
-            "header doit révéler que TX émet en NORMAL"
+            "header must reveal TX is emitting NORMAL"
         );
 
-        // 2ème essai : config NORMAL → décode complet.
+        // 2nd attempt: NORMAL config -> full decode.
         let r2 = rx_v3(&samples, &normal).expect("rx_v3 None with NORMAL config");
         assert!(r2.app_header.is_some());
         assert_eq!(&r2.data[..data.len()], &data[..]);
-        // Sanity : le payload décodé avec le bon profil restitue les bytes.
+        // Sanity: payload decoded with the correct profile restores the bytes.
         let _ = mime::BINARY;
     }
 
-    /// Régression : un burst avec `n_total` impair et zéro marge repair (cas
-    /// observé OTA en HIGH avec K=19, repair_pct=0) doit récupérer le tout
-    /// dernier codeword. Avant fix : le TX écrit 1 CW dans le segment final,
-    /// le RX en attend 2 + pilotes, le runout ne couvre pas le delta → break
-    /// au-delà du buffer et l'ESI final est perdu. RaptorQ ne converge plus.
+    /// Regression: a burst with odd `n_total` and zero repair margin
+    /// (observed OTA in HIGH with K=19, repair_pct=0) must recover the
+    /// very last codeword. Before fix: the TX wrote 1 CW into the final
+    /// segment, the RX expected 2 + pilots, and the runout did not
+    /// cover the delta -> break past the buffer and the final ESI is
+    /// lost. RaptorQ no longer converges.
     #[test]
     fn loopback_v3_high_odd_n_total_recovers_last_block() {
         use crate::app_header::mime;
@@ -1636,13 +1639,14 @@ mod tests {
         use crate::raptorq_codec;
         let config = profile_high();
         let k_bytes = LdpcEncoder::new(config.ldpc_rate).k() / 8;
-        // 4003 B → K = ceil(4003/216) = 19 (impair). Avec n_packets = K et
-        // repair_pct = 0, n_total = 19 reproduit exactement la session ratée.
+        // 4003 B -> K = ceil(4003/216) = 19 (odd). With n_packets = K
+        // and repair_pct = 0, n_total = 19 reproduces exactly the
+        // failed session.
         let data: Vec<u8> = (0..4003)
             .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
             .collect();
         let k = raptorq_codec::k_from_payload(data.len(), k_bytes) as u32;
-        assert_eq!(k % 2, 1, "test setup : K doit être impair pour reproduire le bug");
+        assert_eq!(k % 2, 1, "test setup: K must be odd to reproduce the bug");
         let session = 0xDEAD_C0FFu32;
         let hash = make_session_hash(&data);
 
@@ -1658,14 +1662,14 @@ mod tests {
         let result = rx_v3(&audio, &config).expect("rx_v3 None");
         let ah = result.app_header.as_ref().expect("AppHeader");
         eprintln!(
-            "V3 HIGH odd-K=19 : data_cw_recovered={}/{} bytes={}",
+            "V3 HIGH odd-K=19: data_cw_recovered={}/{} bytes={}",
             result.data_blocks_recovered,
             ah.k_symbols,
             result.data.len()
         );
         assert!(
             result.data_blocks_recovered >= ah.k_symbols as usize,
-            "K={} mais seulement {} CWs récupérés — segment final perdu",
+            "K={} but only {} CWs recovered -- final segment lost",
             ah.k_symbols, result.data_blocks_recovered,
         );
         assert_eq!(&result.data[..data.len()], &data[..]);

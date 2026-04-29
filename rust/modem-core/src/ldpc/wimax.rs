@@ -162,11 +162,11 @@ const BASE_R3_4: [BaseEntry; 6 * 24] = [
     -1, 63, 31, 88, 20, -1, -1, -1,  6, 40, 56, 16, 71, 53, -1, -1, 27, 26, 48, -1, -1, -1, -1,  0,
 ];
 
-/// Rate 5/6. 4 rows × 24 columns, z=96.
-/// Source: RPTU Channel Codes Database (IEEE 802.16e-2005), fichier
-/// `wimax_2304_0.83.alist` extrait via `study/extract_wimax_base_matrix.py`.
-/// Verified : 7680 ones, chaque sous-bloc 96×96 = identité cyclique
-/// propre (validé par le script d'extraction), entrées dans [-1, 95].
+/// Rate 5/6. 4 rows x 24 columns, z=96.
+/// Source: RPTU Channel Codes Database (IEEE 802.16e-2005), file
+/// `wimax_2304_0.83.alist` extracted via `study/extract_wimax_base_matrix.py`.
+/// Verified: 7680 ones, every 96x96 sub-block is a clean cyclic identity
+/// (validated by the extraction script), entries in [-1, 95].
 #[rustfmt::skip]
 const BASE_R5_6: [BaseEntry; 4 * 24] = [
       1, 25, 55, -1, 47,  4, -1, 91, 84,  8, 86, 52, 82, 33,  5,  0, 36, 20,  4, 77, 80,  0, -1, -1,
