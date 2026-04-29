@@ -681,34 +681,105 @@ function applyRxForceSettingsToUI() {
   }
 }
 
+/// Cache des <option class="experimental-option"> retirées du DOM lorsque le
+/// toggle est désactivé. Indexé par id du <select>, chaque entrée garde le
+/// outerHTML et l'index d'insertion d'origine. Rempli lazy au premier appel
+/// d'applyExperimentalModesToUI() pendant que les options sont encore dans
+/// le DOM (c'est le cas dès le chargement de index.html).
+const _experimentalOptionsCache = new Map();
+
+function _cacheExperimentalOptions() {
+  if (_experimentalOptionsCache.size > 0) return;
+  document.querySelectorAll("select").forEach((sel) => {
+    if (!sel.id) return;
+    const exps = Array.from(sel.querySelectorAll("option.experimental-option"));
+    if (exps.length === 0) return;
+    const allOpts = Array.from(sel.options);
+    _experimentalOptionsCache.set(sel.id, exps.map((opt) => ({
+      outerHTML: opt.outerHTML,
+      index: allOpts.indexOf(opt),
+    })));
+  });
+}
+
 /// Applique l'état du toggle « Activer les modes expérimentaux » :
 /// - met à jour la case à cocher des paramètres
-/// - masque/affiche les options .experimental-option dans tous les combos
+/// - retire ou ré-insère physiquement les options .experimental-option dans
+///   tous les <select> (elles ne doivent pas apparaître du tout dans le
+///   dropdown quand le mode est OFF — cacher via `hidden` n'est pas fiable
+///   sous tous les WebView Tauri)
 /// - masque/affiche la barre « Forcer un profil » de l'onglet RX
-/// Si l'utilisateur désactive le toggle alors que rx_force_mode est ON,
-/// on désactive le mode forcé pour éviter de rester verrouillé sur un
-/// profil expérimental sans pouvoir y accéder.
+/// Si l'utilisateur désactive le toggle alors que rx_force_mode est ON, on
+/// désactive le mode forcé pour éviter de rester verrouillé sur un profil
+/// expérimental sans pouvoir y accéder. Idem si la valeur courante d'un
+/// select devient invalide après retrait : on retombe sur la première option.
 function applyExperimentalModesToUI() {
   const enabled = !!currentSettings.experimental_modes_enabled;
   const cb = document.getElementById("experimental-modes-enabled");
   if (cb) cb.checked = enabled;
 
-  document.querySelectorAll(".experimental-option").forEach((opt) => {
-    opt.hidden = !enabled;
-    opt.disabled = !enabled;
-  });
+  _cacheExperimentalOptions();
+
+  for (const [selId, entries] of _experimentalOptionsCache.entries()) {
+    const sel = document.getElementById(selId);
+    if (!sel) continue;
+    const present = sel.querySelector("option.experimental-option") !== null;
+    if (enabled && !present) {
+      // Réinsérer chaque option à son index d'origine. Trier par index
+      // croissant pour que les insertBefore successifs gardent l'ordre.
+      const sorted = [...entries].sort((a, b) => a.index - b.index);
+      for (const e of sorted) {
+        const tmp = document.createElement("div");
+        tmp.innerHTML = e.outerHTML;
+        const newOpt = tmp.firstElementChild;
+        if (!newOpt) continue;
+        if (e.index >= sel.options.length) {
+          sel.appendChild(newOpt);
+        } else {
+          sel.insertBefore(newOpt, sel.options[e.index]);
+        }
+      }
+    } else if (!enabled && present) {
+      Array.from(sel.querySelectorAll("option.experimental-option"))
+        .forEach((opt) => opt.remove());
+      // Si la valeur courante du select pointait sur une option retirée,
+      // retomber sur la première option restante (sinon le select garde
+      // visuellement la valeur fantôme).
+      if (sel.value && !sel.querySelector(`option[value="${CSS.escape(sel.value)}"]`)) {
+        const fallback = sel.options[0];
+        if (fallback) sel.value = fallback.value;
+      }
+    }
+  }
 
   const forceBar = document.getElementById("rx-force-bar");
   if (forceBar) forceBar.hidden = !enabled;
 
-  if (!enabled && currentSettings.rx_force_mode) {
-    currentSettings.rx_force_mode = false;
-    const forceCb = document.getElementById("rx-force-mode");
-    const forceSel = document.getElementById("rx-forced-profile");
-    if (forceCb) forceCb.checked = false;
-    if (forceSel) forceSel.disabled = true;
-    persistSettings();
+  // Si l'utilisateur désactive le toggle alors qu'il était positionné sur un
+  // profil expérimental (côté TX et/ou RX forcé), on retombe sur HIGH56
+  // (standard depuis 2026-04-28) — sinon txState garderait la valeur fantôme
+  // après applyTxSettingsToUI() et la TX échouerait silencieusement.
+  const EXPERIMENTAL_MODES = ["MEGA", "FAST", "HIGH++", "HIGH+56"];
+  let needPersist = false;
+  if (!enabled) {
+    if (EXPERIMENTAL_MODES.includes(currentSettings.tx_mode)) {
+      currentSettings.tx_mode = "HIGH56";
+      needPersist = true;
+    }
+    if (EXPERIMENTAL_MODES.includes(currentSettings.rx_forced_profile)) {
+      currentSettings.rx_forced_profile = "HIGH56";
+      needPersist = true;
+    }
+    if (currentSettings.rx_force_mode) {
+      currentSettings.rx_force_mode = false;
+      const forceCb = document.getElementById("rx-force-mode");
+      const forceSel = document.getElementById("rx-forced-profile");
+      if (forceCb) forceCb.checked = false;
+      if (forceSel) forceSel.disabled = true;
+      needPersist = true;
+    }
   }
+  if (needPersist) persistSettings();
 }
 
 // Synchronise tous les paramètres TX persistés vers txState et l'UI. Appelé
@@ -1834,10 +1905,12 @@ function fmtSeconds(s) {
 function refreshTxExperimentalWarn() {
   const warn = document.getElementById("tx-experimental-warn");
   if (!warn) return;
+  // HIGH56 a été promu standard depuis 2026-04-28 (commit bec4e63), il ne
+  // déclenche plus le warning. Liste alignée sur ce qui porte la classe
+  // .experimental-option dans index.html.
   const isExp = txState.mode === "MEGA"
     || txState.mode === "FAST"
     || txState.mode === "HIGH++"
-    || txState.mode === "HIGH56"
     || txState.mode === "HIGH+56";
   warn.hidden = !isExp;
 }
