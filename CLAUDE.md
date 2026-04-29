@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Language convention
+
+**All new code, comments, doc-strings, log messages, identifiers, commit
+messages, and PR descriptions must be in English** from 2026-04-29 onwards.
+Existing French comments are being migrated incrementally; do not introduce
+new French ones, even when editing a file that still has French legacy.
+
+Exception — **user-facing UI strings stay in French** (button labels, hints,
+error messages shown in the GUI, capture dialogs, etc.) because the target
+audience is French-speaking radio amateurs. When in doubt: if the string is
+read by an end user inside the app, French is fine; everywhere else, English.
+
 ## Project
 
 Conception d'un modem audio pour transmission d'images sur canal radio amateur NBFM (Narrowband FM). Les transceivers appliquent pré-emphase à l'émission et dé-emphase à la réception.
