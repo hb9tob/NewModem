@@ -38,6 +38,16 @@ fn column_permutation(ct: ConstellationType) -> &'static [usize] {
         // 32-APSK : identité, conforme au défaut gr-dvbs2 pour
         // MOD_32APSK (interleaver_bb_impl.cc ligne 247, /* 01234 */).
         ConstellationType::Apsk32 => &[0, 1, 2, 3, 4],
+        // 64-APSK 4+12+20+28 : pas de port SDR de référence
+        // (gr-dvbs2/rx/acm n'implémentent pas ce layout). EN 302 307-2
+        // V1.4.1 §5.3.3 spécifie le BICM par MODCOD ; faute de table
+        // exacte transcrite, on adopte la permutation par renversement
+        // [5,4,3,2,1,0] (même heuristique que 8PSK) qui place les bits
+        // parité LDPC sur les LSB du label (quadrant), bien protégés
+        // par la séparation π/2 entre quadrants — les bits MSB
+        // (sélection anneau/secteur, plus exigeants) reçoivent les bits
+        // systématiques LDPC plus fiables.
+        ConstellationType::Apsk64 => &[5, 4, 3, 2, 1, 0],
     }
 }
 

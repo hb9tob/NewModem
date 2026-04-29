@@ -89,10 +89,14 @@ pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
         "NORMAL" => Ok(profile::profile_normal()),
         "ROBUST" => Ok(profile::profile_robust()),
         "ULTRA" => Ok(profile::profile_ultra()),
-        // EXPERIMENTAL — décodable seulement par un pair en mode forcé sur
-        // le même profil. Cf. profile.rs::profile_high_plus / profile_fast.
+        // HIGH+ promu standard depuis 2026-04-28 (validé OTA HB9MM).
         "HIGH+" | "HIGHPLUS" => Ok(profile::profile_high_plus()),
+        // EXPERIMENTAL — décodable seulement par un pair en mode forcé sur
+        // le même profil.
         "FAST" => Ok(profile::profile_fast()),
+        "HIGH++" | "HIGHPLUSPLUS" => Ok(profile::profile_high_plus_plus()),
+        "HIGH56" | "HIGH-56" => Ok(profile::profile_high_5_6()),
+        "HIGH+56" | "HIGHPLUS56" => Ok(profile::profile_high_plus_5_6()),
         _ => Err(format!("unknown profile '{name}'")),
     }
 }
@@ -303,6 +307,7 @@ pub fn spawn_more(
     esi_start: u32,
     count: u32,
     attenuation_db: f32,
+    preemphasis_enabled: bool,
     ptt: SharedPtt,
     app: AppHandle,
 ) -> TxHandle {
@@ -379,6 +384,7 @@ pub fn spawn_more(
             duration_s,
             wav_str,
             attenuation_db,
+            preemphasis_enabled,
             stop_thread,
             ptt,
             app,
@@ -399,6 +405,7 @@ pub fn spawn(
     save_dir: PathBuf,
     repair_pct: u32,
     attenuation_db: f32,
+    preemphasis_enabled: bool,
     ptt: SharedPtt,
     app: AppHandle,
 ) -> TxHandle {
@@ -502,6 +509,7 @@ pub fn spawn(
             duration_s,
             wav_str,
             attenuation_db,
+            preemphasis_enabled,
             stop_thread,
             ptt,
             app,
@@ -510,6 +518,40 @@ pub fn spawn(
     TxHandle {
         stop,
         thread: Some(thread),
+    }
+}
+
+/// Pré-emphase numérique +6 dB/octave pour NBFM : shelf 1ᵉʳ ordre
+/// H(s) = (1+sτ₁)/(1+sτ₂), τ₁ = 750 µs (zéro de boost à f₁ ≈ 212 Hz),
+/// τ₂ = 75 µs (pôle à f₂ ≈ 2.12 kHz qui plafonne le gain HF à
+/// τ₁/τ₂ = 20 dB). Bilinear transform à 48 kHz, coefficients normalisés
+/// pour DC = 1.
+///
+/// Réponse digitale :
+///   - DC : 0 dB
+///   - 1 kHz : ~+13 dB
+///   - 2.7 kHz : ~+18 dB
+///   - Nyquist : +20 dB (plateau du shelf)
+///
+/// Boost important sur tout l'audio utile (NBFM commence à pré-accentuer
+/// dès 200 Hz, pas 2 kHz comme la FM broadcast). L'appelant DOIT
+/// peak-normaliser le signal après filtrage : sinon la carte son écrête.
+fn preemphasis_nbfm_48k(samples: &mut [f32]) {
+    // Bilinear sans prewarp : 2τ₁/T = 72.0, 2τ₂/T = 7.2.
+    // Num brut : 73 - 71 z⁻¹  ;  Den brut : 8.2 - 6.2 z⁻¹.
+    // Normalisation par a0 = 8.2 → b0 = 8.9024, b1 = -8.6585, a1 = -0.7561.
+    // Pôle à z = 0.7561, stable.
+    const B0: f32 = 8.9024;
+    const B1: f32 = -8.6585;
+    const A1: f32 = -0.7561;
+    let mut x_prev = 0.0f32;
+    let mut y_prev = 0.0f32;
+    for s in samples.iter_mut() {
+        let x = *s;
+        let y = B0 * x + B1 * x_prev - A1 * y_prev;
+        x_prev = x;
+        y_prev = y;
+        *s = y;
     }
 }
 
@@ -550,10 +592,29 @@ fn run_playback(
     duration_s: f64,
     wav_path: String,
     attenuation_db: f32,
+    preemphasis_enabled: bool,
     stop: Arc<AtomicBool>,
     ptt: SharedPtt,
     app: AppHandle,
 ) {
+    // Pré-emphase NBFM optionnelle (+6 dB/oct, τ = 750 µs). Appliquée AVANT
+    // l'atténuation pour que le pic re-normalisé respecte ensuite la consigne
+    // ATT. Le shelf élève fortement les hautes fréquences audio (+13 dB à
+    // 1 kHz, +18 dB à 2.7 kHz, plafond +20 dB) : sans re-normalisation le
+    // signal écrêterait la carte son.
+    if preemphasis_enabled {
+        preemphasis_nbfm_48k(&mut samples);
+        // Re-peak-normalize au même niveau que la sortie modem-cli (PEAK_NORMALIZE
+        // = 0.9 dans modem-core::types). Garde un headroom de ~0.9 dB avant
+        // saturation int16/F32 quelle que soit l'élévation HF du shelf.
+        let peak = samples.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+        if peak > 0.9 {
+            let scale = 0.9 / peak;
+            for s in samples.iter_mut() {
+                *s *= scale;
+            }
+        }
+    }
     // Applique l'atténuation de la cascade ATT (onglet Canal). Clamp à
     // [-60, 0] dB par sécurité — au-delà ça ne sert à rien et un signe
     // positif inattendu saturerait la carte son.

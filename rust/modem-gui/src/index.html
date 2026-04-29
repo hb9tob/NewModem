@@ -37,7 +37,7 @@
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
         <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
       </div>
-      <div class="rx-force-bar">
+      <div class="rx-force-bar" id="rx-force-bar" hidden>
         <label>
           <input type="checkbox" id="rx-force-mode">
           Forcer un profil
@@ -46,10 +46,13 @@
           <option value="ULTRA">ULTRA</option>
           <option value="ROBUST">ROBUST</option>
           <option value="NORMAL">NORMAL</option>
-          <option value="HIGH" selected>HIGH</option>
-          <option value="MEGA">MEGA</option>
-          <option value="HIGH+" class="experimental-option">⚠ HIGH+ [EXPÉRIMENTAL]</option>
+          <option value="HIGH">HIGH</option>
+          <option value="HIGH+">HIGH+</option>
+          <option value="HIGH56" selected>HIGH56</option>
+          <option value="MEGA" class="experimental-option">⚠ MEGA [EXPÉRIMENTAL]</option>
           <option value="FAST" class="experimental-option">⚠ FAST [EXPÉRIMENTAL]</option>
+          <option value="HIGH++" class="experimental-option">⚠ HIGH++ [EXPÉRIMENTAL]</option>
+          <option value="HIGH+56" class="experimental-option">⚠ HIGH+56 [EXPÉRIMENTAL]</option>
         </select>
         <span class="rx-force-hint">prend effet au prochain ▶ Démarrer</span>
       </div>
@@ -99,13 +102,16 @@
         <fieldset>
           <legend>Mode modem</legend>
           <select id="tx-mode">
-            <option value="ULTRA">ULTRA — QPSK τ=1, LDPC 1/2</option>
-            <option value="ROBUST">ROBUST — QPSK τ=1, LDPC 1/2</option>
-            <option value="NORMAL">NORMAL — 8-PSK τ=1, LDPC 1/2</option>
-            <option value="HIGH" selected>HIGH — 16-APSK τ=1, LDPC 3/4</option>
-            <option value="MEGA">MEGA — 16-APSK τ=30/32, LDPC 3/4</option>
-            <option value="HIGH+" class="experimental-option">⚠ HIGH+ — 32-APSK τ=1, LDPC 3/4 [EXPÉRIMENTAL]</option>
-            <option value="FAST" class="experimental-option">⚠ FAST — 16-APSK Rs=1714 β=0.15, LDPC 3/4 [EXPÉRIMENTAL]</option>
+            <option value="ULTRA">ULTRA — QPSK τ=1, LDPC 1/2 — 444 bps</option>
+            <option value="ROBUST">ROBUST — QPSK τ=1, LDPC 1/2 — 941 bps</option>
+            <option value="NORMAL">NORMAL — 8-PSK τ=1, LDPC 1/2 — 2118 bps</option>
+            <option value="HIGH">HIGH — 16-APSK τ=1, LDPC 3/4 — 4235 bps</option>
+            <option value="HIGH56" selected>HIGH56 — 16-APSK τ=1, LDPC 5/6 — 4706 bps</option>
+            <option value="HIGH+">HIGH+ — 32-APSK τ=1, LDPC 3/4 — 5294 bps</option>
+            <option value="MEGA" class="experimental-option">⚠ MEGA — 16-APSK τ=30/32, LDPC 3/4 — 3971 bps [EXPÉRIMENTAL]</option>
+            <option value="FAST" class="experimental-option">⚠ FAST — 16-APSK Rs=1714 β=0.15, LDPC 3/4 — 4840 bps [EXPÉRIMENTAL]</option>
+            <option value="HIGH++" class="experimental-option">⚠ HIGH++ — 64-APSK τ=1, LDPC 3/4 — 6000 bps [EXPÉRIMENTAL]</option>
+            <option value="HIGH+56" class="experimental-option">⚠ HIGH+56 — 32-APSK τ=1, LDPC 5/6 — 5882 bps [EXPÉRIMENTAL]</option>
           </select>
           <div id="tx-experimental-warn" class="experimental-warn" hidden>
             ⚠ Mode expérimental — non décodable côté RX sans activer "Forcer un profil" sur le pair, et seulement sur la même version de l'appli.
@@ -192,6 +198,13 @@
     </section>
     <section id="tab-settings" class="tab-panel settings-layout">
       <div class="settings-form">
+        <div id="settings-rx-warn" class="settings-warn" hidden>
+          <span class="settings-warn-text">
+            ⚠ Le RX est en cours. Pour modifier la carte son ou la
+            pré-emphase, il faut d'abord arrêter la réception.
+          </span>
+          <button type="button" id="settings-stop-rx-btn">Arrêter le RX</button>
+        </div>
         <fieldset>
           <legend>Indicatif</legend>
           <input type="text" id="callsign-input" placeholder="HB9TOB" maxlength="12">
@@ -208,6 +221,16 @@
           <select id="tx-device-select">
             <option>Chargement…</option>
           </select>
+          <label class="ptt-row" style="margin-top: 0.5rem;">
+            <input type="checkbox" id="tx-preemphasis-enabled">
+            Pré-emphase NBFM +6 dB/oct (τ = 750 µs)
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Boost des aigus dès ~212 Hz (~+13 dB à 1 kHz, ~+18 dB à 2.7 kHz,
+            plateau +20 dB). Le signal est re-normalisé après filtrage pour
+            ne pas écrêter la carte son. À activer si la chaîne audio TX
+            n'effectue pas elle-même la pré-emphase.
+          </p>
         </fieldset>
         <fieldset>
           <legend>PTT (RTS/DTR sur port série)</legend>
@@ -267,6 +290,19 @@
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
             Au-delà, les plus anciens sont purgés à chaque nouvelle émission.
             Stocké sous <code>&lt;save_dir&gt;/tx_history/</code>.
+          </p>
+        </fieldset>
+        <fieldset>
+          <legend>Modes expérimentaux</legend>
+          <label class="ptt-row">
+            <input type="checkbox" id="experimental-modes-enabled">
+            Activer les modes expérimentaux
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Affiche les profils marqués ⚠ dans les combos TX et RX (MEGA,
+            FAST, HIGH++, HIGH+56), et l'option « Forcer un profil » au
+            démarrage RX. Ces modes ne sont décodables que par un pair
+            sur la même version de l'appli en mode forcé.
           </p>
         </fieldset>
         <div class="settings-status" id="settings-status">—</div>

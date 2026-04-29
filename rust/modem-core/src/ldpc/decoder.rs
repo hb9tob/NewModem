@@ -220,6 +220,11 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_r5_6_clean() {
+        encode_decode_test(LdpcRate::R5_6, 0.0);
+    }
+
+    #[test]
     fn decode_all_zeros() {
         let dec = LdpcDecoder::new(LdpcRate::R1_2, 50);
         // All-zero codeword with positive LLR

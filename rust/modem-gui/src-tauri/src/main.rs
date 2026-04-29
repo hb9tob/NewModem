@@ -155,6 +155,9 @@ fn start_capture(
         // EXPERIMENTAL : seulement utilisable si forced=true.
         "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
         "FAST" => modem_core::profile::ProfileIndex::Fast,
+        "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
+        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix,
+        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix,
         other => return Err(format!("unknown profile '{other}'")),
     };
     let forced = forced.unwrap_or(false);
@@ -362,6 +365,7 @@ fn tx_start(
     }
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
+    let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let history_max = cfg.tx_history_max;
     let repair_pct = args.repair_pct.unwrap_or(30);
     tx_worker::archive_payload(
@@ -382,6 +386,7 @@ fn tx_start(
         save_dir,
         repair_pct,
         attenuation_db,
+        preemphasis_enabled,
         state.ptt.clone(),
         app,
     );
@@ -434,7 +439,9 @@ fn tx_more(
     if args.count == 0 {
         return Err("choisir un nombre de blocs > 0".into());
     }
-    let attenuation_db = settings::load().tx_attenuation_db;
+    let cfg = settings::load();
+    let attenuation_db = cfg.tx_attenuation_db;
+    let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let handle = tx_worker::spawn_more(
         payload_path,
         args.mode,
@@ -445,6 +452,7 @@ fn tx_more(
         args.esi_start,
         args.count,
         attenuation_db,
+        preemphasis_enabled,
         state.ptt.clone(),
         app,
     );

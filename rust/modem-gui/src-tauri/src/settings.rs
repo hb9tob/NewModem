@@ -26,6 +26,15 @@ pub struct Settings {
     /// (≤ 0). Renseignée par l'onglet Canal (cascade ATT). Gain appliqué :
     /// `10^(att/20)`. Défaut : 0 dB (pas d'atténuation).
     pub tx_attenuation_db: f32,
+    /// Si vrai, applique une pré-emphase NBFM +6 dB/octave (shelf
+    /// τ₁ = 750 µs / τ₂ = 75 µs, breakpoints ~212 Hz et ~2.12 kHz) au WAV
+    /// avant envoi à la carte son. Utile pour compenser une chaîne audio
+    /// TX qui dé-emphase trop fort, ou pour retrouver la pente attendue
+    /// par un transceiver dont la pré-emphase interne serait absente. Le
+    /// signal filtré est re-normalisé à pic 0.9 pour éviter l'écrêtage
+    /// de la carte son. Défaut : false.
+    #[serde(default)]
+    pub tx_preemphasis_enabled: bool,
     /// URL de base du collector Phase D (ex: `https://hb9tob-modem.duckdns.org`).
     /// Si vide, le prompt post-capture brute n'apparaît pas et la
     /// soumission est désactivée pour la session.
@@ -38,8 +47,10 @@ pub struct Settings {
     /// Défaut 5 : redondance modeste, l'utilisateur monte au besoin.
     #[serde(default = "default_tx_repair_pct")]
     pub tx_repair_pct: u32,
-    /// Mode modem sélectionné dans la fenêtre TX (ULTRA / ROBUST / NORMAL /
-    /// HIGH / MEGA). Défaut HIGH (correspond à l'option HTML cochée).
+    /// Mode modem sélectionné dans la fenêtre TX. Profils standards :
+    /// ULTRA / ROBUST / NORMAL / HIGH / HIGH56 / HIGH+. Profils
+    /// expérimentaux (visibles si `experimental_modes_enabled`) :
+    /// MEGA / FAST / HIGH++ / HIGH+56. Défaut HIGH56.
     #[serde(default = "default_tx_mode")]
     pub tx_mode: String,
     /// Choix de redimensionnement (`none`, `1920x1024`, `800x600`, `free`).
@@ -61,6 +72,22 @@ pub struct Settings {
     /// anciens sont purgés à chaque archivage.
     #[serde(default = "default_tx_history_max")]
     pub tx_history_max: u32,
+    /// Verrouillage RX sur un profil donné (bypass auto-détection du
+    /// gate FFT). Indispensable pour décoder les profils expérimentaux
+    /// (MEGA, FAST, HIGH++, HIGH+56) qui ne sont pas dans
+    /// `PROBE_TEMPLATES`. Défaut false.
+    #[serde(default)]
+    pub rx_force_mode: bool,
+    /// Profil à forcer côté RX quand `rx_force_mode = true`. Ignoré
+    /// sinon. Défaut HIGH56 (le profil standard recommandé).
+    #[serde(default = "default_rx_forced_profile")]
+    pub rx_forced_profile: String,
+    /// Affiche/masque les profils expérimentaux dans les combos TX et
+    /// RX et l'option « Forcer un profil » au démarrage. Défaut false :
+    /// l'utilisateur découvre l'application avec uniquement les profils
+    /// standards exposés. Activable via Paramètres.
+    #[serde(default)]
+    pub experimental_modes_enabled: bool,
 }
 
 fn default_tx_quality() -> u32 {
@@ -72,7 +99,11 @@ fn default_tx_repair_pct() -> u32 {
 }
 
 fn default_tx_mode() -> String {
-    "HIGH".to_string()
+    "HIGH56".to_string()
+}
+
+fn default_rx_forced_profile() -> String {
+    "HIGH56".to_string()
 }
 
 fn default_tx_resize() -> String {
@@ -112,6 +143,7 @@ impl Default for Settings {
             ptt_rts_tx_high: true,
             ptt_dtr_tx_high: true,
             tx_attenuation_db: 0.0,
+            tx_preemphasis_enabled: false,
             collector_url: String::new(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),
@@ -122,6 +154,9 @@ impl Default for Settings {
             tx_speed: default_tx_speed(),
             tx_more_count: default_tx_more_count(),
             tx_history_max: default_tx_history_max(),
+            rx_force_mode: false,
+            rx_forced_profile: default_rx_forced_profile(),
+            experimental_modes_enabled: false,
         }
     }
 }

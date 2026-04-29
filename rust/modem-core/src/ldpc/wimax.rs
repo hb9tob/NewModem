@@ -1,9 +1,10 @@
 //! WiMAX IEEE 802.16e LDPC base matrices.
 //!
 //! Base matrices from IEEE 802.16e-2005:
-//! - Rate 1/2: Table 574 (12 x 24)
-//! - Rate 2/3A: Table 575a (8 x 24)
-//! - Rate 3/4A: Table 576a (6 x 24)
+//! - Rate 1/2:   Table 574  (12 x 24)
+//! - Rate 2/3A:  Table 575a ( 8 x 24)
+//! - Rate 3/4A:  Table 576a ( 6 x 24)
+//! - Rate 5/6:   Table 576c ( 4 x 24) — RPTU alist `wimax_2304_0.83.alist`
 //!
 //! Expansion factor z = 96, giving N = 24 * 96 = 2304.
 //! Entry -1 means zero z×z block. Entry s (0..z-1) means
@@ -49,6 +50,11 @@ pub fn base_matrix(rate: LdpcRate) -> BaseMatrix {
             n_rows: 6,
             n_cols: 24,
             data: &BASE_R3_4,
+        },
+        LdpcRate::R5_6 => BaseMatrix {
+            n_rows: 4,
+            n_cols: 24,
+            data: &BASE_R5_6,
         },
     }
 }
@@ -156,6 +162,19 @@ const BASE_R3_4: [BaseEntry; 6 * 24] = [
     -1, 63, 31, 88, 20, -1, -1, -1,  6, 40, 56, 16, 71, 53, -1, -1, 27, 26, 48, -1, -1, -1, -1,  0,
 ];
 
+/// Rate 5/6. 4 rows × 24 columns, z=96.
+/// Source: RPTU Channel Codes Database (IEEE 802.16e-2005), fichier
+/// `wimax_2304_0.83.alist` extrait via `study/extract_wimax_base_matrix.py`.
+/// Verified : 7680 ones, chaque sous-bloc 96×96 = identité cyclique
+/// propre (validé par le script d'extraction), entrées dans [-1, 95].
+#[rustfmt::skip]
+const BASE_R5_6: [BaseEntry; 4 * 24] = [
+      1, 25, 55, -1, 47,  4, -1, 91, 84,  8, 86, 52, 82, 33,  5,  0, 36, 20,  4, 77, 80,  0, -1, -1,
+     -1,  6, -1, 36, 40, 47, 12, 79, 47, -1, 41, 21, 12, 71, 14, 72,  0, 44, 49,  0,  0,  0,  0, -1,
+     51, 81, 83,  4, 67, -1, 21, -1, 31, 24, 91, 61, 81,  9, 86, 78, 60, 88, 67, 15, -1, -1,  0,  0,
+     50, -1, 50, 15, -1, 36, 13, 10, 11, 20, 53, 90, 29, 92, 57, 30, 84, 92, 11, 66, 80, -1, -1,  0,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +192,10 @@ mod tests {
 
         let bm = base_matrix(LdpcRate::R3_4);
         assert_eq!(bm.n_rows, 6);
+        assert_eq!(bm.n_cols, 24);
+
+        let bm = base_matrix(LdpcRate::R5_6);
+        assert_eq!(bm.n_rows, 4);
         assert_eq!(bm.n_cols, 24);
     }
 
@@ -222,7 +245,7 @@ mod tests {
 
     #[test]
     fn shift_values_in_range() {
-        for rate in [LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4] {
+        for rate in [LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4, LdpcRate::R5_6] {
             let bm = base_matrix(rate);
             for r in 0..bm.n_rows {
                 for c in 0..bm.n_cols {
