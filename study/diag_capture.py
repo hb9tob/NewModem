@@ -223,7 +223,7 @@ def verdict(samples, sr, regions, main):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("wav", help="chemin vers le WAV OTA capturé")
+    p.add_argument("wav", help="path to the captured OTA WAV")
     p.add_argument("--outdir", default=RESULTS_DIR)
     args = p.parse_args()
 

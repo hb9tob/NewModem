@@ -165,7 +165,7 @@ blocks:
     rotation: 0
     state: enabled
 
-# --- Source : tone sinusoïdal ---
+# --- Source: sine tone ---
 - name: analog_sig_source_x_0
   id: analog_sig_source_x
   parameters:

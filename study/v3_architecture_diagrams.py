@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Génère les schémas et graphiques de documentation de la trame V3 et du RX V3.
+"""Generate documentation diagrams and plots of the V3 frame and the V3 RX.
 
-Sorties (results/doc_v3/) :
-  v3_frame_layout.png          Timeline trame V3 (BOOT + STEADY) coloriée par champ
-  v3_constellations.png        QPSK préambule / 16-APSK data / TDM pilots
-  v3_rx_block_diagram.png      Schéma bloc RX avec boucles de rétroaction
-  v3_pilots_matrix.png         Matrice pilotes × modules RX
-  v3_real_signal_spectrogram.png      Spectrogramme du WAV V3 avec préambules
-  v3_real_signal_preamble_corr.png    Trace de corrélation préambule
-  v3_real_signal_constellation.png    Constellation mesurée après MF
+Outputs (results/doc_v3/):
+  v3_frame_layout.png          V3 frame timeline (BOOT + STEADY) colored by field
+  v3_constellations.png        QPSK preamble / 16-APSK data / TDM pilots
+  v3_rx_block_diagram.png      RX block diagram with feedback loops
+  v3_pilots_matrix.png         Pilots x RX-modules matrix
+  v3_real_signal_spectrogram.png      Spectrogram of the V3 WAV with preambles
+  v3_real_signal_preamble_corr.png    Preamble correlation trace
+  v3_real_signal_constellation.png    Measured constellation after MF
 
-Usage :
+Usage:
   /c/Users/tous/radioconda/python.exe study/v3_architecture_diagrams.py
 """
 
@@ -30,16 +30,16 @@ OUT_DIR = os.path.join(ROOT, "results", "doc_v3")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------------
-# Palette unifiée : un code couleur pour chaque type de champ de trame
+# Unified palette: one color code per frame-field type
 # ----------------------------------------------------------------------------
 COLORS = {
-    "preamble": "#2b7fbf",   # bleu
-    "header":   "#7fbf3f",   # vert clair
-    "marker":   "#bf5f2b",   # orange brûlé
-    "meta":     "#bfa02b",   # doré
-    "data":     "#8b2bbf",   # violet
+    "preamble": "#2b7fbf",   # blue
+    "header":   "#7fbf3f",   # light green
+    "marker":   "#bf5f2b",   # burnt orange
+    "meta":     "#bfa02b",   # gold
+    "data":     "#8b2bbf",   # purple
     "pilot":    "#2bbfaf",   # turquoise
-    "runout":   "#666666",   # gris
+    "runout":   "#666666",   # gray
 }
 
 
@@ -48,13 +48,13 @@ COLORS = {
 # ============================================================================
 
 def plot_frame_layout(path):
-    """Timeline symbolique d'une trame V3 HIGH (cadence constante T=4s)."""
-    # Chronogramme idéal HIGH 1500 Bd, 16-APSK, LDPC 3/4 :
+    """Symbolic timeline of a HIGH V3 frame (constant cadence T=4 s)."""
+    # Idealized chronogram HIGH 1500 Bd, 16-APSK, LDPC 3/4:
     # 1 CW = 288 syms = 192 ms
-    # data segment (2 CW + marker + pilots) ≈ 500 ms
-    # meta segment (1 CW + marker + pilots) ≈ 280 ms
-    # preamble + header = 256 + 96 = 352 syms ≈ 235 ms
-    # cadence 4s → ~8 data-segs par cycle
+    # data segment (2 CW + marker + pilots) ~= 500 ms
+    # meta segment (1 CW + marker + pilots) ~= 280 ms
+    # preamble + header = 256 + 96 = 352 syms ~= 235 ms
+    # 4 s cadence -> ~8 data-segs per cycle
 
     fig, ax = plt.subplots(figsize=(16, 4.2))
     t = 0.0
@@ -74,14 +74,14 @@ def plot_frame_layout(path):
             push("MK", COLORS["marker"], 0.085)
             push("DATA", COLORS["data"], 0.384)
 
-    # 3 cycles identiques à cadence ~4s (HIGH)
+    # 3 identical cycles at ~4 s cadence (HIGH)
     push_cycle(8)
     push_cycle(8)
     push_cycle(8)
 
     push("runout", COLORS["runout"], 0.1)
 
-    # Dessin
+    # Drawing
     y = 0.3
     h = 0.5
     for start, dur, name, color, label in segs:
@@ -97,7 +97,7 @@ def plot_frame_layout(path):
                     ha="center", va="top", color="black", fontsize=7)
 
     total = t
-    # Annotations cycles : 3 cycles identiques à ~4 s
+    # Cycle annotations: 3 identical cycles at ~4 s
     annot_y = y + h + 0.15
     cycle_dur = 0.17 + 0.064 + 0.085 + 0.192 + 8 * (0.085 + 0.384)
     for i in range(3):
@@ -106,22 +106,22 @@ def plot_frame_layout(path):
         ax.annotate("", xy=(ce, annot_y), xytext=(cs, annot_y),
                     arrowprops=dict(arrowstyle="<->", color="#bfa02b"))
         ax.text((cs + ce) / 2, annot_y + 0.05,
-                f"cycle {i} (T≈4 s, cadence constante)",
+                f"cycle {i} (T~=4 s, constant cadence)",
                 ha="center", fontsize=9, color="#bfa02b")
 
-    # Réinsertion V3
-    ax.annotate("réinsertion V3\nPRE+HDR tous les 4 s", xy=(cycle_dur + 0.08, y + h),
+    # V3 re-insertion
+    ax.annotate("V3 re-insertion\nPRE+HDR every 4 s", xy=(cycle_dur + 0.08, y + h),
                 xytext=(cycle_dur + 0.3, y + h + 0.8),
                 arrowprops=dict(arrowstyle="->", color="red"),
                 fontsize=9, color="red", ha="center")
 
-    # Légende
+    # Legend
     legend_items = [
-        ("PRE — 256 QPSK fixe (seed 1234)", COLORS["preamble"]),
-        ("HDR — 96 QPSK Golay(24,12)×8 (version=3)", COLORS["header"]),
-        ("MK  — 128 QPSK (32 sync + 96 ctrl Golay+CRC8)", COLORS["marker"]),
-        ("META — 1 CW LDPC 16-APSK (AppHeader×4)", COLORS["meta"]),
-        ("DATA — 2 CW LDPC 16-APSK (+TDM pilots)", COLORS["data"]),
+        ("PRE - 256 fixed QPSK (seed 1234)", COLORS["preamble"]),
+        ("HDR - 96 QPSK Golay(24,12)x8 (version=3)", COLORS["header"]),
+        ("MK  - 128 QPSK (32 sync + 96 ctrl Golay+CRC8)", COLORS["marker"]),
+        ("META - 1 CW LDPC 16-APSK (AppHeader x4)", COLORS["meta"]),
+        ("DATA - 2 CW LDPC 16-APSK (+TDM pilots)", COLORS["data"]),
     ]
     from matplotlib.patches import Patch
     handles = [Patch(facecolor=c, edgecolor="black", label=lbl) for lbl, c in legend_items]
@@ -131,9 +131,9 @@ def plot_frame_layout(path):
     ax.set_xlim(-0.1, total + 0.1)
     ax.set_ylim(-0.3, annot_y + 0.35)
     ax.set_yticks([])
-    ax.set_xlabel("temps (s)")
-    ax.set_title("Trame V3 — modulation de chaque champ  "
-                 "(profil HIGH 1500 Bd · 16-APSK · LDPC 3/4)")
+    ax.set_xlabel("time (s)")
+    ax.set_title("V3 frame - modulation of each field  "
+                 "(HIGH profile 1500 Bd, 16-APSK, LDPC 3/4)")
     plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
@@ -149,15 +149,15 @@ def make_qpsk():
 
 
 def make_16apsk():
-    # DVB-S2 style 4+12 : 1 ring inner (4 pts) + 1 ring outer (12 pts)
-    r1, r2 = 1.0, 2.85  # ratio typique DVB-S2 16-APSK
+    # DVB-S2 style 4+12: 1 inner ring (4 pts) + 1 outer ring (12 pts)
+    r1, r2 = 1.0, 2.85  # typical DVB-S2 16-APSK ratio
     inner = r1 * np.exp(1j * (np.pi / 4 + np.arange(4) * np.pi / 2))
     outer = r2 * np.exp(1j * (np.pi / 12 + np.arange(12) * np.pi / 6))
     return np.concatenate([inner, outer])
 
 
 def make_pilots():
-    """4 phases QPSK sur cercle (cycle π/2)."""
+    """4 QPSK phases on the unit circle (pi/2 cycle)."""
     return np.array([np.exp(1j * n * np.pi / 2) for n in range(4)])
 
 
@@ -170,7 +170,7 @@ def plot_constellations(path):
         ax.set_aspect("equal")
         ax.grid(alpha=0.3)
 
-    # QPSK (préambule, header, marker)
+    # QPSK (preamble, header, marker)
     q = make_qpsk()
     axes[0].scatter(q.real, q.imag, s=180, c=COLORS["preamble"], edgecolor="black", zorder=3)
     for i, s in enumerate(q):
@@ -180,14 +180,14 @@ def plot_constellations(path):
     axes[0].add_patch(circle)
     axes[0].set_xlim(-1.6, 1.6)
     axes[0].set_ylim(-1.6, 1.6)
-    axes[0].set_title("QPSK (préambule / header / marker)\nexp(j·(π/4 + q·π/2)), q∈{0..3}")
+    axes[0].set_title("QPSK (preamble / header / marker)\nexp(j*(pi/4 + q*pi/2)), q in {0..3}")
 
     # 16-APSK (data, meta)
     a = make_16apsk()
     axes[1].scatter(a[:4].real, a[:4].imag, s=120, c="#bfa02b", edgecolor="black",
                     label="inner ring (r=1)", zorder=3)
     axes[1].scatter(a[4:].real, a[4:].imag, s=120, c=COLORS["data"], edgecolor="black",
-                    label="outer ring (r≈2.85)", zorder=3)
+                    label="outer ring (r~=2.85)", zorder=3)
     for r in [1.0, 2.85]:
         circle = plt.Circle((0, 0), r, fill=False, linestyle="--", color="gray", alpha=0.5)
         axes[1].add_patch(circle)
@@ -212,16 +212,16 @@ def plot_constellations(path):
     axes[2].add_patch(circle)
     axes[2].set_xlim(-1.6, 1.6)
     axes[2].set_ylim(-1.6, 1.6)
-    axes[2].set_title("TDM pilot (QPSK cycle π/2)\nexp(j·n·π/2), n cyclé 0..3")
+    axes[2].set_title("TDM pilot (QPSK pi/2 cycle)\nexp(j*n*pi/2), n cycled 0..3")
 
-    fig.suptitle("Constellations par champ de trame V3", fontsize=13, weight="bold")
+    fig.suptitle("Constellations per V3 frame field", fontsize=13, weight="bold")
     plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
     plt.close()
 
 
 # ============================================================================
-# 3. RX BLOCK DIAGRAM — pipeline + boucles de rétroaction
+# 3. RX BLOCK DIAGRAM - pipeline + feedback loops
 # ============================================================================
 
 def plot_rx_block_diagram(path):
@@ -245,14 +245,14 @@ def plot_rx_block_diagram(path):
         ax.text(x, y, t, color=color, fontsize=fontsize, weight=weight, ha=ha)
 
     # Header pipeline
-    label(7, 12.6, "RX V3 — pipeline de décodage & boucles de rétroaction",
+    label(7, 12.6, "V3 RX - decoding pipeline & feedback loops",
           fontsize=13, weight="bold")
 
-    # Entrée
+    # Input
     box(0.3, 11.5, 2.2, 0.6, "samples f32 @ 48 kHz", fc="#fff0e0")
     arrow(1.4, 11.5, 1.4, 11.1)
 
-    box(0.3, 10.5, 2.2, 0.6, "downmix (e^-j2πfct)")
+    box(0.3, 10.5, 2.2, 0.6, "downmix (e^-j2*pi*fc*t)")
     arrow(1.4, 10.5, 1.4, 10.1)
 
     box(0.3, 9.5, 2.2, 0.6, "matched filter (RRC)")
@@ -262,9 +262,9 @@ def plot_rx_block_diagram(path):
     box(0.3, 8.3, 2.2, 0.8, "sync::find_all_preambles\ncoarse NMS + fine refine",
         fc="#ffe8e8")
     arrow(1.4, 8.3, 1.4, 7.9)
-    label(2.6, 8.7, "→ [P0, P1, … Pn]", fontsize=8)
+    label(2.6, 8.7, "-> [P0, P1, ... Pn]", fontsize=8)
 
-    # Label pipeline à gauche
+    # Pipeline labels on the left
     label(0.1, 10.8, "1", weight="bold", fontsize=11)
     label(0.1, 8.7, "2", weight="bold", fontsize=11)
 
@@ -275,13 +275,13 @@ def plot_rx_block_diagram(path):
                               edgecolor="#444444", linewidth=1.5, linestyle="--")
     ax.add_patch(loop_box)
     label(loop_x + 0.2, loop_y + loop_h - 0.3,
-          "3.  FOR EACH WINDOW  [P_i − margin .. P_{i+1} + margin]",
+          "3.  FOR EACH WINDOW  [P_i - margin .. P_{i+1} + margin]",
           weight="bold", fontsize=10, ha="left")
 
-    # Inside loop : grid ppm wrapper
-    box(loop_x + 0.3, 6.2, 3.8, 0.9, "A.  grid ppm (±80, pas 20)\n + refine ±10 pas 5",
+    # Inside loop: grid ppm wrapper
+    box(loop_x + 0.3, 6.2, 3.8, 0.9, "A.  grid ppm (+/-80, step 20)\n + refine +/-10 step 5",
         fc="#f0e8ff")
-    label(loop_x + 0.3 + 3.8 / 2, 6.0, "best ppm → score", fontsize=7, color="#555555")
+    label(loop_x + 0.3 + 3.8 / 2, 6.0, "best ppm -> score", fontsize=7, color="#555555")
 
     # feedback arrow: grid loop
     arrow(loop_x + 0.3 + 3.8 + 0.1, 6.55,
@@ -293,23 +293,23 @@ def plot_rx_block_diagram(path):
           loop_x + 0.3 + 3.8 / 2, 7.0, color="#7f2bbf", lw=1.2, style="-")
     arrow(loop_x + 0.3 + 3.8 / 2, 7.0,
           loop_x + 0.3 + 3.8 / 2, 7.1, color="#7f2bbf", lw=1.2)
-    label(loop_x + 0.3 + 3.8 / 2, 7.3, "BOUCLE 1 : grid score",
+    label(loop_x + 0.3 + 3.8 / 2, 7.3, "LOOP 1: grid score",
           fontsize=7, color="#7f2bbf")
 
-    # B.1 downmix + MF + find_preamble (unique dans fenêtre)
+    # B.1 downmix + MF + find_preamble (single match in window)
     box(loop_x + 0.3, 5.2, 3.8, 0.7,
-        "B.1  downmix + MF (resample)\nfind_preamble lock unique", fc="#eef6ff")
+        "B.1  downmix + MF (resample)\nfind_preamble single lock", fc="#eef6ff")
 
     # B.2 FFE LS-train
     box(loop_x + 0.3, 4.3, 3.8, 0.7,
-        "B.2  ffe::train_ffe_ls (closed-form)\nn_ff≈8·sps+1, matrice Hermitienne",
+        "B.2  ffe::train_ffe_ls (closed-form)\nn_ff~=8*sps+1, Hermitian matrix",
         fc="#eef6ff")
-    label(loop_x + 4.2, 4.65, "← PREAMBLE\n256 QPSK",
+    label(loop_x + 4.2, 4.65, "<- PREAMBLE\n256 QPSK",
           color="#2b7fbf", fontsize=7, ha="left")
 
-    # B.3 FFE LMS (TRAIN + DD) — boucle fermée
+    # B.3 FFE LMS (TRAIN + DD) - closed loop
     box(loop_x + 0.3, 3.2, 3.8, 0.9,
-        "B.3  ffe::apply_ffe_lms_with_training\nTRAIN μ=0.10 / DD μ=0.02",
+        "B.3  ffe::apply_ffe_lms_with_training\nTRAIN mu=0.10 / DD mu=0.02",
         fc="#fff0e0")
     # feedback loop on FFE
     arrow(loop_x + 0.3 + 3.8, 3.6,
@@ -320,25 +320,25 @@ def plot_rx_block_diagram(path):
           loop_x + 0.3 + 2.0, 3.1, color="#bf5f2b", lw=1.3, style="-")
     arrow(loop_x + 0.3 + 2.0, 3.1,
           loop_x + 0.3 + 2.0, 3.2, color="#bf5f2b", lw=1.3)
-    label(loop_x + 5.2, 3.35, "BOUCLE 2 : LMS err·x*",
+    label(loop_x + 5.2, 3.35, "LOOP 2: LMS err*x*",
           fontsize=7, color="#bf5f2b", ha="left")
-    label(loop_x + 5.2, 3.15, "(DD sur 16-APSK slicer)",
+    label(loop_x + 5.2, 3.15, "(DD on 16-APSK slicer)",
           fontsize=7, color="#bf5f2b", ha="left")
 
     # B.4 decode header
     box(loop_x + 0.3, 2.2, 3.8, 0.7,
-        "B.4  decode header (QPSK Golay)\ncheck version ∈ {2,3}", fc="#eef6ff")
-    label(loop_x + 4.2, 2.55, "← HEADER v3\n96 QPSK",
+        "B.4  decode header (QPSK Golay)\ncheck version in {2,3}", fc="#eef6ff")
+    label(loop_x + 4.2, 2.55, "<- HEADER v3\n96 QPSK",
           color="#7fbf3f", fontsize=7, ha="left")
 
-    # Right column : marker walk & track_segment
+    # Right column: marker walk & track_segment
     box(loop_x + 6.2, 5.2, 3.8, 1.0,
-        "B.5  MARKER WALK\nfind_sync_in_window\n(NARROW=8, WIDE=512 si fail)",
+        "B.5  MARKER WALK\nfind_sync_in_window\n(NARROW=8, WIDE=512 on fail)",
         fc="#ffe8e8")
-    label(loop_x + 10.1, 5.7, "← MARKER\n128 QPSK",
+    label(loop_x + 10.1, 5.7, "<- MARKER\n128 QPSK",
           color="#bf5f2b", fontsize=7, ha="left")
 
-    # narrow→wide loop
+    # narrow->wide loop
     arrow(loop_x + 6.2 + 3.8, 5.4,
           loop_x + 6.2 + 3.8 + 0.8, 5.4, color="#bf2b2b", lw=1.3)
     arrow(loop_x + 6.2 + 3.8 + 0.8, 5.4,
@@ -347,15 +347,15 @@ def plot_rx_block_diagram(path):
           loop_x + 6.2 + 2.0, 6.0, color="#bf2b2b", lw=1.3, style="-")
     arrow(loop_x + 6.2 + 2.0, 6.0,
           loop_x + 6.2 + 2.0, 6.2, color="#bf2b2b", lw=1.3)
-    label(loop_x + 6.2 + 3.8 + 0.8, 5.9, "BOUCLE 3", fontsize=7, color="#bf2b2b")
-    label(loop_x + 6.2 + 3.8 + 0.8, 5.7, "narrow↔wide", fontsize=7, color="#bf2b2b")
+    label(loop_x + 6.2 + 3.8 + 0.8, 5.9, "LOOP 3", fontsize=7, color="#bf2b2b")
+    label(loop_x + 6.2 + 3.8 + 0.8, 5.7, "narrow<->wide", fontsize=7, color="#bf2b2b")
 
     # track_segment
     box(loop_x + 6.2, 3.6, 3.8, 1.3,
-        "B.6  track_segment (pilot-aided)\n• per-group LS complex gain\n"
-        "• phase unwrap + 3-pt smooth\n• linear interp per-sym",
+        "B.6  track_segment (pilot-aided)\n* per-group LS complex gain\n"
+        "* phase unwrap + 3-pt smooth\n* linear interp per-sym",
         fc="#e8fff6")
-    label(loop_x + 10.1, 4.25, "← TDM PILOTS\n2/group (QPSK π/2)",
+    label(loop_x + 10.1, 4.25, "<- TDM PILOTS\n2/group (QPSK pi/2)",
           color="#2bbfaf", fontsize=7, ha="left")
 
     # B.7 LLR + LDPC
@@ -364,56 +364,56 @@ def plot_rx_block_diagram(path):
         fc="#fff5e0")
 
     # connections inside loop
-    arrow(loop_x + 2.2, 6.2, loop_x + 2.2, 5.9)  # A → B.1
-    arrow(loop_x + 2.2, 5.2, loop_x + 2.2, 5.0)  # B.1 → B.2
-    arrow(loop_x + 2.2, 4.3, loop_x + 2.2, 4.1)  # B.2 → B.3
-    arrow(loop_x + 2.2, 3.2, loop_x + 2.2, 2.9)  # B.3 → B.4
+    arrow(loop_x + 2.2, 6.2, loop_x + 2.2, 5.9)  # A -> B.1
+    arrow(loop_x + 2.2, 5.2, loop_x + 2.2, 5.0)  # B.1 -> B.2
+    arrow(loop_x + 2.2, 4.3, loop_x + 2.2, 4.1)  # B.2 -> B.3
+    arrow(loop_x + 2.2, 3.2, loop_x + 2.2, 2.9)  # B.3 -> B.4
 
-    # B.4 → B.5 (across columns)
+    # B.4 -> B.5 (across columns)
     arrow(loop_x + 4.1, 2.55, loop_x + 6.2 - 0.05, 5.2 + 0.5, color="black", lw=1.2)
 
-    arrow(loop_x + 8.1, 5.2, loop_x + 8.1, 4.9)  # B.5 → B.6
-    arrow(loop_x + 8.1, 3.6, loop_x + 8.1, 3.3)  # B.6 → B.7
+    arrow(loop_x + 8.1, 5.2, loop_x + 8.1, 4.9)  # B.5 -> B.6
+    arrow(loop_x + 8.1, 3.6, loop_x + 8.1, 3.3)  # B.6 -> B.7
 
     # merge output
     arrow(loop_x + 8.1, 2.4, loop_x + 8.1, 2.0)
-    box(loop_x + 6.2, 1.7, 3.8, 0.35, "cw_bytes_map (par fenêtre)",
+    box(loop_x + 6.2, 1.7, 3.8, 0.35, "cw_bytes_map (per window)",
         fc="#e0e0e0", fontsize=9)
 
-    # ─── hors boucle ───
+    # --- outside loop ---
     arrow(loop_x + 8.1, 1.7, loop_x + 8.1, 1.3)
     box(3.0, 0.7, 5.8, 0.6,
-        "merge (first-wins par ESI) sur TOUTES les fenêtres",
+        "merge (first-wins per ESI) across ALL windows",
         fc="#d0e8d0", fontsize=10, lw=1.5)
     arrow(5.9, 0.7, 5.9, 0.3)
     box(3.0, -0.3, 5.8, 0.6,
-        "Assembly via AppHeader.file_size → RxV2Result",
+        "Assembly via AppHeader.file_size -> RxV2Result",
         fc="#b0ffb0", fontsize=10, lw=1.5)
 
-    # Légende boucles à droite
+    # Loop legend on the right
     legend_box = FancyBboxPatch((loop_x + 6.5, 0.6), 3.4, 1.0,
                                 boxstyle="round,pad=0.1", facecolor="#fffff0",
                                 edgecolor="#888888", linewidth=0.8)
     ax.add_patch(legend_box)
-    label(loop_x + 6.7, 1.45, "Boucles de rétroaction :", weight="bold", fontsize=8, ha="left")
-    label(loop_x + 6.7, 1.2, "1 (violet) grid ppm + score",
+    label(loop_x + 6.7, 1.45, "Feedback loops:", weight="bold", fontsize=8, ha="left")
+    label(loop_x + 6.7, 1.2, "1 (purple) grid ppm + score",
           color="#7f2bbf", fontsize=7, ha="left")
     label(loop_x + 6.7, 1.0, "2 (orange) FFE LMS TRAIN+DD",
           color="#bf5f2b", fontsize=7, ha="left")
-    label(loop_x + 6.7, 0.8, "3 (rouge) marker narrow/wide",
+    label(loop_x + 6.7, 0.8, "3 (red) marker narrow/wide",
           color="#bf2b2b", fontsize=7, ha="left")
 
-    # Légende entrées pilotes
-    label(0.2, 2.9, "Entrées pilotes :", weight="bold", fontsize=9, ha="left")
-    label(0.2, 2.6, "■ PREAMBLE → sync, FFE train, gain", color="#2b7fbf",
+    # Pilot inputs legend
+    label(0.2, 2.9, "Pilot inputs:", weight="bold", fontsize=9, ha="left")
+    label(0.2, 2.6, "[*] PREAMBLE -> sync, FFE train, gain", color="#2b7fbf",
           fontsize=8, ha="left")
-    label(0.2, 2.3, "■ HEADER → version, payload_length", color="#7fbf3f",
+    label(0.2, 2.3, "[*] HEADER -> version, payload_length", color="#7fbf3f",
           fontsize=8, ha="left")
-    label(0.2, 2.0, "■ MARKER sync → resync anchor", color="#bf5f2b",
+    label(0.2, 2.0, "[*] MARKER sync -> resync anchor", color="#bf5f2b",
           fontsize=8, ha="left")
-    label(0.2, 1.7, "■ MARKER ctrl → seg_id, base_esi", color="#bf5f2b",
+    label(0.2, 1.7, "[*] MARKER ctrl -> seg_id, base_esi", color="#bf5f2b",
           fontsize=8, ha="left")
-    label(0.2, 1.4, "■ TDM pilots → phase/amp tracking", color="#2bbfaf",
+    label(0.2, 1.4, "[*] TDM pilots -> phase/amp tracking", color="#2bbfaf",
           fontsize=8, ha="left")
 
     plt.savefig(path, dpi=140, bbox_inches="tight")
@@ -425,9 +425,9 @@ def plot_rx_block_diagram(path):
 # ============================================================================
 
 def plot_field_layouts(path):
-    """Représentation byte-par-byte des contenus HDR, MK ctrl et META."""
+    """Byte-by-byte representation of HDR, MK ctrl and META contents."""
 
-    # Champs (label, bytes, couleur, valeur exemple)
+    # Fields (label, bytes, color, example value)
     hdr_fields = [
         ("magic\n0xCAFE",        2, "#5b8fd1", "CA FE"),
         ("version",              1, "#2b7fbf", "03"),
@@ -461,7 +461,7 @@ def plot_field_layouts(path):
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
 
     def draw_bytes(ax, fields, title, subtitle, total_label, start_x=0.5, byte_w=0.9):
-        """Dessine une bande d'octets étiquetée."""
+        """Draw a labelled byte strip."""
         x = start_x
         y = 1.2
         h = 1.2
@@ -469,13 +469,13 @@ def plot_field_layouts(path):
             w = n_bytes * byte_w
             rect = Rectangle((x, y), w, h, facecolor=color, edgecolor="black", linewidth=1.0)
             ax.add_patch(rect)
-            # Label dedans
+            # Label inside
             ax.text(x + w / 2, y + h * 0.63, label, ha="center", va="center",
                     fontsize=9, weight="bold")
-            # Taille (B) dedans
+            # Size (B) inside
             ax.text(x + w / 2, y + h * 0.22, f"{n_bytes} B",
                     ha="center", va="center", fontsize=8, color="#333333")
-            # Exemple dessous
+            # Example below
             ax.text(x + w / 2, y - 0.25, example, ha="center", va="top",
                     fontsize=7, family="monospace", color="#555555")
             x += w
@@ -494,17 +494,17 @@ def plot_field_layouts(path):
         ax.set_aspect("equal")
         ax.axis("off")
 
-    # HEADER protocole
+    # Protocol HEADER
     draw_bytes(
         axes[0], hdr_fields,
-        "HEADER protocole (12 octets)",
-        "→ Golay(24,12) × 8 blocs → 192 bits codés → 96 symboles QPSK  "
-        "(FEC robuste, décodable sans aucun pilote autre que PREAMBLE)",
+        "Protocol HEADER (12 bytes)",
+        "-> Golay(24,12) x 8 blocks -> 192 coded bits -> 96 QPSK symbols  "
+        "(robust FEC, decodable without any pilot other than PREAMBLE)",
         "12 B = 96 info bits",
     )
-    # Ajout : chaîne TX → RX à droite
+    # Annotation: TX -> RX chain on the right
     axes[0].text(13.5, 1.8,
-                 "→ 96 QPSK syms\n(exp(j·(π/4 + q·π/2)))",
+                 "-> 96 QPSK syms\n(exp(j*(pi/4 + q*pi/2)))",
                  fontsize=9, color="#2b7fbf", weight="bold",
                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#eef6ff",
                            edgecolor="#2b7fbf"))
@@ -512,23 +512,23 @@ def plot_field_layouts(path):
     # MARKER ctrl
     draw_bytes(
         axes[1], mk_fields,
-        "MARKER ctrl (12 octets)  —  précédé de 32 sync syms QPSK fixes",
-        "→ Golay(24,12) × 8 → 192 bits → 96 QPSK ctrl  |  total marker = 32 sync + 96 ctrl = 128 syms",
+        "MARKER ctrl (12 bytes)  -  preceded by 32 fixed QPSK sync syms",
+        "-> Golay(24,12) x 8 -> 192 bits -> 96 QPSK ctrl  |  total marker = 32 sync + 96 ctrl = 128 syms",
         "12 B = 96 info bits",
     )
     axes[1].text(13.5, 1.8,
-                 "→ 128 QPSK syms\n(32 sync + 96 ctrl)",
+                 "-> 128 QPSK syms\n(32 sync + 96 ctrl)",
                  fontsize=9, color="#bf5f2b", weight="bold",
                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff0e8",
                            edgecolor="#bf5f2b"))
 
-    # META (AppHeader × 4 copies)
+    # META (AppHeader x 4 copies)
     # Draw 4 copies side by side + zero pad
     ax = axes[2]
     y = 1.2
     h = 1.2
     x = 0.5
-    byte_w = 0.16  # plus petit car 17 B × 4 = 68 B
+    byte_w = 0.16  # smaller because 17 B x 4 = 68 B
 
     # Draw 4 copies
     copy_colors_alpha = [1.0, 0.85, 0.7, 0.55]
@@ -540,17 +540,17 @@ def plot_field_layouts(path):
             rect = Rectangle((x, y), w, h, facecolor=color, edgecolor="black",
                              linewidth=0.8, alpha=alpha)
             ax.add_patch(rect)
-            if copy_idx == 0 and w > 0.3:  # label uniquement sur 1ère copie
+            if copy_idx == 0 and w > 0.3:  # label only on the 1st copy
                 short_label = label.split("\n")[0].replace("_", " ")[:10]
                 ax.text(x + w / 2, y + h * 0.55, short_label,
                         ha="center", va="center", fontsize=6.5, weight="bold")
                 ax.text(x + w / 2, y + h * 0.22, f"{n_bytes}",
                         ha="center", va="center", fontsize=6, color="#333333")
             x += w
-        # Label copy
+        # Copy label
         copy_w = 17 * byte_w
         ax.text(copy_start + copy_w / 2, y + h + 0.2,
-                f"copie #{copy_idx}",
+                f"copy #{copy_idx}",
                 ha="center", fontsize=8, weight="bold", color="#666666")
         if copy_idx == 0:
             ax.text(copy_start + copy_w / 2, y - 0.3,
@@ -558,14 +558,14 @@ def plot_field_layouts(path):
                     ha="center", fontsize=7, style="italic", color="#666666")
 
     # Zero-pad
-    pad_w = 30 * byte_w  # illustratif
+    pad_w = 30 * byte_w  # illustrative
     rect = Rectangle((x, y), pad_w, h, facecolor="#f0f0f0", edgecolor="black",
                      linewidth=0.8, hatch="//")
     ax.add_patch(rect)
     ax.text(x + pad_w / 2, y + h * 0.5, "zero-pad",
             ha="center", va="center", fontsize=8, color="#666666")
     ax.text(x + pad_w / 2, y - 0.3,
-            "jusqu'à k_bytes (HIGH k=108 B)",
+            "up to k_bytes (HIGH k=108 B)",
             ha="center", fontsize=7, style="italic", color="#666666")
     x += pad_w
 
@@ -574,27 +574,27 @@ def plot_field_layouts(path):
     ax.annotate("", xy=(0.5, y + h + 0.7), xytext=(total_x_end, y + h + 0.7),
                 arrowprops=dict(arrowstyle="<->", color="black", lw=1))
     ax.text((0.5 + total_x_end) / 2, y + h + 0.9,
-            "Meta CW info payload (HIGH : 108 B = 4 × 17 + 40 pad)",
+            "Meta CW info payload (HIGH: 108 B = 4 x 17 + 40 pad)",
             ha="center", fontsize=9, weight="bold")
 
     ax.set_xlim(0, max(total_x_end + 0.5, 14))
     ax.set_ylim(-1.2, y + h + 1.5)
     ax.set_title(
-        "META segment — AppHeader REPLIQUÉ ×4 dans un codeword LDPC\n"
-        "→ encode LDPC(n,k) → interleave → 16-APSK (config) — décodable si ≥1 CRC16 OK sur les 4 copies",
+        "META segment - AppHeader REPLICATED x4 in a single LDPC codeword\n"
+        "-> LDPC(n,k) encode -> interleave -> 16-APSK (config) - decodable if >=1 CRC16 OK across the 4 copies",
         fontsize=11, weight="bold", loc="left", pad=10,
     )
     ax.set_aspect("equal")
     ax.axis("off")
     ax.text(13.5, 1.8,
-            "→ 1 CW LDPC\n→ syms 16-APSK",
+            "-> 1 LDPC CW\n-> 16-APSK syms",
             fontsize=9, color="#bfa02b", weight="bold",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff9e0",
                       edgecolor="#bfa02b"))
 
     # Legend with byte-level fields of AppHeader
     legend_text = (
-        "Champs AppHeader : session_id 4B | file_size 4B | k_symbols 2B | "
+        "AppHeader fields: session_id 4B | file_size 4B | k_symbols 2B | "
         "t_bytes 1B | mode_code 1B | mime_type 1B | hash_short 2B | CRC16 2B"
     )
     fig.text(0.5, 0.01, legend_text, ha="center", fontsize=8,
@@ -613,7 +613,7 @@ def plot_pilots_matrix(path):
     pilots = [
         "PREAMBLE (256 QPSK)",
         "HEADER (96 QPSK Golay)",
-        "MARKER sync (32 QPSK fixe)",
+        "MARKER sync (32 fixed QPSK)",
         "MARKER ctrl (96 QPSK Golay)",
         "TDM pilots 2/32 QPSK\n(HIGH/NORMAL/ROBUST/MEGA)",
         "TDM pilots 2/16 QPSK\n(ULTRA, dense)",
@@ -621,7 +621,7 @@ def plot_pilots_matrix(path):
     modules = [
         "find_all_preambles",
         "FFE LS train",
-        "FFE LMS train (μ=0.10)",
+        "FFE LMS train (mu=0.10)",
         "Global gain LS",
         "decode header",
         "find_sync_in_window",
@@ -629,25 +629,25 @@ def plot_pilots_matrix(path):
         "decode_marker (Golay+CRC8)",
         "session lock",
         "track_segment (complex gain)",
-        "σ² estim (LLR)",
+        "sigma^2 estim (LLR)",
     ]
-    # Matrice usage (0 = non, 1 = oui, 2 = primaire)
+    # Usage matrix (0 = no, 1 = yes, 2 = primary)
     usage = np.zeros((len(pilots), len(modules)))
-    usage[0, 0] = 2   # PREAMBLE → find_all_preambles
+    usage[0, 0] = 2   # PREAMBLE -> find_all_preambles
     usage[0, 1] = 2   # FFE LS
     usage[0, 2] = 2   # FFE LMS train
     usage[0, 3] = 2   # Global gain
-    usage[1, 4] = 2   # HEADER → decode_header
-    usage[2, 5] = 2   # MARKER sync → find_sync_in_window
-    usage[2, 6] = 2   # MARKER sync → local gain
-    usage[3, 7] = 2   # MARKER ctrl → decode_marker
-    usage[3, 8] = 2   # MARKER ctrl → session lock
-    usage[4, 9] = 2   # TDM 2/32 → track_segment
-    usage[4, 10] = 2  # TDM 2/32 → σ²
-    usage[5, 9] = 2   # TDM 2/16 → track_segment (même rôle, cadence ×2)
-    usage[5, 10] = 2  # TDM 2/16 → σ²
+    usage[1, 4] = 2   # HEADER -> decode_header
+    usage[2, 5] = 2   # MARKER sync -> find_sync_in_window
+    usage[2, 6] = 2   # MARKER sync -> local gain
+    usage[3, 7] = 2   # MARKER ctrl -> decode_marker
+    usage[3, 8] = 2   # MARKER ctrl -> session lock
+    usage[4, 9] = 2   # TDM 2/32 -> track_segment
+    usage[4, 10] = 2  # TDM 2/32 -> sigma^2
+    usage[5, 9] = 2   # TDM 2/16 -> track_segment (same role, x2 cadence)
+    usage[5, 10] = 2  # TDM 2/16 -> sigma^2
     # Some secondary usages
-    usage[0, 10] = 1  # PREAMBLE peut aussi servir à estim σ² fallback
+    usage[0, 10] = 1  # PREAMBLE can also serve as a sigma^2 fallback
 
     fig, ax = plt.subplots(figsize=(14, 5.2))
     im = ax.imshow(usage, cmap="YlGnBu", aspect="auto", vmin=0, vmax=2)
@@ -661,12 +661,12 @@ def plot_pilots_matrix(path):
         for j in range(len(modules)):
             v = usage[i, j]
             if v > 0:
-                mark = "●" if v == 2 else "○"
+                mark = "*" if v == 2 else "o"
                 color = "white" if v >= 1.5 else "black"
                 ax.text(j, i, mark, ha="center", va="center", color=color, fontsize=12)
 
-    ax.set_title("Matrice d'utilisation — pilotes × modules RX V3\n"
-                 "● usage primaire    ○ usage secondaire",
+    ax.set_title("Usage matrix - pilots x V3 RX modules\n"
+                 "*  primary use    o  secondary use",
                  fontsize=11, weight="bold")
     plt.tight_layout()
     plt.savefig(path, dpi=140, bbox_inches="tight")
@@ -674,7 +674,7 @@ def plot_pilots_matrix(path):
 
 
 # ============================================================================
-# 5. REAL SIGNAL ANALYSIS — WAV V3 généré
+# 5. REAL SIGNAL ANALYSIS - generated V3 WAV
 # ============================================================================
 
 def load_wav_mono(path):
@@ -688,7 +688,7 @@ def load_wav_mono(path):
     elif bits == 32:
         s = np.frombuffer(raw, dtype=np.int32).astype(np.float64) / (2 ** 31)
     else:
-        raise ValueError(f"bit depth {bits} non supporté")
+        raise ValueError(f"bit depth {bits} not supported")
     if nch > 1:
         s = s.reshape(-1, nch).mean(axis=1)
     return s, sr
@@ -763,7 +763,7 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
                                         cmap="viridis", vmin=-80, vmax=-20)
     ax.set_ylim(0, 3000)
 
-    # 2) Downmix + MF + preamble correlation pour repérer les préambules
+    # 2) Downmix + MF + preamble correlation to locate the preambles
     t = np.arange(len(samples)) / sr
     bb = samples * np.exp(-1j * 2 * np.pi * fc * t)
     taps = rrc_taps(beta, span, sps)
@@ -772,7 +772,7 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
     preamble = make_preamble_numpy()
     n_pre = len(preamble)
 
-    # Corrélation à pas `pitch` (exactement ce que fait find_all_preambles)
+    # Correlation with `pitch` step (exactly what find_all_preambles does)
     max_start = len(mf) - n_pre * pitch
     starts = np.arange(0, max_start, pitch)
     mags = np.zeros(len(starts))
@@ -781,7 +781,7 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
         corr = np.sum(mf[idx] * np.conj(preamble))
         mags[i] = np.abs(corr)
 
-    # NMS pour trouver les positions (même algo que sync.rs)
+    # NMS to find the positions (same algo as sync.rs)
     threshold = 0.3 * mags.max()
     min_sep = (n_pre * pitch) // 2
     candidates = [(starts[i], mags[i]) for i in range(len(starts)) if mags[i] >= threshold]
@@ -791,58 +791,58 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
         if all(abs(pos - k) >= min_sep for k in kept):
             kept.append(pos)
     kept.sort()
-    print(f"[real] {len(kept)} préambules détectés aux positions (s): "
+    print(f"[real] {len(kept)} preambles detected at positions (s): "
           f"{[f'{p / sr:.2f}' for p in kept]}")
 
-    # Overlay préambules sur spectrogramme
+    # Overlay preambles on the spectrogram
     for p in kept:
         t_p = p / sr
         ax.axvline(t_p, color="red", linestyle="--", linewidth=1.2, alpha=0.8)
-    ax.text(0.02, 0.95, f"{len(kept)} préambules V3 détectés (lignes rouges)",
+    ax.text(0.02, 0.95, f"{len(kept)} V3 preambles detected (red lines)",
             transform=ax.transAxes, fontsize=10, color="red",
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
-    ax.set_xlabel("temps (s)")
-    ax.set_ylabel("fréquence (Hz)")
-    ax.set_title(f"Signal V3 réel — spectrogramme + préambules détectés\n"
-                 f"WAV : {os.path.relpath(wav_path, ROOT)}")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("frequency (Hz)")
+    ax.set_title(f"Real V3 signal - spectrogram + detected preambles\n"
+                 f"WAV: {os.path.relpath(wav_path, ROOT)}")
     plt.colorbar(im, ax=ax, label="PSD (dB)")
     plt.tight_layout()
     plt.savefig(spec_path, dpi=140, bbox_inches="tight")
     plt.close()
 
-    # 3) Courbe de corrélation
+    # 3) Correlation curve
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.plot(starts / sr, mags, color="#2b7fbf", linewidth=0.7)
     ax.axhline(threshold, color="orange", linestyle="--",
-               label=f"threshold 0.3·max = {threshold:.2f}")
+               label=f"threshold 0.3*max = {threshold:.2f}")
     for p in kept:
         ax.axvline(p / sr, color="red", linestyle=":", alpha=0.6)
     ax.scatter([p / sr for p in kept], [mags[list(starts).index(p)] for p in kept],
-               color="red", s=50, zorder=5, label=f"{len(kept)} lock retenus (NMS)")
-    ax.set_xlabel("temps (s)")
+               color="red", s=50, zorder=5, label=f"{len(kept)} locks kept (NMS)")
+    ax.set_xlabel("time (s)")
     ax.set_ylabel("|corr(mf, preamble)|")
-    ax.set_title("Corrélation préambule sur le signal V3 (sync::find_all_preambles)\n"
-                 "chaque pic = un point de resynchronisation potentiel pour RX V3")
+    ax.set_title("Preamble correlation on the V3 signal (sync::find_all_preambles)\n"
+                 "each peak = a potential resync point for the V3 RX")
     ax.legend(loc="upper right")
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(corr_path, dpi=140, bbox_inches="tight")
     plt.close()
 
-    # 4) Constellation après MF sur la première fenêtre (juste après 1er préambule)
+    # 4) Post-MF constellation on the first window (right after 1st preamble)
     if not kept:
-        print("[real] pas de préambule détecté, skip constellation")
+        print("[real] no preamble detected, skipping constellation")
         return
 
     p0 = kept[0]
-    # Extraire quelques symboles juste après le préambule (header + début data)
+    # Take a few symbols right after the preamble (header + start of data)
     idx = p0 + np.arange(n_pre) * pitch
     preamble_syms = mf[idx]
-    # Normaliser par gain LS
+    # Normalize by LS gain
     gain = np.sum(preamble_syms * np.conj(preamble)) / np.sum(np.abs(preamble) ** 2)
     preamble_corr = preamble_syms / gain
 
-    # Symboles suivants (data brut, sans équalisation sophistiquée — pour visu)
+    # Following symbols (raw data, without sophisticated equalization - for viz)
     n_data_syms = 400
     data_idx = p0 + (n_pre + 96) * pitch + np.arange(n_data_syms) * pitch
     data_idx = data_idx[data_idx < len(mf)]
@@ -853,8 +853,8 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
                     c=COLORS["preamble"], alpha=0.7)
     axes[0].set_aspect("equal")
     axes[0].grid(alpha=0.3)
-    axes[0].set_title(f"Préambule reçu après MF + gain LS\n"
-                      f"({n_pre} points, constellation QPSK attendue)")
+    axes[0].set_title(f"Received preamble after MF + LS gain\n"
+                      f"({n_pre} points, expected QPSK constellation)")
     axes[0].set_xlabel("I")
     axes[0].set_ylabel("Q")
     axes[0].axhline(0, color="gray", linewidth=0.5)
@@ -864,14 +864,14 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
                     c=COLORS["data"], alpha=0.6)
     axes[1].set_aspect("equal")
     axes[1].grid(alpha=0.3)
-    axes[1].set_title(f"Premiers ~{len(data_syms)} symboles data/marker/pilot\n"
-                      f"(mélange 16-APSK + QPSK pilots + QPSK marker)")
+    axes[1].set_title(f"First ~{len(data_syms)} data/marker/pilot symbols\n"
+                      f"(mix of 16-APSK + QPSK pilots + QPSK marker)")
     axes[1].set_xlabel("I")
     axes[1].set_ylabel("Q")
     axes[1].axhline(0, color="gray", linewidth=0.5)
     axes[1].axvline(0, color="gray", linewidth=0.5)
 
-    fig.suptitle("Constellation mesurée sur le signal V3 (fenêtre du 1er préambule)",
+    fig.suptitle("Measured constellation on the V3 signal (1st preamble window)",
                  fontsize=12, weight="bold")
     plt.tight_layout()
     plt.savefig(const_path, dpi=140, bbox_inches="tight")
@@ -883,7 +883,7 @@ def plot_real_signal(wav_path, spec_path, corr_path, const_path):
 # ============================================================================
 
 def main():
-    print(f"[v3_doc] génération dans {OUT_DIR}")
+    print(f"[v3_doc] generating into {OUT_DIR}")
 
     plot_frame_layout(os.path.join(OUT_DIR, "v3_frame_layout.png"))
     print("  OK v3_frame_layout.png")
@@ -910,8 +910,8 @@ def main():
         )
         print("  OK v3_real_signal_*.png")
     else:
-        print(f"  ! WAV {wav} absent — skip real-signal analysis")
-        print(f"    → génère d'abord : nbfm-modem tx -i file -o {wav} "
+        print(f"  ! WAV {wav} missing - skipping real-signal analysis")
+        print(f"    -> generate it first: nbfm-modem tx -i file -o {wav} "
               f"--profile HIGH --frame-version 3 --callsign HB9TOB")
 
 

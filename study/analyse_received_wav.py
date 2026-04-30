@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Analyse le WAV enregistré en réception après transmission NBFM réelle
-d'un signal multitone.
+Analyse the WAV recorded on RX after a real NBFM transmission of a
+multitone signal.
 
-Étapes :
-  1. Charge le WAV reçu et les paramètres du signal émis (JSON)
-  2. Détecte le pilote 1000 Hz pour synchroniser TX/RX
-  3. Pour chaque bloc multitone, calcule la FFT et mesure l'amplitude
-     de chaque tone (sur les bins exacts, grâce à l'espacement choisi)
-  4. Mesure le bruit dans les silences et entre les tones (bins voisins)
-  5. Compare avec la simulation GNU Radio
-  6. Sauvegarde résultats + graphiques
+Steps:
+  1. Load the received WAV and the parameters of the transmitted signal (JSON).
+  2. Detect the 1000 Hz pilot tone to synchronize TX/RX.
+  3. For each multitone block, compute the FFT and measure the amplitude
+     of each tone (on exact bins thanks to the chosen spacing).
+  4. Measure the noise in the silences and between tones (neighbour bins).
+  5. Compare with the GNU Radio simulation.
+  6. Save results + plots.
 
-Usage :
-  python analyse_received_wav.py <fichier_reçu.wav>
+Usage:
+  python analyse_received_wav.py <received_file.wav>
 """
 
 import argparse
@@ -29,11 +29,11 @@ import wave
 
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-SETTLE_SKIP = 0.05  # secondes à ignorer au début (rampe)
+SETTLE_SKIP = 0.05  # seconds to skip at the start (ramp)
 
 
 def load_wav(filename):
-    """Charge un WAV mono, retourne (samples_float, sample_rate)."""
+    """Load a mono WAV, return (samples_float, sample_rate)."""
     with wave.open(filename, "r") as wf:
         nch = wf.getnchannels()
         sw = wf.getsampwidth()
@@ -46,20 +46,20 @@ def load_wav(filename):
     elif sw == 4:
         samples = np.frombuffer(raw, dtype=np.int32).astype(np.float64) / 2147483648.0
     else:
-        raise ValueError(f"Format non supporté: {sw*8} bits")
+        raise ValueError(f"Unsupported format: {sw*8} bits")
 
     if nch == 2:
-        samples = samples[::2]  # prendre canal gauche
+        samples = samples[::2]  # take left channel
     elif nch != 1:
-        raise ValueError(f"Attendu mono ou stéréo, reçu {nch} canaux")
+        raise ValueError(f"Expected mono or stereo, got {nch} channels")
 
     return samples, sr
 
 
 def find_pilot_offset(rx_audio, sr, pilot_freq, search_window=15.0):
     """
-    Détecte le début du tone pilote par corrélation glissante.
-    Retourne l'offset en secondes.
+    Detect the start of the pilot tone by sliding correlation.
+    Return the offset in seconds.
     """
     search_samples = int(search_window * sr)
     chunk = rx_audio[:min(search_samples, len(rx_audio))]
@@ -83,26 +83,26 @@ def find_pilot_offset(rx_audio, sr, pilot_freq, search_window=15.0):
     above = np.where(corr_power > threshold)[0]
 
     if len(above) == 0:
-        print("ERREUR: pilote non détecté !")
+        print("ERROR: pilot not detected!")
         sys.exit(1)
 
     pilot_start_idx = indices[above[0]]
     pilot_start_s = pilot_start_idx / sr
-    print(f"Pilote détecté à t = {pilot_start_s:.3f} s")
+    print(f"Pilot detected at t = {pilot_start_s:.3f} s")
     return pilot_start_s
 
 
 def measure_multitone_fft(audio, sr, t_start, t_end, freqs, duration):
     """
-    Mesure l'amplitude de chaque tone par FFT sur le segment [t_start, t_end].
+    Measure the amplitude of each tone by FFT over [t_start, t_end].
 
-    Comme les fréquences sont des multiples de df = 1/duration,
-    chaque tone tombe exactement sur un bin FFT → pas de fuite spectrale.
+    Because the frequencies are multiples of df = 1/duration, each tone
+    lands exactly on an FFT bin -> no spectral leakage.
 
-    Retourne (amplitudes, noise_floor_per_bin).
+    Return (amplitudes, noise_floor_per_bin).
     """
     i0 = int((t_start + SETTLE_SKIP) * sr)
-    # Prendre exactement `duration` secondes pour la FFT (bins exacts)
+    # Take exactly `duration` seconds for the FFT (exact bins)
     n_fft = int(duration * sr)
     i1 = i0 + n_fft
     if i1 > len(audio):
@@ -111,9 +111,9 @@ def measure_multitone_fft(audio, sr, t_start, t_end, freqs, duration):
 
     seg = audio[i0:i1]
 
-    # Fenêtre rectangulaire (les tones sont sur des bins exacts)
+    # Rectangular window (tones land on exact bins)
     spectrum = np.fft.rfft(seg)
-    magnitudes = np.abs(spectrum) * 2.0 / n_fft  # amplitude crête
+    magnitudes = np.abs(spectrum) * 2.0 / n_fft  # peak amplitude
 
     df = sr / n_fft
     amplitudes = []
@@ -127,7 +127,7 @@ def measure_multitone_fft(audio, sr, t_start, t_end, freqs, duration):
             amp = 0.0
         amplitudes.append(amp)
 
-        # Bruit : médiane des bins voisins (±5 bins, excluant le bin central)
+        # Noise: median of neighbour bins (+/- 5 bins, excluding the centre bin)
         neighbors = []
         for offset in range(-5, 6):
             if offset == 0:
@@ -152,30 +152,30 @@ def measure_silence_rms(audio, sr, t_start, t_end):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyse du WAV multitone reçu après transmission NBFM")
-    parser.add_argument("rx_wav", help="Fichier WAV enregistré en réception")
+        description="Analyse a multitone WAV received after NBFM transmission")
+    parser.add_argument("rx_wav", help="WAV file recorded on RX")
     parser.add_argument("--params",
                         default=os.path.join(RESULTS_DIR, "nbfm_test_params.json"),
-                        help="Fichier paramètres JSON du signal émis")
+                        help="JSON parameter file of the transmitted signal")
     parser.add_argument("--timeline",
                         default=os.path.join(RESULTS_DIR, "nbfm_test_timeline.csv"),
-                        help="Fichier timeline CSV")
+                        help="Timeline CSV file")
     parser.add_argument("--simulated",
                         default=os.path.join(RESULTS_DIR, "nbfm_channel_response.csv"),
-                        help="Réponse simulée CSV pour comparaison")
+                        help="Simulated response CSV for comparison")
     parser.add_argument("--output-prefix", default="nbfm_real_channel",
-                        help="Préfixe des fichiers de sortie")
+                        help="Output filename prefix")
     args = parser.parse_args()
 
-    # --- Chargement ---
-    print(f"Chargement de {args.rx_wav}...")
+    # --- Loading ---
+    print(f"Loading {args.rx_wav}...")
     rx_audio, sr = load_wav(args.rx_wav)
-    print(f"  {len(rx_audio)} échantillons, {sr} Hz, "
-          f"durée: {len(rx_audio)/sr:.1f} s")
-    print(f"  Crête: {np.max(np.abs(rx_audio)):.4f} "
+    print(f"  {len(rx_audio)} samples, {sr} Hz, "
+          f"duration: {len(rx_audio)/sr:.1f} s")
+    print(f"  Peak: {np.max(np.abs(rx_audio)):.4f} "
           f"({20*np.log10(np.max(np.abs(rx_audio))+1e-12):.1f} dBFS)")
 
-    print(f"\nChargement paramètres {args.params}...")
+    print(f"\nLoading parameters {args.params}...")
     with open(args.params) as f:
         params = json.load(f)
     freqs = np.array(params["freqs"])
@@ -185,7 +185,7 @@ def main():
     n_blocks = params["n_blocks"]
     print(f"  {len(freqs)} tones, amplitude/tone: {amp_per_tone:.6f}")
 
-    print(f"\nChargement timeline {args.timeline}...")
+    print(f"\nLoading timeline {args.timeline}...")
     timeline = []
     with open(args.timeline) as f:
         f.readline()  # header
@@ -193,8 +193,8 @@ def main():
             parts = line.strip().split(",")
             timeline.append((float(parts[0]), float(parts[1]), parts[2]))
 
-    # --- Synchronisation ---
-    print("\nRecherche du pilote...")
+    # --- Synchronization ---
+    print("\nSearching for pilot...")
     pilot_offset = find_pilot_offset(rx_audio, sr, pilot_freq)
 
     pilot_timeline_start = None
@@ -205,8 +205,8 @@ def main():
     time_offset = pilot_offset - pilot_timeline_start
     print(f"Offset TX->RX: {time_offset:.3f} s")
 
-    # --- Mesure des blocs multitone ---
-    print("\nMesure des blocs multitone...")
+    # --- Multitone block measurement ---
+    print("\nMeasuring multitone blocks...")
     all_amplitudes = []
 
     for t0, t1, label in timeline:
@@ -215,26 +215,26 @@ def main():
 
         if label.startswith("multitone_"):
             block_idx = int(label.split("_")[1])
-            print(f"\n  Bloc {block_idx} [{rx_t0:.2f} – {rx_t1:.2f} s]")
+            print(f"\n  Block {block_idx} [{rx_t0:.2f} - {rx_t1:.2f} s]")
 
             amps, noise = measure_multitone_fft(
                 rx_audio, sr, rx_t0, rx_t1, freqs, multitone_duration)
             all_amplitudes.append(amps)
 
-            # Quelques valeurs
+            # A few sample values
             for fi in [0, len(freqs)//4, len(freqs)//2, 3*len(freqs)//4, -1]:
                 gain_db = 20 * np.log10(amps[fi] / amp_per_tone + 1e-12)
                 print(f"    {freqs[fi]:6.0f} Hz : "
                       f"amp = {amps[fi]:.6f}, gain = {gain_db:+6.1f} dB")
 
     if not all_amplitudes:
-        print("ERREUR: aucun bloc multitone trouvé !")
+        print("ERROR: no multitone block found!")
         sys.exit(1)
 
-    # Moyenne sur les blocs
+    # Average over blocks
     amplitudes = np.mean(all_amplitudes, axis=0)
 
-    # --- Mesure bruit dans les silences ---
+    # --- Noise measurement in silences ---
     silence_rms_list = []
     for t0, t1, label in timeline:
         if label in ("silence_start", "silence_end", "gap"):
@@ -243,43 +243,43 @@ def main():
             rms = measure_silence_rms(rx_audio, sr, rx_t0, rx_t1)
             silence_rms_list.append(rms)
     noise_floor = np.median(silence_rms_list) if silence_rms_list else 0.0
-    print(f"\nPlancher de bruit (silences): {noise_floor:.6f}")
+    print(f"\nNoise floor (silences): {noise_floor:.6f}")
 
-    # --- Calcul gains ---
+    # --- Gain computation ---
     gains_db = 20 * np.log10(amplitudes / amp_per_tone + 1e-12)
-    gains_db -= np.max(gains_db)  # normaliser à 0 dB au max
+    gains_db -= np.max(gains_db)  # normalize to 0 dB at max
 
     snr_per_tone = 20 * np.log10(amplitudes / (noise_floor + 1e-12))
 
-    # --- Chargement simulation ---
+    # --- Load simulation ---
     sim_freqs, sim_gains = None, None
     if os.path.exists(args.simulated):
         sim_data = np.loadtxt(args.simulated, delimiter=",")
         sim_freqs = sim_data[:, 0]
         sim_gains = sim_data[:, 2]
 
-    # --- Sauvegarde ---
+    # --- Save ---
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_csv = os.path.join(RESULTS_DIR, f"{args.output_prefix}.csv")
     data = np.column_stack([freqs, amplitudes, gains_db, snr_per_tone])
     np.savetxt(out_csv, data, header="freq_hz,amplitude,gain_db,snr_db",
                fmt="%.6f", delimiter=",")
-    print(f"\nDonnées: {out_csv}")
+    print(f"\nData: {out_csv}")
 
-    # --- Tracés ---
+    # --- Plots ---
     fig, axes = plt.subplots(3, 1, figsize=(12, 14), sharex=True)
 
-    # 1. Réponse fréquentielle
+    # 1. Frequency response
     ax = axes[0]
     ax.plot(freqs, gains_db, "b.-", linewidth=1.5, markersize=3,
-            label="Mesuré (canal réel)")
+            label="Measured (real channel)")
     if sim_freqs is not None:
         ax.plot(sim_freqs, sim_gains, "r--", linewidth=1.5, alpha=0.7,
-                label="Simulé (GNU Radio)")
+                label="Simulated (GNU Radio)")
     ax.axhline(-3, color="gray", linestyle=":", alpha=0.5, label="-3 dB")
-    ax.set_ylabel("Gain relatif (dB)")
-    ax.set_title("Réponse fréquentielle — canal NBFM réel vs simulé\n"
-                 f"({len(freqs)} tones simultanés)")
+    ax.set_ylabel("Relative gain (dB)")
+    ax.set_title("Frequency response - real vs simulated NBFM channel\n"
+                 f"({len(freqs)} simultaneous tones)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -287,30 +287,30 @@ def main():
     ax = axes[1]
     ax.plot(freqs, snr_per_tone, "g.-", linewidth=1.5, markersize=3)
     ax.set_ylabel("SNR (dB)")
-    ax.set_title("SNR par fréquence")
+    ax.set_title("SNR per frequency")
     ax.grid(True, alpha=0.3)
 
     # 3. Amplitudes
     ax = axes[2]
     ax.plot(freqs, amplitudes, "m.-", linewidth=1.5, markersize=3,
-            label="Reçu")
+            label="Received")
     ax.axhline(amp_per_tone, color="k", linestyle="--", alpha=0.5,
-               label=f"Émis ({amp_per_tone:.4f})")
+               label=f"Transmitted ({amp_per_tone:.4f})")
     ax.axhline(noise_floor, color="r", linestyle=":", alpha=0.5,
-               label=f"Bruit ({noise_floor:.4f})")
-    ax.set_xlabel("Fréquence (Hz)")
+               label=f"Noise ({noise_floor:.4f})")
+    ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Amplitude")
-    ax.set_title("Amplitudes absolues")
+    ax.set_title("Absolute amplitudes")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     out_png = os.path.join(RESULTS_DIR, f"{args.output_prefix}.png")
     plt.savefig(out_png, dpi=150)
-    print(f"Graphique: {out_png}")
+    print(f"Plot: {out_png}")
     plt.close()
 
-    # --- Spectre complet du premier bloc ---
+    # --- Full spectrum of the first block ---
     for t0, t1, label in timeline:
         if label == "multitone_0":
             rx_t0 = t0 + time_offset + SETTLE_SKIP
@@ -326,27 +326,27 @@ def main():
                          linewidth=0.5, alpha=0.8)
                 ax2.set_xlim(0, 5000)
                 ax2.set_ylim(-80, 0)
-                ax2.set_xlabel("Fréquence (Hz)")
+                ax2.set_xlabel("Frequency (Hz)")
                 ax2.set_ylabel("Amplitude (dB)")
-                ax2.set_title("Spectre FFT complet — bloc multitone reçu")
+                ax2.set_title("Full FFT spectrum - received multitone block")
                 ax2.grid(True, alpha=0.3)
                 plt.tight_layout()
                 out_spec = os.path.join(RESULTS_DIR,
                                         f"{args.output_prefix}_spectrum.png")
                 plt.savefig(out_spec, dpi=150)
-                print(f"Spectre: {out_spec}")
+                print(f"Spectrum: {out_spec}")
                 plt.close()
             break
 
-    # --- Résumé ---
+    # --- Summary ---
     bw_mask = gains_db >= -3.0
     if np.any(bw_mask):
-        print(f"\nBande passante à -3 dB: "
-              f"{freqs[bw_mask][0]:.0f} – {freqs[bw_mask][-1]:.0f} Hz")
+        print(f"\n-3 dB bandwidth: "
+              f"{freqs[bw_mask][0]:.0f} - {freqs[bw_mask][-1]:.0f} Hz")
 
     valid = (freqs >= 300) & (freqs <= 3000)
     if np.any(valid):
-        print(f"SNR moyen (300-3000 Hz): {np.mean(snr_per_tone[valid]):.1f} dB")
+        print(f"Mean SNR (300-3000 Hz): {np.mean(snr_per_tone[valid]):.1f} dB")
 
 
 if __name__ == "__main__":

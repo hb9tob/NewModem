@@ -4,13 +4,13 @@ Input  : .alist file describing the expanded H matrix (M x N binary sparse).
 Output : 4 x 24 base matrix in {-1, 0..z-1} where -1 = zero block, s = cyclic
          shift of identity I_z.
 
-Convention rappel (alist MacKay) :
-  ligne 1 : N M
-  ligne 2 : max_col_weight max_row_weight
-  ligne 3 : col_weights[N]
-  ligne 4 : row_weights[M]
-  N lignes : indices (1-based) des lignes où la colonne a un 1
-  M lignes : indices (1-based) des colonnes où la ligne a un 1
+Convention reminder (MacKay alist):
+  line 1 : N M
+  line 2 : max_col_weight max_row_weight
+  line 3 : col_weights[N]
+  line 4 : row_weights[M]
+  N lines : (1-based) row indices where each column has a 1
+  M lines : (1-based) column indices where each row has a 1
 """
 
 import sys
@@ -20,17 +20,17 @@ from pathlib import Path
 def load_alist(path: Path):
     lines = path.read_text().splitlines()
     n, m = map(int, lines[0].split())
-    # max weights, col weights, row weights : on ignore (suffisant : la
-    # liste sparse complète suit).
-    # Indices (1-based) des lignes où chaque colonne a un 1.
+    # max weights, col weights, row weights: ignored (the full sparse
+    # list that follows is sufficient).
+    # (1-based) row indices where each column has a 1.
     col_lists = []
-    cursor = 4  # après 4 lignes d'en-tête
+    cursor = 4  # after the 4 header lines
     for _ in range(n):
         entries = [int(x) for x in lines[cursor].split() if int(x) != 0]
         col_lists.append(entries)
         cursor += 1
-    # Indices des colonnes par ligne — on n'en a pas besoin (col_lists
-    # suffit pour reconstruire H).
+    # Per-row column indices - not needed (col_lists is enough to
+    # rebuild H).
     return n, m, col_lists
 
 
@@ -39,29 +39,29 @@ def expand_h(n, m, col_lists):
     h = [[0] * n for _ in range(m)]
     for c, rows in enumerate(col_lists):
         for r in rows:
-            h[r - 1][c] = 1  # alist est 1-based
+            h[r - 1][c] = 1  # alist is 1-based
     return h
 
 
 def extract_base_matrix(h, m, n, z=96, mb=4, nb=24):
-    """Pour chaque sous-bloc (br, bc) de taille z×z, déterminer le shift
-    cyclique : -1 si bloc nul, s ∈ 0..z-1 sinon (la ligne 0 du sous-bloc
-    a son 1 unique à la colonne s mod z).
+    """For each (br, bc) sub-block of size z*z, determine the cyclic
+    shift: -1 if zero block, s in 0..z-1 otherwise (row 0 of the
+    sub-block has its single 1 at column s mod z).
     """
-    assert m == mb * z, f"m={m} ≠ mb*z={mb*z}"
-    assert n == nb * z, f"n={n} ≠ nb*z={nb*z}"
+    assert m == mb * z, f"m={m} != mb*z={mb*z}"
+    assert n == nb * z, f"n={n} != nb*z={nb*z}"
     base = [[-1] * nb for _ in range(mb)]
     for br in range(mb):
         for bc in range(nb):
-            row_top = br * z  # ligne 0 du sous-bloc
+            row_top = br * z  # row 0 of the sub-block
             col_off = bc * z
             shift = -1
             for j in range(z):
                 if h[row_top][col_off + j] == 1:
                     shift = j
                     break
-            # Validation cohérence : si shift trouvé, vérifier que les
-            # autres lignes du sous-bloc respectent l'identité décalée.
+            # Consistency check: if a shift was found, verify the other
+            # rows of the sub-block honour the shifted identity.
             if shift >= 0:
                 for i in range(z):
                     expected_col = (i + shift) % z
@@ -75,13 +75,13 @@ def extract_base_matrix(h, m, n, z=96, mb=4, nb=24):
                                 f"(shift={shift})"
                             )
             else:
-                # Vérifier que le bloc est entièrement nul.
+                # Check that the block is fully zero.
                 for i in range(z):
                     for j in range(z):
                         if h[row_top + i][col_off + j] != 0:
                             raise ValueError(
                                 f"Sub-block ({br},{bc}) not all-zero (entry at "
-                                f"({i},{j})) but row 0 was zero — non-cyclic"
+                                f"({i},{j})) but row 0 was zero - non-cyclic"
                             )
             base[br][bc] = shift
     return base
@@ -100,7 +100,7 @@ def format_rust(base, mb=4, nb=24):
 def main():
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/tmp/wimax_2304_5_6.alist")
     n, m, col_lists = load_alist(path)
-    print(f"alist parsed : N={n}, M={m}, K={n - m} (rate = {(n - m) / n:.4f})")
+    print(f"alist parsed: N={n}, M={m}, K={n - m} (rate = {(n - m) / n:.4f})")
     h = expand_h(n, m, col_lists)
     # Sanity : count ones (should be sum of col weights)
     ones = sum(sum(row) for row in h)
