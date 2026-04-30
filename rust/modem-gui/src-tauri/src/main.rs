@@ -33,9 +33,9 @@ struct AppState {
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     tx_source: Arc<Mutex<Option<Vec<u8>>>>,
-    /// Chemin de la payload prête à émettre (`tx_preview.avif` ou
-    /// `tx_preview.zst`). Renseigné par compress_image / compress_file_zstd.
-    /// `tx_start` lit ce chemin pour piloter le CLI.
+    /// Path of the payload ready to transmit (`tx_preview.avif` or
+    /// `tx_preview.zst`). Filled in by compress_image / compress_file_zstd.
+    /// `tx_start` reads this path to drive the CLI.
     tx_payload_path: Arc<Mutex<Option<PathBuf>>>,
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
@@ -43,8 +43,8 @@ struct AppState {
 
 #[derive(serde::Serialize, Clone)]
 struct PttStatusEvent {
-    /// "ok" : port ouvert, lignes en RX. "off" : désactivée par config.
-    /// "error" : ouverture échouée — `message` détaille.
+    /// "ok": port open, lines in RX. "off": disabled by config.
+    /// "error": open failed - `message` has the details.
     state: &'static str,
     message: String,
 }
@@ -258,9 +258,9 @@ fn is_raw_recording(state: State<'_, AppState>) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
-/// Submit a finished raw capture to the Phase D collector. URL et HMAC
-/// sont gérés dans `collector_client`. Async parce que reqwest l'est ;
-/// Tauri 2 sait gérer async commands.
+/// Submit a finished raw capture to the Phase D collector. URL and HMAC
+/// are handled inside `collector_client`. Async because reqwest is;
+/// Tauri 2 handles async commands.
 #[tauri::command]
 async fn submit_capture(
     args: collector_client::SubmitCaptureArgs,
@@ -280,20 +280,20 @@ struct CompressResult {
 
 #[derive(serde::Serialize)]
 struct TxEstimate {
-    /// Durée audio pour émettre n_initial (K + repair). Valeur de référence
-    /// pour la barre de progression et le garde-fou "TX > 5 min".
+    /// Audio duration to transmit n_initial (K + repair). Reference
+    /// value for the progress bar and the "TX > 5 min" guard.
     duration_s: f64,
-    /// Nombre total de blocs émis par le burst initial (= K + repair).
+    /// Total number of blocks emitted by the initial burst (= K + repair).
     total_blocks: u32,
-    /// Blocs RaptorQ nécessaires au décodage (K source-symbols).
+    /// RaptorQ blocks required to decode (K source symbols).
     k_source: u32,
-    /// Blocs réellement émis par le TX initial (= K + repair, redondant avec
-    /// total_blocks mais explicite pour l'UI).
+    /// Blocks actually emitted by the initial TX (= K + repair, redundant
+    /// with total_blocks but explicit for the UI).
     n_initial: u32,
-    /// Durée minimale théorique si zéro paquet n'était perdu (K seul).
+    /// Minimum theoretical duration if zero packets were lost (K only).
     duration_s_k: f64,
-    /// Durée d'un codeword, utilisé côté UI pour dériver la durée "+N%" du
-    /// bouton More.
+    /// Duration of a single codeword, used UI-side to derive the "+N%"
+    /// duration of the More button.
     seconds_per_cw: f64,
 }
 
@@ -481,10 +481,11 @@ fn delete_session(session_id: u32, state: State<'_, AppState>) -> Result<(), Str
 
 // ─────────────────────────────────────────── Onglet Historique
 //
-// Vue unifiée des fichiers TX (archivés au lancement de chaque émission par
-// `tx_worker::archive_payload`) et RX (sessions décodées par session_store).
-// Sert le mode radio-secours : un opérateur reçoit un fichier et peut le
-// re-émettre d'un clic pour le propager plus loin sur le réseau.
+// Unified view of TX files (archived at TX launch by
+// `tx_worker::archive_payload`) and RX files (sessions decoded by
+// `session_store`). Powers the radio-rescue mode: an operator receives
+// a file and can re-emit it with one click to forward it further on the
+// network.
 
 #[derive(serde::Serialize)]
 struct TxHistoryItem {
@@ -503,12 +504,13 @@ struct RxHistoryItem {
     timestamp: i64,
     callsign: Option<String>,
     filename: String,
-    /// Chemin pour la vignette (asset:// affichable). Toujours pointé sur le
-    /// fichier décompressé/affichable s'il existe (sinon le decoded.<ext>
-    /// brut du session_dir).
+    /// Path for the thumbnail (`asset://`-displayable). Always points to
+    /// the decompressed/displayable file when it exists (otherwise the
+    /// raw `decoded.<ext>` from the session_dir).
     preview_path: String,
-    /// Chemin à passer à `set_tx_source_from_path` pour relayer (radio-secours).
-    /// AVIF → `decoded.avif` (passthrough bit-à-bit) ; sinon copie root.
+    /// Path to pass to `set_tx_source_from_path` for relaying
+    /// (radio rescue). AVIF -> `decoded.avif` (bit-for-bit passthrough);
+    /// otherwise the root copy.
     relay_path: String,
     is_image: bool,
     size_bytes: u64,
@@ -545,8 +547,9 @@ fn list_tx_history(state: State<'_, AppState>) -> Result<Vec<TxHistoryItem>, Str
             Some(s) => s.to_string(),
             None => continue,
         };
-        // Trouve le fichier source jumeau (avif/zst/bin) — pas forcément même
-        // extension que celle déduite du mime_type, on parcourt le dossier.
+        // Find the twin source file (avif/zst/bin) - not necessarily the
+        // same extension as the one derived from mime_type, so we walk
+        // the directory.
         let mut payload_path: Option<PathBuf> = None;
         for sib in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let p = sib.path();
@@ -593,15 +596,15 @@ fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, Str
             format!("session-{:08x}.bin", meta.session_id)
         });
         let root_copy = save_dir.join(&display_filename);
-        // Preview ET relay : on utilise toujours la copie root écrite par
-        // rx_worker::emit_decoded_file. C'est la SEULE version contenant le
-        // fichier extrait de la PayloadEnvelope (= AVIF/PNG/ZSTD pur). Le
-        // fichier `decoded.<ext>` du session_dir contient l'envelope brute
-        // (header + content) et n'est pas exploitable directement comme
-        // image ou comme payload TX.
+        // Preview AND relay: we always use the root copy written by
+        // `rx_worker::emit_decoded_file`. That is the ONLY version that
+        // contains the file extracted from the PayloadEnvelope (= pure
+        // AVIF/PNG/ZSTD). The `decoded.<ext>` file in the session_dir
+        // contains the raw envelope (header + content) and cannot be
+        // used directly as an image or as a TX payload.
         if !root_copy.exists() {
-            // Session décodée mais copie root absente (cleanup manuel ou
-            // sessions héritées d'une version antérieure) — on l'ignore.
+            // Session decoded but root copy missing (manual cleanup or
+            // sessions inherited from an older version) - skip it.
             continue;
         }
         let preview = root_copy.clone();
@@ -634,7 +637,7 @@ fn delete_history_item(
     match kind.as_str() {
         "tx" => {
             let path = PathBuf::from(&key);
-            // Garde-fou : doit être dans <save_dir>/tx_history/.
+            // Guard: must be inside <save_dir>/tx_history/.
             let history_dir = save_dir.join("tx_history");
             if !path.starts_with(&history_dir) {
                 return Err("chemin hors tx_history/".into());
@@ -658,10 +661,11 @@ fn delete_history_item(
                 std::fs::remove_dir_all(&dir)
                     .map_err(|e| format!("rm {}: {e}", dir.display()))?;
             }
-            // Supprime aussi la copie root si on retrouve le filename via meta.
-            // Best-effort : on ne lit plus le meta.json (déjà rm'd) — on laisse
-            // la copie root en place si l'utilisateur l'a déjà déplacée ou
-            // copiée ailleurs, c'est plus prudent que d'effacer à l'aveugle.
+            // We also remove the root copy if we can recover the filename
+            // from the meta. Best-effort: we don't read meta.json any more
+            // (already rm'd) - we leave the root copy in place if the user
+            // has already moved or copied it elsewhere; safer than blind
+            // deletion.
             Ok(())
         }
         other => Err(format!("kind inconnu '{other}' (tx|rx)")),
@@ -756,9 +760,9 @@ struct CompressFileResult {
     byte_len: usize,
 }
 
-/// Compresse la source (chargée via set_tx_source_from_path) en zstd niveau
-/// max et écrit le résultat dans `tx_preview.zst`. Pour les fichiers non-image
-/// (texte, archives, etc.) où on veut une transmission sans perte.
+/// Compress the source (loaded via `set_tx_source_from_path`) with zstd
+/// at max level and write the result to `tx_preview.zst`. For non-image
+/// files (text, archives, etc.) that require lossless transmission.
 #[tauri::command]
 fn compress_file_zstd(state: State<'_, AppState>) -> Result<CompressFileResult, String> {
     let source = {
@@ -803,9 +807,9 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let ptt: SharedPtt = Arc::new(Mutex::new(None));
-            // Tentative d'ouverture du port PTT au démarrage. Si KO, on émet
-            // un événement et on laisse `ptt` à None pour la session — l'UI
-            // peut toujours rouvrir via Paramètres → save_settings.
+            // Best-effort PTT port open at startup. On failure we emit an
+            // event and leave `ptt` at None for the session - the UI can
+            // still re-open it later via Settings -> save_settings.
             let startup_settings = settings::load();
             let status = compute_ptt_status(&ptt, &startup_settings);
             if status.state == "error" {

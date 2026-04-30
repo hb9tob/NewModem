@@ -1,27 +1,27 @@
-//! Worker V3 — sliding-window RX à partir du session_buffer.
+//! V3 worker - sliding-window RX over the session_buffer.
 //!
-//! Deux chemins tournent en parallèle sur le même buffer audio accumulé :
+//! Two paths run in parallel on the same accumulated audio buffer:
 //!
-//! 1. **Main loop** : dès qu'on détecte ≥ 2 préambules dans le buffer, on
-//!    traite la fenêtre `[P_i − margin .. P_{i+1} + margin]` avec `rx_v2`
-//!    comme si c'était une mini-transmission V2 autonome (timing re-init,
-//!    FFE LS re-train, grid ppm, marker walk, LDPC decode). Les codewords
-//!    décodés sont mergés first-wins par ESI dans un accumulateur global.
-//!    Chaque position `P_i` n'est finalisée qu'une seule fois.
+//! 1. **Main loop**: as soon as we detect >= 2 preambles in the buffer, the
+//!    window `[P_i - margin .. P_{i+1} + margin]` is processed with
+//!    `rx_v2` as if it were a self-contained mini V2 transmission (timing
+//!    re-init, FFE LS re-train, grid ppm, marker walk, LDPC decode). The
+//!    decoded codewords are merged first-wins by ESI into a global
+//!    accumulator. Each position `P_i` is finalized only once.
 //!
-//! 2. **Light tick** (toutes les 1 s) : `rx_v2` sur la fenêtre ouverte
-//!    `[P_last − margin .. buffer_end]`. Les résultats sont « provisoires »
-//!    et servent uniquement à rafraîchir les events de progression côté GUI ;
-//!    dès qu'un nouveau préambule apparaît (→ fenêtre close), la main loop
-//!    refait proprement le décodage sur la fenêtre complète.
+//! 2. **Light tick** (every 1 s): `rx_v2` runs on the open window
+//!    `[P_last - margin .. buffer_end]`. Its output is "provisional" and
+//!    only refreshes the GUI progress events; as soon as a new preamble
+//!    appears (-> window closes), the main loop re-decodes the full
+//!    window cleanly.
 //!
-//! Fin de session : silence RMS ≥ 2 s après au moins un préambule vu →
-//! dernier `rx_v2` sur `[P_last − margin .. EOF]` → `file_complete` →
-//! reset accumulateur.
+//! End of session: RMS silence >= 2 s after at least one preamble seen
+//! -> final `rx_v2` on `[P_last - margin .. EOF]` -> `file_complete` ->
+//! accumulator reset.
 //!
-//! Le profil modem (constellation / LDPC rate / symbol rate) est passé à
-//! `spawn()` au démarrage de la capture. Un changement de profil impose un
-//! stop/start du worker.
+//! The modem profile (constellation / LDPC rate / symbol rate) is passed
+//! to `spawn()` when the capture starts. Changing profile requires a
+//! stop/start of the worker.
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use modem_core::header::Header;
@@ -223,13 +223,13 @@ impl WorkerHandle {
     }
 }
 
-/// Démarre un worker RX.
+/// Spawn an RX worker.
 ///
-/// Si `forced=true`, le profil RX est verrouillé sur `profile` :
-/// - le gate FFT (auto-détection famille) est bypass complet,
-/// - la post-décode header refine est bypass aussi.
-/// C'est obligatoire pour décoder les profils EXPERIMENTAL (HIGH+, FAST)
-/// qui ne sont pas dans `PROBE_TEMPLATES` et ne s'auto-détectent pas.
+/// If `forced=true`, the RX profile is locked on `profile`:
+/// - the FFT gate (family auto-detection) is fully bypassed,
+/// - the post-decode header refine is bypassed as well.
+/// This is mandatory to decode EXPERIMENTAL profiles (HIGH+, FAST) which
+/// are absent from `PROBE_TEMPLATES` and therefore not auto-detected.
 pub fn spawn(
     samples: Receiver<Vec<f32>>,
     app: AppHandle,
@@ -292,9 +292,9 @@ const PREAMBLE_SILENCE_TIMEOUT_S: u64 = 6;
 struct WorkerState {
     config: ModemConfig,
     profile: ProfileIndex,
-    /// `true` quand le profil RX est verrouillé par l'utilisateur (UI :
-    /// "Forcer un profil"). Désactive l'auto-détection (gate FFT) et la
-    /// post-décode header refine. Indispensable pour HIGH+/FAST.
+    /// `true` when the RX profile is locked by the user (UI:
+    /// "Forcer un profil"). Disables auto-detection (FFT gate) and the
+    /// post-decode header refine. Required for HIGH+/FAST.
     forced: bool,
     /// Accumulated audio for the current capture. Rolled to PREROLL_SECONDS
     /// while Idle (cheap noise buffer) ; bounded to CAPTURE_WINDOW_SECONDS
@@ -605,9 +605,9 @@ fn scan_and_route(
             state.config = want_anchor.to_config();
         }
     }
-    // En mode forcé : pas de gate FFT (les profils EXPERIMENTAL ne sont pas
-    // dans PROBE_TEMPLATES), pas de squelch sur préambule. rx_v3 fera son
-    // propre find_preamble en aval — sur du bruit pur il sort vite (None).
+    // Forced mode: no FFT gate (EXPERIMENTAL profiles are absent from
+    // PROBE_TEMPLATES) and no preamble squelch. rx_v3 will run its own
+    // find_preamble downstream - on pure noise it bails out quickly (None).
 
     // `t_detect_us` retained in the [scan] log for compatibility with
     // existing baseline captures ; phase-2b removes detect_best_profile
@@ -703,13 +703,12 @@ fn scan_and_route(
             }
         }
     } else if let Some(ref hdr) = result.header {
-        // Mode forcé : on ne switche PAS le profil, mais on logue les
-        // discordances pour aider au debug ("le pair envoie HIGH alors qu'on
-        // est forcé sur HIGH+").
+        // Forced mode: we do NOT switch profile, but we log mismatches to
+        // help debugging ("peer sends HIGH while we're forced on HIGH+").
         if let Some(hdr_profile) = modem_core::profile::ProfileIndex::from_u8(hdr.profile_index) {
             if hdr_profile != state.profile {
                 worker_log(&format!(
-                    "[forced] header says {:?}, mode forcé sur {:?} → décodage attendu invalide",
+                    "[forced] header says {:?}, locked on {:?} -> expected decode failure",
                     hdr_profile, state.profile
                 ));
             }
@@ -954,9 +953,9 @@ fn emit_decoded_file(
             df.payload.clone(),
         )
     };
-    // Si la payload est zstd-compressée (cas "fichier non-image"), on la
-    // décompresse avant écriture. Le filename de l'envelope est l'original
-    // (sans suffixe `.zst`), donc on écrit tel quel.
+    // If the payload is zstd-compressed (the "non-image file" case), we
+    // decompress before writing. The envelope's filename is the original
+    // one (without the `.zst` suffix), so we write it as-is.
     let (final_content, final_mime) = if df.meta.mime_type == modem_core::app_header::mime::ZSTD {
         match zstd::stream::decode_all(content.as_slice()) {
             Ok(decoded) => (decoded, modem_core::app_header::mime::BINARY),
@@ -1039,10 +1038,10 @@ fn save_file(dir: &Path, filename: &str, content: &[u8]) -> std::io::Result<Path
     Ok(path)
 }
 
-/// Renvoie un chemin libre dans `dir` : si `filename` existe déjà, suffixe
-/// `(1)`, `(2)`, ... avant l'extension, jusqu'à 9999. Au-delà (cas
-/// pathologique), tombe sur un suffixe timestamp pour garantir l'unicité
-/// sans jamais écraser une réception précédente.
+/// Return a free path inside `dir`: if `filename` already exists, append
+/// a `(1)`, `(2)`, ... suffix before the extension, up to 9999. Beyond
+/// that (pathological case), fall back to a timestamp suffix to
+/// guarantee uniqueness without ever overwriting an earlier reception.
 fn unique_path(dir: &Path, filename: &str) -> PathBuf {
     let candidate = dir.join(filename);
     if !candidate.exists() {

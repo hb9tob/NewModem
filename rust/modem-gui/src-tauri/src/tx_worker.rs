@@ -1,18 +1,18 @@
-//! TX worker : génération du WAV via le binaire modem-cli, puis playback
-//! sur la carte son sélectionnée.
+//! TX worker: generates the WAV through the modem-cli binary, then plays
+//! it back on the selected sound card.
 //!
-//! Pipeline (thread dédié, non bloquant pour Tauri) :
-//!   1. Estime durée / nb de blocs (helper pour la validation UI côté JS).
+//! Pipeline (dedicated thread, non-blocking for Tauri):
+//!   1. Estimate duration / block count (helper for JS-side UI validation).
 //!   2. Spawn `nbfm-modem tx --input <avif> --output <wav> --frame-version 3
 //!                           --profile <MODE> --callsign <QRZ> --filename <...>`
-//!   3. Lit le WAV produit avec hound, décode en f32.
-//!   4. Joue via cpal sur le device TX choisi.
+//!   3. Read the resulting WAV with hound, decode to f32.
+//!   4. Play it via cpal on the chosen TX device.
 //!
-//! Événements (AppHandle::emit) :
+//! Events (AppHandle::emit):
 //!   - tx_plan      { duration_s, total_blocks, wire_bytes, wav_path,
 //!                    mode, callsign, filename }
 //!   - tx_progress  { pos_samples, total_samples, elapsed_s, duration_s,
-//!                    blocks_sent (interp. linéaire), total_blocks }
+//!                    blocks_sent (linearly interpolated), total_blocks }
 //!   - tx_complete  { duration_s, wav_path, stopped_early }
 //!   - tx_error     { message }
 
@@ -89,10 +89,10 @@ pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
         "NORMAL" => Ok(profile::profile_normal()),
         "ROBUST" => Ok(profile::profile_robust()),
         "ULTRA" => Ok(profile::profile_ultra()),
-        // HIGH+ promu standard depuis 2026-04-28 (validé OTA HB9MM).
+        // HIGH+ promoted to standard since 2026-04-28 (validated OTA at HB9MM).
         "HIGH+" | "HIGHPLUS" => Ok(profile::profile_high_plus()),
-        // EXPERIMENTAL — décodable seulement par un pair en mode forcé sur
-        // le même profil.
+        // EXPERIMENTAL - only decodable by a peer locked on the same
+        // profile in forced mode.
         "FAST" => Ok(profile::profile_fast()),
         "HIGH++" | "HIGHPLUSPLUS" => Ok(profile::profile_high_plus_plus()),
         "HIGH56" | "HIGH-56" => Ok(profile::profile_high_5_6()),
@@ -124,12 +124,12 @@ pub struct TxPlan {
 }
 
 /// Compute the transmission plan for a given payload + profile + chosen
-/// RaptorQ repair percentage. Inclut tous les overheads de trame (préambule,
-/// header, meta, markers, pilotes, runout, EOT, plus les réinsertions
-/// périodiques toutes les `V3_PREAMBLE_PERIOD_S`) pour que la durée affichée
-/// dans l'UI matche ce qui passe réellement à l'antenne. Les valeurs précises
-/// sortent de `frame::superframe_total_symbols` + `frame::eot_frame_symbols`,
-/// qui miroitent à l'identique le builder de trame.
+/// RaptorQ repair percentage. Includes every frame overhead (preamble,
+/// header, meta, markers, pilots, runout, EOT, plus periodic re-insertions
+/// every `V3_PREAMBLE_PERIOD_S`) so the duration shown in the UI matches
+/// what actually goes on air. Exact values come from
+/// `frame::superframe_total_symbols` + `frame::eot_frame_symbols`, which
+/// mirror the frame builder one-to-one.
 pub fn tx_plan(
     payload_bytes: usize,
     mode_name: &str,
@@ -142,24 +142,24 @@ pub fn tx_plan(
     let wire = payload_bytes + envelope_overhead;
     let k_bytes = config.ldpc_rate.k() / 8;
     let k_source = k_from_payload(wire, k_bytes) as u32;
-    // Aligner sur ce que build_superframe_v3_range va réellement émettre :
-    // si n_initial brut est impair, le builder l'arrondit pour que le
-    // dernier data segment soit complet (sinon le RX perd ce CW final).
+    // Align on what build_superframe_v3_range will actually emit: if the
+    // raw n_initial is odd, the builder rounds it so the last data
+    // segment is complete (otherwise RX loses that final CW).
     let n_initial =
         modem_core::frame::effective_packet_count(k_source + (k_source * repair_pct) / 100);
     // Asymptote payload-only : utile pour l'estimation marginale "+N blocs".
     let bits_per_cw = (k_bytes as f64) * 8.0;
     let seconds_per_cw = bits_per_cw / config.net_bitrate();
 
-    // Durée réelle = symboles totaux du superframe + symboles EOT, divisés par
-    // le débit symbole. Capture les réinsertions périodiques (très lourdes en
-    // ULTRA où une réinsertion par segment) et tous les overheads structurels.
+    // Actual duration = total superframe symbols + EOT symbols, divided
+    // by the symbol rate. Captures periodic re-insertions (very costly on
+    // ULTRA where there is one per segment) and every structural overhead.
     let total_syms_initial =
         modem_core::frame::superframe_total_symbols(&config, n_initial)
             + modem_core::frame::eot_frame_symbols(&config);
     let duration_s_initial = total_syms_initial as f64 / config.symbol_rate;
-    // Pour duration_s_k : durée jusqu'au K-ième codeword, sans EOT (le RX
-    // peut décoder dès K reçus, avant l'EOT).
+    // For duration_s_k: duration up to the K-th codeword, without EOT
+    // (the RX can decode as soon as K are received, before the EOT).
     let duration_s_k =
         modem_core::frame::superframe_total_symbols(&config, k_source) as f64
             / config.symbol_rate;
@@ -173,10 +173,12 @@ pub fn tx_plan(
 }
 
 
-/// Retrouve le binaire modem-cli à côté du GUI. Priorité :
-///   1. `nbfm-modem-<TARGET_TRIPLE>[.exe]` — nom produit par le sidecar
-///      Tauri (`externalBin`), installé dans `/usr/bin/` par le .deb.
-///   2. `nbfm-modem[.exe]` — nom brut (dev workspace `target/release/`).
+/// Locate the modem-cli binary next to the GUI. Priority:
+///   1. `nbfm-modem-<TARGET_TRIPLE>[.exe]` - the name produced by the
+///      Tauri sidecar (`externalBin`), installed under `/usr/bin/` by
+///      the .deb.
+///   2. `nbfm-modem[.exe]` - the bare name (dev workspace
+///      `target/release/`).
 fn locate_cli_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -521,26 +523,27 @@ pub fn spawn(
     }
 }
 
-/// Pré-emphase numérique +6 dB/octave pour NBFM : shelf 1ᵉʳ ordre
-/// H(s) = (1+sτ₁)/(1+sτ₂), τ₁ = 750 µs (zéro de boost à f₁ ≈ 212 Hz),
-/// τ₂ = 75 µs (pôle à f₂ ≈ 2.12 kHz qui plafonne le gain HF à
-/// τ₁/τ₂ = 20 dB). Bilinear transform à 48 kHz, coefficients normalisés
-/// pour DC = 1.
+/// Digital +6 dB/octave NBFM pre-emphasis: first-order shelf
+/// H(s) = (1+s*tau1)/(1+s*tau2), tau1 = 750 us (zero at f1 ~= 212 Hz),
+/// tau2 = 75 us (pole at f2 ~= 2.12 kHz, capping the HF gain at
+/// tau1/tau2 = 20 dB). Bilinear transform at 48 kHz, coefficients
+/// normalized for DC = 1.
 ///
-/// Réponse digitale :
-///   - DC : 0 dB
-///   - 1 kHz : ~+13 dB
+/// Digital response:
+///   - DC      : 0 dB
+///   - 1 kHz   : ~+13 dB
 ///   - 2.7 kHz : ~+18 dB
-///   - Nyquist : +20 dB (plateau du shelf)
+///   - Nyquist : +20 dB (shelf plateau)
 ///
-/// Boost important sur tout l'audio utile (NBFM commence à pré-accentuer
-/// dès 200 Hz, pas 2 kHz comme la FM broadcast). L'appelant DOIT
-/// peak-normaliser le signal après filtrage : sinon la carte son écrête.
+/// Heavy boost across the full useful audio band (NBFM starts pre-
+/// emphasizing as low as 200 Hz, not 2 kHz like broadcast FM). The
+/// caller MUST peak-normalize the signal after filtering, otherwise
+/// the sound card clips.
 fn preemphasis_nbfm_48k(samples: &mut [f32]) {
     // Bilinear sans prewarp : 2τ₁/T = 72.0, 2τ₂/T = 7.2.
     // Num brut : 73 - 71 z⁻¹  ;  Den brut : 8.2 - 6.2 z⁻¹.
     // Normalisation par a0 = 8.2 → b0 = 8.9024, b1 = -8.6585, a1 = -0.7561.
-    // Pôle à z = 0.7561, stable.
+    // Pole at z = 0.7561, stable.
     const B0: f32 = 8.9024;
     const B1: f32 = -8.6585;
     const A1: f32 = -0.7561;
@@ -555,9 +558,9 @@ fn preemphasis_nbfm_48k(samples: &mut [f32]) {
     }
 }
 
-/// Bascule la PTT sur la polarité TX. Best-effort : si l'écriture sur le
-/// port échoue (câble débranché en cours de session…) on log et on continue,
-/// le worker n'a pas vocation à interrompre la transmission pour ça.
+/// Switch the PTT to TX polarity. Best-effort: if writing to the port
+/// fails (cable unplugged mid-session, ...) we log and keep going - the
+/// worker is not in the business of aborting a transmission for that.
 fn ptt_engage(ptt: &SharedPtt) -> bool {
     let mut g = match ptt.lock() {
         Ok(g) => g,
@@ -597,16 +600,17 @@ fn run_playback(
     ptt: SharedPtt,
     app: AppHandle,
 ) {
-    // Pré-emphase NBFM optionnelle (+6 dB/oct, τ = 750 µs). Appliquée AVANT
-    // l'atténuation pour que le pic re-normalisé respecte ensuite la consigne
-    // ATT. Le shelf élève fortement les hautes fréquences audio (+13 dB à
-    // 1 kHz, +18 dB à 2.7 kHz, plafond +20 dB) : sans re-normalisation le
-    // signal écrêterait la carte son.
+    // Optional NBFM pre-emphasis (+6 dB/oct, tau = 750 us). Applied
+    // BEFORE the attenuation so that the re-normalized peak still
+    // respects the ATT setpoint. The shelf strongly lifts the high audio
+    // frequencies (+13 dB at 1 kHz, +18 dB at 2.7 kHz, plateau +20 dB):
+    // without re-normalization the signal would clip the sound card.
     if preemphasis_enabled {
         preemphasis_nbfm_48k(&mut samples);
-        // Re-peak-normalize au même niveau que la sortie modem-cli (PEAK_NORMALIZE
-        // = 0.9 dans modem-core::types). Garde un headroom de ~0.9 dB avant
-        // saturation int16/F32 quelle que soit l'élévation HF du shelf.
+        // Re-peak-normalize back to the modem-cli output level
+        // (PEAK_NORMALIZE = 0.9 in modem-core::types). Keeps ~0.9 dB of
+        // headroom before int16/F32 saturation regardless of the shelf
+        // HF lift.
         let peak = samples.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
         if peak > 0.9 {
             let scale = 0.9 / peak;
@@ -615,9 +619,9 @@ fn run_playback(
             }
         }
     }
-    // Applique l'atténuation de la cascade ATT (onglet Canal). Clamp à
-    // [-60, 0] dB par sécurité — au-delà ça ne sert à rien et un signe
-    // positif inattendu saturerait la carte son.
+    // Apply the ATT cascade attenuation (Channel tab). Clamp to
+    // [-60, 0] dB defensively - beyond that range it serves no purpose
+    // and an unexpected positive sign would saturate the sound card.
     let att_db = attenuation_db.clamp(-60.0, 0.0);
     if att_db < 0.0 {
         let gain = 10f32.powf(att_db / 20.0);
@@ -742,8 +746,8 @@ fn run_playback(
             return;
         }
     };
-    // PTT : on bascule en émission AVANT d'ouvrir le flux audio, et on
-    // attend 200 ms pour laisser le temps au transceiver de commuter.
+    // PTT: switch to TX BEFORE opening the audio stream, then wait
+    // 200 ms to give the transceiver time to commute.
     let ptt_engaged = ptt_engage(&ptt);
     if ptt_engaged {
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
@@ -803,7 +807,7 @@ fn run_playback(
     }
 
     drop(stream);
-    // 200 ms de silence avant de relâcher la PTT, puis bascule RX.
+    // 200 ms of silence before releasing the PTT, then switch back to RX.
     if ptt_engaged {
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
         ptt_release(&ptt);
@@ -875,15 +879,15 @@ fn write_out_u16(out: &mut [u16], channels: usize, samples: &[f32], pos: &Atomic
     pos.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Archive le fichier payload TX dans `<save_dir>/tx_history/` au moment où
-/// l'utilisateur lance une émission. Garantit que l'historique TX trace
-/// toute tentative, y compris celles coupées en cours (PTT relâché, erreur
-/// audio). Émet `tx_archived` au frontend, et purge les plus anciens si on
-/// dépasse `max_items`.
+/// Archive the TX payload file under `<save_dir>/tx_history/` at the
+/// moment the user starts a transmission. Guarantees that the TX
+/// history traces every attempt, including the ones aborted mid-burst
+/// (PTT released, audio error). Emits `tx_archived` on the frontend
+/// and purges the oldest entries if `max_items` is exceeded.
 ///
-/// `payload_path` doit pointer sur un fichier existant (`tx_preview.avif` ou
-/// `tx_preview.zst`). `filename` est le nom original choisi par l'utilisateur,
-/// préservé tel quel dans le metadata pour l'affichage de la vignette.
+/// `payload_path` must point at an existing file (`tx_preview.avif` or
+/// `tx_preview.zst`). `filename` is the original name chosen by the
+/// user, preserved as-is in the metadata for thumbnail display.
 pub fn archive_payload(
     save_dir: &Path,
     payload_path: &Path,
@@ -934,9 +938,9 @@ pub fn archive_payload(
     let _ = app.emit("tx_archived", ());
 }
 
-/// Limite le dossier `tx_history/` à `max_items` triplets fichier+json. Trie
-/// les `.json` par mtime descendant et supprime les plus anciens (avec leur
-/// fichier source jumeau).
+/// Cap the `tx_history/` folder to `max_items` file+json pairs. Sort
+/// the `.json` files by descending mtime and remove the oldest ones
+/// (along with their twin source file).
 fn purge_history(history_dir: &Path, max_items: u32) {
     let max = max_items.max(1) as usize;
     let mut metas: Vec<(SystemTime, PathBuf)> = match std::fs::read_dir(history_dir) {
@@ -959,7 +963,7 @@ fn purge_history(history_dir: &Path, max_items: u32) {
     if metas.len() <= max {
         return;
     }
-    metas.sort_by(|a, b| b.0.cmp(&a.0)); // plus récent d'abord
+    metas.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
     for (_, json_path) in metas.into_iter().skip(max) {
         if let Some(stem) = json_path.file_stem().and_then(|s| s.to_str()) {
             if let Some(parent) = json_path.parent() {
@@ -974,9 +978,9 @@ fn purge_history(history_dir: &Path, max_items: u32) {
     }
 }
 
-/// Sanitize un nom de fichier pour le système de fichiers : remplace les
-/// caractères réservés Windows/Linux par `_`, tronque à 80 caractères pour
-/// laisser de la place au préfixe timestamp + extension.
+/// Sanitize a filename for the filesystem: replace Windows/Linux
+/// reserved characters with `_`, and truncate to 80 characters to
+/// leave room for the timestamp prefix + extension.
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()

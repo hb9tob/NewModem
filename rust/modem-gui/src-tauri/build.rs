@@ -38,11 +38,11 @@ fn main() {
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Secret HMAC partagé avec le collector (Phase D). Le fichier est
-    // gitignoré ; on en crée un placeholder s'il manque pour qu'un clone
-    // vierge build sans étape manuelle. La soumission échouera (signature
-    // invalide) tant que le secret réel n'est pas posé via
-    // `openssl rand -hex 32` côté GUI ET côté collector.
+    // HMAC secret shared with the collector (Phase D). The file is
+    // gitignored; we create a placeholder if missing so that a fresh
+    // clone builds without a manual step. Submissions will fail
+    // (invalid signature) until the real secret is installed via
+    // `openssl rand -hex 32` on both the GUI and collector sides.
     let secret_path = manifest_dir.join("secret.txt");
     if !secret_path.exists() {
         let _ = std::fs::write(
@@ -50,9 +50,9 @@ fn main() {
             "0000000000000000000000000000000000000000000000000000000000000000\n",
         );
         println!(
-            "cargo:warning=secret.txt absent — placeholder créé. \
-             Remplace par `openssl rand -hex 32` côté GUI ET côté collector \
-             avant tout submit réel."
+            "cargo:warning=secret.txt missing - placeholder created. \
+             Replace it with `openssl rand -hex 32` on both the GUI and \
+             collector sides before any real submission."
         );
     }
     println!("cargo:rerun-if-changed={}", secret_path.display());

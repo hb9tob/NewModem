@@ -1,12 +1,12 @@
-//! Client HTTP du collector Phase D.
+//! HTTP client for the Phase-D collector.
 //!
-//! Construit le multipart d'un sondage à partir d'une capture brute (WAV
-//! + event log JSON) et le POST signé HMAC à `<base_url>/api/v1/sondage`.
+//! Builds the multipart payload of a sounding report from a raw capture
+//! (WAV + event-log JSON) and POSTs it (HMAC-signed) to
+//! `<base_url>/api/v1/sondage`.
 //!
-//! Le secret HMAC est partagé avec le collector via deux fichiers
-//! `secret.txt` jumeaux (gitignorés) — c'est le contrat anti-abus
-//! "quasi obligatoire NewModem". Détails serveur : voir
-//! `rust/newmodem-collector/`.
+//! The HMAC secret is shared with the collector through two twin
+//! `secret.txt` files (gitignored) - the "near-mandatory NewModem"
+//! anti-abuse contract. Server details: see `rust/newmodem-collector/`.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,26 +18,25 @@ type HmacSha256 = Hmac<Sha256>;
 
 const HMAC_SECRET: &str = include_str!("../secret.txt");
 
-/// Args passés depuis le frontend via la commande Tauri `submit_capture`.
+/// Args passed from the frontend via the Tauri command `submit_capture`.
 #[derive(Debug, Deserialize)]
 pub struct SubmitCaptureArgs {
     pub wav_path: String,
     pub callsign: String,
-    /// URL de base du collector, sans suffixe (ex: `https://hb9tob-modem.duckdns.org`).
+    /// Base URL of the collector, no suffix (e.g. `https://hb9tob-modem.duckdns.org`).
     pub collector_url: String,
     #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
-    /// Event log sérialisé en JSON par le frontend. Stocké tel quel sur
-    /// le serveur en `report.json` (le serveur ne parse pas son contenu).
+    /// Event log serialized to JSON by the frontend. Stored as-is on the
+    /// server as `report.json` (the server does not parse its contents).
     #[serde(default)]
     pub event_log_json: Option<String>,
 }
 
-/// Résultat retourné côté JS : URL relative vers le sondage sur le
-/// collector (à concaténer à `collector_url` pour ouvrir dans un
-/// navigateur).
+/// Result returned to JS: relative URL of the report on the collector
+/// (concatenate to `collector_url` to open it in a browser).
 #[derive(serde::Serialize)]
 pub struct SubmitResult {
     pub folder: String,
@@ -64,7 +63,7 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
     }
     let url = format!("{base}/api/v1/sondage");
 
-    // metadata.json minimaliste, conforme à `ReportMeta` côté serveur.
+    // Minimal metadata.json, matching `ReportMeta` on the server side.
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -80,7 +79,7 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
     let metadata_bytes =
         serde_json::to_vec(&metadata).map_err(|e| format!("metadata serialize: {e}"))?;
 
-    // report.json = event log sérialisé tel quel ("[]" si rien fourni).
+    // report.json = event log serialized as-is ("[]" if none provided).
     let report_bytes = args
         .event_log_json
         .as_deref()
@@ -88,10 +87,10 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
         .as_bytes()
         .to_vec();
 
-    // Hash du body signé : metadata || report. Les binaires (WAV) ne sont
-    // PAS signés ici — leur intégrité repose sur le tunnel TLS et
-    // accessoirement sur un hash qui pourra être ajouté à report.json
-    // quand Phase B générera des rapports plus formels.
+    // Signed-body hash: metadata || report. Binaries (WAV) are NOT signed
+    // here - their integrity relies on the TLS tunnel and, secondarily, on
+    // a hash that can be added to report.json once Phase B starts emitting
+    // more formal reports.
     let body_hash = {
         let mut h = Sha256::new();
         h.update(&metadata_bytes);
@@ -107,8 +106,8 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
     mac.update(&body_hash);
     let signature = hex::encode(mac.finalize().into_bytes());
 
-    // Lecture du WAV. tokio::fs pour ne pas bloquer le runtime sur un gros
-    // fichier (les captures peuvent atteindre quelques MB).
+    // Read the WAV. tokio::fs so we don't block the runtime on a large
+    // file (captures can reach a few MB).
     let wav_bytes = tokio::fs::read(&args.wav_path)
         .await
         .map_err(|e| format!("lecture WAV {} : {}", args.wav_path, e))?;
@@ -119,9 +118,9 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
         .to_string();
     let bytes_uploaded = metadata_bytes.len() + report_bytes.len() + wav_bytes.len();
 
-    // Multipart. Ordre des fields = ordre arbitraire côté serveur (il
-    // les indexe par nom), mais on garde callsign en premier pour la
-    // lisibilité dans les logs nginx en cas de pépin.
+    // Multipart. Field order is arbitrary on the server side (it indexes
+    // by name), but we keep callsign first for readability in nginx logs
+    // if anything goes wrong.
     let form = reqwest::multipart::Form::new()
         .text("callsign", callsign.clone())
         .part(
@@ -146,7 +145,7 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
                 .map_err(|e| e.to_string())?,
         );
 
-    // 2 minutes : couvre les uploads multi-MB sur ADSL asymétrique.
+    // 2 minutes: covers multi-MB uploads over asymmetric ADSL.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -164,7 +163,7 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
     if !status.is_success() {
         return Err(format!("HTTP {status} : {}", body.trim()));
     }
-    // Le serveur répond `{"ok":true,"folder":"...","url":"..."}`.
+    // The server replies `{"ok":true,"folder":"...","url":"..."}`.
     #[derive(Deserialize)]
     struct ServerResponse {
         #[serde(default)]

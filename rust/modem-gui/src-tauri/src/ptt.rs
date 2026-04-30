@@ -1,9 +1,9 @@
-//! PTT (Push-To-Talk) via RTS/DTR sur port série COM/tty.
+//! PTT (Push-To-Talk) via RTS/DTR on a COM/tty serial port.
 //!
-//! Au démarrage et à chaque sauvegarde des paramètres on tente d'ouvrir le
-//! port et d'appliquer la polarité "RX". Avant la lecture du WAV TX on bascule
-//! sur la polarité "TX" et on attend 200 ms. À la fin du WAV (ou stop) on
-//! attend 200 ms de silence et on remet la polarité "RX".
+//! On startup and on every settings save we try to open the port and apply
+//! the "RX" polarity. Before playing back the TX WAV we switch to the "TX"
+//! polarity and wait 200 ms. At the end of the WAV (or on stop) we wait
+//! 200 ms of silence and then return to the "RX" polarity.
 
 use serialport::SerialPort;
 use std::sync::{Arc, Mutex};
@@ -11,9 +11,8 @@ use std::time::Duration;
 
 use crate::settings::Settings;
 
-/// Délai entre l'assertion PTT et le démarrage audio (et symétriquement entre
-/// la fin du WAV et la libération PTT). Couvre le temps de commutation
-/// TX/RX de la radio.
+/// Delay between PTT assertion and audio playback (symmetrically, between
+/// end of WAV and PTT release). Covers the radio's TX/RX switching time.
 pub const PTT_GUARD_MS: u64 = 200;
 
 #[derive(Clone, Debug)]
@@ -21,9 +20,9 @@ pub struct PttConfig {
     pub port: String,
     pub use_rts: bool,
     pub use_dtr: bool,
-    /// Niveau de la ligne RTS quand on est en émission (true = haut).
+    /// Level of the RTS line when transmitting (true = high).
     pub rts_tx_high: bool,
-    /// Niveau de la ligne DTR quand on est en émission (true = haut).
+    /// Level of the DTR line when transmitting (true = high).
     pub dtr_tx_high: bool,
 }
 
@@ -45,18 +44,18 @@ impl PttConfig {
     }
 }
 
-/// Contrôleur PTT actif : encapsule un handle de port série ouvert et la
-/// configuration de polarité. On le garde dans `AppState` derrière un mutex.
+/// Active PTT controller: wraps an open serial-port handle plus the
+/// polarity configuration. Held inside `AppState` behind a mutex.
 pub struct PttController {
     cfg: PttConfig,
     port: Box<dyn SerialPort>,
 }
 
 impl PttController {
-    /// Ouvre le port et applique tout de suite la polarité RX.
+    /// Open the port and immediately apply the RX polarity.
     pub fn open(cfg: PttConfig) -> Result<Self, String> {
-        // Baudrate sans importance pour piloter RTS/DTR, mais le builder le
-        // demande. Timeout court : on n'écrit pas de données.
+        // Baudrate is irrelevant for driving RTS/DTR but the builder
+        // requires one. Short timeout: we never write data.
         let port = serialport::new(&cfg.port, 9600)
             .timeout(Duration::from_millis(50))
             .open()
@@ -95,26 +94,27 @@ impl PttController {
     }
 }
 
-/// Slot partagé entre `AppState` et le worker TX. `None` = PTT désactivée
-/// pour la session (pas configuré, ou ouverture échouée).
+/// Slot shared between `AppState` and the TX worker. `None` = PTT disabled
+/// for the session (not configured, or open failed).
 pub type SharedPtt = Arc<Mutex<Option<PttController>>>;
 
-/// Énumère les ports série visibles par l'OS. Renvoie une liste de noms
-/// (`COM3`, `/dev/ttyUSB0`...).
+/// Enumerate serial ports visible to the OS. Returns a list of names
+/// (`COM3`, `/dev/ttyUSB0`, ...).
 pub fn list_ports() -> Vec<String> {
     serialport::available_ports()
         .map(|v| v.into_iter().map(|p| p.port_name).collect())
         .unwrap_or_default()
 }
 
-/// (Re)tente d'ouvrir le port à partir des settings courants. Renvoie un
-/// message d'état lisible côté UI.
+/// (Re)try to open the port from the current settings. Returns a
+/// human-readable status string for the UI (in French, since it is shown
+/// to the end user).
 ///
-/// - `Ok(Some(msg))` : PTT active (msg = "PTT prête sur COM3" par ex.)
-/// - `Ok(None)`      : PTT désactivée par configuration (case décochée…)
-/// - `Err(msg)`      : ouverture échouée — `slot` est laissé à `None`.
+/// - `Ok(Some(msg))` : PTT active (msg = e.g. "PTT prête sur COM3").
+/// - `Ok(None)`      : PTT disabled by configuration (checkbox off, ...).
+/// - `Err(msg)`      : open failed - `slot` is left at `None`.
 pub fn refresh(slot: &SharedPtt, settings: &Settings) -> Result<Option<String>, String> {
-    // On ferme l'ancien handle d'abord (drop = release du port côté OS).
+    // Close the previous handle first (drop = release the port at the OS level).
     if let Ok(mut g) = slot.lock() {
         *g = None;
     }

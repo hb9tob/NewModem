@@ -15,8 +15,8 @@ pub struct CompressOpts {
     /// freeze the GUI on modest CPUs.
     #[serde(default)]
     pub speed: Option<u8>,
-    /// Source déjà AVIF : on émet les bytes tels quels, sans décodage ni
-    /// ré-encodage. La sélection se fait côté JS au moment du drop.
+    /// Source already in AVIF: emit the bytes as-is, no decode, no
+    /// re-encode. The selection is done JS-side at drop time.
     #[serde(default)]
     pub passthrough: bool,
 }
@@ -38,10 +38,10 @@ pub struct CompressedFile {
     pub byte_len: usize,
 }
 
-/// Compresse un fichier arbitraire sans perte avec zstd niveau 22 (max).
-/// Choisi pour son ratio proche de xz mais ~5-10× plus rapide. Sur le canal
-/// NBFM lent, l'overhead d'encodage est négligeable face au temps gagné en
-/// secondes-de-canal.
+/// Lossless compression of an arbitrary file with zstd level 22 (max).
+/// Chosen for a ratio close to xz but ~5-10x faster. On the slow NBFM
+/// channel, encoding overhead is negligible compared with the channel
+/// seconds saved.
 pub fn compress_zstd(source_bytes: &[u8]) -> Result<CompressedFile, String> {
     let mut out = Vec::with_capacity(source_bytes.len() / 2);
     let mut enc = zstd::Encoder::new(&mut out, 22).map_err(|e| format!("zstd init: {e}"))?;
@@ -57,13 +57,13 @@ pub fn compress_zstd(source_bytes: &[u8]) -> Result<CompressedFile, String> {
 }
 
 pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<CompressedImage, String> {
-    // Passthrough : la source est déjà un AVIF (drop direct ou relayage
-    // depuis l'historique). On ne touche pas aux bytes — pas de ré-encodage,
-    // donc pas de perte ni de cycles CPU. On ne décode pas l'AVIF côté Rust
-    // pour lire les dimensions (le crate `image` n'a pas la feature `avif`
-    // activée — ça ferait crasher le passthrough silencieusement). Les
-    // dimensions remontées au frontend sont celles passées dans `opts`,
-    // que le JS a déjà obtenues en chargeant l'image via `<Image>`.
+    // Passthrough: the source is already an AVIF (direct drop or relay from
+    // history). We don't touch the bytes - no re-encode, hence no loss and
+    // no CPU cycles. We don't decode the AVIF on the Rust side to read the
+    // dimensions either (the `image` crate doesn't have the `avif` feature
+    // enabled - that would silently crash the passthrough). The dimensions
+    // reported to the frontend are those passed in `opts`, which the JS
+    // already obtained by loading the image via `<Image>`.
     if opts.passthrough {
         let byte_len = source_bytes.len();
         return Ok(CompressedImage {
