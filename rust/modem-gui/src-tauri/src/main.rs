@@ -6,15 +6,14 @@ mod collector_client;
 mod ptt;
 mod settings;
 mod tx_encode;
-mod tx_worker;
 
 use modem_worker::session_store;
-use modem_worker::{rx_worker, EventSink};
+use modem_worker::{rx_worker, tx_worker, EventSink};
 
 use audio::{list_input_devices, list_output_devices, DeviceInfo};
 use ptt::SharedPtt;
 use settings::Settings;
-use tx_worker::TxHandle;
+use modem_worker::tx_worker::TxHandle;
 use audio_capture::CaptureHandle;
 use modem_worker::rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, compress_zstd, CompressOpts};
@@ -376,6 +375,7 @@ fn tx_start(
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let history_max = cfg.tx_history_max;
     let repair_pct = args.repair_pct.unwrap_or(30);
+    let archive_sink = TauriEventSink(app.clone());
     tx_worker::archive_payload(
         &save_dir,
         &payload_path,
@@ -383,8 +383,9 @@ fn tx_start(
         &args.filename,
         repair_pct,
         history_max,
-        &app,
+        &archive_sink,
     );
+    let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn(
         payload_path,
         args.mode,
@@ -396,7 +397,7 @@ fn tx_start(
         attenuation_db,
         preemphasis_enabled,
         state.ptt.clone(),
-        app,
+        tx_sink,
     );
     *tx_guard = Some(handle);
     Ok(())
@@ -450,6 +451,7 @@ fn tx_more(
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
+    let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn_more(
         payload_path,
         args.mode,
@@ -462,7 +464,7 @@ fn tx_more(
         attenuation_db,
         preemphasis_enabled,
         state.ptt.clone(),
-        app,
+        tx_sink,
     );
     *tx_guard = Some(handle);
     Ok(())

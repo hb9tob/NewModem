@@ -8,7 +8,7 @@
 //!   3. Read the resulting WAV with hound, decode to f32.
 //!   4. Play it via cpal on the chosen TX device.
 //!
-//! Events (AppHandle::emit):
+//! Events (sink.emit):
 //!   - tx_plan      { duration_s, total_blocks, wire_bytes, wav_path,
 //!                    mode, callsign, filename }
 //!   - tx_progress  { pos_samples, total_samples, elapsed_s, duration_s,
@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
 
+use crate::event_sink::{EventSink, EventSinkExt};
 use crate::ptt::{SharedPtt, PTT_GUARD_MS};
 
 #[derive(Serialize, Clone)]
@@ -311,13 +311,13 @@ pub fn spawn_more(
     attenuation_db: f32,
     preemphasis_enabled: bool,
     ptt: SharedPtt,
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
         let Some(cli) = locate_cli_binary() else {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: "binaire nbfm-modem introuvable à côté du GUI".to_string(),
@@ -326,7 +326,7 @@ pub fn spawn_more(
             return;
         };
         if !avif_path.exists() {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("AVIF absent : {}", avif_path.display()),
@@ -335,7 +335,7 @@ pub fn spawn_more(
             return;
         }
         if let Err(e) = std::fs::create_dir_all(&save_dir) {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("mkdir save_dir: {e}"),
@@ -354,20 +354,20 @@ pub fn spawn_more(
         if let Err(e) = generate_wav_more_via_cli(
             &cli, &avif_path, &wav_path, &mode, &callsign, &filename, esi_start, count,
         ) {
-            let _ = app.emit("tx_error", TxErrorEvent { message: e });
+            sink.emit("tx_error", TxErrorEvent { message: e });
             return;
         }
         let samples = match read_wav_samples(&wav_path) {
             Ok(v) => v,
             Err(e) => {
-                let _ = app.emit("tx_error", TxErrorEvent { message: e });
+                sink.emit("tx_error", TxErrorEvent { message: e });
                 return;
             }
         };
         let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
         let wav_str = wav_path.to_string_lossy().into_owned();
         let total_blocks = count;
-        let _ = app.emit(
+        sink.emit(
             "tx_plan",
             TxPlanEvent {
                 duration_s,
@@ -389,7 +389,7 @@ pub fn spawn_more(
             preemphasis_enabled,
             stop_thread,
             ptt,
-            app,
+            sink,
         );
     });
     TxHandle {
@@ -409,13 +409,13 @@ pub fn spawn(
     attenuation_db: f32,
     preemphasis_enabled: bool,
     ptt: SharedPtt,
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
         let Some(cli) = locate_cli_binary() else {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: "binaire nbfm-modem introuvable à côté du GUI".to_string(),
@@ -424,7 +424,7 @@ pub fn spawn(
             return;
         };
         if !avif_path.exists() {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("AVIF absent : {}", avif_path.display()),
@@ -435,7 +435,7 @@ pub fn spawn(
         let payload_bytes = match std::fs::metadata(&avif_path) {
             Ok(m) => m.len() as usize,
             Err(e) => {
-                let _ = app.emit(
+                sink.emit(
                     "tx_error",
                     TxErrorEvent {
                         message: format!("metadata avif: {e}"),
@@ -453,13 +453,13 @@ pub fn spawn(
         ) {
             Ok(p) => p.n_initial,
             Err(e) => {
-                let _ = app.emit("tx_error", TxErrorEvent { message: e });
+                sink.emit("tx_error", TxErrorEvent { message: e });
                 return;
             }
         };
 
         if let Err(e) = std::fs::create_dir_all(&save_dir) {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("mkdir save_dir: {e}"),
@@ -476,14 +476,14 @@ pub fn spawn(
         if let Err(e) = generate_wav_via_cli(
             &cli, &avif_path, &wav_path, &mode, &callsign, &filename, repair_pct,
         ) {
-            let _ = app.emit("tx_error", TxErrorEvent { message: e });
+            sink.emit("tx_error", TxErrorEvent { message: e });
             return;
         }
 
         let samples = match read_wav_samples(&wav_path) {
             Ok(v) => v,
             Err(e) => {
-                let _ = app.emit("tx_error", TxErrorEvent { message: e });
+                sink.emit("tx_error", TxErrorEvent { message: e });
                 return;
             }
         };
@@ -491,7 +491,7 @@ pub fn spawn(
         let wire_bytes = payload_bytes as u32; // approx — CLI ne remonte pas la taille envelope
         let wav_str = wav_path.to_string_lossy().into_owned();
 
-        let _ = app.emit(
+        sink.emit(
             "tx_plan",
             TxPlanEvent {
                 duration_s,
@@ -514,7 +514,7 @@ pub fn spawn(
             preemphasis_enabled,
             stop_thread,
             ptt,
-            app,
+            sink,
         );
     });
     TxHandle {
@@ -598,7 +598,7 @@ fn run_playback(
     preemphasis_enabled: bool,
     stop: Arc<AtomicBool>,
     ptt: SharedPtt,
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
 ) {
     // Optional NBFM pre-emphasis (+6 dB/oct, tau = 750 us). Applied
     // BEFORE the attenuation so that the re-normalized peak still
@@ -635,7 +635,7 @@ fn run_playback(
     let device = match host.output_devices() {
         Ok(mut it) => it.find(|d| d.name().map(|n| n == device_name).unwrap_or(false)),
         Err(e) => {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("output_devices: {e}"),
@@ -645,7 +645,7 @@ fn run_playback(
         }
     };
     let Some(device) = device else {
-        let _ = app.emit(
+        sink.emit(
             "tx_error",
             TxErrorEvent {
                 message: format!("TX device '{device_name}' not found"),
@@ -657,7 +657,7 @@ fn run_playback(
     let configs = match device.supported_output_configs() {
         Ok(c) => c.collect::<Vec<_>>(),
         Err(e) => {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("supported_output_configs: {e}"),
@@ -671,7 +671,7 @@ fn run_playback(
         .filter(|c| c.min_sample_rate().0 <= AUDIO_RATE && AUDIO_RATE <= c.max_sample_rate().0)
         .collect();
     if supports_48k.is_empty() {
-        let _ = app.emit(
+        sink.emit(
             "tx_error",
             TxErrorEvent {
                 message: format!("TX device '{device_name}' does not support {AUDIO_RATE} Hz"),
@@ -725,7 +725,7 @@ fn run_playback(
             None,
         ),
         other => {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("unsupported output format: {other:?}"),
@@ -737,7 +737,7 @@ fn run_playback(
     let stream = match build {
         Ok(s) => s,
         Err(e) => {
-            let _ = app.emit(
+            sink.emit(
                 "tx_error",
                 TxErrorEvent {
                     message: format!("build_output_stream: {e}"),
@@ -757,7 +757,7 @@ fn run_playback(
         if ptt_engaged {
             ptt_release(&ptt);
         }
-        let _ = app.emit(
+        sink.emit(
             "tx_error",
             TxErrorEvent {
                 message: format!("stream.play: {e}"),
@@ -788,7 +788,7 @@ fn run_playback(
                 1.0
             };
             let blocks_sent = ((frac * total_blocks as f64).round() as u32).min(total_blocks);
-            let _ = app.emit(
+            sink.emit(
                 "tx_progress",
                 TxProgressEvent {
                     pos_samples: capped as u64,
@@ -812,7 +812,7 @@ fn run_playback(
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
         ptt_release(&ptt);
     }
-    let _ = app.emit(
+    sink.emit(
         "tx_complete",
         TxCompleteEvent {
             duration_s: start.elapsed().as_secs_f64(),
@@ -895,7 +895,7 @@ pub fn archive_payload(
     filename: &str,
     repair_pct: u32,
     max_items: u32,
-    app: &AppHandle,
+    sink: &dyn EventSink,
 ) {
     let history_dir = save_dir.join("tx_history");
     if let Err(e) = std::fs::create_dir_all(&history_dir) {
@@ -935,7 +935,7 @@ pub fn archive_payload(
         eprintln!("[tx_history] write meta {:?}: {e}", meta_path);
     }
     purge_history(&history_dir, max_items);
-    let _ = app.emit("tx_archived", ());
+    sink.emit("tx_archived", ());
 }
 
 /// Cap the `tx_history/` folder to `max_items` file+json pairs. Sort

@@ -2842,6 +2842,7 @@ dependencies = [
 name = "modem-worker"
 version = "0.1.0"
 dependencies = [
+ "cpal",
  "hound",
  "modem-core",
  "serde",
