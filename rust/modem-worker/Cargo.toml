@@ -12,3 +12,6 @@ hound = { workspace = true }
 zstd = "0.13"
 serialport = "4"
 cpal = "0.15"
+
+[dev-dependencies]
+tempfile = "3"

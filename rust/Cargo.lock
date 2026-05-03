@@ -2848,6 +2848,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "tempfile",
  "zstd",
 ]
 

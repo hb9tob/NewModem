@@ -5,10 +5,12 @@
 //! their headline capabilities. A future OFDM or QO-100 modem can implement
 //! the same trait and slot in without the GUI knowing the difference.
 //!
-//! Phase 1 surface: capabilities only. Encode/decode are added in phase 2
-//! when the worker is extracted and starts calling the trait.
+//! Phase 1 surface: capabilities only.
+//! Phase 2D adds the TX-side `encode_to_samples` so the GUI worker can
+//! emit audio without spawning the legacy CLI subprocess.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Public-facing description of a single modem profile/mode.
 ///
@@ -48,10 +50,40 @@ pub struct ProfileDescriptor {
     pub experimental: bool,
 }
 
-/// Trait every modem implementation exposes to the upper layers.
+/// Single TX request — everything an implementation needs to turn an
+/// already-framed wire payload into transmittable audio samples.
 ///
-/// Phase 1 keeps the surface to capability discovery. Encode/decode
-/// methods will be added in phase 2 alongside the worker extraction.
+/// `wire_payload` is what the framing layer (RaptorQ + envelope + headers
+/// in V3) produced; `n_packets` is how many RaptorQ-style packets the
+/// modem should encode (K source + repair, rounded up to a complete
+/// segment by the framing layer's helper). `esi_start` lets the worker
+/// emit a continuation burst (ESI offset) without rewinding the session.
+///
+/// `vox_seconds` = duration of the carrier-frequency VOX preamble emitted
+/// before the data frame. 0.0 = no VOX (the GUI worker, which uses PTT
+/// for switching, can choose this; the legacy CLI defaults to 0.5).
+#[derive(Clone, Debug)]
+pub struct EncodeRequest<'a> {
+    pub profile: &'a str,
+    pub wire_payload: &'a [u8],
+    pub session_id: u32,
+    pub mime_type: u8,
+    pub hash_short: u16,
+    pub esi_start: u32,
+    pub n_packets: u32,
+    pub vox_seconds: f64,
+}
+
+/// Errors a `Modem` implementation can surface to its caller.
+#[derive(Debug, Error)]
+pub enum ModemError {
+    #[error("unknown profile: {0}")]
+    UnknownProfile(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+}
+
+/// Trait every modem implementation exposes to the upper layers.
 pub trait Modem: Send + Sync {
     /// Family identifier shared by every profile this implementation
     /// owns (e.g. "NBFM-V3").
@@ -64,4 +96,13 @@ pub trait Modem: Send + Sync {
     /// Look up a profile by its stable name. Returns `None` if the name
     /// is unknown to this implementation.
     fn profile_by_name(&self, name: &str) -> Option<ProfileDescriptor>;
+
+    /// Encode an already-framed wire payload into mono 48 kHz f32 audio
+    /// samples ready for a sound-card / SDR sink. The output includes
+    /// every protocol-level appendage the modem needs (preamble,
+    /// markers, EOT frame, inter-frame silence, etc.) and is byte-for-
+    /// byte equivalent to what the legacy `nbfm-modem tx` CLI used to
+    /// write into a WAV — verified by the integration test in
+    /// `modem-worker/tests/cli_parity.rs`.
+    fn encode_to_samples(&self, req: &EncodeRequest<'_>) -> Result<Vec<f32>, ModemError>;
 }
