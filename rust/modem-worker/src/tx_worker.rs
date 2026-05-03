@@ -1,16 +1,21 @@
-//! TX worker: generates the WAV through the modem-cli binary, then plays
-//! it back on the selected sound card.
+//! TX worker: synthesises the audio in-process via `V3Modem.encode_to_samples`
+//! and plays it back on the selected sound card. Phase 2D-ii dropped the
+//! legacy subprocess CLI pipeline (was: `nbfm-modem tx --input <avif>
+//! --output <wav>`, then read back the WAV).
 //!
 //! Pipeline (dedicated thread, non-blocking for Tauri):
-//!   1. Estimate duration / block count (helper for JS-side UI validation).
-//!   2. Spawn `nbfm-modem tx --input <avif> --output <wav> --frame-version 3
-//!                           --profile <MODE> --callsign <QRZ> --filename <...>`
-//!   3. Read the resulting WAV with hound, decode to f32.
-//!   4. Play it via cpal on the chosen TX device.
+//!   1. Read the source bytes (AVIF or zstd, produced by tx_encode).
+//!   2. Wrap in PayloadEnvelope (filename + callsign + content).
+//!   3. Plan RaptorQ: K + repair → n_total packets.
+//!   4. Build EncodeRequest, call V3Modem.encode_to_samples(req).
+//!      VOX preamble stays at 0.5 s (radios without PTT need it —
+//!      memory feedback_keep_vox).
+//!   5. Play the resulting f32 samples via cpal on the chosen TX device.
 //!
 //! Events (sink.emit):
 //!   - tx_plan      { duration_s, total_blocks, wire_bytes, wav_path,
 //!                    mode, callsign, filename }
+//!     `wav_path` is now empty (no intermediate file).
 //!   - tx_progress  { pos_samples, total_samples, elapsed_s, duration_s,
 //!                    blocks_sent (linearly interpolated), total_blocks }
 //!   - tx_complete  { duration_s, wav_path, stopped_early }
@@ -18,15 +23,17 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate};
-use hound::{SampleFormat as WavFmt, WavReader};
 use modem_core::{
-    profile::{self, ModemConfig},
+    app_header::{self, mime},
+    payload_envelope::PayloadEnvelope,
+    profile::{self, ModemConfig, ProfileIndex},
     raptorq_codec::k_from_payload,
+    traits::{EncodeRequest, Modem},
     types::AUDIO_RATE,
+    v3_modem::V3Modem,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -34,6 +41,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::event_sink::{EventSink, EventSinkExt};
 use crate::ptt::{SharedPtt, PTT_GUARD_MS};
+
+/// VOX preamble duration passed to `V3Modem.encode_to_samples`. 0.5 s
+/// matches what `nbfm-modem tx` writes by default (`--vox 0.5`) and what
+/// the GUI played on air before the in-process migration. Required for
+/// stations whose transceiver triggers TX via VOX rather than a wired PTT.
+const TX_VOX_SECONDS: f64 = 0.5;
 
 #[derive(Serialize, Clone)]
 pub struct TxPlanEvent {
@@ -173,139 +186,63 @@ pub fn tx_plan(
 }
 
 
-/// Locate the modem-cli binary next to the GUI. Priority:
-///   1. `nbfm-modem-<TARGET_TRIPLE>[.exe]` - the name produced by the
-///      Tauri sidecar (`externalBin`), installed under `/usr/bin/` by
-///      the .deb.
-///   2. `nbfm-modem[.exe]` - the bare name (dev workspace
-///      `target/release/`).
-fn locate_cli_binary() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let triple = env!("TARGET_TRIPLE");
-    let sidecar = dir.join(format!("nbfm-modem-{triple}{ext}"));
-    if sidecar.exists() {
-        return Some(sidecar);
+/// FNV-1a 32-bit + xor-fold to 16 bits — same routine the legacy CLI
+/// uses to derive the app-header `hash_short` field. Bit-for-bit
+/// equivalent to `content_hash_short` in modem-cli/src/main.rs.
+fn fnv_short(data: &[u8]) -> u16 {
+    let mut h: u32 = 2166136261;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
     }
-    let bare = dir.join(format!("nbfm-modem{ext}"));
-    if bare.exists() {
-        return Some(bare);
-    }
-    None
+    (h ^ (h >> 16)) as u16
 }
 
-fn generate_wav_via_cli(
-    cli: &Path,
-    input_avif: &Path,
-    output_wav: &Path,
-    mode: &str,
-    callsign: &str,
-    filename: &str,
-    repair_pct: u32,
-) -> Result<(), String> {
-    let output = Command::new(cli)
-        .arg("tx")
-        .arg("--input")
-        .arg(input_avif)
-        .arg("--output")
-        .arg(output_wav)
-        .arg("--profile")
-        .arg(mode)
-        .arg("--callsign")
-        .arg(callsign)
-        .arg("--filename")
-        .arg(filename)
-        .arg("--repair-pct")
-        .arg(repair_pct.to_string())
-        .output()
-        .map_err(|e| format!("spawn modem-cli: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "modem-cli tx exit {:?} — {}",
-            output.status.code(),
-            stderr.trim()
-        ));
+/// Map a source-file extension to the protocol-level mime byte. Mirrors
+/// `infer_mime` in modem-cli/src/main.rs — the GUI sends either
+/// `tx-preview.avif` (image) or `tx-preview.zst` (file mode).
+fn infer_mime(path: &Path) -> u8 {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("avif") => mime::IMAGE_AVIF,
+        Some("jpg") | Some("jpeg") => mime::IMAGE_JPEG,
+        Some("png") => mime::IMAGE_PNG,
+        Some("txt") | Some("md") => mime::TEXT,
+        Some("zst") => mime::ZSTD,
+        _ => mime::BINARY,
     }
-    Ok(())
 }
 
-fn generate_wav_more_via_cli(
-    cli: &Path,
-    input_avif: &Path,
-    output_wav: &Path,
-    mode: &str,
-    callsign: &str,
-    filename: &str,
-    esi_start: u32,
-    count: u32,
-) -> Result<(), String> {
-    let output = Command::new(cli)
-        .arg("tx-more")
-        .arg("--input")
-        .arg(input_avif)
-        .arg("--output")
-        .arg(output_wav)
-        .arg("--profile")
-        .arg(mode)
-        .arg("--callsign")
-        .arg(callsign)
-        .arg("--filename")
-        .arg(filename)
-        .arg("--esi-start")
-        .arg(esi_start.to_string())
-        .arg("--count")
-        .arg(count.to_string())
-        .output()
-        .map_err(|e| format!("spawn modem-cli tx-more: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "modem-cli tx-more exit {:?} — {}",
-            output.status.code(),
-            stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
-fn read_wav_samples(path: &Path) -> Result<Vec<f32>, String> {
-    let mut reader = WavReader::open(path).map_err(|e| format!("wav open: {e}"))?;
-    let spec = reader.spec();
-    if spec.channels != 1 {
-        return Err(format!("wav not mono (channels={})", spec.channels));
-    }
-    if spec.sample_rate != AUDIO_RATE {
-        return Err(format!(
-            "wav sample_rate {} != {}",
-            spec.sample_rate, AUDIO_RATE
-        ));
-    }
-    match spec.sample_format {
-        WavFmt::Int => {
-            let max = (1u32 << (spec.bits_per_sample - 1)) as f32;
-            Ok(reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / max).unwrap_or(0.0))
-                .collect())
-        }
-        WavFmt::Float => Ok(reader
-            .samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect()),
-    }
+/// Resolve a profile name to its protocol-level `ProfileIndex` byte
+/// (used to seed `compute_session_id`). Returns `None` for an unknown
+/// name; callers report it as a tx_error.
+fn profile_index_for(name: &str) -> Option<u8> {
+    ProfileIndex::ALL
+        .iter()
+        .copied()
+        .find(|p| p.name() == name)
+        .map(|p| p.as_u8())
 }
 
 /// Burst variant : initial (`esi_start=None`) or "More" (`esi_start=Some,
 /// pct`). Both paths share `run_playback` for the cpal stream.
+/// Continuation burst (RaptorQ "More"): encodes `count` packets starting
+/// at `esi_start`, reusing the same envelope/session/mime as the initial
+/// burst. The RX recognises the session by `session_id` (deterministic
+/// from envelope + profile), so as long as the source file + profile +
+/// callsign + filename match the initial TX, the new ESIs land in the
+/// same disk session.
 pub fn spawn_more(
     avif_path: PathBuf,
     mode: String,
     callsign: String,
     filename: String,
     device_name: String,
-    save_dir: PathBuf,
+    _save_dir: PathBuf,
     esi_start: u32,
     count: u32,
     attenuation_db: f32,
@@ -316,56 +253,21 @@ pub fn spawn_more(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        let Some(cli) = locate_cli_binary() else {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: "binaire nbfm-modem introuvable à côté du GUI".to_string(),
-                },
-            );
-            return;
-        };
-        if !avif_path.exists() {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("AVIF absent : {}", avif_path.display()),
-                },
-            );
-            return;
-        }
-        if let Err(e) = std::fs::create_dir_all(&save_dir) {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("mkdir save_dir: {e}"),
-                },
-            );
-            return;
-        }
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let wav_path = save_dir.join(format!(
-            "tx-more-{ts}-{}-esi{esi_start}.wav",
-            mode.to_lowercase()
-        ));
-        if let Err(e) = generate_wav_more_via_cli(
-            &cli, &avif_path, &wav_path, &mode, &callsign, &filename, esi_start, count,
+        let samples = match encode_in_process(
+            &avif_path,
+            &mode,
+            &callsign,
+            &filename,
+            esi_start,
+            count,
         ) {
-            sink.emit("tx_error", TxErrorEvent { message: e });
-            return;
-        }
-        let samples = match read_wav_samples(&wav_path) {
-            Ok(v) => v,
+            Ok(s) => s,
             Err(e) => {
                 sink.emit("tx_error", TxErrorEvent { message: e });
                 return;
             }
         };
         let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
-        let wav_str = wav_path.to_string_lossy().into_owned();
         let total_blocks = count;
         sink.emit(
             "tx_plan",
@@ -373,7 +275,7 @@ pub fn spawn_more(
                 duration_s,
                 total_blocks,
                 wire_bytes: 0,
-                wav_path: wav_str.clone(),
+                wav_path: String::new(),
                 mode: mode.clone(),
                 callsign: callsign.clone(),
                 filename: filename.clone(),
@@ -384,7 +286,7 @@ pub fn spawn_more(
             samples,
             total_blocks,
             duration_s,
-            wav_str,
+            String::new(),
             attenuation_db,
             preemphasis_enabled,
             stop_thread,
@@ -398,13 +300,16 @@ pub fn spawn_more(
     }
 }
 
+/// Initial TX burst: encodes K source + repair packets so the RX has
+/// enough redundancy to fountain-decode without retransmission, on a
+/// loss-free channel.
 pub fn spawn(
     avif_path: PathBuf,
     mode: String,
     callsign: String,
     filename: String,
     device_name: String,
-    save_dir: PathBuf,
+    _save_dir: PathBuf,
     repair_pct: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
@@ -414,82 +319,50 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        let Some(cli) = locate_cli_binary() else {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: "binaire nbfm-modem introuvable à côté du GUI".to_string(),
-                },
-            );
-            return;
-        };
-        if !avif_path.exists() {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("AVIF absent : {}", avif_path.display()),
-                },
-            );
-            return;
-        }
-        let payload_bytes = match std::fs::metadata(&avif_path) {
-            Ok(m) => m.len() as usize,
+        let payload_bytes = match std::fs::metadata(&avif_path).map(|m| m.len() as usize) {
+            Ok(n) => n,
             Err(e) => {
                 sink.emit(
                     "tx_error",
                     TxErrorEvent {
-                        message: format!("metadata avif: {e}"),
+                        message: format!("source absent ou inaccessible: {e}"),
                     },
                 );
                 return;
             }
         };
-        let total_blocks = match tx_plan(
+        let plan = match tx_plan(
             payload_bytes,
             &mode,
             callsign.len(),
             filename.len(),
             repair_pct,
         ) {
-            Ok(p) => p.n_initial,
+            Ok(p) => p,
             Err(e) => {
                 sink.emit("tx_error", TxErrorEvent { message: e });
                 return;
             }
         };
+        let total_blocks = plan.n_initial;
 
-        if let Err(e) = std::fs::create_dir_all(&save_dir) {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("mkdir save_dir: {e}"),
-                },
-            );
-            return;
-        }
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let wav_path = save_dir.join(format!("tx-{ts}-{}.wav", mode.to_lowercase()));
-
-        if let Err(e) = generate_wav_via_cli(
-            &cli, &avif_path, &wav_path, &mode, &callsign, &filename, repair_pct,
+        let samples = match encode_in_process(
+            &avif_path,
+            &mode,
+            &callsign,
+            &filename,
+            0,
+            total_blocks,
         ) {
-            sink.emit("tx_error", TxErrorEvent { message: e });
-            return;
-        }
-
-        let samples = match read_wav_samples(&wav_path) {
-            Ok(v) => v,
+            Ok(s) => s,
             Err(e) => {
                 sink.emit("tx_error", TxErrorEvent { message: e });
                 return;
             }
         };
         let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
-        let wire_bytes = payload_bytes as u32; // approx — CLI ne remonte pas la taille envelope
-        let wav_str = wav_path.to_string_lossy().into_owned();
+        let envelope_overhead = 2 + filename.len() + 1 + callsign.len() + 1;
+        let wire_bytes = (payload_bytes + envelope_overhead) as u32;
 
         sink.emit(
             "tx_plan",
@@ -497,7 +370,7 @@ pub fn spawn(
                 duration_s,
                 total_blocks,
                 wire_bytes,
-                wav_path: wav_str.clone(),
+                wav_path: String::new(),
                 mode: mode.clone(),
                 callsign: callsign.clone(),
                 filename: filename.clone(),
@@ -509,7 +382,7 @@ pub fn spawn(
             samples,
             total_blocks,
             duration_s,
-            wav_str,
+            String::new(),
             attenuation_db,
             preemphasis_enabled,
             stop_thread,
@@ -521,6 +394,52 @@ pub fn spawn(
         stop,
         thread: Some(thread),
     }
+}
+
+/// Read the source file, build the wire payload (envelope-wrapped),
+/// derive session_id + hash + mime, and call `V3Modem.encode_to_samples`
+/// to produce the audio. Used for both the initial burst (esi_start=0)
+/// and the "More" continuation burst (esi_start>0).
+fn encode_in_process(
+    avif_path: &Path,
+    mode: &str,
+    callsign: &str,
+    filename: &str,
+    esi_start: u32,
+    n_packets: u32,
+) -> Result<Vec<f32>, String> {
+    let payload = std::fs::read(avif_path)
+        .map_err(|e| format!("read {}: {e}", avif_path.display()))?;
+    let mime_type = infer_mime(avif_path);
+    let envelope = PayloadEnvelope::new(filename, callsign, payload).ok_or_else(|| {
+        format!(
+            "envelope too large (filename={}, callsign={})",
+            filename.len(),
+            callsign.len()
+        )
+    })?;
+    let wire_payload = envelope.encode();
+
+    let cfg = parse_profile(mode)?;
+    let profile_index = profile_index_for(mode)
+        .ok_or_else(|| format!("unknown profile '{mode}'"))?;
+    let session_id =
+        app_header::compute_session_id(&wire_payload, cfg.mode_code(), profile_index);
+    let hash_short = fnv_short(&wire_payload);
+
+    let req = EncodeRequest {
+        profile: mode,
+        wire_payload: &wire_payload,
+        session_id,
+        mime_type,
+        hash_short,
+        esi_start,
+        n_packets,
+        vox_seconds: TX_VOX_SECONDS,
+    };
+    V3Modem
+        .encode_to_samples(&req)
+        .map_err(|e| format!("encode: {e}"))
 }
 
 /// Digital +6 dB/octave NBFM pre-emphasis: first-order shelf
