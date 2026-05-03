@@ -658,6 +658,9 @@ async function loadSettings() {
   }
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
+  // Fetch profile list from modem-core BEFORE any code that touches the
+  // tx-mode / rx-forced-profile selects (they're empty in index.html).
+  await loadModemProfiles();
   applyPttSettingsToUI();
   applyRxForceSettingsToUI();
   applyExperimentalModesToUI();
@@ -680,92 +683,93 @@ function applyRxForceSettingsToUI() {
   }
 }
 
-/// Cache of <option class="experimental-option"> removed from the DOM when
-/// the toggle is disabled. Indexed by <select> id, each entry keeps the
-/// outerHTML and the original insertion index. Lazily filled on the first
-/// call to applyExperimentalModesToUI() while the options are still in the
-/// DOM (which is the case as soon as index.html is loaded).
-const _experimentalOptionsCache = new Map();
+/// Profiles fetched from modem-core via the Tauri command list_modem_profiles.
+/// Drives the contents of the tx-mode and rx-forced-profile combos so the GUI
+/// never hard-codes the modem list — adding a profile in modem-core makes it
+/// appear here with no JS/HTML change required.
+let modemProfiles = [];
 
-function _cacheExperimentalOptions() {
-  if (_experimentalOptionsCache.size > 0) return;
-  document.querySelectorAll("select").forEach((sel) => {
-    if (!sel.id) return;
-    const exps = Array.from(sel.querySelectorAll("option.experimental-option"));
-    if (exps.length === 0) return;
-    const allOpts = Array.from(sel.options);
-    _experimentalOptionsCache.set(sel.id, exps.map((opt) => ({
-      outerHTML: opt.outerHTML,
-      index: allOpts.indexOf(opt),
-    })));
-  });
+async function loadModemProfiles() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    modemProfiles = await invoke("list_modem_profiles");
+  } catch (err) {
+    console.error("list_modem_profiles", err);
+    modemProfiles = [];
+  }
+  populateProfileSelects();
+}
+
+/// (Re)builds the tx-mode and rx-forced-profile <select>s from the cached
+/// profile descriptors. When the experimental toggle is OFF, profiles flagged
+/// experimental are physically excluded — hiding via `hidden` is unreliable
+/// across some Tauri WebViews. The previous select.value is preserved when
+/// the matching option is still present.
+function populateProfileSelects() {
+  const allowExp = !!currentSettings.experimental_modes_enabled;
+  populateOneProfileSelect("tx-mode", allowExp, /*rich=*/true);
+  populateOneProfileSelect("rx-forced-profile", allowExp, /*rich=*/false);
+}
+
+function populateOneProfileSelect(selId, allowExperimental, rich) {
+  const sel = document.getElementById(selId);
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
+  for (const p of modemProfiles) {
+    if (!allowExperimental && p.experimental) continue;
+    const opt = document.createElement("option");
+    opt.value = p.name;
+    if (rich) {
+      opt.textContent = p.experimental
+        ? `⚠ ${p.label} [EXPÉRIMENTAL]`
+        : p.label;
+    } else {
+      opt.textContent = p.experimental
+        ? `⚠ ${p.name} [EXPÉRIMENTAL]`
+        : p.name;
+    }
+    if (p.experimental) opt.classList.add("experimental-option");
+    sel.appendChild(opt);
+  }
+  if (prev && sel.querySelector(`option[value="${CSS.escape(prev)}"]`)) {
+    sel.value = prev;
+  } else if (sel.options.length > 0) {
+    sel.value = sel.options[0].value;
+  }
+}
+
+function experimentalProfileNames() {
+  return modemProfiles.filter((p) => p.experimental).map((p) => p.name);
 }
 
 /// Apply the state of the "Enable experimental modes" toggle:
 /// - update the settings checkbox
-/// - physically remove or re-insert .experimental-option options in all
-///   <select> elements (they must not appear in the dropdown at all when
-///   the mode is OFF - hiding via `hidden` is unreliable across all Tauri
-///   WebViews)
+/// - re-populate the profile combos with experimentals filtered in/out
 /// - hide/show the "Force a profile" bar of the RX tab
 /// If the user disables the toggle while rx_force_mode is ON, we disable
 /// forced mode to avoid staying locked on an experimental profile with no
-/// way to reach it. Same if the current value of a select becomes invalid
-/// after removal: we fall back to the first option.
+/// way to reach it. Same if the current persisted profile is experimental:
+/// we fall back to HIGH56 (standard since 2026-04-28).
 function applyExperimentalModesToUI() {
   const enabled = !!currentSettings.experimental_modes_enabled;
   const cb = document.getElementById("experimental-modes-enabled");
   if (cb) cb.checked = enabled;
 
-  _cacheExperimentalOptions();
-
-  for (const [selId, entries] of _experimentalOptionsCache.entries()) {
-    const sel = document.getElementById(selId);
-    if (!sel) continue;
-    const present = sel.querySelector("option.experimental-option") !== null;
-    if (enabled && !present) {
-      // Re-insert each option at its original index. Sort by ascending
-      // index so that successive insertBefore calls preserve order.
-      const sorted = [...entries].sort((a, b) => a.index - b.index);
-      for (const e of sorted) {
-        const tmp = document.createElement("div");
-        tmp.innerHTML = e.outerHTML;
-        const newOpt = tmp.firstElementChild;
-        if (!newOpt) continue;
-        if (e.index >= sel.options.length) {
-          sel.appendChild(newOpt);
-        } else {
-          sel.insertBefore(newOpt, sel.options[e.index]);
-        }
-      }
-    } else if (!enabled && present) {
-      Array.from(sel.querySelectorAll("option.experimental-option"))
-        .forEach((opt) => opt.remove());
-      // If the current select value pointed to a removed option, fall
-      // back to the first remaining option (otherwise the select keeps
-      // the phantom value visually).
-      if (sel.value && !sel.querySelector(`option[value="${CSS.escape(sel.value)}"]`)) {
-        const fallback = sel.options[0];
-        if (fallback) sel.value = fallback.value;
-      }
-    }
-  }
+  populateProfileSelects();
 
   const forceBar = document.getElementById("rx-force-bar");
   if (forceBar) forceBar.hidden = !enabled;
 
-  // If the user disables the toggle while positioned on an experimental
-  // profile (TX side and/or RX forced), we fall back to HIGH56 (standard
-  // since 2026-04-28) - otherwise txState would keep the phantom value
-  // after applyTxSettingsToUI() and TX would silently fail.
-  const EXPERIMENTAL_MODES = ["MEGA", "FAST", "HIGH++", "HIGH+56"];
+  const expNames = experimentalProfileNames();
   let needPersist = false;
   if (!enabled) {
-    if (EXPERIMENTAL_MODES.includes(currentSettings.tx_mode)) {
+    if (expNames.includes(currentSettings.tx_mode)) {
       currentSettings.tx_mode = "HIGH56";
       needPersist = true;
     }
-    if (EXPERIMENTAL_MODES.includes(currentSettings.rx_forced_profile)) {
+    if (expNames.includes(currentSettings.rx_forced_profile)) {
       currentSettings.rx_forced_profile = "HIGH56";
       needPersist = true;
     }
@@ -1905,14 +1909,11 @@ function fmtSeconds(s) {
 function refreshTxExperimentalWarn() {
   const warn = document.getElementById("tx-experimental-warn");
   if (!warn) return;
-  // HIGH56 was promoted standard on 2026-04-28 (commit bec4e63), so it no
-  // longer triggers the warning. List kept in sync with what carries the
-  // .experimental-option class in index.html.
-  const isExp = txState.mode === "MEGA"
-    || txState.mode === "FAST"
-    || txState.mode === "HIGH++"
-    || txState.mode === "HIGH+56";
-  warn.hidden = !isExp;
+  // Source of truth: ProfileDescriptor.experimental from modem-core (cf.
+  // V3Modem in modem-core/src/v3_modem.rs). Adding/removing an experimental
+  // profile in core automatically re-flags the warning here.
+  const desc = modemProfiles.find((p) => p.name === txState.mode);
+  warn.hidden = !(desc && desc.experimental);
 }
 
 function refreshTxButtons() {
