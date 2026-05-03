@@ -2854,6 +2854,7 @@ dependencies = [
  "cpal",
  "hound",
  "modem-core",
+ "modem-io",
  "serde",
  "serde_json",
  "serialport",

@@ -10,4 +10,9 @@
 //! public surface so existing callers compile unchanged.
 
 pub mod cpal_capture;
+pub mod cpal_sink;
 pub mod devices;
+pub mod traits;
+
+pub use cpal_sink::CpalSink;
+pub use traits::{IoError, PlaybackHandle, SampleSink};

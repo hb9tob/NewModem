@@ -21,8 +21,6 @@
 //!   - tx_complete  { duration_s, wav_path, stopped_early }
 //!   - tx_error     { message }
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate};
 use modem_core::{
     app_header::{self, mime},
     payload_envelope::PayloadEnvelope,
@@ -32,9 +30,10 @@ use modem_core::{
     types::AUDIO_RATE,
     v3_modem::V3Modem,
 };
+use modem_io::{CpalSink, SampleSink};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -531,148 +530,39 @@ fn run_playback(
     }
     let total_samples = samples.len();
 
-    let host = cpal::default_host();
-    let device = match host.output_devices() {
-        Ok(mut it) => it.find(|d| d.name().map(|n| n == device_name).unwrap_or(false)),
-        Err(e) => {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("output_devices: {e}"),
-                },
-            );
-            return;
-        }
-    };
-    let Some(device) = device else {
-        sink.emit(
-            "tx_error",
-            TxErrorEvent {
-                message: format!("TX device '{device_name}' not found"),
-            },
-        );
-        return;
-    };
-
-    let configs = match device.supported_output_configs() {
-        Ok(c) => c.collect::<Vec<_>>(),
-        Err(e) => {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("supported_output_configs: {e}"),
-                },
-            );
-            return;
-        }
-    };
-    let supports_48k: Vec<_> = configs
-        .into_iter()
-        .filter(|c| c.min_sample_rate().0 <= AUDIO_RATE && AUDIO_RATE <= c.max_sample_rate().0)
-        .collect();
-    if supports_48k.is_empty() {
-        sink.emit(
-            "tx_error",
-            TxErrorEvent {
-                message: format!("TX device '{device_name}' does not support {AUDIO_RATE} Hz"),
-            },
-        );
-        return;
-    }
-    fn rank(f: SampleFormat) -> u8 {
-        match f {
-            SampleFormat::F32 => 0,
-            SampleFormat::I16 => 1,
-            SampleFormat::U16 => 2,
-            _ => 4,
-        }
-    }
-    let range = supports_48k
-        .into_iter()
-        .min_by_key(|c| rank(c.sample_format()))
-        .unwrap();
-    let format = range.sample_format();
-    let cfg = range.with_sample_rate(SampleRate(AUDIO_RATE));
-    let channels = cfg.channels() as usize;
-    let stream_cfg: cpal::StreamConfig = cfg.into();
-
-    let pos = Arc::new(AtomicUsize::new(0));
-    let pos_cb = pos.clone();
-    let err_cb = |e| eprintln!("[tx] stream err: {e}");
-
-    let samples_arc: Arc<[f32]> = samples.into();
-    let s_f32 = samples_arc.clone();
-    let s_i16 = samples_arc.clone();
-    let s_u16 = samples_arc.clone();
-
-    let build = match format {
-        SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
-            &stream_cfg,
-            move |data, _| write_out_f32(data, channels, &s_f32, &pos_cb),
-            err_cb,
-            None,
-        ),
-        SampleFormat::I16 => device.build_output_stream::<i16, _, _>(
-            &stream_cfg,
-            move |data, _| write_out_i16(data, channels, &s_i16, &pos_cb),
-            err_cb,
-            None,
-        ),
-        SampleFormat::U16 => device.build_output_stream::<u16, _, _>(
-            &stream_cfg,
-            move |data, _| write_out_u16(data, channels, &s_u16, &pos_cb),
-            err_cb,
-            None,
-        ),
-        other => {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("unsupported output format: {other:?}"),
-                },
-            );
-            return;
-        }
-    };
-    let stream = match build {
-        Ok(s) => s,
-        Err(e) => {
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: format!("build_output_stream: {e}"),
-                },
-            );
-            return;
-        }
-    };
     // PTT: switch to TX BEFORE opening the audio stream, then wait
-    // 200 ms to give the transceiver time to commute.
+    // 200 ms for the transceiver to commute. The single-step
+    // SampleSink::play_buffer combines lookup+build+play, so a missing
+    // device now flashes the PTT briefly before tx_error — accepted
+    // trade-off for a simpler trait surface.
     let ptt_engaged = ptt_engage(&ptt);
     if ptt_engaged {
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
     }
 
-    if let Err(e) = stream.play() {
-        if ptt_engaged {
-            ptt_release(&ptt);
+    let handle = match CpalSink.play_buffer(device_name, AUDIO_RATE, samples) {
+        Ok(h) => h,
+        Err(e) => {
+            if ptt_engaged {
+                ptt_release(&ptt);
+            }
+            sink.emit(
+                "tx_error",
+                TxErrorEvent {
+                    message: e.to_string(),
+                },
+            );
+            return;
         }
-        sink.emit(
-            "tx_error",
-            TxErrorEvent {
-                message: format!("stream.play: {e}"),
-            },
-        );
-        return;
-    }
+    };
 
     let start = Instant::now();
     let mut last_tick = Instant::now() - Duration::from_millis(300);
     let mut stopped_early = false;
     loop {
         thread::sleep(Duration::from_millis(100));
-        let p = pos.load(Ordering::Relaxed);
-        let done = p >= total_samples;
+        let p = handle.pos();
+        let done = handle.is_done();
         if stop.load(Ordering::Relaxed) {
             stopped_early = true;
         }
@@ -681,9 +571,8 @@ fn run_playback(
             now.duration_since(last_tick) >= Duration::from_millis(200) || done || stopped_early;
         if should_emit {
             let elapsed_s = start.elapsed().as_secs_f64();
-            let capped = p.min(total_samples);
             let frac = if total_samples > 0 {
-                capped as f64 / total_samples as f64
+                p as f64 / total_samples as f64
             } else {
                 1.0
             };
@@ -691,7 +580,7 @@ fn run_playback(
             sink.emit(
                 "tx_progress",
                 TxProgressEvent {
-                    pos_samples: capped as u64,
+                    pos_samples: p as u64,
                     total_samples: total_samples as u64,
                     elapsed_s,
                     duration_s,
@@ -706,7 +595,7 @@ fn run_playback(
         }
     }
 
-    drop(stream);
+    drop(handle);
     // 200 ms of silence before releasing the PTT, then switch back to RX.
     if ptt_engaged {
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
@@ -720,63 +609,6 @@ fn run_playback(
             stopped_early,
         },
     );
-}
-
-fn write_out_f32(out: &mut [f32], channels: usize, samples: &[f32], pos: &AtomicUsize) {
-    let frames = out.len() / channels;
-    let p = pos.load(Ordering::Relaxed);
-    let avail = samples.len().saturating_sub(p);
-    let n = frames.min(avail);
-    for i in 0..n {
-        let v = samples[p + i];
-        for c in 0..channels {
-            out[i * channels + c] = v;
-        }
-    }
-    for i in n..frames {
-        for c in 0..channels {
-            out[i * channels + c] = 0.0;
-        }
-    }
-    pos.fetch_add(n, Ordering::Relaxed);
-}
-
-fn write_out_i16(out: &mut [i16], channels: usize, samples: &[f32], pos: &AtomicUsize) {
-    let frames = out.len() / channels;
-    let p = pos.load(Ordering::Relaxed);
-    let avail = samples.len().saturating_sub(p);
-    let n = frames.min(avail);
-    for i in 0..n {
-        let v = (samples[p + i] * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        for c in 0..channels {
-            out[i * channels + c] = v;
-        }
-    }
-    for i in n..frames {
-        for c in 0..channels {
-            out[i * channels + c] = 0;
-        }
-    }
-    pos.fetch_add(n, Ordering::Relaxed);
-}
-
-fn write_out_u16(out: &mut [u16], channels: usize, samples: &[f32], pos: &AtomicUsize) {
-    let frames = out.len() / channels;
-    let p = pos.load(Ordering::Relaxed);
-    let avail = samples.len().saturating_sub(p);
-    let n = frames.min(avail);
-    for i in 0..n {
-        let v = ((samples[p + i] * 32767.0).clamp(-32768.0, 32767.0) as i32 + 32768) as u16;
-        for c in 0..channels {
-            out[i * channels + c] = v;
-        }
-    }
-    for i in n..frames {
-        for c in 0..channels {
-            out[i * channels + c] = 32768;
-        }
-    }
-    pos.fetch_add(n, Ordering::Relaxed);
 }
 
 /// Archive the TX payload file under `<save_dir>/tx_history/` at the
