@@ -1,0 +1,10 @@
+[package]
+name = "modem-worker"
+version = "0.1.0"
+edition = "2021"
+description = "GUI-agnostic TX/RX orchestration for the NBFM modem (extracted from modem-gui in phase 2 of layered-arch)"
+
+[dependencies]
+modem-core = { path = "../modem-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
