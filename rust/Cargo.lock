@@ -2846,6 +2846,7 @@ dependencies = [
  "modem-core",
  "serde",
  "serde_json",
+ "serialport",
  "zstd",
 ]
 
