@@ -4,19 +4,19 @@ mod audio;
 mod audio_capture;
 mod collector_client;
 mod ptt;
-mod rx_worker;
 mod settings;
 mod tx_encode;
 mod tx_worker;
 
 use modem_worker::session_store;
+use modem_worker::{rx_worker, EventSink};
 
 use audio::{list_input_devices, list_output_devices, DeviceInfo};
 use ptt::SharedPtt;
 use settings::Settings;
 use tx_worker::TxHandle;
 use audio_capture::CaptureHandle;
-use rx_worker::{SharedWavSink, WavSink, WorkerHandle};
+use modem_worker::rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, compress_zstd, CompressOpts};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -175,9 +175,10 @@ fn start_capture(
         ));
     }
     let (capture, samples) = audio_capture::start(&device_name)?;
+    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
         samples,
-        app.clone(),
+        sink,
         state.save_dir.clone(),
         state.wav_sink.clone(),
         profile_idx,
@@ -804,6 +805,19 @@ fn set_save_dir(path: String, state: State<'_, AppState>) -> Result<(), String> 
     std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
     *dir = p;
     Ok(())
+}
+
+/// Adapter that bridges `modem_worker::EventSink` onto a Tauri `AppHandle`,
+/// so workers extracted into `modem-worker` can keep their existing event
+/// names + payload shapes without depending on Tauri.
+struct TauriEventSink(AppHandle);
+
+impl EventSink for TauriEventSink {
+    fn emit_json(&self, name: &str, payload: serde_json::Value) {
+        // Same fire-and-forget semantics the workers used to have when
+        // they called `app.emit(...)` directly.
+        let _ = self.0.emit(name, payload);
+    }
 }
 
 fn main() {

@@ -2842,9 +2842,11 @@ dependencies = [
 name = "modem-worker"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "modem-core",
  "serde",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]

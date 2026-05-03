@@ -38,7 +38,8 @@ pub trait EventSink: Send + Sync {
 }
 
 /// Convenience extension that mirrors the shape of `tauri::Emitter::emit`,
-/// so call sites read the same way they did before extraction.
+/// so call sites read the same way they did before extraction — pass the
+/// payload by value, the sink handles serialization.
 ///
 /// Implemented for every `EventSink` via a blanket impl, including
 /// `Box<dyn EventSink>` and `Arc<dyn EventSink>`.
@@ -46,7 +47,7 @@ pub trait EventSinkExt: EventSink {
     /// Serialize `payload` and forward to `emit_json`. A serialization
     /// failure (which should not happen for the worker's payload types)
     /// degrades to a `null` payload rather than dropping the event.
-    fn emit<S: Serialize + ?Sized>(&self, name: &str, payload: &S) {
+    fn emit<S: Serialize>(&self, name: &str, payload: S) {
         let value = serde_json::to_value(payload).unwrap_or(Value::Null);
         self.emit_json(name, value);
     }
@@ -112,13 +113,13 @@ mod tests {
     fn noop_drops_events() {
         let sink = NoopSink;
         sink.emit_json("anything", Value::Null);
-        sink.emit("typed", &DummyPayload { n: 1, msg: "hi" });
+        sink.emit("typed", DummyPayload { n: 1, msg: "hi" });
     }
 
     #[test]
     fn recording_captures_events_in_order() {
         let sink = RecordingSink::new();
-        sink.emit("first", &DummyPayload { n: 1, msg: "a" });
+        sink.emit("first", DummyPayload { n: 1, msg: "a" });
         sink.emit_json("second", serde_json::json!({"x": 42}));
         let events = sink.events();
         assert_eq!(events.len(), 2);
@@ -134,7 +135,7 @@ mod tests {
         let sink: Box<dyn EventSink> = Box::new(RecordingSink::new());
         // Both methods callable through the trait object.
         sink.emit_json("a", Value::Null);
-        sink.emit("b", &DummyPayload { n: 2, msg: "x" });
+        sink.emit("b", DummyPayload { n: 2, msg: "x" });
     }
 
     #[test]
@@ -149,7 +150,7 @@ mod tests {
             }
         }
         let sink = RecordingSink::new();
-        sink.emit("fail", &AlwaysFails);
+        sink.emit("fail", AlwaysFails);
         let events = sink.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "fail");

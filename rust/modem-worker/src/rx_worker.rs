@@ -39,9 +39,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
 
-use modem_worker::session_store::{self, SessionStore};
+use crate::event_sink::{EventSink, EventSinkExt};
+use crate::session_store::{self, SessionStore};
 
 type WavFileWriter = WavWriter<BufWriter<std::fs::File>>;
 
@@ -232,7 +232,7 @@ impl WorkerHandle {
 /// are absent from `PROBE_TEMPLATES` and therefore not auto-detected.
 pub fn spawn(
     samples: Receiver<Vec<f32>>,
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
@@ -241,7 +241,7 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        run_worker(samples, app, save_dir, wav_sink, profile, forced, stop_thread);
+        run_worker(samples, sink, save_dir, wav_sink, profile, forced, stop_thread);
     });
     WorkerHandle {
         stop,
@@ -381,7 +381,7 @@ impl WorkerState {
 
 fn run_worker(
     samples: Receiver<Vec<f32>>,
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
@@ -411,7 +411,7 @@ fn run_worker(
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle : still pulse the maintenance checks (silence trigger)
-                maintenance_tick(&app, &save_dir, &mut state);
+                maintenance_tick(&*sink, &save_dir, &mut state);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -438,7 +438,7 @@ fn run_worker(
         let (peak, rms, crest_db) = compute_audio_stats(&batch);
         let overdrive =
             rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
-        let _ = app.emit(
+        sink.emit(
             "audio_level",
             AudioLevelPayload {
                 rms,
@@ -467,7 +467,7 @@ fn run_worker(
             state.session_buffer.drain(..len - keep);
         }
 
-        maintenance_tick(&app, &save_dir, &mut state);
+        maintenance_tick(&*sink, &save_dir, &mut state);
     }
 
     worker_log("[worker] stop");
@@ -497,7 +497,7 @@ fn compute_audio_stats(batch: &[f32]) -> (f32, f32, f32) {
 ///  - routes decoded packets to the disk-persistent session store
 ///  - max-duration guard on the in-memory audio buffer
 fn maintenance_tick(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     state: &mut WorkerState,
 ) {
@@ -505,7 +505,7 @@ fn maintenance_tick(
 
     if now.duration_since(state.last_scan_at) >= Duration::from_millis(SCAN_INTERVAL_MS) {
         state.last_scan_at = now;
-        scan_and_route(app, save_dir, state);
+        scan_and_route(sink, save_dir, state);
     }
 
     // Preamble-silence fallback : if we're Capturing but haven't seen a
@@ -539,7 +539,7 @@ fn maintenance_tick(
 // ---------------------------------------------------------------------------
 
 fn scan_and_route(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     state: &mut WorkerState,
 ) {
@@ -672,7 +672,7 @@ fn scan_and_route(
                     // positions). Drop it so the re-decode below scans
                     // everything fresh.
                     state.last_closed_preamble_abs = None;
-                    let _ = app.emit(
+                    sink.emit(
                         "profile_auto_detected",
                         serde_json::json!({ "profile": profile_name(state.profile) }),
                     );
@@ -766,7 +766,7 @@ fn scan_and_route(
         state.session_started_at = Instant::now();
         state.last_audio_above_silence_at = Instant::now();
         state.last_preamble_seen_at = Instant::now();
-        let _ = app.emit(
+        sink.emit(
             "preamble",
             PreamblePayload {
                 profile: profile_name(state.profile),
@@ -786,7 +786,7 @@ fn scan_and_route(
     // Legacy protocol header event (once per session).
     if state.header.is_none() {
         if let Some(h) = result.header.clone() {
-            let _ = app.emit(
+            sink.emit(
                 "header",
                 HeaderPayload {
                     profile: profile_name(state.profile),
@@ -822,7 +822,7 @@ fn scan_and_route(
             .store
             .root()
             .join(format!("{:08x}.session", ah.session_id));
-        let _ = app.emit(
+        sink.emit(
             "session_armed",
             SessionArmedPayload {
                 session_id: ah.session_id,
@@ -835,7 +835,7 @@ fn scan_and_route(
             },
         );
         // Also fire the legacy app_header event so existing UI keeps working.
-        let _ = app.emit(
+        sink.emit(
             "app_header",
             AppHeaderPayload {
                 session_id: ah.session_id,
@@ -845,7 +845,7 @@ fn scan_and_route(
             },
         );
         if let Some(df) = state.store.peek_decoded(ah, state.profile) {
-            emit_decoded_file(app, save_dir, &df, result.sigma2);
+            emit_decoded_file(sink, save_dir, &df, result.sigma2);
         }
     }
 
@@ -859,7 +859,7 @@ fn scan_and_route(
     let last = state.last_progress.get(&ah.session_id).copied().unwrap_or(u32::MAX);
     if outcome.unique_esis != last || outcome.decoded.is_some() {
         state.last_progress.insert(ah.session_id, outcome.unique_esis);
-        let _ = app.emit(
+        sink.emit(
             "session_progress",
             SessionProgressPayload {
                 session_id: ah.session_id,
@@ -874,7 +874,7 @@ fn scan_and_route(
         // last few seconds of ESIs and appear to "scroll").
         let sigma2 = result.sigma2;
         let expected = outcome.needed as usize;
-        let _ = app.emit(
+        sink.emit(
             "v2_progress",
             V2ProgressPayload {
                 blocks_converged: outcome.unique_esis as usize,
@@ -891,7 +891,7 @@ fn scan_and_route(
     // A freshly-decoded file : emit session_decoded, copy to save_dir root
     // under the envelope filename, and emit the legacy file_complete event.
     if let Some(df) = outcome.decoded {
-        emit_decoded_file(app, save_dir, &df, result.sigma2);
+        emit_decoded_file(sink, save_dir, &df, result.sigma2);
     }
 
     // Free the in-memory audio buffer only once the TX explicitly signalled
@@ -916,13 +916,13 @@ fn scan_and_route(
 /// re-announce path (peek_decoded on a session that was already decoded in a
 /// previous capture episode).
 fn emit_decoded_file(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     df: &session_store::DecodedFile,
     sigma2: f64,
 ) {
     if let Some(fname) = df.meta.filename.clone() {
-        let _ = app.emit(
+        sink.emit(
             "envelope",
             EnvelopePayload {
                 filename: fname,
@@ -930,7 +930,7 @@ fn emit_decoded_file(
             },
         );
     }
-    let _ = app.emit(
+    sink.emit(
         "session_decoded",
         SessionDecodedPayload {
             session_id: df.session_id,
@@ -960,7 +960,7 @@ fn emit_decoded_file(
         match zstd::stream::decode_all(content.as_slice()) {
             Ok(decoded) => (decoded, modem_core::app_header::mime::BINARY),
             Err(e) => {
-                let _ = app.emit(
+                sink.emit(
                     "error",
                     ErrorPayload {
                         message: format!("zstd decode: {e}"),
@@ -974,7 +974,7 @@ fn emit_decoded_file(
     };
     match save_file(&dir, &fname, &final_content) {
         Ok(path) => {
-            let _ = app.emit(
+            sink.emit(
                 "file_complete",
                 FileCompletePayload {
                     filename: fname,
@@ -987,7 +987,7 @@ fn emit_decoded_file(
             );
         }
         Err(e) => {
-            let _ = app.emit(
+            sink.emit(
                 "error",
                 ErrorPayload {
                     message: format!("save failed: {e}"),
