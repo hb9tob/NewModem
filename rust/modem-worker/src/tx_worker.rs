@@ -96,22 +96,7 @@ impl TxHandle {
 }
 
 pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
-    match name.to_uppercase().as_str() {
-        "MEGA" => Ok(profile::profile_mega()),
-        "HIGH" => Ok(profile::profile_high()),
-        "NORMAL" => Ok(profile::profile_normal()),
-        "ROBUST" => Ok(profile::profile_robust()),
-        "ULTRA" => Ok(profile::profile_ultra()),
-        // HIGH+ promoted to standard since 2026-04-28 (validated OTA at HB9MM).
-        "HIGH+" | "HIGHPLUS" => Ok(profile::profile_high_plus()),
-        // EXPERIMENTAL - only decodable by a peer locked on the same
-        // profile in forced mode.
-        "FAST" => Ok(profile::profile_fast()),
-        "HIGH++" | "HIGHPLUSPLUS" => Ok(profile::profile_high_plus_plus()),
-        "HIGH56" | "HIGH-56" => Ok(profile::profile_high_5_6()),
-        "HIGH+56" | "HIGHPLUS56" => Ok(profile::profile_high_plus_5_6()),
-        _ => Err(format!("unknown profile '{name}'")),
-    }
+    profile::config_by_name(name).ok_or_else(|| format!("unknown profile '{name}'"))
 }
 
 /// Per-profile transmission plan, derived purely from arithmetic (no symbol
@@ -221,11 +206,7 @@ fn infer_mime(path: &Path) -> u8 {
 /// (used to seed `compute_session_id`). Returns `None` for an unknown
 /// name; callers report it as a tx_error.
 fn profile_index_for(name: &str) -> Option<u8> {
-    ProfileIndex::ALL
-        .iter()
-        .copied()
-        .find(|p| p.name() == name)
-        .map(|p| p.as_u8())
+    ProfileIndex::from_name(name).map(ProfileIndex::as_u8)
 }
 
 /// Burst variant : initial (`esi_start=None`) or "More" (`esi_start=Some,

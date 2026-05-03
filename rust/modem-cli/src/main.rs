@@ -659,28 +659,14 @@ fn infer_mime(path: &PathBuf) -> u8 {
 }
 
 fn parse_profile(name: &str) -> ModemConfig {
-    match name.to_uppercase().as_str() {
-        "MEGA" => profile::profile_mega(),
-        "HIGH" => profile::profile_high(),
-        "NORMAL" => profile::profile_normal(),
-        "ROBUST" => profile::profile_robust(),
-        "ULTRA" => profile::profile_ultra(),
-        // EXPERIMENTAL - outside RX auto-detection. The peer must use the
-        // same forced profile to decode.
-        "HIGH+" | "HIGHPLUS" => profile::profile_high_plus(),
-        "FAST" => profile::profile_fast(),
-        "HIGH++" | "HIGHPLUSPLUS" => profile::profile_high_plus_plus(),
-        "HIGH56" | "HIGH-56" => profile::profile_high_5_6(),
-        "HIGH+56" | "HIGHPLUS56" => profile::profile_high_plus_5_6(),
-        _ => {
-            eprintln!(
-                "Unknown profile '{}'. Stable: ULTRA, ROBUST, NORMAL, HIGH, HIGH+. \
-                 Experimental (forced-mode only): MEGA, FAST, HIGH++, HIGH56, HIGH+56",
-                name
-            );
-            std::process::exit(1);
-        }
-    }
+    profile::config_by_name(name).unwrap_or_else(|| {
+        eprintln!(
+            "Unknown profile '{}'. Stable: ULTRA, ROBUST, NORMAL, HIGH, HIGH+, HIGH56. \
+             Experimental (forced-mode only): MEGA, FAST, HIGH++, HIGH+56",
+            name
+        );
+        std::process::exit(1);
+    })
 }
 
 fn parse_constellation(s: &str) -> ConstellationType {

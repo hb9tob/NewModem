@@ -269,6 +269,27 @@ impl ProfileIndex {
         }
     }
 
+    /// Resolve a profile by name. Accepts the canonical name returned by
+    /// `name()` plus a few legacy aliases the CLI used to take from shells
+    /// where `+` is awkward to type (`HIGHPLUS`, `HIGH-56`, ...). Single
+    /// source of truth for every layer that needs to go from a user- or
+    /// wire-supplied string back to a `ProfileIndex`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_uppercase().as_str() {
+            "ULTRA" => Some(Self::Ultra),
+            "ROBUST" => Some(Self::Robust),
+            "NORMAL" => Some(Self::Normal),
+            "HIGH" => Some(Self::High),
+            "MEGA" => Some(Self::Mega),
+            "HIGH+" | "HIGHPLUS" => Some(Self::HighPlus),
+            "FAST" => Some(Self::Fast),
+            "HIGH++" | "HIGHPLUSPLUS" => Some(Self::HighPlusPlus),
+            "HIGH56" | "HIGH-56" => Some(Self::HighFiveSix),
+            "HIGH+56" | "HIGHPLUS56" => Some(Self::HighPlusFiveSix),
+            _ => None,
+        }
+    }
+
     /// All profile indices in canonical order. EXPERIMENTAL profiles
     /// (Mega, Fast, HighPlusPlus, HighFiveSix, HighPlusFiveSix) are
     /// included so they can be selected in forced mode, but they do
@@ -347,6 +368,14 @@ impl ProfileIndex {
             PreambleFamily::C => Self::Ultra,
         }
     }
+}
+
+/// Resolve a profile name (canonical or legacy alias, see
+/// `ProfileIndex::from_name`) to its full `ModemConfig`. The single helper
+/// the worker / CLI / Modem trait all funnel through, so adding a new mode
+/// only touches `ProfileIndex` itself.
+pub fn config_by_name(name: &str) -> Option<ModemConfig> {
+    ProfileIndex::from_name(name).map(ProfileIndex::to_config)
 }
 
 impl ModemConfig {
