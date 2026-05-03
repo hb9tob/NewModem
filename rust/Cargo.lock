@@ -2808,6 +2808,7 @@ dependencies = [
  "raptorq",
  "realfft",
  "rustfft",
+ "serde",
  "thiserror 2.0.18",
 ]
 

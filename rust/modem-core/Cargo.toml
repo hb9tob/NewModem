@@ -10,3 +10,4 @@ thiserror = { workspace = true }
 raptorq = "2.0"
 realfft = "3"
 rustfft = "6"
+serde = { version = "1", features = ["derive"] }

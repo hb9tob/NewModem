@@ -32,3 +32,6 @@ pub mod pll;
 pub mod soft_demod;
 pub mod rx_v2;
 pub mod gate;
+
+pub mod traits;
+pub mod v3_modem;

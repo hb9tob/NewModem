@@ -70,6 +70,12 @@ fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
 }
 
 #[tauri::command]
+fn list_modem_profiles() -> Vec<modem_core::traits::ProfileDescriptor> {
+    use modem_core::traits::Modem;
+    modem_core::v3_modem::V3Modem.list_profiles()
+}
+
+#[tauri::command]
 fn get_settings() -> Settings {
     settings::load()
 }
@@ -830,6 +836,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
+            list_modem_profiles,
             list_serial_ports,
             ptt_status,
             get_settings,
