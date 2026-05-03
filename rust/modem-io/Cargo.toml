@@ -1,0 +1,9 @@
+[package]
+name = "modem-io"
+version = "0.1.0"
+edition = "2021"
+description = "Audio I/O backends for the NBFM modem (cpal devices + capture, future SDR sinks). Extracted from modem-gui in phase 3 of layered-arch."
+
+[dependencies]
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }

@@ -1,7 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod audio;
-mod audio_capture;
 mod collector_client;
 mod ptt;
 mod settings;
@@ -10,11 +8,11 @@ mod tx_encode;
 use modem_worker::session_store;
 use modem_worker::{rx_worker, tx_worker, EventSink};
 
-use audio::{list_input_devices, list_output_devices, DeviceInfo};
+use modem_io::cpal_capture::{self, CaptureHandle};
+use modem_io::devices::{list_input_devices, list_output_devices, DeviceInfo};
 use ptt::SharedPtt;
 use settings::Settings;
 use modem_worker::tx_worker::TxHandle;
-use audio_capture::CaptureHandle;
 use modem_worker::rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, compress_zstd, CompressOpts};
 use std::path::PathBuf;
@@ -173,7 +171,7 @@ fn start_capture(
             profile_idx.name()
         ));
     }
-    let (capture, samples) = audio_capture::start(&device_name)?;
+    let (capture, samples) = cpal_capture::start(&device_name)?;
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
         samples,

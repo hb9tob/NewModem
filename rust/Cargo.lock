@@ -2823,6 +2823,7 @@ dependencies = [
  "hound",
  "image",
  "modem-core",
+ "modem-io",
  "modem-worker",
  "ravif",
  "reqwest 0.12.28",
@@ -2836,6 +2837,14 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "zstd",
+]
+
+[[package]]
+name = "modem-io"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "serde",
 ]
 
 [[package]]
