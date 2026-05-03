@@ -18,7 +18,13 @@ impl Modem for V3Modem {
     }
 
     fn list_profiles(&self) -> Vec<ProfileDescriptor> {
-        ProfileIndex::ALL.iter().copied().map(descriptor_for).collect()
+        // Standards first (in canonical order), then experimentals (also in
+        // canonical order). Stable sort preserves the relative order inside
+        // each group. The GUI relies on this layout to display experimentals
+        // grouped at the end of the combo.
+        let mut all: Vec<_> = ProfileIndex::ALL.iter().copied().collect();
+        all.sort_by_key(|p| p.is_experimental());
+        all.into_iter().map(descriptor_for).collect()
     }
 
     fn profile_by_name(&self, name: &str) -> Option<ProfileDescriptor> {

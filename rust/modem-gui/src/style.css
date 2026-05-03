@@ -1594,8 +1594,12 @@ main {
   background: #3a2a1a;
 }
 
-/* Experimental profiles: well-visible red badge */
-.experimental-option {
+/* Experimental profiles: well-visible red badge.
+   The `select option.experimental-option` form is needed to outrank the
+   `.tx-controls select option` and `.rx-toolbar select option` rules,
+   which otherwise win on specificity (1 class + 2 elements). */
+.experimental-option,
+select option.experimental-option {
   color: #ff6b4a;
   font-weight: bold;
   background: #2a1a14;
