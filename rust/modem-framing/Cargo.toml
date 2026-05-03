@@ -1,0 +1,10 @@
+[package]
+name = "modem-framing"
+version = "0.1.0"
+edition = "2021"
+description = "Transport-agnostic framing utilities — payload envelope, app header, RaptorQ fountain codec. Reusable across modem families and over non-RF transports (UDP, …)."
+
+[dependencies]
+raptorq = "2.0"
+serde = { version = "1", features = ["derive"] }
+thiserror = { workspace = true }
