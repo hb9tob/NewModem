@@ -118,7 +118,7 @@ body {
   text-transform: lowercase;
   letter-spacing: 0.02em;
 }
-/* #HB9TOB: voir OVD_STICKY_MS dans main.js pour la durée d'affichage. */
+/* #HB9TOB: see OVD_STICKY_MS in main.js for the display duration. */
 .ovd-chip {
   font-family: ui-monospace, monospace;
   font-size: 0.75rem;
@@ -234,7 +234,7 @@ main {
   flex: 1;
   min-height: 0;
   padding: 0;
-  /* Laisse la place à la barre de progression fixe en bas. */
+  /* Leave room for the fixed progress bar at the bottom. */
   padding-bottom: 6px;
   overflow: hidden;
 }
@@ -410,7 +410,7 @@ main {
   cursor: zoom-in;
   user-select: none;
 }
-/* Barre de progression globale en bas de fenêtre : quelques pixels. */
+/* Global progress bar at the bottom of the window: a few pixels tall. */
 .rx-progress-bar {
   position: fixed;
   left: 0;
@@ -506,9 +506,9 @@ main {
   object-fit: contain;
   user-select: none;
 }
-/* Bande perforée 8 voies affichée à la place de l'image quand on transmet
-   un fichier non-image. Les trous représentent les vrais bytes du nom de
-   fichier (ASCII), défilement SMIL pour la rétro-vibe. */
+/* 8-channel punched tape displayed in place of the image when transmitting
+   a non-image file. The holes represent the actual filename bytes (ASCII),
+   SMIL scrolling for the retro vibe. */
 .tx-file-tape {
   position: absolute;
   inset: 8% 4%;
@@ -1594,7 +1594,7 @@ main {
   background: #3a2a1a;
 }
 
-/* Profils expérimentaux : badge rouge bien visible */
+/* Experimental profiles: well-visible red badge */
 .experimental-option {
   color: #ff6b4a;
   font-weight: bold;

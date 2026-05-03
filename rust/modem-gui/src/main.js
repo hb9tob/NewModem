@@ -1,9 +1,9 @@
 // NBFM Modem GUI — 3-tab layout (RX / TX / Info) with per-block progress and
 // live constellation display.
 
-// Mapping aligné sur modem-core/src/app_header.rs :: mime
+// Mapping aligned with modem-core/src/app_header.rs :: mime
 //   0 = BINARY, 1 = TEXT, 2 = IMAGE_AVIF, 3 = IMAGE_JPEG, 4 = IMAGE_PNG,
-//   5 = ZSTD (fichier non-image décompressé côté RX par le worker Rust).
+//   5 = ZSTD (non-image file decompressed RX-side by the Rust worker).
 const MIME_TYPES = {
   0: "application/octet-stream",
   1: "text/plain",
@@ -31,9 +31,9 @@ function now() {
   return new Date().toLocaleTimeString();
 }
 
-// Event log : on garde aussi un buffer mémoire pour pouvoir le sérialiser
-// et le pousser au collecteur Phase D au moment d'une soumission. Cap à
-// 500 entrées comme la liste DOM.
+// Event log: we also keep an in-memory buffer so we can serialize and
+// push it to the Phase D collector at submission time. Capped at 500
+// entries like the DOM list.
 const eventLogBuffer = [];
 
 function logEvent(name, data) {
@@ -80,12 +80,12 @@ function setupTabs() {
   }
 }
 
-// Onglet Paramètres : si le RX tourne, le worker a déjà ouvert la carte son
-// RX et ne lira un changement de device qu'au prochain démarrage. On ne coupe
-// PAS automatiquement (l'utilisateur peut juste consulter l'onglet) — on
-// affiche une bannière qui propose d'arrêter le RX, et on désactive le select
-// RX device pour empêcher une modification fantôme (on ne touche pas aux
-// autres champs : pré-emphase, TX device, indicatif… restent modifiables).
+// Settings tab: if RX is running, the worker has already opened the RX
+// sound card and won't pick up a device change until the next start. We
+// do NOT cut RX automatically (the user may just want to consult the
+// tab) - we show a banner offering to stop RX and disable the RX device
+// select to prevent a phantom change (other fields - pre-emphasis, TX
+// device, callsign... - remain editable).
 function refreshSettingsRxWarn() {
   const stopBtn = document.getElementById("btn-stop");
   const warn = document.getElementById("settings-rx-warn");
@@ -98,10 +98,9 @@ function refreshSettingsRxWarn() {
   if (rxSel) rxSel.disabled = rxRunning;
 }
 
-// Onglet Canal : on coupe RX et TX en cours en entrant. Le réglage
-// d'atténuation s'applique au prochain TX, et un RX qui tourne pendant
-// qu'on bidouille le slider risque de se faire saturer par notre propre
-// signal de test plus tard (phase B).
+// Channel tab: we stop RX and TX in progress on entry. The attenuation
+// setting applies to the next TX, and an RX running while we twiddle the
+// slider would risk being saturated by our own test signal later (phase B).
 async function stopRxAndTxForChannelTab() {
   const stopBtn = document.getElementById("btn-stop");
   const txStopBtn = document.getElementById("tx-btn-stop");
@@ -264,9 +263,9 @@ function showCurrentFile(payload) {
   }
 }
 
-// Ouvre l'explorateur de fichiers sur le fichier reçu (sélectionné). Utilise
-// tauri-plugin-opener qui gère Windows (explorer /select), Linux (D-Bus
-// FileManager1, fallback xdg-open du parent) et macOS (open -R).
+// Open the file explorer on the received (selected) file. Uses
+// tauri-plugin-opener, which handles Windows (explorer /select), Linux
+// (D-Bus FileManager1, parent xdg-open fallback) and macOS (open -R).
 async function revealReceivedFile(savedPath) {
   if (!savedPath) return;
   try {
@@ -274,8 +273,8 @@ async function revealReceivedFile(savedPath) {
     if (opener && typeof opener.revealItemInDir === "function") {
       await opener.revealItemInDir(savedPath);
     } else if (window.__TAURI__ && window.__TAURI__.core) {
-      // Fallback via invoke direct si la surface globale du plugin n'est pas
-      // exposée par withGlobalTauri sur cette version de Tauri.
+      // Fallback through direct invoke if the plugin's global surface is
+      // not exposed by withGlobalTauri on this Tauri version.
       await window.__TAURI__.core.invoke("plugin:opener|reveal_item_in_dir", {
         path: savedPath,
       });
@@ -285,9 +284,9 @@ async function revealReceivedFile(savedPath) {
   }
 }
 
-// ─────────────────────────────────────────────────── Lightbox (double-clic)
-// Affiche l'image plein écran OS (Tauri setFullscreen) avec zoom molette ou
-// clavier (jusqu'à 8× pour inspecter les détails) et pan au drag/flèches.
+// ─────────────────────────────────────────────────── Lightbox (double-click)
+// Displays the image in OS fullscreen (Tauri setFullscreen) with wheel or
+// keyboard zoom (up to 8x to inspect details) and drag/arrow pan.
 const LIGHTBOX_MAX_SCALE = 8;
 const lightbox = {
   viewEl: null,
@@ -314,8 +313,8 @@ async function setWindowFullscreen(flag) {
   }
 }
 
-// setFullscreen Tauri resolve avant que WebView ait propagé le nouveau viewport.
-// On attend soit un événement resize, soit un timeout de sécurité.
+// Tauri setFullscreen resolves before the WebView has propagated the new
+// viewport. We wait for either a resize event or a safety timeout.
 function waitForResize(prevW, prevH, timeoutMs = 400) {
   return new Promise((resolve) => {
     if (window.innerWidth !== prevW || window.innerHeight !== prevH) {
@@ -345,8 +344,8 @@ async function openLightbox(src, alt) {
   };
   lightbox.imgEl.src = src;
   lightbox.viewEl.hidden = false;
-  // Plein écran OS via Tauri : le requestFullscreen navigateur ne fullscreen
-  // que la WebView dans la fenêtre, pas la fenêtre elle-même.
+  // OS fullscreen via Tauri: the browser requestFullscreen only fullscreens
+  // the WebView inside the window, not the window itself.
   try {
     const win = window.__TAURI__.window.getCurrentWindow();
     lightbox.wasFullscreen = await win.isFullscreen();
@@ -354,16 +353,16 @@ async function openLightbox(src, alt) {
       const prevW = window.innerWidth;
       const prevH = window.innerHeight;
       await win.setFullscreen(true);
-      // Attend la propagation du resize côté WebView avant de fit, sinon
-      // on calcule le centre avec les dimensions windowed et l'image apparaît
-      // décalée vers le coin haut-gauche.
+      // Wait for the resize to propagate WebView-side before fitting,
+      // otherwise we compute the center with the windowed dimensions and
+      // the image appears offset toward the top-left corner.
       await waitForResize(prevW, prevH);
     }
   } catch (err) {
     console.error("isFullscreen/setFullscreen", err);
   }
-  // Si l'image est en cache, onload peut ne pas refire — refit explicite avec
-  // la taille viewport finale.
+  // If the image is cached, onload may not refire - explicit refit with the
+  // final viewport size.
   if (lightbox.imgEl.complete && lightbox.imgEl.naturalWidth > 0) {
     lightbox.natW = lightbox.imgEl.naturalWidth;
     lightbox.natH = lightbox.imgEl.naturalHeight;
@@ -380,10 +379,10 @@ async function closeLightbox() {
   }
 }
 
-// Garde l'image au moins partiellement dans le viewport :
-//  - si elle rentre entièrement (w <= vw / h <= vh), on la centre ;
-//  - sinon, on l'empêche de glisser hors-écran (au minimum un bord touche
-//    un bord du viewport).
+// Keeps the image at least partially inside the viewport:
+//  - if it fits entirely (w <= vw / h <= vh), we center it;
+//  - otherwise, we prevent it from sliding off-screen (at minimum one edge
+//    touches an edge of the viewport).
 function clampLightboxPan() {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
@@ -411,8 +410,8 @@ function applyLightboxTransform() {
 function fitLightbox() {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  // fit = ce qui rentre l'image entière dans le viewport, plafonné à 1:1
-  // (pas d'upscale auto pour les petites images).
+  // fit = what makes the whole image fit in the viewport, capped at 1:1
+  // (no auto-upscale for small images).
   const fit = Math.min(vw / lightbox.natW, vh / lightbox.natH, 1);
   lightbox.minScale = fit;
   lightbox.maxScale = LIGHTBOX_MAX_SCALE;
@@ -427,7 +426,7 @@ function zoomLightboxBy(factor, cx, cy) {
   let next = prev * factor;
   next = Math.max(lightbox.minScale, Math.min(lightbox.maxScale, next));
   if (next === prev) return;
-  // Zoom centré sur (cx, cy) : ce point en coords écran reste fixe.
+  // Zoom centered on (cx, cy): this point in screen coords stays fixed.
   lightbox.tx = cx - (cx - lightbox.tx) * (next / prev);
   lightbox.ty = cy - (cy - lightbox.ty) * (next / prev);
   lightbox.scale = next;
@@ -472,7 +471,7 @@ function setupLightbox() {
     lightbox.dragging = false;
     view.classList.remove("dragging");
   });
-  // Clic simple sur le fond (pas sur l'image) ferme. Double-clic ferme aussi.
+  // Single click on the background (not the image) closes. Double-click also closes.
   view.addEventListener("click", (ev) => {
     if (ev.target === view) closeLightbox();
   });
@@ -482,9 +481,9 @@ function setupLightbox() {
     const cx = window.innerWidth / 2;
     const cy = window.innerHeight / 2;
     const PAN_STEP = 60;
-    // On regarde key ET code : sur certains layouts (AZERTY suisse), le pavé
-    // numérique ne remonte pas "+"/"-" comme key, mais NumpadAdd/Subtract
-    // est toujours là.
+    // We look at both key AND code: on some layouts (Swiss AZERTY), the
+    // numpad does not surface "+"/"-" as key, but NumpadAdd/Subtract is
+    // always there.
     const isPlus = ev.key === "+" || ev.key === "=" || ev.key === "a" || ev.key === "A" || ev.code === "NumpadAdd";
     const isMinus = ev.key === "-" || ev.key === "_" || ev.key === "q" || ev.key === "Q" || ev.code === "NumpadSubtract";
     const isZero = ev.key === "0" || ev.code === "Numpad0";
@@ -513,16 +512,16 @@ function setupLightbox() {
       ev.preventDefault();
     }
   });
-  // Le resize fire après que setFullscreen Tauri ait redimensionné la fenêtre,
-  // ce qui rebascule l'image au centre du nouveau viewport.
+  // Resize fires after Tauri setFullscreen has resized the window, which
+  // re-centers the image in the new viewport.
   window.addEventListener("resize", () => {
     if (!view.hidden) fitLightbox();
   });
 }
 
 // ─────────────────────────────────────────── Settings / device selection
-// Les deux cartes son (RX/TX) + l'indicatif vivent dans l'onglet Paramètres
-// et sont persistés via les commandes Tauri get_settings / save_settings.
+// Both sound cards (RX/TX) + the callsign live in the Settings tab and are
+// persisted via the Tauri get_settings / save_settings commands.
 let currentSettings = {
   callsign: "",
   rx_device: "",
@@ -544,16 +543,16 @@ let currentSettings = {
   tx_free_h: 600,
   tx_speed: 6,
   tx_more_count: 5,
-  /// Si true, le profil RX est verrouillé sur rx_forced_profile et
-  /// l'auto-détection est désactivée. Indispensable pour recevoir
-  /// MEGA, FAST, HIGH++ ou HIGH+56 (hors PROBE_TEMPLATES).
+  /// If true, the RX profile is locked on rx_forced_profile and auto-
+  /// detection is disabled. Required to receive MEGA, FAST, HIGH++ or
+  /// HIGH+56 (which are outside PROBE_TEMPLATES).
   rx_force_mode: false,
   rx_forced_profile: "HIGH56",
-  /// Si true, les profils expérimentaux apparaissent dans les combos TX
-  /// et RX et l'UI « Forcer un profil » devient visible au démarrage.
-  /// Si false (défaut) : combos filtrés sur les profils standards
-  /// (ULTRA / ROBUST / NORMAL / HIGH / HIGH56 / HIGH+) et la barre
-  /// rx-force-bar est masquée.
+  /// If true, experimental profiles appear in the TX and RX combos and
+  /// the "Force a profile" UI becomes visible at startup. If false
+  /// (default): combos are filtered to standard profiles (ULTRA /
+  /// ROBUST / NORMAL / HIGH / HIGH56 / HIGH+) and the rx-force-bar is
+  /// hidden.
   experimental_modes_enabled: false,
 };
 
@@ -584,7 +583,7 @@ function populateDeviceSelect(selectId, devices, savedName) {
     if (preferred === null && dev.supports_48k) preferred = dev;
     if (dev.is_default && dev.supports_48k) preferred = dev;
   }
-  // Priorité : valeur sauvegardée si encore disponible, sinon préférée.
+  // Priority: saved value if still available, otherwise the preferred one.
   if (savedName && devices.some(d => d.name === savedName)) {
     select.value = savedName;
   } else if (preferred) {
@@ -607,7 +606,7 @@ function refreshStartButtonFromRx() {
   if (!select || !btn) return;
   const opt = select.options[select.selectedIndex];
   const ok = !!(opt && opt.value && opt.dataset.supports48k === "1");
-  // Ne touche pas à btn-start si capture en cours (disabled via startCapture).
+  // Don't touch btn-start if capture is running (disabled via startCapture).
   if (!document.getElementById("btn-stop").disabled) return;
   btn.disabled = !ok;
 }
@@ -681,11 +680,11 @@ function applyRxForceSettingsToUI() {
   }
 }
 
-/// Cache des <option class="experimental-option"> retirées du DOM lorsque le
-/// toggle est désactivé. Indexé par id du <select>, chaque entrée garde le
-/// outerHTML et l'index d'insertion d'origine. Rempli lazy au premier appel
-/// d'applyExperimentalModesToUI() pendant que les options sont encore dans
-/// le DOM (c'est le cas dès le chargement de index.html).
+/// Cache of <option class="experimental-option"> removed from the DOM when
+/// the toggle is disabled. Indexed by <select> id, each entry keeps the
+/// outerHTML and the original insertion index. Lazily filled on the first
+/// call to applyExperimentalModesToUI() while the options are still in the
+/// DOM (which is the case as soon as index.html is loaded).
 const _experimentalOptionsCache = new Map();
 
 function _cacheExperimentalOptions() {
@@ -702,17 +701,17 @@ function _cacheExperimentalOptions() {
   });
 }
 
-/// Applique l'état du toggle « Activer les modes expérimentaux » :
-/// - met à jour la case à cocher des paramètres
-/// - retire ou ré-insère physiquement les options .experimental-option dans
-///   tous les <select> (elles ne doivent pas apparaître du tout dans le
-///   dropdown quand le mode est OFF — cacher via `hidden` n'est pas fiable
-///   sous tous les WebView Tauri)
-/// - masque/affiche la barre « Forcer un profil » de l'onglet RX
-/// Si l'utilisateur désactive le toggle alors que rx_force_mode est ON, on
-/// désactive le mode forcé pour éviter de rester verrouillé sur un profil
-/// expérimental sans pouvoir y accéder. Idem si la valeur courante d'un
-/// select devient invalide après retrait : on retombe sur la première option.
+/// Apply the state of the "Enable experimental modes" toggle:
+/// - update the settings checkbox
+/// - physically remove or re-insert .experimental-option options in all
+///   <select> elements (they must not appear in the dropdown at all when
+///   the mode is OFF - hiding via `hidden` is unreliable across all Tauri
+///   WebViews)
+/// - hide/show the "Force a profile" bar of the RX tab
+/// If the user disables the toggle while rx_force_mode is ON, we disable
+/// forced mode to avoid staying locked on an experimental profile with no
+/// way to reach it. Same if the current value of a select becomes invalid
+/// after removal: we fall back to the first option.
 function applyExperimentalModesToUI() {
   const enabled = !!currentSettings.experimental_modes_enabled;
   const cb = document.getElementById("experimental-modes-enabled");
@@ -725,8 +724,8 @@ function applyExperimentalModesToUI() {
     if (!sel) continue;
     const present = sel.querySelector("option.experimental-option") !== null;
     if (enabled && !present) {
-      // Réinsérer chaque option à son index d'origine. Trier par index
-      // croissant pour que les insertBefore successifs gardent l'ordre.
+      // Re-insert each option at its original index. Sort by ascending
+      // index so that successive insertBefore calls preserve order.
       const sorted = [...entries].sort((a, b) => a.index - b.index);
       for (const e of sorted) {
         const tmp = document.createElement("div");
@@ -742,9 +741,9 @@ function applyExperimentalModesToUI() {
     } else if (!enabled && present) {
       Array.from(sel.querySelectorAll("option.experimental-option"))
         .forEach((opt) => opt.remove());
-      // Si la valeur courante du select pointait sur une option retirée,
-      // retomber sur la première option restante (sinon le select garde
-      // visuellement la valeur fantôme).
+      // If the current select value pointed to a removed option, fall
+      // back to the first remaining option (otherwise the select keeps
+      // the phantom value visually).
       if (sel.value && !sel.querySelector(`option[value="${CSS.escape(sel.value)}"]`)) {
         const fallback = sel.options[0];
         if (fallback) sel.value = fallback.value;
@@ -755,10 +754,10 @@ function applyExperimentalModesToUI() {
   const forceBar = document.getElementById("rx-force-bar");
   if (forceBar) forceBar.hidden = !enabled;
 
-  // Si l'utilisateur désactive le toggle alors qu'il était positionné sur un
-  // profil expérimental (côté TX et/ou RX forcé), on retombe sur HIGH56
-  // (standard depuis 2026-04-28) — sinon txState garderait la valeur fantôme
-  // après applyTxSettingsToUI() et la TX échouerait silencieusement.
+  // If the user disables the toggle while positioned on an experimental
+  // profile (TX side and/or RX forced), we fall back to HIGH56 (standard
+  // since 2026-04-28) - otherwise txState would keep the phantom value
+  // after applyTxSettingsToUI() and TX would silently fail.
   const EXPERIMENTAL_MODES = ["MEGA", "FAST", "HIGH++", "HIGH+56"];
   let needPersist = false;
   if (!enabled) {
@@ -782,9 +781,9 @@ function applyExperimentalModesToUI() {
   if (needPersist) persistSettings();
 }
 
-// Synchronise tous les paramètres TX persistés vers txState et l'UI. Appelé
-// après loadSettings, donc setupTxTab a déjà attaché ses listeners — on met
-// juste à jour les valeurs.
+// Sync all persisted TX settings into txState and the UI. Called after
+// loadSettings, so setupTxTab has already attached its listeners - we just
+// update the values.
 function applyTxSettingsToUI() {
   const intOr = (v, def) => Number.isFinite(v) ? v : def;
   const q = intOr(currentSettings.tx_quality, 10);
@@ -874,7 +873,7 @@ async function loadSerialPorts() {
     sel.appendChild(opt);
   } else {
     if (saved && !ports.includes(saved)) {
-      // Conserve la valeur sauvegardée même absente, pour la rendre visible.
+      // Keep the saved value even when absent, to make it visible.
       const opt = document.createElement("option");
       opt.value = saved;
       opt.textContent = `${saved} (introuvable)`;
@@ -976,8 +975,8 @@ function setupSettingsTab() {
       } catch (err) {
         logEvent("settings_stop_rx_error", { message: String(err) });
       }
-      // stopCapture rappelle refreshSettingsRxWarn, donc l'état UI sera
-      // re-synchronisé (bannière cachée, select RX ré-activé).
+      // stopCapture re-calls refreshSettingsRxWarn, so the UI state will
+      // be re-synced (banner hidden, RX select re-enabled).
     });
   }
   // PTT widgets : enable/disable + persist.
@@ -1058,8 +1057,8 @@ async function startCapture() {
     return;
   }
   const forced = !!currentSettings.rx_force_mode;
-  // Si forcé, on passe le profil choisi ; sinon HIGH (anchor par défaut,
-  // l'auto-détection le raffinera).
+  // If forced, pass the chosen profile; otherwise HIGH (default anchor,
+  // auto-detection will refine it).
   const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
   try {
     await invoke("start_capture", { deviceName, profile, forced });
@@ -1079,9 +1078,9 @@ async function startCapture() {
   }
 }
 
-// Démarre la capture RX si elle n'est pas déjà en cours, qu'aucune TX
-// n'occupe la chaîne audio, et qu'une carte RX valide est sélectionnée.
-// Appelé au démarrage de l'app et au retour sur l'onglet RX.
+// Start RX capture if it isn't already running, no TX is occupying the
+// audio chain, and a valid RX device is selected. Called at app startup
+// and when returning to the RX tab.
 async function tryAutoStartCapture() {
   const stopBtn = document.getElementById("btn-stop");
   const startBtn = document.getElementById("btn-start");
@@ -1156,9 +1155,9 @@ async function toggleRawRecording() {
 }
 
 // ─────────────────────────────────────────── Submit capture (Phase D)
-// Si l'utilisateur a renseigné une URL collecteur dans Paramètres, on
-// affiche un panneau juste après la fin d'une capture brute pour proposer
-// la soumission. Sinon, rien — on ne submit qu'à la demande explicite.
+// If the user has set a collector URL in Settings, we show a panel right
+// after the end of a raw capture to offer submission. Otherwise, nothing -
+// we only submit on explicit request.
 let pendingCapture = null;
 
 function maybeOfferCaptureSubmit(captureInfo) {
@@ -1266,9 +1265,9 @@ function updateLevel(rms, peak, _totalSamples) {
   text.textContent = `${dbStr} dB · peak ${peakStr}`;
 }
 
-// #HB9TOB: durée d'affichage rouge du chip OVD après dernière détection.
-// Le chip s'efface tout seul après ce délai si plus aucun batch n'est marqué
-// overdrive. Voir OVERDRIVE_* côté Rust pour le seuil de détection.
+// #HB9TOB: how long the OVD chip stays red after the last detection. The
+// chip clears itself after this delay if no further batch is flagged
+// overdrive. See OVERDRIVE_* on the Rust side for the detection threshold.
 const OVD_STICKY_MS = 5000;
 
 let lastOverdriveMs = 0;
@@ -1359,9 +1358,9 @@ function updateFountainStatus(partial) {
   el.hidden = false;
   const k = next.needed || 0;
   const r = next.received || 0;
-  // Ne cap pas le "reçu" à K — l'utilisateur a le droit de voir qu'il a
-  // déjà avalé plus de blocs que le strict minimum (repair compris).
-  // "Manquants" ne peut pas descendre en négatif : c'est max(0, K - R).
+  // Don't cap "received" at K - the user is allowed to see they have
+  // already swallowed more blocks than the strict minimum (repair
+  // included). "Missing" cannot go negative: it's max(0, K - R).
   const missing = Math.max(0, k - r);
   const missingTail = next.decoded
     ? ""
@@ -1445,12 +1444,12 @@ function drawProgressBlocks() {
     ctx.fillRect(0, 0, w, h);
     return;
   }
-  // Stratégie "fountain fill" : le code RaptorQ n'a pas besoin de récupérer
-  // les ESIs manquants exactement — il suffit de K blocs au total. On
-  // affiche donc la bitmap réelle (positions ESI effectivement reçues),
-  // puis on "bouche les trous" dès que `converged` dépasse le nombre de
-  // bits à 1 dans [0..expected) : les ESIs > expected (venus par More ou
-  // par repair) ne sont pas perdus, ils repeignent le premier trou rouge.
+  // "Fountain fill" strategy: the RaptorQ code doesn't need to recover
+  // the missing ESIs exactly - K total blocks is enough. So we display
+  // the actual bitmap (ESI positions effectively received), then we
+  // "plug the holes" as soon as `converged` exceeds the number of bits
+  // set in [0..expected): ESIs > expected (coming from More or repair)
+  // are not lost, they repaint the first red hole.
   const bw = w / expected;
   const slotConverged = new Array(expected).fill(false);
   let filled = 0;
@@ -1463,8 +1462,8 @@ function drawProgressBlocks() {
       }
     }
   }
-  // Surplus = blocs reçus au-delà de ce que la bitmap locale peut montrer.
-  // Comble les trous de gauche à droite.
+  // Surplus = blocks received beyond what the local bitmap can show.
+  // Fills the holes from left to right.
   let surplus = Math.max(0, (converged || 0) - filled);
   if (surplus > 0) {
     for (let i = 0; i < expected && surplus > 0; i++) {
@@ -1706,9 +1705,9 @@ function wireEvents() {
       logEvent(name, event.payload);
       if (name === "file_complete") {
         showCurrentFile(event.payload);
-        // Reveal-in-folder uniquement pour les fichiers non-image. Pour
-        // les images on a déjà la preview dans l'onglet RX + l'historique,
-        // ouvrir le dossier serait intrusif (vol de focus).
+        // Reveal-in-folder only for non-image files. For images we
+        // already have the preview in the RX tab + the history, opening
+        // the folder would be intrusive (focus stealing).
         if (!isImageMime(event.payload.mime_type)) {
           revealReceivedFile(event.payload.saved_path);
         }
@@ -1808,20 +1807,20 @@ function wireEvents() {
       capReached: false,
     });
     logEvent("session_decoded", p);
-    // Refresh la colonne RX de l'onglet Historique. Léger : un read_dir +
-    // parsing du meta.json de chaque session.
+    // Refresh the RX column of the History tab. Lightweight: one
+    // read_dir + parsing each session's meta.json.
     refreshHistory().catch(() => {});
   });
   listen("tx_archived", () => {
-    // Émis par tx_worker::archive_payload au lancement de chaque émission.
+    // Emitted by tx_worker::archive_payload at the start of every transmission.
     refreshHistory().catch(() => {});
   });
 }
 
 // ────────────────────────────────────────────────────────────── TX tab (GUI)
-// Le câblage backend (encodage AVIF, lancement TX, rendu audio) viendra
-// ensuite. Ici on gère uniquement : chargement fichier (picker + DnD),
-// dimensions cibles avec respect de l'aspect, état des contrôles.
+// The backend wiring (AVIF encoding, TX launch, audio rendering) comes
+// later. Here we only handle: file loading (picker + DnD), target
+// dimensions with aspect ratio respected, state of the controls.
 const txState = {
   sourceFile: null,
   sourceImage: null,
@@ -1831,64 +1830,65 @@ const txState = {
   resize: "800x600",
   freeW: 640,
   freeH: 480,
-  // Défaut 10 : compromis taille/qualité utilisable d'office sur passe NBFM.
-  // Persisté entre sessions (cf. applyTxSettingsToUI).
+  // Default 10: size/quality trade-off usable out-of-the-box on a NBFM pass.
+  // Persisted across sessions (cf. applyTxSettingsToUI).
   quality: 10,
-  // Vitesse encodeur AVIF, 1..=10. 6 = équilibré (quelques secondes sur un
-  // SP7), 1 = max compression/très lent, 10 = rapide mais fichier plus gros.
+  // AVIF encoder speed, 1..=10. 6 = balanced (a few seconds on an SP7),
+  // 1 = max compression/very slow, 10 = fast but larger file.
   speed: 6,
-  // % de blocs repair RaptorQ ajoutés au burst initial (0, 5, 10, 20, 30,
-  // 50, 100). 5 = défaut modeste (l'utilisateur monte au besoin via
-  // "TX more"). Persisté entre sessions.
+  // % of RaptorQ repair blocks added to the initial burst (0, 5, 10, 20,
+  // 30, 50, 100). 5 = modest default (user bumps it as needed via
+  // "TX more"). Persisted across sessions.
   repairPct: 5,
-  // True quand la source est déjà un AVIF : on émet les bytes tels quels,
-  // sans décodage ni ré-encodage (pas de perte, pas de cycle CPU).
+  // True when the source is already an AVIF: we emit the bytes as-is,
+  // with no decoding or re-encoding (no loss, no CPU cycles).
   avifPassthrough: false,
-  // True quand la source n'est pas une image — on bascule sur compress_file_zstd
-  // (compression sans perte) au lieu de compress_image. Pas de preview image,
-  // pas de redimensionnement, limite 10 min au lieu de 5.
+  // True when the source is not an image - we switch to compress_file_zstd
+  // (lossless) instead of compress_image. No image preview, no resizing,
+  // 10 min limit instead of 5.
   fileMode: false,
-  // Nombre de blocs à émettre en "More" burst (valeur exacte, pas un %).
-  // L'user choisit depuis un select discret ou saisit via l'input libre.
-  // L'user cas d'usage typique : "il me manque 5 blocs" → count = 5.
+  // Number of blocks to emit as a "More" burst (exact value, not a %).
+  // User picks from a discrete select or enters a free value.
+  // Typical use case: "I'm missing 5 blocks" -> count = 5.
   moreCount: 5,
   aspectLinked: true,
   txActive: false,
-  // Blocs fontaine additionnels à générer sur TX more (% de la taille code).
+  // Additional fountain blocks to generate on TX more (% of code size).
   morePct: 20,
-  // État de la session TX en cours : conservé entre le TX initial et les
-  // bursts "More" successifs pour pouvoir continuer l'ESI sans recouvrir
-  // les packets déjà émis. Reset quand l'image ou le mode changent.
+  // State of the in-progress TX session: kept between the initial TX and
+  // successive "More" bursts so we can continue ESI without overlapping
+  // packets already emitted. Reset when image or mode change.
   lastTx: null,  // { esiMax, mode }
   compressedBytes: null,
   compressedUrl: null,
   compressing: false,
   compressTimer: null,
   compressSeq: 0,
-  // True quand un paramètre (quality / resize / dimensions libres) a été
-  // modifié depuis la dernière compression réussie. Pilote l'indicateur
-  // "obsolète" + le style warn du bouton Recalculer.
+  // True when a parameter (quality / resize / free dimensions) has been
+  // modified since the last successful compression. Drives the "stale"
+  // indicator + the warn style of the Recompute button.
   compressDirty: false,
-  // Garde anti-réentrance : drop ignoré pendant qu'un chargement d'image
-  // est en cours (évite deux loadTxFileFromPath en parallèle).
+  // Anti-reentrance guard: drop ignored while an image is loading
+  // (avoids two parallel loadTxFileFromPath calls).
   loading: false,
-  // Estimation calculée par le backend après chaque compression ou
-  // changement de mode ; pilote l'activation du bouton TX et l'affichage
-  // "durée estimée · nb blocs".
+  // Estimate computed by the backend after each compression or mode
+  // change; drives TX button activation and the "estimated duration ·
+  // block count" display.
   estimate: null,
-  // Suivi d'une émission en cours.
+  // Tracking of an in-progress transmission.
   progress: null,
   restartRxAfter: false,
 };
 
-// Chaîne de promesses pour sérialiser les compressions AVIF. Sans ça, un drop
-// d'image pendant qu'une compression tourne lance un 2e encodeur ravif speed-1
-// en parallèle — assez pour saturer la RAM et geler KDE sur les grosses images.
+// Promise chain to serialize AVIF compressions. Without it, dropping an
+// image while a compression is running launches a 2nd ravif speed-1
+// encoder in parallel - enough to saturate RAM and freeze KDE on large
+// images.
 let _compressChain = Promise.resolve();
 
-// Limites du transport. Image : ≤ 100 ko + ≤ 5 min (warn > 2 min). Fichier
-// non-image : ≤ 10 min (warn > 5 min), pas de limite de taille en plus —
-// la durée est la vraie contrainte en NBFM.
+// Transport limits. Image: <= 100 kB + <= 5 min (warn > 2 min). Non-image
+// file: <= 10 min (warn > 5 min), no extra size limit - duration is the
+// real NBFM constraint.
 const TX_HARD_BYTES = 100 * 1024;
 const TX_HARD_SECONDS = 5 * 60;
 const TX_WARN_SECONDS = 2 * 60;
@@ -1905,9 +1905,9 @@ function fmtSeconds(s) {
 function refreshTxExperimentalWarn() {
   const warn = document.getElementById("tx-experimental-warn");
   if (!warn) return;
-  // HIGH56 a été promu standard depuis 2026-04-28 (commit bec4e63), il ne
-  // déclenche plus le warning. Liste alignée sur ce qui porte la classe
-  // .experimental-option dans index.html.
+  // HIGH56 was promoted standard on 2026-04-28 (commit bec4e63), so it no
+  // longer triggers the warning. List kept in sync with what carries the
+  // .experimental-option class in index.html.
   const isExp = txState.mode === "MEGA"
     || txState.mode === "FAST"
     || txState.mode === "HIGH++"
@@ -1967,7 +1967,7 @@ function refreshTxButtons() {
   if (repairPct) repairPct.disabled = !hasSource || txState.txActive;
   if (moreCount) moreCount.disabled = !hasSource || txState.txActive;
 
-  // Libellé + couleur du bouton TX selon l'état.
+  // TX button label + color depending on state.
   if (txState.txActive) {
     btnTx.textContent = "TX en cours…";
     btnTx.title = "émission en cours";
@@ -1998,7 +1998,7 @@ function txFormatBytes(n) {
   return `${(n / 1024 / 1024).toFixed(2)} Mio`;
 }
 
-// Tooltip du bouton TX : durée, N émis, K requis, seuil K.
+// TX button tooltip: duration, N emitted, K required, K threshold.
 function txButtonTitle(est, dur, longTx) {
   if (!est) return "";
   const base = longTx ? `transmission longue (> 2 min) — durée ` : `durée `;
@@ -2014,7 +2014,7 @@ function txButtonTitle(est, dur, longTx) {
   return parts.join(" · ");
 }
 
-// Tooltip du bouton More : blocs additionnels, durée attendue.
+// More button tooltip: additional blocks, expected duration.
 function moreButtonTitle() {
   const est = txState.estimate;
   const count = computeMoreCount();
@@ -2061,8 +2061,8 @@ function refreshTxPreview() {
     return;
   }
   if (txState.fileMode) {
-    // Pas de dimensions à afficher pour un fichier non-image — on montre le
-    // nom original et le mode modem en cours.
+    // No dimensions to display for a non-image file - show the original
+    // filename and the current modem mode.
     if (info) {
       const cmpPart = txState.compressing ? " · zstd…" : "";
       info.textContent = `${txState.sourceFile.name} · zstd · ${txState.mode}${cmpPart}`;
@@ -2108,13 +2108,13 @@ function scheduleTxCompress(delayMs = 300) {
 
 function getTxFilename() {
   if (!txState.sourceFile) return "image.avif";
-  // En mode fichier, on garde le nom original (extension comprise) — c'est ce
-  // que le RX attend pour décompresser et écrire le fichier final.
+  // In file mode, keep the original name (including extension) - that's
+  // what the RX expects to decompress and write the final file.
   if (txState.fileMode) {
     return (txState.sourceFile.name || "fichier.bin").slice(0, 60);
   }
   const base = txState.sourceFile.name.replace(/\.[^/.]+$/, "");
-  // Envelope autorise 64 octets UTF-8, on garde un peu de marge.
+  // Envelope allows 64 UTF-8 bytes, leave a little margin.
   return `${base.slice(0, 56)}.avif`;
 }
 
@@ -2144,9 +2144,9 @@ async function refreshTxEstimate() {
 }
 
 function runTxCompress() {
-  // Sérialise via _compressChain : on enchaîne la nouvelle compression après
-  // celle qui est en cours, au lieu de laisser ravif tourner deux fois en
-  // parallèle (cf. _compressChain supra).
+  // Serialize via _compressChain: chain the new compression after the
+  // current one, instead of letting ravif run twice in parallel (see
+  // _compressChain above).
   const chained = _compressChain
     .then(() => _runTxCompressImpl())
     .catch((err) => logEvent("tx_compress_chain_error", { message: String(err) }));
@@ -2164,7 +2164,7 @@ async function _runTxCompressImpl() {
   if (previewEl) previewEl.classList.add("compressing");
   refreshTxPreview();
   refreshTxButtons();
-  // Force le browser à peindre le loader avant de lancer invoke().
+  // Force the browser to paint the loader before launching invoke().
   await new Promise((r) =>
     requestAnimationFrame(() => requestAnimationFrame(r)),
   );
@@ -2182,7 +2182,7 @@ async function _runTxCompressImpl() {
         byte_len: result.byte_len,
       });
     } else {
-      // Resync defensif depuis le DOM (resize peut diverger du txState).
+      // Defensive resync from the DOM (resize can diverge from txState).
       const checkedRadio = document.querySelector('input[name="tx-resize"]:checked');
       if (checkedRadio && checkedRadio.value !== txState.resize) {
         txState.resize = checkedRadio.value;
@@ -2239,7 +2239,7 @@ async function _runTxCompressImpl() {
   }
 }
 
-// Détection extension image — si false, on bascule sur le flow file/zstd.
+// Image-extension detection - if false, switch to the file/zstd flow.
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "avif", "webp", "gif", "bmp"]);
 function isImageFilename(name) {
   const lower = (name || "").toLowerCase();
@@ -2248,10 +2248,10 @@ function isImageFilename(name) {
   return IMAGE_EXTS.has(lower.slice(dot + 1));
 }
 
-// Génère un visuel de bande perforée 8 voies à partir du nom de fichier (les
-// trous représentent les bytes ASCII réels). Défilement SMIL en boucle pour
-// la rétro-vibe — pure décoration, aucune sémantique modem. Placé à la place
-// de l'image en mode fichier.
+// Render an 8-channel punched-tape visual from the filename (holes
+// represent the actual ASCII bytes). Looping SMIL scroll for the retro
+// vibe - pure decoration, no modem semantics. Placed in lieu of the
+// image in file mode.
 function renderFileTape(filename) {
   const container = document.getElementById("tx-file-tape");
   if (!container) return;
@@ -2259,8 +2259,8 @@ function renderFileTape(filename) {
   const ROW_Y = [16, 38, 60, 88, 110, 132, 154, 176];
   const SPROCKET_Y = 99;
   const TAPE_H = 192;
-  // 30 octets pour un défilement bouclable même sur fichiers à nom court.
-  // Si filename plus court, on le répète ; si plus long, on le tronque.
+  // 30 bytes so the scroll loops even for short filenames. If the
+  // filename is shorter, repeat it; if longer, truncate it.
   const N_BYTES = 30;
   const src = filename || "fichier.bin";
   const bytes = [];
@@ -2303,9 +2303,9 @@ function renderFileTape(filename) {
   `;
 }
 
-// État unique des contrôles AVIF (resize / qualité / vitesse) : verrouillés
-// quand la source est déjà un AVIF (passthrough) OU pas une image (zstd).
-// Dans les deux cas, ces contrôles n'ont aucun effet sur les bytes émis.
+// Single state for the AVIF controls (resize / quality / speed): locked
+// when the source is already an AVIF (passthrough) OR not an image
+// (zstd). In both cases, these controls have no effect on emitted bytes.
 function applyTxModeUI() {
   const passthrough = !!txState.avifPassthrough;
   const file = !!txState.fileMode;
@@ -2341,18 +2341,18 @@ function applyTxModeUI() {
     r.disabled = lock;
   }
 }
-// Aliases pour compatibilité avec les call sites existants.
+// Aliases for compatibility with existing call sites.
 function applyPassthroughUI() { applyTxModeUI(); }
 function applyFileModeUI() { applyTxModeUI(); }
 
-// Charge un fichier depuis un chemin disque (drag-drop natif Tauri). Le backend
-// lit lui-même les bytes via set_tx_source_from_path : on évite complètement
-// la sérialisation JSON-array via IPC qui, sur une grosse image, allouait
-// ~10× la taille du fichier côté JS + côté Rust et pouvait faire geler KDE.
+// Load a file from a disk path (native Tauri drag-drop). The backend
+// reads the bytes itself via set_tx_source_from_path: we completely
+// avoid JSON-array IPC serialization which, on a large image, allocated
+// ~10x the file size on both JS and Rust sides and could freeze KDE.
 async function loadTxFileFromPath(path) {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  // Anti-réentrance : ignore les drops successifs pendant qu'un chargement
-  // ou une compression est en cours.
+  // Anti-reentrance: ignore successive drops while a load or compression
+  // is in progress.
   if (txState.loading) {
     logEvent("tx_drop_ignored", { message: "chargement déjà en cours", path });
     return;
@@ -2363,7 +2363,7 @@ async function loadTxFileFromPath(path) {
   const name = path.split(/[/\\]/).pop() || "fichier";
   const isImage = isImageFilename(name);
   try {
-    // Upload par chemin (pas de bytes via IPC).
+    // Upload by path (no bytes through IPC).
     const size = await invoke("set_tx_source_from_path", { path });
     if (txState.sourceUrl) {
       URL.revokeObjectURL(txState.sourceUrl);
@@ -2378,7 +2378,7 @@ async function loadTxFileFromPath(path) {
     txState.compressDirty = false;
     txState.lastTx = null;
     if (isImage) {
-      // Charge l'image en preview via asset://.
+      // Load the image as preview via asset://.
       const img = new Image();
       await new Promise((resolve, reject) => {
         img.onload = () => resolve();
@@ -2416,7 +2416,7 @@ async function loadTxFileFromPath(path) {
 
 async function loadTxFile(file) {
   if (!file) return;
-  // Libère l'ancien blob URL s'il existe.
+  // Release the previous blob URL if any.
   if (txState.sourceUrl) {
     URL.revokeObjectURL(txState.sourceUrl);
     txState.sourceUrl = null;
@@ -2446,7 +2446,7 @@ async function loadTxFile(file) {
     if (preview) preview.hidden = false;
     refreshTxPreview();
     refreshTxButtons();
-    // Upload source au backend pour les compressions ultérieures.
+    // Upload source to the backend for later compressions.
     try {
       const buf = await file.arrayBuffer();
       const { invoke } = window.__TAURI__.core;
@@ -2514,7 +2514,7 @@ async function resetTxFile() {
     const { invoke } = window.__TAURI__.core;
     await invoke("clear_tx_source");
   } catch {
-    // peu importe : le state JS est déjà réinitialisé.
+    // Doesn't matter: the JS state is already reset.
   }
 }
 
@@ -2528,10 +2528,10 @@ function setupTxTab() {
     if (fileInput.files && fileInput.files[0]) loadTxFile(fileInput.files[0]);
   });
 
-  // Drag-drop : sur Linux/WebKitGTK les events HTML5 dragover/drop ne sont
-  // pas remontés de façon fiable (le WM intercepte). On passe par les
-  // events natifs Tauri v2 (dragDropEnabled:true dans tauri.conf.json),
-  // émis au niveau fenêtre.
+  // Drag-drop: on Linux/WebKitGTK the HTML5 dragover/drop events are not
+  // reliably surfaced (the WM intercepts). We use the native Tauri v2
+  // events (dragDropEnabled:true in tauri.conf.json), emitted at the
+  // window level.
   if (window.__TAURI__ && window.__TAURI__.event) {
     const { listen } = window.__TAURI__.event;
     const setOver = (on) => drop.classList.toggle("drag-over", on);
@@ -2552,7 +2552,7 @@ function setupTxTab() {
 
   document.getElementById("tx-mode").addEventListener("change", (ev) => {
     txState.mode = ev.target.value;
-    // Nouveau mode → nouvelle session (session_id RaptorQ dépend du mode).
+    // New mode -> new session (RaptorQ session_id depends on the mode).
     txState.lastTx = null;
     currentSettings.tx_mode = txState.mode;
     persistSettings();
@@ -2606,8 +2606,8 @@ function setupTxTab() {
     }
     markCompressDirty();
   });
-  // change (blur/Enter) : persiste les dimensions libres sans saturer le
-  // disque pendant la frappe.
+  // change (blur/Enter): persist free dimensions without hammering the
+  // disk during typing.
   const persistFree = () => {
     currentSettings.tx_free_w = txState.freeW;
     currentSettings.tx_free_h = txState.freeH;
@@ -2622,8 +2622,8 @@ function setupTxTab() {
     document.getElementById("tx-quality-val").textContent = txState.quality;
     markCompressDirty();
   });
-  // change = mouseup sur le slider : moment naturel pour persister sans
-  // saturer le disque pendant le drag.
+  // change = mouseup on the slider: natural moment to persist without
+  // hammering the disk during the drag.
   quality.addEventListener("change", () => {
     currentSettings.tx_quality = txState.quality;
     persistSettings();
@@ -2670,7 +2670,7 @@ function setupTxTab() {
       }
       currentSettings.tx_repair_pct = txState.repairPct;
       persistSettings();
-      // Refresh estimate : la durée et N dépendent de ce %.
+      // Refresh estimate: duration and N depend on this %.
       refreshTxEstimate().catch(() => {});
       refreshTxButtons();
     });
@@ -2733,10 +2733,10 @@ async function txStart() {
         repair_pct: txState.repairPct,
       },
     });
-    // Après un TX initial, on mémorise l'état session pour activer "More".
-    // Le burst initial émet K + floor(K * pct / 100) packets (cf. CLI
-    // main.rs, division entière Rust). Doit matcher à l'unité près pour
-    // éviter un trou ESI entre l'initial et le premier More.
+    // After an initial TX, we remember the session state to enable "More".
+    // The initial burst emits K + floor(K * pct / 100) packets (cf. CLI
+    // main.rs, Rust integer division). Must match exactly to avoid an
+    // ESI gap between the initial burst and the first More.
     const k = computeK();
     if (k) {
       const pct = txState.repairPct || 0;
@@ -2751,9 +2751,10 @@ async function txStart() {
   }
 }
 
-// K RaptorQ = nombre de codewords source nécessaires au décodage.
-// Fourni directement par le backend via l'estimate (k_source), ou approximé
-// via total_blocks pour compatibilité avec un backend antérieur.
+// K RaptorQ = number of source codewords required for decoding.
+// Provided directly by the backend via the estimate (k_source), or
+// approximated through total_blocks for compatibility with an older
+// backend.
 function computeK() {
   const est = txState.estimate;
   if (!est) return null;
@@ -2762,8 +2763,8 @@ function computeK() {
   return null;
 }
 
-// Nombre de blocs additionnels à émettre en "More" burst. Lu directement
-// depuis l'input numérique (presets via datalist, saisie libre tolérée).
+// Number of additional blocks to emit in a "More" burst. Read directly
+// from the numeric input (presets via datalist, free input allowed).
 function computeMoreCount() {
   const el = document.getElementById("tx-more-count");
   if (!el) return txState.moreCount || 5;
@@ -2797,7 +2798,7 @@ async function txMore() {
   txState.restartRxAfter = rxWasActive;
   txState.txActive = true;
   txState.progress = null;
-  // On retient où on va tomber après ce burst (count packets à partir d'esiStart).
+  // Remember where we'll land after this burst (count packets starting at esiStart).
   txState.lastTx = {
     mode: txState.mode,
     esiMax: esiStart + count - 1,
@@ -2837,8 +2838,8 @@ async function txStop() {
 async function maybeRestartRx() {
   if (!txState.restartRxAfter) return;
   txState.restartRxAfter = false;
-  // Petit délai pour laisser la carte son TX libérer ses handles avant
-  // d'ouvrir la capture RX (surtout si la même carte est utilisée).
+  // Small delay to let the TX sound card release its handles before
+  // opening the RX capture (especially when the same card is used).
   await new Promise((r) => setTimeout(r, 300));
   await startCapture();
 }
@@ -2850,9 +2851,9 @@ function updateTxProgressText() {
   const est = txState.estimate;
   if (!p) {
     if (est) {
-      // K = blocs nécessaires au décodage (RaptorQ source), N = émis (K + repair).
-      // Afficher les deux aide l'utilisateur à comprendre pourquoi la durée
-      // dépasse le strict minimum et combien de marge le repair lui donne.
+      // K = blocks needed for decoding (RaptorQ source), N = emitted (K + repair).
+      // Showing both helps the user understand why the duration goes beyond
+      // the strict minimum and how much margin the repair provides.
       const k = est.k_source != null ? est.k_source : est.total_blocks;
       const n = est.n_initial != null ? est.n_initial : est.total_blocks;
       const dur = fmtSeconds(est.duration_s);
@@ -2871,7 +2872,7 @@ function updateTxProgressText() {
 function onTxProgress(payload) {
   txState.progress = payload;
   updateTxProgressText();
-  // Réutilise la barre de progression du bas (blocs) en mode TX.
+  // Reuse the bottom progress bar (blocks) in TX mode.
   const bitmap = new Uint8Array(Math.ceil((payload.total_blocks || 0) / 8));
   for (let i = 0; i < payload.blocks_sent; i++) {
     bitmap[i >> 3] |= 1 << (i & 7);
@@ -2914,10 +2915,10 @@ async function onTxError(payload) {
   await maybeRestartRx();
 }
 
-// ─────────────────────────────────────────── Onglet Canal (cascade ATT)
-// Phase A : un seul réglage persistant (tx_attenuation_db dans Settings),
-// alimenté soit à la main par le slider, soit par la médiane d'une liste
-// de feedbacks reçus en QSO. Liste cascade : session JS uniquement.
+// ─────────────────────────────────────────── Channel tab (cascade ATT)
+// Phase A: a single persistent setting (tx_attenuation_db in Settings),
+// fed either manually via the slider or by the median of a list of
+// feedbacks received during QSO. Cascade list: JS session only.
 let cascadeFeedback = [];
 
 function attGainStr(db) {
@@ -3070,11 +3071,11 @@ function setupChannelTab() {
   renderCascade();
 }
 
-// ─────────────────────────────────────────── Onglet Historique
-// Vue unifiée TX (fichiers émis, archivés au lancement de chaque tx_start)
-// et RX (sessions décodées). Bouton "↻ Renvoyer" sur chaque vignette pour
-// le mode radio-secours : recharger un fichier dans l'onglet TX et le
-// propager plus loin sur le réseau.
+// ─────────────────────────────────────────── History tab
+// Unified TX (files emitted, archived at each tx_start) and RX (decoded
+// sessions) view. "↻ Relay" button on each thumbnail for the emergency-
+// radio mode: reload a file in the TX tab and propagate it further on
+// the network.
 
 function setupHistoryTab() {
   document
@@ -3115,7 +3116,7 @@ function renderHistoryColumn(items, kind) {
     const card = document.createElement("div");
     card.className = "history-card";
 
-    // Vignette (image ou icône fichier).
+    // Thumbnail (image or file icon).
     const thumb = document.createElement("div");
     thumb.className = "history-card-thumb";
     const previewPath = kind === "tx" ? item.file_path : item.preview_path;
@@ -3261,7 +3262,7 @@ async function init() {
   await loadDevices();
   await loadSerialPorts();
   await loadSaveDir();
-  // Affiche l'état initial de la PTT (calculé par le backend au setup).
+  // Display the initial PTT state (computed by the backend at setup).
   try {
     const st = await window.__TAURI__.core.invoke("ptt_status");
     renderPttStatus(st);
@@ -3279,10 +3280,10 @@ async function init() {
   await refreshRawRecordingState();
   await refreshSessions();
   resetRxVisuals();
-  // #HB9TOB: tick périodique pour effacer le chip OVD si aucun batch overdrive
-  // n'est arrivé depuis OVD_STICKY_MS (utile aussi quand la capture est arrêtée).
+  // #HB9TOB: periodic tick to clear the OVD chip if no overdrive batch
+  // has arrived for OVD_STICKY_MS (also useful when capture is stopped).
   setInterval(refreshOverdriveChip, 200);
-  // Démarre la capture RX automatiquement si une carte est configurée.
+  // Auto-start RX capture if a device is configured.
   await tryAutoStartCapture();
 }
 
