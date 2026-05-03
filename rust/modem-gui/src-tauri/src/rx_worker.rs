@@ -41,7 +41,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-use crate::session_store::{self, SessionStore};
+use modem_worker::session_store::{self, SessionStore};
 
 type WavFileWriter = WavWriter<BufWriter<std::fs::File>>;
 

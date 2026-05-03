@@ -2823,6 +2823,7 @@ dependencies = [
  "hound",
  "image",
  "modem-core",
+ "modem-worker",
  "ravif",
  "reqwest 0.12.28",
  "rgb",

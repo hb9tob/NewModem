@@ -14,5 +14,6 @@
 //! subprocess dependency for TX.
 
 pub mod event_sink;
+pub mod session_store;
 
 pub use event_sink::{EventSink, EventSinkExt, NoopSink, RecordingSink};

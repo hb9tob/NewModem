@@ -5,10 +5,11 @@ mod audio_capture;
 mod collector_client;
 mod ptt;
 mod rx_worker;
-mod session_store;
 mod settings;
 mod tx_encode;
 mod tx_worker;
+
+use modem_worker::session_store;
 
 use audio::{list_input_devices, list_output_devices, DeviceInfo};
 use ptt::SharedPtt;
