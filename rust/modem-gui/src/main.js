@@ -91,11 +91,15 @@ function refreshSettingsRxWarn() {
   const warn = document.getElementById("settings-rx-warn");
   const stopRxBtn = document.getElementById("settings-stop-rx-btn");
   const rxSel = document.getElementById("rx-device-select");
+  const deemph = document.getElementById("rx-deemphasis-enabled");
   if (!warn) return;
   const rxRunning = !!(stopBtn && !stopBtn.disabled);
   warn.hidden = !rxRunning;
   if (stopRxBtn) stopRxBtn.disabled = !rxRunning;
   if (rxSel) rxSel.disabled = rxRunning;
+  // De-emphasis is read at start_capture time; mid-RX changes have no
+  // effect, so we disable the checkbox while RX is running for clarity.
+  if (deemph) deemph.disabled = rxRunning;
 }
 
 // Channel tab: we stop RX and TX in progress on entry. The attenuation
@@ -534,6 +538,7 @@ let currentSettings = {
   ptt_dtr_tx_high: true,
   tx_attenuation_db: 0,
   tx_preemphasis_enabled: false,
+  rx_deemphasis_enabled: false,
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
@@ -648,7 +653,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, rx_deemphasis_enabled: false, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -670,6 +675,8 @@ async function loadSettings() {
   if (histMax) histMax.value = String(currentSettings.tx_history_max ?? 100);
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.checked = !!currentSettings.tx_preemphasis_enabled;
+  const deemph = document.getElementById("rx-deemphasis-enabled");
+  if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
   applyTxSettingsToUI();
 }
 
@@ -937,6 +944,8 @@ async function persistSettings() {
   }
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) currentSettings.tx_preemphasis_enabled = !!preemph.checked;
+  const deemph = document.getElementById("rx-deemphasis-enabled");
+  if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -970,6 +979,8 @@ function setupSettingsTab() {
   }
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.addEventListener("change", persistSettings);
+  const deemph = document.getElementById("rx-deemphasis-enabled");
+  if (deemph) deemph.addEventListener("change", persistSettings);
   const stopRxBtn = document.getElementById("settings-stop-rx-btn");
   if (stopRxBtn) {
     stopRxBtn.addEventListener("click", async () => {

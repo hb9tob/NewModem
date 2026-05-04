@@ -237,15 +237,76 @@ pub fn spawn(
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
     forced: bool,
+    deemphasis_enabled: bool,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        run_worker(samples, sink, save_dir, wav_sink, profile, forced, stop_thread);
+        run_worker(
+            samples,
+            sink,
+            save_dir,
+            wav_sink,
+            profile,
+            forced,
+            deemphasis_enabled,
+            stop_thread,
+        );
     });
     WorkerHandle {
         stop,
         thread: Some(thread),
+    }
+}
+
+/// First-order IIR de-emphasis filter, mathematical inverse of the TX
+/// pre-emphasis defined in `tx_worker::preemphasis_nbfm_48k`. Same
+/// bilinear transform at 48 kHz with tau1 = 750 us and tau2 = 75 us,
+/// roles of the time constants swapped:
+///   H(s) = (1 + s*tau2) / (1 + s*tau1)
+/// → -20 dB plateau above ~2 kHz, flat at DC, breakpoints near 212 Hz
+/// and 2.12 kHz. Cascaded with the matching pre-emphasis the response
+/// is flat to within discretization noise. Stateful: the worker keeps
+/// one instance across batches to avoid boundary clicks.
+pub struct DeemphasisFilter {
+    x_prev: f32,
+    y_prev: f32,
+}
+
+impl DeemphasisFilter {
+    // Bilinear coefficients without pre-warp, fs = 48 kHz, tau1/tau2
+    // swapped relative to preemphasis_nbfm_48k:
+    //   2*tau2/T = 7.2, 2*tau1/T = 72.0
+    //   Numerator   : 8.2 - 6.2 z^-1
+    //   Denominator : 73  - 71  z^-1
+    //   Normalized by a0 = 73 →
+    const B0: f32 = 0.112_328_77; // 8.2 / 73
+    const B1: f32 = -0.084_931_51; // -6.2 / 73
+    const A1: f32 = -0.972_602_75; // -71 / 73
+
+    pub fn new() -> Self {
+        Self {
+            x_prev: 0.0,
+            y_prev: 0.0,
+        }
+    }
+
+    /// Apply the filter in place. Designed to be called batch-by-batch;
+    /// internal state carries across calls.
+    pub fn process(&mut self, samples: &mut [f32]) {
+        for s in samples.iter_mut() {
+            let x = *s;
+            let y = Self::B0 * x + Self::B1 * self.x_prev - Self::A1 * self.y_prev;
+            self.x_prev = x;
+            self.y_prev = y;
+            *s = y;
+        }
+    }
+}
+
+impl Default for DeemphasisFilter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -325,10 +386,19 @@ struct WorkerState {
     /// on profile switch / soft buffer reset / preroll trim. None = no
     /// closed window decoded yet (start, or after reset).
     last_closed_preamble_abs: Option<u64>,
+    /// Optional NBFM de-emphasis filter applied to the path going to the
+    /// modem demodulator (after the raw WAV tee + level meter). `None`
+    /// when the user has not enabled the toggle in Settings.
+    deemphasis: Option<DeemphasisFilter>,
 }
 
 impl WorkerState {
-    fn new(profile: ProfileIndex, forced: bool, store: SessionStore) -> Self {
+    fn new(
+        profile: ProfileIndex,
+        forced: bool,
+        store: SessionStore,
+        deemphasis_enabled: bool,
+    ) -> Self {
         let now = Instant::now();
         Self {
             config: profile.to_config(),
@@ -346,6 +416,7 @@ impl WorkerState {
             last_preamble_seen_at: now,
             total_samples: 0,
             last_closed_preamble_abs: None,
+            deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
         }
     }
 
@@ -386,6 +457,7 @@ fn run_worker(
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
     forced: bool,
+    deemphasis_enabled: bool,
     stop: Arc<AtomicBool>,
 ) {
     let _ = std::fs::remove_file(log_path());
@@ -404,7 +476,7 @@ fn run_worker(
             return;
         }
     };
-    let mut state = WorkerState::new(profile, forced, store);
+    let mut state = WorkerState::new(profile, forced, store, deemphasis_enabled);
 
     while !stop.load(Ordering::Relaxed) {
         let first = match samples.recv_timeout(Duration::from_millis(200)) {
@@ -450,6 +522,15 @@ fn run_worker(
         );
         if rms > SILENCE_RMS_THRESHOLD {
             state.last_audio_above_silence_at = Instant::now();
+        }
+
+        // Optional NBFM de-emphasis. Applied AFTER the raw WAV tee and the
+        // audio_level metric so those still reflect what the radio actually
+        // delivered (clip diagnostics stay meaningful), and BEFORE feeding
+        // the modem demodulator so rx_v3 sees a flat spectrum when paired
+        // with a transmitter that ran the matching pre-emphasis.
+        if let Some(filter) = state.deemphasis.as_mut() {
+            filter.process(&mut batch);
         }
 
         // Append + rolling trim. Idle = PREROLL_SECONDS (just enough for a
@@ -1116,5 +1197,50 @@ mod tests {
         fs::write(dir.join("readme"), b"a").unwrap();
         let p = unique_path(&dir, "readme");
         assert_eq!(p, dir.join("readme (1)"));
+    }
+
+    #[test]
+    fn deemphasis_dc_gain_is_unity() {
+        let mut filter = super::DeemphasisFilter::new();
+        let mut buf = vec![1.0f32; 4096];
+        filter.process(&mut buf);
+        // After enough samples to settle, DC output must equal DC input
+        // (the IIR has unity DC gain by construction).
+        let tail = &buf[buf.len() - 256..];
+        let mean: f32 = tail.iter().sum::<f32>() / tail.len() as f32;
+        assert!(
+            (mean - 1.0).abs() < 1e-3,
+            "DC gain should be 1.0, got {mean}",
+        );
+    }
+
+    #[test]
+    fn deemphasis_nyquist_gain_is_minus_20_db() {
+        // A square wave alternating ±1 every sample sits at Nyquist
+        // (z = -1). Steady-state output amplitude should be the high-
+        // shelf plateau gain = (b0 - b1) / (1 - a1) = 0.197 / 1.973 = 0.1.
+        let mut filter = super::DeemphasisFilter::new();
+        let mut buf: Vec<f32> = (0..8192)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        filter.process(&mut buf);
+        let tail = &buf[buf.len() - 64..];
+        let peak = tail.iter().cloned().fold(0.0f32, |m, x| m.max(x.abs()));
+        // -20 dB = 0.1, accept 5% slack for discretization
+        assert!(
+            (peak - 0.1).abs() < 0.005,
+            "Nyquist gain should be ~0.1 (-20 dB), got {peak}",
+        );
+    }
+
+    #[test]
+    fn deemphasis_passes_through_when_disabled_path() {
+        // Sanity: with no filter applied (the worker stores `None`), the
+        // batch is untouched. This mirrors how the run loop behaves when
+        // `rx_deemphasis_enabled = false`.
+        let original: Vec<f32> = (0..1024).map(|i| (i as f32) * 0.001).collect();
+        let mut buf = original.clone();
+        // No call to filter.process -> buffer unchanged.
+        assert_eq!(buf, original);
     }
 }

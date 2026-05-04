@@ -173,6 +173,7 @@ fn start_capture(
     }
     let (capture, samples) = cpal_capture::start(&device_name)?;
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
+    let cfg = settings::load();
     let worker = rx_worker::spawn(
         samples,
         sink,
@@ -180,6 +181,7 @@ fn start_capture(
         state.wav_sink.clone(),
         profile_idx,
         forced,
+        cfg.rx_deemphasis_enabled,
     );
     *guard = Some(CaptureSession {
         capture,

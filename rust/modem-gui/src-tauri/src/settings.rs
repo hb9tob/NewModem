@@ -35,6 +35,16 @@ pub struct Settings {
     /// peak 0.9 to avoid sound-card clipping. Default: false.
     #[serde(default)]
     pub tx_preemphasis_enabled: bool,
+    /// If true, applies an NBFM de-emphasis -6 dB/octave shelf
+    /// (mathematical inverse of `tx_preemphasis_enabled`, same break
+    /// points ~212 Hz / ~2.12 kHz, plateau -20 dB) to the captured
+    /// audio on the path going to the modem demodulator. The raw WAV
+    /// capture and the audio level meter stay on the unfiltered signal.
+    /// Useful when the receiving transceiver does not apply enough
+    /// de-emphasis (or none) and the high-frequency boost from the
+    /// transmitter side hurts EVM. Default: false.
+    #[serde(default)]
+    pub rx_deemphasis_enabled: bool,
     /// Base URL of the Phase-D collector (e.g. `https://hb9tob-modem.duckdns.org`).
     /// If empty, the post-raw-capture prompt does not appear and submission
     /// is disabled for the session.
@@ -146,6 +156,7 @@ impl Default for Settings {
             ptt_dtr_tx_high: true,
             tx_attenuation_db: 0.0,
             tx_preemphasis_enabled: false,
+            rx_deemphasis_enabled: false,
             collector_url: String::new(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),

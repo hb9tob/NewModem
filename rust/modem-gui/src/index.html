@@ -182,8 +182,8 @@
       <div class="settings-form">
         <div id="settings-rx-warn" class="settings-warn" hidden>
           <span class="settings-warn-text">
-            ⚠ Le RX est en cours. Pour modifier la carte son ou la
-            pré-emphase, il faut d'abord arrêter la réception.
+            ⚠ Le RX est en cours. Pour modifier la carte son RX ou
+            la désemphase, il faut d'abord arrêter la réception.
           </span>
           <button type="button" id="settings-stop-rx-btn">Arrêter le RX</button>
         </div>
@@ -197,6 +197,17 @@
           <select id="rx-device-select">
             <option>Chargement…</option>
           </select>
+          <label class="ptt-row" style="margin-top: 0.5rem;">
+            <input type="checkbox" id="rx-deemphasis-enabled">
+            Désemphase NBFM −6 dB/oct (τ = 750 µs)
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Inverse mathématique exact de la pré-emphase TX (~−13 dB à 1 kHz,
+            ~−18 dB à 2.7 kHz, plateau −20 dB). Capture WAV brute et
+            level-meter inchangés — seul le démod modem voit le signal
+            filtré. À activer si le récepteur radio n'applique pas (ou
+            insuffisamment) la désemphase.
+          </p>
         </fieldset>
         <fieldset>
           <legend>Carte son émission (TX)</legend>
