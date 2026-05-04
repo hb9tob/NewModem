@@ -20,15 +20,6 @@ pub mod ldpc;
 pub mod modulator;
 pub mod frame;
 
-// Transport-agnostic framing modules now live in `modem-framing`. The
-// re-exports keep every existing call site (modem-cli, modem-worker,
-// modem-gui, tests) compiling without modification — they will be
-// retired in a follow-up cleanup phase once all consumers migrate to
-// the direct `modem_framing::*` import path. `crc` moves with them
-// because `app_header::crc16` requires it and modem-framing must not
-// depend on modem-core (would create a cycle).
-pub use modem_framing::{app_header, crc, payload_envelope, raptorq_codec};
-
 pub mod demodulator;
 pub mod sync;
 pub mod ffe;

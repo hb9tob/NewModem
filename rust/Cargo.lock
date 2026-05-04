@@ -2798,6 +2798,7 @@ dependencies = [
  "clap",
  "hound",
  "modem-core",
+ "modem-framing",
 ]
 
 [[package]]
@@ -2832,6 +2833,7 @@ dependencies = [
  "hound",
  "image",
  "modem-core",
+ "modem-framing",
  "modem-io",
  "modem-worker",
  "ravif",
@@ -2863,6 +2865,7 @@ dependencies = [
  "cpal",
  "hound",
  "modem-core",
+ "modem-framing",
  "modem-io",
  "serde",
  "serde_json",

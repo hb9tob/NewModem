@@ -18,9 +18,9 @@ use std::process::Command;
 
 use modem_core::frame::effective_packet_count;
 use modem_core::ldpc::encoder::LdpcEncoder;
-use modem_core::payload_envelope::PayloadEnvelope;
+use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_core::profile::ProfileIndex;
-use modem_core::raptorq_codec::k_from_payload;
+use modem_framing::raptorq_codec::k_from_payload;
 use modem_core::traits::{EncodeRequest, Modem};
 use modem_core::v3_modem::V3Modem;
 
@@ -114,7 +114,7 @@ fn cli_and_v3modem_produce_identical_samples() {
         profile: profile_name,
         wire_payload: &wire_payload,
         session_id,
-        mime_type: modem_core::app_header::mime::BINARY,
+        mime_type: modem_framing::app_header::mime::BINARY,
         hash_short: fnv_short(&wire_payload),
         esi_start: 0,
         n_packets: n_total,

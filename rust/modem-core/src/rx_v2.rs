@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::app_header::{self, AppHeader};
+use modem_framing::app_header::{self, AppHeader};
 use crate::demodulator;
 use crate::ffe;
 use crate::frame::{self, HEADER_VERSION_V3, V2_CODEWORDS_PER_SEGMENT};
@@ -772,7 +772,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let mut assembled: Vec<u8> = Vec::new();
     if let Some(ref h) = app_hdr {
         if let Some(payload) =
-            crate::raptorq_codec::try_decode(&cw_bytes, h.file_size, h.t_bytes as u16)
+            modem_framing::raptorq_codec::try_decode(&cw_bytes, h.file_size, h.t_bytes as u16)
         {
             assembled = payload;
         } else {
@@ -986,7 +986,7 @@ pub fn rx_v3_after(
     let mut assembled: Vec<u8> = Vec::new();
     if let Some(ref h) = app_hdr {
         if let Some(payload) =
-            crate::raptorq_codec::try_decode(&merged, h.file_size, h.t_bytes as u16)
+            modem_framing::raptorq_codec::try_decode(&merged, h.file_size, h.t_bytes as u16)
         {
             assembled = payload;
         } else {
@@ -1196,7 +1196,7 @@ fn track_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_header::mime;
+    use modem_framing::app_header::mime;
     use crate::modulator;
     use crate::profile::profile_high;
 
@@ -1509,7 +1509,7 @@ mod tests {
                 .expect("profile");
         let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
         let main_syms = frame::build_superframe_v3(
-            &data, &config, session, crate::app_header::mime::BINARY, make_session_hash(&data),
+            &data, &config, session, modem_framing::app_header::mime::BINARY, make_session_hash(&data),
         );
         let main_audio = crate::modulator::modulate(&main_syms, sps, pitch, &taps, config.center_freq_hz);
         let eot_syms = frame::build_eot_frame(&config, session);
@@ -1534,9 +1534,9 @@ mod tests {
     /// against the same session_id. The concatenated audio stream, fed as a
     /// single input to rx_v3, must decode from the union of packets.
     #[test]
-    fn loopback_v3_two_bursts_continuing_esi() {        use crate::app_header::mime;
+    fn loopback_v3_two_bursts_continuing_esi() {        use modem_framing::app_header::mime;
         use crate::ldpc::encoder::LdpcEncoder;
-        use crate::raptorq_codec;
+        use modem_framing::raptorq_codec;
 
         let config = profile_high();
         let data: Vec<u8> = (0..3_000)
@@ -1597,7 +1597,7 @@ mod tests {
     /// on session 2dc17ae3).
     #[test]
     fn rx_v3_normal_decoded_with_high_config_exposes_profile_index() {
-        use crate::app_header::mime;
+        use modem_framing::app_header::mime;
         use crate::profile::{profile_high, profile_normal, ProfileIndex};
         let normal = profile_normal();
         let data: Vec<u8> = (0..2000)
@@ -1634,9 +1634,9 @@ mod tests {
     /// lost. RaptorQ no longer converges.
     #[test]
     fn loopback_v3_high_odd_n_total_recovers_last_block() {
-        use crate::app_header::mime;
+        use modem_framing::app_header::mime;
         use crate::ldpc::encoder::LdpcEncoder;
-        use crate::raptorq_codec;
+        use modem_framing::raptorq_codec;
         let config = profile_high();
         let k_bytes = LdpcEncoder::new(config.ldpc_rate).k() / 8;
         // 4003 B -> K = ceil(4003/216) = 19 (odd). With n_packets = K

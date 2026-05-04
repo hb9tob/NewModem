@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 modem-core = { path = "../modem-core" }
+modem-framing = { path = "../modem-framing" }
 hound = { workspace = true }
 clap = { workspace = true }

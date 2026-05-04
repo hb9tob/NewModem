@@ -4,7 +4,7 @@
 //! like DVB-S2 PLHEADER (always pi/2-BPSK).
 
 use crate::constellation::qpsk_gray;
-use crate::crc::crc8;
+use modem_framing::crc::crc8;
 use crate::golay::{golay_decode, golay_encode};
 use crate::profile::ModemConfig;
 use crate::types::Complex64;

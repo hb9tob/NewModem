@@ -573,9 +573,9 @@ fn list_tx_history(state: State<'_, AppState>) -> Result<Vec<TxHistoryItem>, Str
         let Some(payload) = payload_path else { continue };
         let size_bytes = payload.metadata().map(|m| m.len()).unwrap_or(0);
         let is_image =
-            meta.mime_type == modem_core::app_header::mime::IMAGE_AVIF
-                || meta.mime_type == modem_core::app_header::mime::IMAGE_JPEG
-                || meta.mime_type == modem_core::app_header::mime::IMAGE_PNG;
+            meta.mime_type == modem_framing::app_header::mime::IMAGE_AVIF
+                || meta.mime_type == modem_framing::app_header::mime::IMAGE_JPEG
+                || meta.mime_type == modem_framing::app_header::mime::IMAGE_PNG;
         items.push(TxHistoryItem {
             timestamp: meta.timestamp,
             mode: meta.mode,
@@ -597,9 +597,9 @@ fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, Str
     let mut items: Vec<RxHistoryItem> = Vec::new();
     for meta in store.list_all().into_iter().filter(|m| m.decoded) {
         let mime = meta.mime_type;
-        let is_image = mime == modem_core::app_header::mime::IMAGE_AVIF
-            || mime == modem_core::app_header::mime::IMAGE_JPEG
-            || mime == modem_core::app_header::mime::IMAGE_PNG;
+        let is_image = mime == modem_framing::app_header::mime::IMAGE_AVIF
+            || mime == modem_framing::app_header::mime::IMAGE_JPEG
+            || mime == modem_framing::app_header::mime::IMAGE_PNG;
         let display_filename = meta.filename.clone().unwrap_or_else(|| {
             format!("session-{:08x}.bin", meta.session_id)
         });

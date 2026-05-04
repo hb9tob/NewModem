@@ -30,7 +30,7 @@
 //! position-dependent phase offset in the stream.
 
 use crate::constellation::qpsk_gray;
-use crate::crc::crc8;
+use modem_framing::crc::crc8;
 use crate::golay::{golay_decode, golay_encode};
 use crate::types::Complex64;
 

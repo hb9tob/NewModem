@@ -230,7 +230,7 @@ fn main() {
                 eprintln!("TX error: --callsign is required (e.g. HB9TOB)");
                 std::process::exit(1);
             });
-            let envelope = modem_core::payload_envelope::PayloadEnvelope::new(
+            let envelope = modem_framing::payload_envelope::PayloadEnvelope::new(
                 &fname,
                 &qrz,
                 data.clone(),
@@ -250,7 +250,7 @@ fn main() {
                 .as_deref()
                 .map(parse_explicit_session_id)
                 .unwrap_or_else(|| {
-                    modem_core::app_header::compute_session_id(
+                    modem_framing::app_header::compute_session_id(
                         &wire_payload,
                         config.mode_code(),
                         profile_index,
@@ -266,7 +266,7 @@ fn main() {
             let k_bytes_for_plan =
                 modem_core::ldpc::encoder::LdpcEncoder::new(config.ldpc_rate).k() / 8;
             let k_src =
-                modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes_for_plan)
+                modem_framing::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes_for_plan)
                     as u32;
             // n_total rounded so the last data segment is always complete;
             // otherwise the RX loses that final CW (cf. effective_packet_count).
@@ -373,7 +373,7 @@ fn main() {
                 eprintln!("tx-more error: --callsign required");
                 std::process::exit(1);
             });
-            let envelope = modem_core::payload_envelope::PayloadEnvelope::new(
+            let envelope = modem_framing::payload_envelope::PayloadEnvelope::new(
                 &fname, &qrz, data.clone(),
             )
             .unwrap_or_else(|| {
@@ -387,7 +387,7 @@ fn main() {
                 .as_deref()
                 .map(parse_explicit_session_id)
                 .unwrap_or_else(|| {
-                    modem_core::app_header::compute_session_id(
+                    modem_framing::app_header::compute_session_id(
                         &wire_payload,
                         config.mode_code(),
                         profile_index,
@@ -402,7 +402,7 @@ fn main() {
             // path is kept for backwards-compat and CLI scripting.
             let k_bytes = modem_core::profile::LdpcRate::k(config.ldpc_rate) / 8;
             let k =
-                modem_core::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes) as u32;
+                modem_framing::raptorq_codec::k_from_payload(wire_payload.len(), k_bytes) as u32;
             let n_packets_raw = match count {
                 Some(c) => c,
                 None => (k * pct) / 100,
@@ -540,7 +540,7 @@ fn main() {
                         );
                     }
 
-                    let envelope = modem_core::payload_envelope::PayloadEnvelope::decode_or_fallback(
+                    let envelope = modem_framing::payload_envelope::PayloadEnvelope::decode_or_fallback(
                         &result.data,
                     );
                     if envelope.version == 0 {
@@ -629,8 +629,8 @@ fn infer_filename(path: &PathBuf) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
         .map(|s| {
-            if s.len() > modem_core::payload_envelope::MAX_FILENAME_BYTES {
-                let max = modem_core::payload_envelope::MAX_FILENAME_BYTES;
+            if s.len() > modem_framing::payload_envelope::MAX_FILENAME_BYTES {
+                let max = modem_framing::payload_envelope::MAX_FILENAME_BYTES;
                 let (stem, ext) = s.rfind('.').map(|i| s.split_at(i)).unwrap_or((s, ""));
                 let keep = max.saturating_sub(ext.len());
                 format!("{}{}", &stem[..keep.min(stem.len())], ext)
@@ -642,7 +642,7 @@ fn infer_filename(path: &PathBuf) -> String {
 }
 
 fn infer_mime(path: &PathBuf) -> u8 {
-    use modem_core::app_header::mime;
+    use modem_framing::app_header::mime;
     match path
         .extension()
         .and_then(|e| e.to_str())

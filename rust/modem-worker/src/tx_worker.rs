@@ -22,13 +22,15 @@
 //!   - tx_error     { message }
 
 use modem_core::{
-    app_header::{self, mime},
-    payload_envelope::PayloadEnvelope,
     profile::{self, ModemConfig, ProfileIndex},
-    raptorq_codec::k_from_payload,
     traits::{EncodeRequest, Modem},
     types::AUDIO_RATE,
     v3_modem::V3Modem,
+};
+use modem_framing::{
+    app_header::{self, mime},
+    payload_envelope::PayloadEnvelope,
+    raptorq_codec::k_from_payload,
 };
 use modem_io::{CpalSink, SampleSink};
 use serde::Serialize;
@@ -639,9 +641,9 @@ pub fn archive_payload(
         .and_then(|s| s.to_str())
         .unwrap_or("bin");
     let mime_type: u8 = match ext {
-        "avif" => modem_core::app_header::mime::IMAGE_AVIF,
-        "zst" => modem_core::app_header::mime::ZSTD,
-        _ => modem_core::app_header::mime::BINARY,
+        "avif" => modem_framing::app_header::mime::IMAGE_AVIF,
+        "zst" => modem_framing::app_header::mime::ZSTD,
+        _ => modem_framing::app_header::mime::BINARY,
     };
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

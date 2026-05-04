@@ -20,9 +20,9 @@
 //! - Session is never "closed" — only removed by the user (rm -rf) or by the
 //!   24 h cleanup on next boot.
 
-use modem_core::app_header::AppHeader;
+use modem_framing::app_header::AppHeader;
 use modem_core::profile::ProfileIndex;
-use modem_core::raptorq_codec;
+use modem_framing::raptorq_codec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -349,7 +349,7 @@ impl SessionStore {
                 } else {
                     state.meta.decoded = true;
                     // Best-effort meta enrichment with envelope fields.
-                    let env = modem_core::payload_envelope::PayloadEnvelope::decode_or_fallback(&payload);
+                    let env = modem_framing::payload_envelope::PayloadEnvelope::decode_or_fallback(&payload);
                     if env.version != 0 {
                         state.meta.callsign = Some(env.callsign.clone());
                         state.meta.filename = Some(env.filename.clone());
@@ -434,7 +434,7 @@ fn build_seen_bitmap(seen: &HashSet<u32>, k: u32) -> Vec<u8> {
 
 /// Map a MIME byte to a file extension for the decoded file.
 fn mime_ext(mime: u8) -> &'static str {
-    use modem_core::app_header::mime;
+    use modem_framing::app_header::mime;
     match mime {
         mime::TEXT => "txt",
         mime::IMAGE_AVIF => "avif",
@@ -450,8 +450,8 @@ fn mime_ext(mime: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modem_core::app_header::mime;
-    use modem_core::raptorq_codec;
+    use modem_framing::app_header::mime;
+    use modem_framing::raptorq_codec;
 
     fn tmp_dir(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

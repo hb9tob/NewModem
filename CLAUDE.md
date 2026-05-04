@@ -39,7 +39,23 @@ Conception d'un modem audio pour transmission d'images sur canal radio amateur N
 ```
 study/          # Scripts d'étude et caractérisation du canal
 results/        # Données CSV et graphiques générés
+rust/           # Cargo workspace (4 crates en couches + GUI + CLI)
+  modem-core/      # Transport: constellations, RRC, LDPC, FFE, DD-PLL,
+                   # superframe V3, Modem trait + V3Modem (one impl today)
+  modem-framing/   # Transport-agnostic framing: PayloadEnvelope,
+                   # AppHeader, RaptorQ codec, CRC. No DSP, no IO.
+  modem-io/        # Sample IO: SampleSink trait + CpalSink + cpal
+                   # device enumeration / capture (libiio-Pluto later).
+  modem-worker/    # GUI-agnostic TX/RX orchestration: tx_worker (in-proc
+                   # via V3Modem.encode_to_samples), rx_worker (sliding
+                   # window), session_store, ptt, EventSink trait.
+  modem-cli/       # `nbfm-modem` CLI binary (WAV TX/RX).
+  modem-gui/       # Tauri 2 GUI (RX-focused, TX in-process).
 ```
+
+Dependency direction (no cycles): `modem-framing` ← `modem-core` ← `modem-worker` → `modem-io`. CLI/GUI sit on top, depend on `modem-core` + `modem-framing` + `modem-io` (+ `modem-worker` for the GUI).
+
+When adding a new mode: edit `ProfileIndex::ALL` and the matching arm in `profile::config_by_name` (single source of truth — the GUI combos read `Modem::list_profiles()`).
 
 ## Canal NBFM — paramètres de référence (défauts GNU Radio)
 

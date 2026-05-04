@@ -10,7 +10,7 @@
 //! input bytes → split into LDPC info blocks → LDPC encode → interleave → symbol map
 //!             → TDM pilot insertion → prepend preamble + header
 
-use crate::app_header::{self, AppHeader};
+use modem_framing::app_header::{self, AppHeader};
 use crate::constellation::{self, Constellation};
 use crate::header::{self, Header, FLAG_EOT, FLAG_LAST};
 use crate::interleaver;
@@ -142,8 +142,8 @@ pub fn build_superframe_v3(
     hash_short: u16,
 ) -> Vec<Complex64> {
     let k_bytes = LdpcEncoder::new(config.ldpc_rate).k() / 8;
-    let k_source = crate::raptorq_codec::k_from_payload(data.len(), k_bytes) as u32;
-    let n_total = k_source + crate::raptorq_codec::n_repair_default(k_source);
+    let k_source = modem_framing::raptorq_codec::k_from_payload(data.len(), k_bytes) as u32;
+    let n_total = k_source + modem_framing::raptorq_codec::n_repair_default(k_source);
     build_superframe_v3_range(data, config, session_id, mime_type, hash_short, 0, n_total)
 }
 
@@ -178,13 +178,13 @@ pub fn build_superframe_v3_range(
     // partial segments). For an even `n_packets` this is a no-op.
     let n_packets = effective_packet_count(n_packets);
     // Generate exactly the packets asked for.
-    let packets = crate::raptorq_codec::encode_packets_range(
+    let packets = modem_framing::raptorq_codec::encode_packets_range(
         data,
         k_bytes as u16,
         esi_start,
         n_packets,
     );
-    let k_source = crate::raptorq_codec::k_from_payload(data.len(), k_bytes);
+    let k_source = modem_framing::raptorq_codec::k_from_payload(data.len(), k_bytes);
     let n_data_cw = packets.len();
 
     let mut data_cw_syms: Vec<Vec<Complex64>> = Vec::with_capacity(n_data_cw);
@@ -483,7 +483,7 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_header::mime;
+    use modem_framing::app_header::mime;
     use crate::profile::profile_normal;
 
     #[test]
@@ -545,8 +545,8 @@ mod tests {
                 let actual_symbols =
                     build_superframe_v3(&data, config, 0xDEAD_BEEF, mime::BINARY, 0x1234);
                 let k_bytes = config.ldpc_rate.k() / 8;
-                let k_source = crate::raptorq_codec::k_from_payload(size, k_bytes) as u32;
-                let n_total = k_source + crate::raptorq_codec::n_repair_default(k_source);
+                let k_source = modem_framing::raptorq_codec::k_from_payload(size, k_bytes) as u32;
+                let n_total = k_source + modem_framing::raptorq_codec::n_repair_default(k_source);
                 let predicted = superframe_total_symbols(config, n_total);
                 assert_eq!(
                     actual_symbols.len(),

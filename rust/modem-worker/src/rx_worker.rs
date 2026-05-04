@@ -25,7 +25,7 @@
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use modem_core::header::Header;
-use modem_core::payload_envelope::PayloadEnvelope;
+use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_core::profile::{ModemConfig, ProfileIndex};
 use modem_core::rx_v2;
 use modem_core::types::AUDIO_RATE;
@@ -956,9 +956,9 @@ fn emit_decoded_file(
     // If the payload is zstd-compressed (the "non-image file" case), we
     // decompress before writing. The envelope's filename is the original
     // one (without the `.zst` suffix), so we write it as-is.
-    let (final_content, final_mime) = if df.meta.mime_type == modem_core::app_header::mime::ZSTD {
+    let (final_content, final_mime) = if df.meta.mime_type == modem_framing::app_header::mime::ZSTD {
         match zstd::stream::decode_all(content.as_slice()) {
-            Ok(decoded) => (decoded, modem_core::app_header::mime::BINARY),
+            Ok(decoded) => (decoded, modem_framing::app_header::mime::BINARY),
             Err(e) => {
                 sink.emit(
                     "error",
