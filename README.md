@@ -7,8 +7,10 @@
 ## Français
 
 Modem audio pour transmission d'images via relais NBFM radio amateur.
-Modem single-carrier broadcast (point-multipoint, sans ARQ) visant un débit
-de 3-4 kb/s net dans le plateau audio NBFM.
+Modem single-carrier broadcast (point-multipoint, sans ARQ) couvrant
+~444 bps (ULTRA, QPSK lent) à ~6 kb/s net (HIGH++ expérimental, 64-APSK)
+dans le plateau audio NBFM. Sweet spot autour de 4-5 kb/s avec
+HIGH / HIGH56 / HIGH+, sélectionnable selon les conditions du canal.
 
 ### Canal
 
@@ -29,30 +31,50 @@ mode data — voir [rapport canal](rapport_canal_nbfm.html).
 Design single-carrier inspiré du modem QO-100 d'EA4GPZ (HSMODEM), avec
 LDPC WiMAX 2304 (LNMS) et chaîne RX FSE T/2 + DD-PLL + soft demap LLR.
 
-Sept profils sélectionnables (`rust/modem-core/src/profile.rs`) — cinq
-stables auto-détectés et deux expérimentaux qui demandent un mode forcé
-côté RX :
+Dix profils sélectionnables (`rust/modem-core/src/profile.rs`) — six
+standards auto-détectés et quatre expérimentaux qui demandent un mode
+forcé côté RX :
 
-| Profil | Constellation | Rs (Bd) | β | τ | LDPC | Net brut |
-|---|---|---|---|---|---|---|
-| ULTRA  | QPSK     | 500  | 0.25 | 1.0   | 1/2 | ~444 bps |
-| ROBUST | QPSK     | 1000 | 0.25 | 1.0   | 1/2 | ~941 bps |
-| NORMAL | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 | ~2 117 bps |
-| HIGH   | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 | ~4 235 bps |
-| MEGA   | 16-APSK  | 1500 | 0.20 | 30/32 | 3/4 | ~3 971 bps |
-| **HIGH+** ⚠ | **32-APSK DVB-S2** | 1500 | 0.20 | 1.0 | 3/4 | **~5 294 bps** |
-| **FAST** ⚠  | 16-APSK | **1714** (sps=28) | **0.15** | 1.0 | 3/4 | **~4 840 bps** |
+| Profil | Constellation | Rs (Bd) | β | τ | LDPC | Pilotes | Net |
+|---|---|---|---|---|---|---|---|
+| ULTRA   | QPSK     | 500  | 0.25 | 1.0   | 1/2 | 16/2 | ~444 bps |
+| ROBUST  | QPSK     | 1000 | 0.25 | 1.0   | 1/2 | 32/2 | ~941 bps |
+| NORMAL  | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 | 32/2 | ~2 118 bps |
+| HIGH    | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 | 32/2 | ~4 235 bps |
+| HIGH56  | 16-APSK  | 1500 | 0.20 | 1.0   | 5/6 | 32/2 | ~4 706 bps |
+| HIGH+   | 32-APSK DVB-S2 | 1500 | 0.20 | 1.0 | 3/4 | 32/2 | ~5 294 bps |
+| **MEGA** ⚠   | 16-APSK | 1500 | 0.20 | **30/32** | 3/4 | 32/2 | **~3 971 bps** |
+| **FAST** ⚠   | 16-APSK | **1714** (sps=28) | **0.15** | 1.0 | 3/4 | 32/2 | **~4 840 bps** |
+| **HIGH+56** ⚠ | 32-APSK | 1500 | 0.20 | 1.0 | **5/6** | 32/2 | **~5 882 bps** |
+| **HIGH++** ⚠ | **64-APSK DVB-S2X** (4+12+20+28) | 1500 | 0.20 | 1.0 | 3/4 | 16/2 | **~6 000 bps** |
 
-Le sweet spot **Rs=1500 Bd, β=0.20** tient dans la BW utile NBFM ; MEGA
-ajoute du FTN (τ<1) pour pousser le débit. Voir [rapport modem SC](rapport_modem.html)
-et [rapport 16-APSK + FTN](rapport_apsk16_ftn.html).
+Le sweet spot **Rs=1500 Bd, β=0.20** tient dans la BW utile NBFM. La
+colonne **Pilotes** donne le pattern TDM (data/pilot par groupe) : 32/2
+par défaut, 16/2 densifié sur ULTRA (drift sub-Nyquist) et HIGH++
+(dmin réduite en 64-APSK). **HIGH56** est le profil par défaut côté GUI.
+Voir [rapport modem SC](rapport_modem.html) et
+[rapport 16-APSK + FTN](rapport_apsk16_ftn.html).
 
-⚠ **Profils expérimentaux HIGH+ et FAST** — validés OTA à 100 % sur
-relais NBFM dans nos tests. Hors auto-détection : le pair RX doit
+⚠ **Profils expérimentaux** — hors auto-détection : le pair RX doit
 activer "Forcer un profil" dans l'onglet RX et choisir le même mode.
-HIGH+ utilise la constellation 32-APSK DVB-S2 (rayons γ1=2.84, γ2=5.27
-pour LDPC 3/4 — table 10 ETSI EN 302 307-1). FAST resserre β et pousse
-Rs pour gagner ~14 % vs HIGH sans changer la constellation.
+Quatre stratégies pour pousser le débit :
+
+- **MEGA** — 16-APSK avec FTN τ=30/32. Gain marginal sur HIGH au prix
+  d'un récepteur plus exigeant ; laissé en expérimental après promotion
+  de HIGH+ comme standard.
+- **FAST** — resserre β à 0.15 et pousse Rs à 1714 Bd (sps=28 entier
+  à 48 kHz) pour gagner ~14 % vs HIGH sans changer la constellation.
+- **HIGH+56** — combine la constellation 32-APSK et le LDPC 5/6
+  (rendements cumulés). +11 % vs HIGH+ au prix d'environ 0.7 dB de
+  marge LDPC en moins.
+- **HIGH++** — 64-APSK DVB-S2X (rayons γ1=2.4, γ2=4.3, γ3=7.0, table
+  13f EN 302 307-2 V1.4.1). Constellation la plus dense livrée à ce
+  jour ; pilotes densifiés 16/2 indispensables pour soutenir le
+  tracking de phase à dmin réduite.
+
+HIGH+ a été promu standard après validation OTA répétée sur HB9MM.
+Les rayons APSK utilisés : HIGH+ → γ1=2.84, γ2=5.27 (table 10
+EN 302 307-1, LDPC 3/4) ; HIGH++ → γ1/γ2/γ3 listés ci-dessus.
 
 ### Simulateur de canal
 
@@ -208,8 +230,10 @@ Les bancs `study/*.py` utilisent radioconda :
 ## English
 
 Audio modem for image transmission over amateur-radio NBFM repeaters.
-Single-carrier broadcast modem (point-to-multipoint, no ARQ) targeting a
-3-4 kb/s net throughput inside the NBFM audio plateau.
+Single-carrier broadcast modem (point-to-multipoint, no ARQ) covering
+~444 bps (ULTRA, slow QPSK) up to ~6 kb/s net (HIGH++ experimental,
+64-APSK) inside the NBFM audio plateau. Sweet spot around 4-5 kb/s with
+HIGH / HIGH56 / HIGH+, picked according to channel conditions.
 
 ### Channel
 
@@ -231,30 +255,51 @@ Single-carrier design inspired by EA4GPZ's QO-100 modem (HSMODEM), with
 WiMAX 2304 LDPC (LNMS) and an RX chain built on FSE T/2 + DD-PLL + soft
 LLR demap.
 
-Seven selectable profiles (`rust/modem-core/src/profile.rs`) — five
-stable ones with auto-detection plus two experimental that require
+Ten selectable profiles (`rust/modem-core/src/profile.rs`) — six
+standard ones with auto-detection plus four experimental that require
 forced-mode RX:
 
-| Profile | Constellation | Rs (Bd) | β | τ | LDPC | Net |
-|---|---|---|---|---|---|---|
-| ULTRA  | QPSK     | 500  | 0.25 | 1.0   | 1/2 | ~444 bps |
-| ROBUST | QPSK     | 1000 | 0.25 | 1.0   | 1/2 | ~941 bps |
-| NORMAL | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 | ~2,117 bps |
-| HIGH   | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 | ~4,235 bps |
-| MEGA   | 16-APSK  | 1500 | 0.20 | 30/32 | 3/4 | ~3,971 bps |
-| **HIGH+** ⚠ | **32-APSK DVB-S2** | 1500 | 0.20 | 1.0 | 3/4 | **~5,294 bps** |
-| **FAST** ⚠  | 16-APSK | **1714** (sps=28) | **0.15** | 1.0 | 3/4 | **~4,840 bps** |
+| Profile | Constellation | Rs (Bd) | β | τ | LDPC | Pilots | Net |
+|---|---|---|---|---|---|---|---|
+| ULTRA   | QPSK     | 500  | 0.25 | 1.0   | 1/2 | 16/2 | ~444 bps |
+| ROBUST  | QPSK     | 1000 | 0.25 | 1.0   | 1/2 | 32/2 | ~941 bps |
+| NORMAL  | 8-PSK    | 1500 | 0.20 | 1.0   | 1/2 | 32/2 | ~2,118 bps |
+| HIGH    | 16-APSK  | 1500 | 0.20 | 1.0   | 3/4 | 32/2 | ~4,235 bps |
+| HIGH56  | 16-APSK  | 1500 | 0.20 | 1.0   | 5/6 | 32/2 | ~4,706 bps |
+| HIGH+   | 32-APSK DVB-S2 | 1500 | 0.20 | 1.0 | 3/4 | 32/2 | ~5,294 bps |
+| **MEGA** ⚠   | 16-APSK | 1500 | 0.20 | **30/32** | 3/4 | 32/2 | **~3,971 bps** |
+| **FAST** ⚠   | 16-APSK | **1714** (sps=28) | **0.15** | 1.0 | 3/4 | 32/2 | **~4,840 bps** |
+| **HIGH+56** ⚠ | 32-APSK | 1500 | 0.20 | 1.0 | **5/6** | 32/2 | **~5,882 bps** |
+| **HIGH++** ⚠ | **64-APSK DVB-S2X** (4+12+20+28) | 1500 | 0.20 | 1.0 | 3/4 | 16/2 | **~6,000 bps** |
 
-The **Rs=1500 Bd, β=0.20** sweet spot fits inside the NBFM audio plateau;
-MEGA layers FTN (τ<1) on top to push throughput. See
-[SC modem report](rapport_modem.html) and [16-APSK + FTN report](rapport_apsk16_ftn.html).
+The **Rs=1500 Bd, β=0.20** sweet spot fits inside the NBFM audio plateau.
+The **Pilots** column gives the TDM pattern (data/pilot per group):
+32/2 by default, 16/2 densified on ULTRA (sub-Nyquist drift) and HIGH++
+(reduced dmin in 64-APSK). **HIGH56** is the GUI default. See
+[SC modem report](rapport_modem.html) and
+[16-APSK + FTN report](rapport_apsk16_ftn.html).
 
-⚠ **Experimental profiles HIGH+ and FAST** — validated OTA at 100 % on
-NBFM repeaters in our tests. Excluded from auto-detection: the RX peer
+⚠ **Experimental profiles** — excluded from auto-detection: the RX peer
 must enable "Forcer un profil" in the RX tab and pick the same mode.
-HIGH+ uses the DVB-S2 32-APSK constellation (radii γ1=2.84, γ2=5.27 for
-LDPC 3/4 — table 10 in ETSI EN 302 307-1). FAST tightens β and bumps Rs
-to gain ~14 % over HIGH without changing the constellation.
+Four strategies to push throughput:
+
+- **MEGA** — 16-APSK with FTN τ=30/32. Marginal gain over HIGH at the
+  cost of a more demanding receiver; kept experimental after HIGH+ was
+  promoted to standard.
+- **FAST** — tightens β to 0.15 and bumps Rs to 1714 Bd (integer
+  sps=28 at 48 kHz) to gain ~14 % over HIGH without changing the
+  constellation.
+- **HIGH+56** — combines the 32-APSK constellation and LDPC 5/6
+  (compounded throughput). +11 % over HIGH+ at the cost of about
+  0.7 dB less LDPC margin.
+- **HIGH++** — 64-APSK DVB-S2X (radii γ1=2.4, γ2=4.3, γ3=7.0 from
+  table 13f in EN 302 307-2 V1.4.1). Densest constellation shipped so
+  far; densified pilots 16/2 are required to support phase tracking at
+  reduced dmin.
+
+HIGH+ was promoted to standard after repeated OTA validation on HB9MM.
+APSK radii used: HIGH+ → γ1=2.84, γ2=5.27 (table 10 EN 302 307-1, LDPC
+3/4); HIGH++ → γ1/γ2/γ3 listed above.
 
 ### Channel simulator
 
