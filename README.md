@@ -187,6 +187,36 @@ Détails et dépannage : [`rust/modem-gui/BUILD_DEBIAN.md`](rust/modem-gui/BUILD
 ./make-portable.sh "" --skip-build   # saute les cargo build
 ```
 
+### Build — Raspberry Pi 5 (Debian 13 trixie, 7" écran tactile)
+
+Build natif identique au flux Linux ci-dessus, avec deux particularités :
+
+- L'apt-rust de Debian 13 fournit Rust 1.85, **insuffisant** pour la
+  crate `raptorq` 2.0.1 qui requiert ≥ 1.88 (`let-chains`,
+  `unsigned_is_multiple_of`). Passer par `rustup` :
+
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  source "$HOME/.cargo/env"
+  ```
+
+- Pour l'écran officiel Raspberry Pi 7" (DSI 800×480), un **build kiosk
+  dédié** active automatiquement plein écran sans bordure et un layout
+  compact via `@media (max-width: 900px)` :
+
+  ```bash
+  cd rust/modem-gui/src-tauri
+  cargo tauri build --bundles deb --config configs/tauri.pi.conf.json
+  ```
+
+  Le `.desktop` produit injecte `Exec=env NBFM_KIOSK=1 …` ; au
+  démarrage le binaire Rust détecte cette variable et applique
+  `set_fullscreen` + `set_decorations(false)`. Bouton ✕ dans la barre
+  d'onglets pour quitter, **Échap** pour basculer plein écran ↔
+  fenêtré. Build standard sans `--config` = comportement desktop
+  classique. Détails :
+  [`rust/modem-gui/src-tauri/configs/README.md`](rust/modem-gui/src-tauri/configs/README.md).
+
 ### Build — Windows 10/11 (MSVC)
 
 **Pré-requis :**
@@ -442,6 +472,35 @@ Details and troubleshooting: [`rust/modem-gui/BUILD_DEBIAN.md`](rust/modem-gui/B
 ./make-portable.sh v0.1.0-test       # explicit tag
 ./make-portable.sh "" --skip-build   # skip cargo build
 ```
+
+### Build — Raspberry Pi 5 (Debian 13 trixie, 7" touchscreen)
+
+Native build identical to the Linux flow above, with two specifics:
+
+- Debian 13's apt-rust ships Rust 1.85, **too old** for the `raptorq`
+  2.0.1 crate (which requires ≥ 1.88 — `let-chains`,
+  `unsigned_is_multiple_of`). Use `rustup`:
+
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  source "$HOME/.cargo/env"
+  ```
+
+- For the official Raspberry Pi 7" touchscreen (DSI 800×480), a
+  **dedicated kiosk build** auto-engages borderless fullscreen and a
+  compact layout through `@media (max-width: 900px)`:
+
+  ```bash
+  cd rust/modem-gui/src-tauri
+  cargo tauri build --bundles deb --config configs/tauri.pi.conf.json
+  ```
+
+  The bundled `.desktop` injects `Exec=env NBFM_KIOSK=1 …`; the Rust
+  binary detects this env var at startup and applies `set_fullscreen`
+  + `set_decorations(false)`. A ✕ button in the tab bar quits,
+  **Escape** toggles fullscreen ↔ windowed. Standard build without
+  `--config` keeps the desktop behavior. See
+  [`rust/modem-gui/src-tauri/configs/README.md`](rust/modem-gui/src-tauri/configs/README.md).
 
 ### Build — Windows 10/11 (MSVC)
 

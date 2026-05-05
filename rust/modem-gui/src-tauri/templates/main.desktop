@@ -1,0 +1,9 @@
+[Desktop Entry]
+Categories={{categories}}
+Comment={{comment}}
+Exec=env NBFM_KIOSK=1 {{exec}}
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name=NBFM Modem RX
+Terminal=false
+Type=Application

@@ -1793,3 +1793,153 @@ select option.experimental-option {
   font-style: italic;
   margin-left: auto;
 }
+
+
+/* ============================================================
+   Kiosk-mode exit button — only visible when the Rust backend
+   has emitted `kiosk_mode` (small touchscreen detected, or env
+   `NBFM_KIOSK=1` set).
+   ============================================================ */
+.kiosk-only { display: none; }
+body.kiosk-mode .kiosk-only { display: inline-flex; }
+
+/* ============================================================
+   Small-screen layout — Raspberry Pi 7" 800x480 and similar.
+   Compact-first: priority is fitting everything on 480 px tall
+   rather than enlarging touch targets. Activates purely by
+   viewport width, independent of the Rust kiosk hook.
+   ============================================================ */
+@media (max-width: 900px) {
+  /* Baseline: smaller font, no enlarged controls. */
+  body { font-size: 12px; }
+
+  /* Tab bar — 7 tabs (Info hidden) ~110 px each on 800 px wide. */
+  .tab-bar {
+    gap: 1px;
+    padding: 1px;
+    flex-wrap: nowrap;
+  }
+  .tab-bar .tab {
+    padding: 4px 4px;
+    font-size: 11px;
+    min-width: 0;
+    flex: 1 1 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tab-bar .tab[data-tab="info"] { display: none; }
+
+  /* Top bar — compact, never wraps (height stays ~22 px). */
+  .top-bar {
+    padding: 2px 6px;
+    gap: 6px;
+    font-size: 10.5px;
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+  .top-bar select {
+    padding: 1px 1.4rem 1px 0.3rem;
+    font-size: 10.5px;
+  }
+  /* #status holds long text like "capture en cours (mode forcé : MEGA)".
+     On 800x480 it either balloons the top-bar to 3 lines or gets
+     truncated to a useless "c…". The state is already conveyed by the
+     v2-state-chip and by the Démarrer/Arrêter buttons being toggled,
+     so we just drop it on small screens. */
+  #status { display: none; }
+
+  /* RX toolbar / force-bar — tighter. */
+  .rx-layout .rx-toolbar { padding: 3px 6px; gap: 4px; }
+  .rx-layout .rx-toolbar button { padding: 3px 8px; font-size: 11px; }
+  .rx-force-bar { padding: 3px 6px; font-size: 10.5px; gap: 6px; }
+
+  /* Constellation overlay — smaller (140x140 instead of 200x200). */
+  .rx-constellation {
+    width: 140px;
+    height: 140px;
+    bottom: 4px;
+    right: 4px;
+  }
+
+  /* TX layout — KEEP horizontal (sidebar + image). Slim the
+     sidebar to leave more room for the image preview. */
+  .tab-panel.active.tx-layout {
+    flex-direction: row;
+  }
+  .tx-controls {
+    min-width: 220px !important;
+    max-width: 220px !important;
+    padding: 4px 6px;
+    gap: 4px;
+    font-size: 11px;
+  }
+  .tx-controls h2,
+  .tx-controls h3 { font-size: 12px; margin: 4px 0 2px; }
+  .tx-controls label { font-size: 11px; }
+  .tx-controls input,
+  .tx-controls select,
+  .tx-controls button { font-size: 11px; }
+  .tx-image-area { padding: 2px; }
+  .tx-drop-zone { padding: 1.5rem 1rem; }
+  .tx-drop-zone p { font-size: 0.85rem; line-height: 1.3; }
+
+  /* TX action buttons: stack vertically so "Stop", "TX more", etc.
+     don't overflow the slim 220 px sidebar. */
+  .tx-actions-row {
+    flex-direction: column;
+    gap: 4px;
+  }
+  .tx-actions-row > * { width: 100%; }
+
+  /* Settings/Channel/Overlays/Sessions/History — single column. */
+  .settings-layout,
+  .channel-layout,
+  .overlays-layout,
+  .sessions-layout,
+  .history-layout {
+    grid-template-columns: 1fr !important;
+    padding: 4px;
+    gap: 6px;
+  }
+
+  /* Headings everywhere a notch smaller. */
+  h1 { font-size: 14px; }
+  h2 { font-size: 13px; }
+  h3 { font-size: 12px; }
+
+  /* Generic form rows — tighter. */
+  .form-row { padding: 2px 0; gap: 4px; }
+
+  /* Thin finger-friendly scrollbars. WebKitGTK on Wayland labwc does
+     NOT deliver touch-as-scroll natively for web content, so we keep
+     the scrollbar visible (12 px = grabbable with a fingertip) and
+     hint native pan via `touch-action` for engines that honor it. */
+  * { scrollbar-width: thin; }
+  *::-webkit-scrollbar { width: 12px; height: 12px; }
+  *::-webkit-scrollbar-thumb { background: #555; border-radius: 6px; }
+  *::-webkit-scrollbar-thumb:hover { background: #777; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  .tx-controls,
+  .tab-panel,
+  [class*="-layout"] { touch-action: pan-y; }
+
+  /* Kiosk exit button (✕) — sized for a fingertip (≥40 px wide).
+     Pushed to the right edge of the tab bar. */
+  #kiosk-exit {
+    margin-left: auto;
+    flex: 0 0 auto;
+    background: #4a1f1f;
+    color: #ff8080;
+    border: 1px solid #6a3030;
+    min-width: 44px;
+    padding: 6px 14px;
+    font-size: 16px;
+    font-weight: bold;
+    line-height: 1;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  #kiosk-exit:hover,
+  #kiosk-exit:active { background: #6a2828; }
+}

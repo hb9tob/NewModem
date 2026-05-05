@@ -3583,7 +3583,54 @@ function formatBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(2)} Mio`;
 }
 
+// Kiosk mode (small touchscreen, e.g. Pi 7" 800x480) — the Rust setup
+// hook auto-engages fullscreen and emits `kiosk_mode` so the frontend
+// can switch its CSS layout and reveal the on-screen exit button.
+function setupKioskMode() {
+  // Add the body class based on viewport size — independent of any
+  // Rust-side event. The Rust setup hook emits `kiosk_mode` *before*
+  // the webview is loaded so the listener-driven path always loses
+  // the race; we still register the listener for completeness (e.g.
+  // when an event fires later from runtime), but the viewport check
+  // is what actually drives the class on a fresh open.
+  if (window.innerWidth <= 900 || window.innerHeight <= 600) {
+    document.body.classList.add("kiosk-mode");
+  }
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("kiosk_mode", () => {
+      document.body.classList.add("kiosk-mode");
+    });
+  }
+  const exitBtn = document.getElementById("kiosk-exit");
+  if (exitBtn && window.__TAURI__ && window.__TAURI__.window) {
+    exitBtn.addEventListener("click", async () => {
+      try {
+        await window.__TAURI__.window.getCurrentWindow().close();
+      } catch (e) {
+        console.error("kiosk close", e);
+      }
+    });
+  }
+  // Escape toggles fullscreen on/off (kiosk mode only). The image
+  // lightbox owns its own Escape handler and we yield to it when open.
+  window.addEventListener("keydown", async (ev) => {
+    if (ev.key !== "Escape") return;
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    const lb = document.getElementById("image-lightbox");
+    if (lb && !lb.hidden) return;
+    if (!window.__TAURI__ || !window.__TAURI__.window) return;
+    try {
+      const win = window.__TAURI__.window.getCurrentWindow();
+      const isFs = await win.isFullscreen();
+      await win.setFullscreen(!isFs);
+    } catch (e) {
+      console.error("kiosk toggle", e);
+    }
+  });
+}
+
 async function init() {
+  setupKioskMode();
   setupTabs();
   setupLightbox();
   setupTxTab();

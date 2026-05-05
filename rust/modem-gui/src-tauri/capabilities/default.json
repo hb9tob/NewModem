@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "core:window:allow-set-fullscreen",
+    "core:window:allow-close",
+    "core:window:allow-is-fullscreen",
     "opener:default",
     "opener:allow-reveal-item-in-dir",
     {

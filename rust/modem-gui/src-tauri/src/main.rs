@@ -928,6 +928,65 @@ fn main() {
                 tx_handle: Mutex::new(None),
                 ptt,
             });
+            // Auto-kiosk on tiny touchscreens (e.g. Pi 7" 800x480) or
+            // when `NBFM_KIOSK=1` is set in the environment. Both paths
+            // force a borderless fullscreen window and emit `kiosk_mode`
+            // to the frontend so the CSS layout switches and the
+            // on-screen exit button shows up. Diagnostic eprintlns are
+            // intentional — running the binary from a terminal makes it
+            // easy to see why the auto-detection did or didn't engage.
+            let env_kiosk = std::env::var("NBFM_KIOSK")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false);
+            if let Some(win) = app.get_webview_window("main") {
+                let mon_kiosk = match win.primary_monitor() {
+                    Ok(Some(monitor)) => {
+                        let s = monitor.size();
+                        let f = monitor.scale_factor().max(0.01);
+                        let lw = (s.width as f64 / f) as u32;
+                        let lh = (s.height as f64 / f) as u32;
+                        eprintln!(
+                            "[kiosk] monitor: phys {}x{} scale {:.2} -> logical {}x{}",
+                            s.width, s.height, f, lw, lh
+                        );
+                        lw <= 900 || lh <= 600
+                    }
+                    Ok(None) => {
+                        eprintln!("[kiosk] no primary monitor reported");
+                        false
+                    }
+                    Err(e) => {
+                        eprintln!("[kiosk] primary_monitor error: {e}");
+                        false
+                    }
+                };
+                if env_kiosk || mon_kiosk {
+                    eprintln!(
+                        "[kiosk] engaging (env={} mon={})",
+                        env_kiosk, mon_kiosk
+                    );
+                    if let Err(e) = win.set_decorations(false) {
+                        eprintln!("[kiosk] set_decorations err: {e}");
+                    }
+                    if let Err(e) = win.set_fullscreen(true) {
+                        eprintln!("[kiosk] set_fullscreen err: {e}");
+                    }
+                    // Defer a second attempt: on Wayland (labwc), the
+                    // toplevel surface may not be mapped yet when setup
+                    // runs, so the first set_fullscreen can be a no-op.
+                    let win2 = win.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let _ = win2.set_decorations(false);
+                        let _ = win2.set_fullscreen(true);
+                    });
+                    let _ = app.handle().emit("kiosk_mode", true);
+                } else {
+                    eprintln!("[kiosk] desktop mode (env={} mon={})", env_kiosk, mon_kiosk);
+                }
+            } else {
+                eprintln!("[kiosk] no `main` window in setup hook");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
