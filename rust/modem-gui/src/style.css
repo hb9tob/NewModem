@@ -868,6 +868,20 @@ main {
   font-family: ui-monospace, monospace;
   font-size: 0.92rem;
 }
+.overlays-form select {
+  /* Same WebKitGTK workaround as .settings-form select — without it
+     the GTK native widget ignores the dark theme on Linux. */
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 1.8rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><polygon points='0,0 10,0 5,6' fill='%23e0e0e0'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.6rem center;
+}
+.overlays-form select option {
+  background: #1e1e1e;
+  color: #e0e0e0;
+}
 .overlays-form input[type="number"] {
   width: 5.5rem;
 }
@@ -1753,11 +1767,23 @@ select option.experimental-option {
   cursor: pointer;
 }
 .rx-force-bar select {
+  /* appearance:none switches off the native GTK widget on WebKitGTK
+     (Linux), which otherwise ignores background/color/border. The
+     SVG arrow replaces the dropdown indicator the native widget drew. */
+  appearance: none;
+  -webkit-appearance: none;
   background: #2a2a2a;
   color: #e0e0e0;
   border: 1px solid #444;
-  padding: 0.15rem 0.3rem;
+  padding: 0.15rem 1.5rem 0.15rem 0.4rem;
   border-radius: 3px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><polygon points='0,0 10,0 5,6' fill='%23e0e0e0'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+}
+.rx-force-bar select option {
+  background: #2a2a2a;
+  color: #e0e0e0;
 }
 .rx-force-bar select:disabled {
   opacity: 0.4;
