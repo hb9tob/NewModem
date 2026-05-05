@@ -84,9 +84,37 @@ fn save_settings(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Persist before deciding whether to touch the PTT — even if we
+    // skip the refresh, the disk file must be up to date.
+    let previous = settings::load();
     settings::save(&settings)?;
-    let status = compute_ptt_status(&state.ptt, &settings);
-    let _ = app.emit("ptt_status", status);
+    // Re-opening the serial port toggles DTR/RTS for a few ms (OS-level
+    // behavior of `serialport-rs`), which keys the radio for a short
+    // burst. The frontend calls `save_settings` on every settings change
+    // (including AVIF quality / speed sliders), so we only refresh PTT
+    // when a PTT-relevant field actually changed. Polarity changes are
+    // included because PttController applies them at open time.
+    let ptt_changed = previous.ptt_enabled != settings.ptt_enabled
+        || previous.ptt_port != settings.ptt_port
+        || previous.ptt_use_rts != settings.ptt_use_rts
+        || previous.ptt_use_dtr != settings.ptt_use_dtr
+        || previous.ptt_rts_tx_high != settings.ptt_rts_tx_high
+        || previous.ptt_dtr_tx_high != settings.ptt_dtr_tx_high;
+    // Recovery path: if PTT is enabled but no controller is currently
+    // open (e.g. startup failed because the port was busy), allow any
+    // settings save to retry the open. A failed open doesn't toggle the
+    // serial lines, so this stays silent on the radio.
+    let needs_recovery = settings.ptt_enabled
+        && state
+            .ptt
+            .lock()
+            .ok()
+            .map(|g| g.is_none())
+            .unwrap_or(false);
+    if ptt_changed || needs_recovery {
+        let status = compute_ptt_status(&state.ptt, &settings);
+        let _ = app.emit("ptt_status", status);
+    }
     Ok(())
 }
 
