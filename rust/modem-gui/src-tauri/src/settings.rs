@@ -201,7 +201,7 @@ pub fn portable_root() -> Option<PathBuf> {
     }
 }
 
-fn settings_path() -> PathBuf {
+pub fn settings_path() -> PathBuf {
     if let Some(root) = portable_root() {
         return root.join("settings.json");
     }
@@ -209,6 +209,12 @@ fn settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nbfm-modem-gui")
         .join("settings.json")
+}
+
+/// True when no `settings.json` exists yet — used to seed first-run
+/// defaults (initial overlay slot, sample logo on disk, etc.).
+pub fn is_first_run() -> bool {
+    !settings_path().exists()
 }
 
 pub fn load() -> Settings {

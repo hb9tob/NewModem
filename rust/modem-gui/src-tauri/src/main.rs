@@ -867,6 +867,29 @@ fn main() {
     let save_dir = default_save_dir();
     let _ = std::fs::create_dir_all(&save_dir);
 
+    // First-run: install the default oscilloscope logo and pre-configure
+    // slot 1 (top-left corner, no margin, 10% height) so a fresh install
+    // ships with a working overlay applied automatically.
+    if settings::is_first_run() {
+        if let Ok(filename) = overlay::ensure_default_logo() {
+            let mut s = Settings::default();
+            if let Some(slot) = s.overlays.get_mut(1) {
+                slot.name = "NBFM Modem".to_string();
+                slot.logo = Some(overlay::LogoElement {
+                    filename,
+                    anchor: overlay::Anchor::TopLeft,
+                    margin_x_pct: 0.0,
+                    margin_y_pct: 0.0,
+                    size_pct: 10.0,
+                });
+            }
+            s.active_overlay = 1;
+            if let Err(e) = settings::save(&s) {
+                eprintln!("[overlay] could not seed default settings: {e}");
+            }
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {

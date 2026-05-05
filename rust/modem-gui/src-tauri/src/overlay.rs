@@ -13,6 +13,24 @@ use std::path::{Path, PathBuf};
 /// (Bitstream Vera license + DejaVu changes), redistribution-clean.
 const FONT_TTF: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 
+/// Default oscilloscope-style "NBFM MODEM by HB9TOB" logo. Written
+/// to `logos_dir()` on first GUI launch so a fresh install ships
+/// with a usable overlay out of the box.
+pub const DEFAULT_LOGO_BYTES: &[u8] = include_bytes!("../assets/nbfm-default-logo.png");
+pub const DEFAULT_LOGO_FILENAME: &str = "nbfm-default-logo.png";
+
+/// Write `DEFAULT_LOGO_BYTES` to `logos_dir()` if missing, then return
+/// the filename suitable for `LogoElement::filename`.
+pub fn ensure_default_logo() -> Result<String, String> {
+    let dir = logos_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(DEFAULT_LOGO_FILENAME);
+    if !dest.exists() {
+        std::fs::write(&dest, DEFAULT_LOGO_BYTES).map_err(|e| e.to_string())?;
+    }
+    Ok(DEFAULT_LOGO_FILENAME.to_string())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Anchor {
@@ -219,11 +237,39 @@ fn apply_logo(canvas: &mut RgbaImage, spec: &LogoElement, w: u32, h: u32) {
     let target_h = ((spec.size_pct / 100.0) * h as f32).round().max(1.0) as u32;
     let aspect = logo.width() as f32 / logo.height().max(1) as f32;
     let target_w = ((target_h as f32) * aspect).round().max(1.0) as u32;
-    let resized = imageops::resize(&logo, target_w, target_h, FilterType::Lanczos3);
+    let mut resized = imageops::resize(&logo, target_w, target_h, FilterType::Lanczos3);
+    // Strong downscale softens letter edges noticeably even with
+    // Lanczos3. An unsharp mask restores the edge contrast of typo
+    // and fine UI elements; we only apply it when the reduction is
+    // significant (below ~70% of original height) so logos used at
+    // their native size are left untouched.
+    let scale = (target_h as f32) / (logo.height().max(1) as f32);
+    if scale < 0.7 {
+        resized = unsharp_mask(&resized, 1.0, 0.6);
+    }
     let mx = ((spec.margin_x_pct / 100.0) * w as f32).round().max(0.0) as u32;
     let my = ((spec.margin_y_pct / 100.0) * h as f32).round().max(0.0) as u32;
     let (x, y) = anchor_xy(spec.anchor, w, h, target_w, target_h, mx, my);
     imageops::overlay(canvas, &resized, x as i64, y as i64);
+}
+
+/// Unsharp mask: adds (original − blurred) × amount back to the
+/// original. Operates on RGB channels only — alpha is preserved as-is
+/// so glyph edges stay clean when composited over the photo. `sigma`
+/// controls the radius of the implicit blur (1.0 ≈ a 3×3 effective
+/// kernel), `amount` controls how much edge contrast is recovered.
+fn unsharp_mask(img: &RgbaImage, sigma: f32, amount: f32) -> RgbaImage {
+    let blurred = imageproc::filter::gaussian_blur_f32(img, sigma);
+    let mut out = img.clone();
+    for (px, blur_px) in out.pixels_mut().zip(blurred.pixels()) {
+        for c in 0..3 {
+            let orig = px.0[c] as f32;
+            let bl = blur_px.0[c] as f32;
+            let sharpened = orig + (orig - bl) * amount;
+            px.0[c] = sharpened.clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 fn parse_color(s: &str) -> [u8; 3] {
