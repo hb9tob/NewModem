@@ -2156,6 +2156,16 @@ async function refreshTxEstimate() {
 }
 
 function runTxCompress() {
+  // Bail before any state mutation if there's nothing to compress —
+  // otherwise showTxBusyOverlay would leave a stuck overlay on an
+  // empty preview when the impl exits early on `!sourceFile`.
+  if (!txState.sourceFile) return Promise.resolve();
+  // Show the overlay synchronously so the user gets immediate feedback,
+  // even if `_runTxCompressImpl` only starts 1 microtask later through
+  // the `_compressChain`. Without this, clicking "Recalculer" on a fast
+  // image (or a small AVIF passthrough) would flash the spinner for a
+  // single frame — same root cause as the file-pick path.
+  showTxBusyOverlay();
   // Serialize via _compressChain: chain the new compression after the
   // current one, instead of letting ravif run twice in parallel (see
   // _compressChain above).
@@ -2357,19 +2367,42 @@ function applyTxModeUI() {
 function applyPassthroughUI() { applyTxModeUI(); }
 function applyFileModeUI() { applyTxModeUI(); }
 
+// Show the busy overlay immediately, before any async work. Pinning
+// it on the preview area at the start of the load (rather than waiting
+// for `_runTxCompressImpl` to add `.compressing` after the 50ms
+// debounce + Promise chain) is what keeps the spinner from flashing
+// for a single frame on fast images.
+function showTxBusyOverlay() {
+  const drop = document.getElementById("tx-drop-zone");
+  const preview = document.getElementById("tx-preview");
+  if (drop) drop.hidden = true;
+  if (preview) {
+    preview.hidden = false;
+    preview.classList.add("compressing");
+  }
+}
+function hideTxBusyOverlay() {
+  const preview = document.getElementById("tx-preview");
+  if (preview) preview.classList.remove("compressing");
+}
+
 // Load a file from a disk path (native Tauri drag-drop). The backend
 // reads the bytes itself via set_tx_source_from_path: we completely
 // avoid JSON-array IPC serialization which, on a large image, allocated
 // ~10x the file size on both JS and Rust sides and could freeze KDE.
 async function loadTxFileFromPath(path) {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  // Anti-reentrance: ignore successive drops while a load or compression
-  // is in progress.
-  if (txState.loading) {
-    logEvent("tx_drop_ignored", { message: "chargement déjà en cours", path });
+  // Anti-reentrance: ignore successive drops while a load OR compression
+  // is in progress. Without the `compressing` check, dropping a new image
+  // during a long ravif encode replaced the backend tx_source mid-flight
+  // and piled `_runTxCompressImpl` calls on `_compressChain` until the
+  // WebView ran out of memory.
+  if (txState.loading || txState.compressing) {
+    logEvent("tx_drop_ignored", { message: "chargement ou compression déjà en cours", path });
     return;
   }
   txState.loading = true;
+  showTxBusyOverlay();
   const { convertFileSrc, invoke } = window.__TAURI__.core;
   const url = convertFileSrc(path);
   const name = path.split(/[/\\]/).pop() || "fichier";
@@ -2421,6 +2454,8 @@ async function loadTxFileFromPath(path) {
     scheduleTxCompress(50);
   } catch (err) {
     logEvent("tx_error", { message: `drop ${path}: ${err}` });
+    // Compression won't run -- clear the overlay so it doesn't stay stuck.
+    hideTxBusyOverlay();
   } finally {
     txState.loading = false;
   }
@@ -2428,6 +2463,15 @@ async function loadTxFileFromPath(path) {
 
 async function loadTxFile(file) {
   if (!file) return;
+  // Anti-reentrance: same rationale as `loadTxFileFromPath` — without
+  // this guard, picking a new image during a long ravif encode crashed
+  // the WebView via piled-up `_compressChain` impls.
+  if (txState.loading || txState.compressing) {
+    logEvent("tx_pick_ignored", { message: "chargement ou compression déjà en cours" });
+    return;
+  }
+  txState.loading = true;
+  showTxBusyOverlay();
   // Release the previous blob URL if any.
   if (txState.sourceUrl) {
     URL.revokeObjectURL(txState.sourceUrl);
@@ -2466,6 +2510,9 @@ async function loadTxFile(file) {
       scheduleTxCompress(50);
     } catch (err) {
       logEvent("tx_error", { message: `upload source: ${err}` });
+      hideTxBusyOverlay();
+    } finally {
+      txState.loading = false;
     }
   };
   if (isImage) {
@@ -2484,6 +2531,8 @@ async function loadTxFile(file) {
     };
     img.onerror = () => {
       logEvent("tx_error", { message: `impossible de charger ${file.name}` });
+      hideTxBusyOverlay();
+      txState.loading = false;
     };
     img.src = url;
   } else {
@@ -2512,11 +2561,21 @@ async function resetTxFile() {
     clearTimeout(txState.compressTimer);
     txState.compressTimer = null;
   }
+  // Clear busy state too: once reset, the user must be allowed to pick
+  // a new file even if an abandoned ravif encode is still finishing on
+  // the Rust side. Without this, the `loading || compressing` guard in
+  // loadTxFile/loadTxFileFromPath would lock the picker until the
+  // discarded compression returned.
+  txState.loading = false;
+  txState.compressing = false;
   const drop = document.getElementById("tx-drop-zone");
   const preview = document.getElementById("tx-preview");
   const previewImg = document.getElementById("tx-preview-img");
   const fileInput = document.getElementById("tx-file-input");
-  if (preview) preview.hidden = true;
+  if (preview) {
+    preview.classList.remove("compressing");
+    preview.hidden = true;
+  }
   if (drop) drop.hidden = false;
   if (previewImg) previewImg.src = "";
   if (fileInput) fileInput.value = "";
@@ -2537,7 +2596,11 @@ function setupTxTab() {
 
   drop.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => {
-    if (fileInput.files && fileInput.files[0]) loadTxFile(fileInput.files[0]);
+    const file = fileInput.files && fileInput.files[0];
+    // Clear the value first so picking the same file twice still fires
+    // a `change` event on the next pick (browsers dedupe on value).
+    fileInput.value = "";
+    if (file) loadTxFile(file);
   });
 
   // Drag-drop: on Linux/WebKitGTK the HTML5 dragover/drop events are not
