@@ -1,3 +1,4 @@
+use crate::overlay::{default_overlay_slots, Overlay};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -100,6 +101,16 @@ pub struct Settings {
     /// Toggleable from the Settings tab.
     #[serde(default)]
     pub experimental_modes_enabled: bool,
+    /// Five fixed overlay slots. Slot 0 is the immutable "Aucun" entry
+    /// (no overlay applied); slots 1..=4 are user-editable templates
+    /// for callsign / club logo / etc. Baked into the resized image
+    /// inside `compress_avif` so the preview and the transmitted bytes
+    /// match.
+    #[serde(default = "default_overlay_slots")]
+    pub overlays: Vec<Overlay>,
+    /// Index of the currently active slot (0..=4). 0 means no overlay.
+    #[serde(default)]
+    pub active_overlay: u32,
 }
 
 fn default_tx_quality() -> u32 {
@@ -170,6 +181,8 @@ impl Default for Settings {
             rx_force_mode: false,
             rx_forced_profile: default_rx_forced_profile(),
             experimental_modes_enabled: false,
+            overlays: default_overlay_slots(),
+            active_overlay: 0,
         }
     }
 }

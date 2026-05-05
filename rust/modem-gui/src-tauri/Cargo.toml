@@ -25,6 +25,9 @@ cpal = "0.15"
 dirs = "5"
 hound = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
+imageproc = { version = "0.25", default-features = false }
+ab_glyph = "0.2"
+kamadak-exif = "0.5"
 ravif = { version = "0.11", default-features = false, features = ["threading"] }
 rgb = "0.8"
 serialport = "4"

@@ -1,8 +1,29 @@
+use crate::overlay::{apply_overlay, Overlay};
+use exif::{In, Reader as ExifReader, Tag};
 use image::imageops::FilterType;
+use image::metadata::Orientation;
 use ravif::{Encoder, Img};
 use rgb::FromSlice;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+
+/// Read the EXIF Orientation tag (1..=8) from a buffer that may contain EXIF
+/// metadata (JPEG, TIFF, HEIF). Returns 1 (NoTransforms) when no EXIF block
+/// is present or the tag is missing/invalid. Cameras like the Panasonic S5
+/// always write pixels in sensor-native orientation and store the rotation
+/// to apply in this tag, so re-encoders that ignore EXIF produce sideways
+/// output for portrait shots.
+fn exif_orientation(bytes: &[u8]) -> u8 {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = match ExifReader::new().read_from_container(&mut cursor) {
+        Ok(e) => e,
+        Err(_) => return 1,
+    };
+    exif.get_field(Tag::Orientation, In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .map(|v| v.clamp(1, 8) as u8)
+        .unwrap_or(1)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CompressOpts {
@@ -19,6 +40,12 @@ pub struct CompressOpts {
     /// re-encode. The selection is done JS-side at drop time.
     #[serde(default)]
     pub passthrough: bool,
+    /// Optional active overlay (text + logo). When `Some` and at least
+    /// one element is non-empty, it is baked into the resized buffer
+    /// before encode. Sent from the JS layer alongside the dims/quality
+    /// so the same instance produces identical preview and transmit.
+    #[serde(default)]
+    pub overlay: Option<Overlay>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,7 +103,15 @@ pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<Compres
         });
     }
 
-    let img = image::load_from_memory(source_bytes).map_err(|e| format!("decode: {e}"))?;
+    let mut img = image::load_from_memory(source_bytes).map_err(|e| format!("decode: {e}"))?;
+    // Bake EXIF orientation into the pixels before resize/encode. AVIF can
+    // express rotation via `irot`/`imir` boxes, but ravif doesn't emit them,
+    // so the only way to keep portrait shots upright after re-encode is to
+    // rotate the buffer here. Read dimensions *after* the transform, since
+    // rotations 90/270 swap width and height.
+    if let Some(orientation) = Orientation::from_exif(exif_orientation(source_bytes)) {
+        img.apply_orientation(orientation);
+    }
     let (src_w, src_h) = (img.width(), img.height());
 
     let needs_resize = opts.target_w > 0
@@ -87,11 +122,18 @@ pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<Compres
     // for fast previews — Lanczos3 costs can show on very large source images.
     let speed = opts.speed.unwrap_or(6).clamp(1, 10);
     let filter = if speed >= 7 { FilterType::Triangle } else { FilterType::Lanczos3 };
-    let resized = if needs_resize {
+    let mut resized = if needs_resize {
         img.resize_exact(opts.target_w, opts.target_h, filter)
     } else {
         img
     };
+
+    // Bake the active overlay (text + logo) into the resized buffer so
+    // both preview and transmit share the exact same pixels. Skipped when
+    // no overlay is provided or the overlay has no non-empty element.
+    if let Some(overlay) = opts.overlay.as_ref() {
+        apply_overlay(&mut resized, overlay);
+    }
 
     let rgba = resized.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());

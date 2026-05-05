@@ -26,6 +26,7 @@
     <button class="tab" data-tab="sessions">Sessions</button>
     <button class="tab" data-tab="history">Historique</button>
     <button class="tab" data-tab="channel">Canal</button>
+    <button class="tab" data-tab="overlays">Overlays</button>
     <button class="tab" data-tab="settings">Paramètres</button>
     <button class="tab" data-tab="info">Info</button>
   </nav>
@@ -177,6 +178,99 @@
           <div id="tx-progress-text" class="tx-progress-text">—</div>
         </div>
       </aside>
+    </section>
+    <section id="tab-overlays" class="tab-panel overlays-layout">
+      <div class="overlays-form">
+        <fieldset class="overlays-slot-bar">
+          <legend>Slot actif</legend>
+          <div class="ov-slot-row" id="ov-slot-row">
+            <label><input type="radio" name="active-overlay" value="0" checked> <span class="ov-slot-label">Aucun</span></label>
+            <label><input type="radio" name="active-overlay" value="1"> <span class="ov-slot-label" data-slot="1">Overlay 1</span></label>
+            <label><input type="radio" name="active-overlay" value="2"> <span class="ov-slot-label" data-slot="2">Overlay 2</span></label>
+            <label><input type="radio" name="active-overlay" value="3"> <span class="ov-slot-label" data-slot="3">Overlay 3</span></label>
+            <label><input type="radio" name="active-overlay" value="4"> <span class="ov-slot-label" data-slot="4">Overlay 4</span></label>
+          </div>
+          <div class="ov-hint">Le slot « Aucun » ne modifie pas l'image. Sélectionner 1 à 4 pour appliquer un overlay à chaque recompression.</div>
+        </fieldset>
+
+        <div id="ov-editor" class="overlays-editor" hidden>
+          <fieldset>
+            <legend>Nom du slot</legend>
+            <input type="text" id="ov-name" maxlength="40" placeholder="ex. callsign + logo club">
+          </fieldset>
+
+          <fieldset class="ov-block">
+            <legend><label><input type="checkbox" id="ov-text-enable"> Texte</label></legend>
+            <div class="ov-row">
+              <label class="ov-row-full">Contenu
+                <input type="text" id="ov-text-content" maxlength="60" placeholder="HB9TOB">
+              </label>
+            </div>
+            <div class="ov-row">
+              <label>Coin
+                <select id="ov-text-anchor">
+                  <option value="top_left">Haut gauche</option>
+                  <option value="top_right">Haut droit</option>
+                  <option value="bottom_left">Bas gauche</option>
+                  <option value="bottom_right" selected>Bas droit</option>
+                </select>
+              </label>
+              <label>Hauteur (%)
+                <input type="number" id="ov-text-h" min="1" max="50" step="0.5" value="6">
+              </label>
+            </div>
+            <div class="ov-row">
+              <label>Marge X (%)
+                <input type="number" id="ov-text-mx" min="0" max="50" step="0.1" value="2">
+              </label>
+              <label>Marge Y (%)
+                <input type="number" id="ov-text-my" min="0" max="50" step="0.1" value="2">
+              </label>
+            </div>
+            <div class="ov-row">
+              <label>Couleur
+                <input type="color" id="ov-text-color" value="#ffffff">
+              </label>
+              <label class="ov-checkbox">
+                <input type="checkbox" id="ov-text-halo" checked> Halo noir
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="ov-block">
+            <legend><label><input type="checkbox" id="ov-logo-enable"> Logo</label></legend>
+            <div class="ov-row">
+              <button type="button" id="ov-logo-pick" class="ov-btn">Choisir un fichier…</button>
+              <span id="ov-logo-name" class="ov-logo-name">—</span>
+              <input type="file" id="ov-logo-input" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif" hidden>
+            </div>
+            <img id="ov-logo-preview" class="ov-logo-preview" alt="" hidden>
+            <div class="ov-row">
+              <label>Coin
+                <select id="ov-logo-anchor">
+                  <option value="top_left" selected>Haut gauche</option>
+                  <option value="top_right">Haut droit</option>
+                  <option value="bottom_left">Bas gauche</option>
+                  <option value="bottom_right">Bas droit</option>
+                </select>
+              </label>
+              <label>Taille (%)
+                <input type="number" id="ov-logo-size" min="1" max="50" step="0.5" value="12">
+              </label>
+            </div>
+            <div class="ov-row">
+              <label>Marge X (%)
+                <input type="number" id="ov-logo-mx" min="0" max="50" step="0.1" value="2">
+              </label>
+              <label>Marge Y (%)
+                <input type="number" id="ov-logo-my" min="0" max="50" step="0.1" value="2">
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="ov-hint">Marges et tailles sont relatives à l'image redimensionnée pour la transmission. L'overlay est intégré aux pixels — visible côté RX comme côté preview.</div>
+        </div>
+      </div>
     </section>
     <section id="tab-settings" class="tab-panel settings-layout">
       <div class="settings-form">

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod collector_client;
+mod overlay;
 mod ptt;
 mod settings;
 mod tx_encode;
@@ -823,6 +824,18 @@ fn compress_file_zstd(state: State<'_, AppState>) -> Result<CompressFileResult, 
 }
 
 #[tauri::command]
+fn overlays_import_logo(bytes: Vec<u8>, original_name: String) -> Result<String, String> {
+    overlay::import_logo_bytes(&bytes, &original_name)
+}
+
+#[tauri::command]
+fn overlays_logos_dir() -> Result<String, String> {
+    let dir = overlay::logos_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn get_save_dir(state: State<'_, AppState>) -> Result<String, String> {
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?;
     Ok(dir.to_string_lossy().into_owned())
@@ -899,6 +912,8 @@ fn main() {
             clear_tx_source,
             compress_image,
             compress_file_zstd,
+            overlays_import_logo,
+            overlays_logos_dir,
             tx_estimate,
             tx_start,
             tx_more,

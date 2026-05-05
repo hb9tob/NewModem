@@ -835,6 +835,126 @@ main {
   padding: 1rem 1.5rem;
   overflow-y: auto;
 }
+.overlays-layout {
+  padding: 1rem 1.5rem;
+  overflow-y: auto;
+}
+.overlays-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-width: 640px;
+}
+.overlays-form fieldset {
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  padding: 0.7rem 1rem;
+  margin: 0;
+}
+.overlays-form legend {
+  color: #9ccc65;
+  font-size: 0.85rem;
+  padding: 0 0.4rem;
+  letter-spacing: 0.02em;
+}
+.overlays-form input[type="text"],
+.overlays-form input[type="number"],
+.overlays-form select {
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 0.3rem 0.45rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.92rem;
+}
+.overlays-form input[type="number"] {
+  width: 5.5rem;
+}
+.ov-slot-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  margin: 0.2rem 0 0.5rem 0;
+}
+.ov-slot-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
+.ov-slot-label {
+  color: #e0e0e0;
+}
+.ov-slot-label.ov-empty {
+  color: #777;
+  font-style: italic;
+}
+.ov-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  margin: 0.3rem 0;
+}
+.ov-row label {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.78rem;
+  color: #aaa;
+}
+.ov-row-full {
+  flex: 1 1 100%;
+}
+.ov-row-full input {
+  width: 100%;
+}
+.ov-checkbox {
+  flex-direction: row !important;
+  align-items: center !important;
+  gap: 0.35rem !important;
+  color: #e0e0e0 !important;
+  font-size: 0.9rem !important;
+}
+.ov-block legend label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+}
+.ov-block legend input[type="checkbox"] {
+  margin: 0;
+}
+.ov-btn {
+  background: #3a3a3a;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+.ov-btn:hover {
+  background: #4a4a4a;
+}
+.ov-logo-name {
+  color: #aaa;
+  font-size: 0.85rem;
+  font-family: ui-monospace, monospace;
+}
+.ov-logo-preview {
+  max-height: 64px;
+  max-width: 220px;
+  margin: 0.4rem 0;
+  border: 1px solid #3a3a3a;
+  background: #111;
+  display: block;
+}
+.ov-hint {
+  color: #888;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
 .settings-form {
   display: flex;
   flex-direction: column;
