@@ -91,6 +91,36 @@ python study/nbfm_channel_sim.py input.wav output.wav \
     --thermal-ppm 5 --thermal-period 180
 ```
 
+### ⚠ Carte son sous Windows — vérifier le format à 48 kHz
+
+**Symptôme** : votre carte son (typiquement **SignaLink USB**, ou tout autre
+boîtier USB type CM119) apparaît dans la liste *Carte son réception* sans le
+tag *✓48k*, et le bouton *Démarrer* reste grisé. La GUI affiche par exemple
+`SignaLink USB — 44100–44100 Hz` au lieu de `48000–48000 Hz`.
+
+**Cause** : sur Windows, l'API audio (WASAPI partagé) n'expose pas les
+formats réels du matériel — elle ne renvoie que le **format par défaut**
+configuré dans les propriétés Windows du périphérique. Si Windows est en
+44,1 kHz, l'app voit 44,1 kHz, point. Le CM119 du SignaLink supporte
+nativement 48 kHz mais la couche partagée le masque.
+
+**Correctif (à faire une fois par carte son) :**
+
+1. Clic droit sur l'icône haut-parleur (zone de notification) → *Sons*
+   (ou : Panneau de configuration → Matériel et audio → Son).
+2. Onglet **Enregistrement** → double-clic sur l'entrée du SignaLink
+   (souvent `Microphone (USB Audio CODEC)`) → onglet **Avancé** → liste
+   *Format par défaut* → choisir **« 2 canaux, 16 bits, 48000 Hz (qualité DVD) »**
+   → *Appliquer* / *OK*.
+3. Onglet **Lecture** → faire la même chose sur la sortie SignaLink (sinon
+   la chaîne TX ressamplera 48 → 44,1 → 48 kHz et abîmera le signal modem).
+4. Fermer puis rouvrir le NBFM Modem ; l'entrée doit maintenant afficher
+   `48000–48000 Hz ✓48k` et *Démarrer* devient cliquable.
+
+Vrai pour toutes les interfaces USB-audio classe (SignaLink, RIGblaster,
+DigiRig, câbles CM108/CM119 isolés, etc.). Une fois fait, le réglage est
+persistant — on ne le refait que si on change de carte ou réinstalle Windows.
+
 ### Structure du dépôt
 
 ```
@@ -315,6 +345,37 @@ python study/nbfm_channel_sim.py input.wav output.wav \
     --if-noise 0.165 --drift-ppm -16 \
     --thermal-ppm 5 --thermal-period 180
 ```
+
+### ⚠ Sound card on Windows — make sure the default format is 48 kHz
+
+**Symptom**: your sound card (typically a **SignaLink USB**, or any other
+USB CM119-class interface) shows up in the *RX sound card* combo without
+the *✓48k* tag, and *Start* stays greyed out. The GUI reports e.g.
+`SignaLink USB — 44100–44100 Hz` instead of `48000–48000 Hz`.
+
+**Cause**: on Windows, the shared-mode audio API (WASAPI) does not expose
+the device's real capability list — only the **default format** configured
+in the device's Windows properties. If Windows is set to 44.1 kHz, the
+app sees 44.1 kHz, period. The SignaLink's CM119 chip natively supports
+48 kHz but the shared layer hides it.
+
+**Fix (one-time per sound card):**
+
+1. Right-click the speaker icon (notification area) → *Sounds* (or:
+   Control Panel → Hardware and Sound → Sound).
+2. *Recording* tab → double-click the SignaLink input (usually
+   `Microphone (USB Audio CODEC)`) → *Advanced* tab → *Default Format*
+   list → pick **"2 channel, 16 bit, 48000 Hz (DVD Quality)"** → *Apply* /
+   *OK*.
+3. *Playback* tab → repeat the same on the SignaLink output (otherwise
+   the TX chain will resample 48 → 44.1 → 48 kHz and degrade the modem
+   signal).
+4. Close and reopen the NBFM Modem; the input should now read
+   `48000–48000 Hz ✓48k` and *Start* becomes clickable.
+
+This applies to every USB-audio class interface (SignaLink, RIGblaster,
+DigiRig, isolated CM108/CM119 cables, etc.). The setting is persistent —
+only redo it if you switch cards or reinstall Windows.
 
 ### Repository layout
 
