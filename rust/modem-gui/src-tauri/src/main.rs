@@ -867,25 +867,41 @@ fn main() {
     let save_dir = default_save_dir();
     let _ = std::fs::create_dir_all(&save_dir);
 
-    // First-run: install the default oscilloscope logo and pre-configure
-    // slot 1 (top-left corner, no margin, 10% height) so a fresh install
-    // ships with a working overlay applied automatically.
-    if settings::is_first_run() {
-        if let Ok(filename) = overlay::ensure_default_logo() {
-            let mut s = Settings::default();
-            if let Some(slot) = s.overlays.get_mut(1) {
-                slot.name = "NBFM Modem".to_string();
-                slot.logo = Some(overlay::LogoElement {
-                    filename,
-                    anchor: overlay::Anchor::TopLeft,
-                    margin_x_pct: 0.0,
-                    margin_y_pct: 0.0,
-                    size_pct: 10.0,
-                });
-            }
-            s.active_overlay = 1;
-            if let Err(e) = settings::save(&s) {
-                eprintln!("[overlay] could not seed default settings: {e}");
+    // Install the default oscilloscope logo + pre-configure slot 1
+    // (top-left corner, 0/0% margin, 10% height) the first time this
+    // build runs against a given user profile. Triggers on both fresh
+    // installs (no settings.json) and upgrades from a version that did
+    // not have overlays. The `overlay_default_seeded` flag prevents
+    // re-seeding on every launch and protects user customizations:
+    // once set, we never touch slot 1 again. Slot 1 is only filled if
+    // it is still empty, and `active_overlay` is only changed if the
+    // user has not picked another slot.
+    {
+        let mut s = settings::load();
+        if !s.overlay_default_seeded {
+            match overlay::ensure_default_logo() {
+                Ok(filename) => {
+                    if let Some(slot) = s.overlays.get_mut(1) {
+                        if slot.text.is_none() && slot.logo.is_none() {
+                            slot.name = "NBFM Modem".to_string();
+                            slot.logo = Some(overlay::LogoElement {
+                                filename,
+                                anchor: overlay::Anchor::TopLeft,
+                                margin_x_pct: 0.0,
+                                margin_y_pct: 0.0,
+                                size_pct: 10.0,
+                            });
+                            if s.active_overlay == 0 {
+                                s.active_overlay = 1;
+                            }
+                        }
+                    }
+                    s.overlay_default_seeded = true;
+                    if let Err(e) = settings::save(&s) {
+                        eprintln!("[overlay] could not save seeded settings: {e}");
+                    }
+                }
+                Err(e) => eprintln!("[overlay] could not write default logo: {e}"),
             }
         }
     }

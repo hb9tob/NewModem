@@ -111,6 +111,13 @@ pub struct Settings {
     /// Index of the currently active slot (0..=4). 0 means no overlay.
     #[serde(default)]
     pub active_overlay: u32,
+    /// Set to `true` once the bundled default overlay (logo on slot 1)
+    /// has been written to disk and seeded into the settings. Stays
+    /// `false` on legacy `settings.json` files so the first run after
+    /// an upgrade installs the default overlay even when the rest of
+    /// the user's preferences are preserved.
+    #[serde(default)]
+    pub overlay_default_seeded: bool,
 }
 
 fn default_tx_quality() -> u32 {
@@ -183,6 +190,7 @@ impl Default for Settings {
             experimental_modes_enabled: false,
             overlays: default_overlay_slots(),
             active_overlay: 0,
+            overlay_default_seeded: false,
         }
     }
 }
@@ -201,7 +209,7 @@ pub fn portable_root() -> Option<PathBuf> {
     }
 }
 
-pub fn settings_path() -> PathBuf {
+fn settings_path() -> PathBuf {
     if let Some(root) = portable_root() {
         return root.join("settings.json");
     }
@@ -209,12 +217,6 @@ pub fn settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nbfm-modem-gui")
         .join("settings.json")
-}
-
-/// True when no `settings.json` exists yet — used to seed first-run
-/// defaults (initial overlay slot, sample logo on disk, etc.).
-pub fn is_first_run() -> bool {
-    !settings_path().exists()
 }
 
 pub fn load() -> Settings {
