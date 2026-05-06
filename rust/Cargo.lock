@@ -2944,6 +2944,7 @@ dependencies = [
  "modem-core",
  "modem-framing",
  "modem-io",
+ "modem-sdr-dsp",
  "serde",
  "serde_json",
  "serialport",

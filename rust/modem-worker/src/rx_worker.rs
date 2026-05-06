@@ -28,6 +28,7 @@ use modem_core::header::Header;
 use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_core::profile::{ModemConfig, ProfileIndex};
 use modem_core::rx_v2;
+use modem_sdr_dsp::emphasis::DeemphasisFilter;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -256,57 +257,6 @@ pub fn spawn(
     WorkerHandle {
         stop,
         thread: Some(thread),
-    }
-}
-
-/// First-order IIR de-emphasis filter, mathematical inverse of the TX
-/// pre-emphasis defined in `tx_worker::preemphasis_nbfm_48k`. Same
-/// bilinear transform at 48 kHz with tau1 = 750 us and tau2 = 75 us,
-/// roles of the time constants swapped:
-///   H(s) = (1 + s*tau2) / (1 + s*tau1)
-/// → -20 dB plateau above ~2 kHz, flat at DC, breakpoints near 212 Hz
-/// and 2.12 kHz. Cascaded with the matching pre-emphasis the response
-/// is flat to within discretization noise. Stateful: the worker keeps
-/// one instance across batches to avoid boundary clicks.
-pub struct DeemphasisFilter {
-    x_prev: f32,
-    y_prev: f32,
-}
-
-impl DeemphasisFilter {
-    // Bilinear coefficients without pre-warp, fs = 48 kHz, tau1/tau2
-    // swapped relative to preemphasis_nbfm_48k:
-    //   2*tau2/T = 7.2, 2*tau1/T = 72.0
-    //   Numerator   : 8.2 - 6.2 z^-1
-    //   Denominator : 73  - 71  z^-1
-    //   Normalized by a0 = 73 →
-    const B0: f32 = 0.112_328_77; // 8.2 / 73
-    const B1: f32 = -0.084_931_51; // -6.2 / 73
-    const A1: f32 = -0.972_602_75; // -71 / 73
-
-    pub fn new() -> Self {
-        Self {
-            x_prev: 0.0,
-            y_prev: 0.0,
-        }
-    }
-
-    /// Apply the filter in place. Designed to be called batch-by-batch;
-    /// internal state carries across calls.
-    pub fn process(&mut self, samples: &mut [f32]) {
-        for s in samples.iter_mut() {
-            let x = *s;
-            let y = Self::B0 * x + Self::B1 * self.x_prev - Self::A1 * self.y_prev;
-            self.x_prev = x;
-            self.y_prev = y;
-            *s = y;
-        }
-    }
-}
-
-impl Default for DeemphasisFilter {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

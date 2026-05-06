@@ -33,6 +33,7 @@ use modem_framing::{
     raptorq_codec::k_from_payload,
 };
 use modem_io::{CpalSink, SampleSink};
+use modem_sdr_dsp::emphasis::preemphasis_nbfm_48k;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -422,41 +423,6 @@ fn encode_in_process(
     V3Modem
         .encode_to_samples(&req)
         .map_err(|e| format!("encode: {e}"))
-}
-
-/// Digital +6 dB/octave NBFM pre-emphasis: first-order shelf
-/// H(s) = (1+s*tau1)/(1+s*tau2), tau1 = 750 us (zero at f1 ~= 212 Hz),
-/// tau2 = 75 us (pole at f2 ~= 2.12 kHz, capping the HF gain at
-/// tau1/tau2 = 20 dB). Bilinear transform at 48 kHz, coefficients
-/// normalized for DC = 1.
-///
-/// Digital response:
-///   - DC      : 0 dB
-///   - 1 kHz   : ~+13 dB
-///   - 2.7 kHz : ~+18 dB
-///   - Nyquist : +20 dB (shelf plateau)
-///
-/// Heavy boost across the full useful audio band (NBFM starts pre-
-/// emphasizing as low as 200 Hz, not 2 kHz like broadcast FM). The
-/// caller MUST peak-normalize the signal after filtering, otherwise
-/// the sound card clips.
-fn preemphasis_nbfm_48k(samples: &mut [f32]) {
-    // Bilinear sans prewarp : 2τ₁/T = 72.0, 2τ₂/T = 7.2.
-    // Num brut : 73 - 71 z⁻¹  ;  Den brut : 8.2 - 6.2 z⁻¹.
-    // Normalisation par a0 = 8.2 → b0 = 8.9024, b1 = -8.6585, a1 = -0.7561.
-    // Pole at z = 0.7561, stable.
-    const B0: f32 = 8.9024;
-    const B1: f32 = -8.6585;
-    const A1: f32 = -0.7561;
-    let mut x_prev = 0.0f32;
-    let mut y_prev = 0.0f32;
-    for s in samples.iter_mut() {
-        let x = *s;
-        let y = B0 * x + B1 * x_prev - A1 * y_prev;
-        x_prev = x;
-        y_prev = y;
-        *s = y;
-    }
 }
 
 /// Switch the PTT to TX polarity. Best-effort: if writing to the port
