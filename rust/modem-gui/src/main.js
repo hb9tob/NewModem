@@ -643,16 +643,36 @@ function populateDeviceSelect(selectId, devices, savedName, plutoDevices) {
   return select.value || null;
 }
 
-/// Show or hide the Pluto-specific settings fieldset based on whether
-/// the currently-selected RX device is a Pluto. Called whenever
-/// `rx-device-select` changes and at startup.
+/// Show or hide the Pluto-specific settings sub-panels based on
+/// whether the currently-selected RX/TX device is a Pluto. Called
+/// whenever rx/tx-device-select changes and at startup. Each
+/// direction has its own `pluto-*-config` block now (no more single
+/// shared `pluto-config` fieldset).
 function refreshPlutoPanelVisibility() {
-  const sel = document.getElementById("rx-device-select");
-  const panel = document.getElementById("pluto-config");
-  if (!sel || !panel) return;
-  const opt = sel.options[sel.selectedIndex];
-  const isPluto = !!(opt && opt.dataset && opt.dataset.kind === "pluto");
-  panel.hidden = !isPluto;
+  const refresh = (selectId, panelId) => {
+    const sel = document.getElementById(selectId);
+    const panel = document.getElementById(panelId);
+    if (!sel || !panel) return;
+    const opt = sel.options[sel.selectedIndex];
+    const isPluto = !!(opt && opt.dataset && opt.dataset.kind === "pluto");
+    panel.hidden = !isPluto;
+  };
+  refresh("rx-device-select", "pluto-rx-config");
+  refresh("tx-device-select", "pluto-tx-config");
+}
+
+/// Recompute and display the effective TX deviation = preset + offset,
+/// as both the visible "5.0 kHz" label and the slider's tooltip.
+/// Called from radio/slider change handlers.
+function refreshPlutoTxDeviationLabel() {
+  const presetEl = document.querySelector('input[name="pluto-tx-dev-preset"]:checked');
+  const offsetEl = document.getElementById("pluto-tx-dev-offset");
+  const out = document.getElementById("pluto-tx-dev-effective");
+  if (!presetEl || !offsetEl || !out) return;
+  const preset = parseInt(presetEl.value, 10) || 5000;
+  const offset = parseInt(offsetEl.value, 10) || 0;
+  const eff = Math.max(500, Math.min(8000, preset + offset));
+  out.textContent = (eff / 1000).toFixed(1) + " kHz";
 }
 
 function refreshRxDeviceLabel() {
@@ -695,7 +715,7 @@ async function loadDevices() {
       }),
     ]);
     populateDeviceSelect("rx-device-select", rxDevices, currentSettings.rx_device, plutoDevices);
-    populateDeviceSelect("tx-device-select", txDevices, currentSettings.tx_device);
+    populateDeviceSelect("tx-device-select", txDevices, currentSettings.tx_device, plutoDevices);
     const n48 = rxDevices.filter(d => d.supports_48k).length;
     const plutoTag = plutoDevices.length > 0 ? ` · ${plutoDevices.length} Pluto` : "";
     status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${plutoTag}`;
@@ -762,6 +782,18 @@ async function loadSettings() {
   if (plutoRxGain) plutoRxGain.value = String(currentSettings.pluto_rx_gain_db ?? 30);
   const plutoTxAtt = document.getElementById("pluto-tx-att-db");
   if (plutoTxAtt) plutoTxAtt.value = String(currentSettings.pluto_tx_attenuation_db ?? 30);
+  // FM deviation : RX preset (5/2.5 kHz radio), TX preset (radio) +
+  // fine-tune offset (slider), and the live "X.X kHz" effective label.
+  const rxDev = currentSettings.pluto_rx_deviation_hz ?? 5000;
+  const rxRadio = document.querySelector(`input[name="pluto-rx-dev"][value="${rxDev}"]`);
+  if (rxRadio) rxRadio.checked = true;
+  const txPreset = currentSettings.pluto_tx_deviation_preset_hz ?? 5000;
+  const txPresetRadio = document.querySelector(`input[name="pluto-tx-dev-preset"][value="${txPreset}"]`);
+  if (txPresetRadio) txPresetRadio.checked = true;
+  const txOffset = currentSettings.pluto_tx_deviation_offset_hz ?? 0;
+  const txOffsetSlider = document.getElementById("pluto-tx-dev-offset");
+  if (txOffsetSlider) txOffsetSlider.value = String(txOffset);
+  refreshPlutoTxDeviationLabel();
   applyTxSettingsToUI();
 }
 
@@ -1066,6 +1098,27 @@ async function persistSettings() {
       currentSettings.pluto_tx_attenuation_db = v;
     }
   }
+  // FM deviation : RX preset radio, TX preset radio, TX fine-tune slider.
+  // Allowed presets are {2500, 5000} on both directions; offset clamped
+  // to [-2000, +2000]. Backend `effective_pluto_tx_deviation_hz` adds
+  // them and clamps to a sane band.
+  const rxDevRadio = document.querySelector('input[name="pluto-rx-dev"]:checked');
+  if (rxDevRadio) {
+    const v = parseInt(rxDevRadio.value, 10);
+    if (v === 2500 || v === 5000) currentSettings.pluto_rx_deviation_hz = v;
+  }
+  const txPresetRadio = document.querySelector('input[name="pluto-tx-dev-preset"]:checked');
+  if (txPresetRadio) {
+    const v = parseInt(txPresetRadio.value, 10);
+    if (v === 2500 || v === 5000) currentSettings.pluto_tx_deviation_preset_hz = v;
+  }
+  const txOffset = document.getElementById("pluto-tx-dev-offset");
+  if (txOffset) {
+    const v = parseInt(txOffset.value, 10);
+    if (Number.isFinite(v) && v >= -2000 && v <= 2000) {
+      currentSettings.pluto_tx_deviation_offset_hz = v;
+    }
+  }
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -1102,8 +1155,28 @@ function setupSettingsTab() {
     const el = document.getElementById(id);
     if (el) el.addEventListener("change", persistSettings);
   });
+  // Deviation radios — persist on selection change.
+  document.querySelectorAll('input[name="pluto-rx-dev"]').forEach(r => {
+    r.addEventListener("change", persistSettings);
+  });
+  document.querySelectorAll('input[name="pluto-tx-dev-preset"]').forEach(r => {
+    r.addEventListener("change", () => {
+      refreshPlutoTxDeviationLabel();
+      persistSettings();
+    });
+  });
+  // TX fine-tune slider : live label update on `input`, persist on
+  // `change` (when the user releases the slider).
+  const txOffset = document.getElementById("pluto-tx-dev-offset");
+  if (txOffset) {
+    txOffset.addEventListener("input", refreshPlutoTxDeviationLabel);
+    txOffset.addEventListener("change", persistSettings);
+  }
   if (txSel) {
-    txSel.addEventListener("change", persistSettings);
+    txSel.addEventListener("change", () => {
+      refreshPlutoPanelVisibility();
+      persistSettings();
+    });
   }
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.addEventListener("change", persistSettings);

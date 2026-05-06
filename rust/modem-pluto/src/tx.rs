@@ -249,7 +249,14 @@ fn run_tx_loop(
         99,
     );
     let mut interp = PolyphaseInterpolator::with_taps(interp_taps, ratio);
-    let pm = PhaseMod::calibrated();
+    // Scale `k_p` linearly from the 5 kHz calibration so that audio
+    // at unit amplitude produces ±`session.tx_deviation_hz` on the
+    // air. PhaseMod is linear in k_p (output phase = k_p · x[n]) and
+    // FM deviation = derivative of phase, so deviation/k_p ratio is
+    // constant — multiplying k_p by 0.5 halves the deviation. See
+    // `PlutoConfig::tx_deviation_hz`.
+    let k_p = (session.tx_deviation_hz / 5000.0) * PhaseMod::DEFAULT_K_P;
+    let pm = PhaseMod::new(k_p);
 
     let mut last_tick = std::time::Instant::now();
     let mut total_iq_pushed: u64 = 0;

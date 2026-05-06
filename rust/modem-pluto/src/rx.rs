@@ -206,7 +206,11 @@ fn capture_loop(
     // DSP chain — built once, reused on every refill.
     let if_rate = session.negotiated_rate.sample_rate_hz as f32;
     let ratio = session.negotiated_rate.ratio;
-    let mut demod = QuadratureDemod::new(if_rate, modem_sdr_dsp::MAX_DEVIATION_HZ);
+    // Discriminator gain follows whatever max deviation the user
+    // selected (5 kHz NBFM standard, 2.5 kHz narrow NFM, etc.) — see
+    // `PlutoConfig::rx_max_deviation_hz`. Picking it below the actual
+    // on-air deviation would soft-clip; above would attenuate.
+    let mut demod = QuadratureDemod::new(if_rate, session.rx_max_deviation_hz);
     // The decimator's input rate is the QuadratureDemod's output rate
     // (= the IF rate, post-discriminator audio is at the IF rate). The
     // taps are designed for an audio-band LPF at 24 kHz cutoff

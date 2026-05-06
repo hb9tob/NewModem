@@ -1089,6 +1089,46 @@ main {
   width: 7em;
   text-align: right;
 }
+.pluto-field-label {
+  font-size: 0.85rem;
+  color: #c0c0c0;
+}
+.pluto-field-value {
+  font-size: 0.85rem;
+  color: #9ccc65;
+  font-variant-numeric: tabular-nums;
+  min-width: 4em;
+}
+/* Sub-fieldset shown inside the RX/TX device fieldsets when the
+   currently-selected device is a Pluto. Visually nested via a
+   left-border accent + indent. Hidden by `[hidden]` when not Pluto. */
+.pluto-subgroup {
+  margin-top: 0.7rem;
+  padding: 0.5rem 0.7rem;
+  border-left: 2px solid #4a90c8;
+  background: rgba(74, 144, 200, 0.06);
+  border-radius: 0 4px 4px 0;
+}
+.pluto-subgroup .pluto-row:first-child {
+  margin-top: 0;
+}
+/* Touch-icon button next to a frequency input: opens the on-screen
+   numeric keypad (added in Commit 3). 44 px wide is the touch-safe
+   minimum used by `#kiosk-exit`. */
+.freq-keypad-trigger {
+  min-width: 44px;
+  padding: 0.25rem 0.5rem;
+  font-size: 1rem;
+  background: #2a3845;
+  color: #d0d0d0;
+  border: 1px solid #4a90c8;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-left: 0.3rem;
+}
+.freq-keypad-trigger:hover {
+  background: #34495a;
+}
 .ptt-status {
   font-size: 0.8rem;
   margin-top: 0.4rem;

@@ -155,6 +155,38 @@ pub struct Settings {
     /// nearby receivers without an antenna isolator).
     #[serde(default = "default_pluto_tx_attenuation_db")]
     pub pluto_tx_attenuation_db: f64,
+    /// Pluto RX FM max deviation in Hz. `5000` = NBFM standard,
+    /// `2500` = narrow NFM (some repeaters / PMR-style channels).
+    /// The discriminator gain scales as `1 / max_deviation`; picking
+    /// it below the actual on-air deviation soft-clips the audio,
+    /// above attenuates it. Default 5000.
+    #[serde(default = "default_pluto_rx_deviation_hz")]
+    pub pluto_rx_deviation_hz: u32,
+    /// Pluto TX FM deviation preset in Hz, before the fine-tune
+    /// offset. `5000` = NBFM, `2500` = narrow NFM. The effective
+    /// deviation passed to the modulator is
+    /// [`Self::effective_pluto_tx_deviation_hz`] = preset + offset.
+    /// Default 5000.
+    #[serde(default = "default_pluto_tx_deviation_preset_hz")]
+    pub pluto_tx_deviation_preset_hz: u32,
+    /// Fine-tune offset around the TX deviation preset, in Hz.
+    /// Range `[-2000, +2000]`. Lets the operator dial in a value
+    /// that the local repeater accepts without clipping (some clip
+    /// at ~4.2 kHz, others tolerate up to 6 kHz). Default 0.
+    #[serde(default = "default_pluto_tx_deviation_offset_hz")]
+    pub pluto_tx_deviation_offset_hz: i32,
+}
+
+impl Settings {
+    /// Effective TX deviation in Hz = preset + fine-tune offset,
+    /// clamped to a sane range (500 Hz min, 8 kHz max). Always use
+    /// this accessor when feeding `PlutoConfig::tx_deviation_hz`;
+    /// callers must NOT add preset+offset themselves to keep the
+    /// clamp policy in one place.
+    pub fn effective_pluto_tx_deviation_hz(&self) -> u32 {
+        let raw = self.pluto_tx_deviation_preset_hz as i32 + self.pluto_tx_deviation_offset_hz;
+        raw.clamp(500, 8000) as u32
+    }
 }
 
 fn default_tx_quality() -> u32 {
@@ -217,6 +249,18 @@ fn default_pluto_tx_attenuation_db() -> f64 {
     30.0
 }
 
+fn default_pluto_rx_deviation_hz() -> u32 {
+    5000
+}
+
+fn default_pluto_tx_deviation_preset_hz() -> u32 {
+    5000
+}
+
+fn default_pluto_tx_deviation_offset_hz() -> i32 {
+    0
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -253,6 +297,9 @@ impl Default for Settings {
             pluto_rx_gain_mode: default_pluto_rx_gain_mode(),
             pluto_rx_gain_db: default_pluto_rx_gain_db(),
             pluto_tx_attenuation_db: default_pluto_tx_attenuation_db(),
+            pluto_rx_deviation_hz: default_pluto_rx_deviation_hz(),
+            pluto_tx_deviation_preset_hz: default_pluto_tx_deviation_preset_hz(),
+            pluto_tx_deviation_offset_hz: default_pluto_tx_deviation_offset_hz(),
         }
     }
 }

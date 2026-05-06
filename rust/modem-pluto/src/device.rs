@@ -76,6 +76,19 @@ pub struct PlutoConfig {
     /// [`crate::FALLBACK_SAMPLE_RATE_HZ`] (2304 kS/s, ratio ÷48) on
     /// `EINVAL`.
     pub prefer_low_rate: bool,
+    /// Maximum RX FM deviation in Hz, used to scale the discriminator
+    /// gain on the demodulator (`gain = sample_rate / (2π · max_dev)`).
+    /// 5000 Hz = standard NBFM; 2500 Hz = narrow NFM (some repeaters,
+    /// PMR-style channels). Picking a value below the actual on-air
+    /// deviation clips the audio amplitude; picking it above attenuates
+    /// it. Default 5000.
+    pub rx_max_deviation_hz: f32,
+    /// Effective TX FM deviation in Hz (= preset + fine-tune offset
+    /// already resolved by the caller). Drives the phase modulator's
+    /// `k_p` so audio at unit amplitude produces ±tx_deviation_hz on
+    /// the air. Linearly scales `PhaseMod::DEFAULT_K_P` from the 5000 Hz
+    /// calibration. Default 5000.
+    pub tx_deviation_hz: f32,
 }
 
 impl Default for PlutoConfig {
@@ -89,6 +102,8 @@ impl Default for PlutoConfig {
             tx_attenuation_db: 10.0,
             rf_bandwidth_hz: 200_000,
             prefer_low_rate: true,
+            rx_max_deviation_hz: 5000.0,
+            tx_deviation_hz: 5000.0,
         }
     }
 }
@@ -178,6 +193,17 @@ pub struct PlutoSession {
     pub rx_buffer_dev: Device,
     pub tx_buffer_dev: Device,
     pub negotiated_rate: NegotiatedRate,
+    /// RX FM max deviation copied from the [`PlutoConfig`] used to
+    /// open this session. Read by `rx::capture_loop` to size the
+    /// `QuadratureDemod` discriminator gain. Carried on the session
+    /// rather than passed as an extra capture-loop argument so the
+    /// existing `start_on` / `capture_loop` signatures stay compatible
+    /// with the loopback test path.
+    pub rx_max_deviation_hz: f32,
+    /// TX FM deviation copied from the [`PlutoConfig`]. Read by
+    /// `tx::run_tx` to scale the `PhaseMod`'s `k_p` from its 5 kHz
+    /// calibration. Same rationale as `rx_max_deviation_hz`.
+    pub tx_deviation_hz: f32,
 }
 
 impl std::fmt::Debug for PlutoSession {
@@ -387,6 +413,8 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
         rx_buffer_dev,
         tx_buffer_dev,
         negotiated_rate,
+        rx_max_deviation_hz: config.rx_max_deviation_hz,
+        tx_deviation_hz: config.tx_deviation_hz,
     })
 }
 

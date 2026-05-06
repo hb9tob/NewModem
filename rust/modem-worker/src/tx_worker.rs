@@ -33,6 +33,8 @@ use modem_framing::{
     raptorq_codec::k_from_payload,
 };
 use modem_io::{CpalSink, SampleSink};
+use modem_pluto::device::PlutoConfig;
+use modem_pluto::tx::PlutoSink;
 use modem_sdr_dsp::emphasis::preemphasis_nbfm_48k;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -230,6 +232,7 @@ pub fn spawn_more(
     count: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
+    pluto_config: Option<PlutoConfig>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
 ) -> TxHandle {
@@ -272,6 +275,7 @@ pub fn spawn_more(
             String::new(),
             attenuation_db,
             preemphasis_enabled,
+            pluto_config,
             stop_thread,
             ptt,
             sink,
@@ -296,6 +300,7 @@ pub fn spawn(
     repair_pct: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
+    pluto_config: Option<PlutoConfig>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
 ) -> TxHandle {
@@ -368,6 +373,7 @@ pub fn spawn(
             String::new(),
             attenuation_db,
             preemphasis_enabled,
+            pluto_config,
             stop_thread,
             ptt,
             sink,
@@ -455,6 +461,33 @@ fn ptt_release(ptt: &SharedPtt) {
     }
 }
 
+/// Erased TX-stream handle so the polling loop in `run_playback`
+/// works against either `cpal::PlaybackHandle` or
+/// `modem_pluto::tx::TxJob`. Both already expose `pos`, `is_done`,
+/// and a drop-on-stop semantic — this trait just unifies the call
+/// sites without paying the cost of `dyn` dispatch on every poll
+/// (one virtual call per 100 ms tick is free).
+trait TxStream {
+    fn pos(&self) -> usize;
+    fn is_done(&self) -> bool;
+}
+impl TxStream for modem_io::PlaybackHandle {
+    fn pos(&self) -> usize {
+        modem_io::PlaybackHandle::pos(self)
+    }
+    fn is_done(&self) -> bool {
+        modem_io::PlaybackHandle::is_done(self)
+    }
+}
+impl TxStream for modem_pluto::tx::TxJob {
+    fn pos(&self) -> usize {
+        modem_pluto::tx::TxJob::pos(self)
+    }
+    fn is_done(&self) -> bool {
+        modem_pluto::tx::TxJob::is_done(self)
+    }
+}
+
 fn run_playback(
     device_name: &str,
     mut samples: Vec<f32>,
@@ -463,6 +496,7 @@ fn run_playback(
     wav_path: String,
     attenuation_db: f32,
     preemphasis_enabled: bool,
+    pluto_config: Option<PlutoConfig>,
     stop: Arc<AtomicBool>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
@@ -508,19 +542,43 @@ fn run_playback(
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
     }
 
-    let handle = match CpalSink.play_buffer(device_name, AUDIO_RATE, samples) {
-        Ok(h) => h,
-        Err(e) => {
-            if ptt_engaged {
-                ptt_release(&ptt);
+    // Route on `pluto_config`: if `Some`, the device is a Pluto
+    // (frontend prefixed it with `pluto:` and the Tauri layer built a
+    // PlutoConfig from settings); send the audio through the Pluto
+    // FM modulator chain. Otherwise the cpal sound-card path. Both
+    // return a handle erased to `Box<dyn TxStream>` so the polling
+    // loop below stays identical.
+    let handle: Box<dyn TxStream> = if let Some(pcfg) = pluto_config {
+        match PlutoSink::new(pcfg).play_buffer(samples) {
+            Ok(h) => Box::new(h),
+            Err(e) => {
+                if ptt_engaged {
+                    ptt_release(&ptt);
+                }
+                sink.emit(
+                    "tx_error",
+                    TxErrorEvent {
+                        message: format!("Pluto TX: {e}"),
+                    },
+                );
+                return;
             }
-            sink.emit(
-                "tx_error",
-                TxErrorEvent {
-                    message: e.to_string(),
-                },
-            );
-            return;
+        }
+    } else {
+        match CpalSink.play_buffer(device_name, AUDIO_RATE, samples) {
+            Ok(h) => Box::new(h),
+            Err(e) => {
+                if ptt_engaged {
+                    ptt_release(&ptt);
+                }
+                sink.emit(
+                    "tx_error",
+                    TxErrorEvent {
+                        message: e.to_string(),
+                    },
+                );
+                return;
+            }
         }
     };
 

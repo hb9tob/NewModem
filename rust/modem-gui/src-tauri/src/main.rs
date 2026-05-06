@@ -257,6 +257,32 @@ fn ptt_status(state: State<'_, AppState>) -> PttStatusEvent {
     }
 }
 
+/// Build a [`modem_pluto::device::PlutoConfig`] from the persistent
+/// [`settings::Settings`] for a given libiio URI. Shared between the
+/// RX `start_capture` branch and the TX `tx_start` / `tx_more`
+/// branches so both directions see the same frequency / gain /
+/// deviation values from one source of truth (the Settings panel).
+fn build_pluto_config(uri: &str, cfg: &settings::Settings) -> modem_pluto::device::PlutoConfig {
+    // Default to slow_attack if Settings ever carries an
+    // unrecognised mode string — the chip would reject the
+    // raw libiio write anyway, but defaulting saves the user
+    // a trip to the Settings panel.
+    let rx_mode = modem_pluto::device::RxGainMode::from_iio_str(&cfg.pluto_rx_gain_mode)
+        .unwrap_or(modem_pluto::device::RxGainMode::SlowAttack);
+    modem_pluto::device::PlutoConfig {
+        uri: uri.to_string(),
+        rx_freq_hz: cfg.pluto_rx_freq_hz,
+        tx_freq_hz: cfg.pluto_tx_freq_hz,
+        rx_gain_mode: rx_mode,
+        rx_gain_db: cfg.pluto_rx_gain_db,
+        tx_attenuation_db: cfg.pluto_tx_attenuation_db,
+        rf_bandwidth_hz: 200_000,
+        prefer_low_rate: true,
+        rx_max_deviation_hz: cfg.pluto_rx_deviation_hz as f32,
+        tx_deviation_hz: cfg.effective_pluto_tx_deviation_hz() as f32,
+    }
+}
+
 #[tauri::command]
 fn start_capture(
     device_name: String,
@@ -298,24 +324,7 @@ fn start_capture(
     // know which backend produced the samples.
     let (capture, samples) =
         if let Some(uri) = device_name.strip_prefix(PLUTO_DEVICE_PREFIX) {
-            // Default to slow_attack if Settings ever carries an
-            // unrecognised mode string — the chip would reject the
-            // raw libiio write anyway, but defaulting saves the user
-            // a trip to the Settings panel.
-            let rx_mode = modem_pluto::device::RxGainMode::from_iio_str(
-                &cfg.pluto_rx_gain_mode,
-            )
-            .unwrap_or(modem_pluto::device::RxGainMode::SlowAttack);
-            let pcfg = modem_pluto::device::PlutoConfig {
-                uri: uri.to_string(),
-                rx_freq_hz: cfg.pluto_rx_freq_hz,
-                tx_freq_hz: cfg.pluto_tx_freq_hz,
-                rx_gain_mode: rx_mode,
-                rx_gain_db: cfg.pluto_rx_gain_db,
-                tx_attenuation_db: cfg.pluto_tx_attenuation_db,
-                rf_bandwidth_hz: 200_000,
-                prefer_low_rate: true,
-            };
+            let pcfg = build_pluto_config(uri, &cfg);
             let (h, rx) = modem_pluto::rx::start(&pcfg)
                 .map_err(|e| format!("Pluto open ({uri}): {e}"))?;
             (CaptureKind::Pluto(h), rx)
@@ -525,6 +534,13 @@ fn tx_start(
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let history_max = cfg.tx_history_max;
     let repair_pct = args.repair_pct.unwrap_or(30);
+    // Build the Pluto config only if the selected TX device is a
+    // Pluto. The worker uses `Option::is_some` to route between the
+    // cpal sound-card path and the Pluto FM-mod chain.
+    let pluto_config = args
+        .tx_device
+        .strip_prefix(PLUTO_DEVICE_PREFIX)
+        .map(|uri| build_pluto_config(uri, &cfg));
     let archive_sink = TauriEventSink(app.clone());
     tx_worker::archive_payload(
         &save_dir,
@@ -546,6 +562,7 @@ fn tx_start(
         repair_pct,
         attenuation_db,
         preemphasis_enabled,
+        pluto_config,
         state.ptt.clone(),
         tx_sink,
     );
@@ -601,6 +618,10 @@ fn tx_more(
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
+    let pluto_config = args
+        .tx_device
+        .strip_prefix(PLUTO_DEVICE_PREFIX)
+        .map(|uri| build_pluto_config(uri, &cfg));
     let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn_more(
         payload_path,
@@ -613,6 +634,7 @@ fn tx_more(
         args.count,
         attenuation_db,
         preemphasis_enabled,
+        pluto_config,
         state.ptt.clone(),
         tx_sink,
     );
