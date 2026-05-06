@@ -428,6 +428,16 @@ fn run_worker(
     };
     let mut state = WorkerState::new(profile, forced, store, deemphasis_enabled);
 
+    // Telemetry to surface "worker falling behind realtime" — the
+    // signature of CPU-limited HIGH+ on the Pi 5 SDR path. We compare
+    // wall-clock time to audio time (= samples processed / 48 kHz);
+    // on a healthy system the two stay locked. A growing gap is the
+    // smoking gun that the decoder can't keep up with the capture.
+    let started = Instant::now();
+    let mut last_telemetry_tick = Instant::now();
+    let mut last_batch_processing_ms: f64 = 0.0;
+    let mut max_batch_processing_ms: f64 = 0.0;
+
     while !stop.load(Ordering::Relaxed) {
         let first = match samples.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
@@ -438,6 +448,7 @@ fn run_worker(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        let batch_start = Instant::now();
         let mut batch = first;
         batch.reserve(BATCH_TARGET_SAMPLES);
         while batch.len() < BATCH_TARGET_SAMPLES {
@@ -499,6 +510,39 @@ fn run_worker(
         }
 
         maintenance_tick(&*sink, &save_dir, &mut state);
+
+        // Per-batch wall time, tracked so the 2 s telemetry tick can
+        // surface peak processing cost. A batch ≈ 500 ms of audio,
+        // so anything over ~500 ms here is "falling behind realtime".
+        last_batch_processing_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+        if last_batch_processing_ms > max_batch_processing_ms {
+            max_batch_processing_ms = last_batch_processing_ms;
+        }
+
+        // 2 s realtime-margin tick.
+        //   wall_s : seconds of wall clock since worker started
+        //   audio_s: seconds of audio that have actually been
+        //            consumed by this loop (= total_samples / 48 kHz)
+        //   lag_ms : (wall_s - audio_s) * 1000. Ideally near 0. A
+        //            positive growing value means the decoder can't
+        //            keep up with the capture and the session_buffer
+        //            trim is silently dropping audio under us.
+        if last_telemetry_tick.elapsed() >= Duration::from_secs(2) {
+            let wall_s = started.elapsed().as_secs_f64();
+            let audio_s = state.total_samples as f64 / AUDIO_RATE as f64;
+            let lag_ms = (wall_s - audio_s) * 1000.0;
+            let session_buf_ms =
+                state.session_buffer.len() as f64 * 1000.0 / AUDIO_RATE as f64;
+            worker_log(&format!(
+                "[worker] tick: audio={audio_s:.1}s wall={wall_s:.1}s \
+                 lag={lag_ms:+.0}ms last_batch={last_batch_processing_ms:.0}ms \
+                 max_batch={max_batch_processing_ms:.0}ms \
+                 session_buf={session_buf_ms:.0}ms session_active={}",
+                state.session_active
+            ));
+            last_telemetry_tick = Instant::now();
+            max_batch_processing_ms = 0.0;
+        }
     }
 
     worker_log("[worker] stop");

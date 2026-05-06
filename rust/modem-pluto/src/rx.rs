@@ -53,6 +53,17 @@ pub const AUDIO_RATE: u32 = modem_sdr_dsp::AUDIO_RATE;
 /// bytes per i16 pair, rounded).
 const RX_BUFFER_SAMPLES: usize = 8192;
 
+/// Audio samples per `Vec<f32>` pushed into the worker mpsc. 1200
+/// samples = 25 ms at 48 kHz, which matches what the cpal soundcard
+/// backend delivers per callback (measured ~40 callbacks/s, ~1200
+/// samples each on the Pi 5 PulseAudio path). One refill of
+/// [`RX_BUFFER_SAMPLES`] produces ~683 audio samples after ÷12
+/// decimation, so we accumulate 2-3 refills' worth before flushing.
+/// Equalising the chunk shape between cpal and Pluto keeps the
+/// worker side homogeneous: same per-batch overhead, same mpsc
+/// pressure, no special case.
+const TARGET_CHUNK_SAMPLES: usize = 1200;
+
 /// AD9361 / AD9363 RX path on Pluto outputs S12 in S16 LE — a 12-bit
 /// signed sample sign-extended into a 16-bit word, peak ±2047. We
 /// scale to unit-amplitude `Complex32` by dividing by this constant.
@@ -211,6 +222,13 @@ fn capture_loop(
     let mut refill_errors: u64 = 0;
     let mut total_iq_samples: u64 = 0;
 
+    // Aggregation buffer between refills — one libiio refill produces
+    // ~RX_BUFFER_SAMPLES/ratio audio samples (~683 at 576 kHz ÷12),
+    // smaller than [`TARGET_CHUNK_SAMPLES`]. We accumulate until we
+    // have a full chunk, then flush. Pre-allocated for a couple of
+    // chunks' worth so steady-state runs allocation-free.
+    let mut pending: Vec<f32> = Vec::with_capacity(TARGET_CHUNK_SAMPLES * 2);
+
     while !stop.load(Ordering::Relaxed) {
         let n = match buf.refill() {
             Ok(n) => n,
@@ -261,8 +279,22 @@ fn capture_loop(
         deemph.process(&mut audio);
         hpf.process(&mut audio);
 
-        if sample_tx.send(audio).is_err() {
-            // Receiver hung up — exit gracefully.
+        // Accumulate into `pending`, flush full chunks of
+        // [`TARGET_CHUNK_SAMPLES`]. The remainder stays in `pending`
+        // for the next refill — no samples dropped, no reframing
+        // jitter visible to the worker. This drops the mpsc send
+        // rate from ~70/s (per-refill) to ~40/s (per-chunk) which
+        // matches cpal exactly.
+        pending.extend_from_slice(&audio);
+        let mut hung_up = false;
+        while pending.len() >= TARGET_CHUNK_SAMPLES {
+            let chunk: Vec<f32> = pending.drain(..TARGET_CHUNK_SAMPLES).collect();
+            if sample_tx.send(chunk).is_err() {
+                hung_up = true;
+                break;
+            }
+        }
+        if hung_up {
             break;
         }
 

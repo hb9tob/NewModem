@@ -121,6 +121,7 @@ struct PlutoDeviceInfo {
 /// but no Pluto plugged in".
 #[tauri::command]
 fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
+    eprintln!("[pluto] list_pluto_devices invoked");
     let scan = match industrial_io::ScanContext::new_usb() {
         Ok(s) => s,
         Err(e) => {
@@ -131,8 +132,10 @@ fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
             return Ok(Vec::new());
         }
     };
+    eprintln!("[pluto] scan ok, len = {}", scan.len());
     let mut out = Vec::new();
     for (uri, descr) in scan.iter() {
+        eprintln!("[pluto] entry uri={uri:?} descr={descr:?}");
         // Only keep entries whose description matches a Pluto. libiio
         // can list other AD9361-class boards too — skip those.
         let is_pluto = descr.contains("PlutoSDR")
@@ -140,6 +143,7 @@ fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
             || descr.contains("AD9363")
             || descr.contains("AD9361");
         if !is_pluto {
+            eprintln!("[pluto]   -> skipped (not a Pluto)");
             continue;
         }
         let friendly_name = format!("Pluto SDR — {uri}");
@@ -150,6 +154,7 @@ fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
             friendly_name,
         });
     }
+    eprintln!("[pluto] returning {} entries", out.len());
     Ok(out)
 }
 
