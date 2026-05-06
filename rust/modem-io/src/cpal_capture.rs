@@ -134,13 +134,16 @@ fn run_capture(
 
     let callback_count = Arc::new(AtomicU64::new(0));
     let callback_samples = Arc::new(AtomicU64::new(0));
+    // Errors are throttled because cpal's ALSA backend can refire POLLERR
+    // millions of times per second (observed: 1.06 M lines, ~16 GiB log
+    // file in a few hours when the audio device misbehaved). We still
+    // surface the count in the periodic tick line so the user sees the
+    // stream is unhealthy.
+    let error_count = Arc::new(AtomicU64::new(0));
     let cb_count = callback_count.clone();
     let cb_samples = callback_samples.clone();
 
     let tx_cb = sample_tx.clone();
-    let err_cb = |e| {
-        log(&format!("[capture] stream error: {e}"));
-    };
 
     let build_res = match format {
         SampleFormat::F32 => device.build_input_stream::<f32, _, _>(
@@ -150,7 +153,7 @@ fn run_capture(
                 cb_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 push_mono_f32(data, channels, &tx_cb);
             },
-            err_cb,
+            make_err_cb(error_count.clone()),
             None,
         ),
         SampleFormat::I16 => device.build_input_stream::<i16, _, _>(
@@ -160,7 +163,7 @@ fn run_capture(
                 cb_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 push_mono_i16(data, channels, &tx_cb);
             },
-            err_cb,
+            make_err_cb(error_count.clone()),
             None,
         ),
         SampleFormat::U16 => device.build_input_stream::<u16, _, _>(
@@ -170,7 +173,7 @@ fn run_capture(
                 cb_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 push_mono_u16(data, channels, &tx_cb);
             },
-            err_cb,
+            make_err_cb(error_count.clone()),
             None,
         ),
         SampleFormat::U8 => device.build_input_stream::<u8, _, _>(
@@ -180,7 +183,7 @@ fn run_capture(
                 cb_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 push_mono_u8(data, channels, &tx_cb);
             },
-            err_cb,
+            make_err_cb(error_count.clone()),
             None,
         ),
         other => {
@@ -211,30 +214,60 @@ fn run_capture(
     let mut last_tick = Instant::now();
     let mut last_samples: u64 = 0;
     let mut last_count: u64 = 0;
+    let mut last_errors: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(500));
         let now = Instant::now();
         if now.duration_since(last_tick) >= Duration::from_secs(2) {
             let cnt = callback_count.load(Ordering::Relaxed);
             let smp = callback_samples.load(Ordering::Relaxed);
+            let err = error_count.load(Ordering::Relaxed);
             let dt = now.duration_since(last_tick).as_secs_f64();
             let cb_per_sec = (cnt - last_count) as f64 / dt;
             let smp_per_sec = (smp - last_samples) as f64 / dt;
             log(&format!(
-                "[capture] tick: cbs={cnt} (+{} in {:.1}s, {:.1}/s), samples={smp} ({:.0} Sa/s ≈ {:.1}× target)",
+                "[capture] tick: cbs={cnt} (+{} in {:.1}s, {:.1}/s), samples={smp} ({:.0} Sa/s ≈ {:.1}× target), errors={err} (+{})",
                 cnt - last_count,
                 dt,
                 cb_per_sec,
                 smp_per_sec,
-                smp_per_sec / (TARGET_RATE as f64 * channels as f64)
+                smp_per_sec / (TARGET_RATE as f64 * channels as f64),
+                err - last_errors,
             ));
             last_tick = now;
             last_count = cnt;
             last_samples = smp;
+            last_errors = err;
         }
     }
     log("[capture] stop flag → dropping stream");
     drop(stream);
+}
+
+/// Builds a throttled error callback for cpal `build_input_stream`.
+///
+/// cpal forwards every backend error verbatim, and on Linux/ALSA a
+/// `POLLERR` condition can refire on every poll iteration — easily a
+/// million times per second. The naive "log every error" approach
+/// produced multi-GiB logs in production, so we count errors via the
+/// shared atomic and only emit a line on power-of-ten milestones (and
+/// once per million afterwards). The current count is also exposed in
+/// the periodic tick log, so a chronically failing stream stays
+/// visible without flooding the disk.
+fn make_err_cb(count: Arc<AtomicU64>) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    move |e| {
+        let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 3
+            || n == 10
+            || n == 100
+            || n == 1_000
+            || n == 10_000
+            || n == 100_000
+            || n % 1_000_000 == 0
+        {
+            log(&format!("[capture] stream error #{n}: {e}"));
+        }
+    }
 }
 
 fn push_mono_f32(data: &[f32], channels: u16, tx: &Sender<Vec<f32>>) {
