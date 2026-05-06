@@ -2322,6 +2322,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "industrial-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "348ab060d6e63ff76337f57d7646fc3bd38d7abc0ac8c98b7acedecf2262e90f"
+dependencies = [
+ "libiio-sys",
+ "nix 0.29.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "infer"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2610,6 +2621,12 @@ dependencies = [
  "arbitrary",
  "cc",
 ]
+
+[[package]]
+name = "libiio-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f643b99b21452dd9bb6cb5a517cfa8342e90c6e9427a2b6274d5331dfb9ad98"
 
 [[package]]
 name = "libloading"
@@ -2929,6 +2946,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "modem-pluto"
+version = "0.1.0"
+dependencies = [
+ "industrial-io",
+ "modem-sdr-dsp",
+ "num-complex",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "modem-sdr-dsp"
 version = "0.1.0"
 dependencies = [
@@ -3108,6 +3135,18 @@ checksum = "598beaf3cc6fdd9a5dfb1630c2800c7acd31df7aaf0f565796fba2b53ca1af1b"
 dependencies = [
  "bitflags 1.3.2",
  "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "cfg_aliases",
  "libc",
 ]
 
@@ -4816,7 +4855,7 @@ dependencies = [
  "io-kit-sys",
  "libudev",
  "mach2",
- "nix",
+ "nix 0.26.4",
  "scopeguard",
  "unescaper",
  "windows-sys 0.52.0",

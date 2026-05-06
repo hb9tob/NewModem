@@ -1,0 +1,15 @@
+[package]
+name = "modem-pluto"
+version = "0.1.0"
+edition = "2021"
+description = "PlutoSDR (ADALM-PLUTO / AD9363) backend for the NBFM modem. Streams I/Q via libiio, runs the radio-faithful PM TX + LPF/HPF RX chain from modem-sdr-dsp, and exposes the same SampleSink (TX) and mpsc::Receiver<Vec<f32>> (RX) seams as the cpal soundcard backend."
+publish = false
+
+[dependencies]
+modem-sdr-dsp = { path = "../modem-sdr-dsp" }
+industrial-io = "0.6"
+num-complex = { workspace = true }
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
