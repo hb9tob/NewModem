@@ -593,6 +593,32 @@
     <div class="image-lightbox-hint">a/q ou +/− ou molette : zoom (jusqu'à 8×) · 0 : ajuster · flèches ou drag : pan · Échap : fermer</div>
     <img id="image-lightbox-img" alt="" />
   </div>
+  <!--
+    Native virtual keyboard for kiosk-mode text/number entry. Auto-opens
+    on focus when body has `.kiosk-mode`. The keypad rows are emitted
+    dynamically by `setupVirtKeyboard()` so the same DOM serves the
+    QWERTY alpha layout, the symbols layout (?123), and the numeric pad
+    that frequency / gain inputs use. Trigger logic + key handlers live
+    in main.js (search "virtKeyboard").
+  -->
+  <div id="virt-keyboard-modal" class="virt-keyboard-modal" hidden>
+    <div class="virt-kb-panel">
+      <div class="virt-kb-header">
+        <span class="virt-kb-label" id="virt-kb-label">—</span>
+        <span class="virt-kb-close" id="virt-kb-cancel" title="Annuler">✕</span>
+      </div>
+      <div class="virt-kb-display">
+        <span id="virt-kb-value">&nbsp;</span><span class="virt-kb-caret">|</span>
+      </div>
+      <div class="virt-kb-rows" id="virt-kb-rows">
+        <!-- Rows injected by setupVirtKeyboard(). -->
+      </div>
+      <div class="virt-kb-actions">
+        <button type="button" id="virt-kb-cancel-btn">Annuler</button>
+        <button type="button" id="virt-kb-ok">Valider</button>
+      </div>
+    </div>
+  </div>
   <script type="module" src="main.js"></script>
 </body>
 </html>

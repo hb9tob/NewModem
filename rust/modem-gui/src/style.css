@@ -1498,6 +1498,130 @@ main {
   pointer-events: none;
 }
 
+/* ─── Native virtual keyboard (kiosk text/number entry) ─── */
+/*
+   Modal overlay that auto-opens when an input is focused while body
+   has `.kiosk-mode`. Layout follows the `.image-lightbox` pattern:
+   `position: fixed; inset: 0` covers the viewport. Touch keys use
+   the same min-height as `#kiosk-exit` (44 px is the ergonomic
+   minimum on a 7" 800x480 panel — keys here go a bit larger at
+   ~52 px for a 4-row layout that still fits below 480 px).
+*/
+.virt-keyboard-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 250;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  /* Native iOS Safari prevents pinch-zoom inside modal — keeps the
+     keyboard scale stable when the user accidentally pinches. */
+  touch-action: manipulation;
+}
+.virt-kb-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.6rem;
+  width: 100%;
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.virt-kb-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: #9ccc65;
+}
+.virt-kb-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.virt-kb-close {
+  font-size: 1.4rem;
+  color: #ef5350;
+  cursor: pointer;
+  padding: 0.1rem 0.5rem;
+  user-select: none;
+}
+.virt-kb-display {
+  background: #000;
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  font-size: 1.4rem;
+  font-family: ui-monospace, monospace;
+  color: #d0d0d0;
+  min-height: 2rem;
+  word-break: break-all;
+  letter-spacing: 0.04em;
+}
+.virt-kb-caret {
+  display: inline-block;
+  margin-left: 1px;
+  color: #9ccc65;
+  animation: virt-kb-blink 1s steps(2, end) infinite;
+}
+@keyframes virt-kb-blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+.virt-kb-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.virt-kb-row {
+  display: flex;
+  gap: 0.3rem;
+  justify-content: center;
+}
+.virt-kb-key {
+  flex: 1;
+  min-width: 0;
+  min-height: 52px;
+  padding: 0.4rem 0;
+  font-size: 1.1rem;
+  background: #2a3845;
+  color: #e0e0e0;
+  border: 1px solid #4a5868;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-family: inherit;
+}
+.virt-kb-key:hover {
+  background: #34495a;
+}
+.virt-kb-key:active,
+.virt-kb-key.held {
+  background: #4a90c8;
+  color: #fff;
+  border-color: #5aa0d8;
+}
+.virt-kb-key.wide-2 { flex: 2; }
+.virt-kb-key.wide-3 { flex: 3; }
+.virt-kb-key.special {
+  background: #34465a;
+  font-size: 0.85rem;
+}
+.virt-kb-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.3rem;
+}
+.virt-kb-actions button {
+  flex: 1;
+  min-height: 50px;
+  font-size: 1.05rem;
+  border-radius: 4px;
+  border: 1px solid #4a5868;
+  cursor: pointer;
+}
+#virt-kb-cancel-btn { background: #34465a; color: #ddd; }
+#virt-kb-ok { background: #4a90c8; color: #fff; border-color: #5aa0d8; }
+
 /* ─── Sessions tab ─── */
 .sessions-layout {
   padding: 12px 16px;

@@ -3801,6 +3801,7 @@ function setupKioskMode() {
 
 async function init() {
   setupKioskMode();
+  setupVirtKeyboard();
   setupTabs();
   setupLightbox();
   setupTxTab();
@@ -3837,6 +3838,275 @@ async function init() {
   setInterval(refreshOverdriveChip, 200);
   // Auto-start RX capture if a device is configured.
   await tryAutoStartCapture();
+}
+
+// ─── Native virtual keyboard (kiosk text/number entry) ────────────
+//
+// In kiosk mode (no physical keyboard on the 7" Pi panel) text/number
+// inputs become impossible to fill: the user can't enter their callsign,
+// a filename, a Pluto frequency offset, etc. This component is a pure
+// in-app touch keyboard — no system dependency (no squeekboard / wvkbd /
+// onboard) — that auto-opens when an `<input>` is focused while
+// `body.kiosk-mode` is set. Outside kiosk it stays dormant: a physical
+// keyboard typing into the input works like before.
+//
+// Layouts:
+//   * `alpha`   QWERTY uppercase + lower toggle, with shift, space,
+//               and a `?123` key to switch to symbols/numerics.
+//   * `symbols` digits, common punctuation, `ABC` to come back.
+//   * `numeric` 0-9 + decimal point + sign for `<input type="number">`.
+//
+// Special-cased by input id:
+//   * `callsign-input` opens caps-locked, ASCII letters + digits only.
+//
+// On Valider: write `virtKb.draft` to `target.value`, dispatch `input`
+// + `change`, close. On Annuler / outside-tap / Esc: close, no save.
+const VIRT_KB_QWERTY_ROWS = [
+  ["q","w","e","r","t","y","u","i","o","p"],
+  ["a","s","d","f","g","h","j","k","l"],
+  ["z","x","c","v","b","n","m"],
+];
+const VIRT_KB_SYMBOLS_ROWS = [
+  ["1","2","3","4","5","6","7","8","9","0"],
+  ["@","#","_","-",".",",","/",":","="],
+  ["+","*","(",")","'","\"","?","!","%"],
+];
+const VIRT_KB_NUMERIC_ROWS = [
+  ["1","2","3"],
+  ["4","5","6"],
+  ["7","8","9"],
+  ["-",".","0"],
+];
+
+const virtKb = {
+  modal: null,
+  rowsEl: null,
+  displayEl: null,
+  labelEl: null,
+  okBtn: null,
+  cancelBtn: null,
+  closeBtn: null,
+  // Live state — reset on every open():
+  target: null,        // the original <input> element
+  draft: "",           // editable string buffer
+  layout: "alpha",     // "alpha" | "symbols" | "numeric"
+  shift: false,        // true = uppercase letters in alpha mode
+  capsLock: false,     // sticky shift (callsign field auto-engages)
+};
+
+function setupVirtKeyboard() {
+  virtKb.modal = document.getElementById("virt-keyboard-modal");
+  virtKb.rowsEl = document.getElementById("virt-kb-rows");
+  virtKb.displayEl = document.getElementById("virt-kb-value");
+  virtKb.labelEl = document.getElementById("virt-kb-label");
+  virtKb.okBtn = document.getElementById("virt-kb-ok");
+  virtKb.cancelBtn = document.getElementById("virt-kb-cancel-btn");
+  virtKb.closeBtn = document.getElementById("virt-kb-cancel");
+  if (!virtKb.modal) return;
+
+  // Single delegated focusin handler (cheap, no re-attach when DOM
+  // changes). Filters by input.type so checkboxes / radios / file pickers
+  // don't trigger the keyboard. Hidden inputs in modals (e.g. file
+  // picker) are skipped via `:not([hidden])`.
+  document.addEventListener("focusin", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement)) return;
+    if (t.dataset.virtKbSkip === "1") return;
+    const type = (t.type || "text").toLowerCase();
+    if (type !== "text" && type !== "number" && type !== "search" && type !== "tel" && type !== "url") return;
+    // Already inside the keyboard? avoid recursion (the display is a
+    // <span>, not an input, but defensive).
+    if (virtKb.modal.contains(t)) return;
+    // Unfocus the input so the OS soft-keyboard (if any) doesn't try to
+    // appear underneath. We keep a reference for the commit.
+    t.blur();
+    openVirtKeyboard(t);
+  });
+
+  // OK / Cancel / outside-tap / Esc.
+  virtKb.okBtn.addEventListener("click", () => closeVirtKeyboard(true));
+  virtKb.cancelBtn.addEventListener("click", () => closeVirtKeyboard(false));
+  virtKb.closeBtn.addEventListener("click", () => closeVirtKeyboard(false));
+  virtKb.modal.addEventListener("click", (e) => {
+    if (e.target === virtKb.modal) closeVirtKeyboard(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (virtKb.modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeVirtKeyboard(false);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      closeVirtKeyboard(true);
+    }
+  });
+}
+
+function openVirtKeyboard(input) {
+  virtKb.target = input;
+  virtKb.draft = input.value || "";
+  // Pick layout from input.type and id.
+  const type = (input.type || "text").toLowerCase();
+  if (type === "number") {
+    virtKb.layout = "numeric";
+    virtKb.shift = false;
+    virtKb.capsLock = false;
+  } else {
+    virtKb.layout = "alpha";
+    // Callsign field — uppercase locked, ASCII alphanum only. Same
+    // pragmatic behaviour as a real radio's callsign editor.
+    virtKb.capsLock = (input.id === "callsign-input");
+    virtKb.shift = virtKb.capsLock;
+  }
+  virtKb.labelEl.textContent = inputLabel(input);
+  virtKb.modal.hidden = false;
+  renderVirtKeyboardLayout();
+  refreshVirtKbDisplay();
+}
+
+function closeVirtKeyboard(commit) {
+  if (!virtKb.modal || virtKb.modal.hidden) return;
+  if (commit && virtKb.target) {
+    const max = parseInt(virtKb.target.getAttribute("maxlength") || "0", 10);
+    let out = virtKb.draft;
+    if (max > 0) out = out.slice(0, max);
+    virtKb.target.value = out;
+    // Notify any change listener wired by the rest of the app
+    // (persistSettings, refreshTxEstimate, …).
+    virtKb.target.dispatchEvent(new Event("input", { bubbles: true }));
+    virtKb.target.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  virtKb.modal.hidden = true;
+  virtKb.target = null;
+  virtKb.draft = "";
+}
+
+function inputLabel(input) {
+  // Prefer the surrounding <label>'s direct text node, fall back to
+  // placeholder, then to the id.
+  const lab = input.closest("label");
+  if (lab) {
+    const txt = (lab.textContent || "").replace(input.value || "", "").trim();
+    if (txt) return txt.replace(/\s+/g, " ").slice(0, 60);
+  }
+  if (input.placeholder) return input.placeholder;
+  return input.id || "Saisie";
+}
+
+function renderVirtKeyboardLayout() {
+  const rows = virtKb.rowsEl;
+  rows.innerHTML = "";
+  if (virtKb.layout === "numeric") {
+    for (const row of VIRT_KB_NUMERIC_ROWS) {
+      const r = document.createElement("div");
+      r.className = "virt-kb-row";
+      for (const k of row) r.appendChild(makeKbKey(k));
+      rows.appendChild(r);
+    }
+    const trailer = document.createElement("div");
+    trailer.className = "virt-kb-row";
+    trailer.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+    rows.appendChild(trailer);
+    return;
+  }
+  const rowsData = virtKb.layout === "symbols" ? VIRT_KB_SYMBOLS_ROWS : VIRT_KB_QWERTY_ROWS;
+  for (const row of rowsData) {
+    const r = document.createElement("div");
+    r.className = "virt-kb-row";
+    for (const k of row) {
+      const display = (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock))
+        ? k.toUpperCase()
+        : k;
+      r.appendChild(makeKbKey(display, k));
+    }
+    rows.appendChild(r);
+  }
+  // Last row : layout-specific specials.
+  const last = document.createElement("div");
+  last.className = "virt-kb-row";
+  if (virtKb.layout === "alpha") {
+    const shiftLabel = virtKb.capsLock ? "⇪" : "⇧";
+    last.appendChild(makeKbKey(shiftLabel, "shift", "wide-2 special"));
+    last.appendChild(makeKbKey("?123", "to-symbols", "wide-2 special"));
+    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
+    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+  } else {
+    last.appendChild(makeKbKey("ABC", "to-alpha", "wide-2 special"));
+    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
+    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+  }
+  rows.appendChild(last);
+}
+
+function makeKbKey(label, action, extraClass) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "virt-kb-key" + (extraClass ? " " + extraClass : "");
+  b.textContent = label;
+  b.dataset.action = action || label;
+  b.addEventListener("click", () => onVirtKbKey(b.dataset.action));
+  return b;
+}
+
+function onVirtKbKey(action) {
+  switch (action) {
+    case "back":
+      virtKb.draft = virtKb.draft.slice(0, -1);
+      break;
+    case "space":
+      appendVirtKbChar(" ");
+      break;
+    case "shift":
+      if (virtKb.shift && !virtKb.capsLock) {
+        // 1st tap : shift on. 2nd consecutive tap : caps-lock.
+        virtKb.capsLock = true;
+      } else if (virtKb.capsLock) {
+        // Tap while capsLock : turn everything off.
+        virtKb.capsLock = false;
+        virtKb.shift = false;
+      } else {
+        virtKb.shift = true;
+      }
+      renderVirtKeyboardLayout();
+      return;
+    case "to-symbols":
+      virtKb.layout = "symbols";
+      renderVirtKeyboardLayout();
+      return;
+    case "to-alpha":
+      virtKb.layout = "alpha";
+      renderVirtKeyboardLayout();
+      return;
+    default:
+      // Single-character key: respect shift / capsLock for letters.
+      let c = action;
+      if (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock) && c.length === 1) {
+        c = c.toUpperCase();
+      }
+      appendVirtKbChar(c);
+      // Auto-release a one-shot shift (capsLock keeps it on).
+      if (virtKb.shift && !virtKb.capsLock) {
+        virtKb.shift = false;
+        renderVirtKeyboardLayout();
+      }
+      break;
+  }
+  refreshVirtKbDisplay();
+}
+
+function appendVirtKbChar(c) {
+  if (virtKb.target) {
+    const max = parseInt(virtKb.target.getAttribute("maxlength") || "0", 10);
+    if (max > 0 && virtKb.draft.length >= max) return;
+  }
+  virtKb.draft += c;
+}
+
+function refreshVirtKbDisplay() {
+  // Replace ` ` to keep an empty draft visible (otherwise the
+  // height collapses).
+  virtKb.displayEl.textContent = virtKb.draft.length ? virtKb.draft : " ";
 }
 
 if (document.readyState === "loading") {
