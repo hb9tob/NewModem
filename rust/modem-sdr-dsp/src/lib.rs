@@ -34,12 +34,14 @@
 
 pub mod traits;
 
+pub mod audio_filters;
 pub mod decimator;
 pub mod emphasis;
 pub mod fir;
 pub mod fm_demod;
 pub mod fm_mod;
 pub mod interpolator;
+pub mod pm_mod;
 
 /// Audio sample rate the modem core expects, in Hz. Mirrors
 /// `modem_core::types::AUDIO_RATE`. Re-exported so SDR backends can
