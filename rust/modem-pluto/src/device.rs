@@ -9,8 +9,10 @@
 //! BBPLL minimum of 2.083 MS/s without a custom FIR loaded, which is
 //! why `sampling_frequency_available` reads `[2083333 1 61440000]` on
 //! a fresh context. Loading a 4× decimating FIR effectively divides
-//! that floor by 4, so the chip then accepts 528 kSa/s
-//! ([`crate::PREFERRED_SAMPLE_RATE_HZ`]).
+//! that floor by 4, so the chip then accepts 576 kSa/s
+//! ([`crate::PREFERRED_SAMPLE_RATE_HZ`], chosen so the ÷N to 48 kHz
+//! audio is the small-prime composite 12 = 2²·3 — see project memory
+//! `sdr-rate-convention.md`).
 //!
 //! The AD9361 driver expects the FIR config in a small ASCII blob
 //! ([`format_fir_blob`]) written into the device-attribute
@@ -53,10 +55,11 @@ pub struct PlutoConfig {
     /// deviation NBFM; the 4× FIR + decimation chain shapes the rest.
     /// Range `[200000, 56000000]` on RX and `[200000, 40000000]` on TX.
     pub rf_bandwidth_hz: u64,
-    /// Whether to attempt [`crate::PREFERRED_SAMPLE_RATE_HZ`] first.
-    /// Always falls back to [`crate::FALLBACK_SAMPLE_RATE_HZ`] on
+    /// Whether to attempt [`crate::PREFERRED_SAMPLE_RATE_HZ`]
+    /// (576 kS/s, ratio ÷12) first. Always falls back to
+    /// [`crate::FALLBACK_SAMPLE_RATE_HZ`] (2304 kS/s, ratio ÷48) on
     /// `EINVAL`.
-    pub prefer_528k: bool,
+    pub prefer_low_rate: bool,
 }
 
 impl Default for PlutoConfig {
@@ -67,7 +70,7 @@ impl Default for PlutoConfig {
             rx_gain_db: 30,
             tx_attenuation_db: 10.0,
             rf_bandwidth_hz: 200_000,
-            prefer_528k: true,
+            prefer_low_rate: true,
         }
     }
 }
@@ -93,29 +96,83 @@ impl NegotiatedRate {
 
 /// Live, fully-configured Pluto session.
 ///
-/// Owns the libiio `Context` plus the three device handles and the
-/// per-direction baseband channel handles (the AD9361 control points
-/// for hardware gain, RF bandwidth, FIR enable). RX / TX modules
-/// borrow buffer devices from here; the phy device handle stays put
-/// for runtime gain / freq retuning.
+/// Owns the libiio `Context` plus the three device handles. **Channels
+/// are intentionally not stored** because `industrial_io::Channel`
+/// holds a raw pointer and is therefore `!Send`, which would prevent
+/// moving the session into a worker thread (the natural place to run
+/// the libiio buffer pump). Channel handles are cheap to re-fetch via
+/// the helpers on this type — `find_channel` is just a name lookup
+/// against the parent device.
+///
+/// `Context` is `Send + Sync` (cloning bumps an internal `Arc`) and
+/// `Device` is manually-marked `Send`, so cloning a session is safe
+/// and used by the loopback test to drive RX and TX simultaneously
+/// from one open Pluto context.
+#[derive(Clone)]
 pub struct PlutoSession {
     pub ctx: Context,
     pub phy: Device,
     pub rx_buffer_dev: Device,
     pub tx_buffer_dev: Device,
-    pub rx_chan: Channel,
-    pub tx_chan: Channel,
     pub negotiated_rate: NegotiatedRate,
 }
 
 impl std::fmt::Debug for PlutoSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `industrial_io::Device` / `Channel` don't impl Debug usefully,
+        // `industrial_io::Device` doesn't impl Debug in a useful way,
         // so summarize what the user actually wants to see.
         f.debug_struct("PlutoSession")
             .field("rate_hz", &self.negotiated_rate.sample_rate_hz)
             .field("ratio", &self.negotiated_rate.ratio)
             .finish()
+    }
+}
+
+impl PlutoSession {
+    /// RX baseband control channel on `ad9361-phy` (`voltage0` input).
+    /// This is where `hardwaregain`, `gain_control_mode`,
+    /// `rf_bandwidth`, `filter_fir_en`, `sampling_frequency` live.
+    pub fn rx_baseband_chan(&self) -> Result<Channel, PlutoError> {
+        self.phy
+            .find_channel("voltage0", Direction::Input)
+            .ok_or(PlutoError::Attribute {
+                device: iio_names::PHY,
+                attr: "voltage0 (input)",
+                detail: "RX baseband channel not present".into(),
+            })
+    }
+
+    /// TX baseband control channel on `ad9361-phy` (`voltage0` output).
+    pub fn tx_baseband_chan(&self) -> Result<Channel, PlutoError> {
+        self.phy
+            .find_channel("voltage0", Direction::Output)
+            .ok_or(PlutoError::Attribute {
+                device: iio_names::PHY,
+                attr: "voltage0 (output)",
+                detail: "TX baseband channel not present".into(),
+            })
+    }
+
+    /// RX_LO frequency channel on `ad9361-phy` (`altvoltage0` output).
+    pub fn rx_lo_chan(&self) -> Result<Channel, PlutoError> {
+        self.phy
+            .find_channel("altvoltage0", Direction::Output)
+            .ok_or(PlutoError::Attribute {
+                device: iio_names::PHY,
+                attr: "altvoltage0",
+                detail: "RX_LO channel not present".into(),
+            })
+    }
+
+    /// TX_LO frequency channel on `ad9361-phy` (`altvoltage1` output).
+    pub fn tx_lo_chan(&self) -> Result<Channel, PlutoError> {
+        self.phy
+            .find_channel("altvoltage1", Direction::Output)
+            .ok_or(PlutoError::Attribute {
+                device: iio_names::PHY,
+                attr: "altvoltage1",
+                detail: "TX_LO channel not present".into(),
+            })
     }
 }
 
@@ -132,8 +189,8 @@ impl std::fmt::Debug for PlutoSession {
 ///    the device-attr `filter_fir_config`.
 /// 6. Enable per-channel `filter_fir_en = 1` on the RX/TX baseband
 ///    channels.
-/// 7. Try `sampling_frequency = 528000` on both directions; if either
-///    rejects with `EINVAL`, retry at `960000`.
+/// 7. Try `sampling_frequency = 576000` on both directions; if either
+///    rejects with `EINVAL`, retry at `2304000`.
 ///
 /// The session that comes back is "armed" — buffer devices are ready
 /// for the rx / tx modules to call `create_buffer` against them.
@@ -251,15 +308,13 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
 
     // --- FIR: load taps, enable per-direction, then negotiate rate.
     load_decim4_fir(&phy, &rx_chan, &tx_chan)?;
-    let negotiated_rate = negotiate_sample_rate(&rx_chan, &tx_chan, config.prefer_528k)?;
+    let negotiated_rate = negotiate_sample_rate(&rx_chan, &tx_chan, config.prefer_low_rate)?;
 
     Ok(PlutoSession {
         ctx,
         phy,
         rx_buffer_dev,
         tx_buffer_dev,
-        rx_chan,
-        tx_chan,
         negotiated_rate,
     })
 }
@@ -305,9 +360,9 @@ fn load_decim4_fir(phy: &Device, rx_chan: &Channel, tx_chan: &Channel) -> Result
 fn negotiate_sample_rate(
     rx_chan: &Channel,
     tx_chan: &Channel,
-    prefer_528k: bool,
+    prefer_low_rate: bool,
 ) -> Result<NegotiatedRate, PlutoError> {
-    let candidates: &[NegotiatedRate] = if prefer_528k {
+    let candidates: &[NegotiatedRate] = if prefer_low_rate {
         &[NegotiatedRate::PREFERRED, NegotiatedRate::FALLBACK]
     } else {
         &[NegotiatedRate::FALLBACK]
@@ -348,17 +403,17 @@ const FIR_QUANT_PEAK: f64 = 32_000.0;
 
 /// Design a 128-tap low-pass FIR for AD9361 4× decimation/interpolation.
 ///
-/// The FIR runs at 4× the requested baseband rate (so 2.112 MS/s when
-/// the negotiated output rate is 528 kSa/s). For an anti-alias /
+/// The FIR runs at 4× the requested baseband rate (so 2.304 MS/s when
+/// the negotiated output rate is 576 kSa/s). For an anti-alias /
 /// anti-image LPF in front of a 4× decimator/interpolator, the
 /// passband edge sits at `f_out/2` and the stopband starts at the
 /// folding frequency on the other side of the output Nyquist —
 /// expressed in normalized FIR-rate frequency, that's
 /// `f_pass = 1/8 (= 0.5 / 4)` and `f_stop ≈ 1/4`. The design here is
-/// intentionally relaxed (passband to ~0.10 of the FIR rate ≈ 211 kHz
-/// when running at 2.112 MS/s) — the modem only uses ~16 kHz of
+/// intentionally relaxed (passband to ~0.10 of the FIR rate ≈ 230 kHz
+/// when running at 2.304 MS/s) — the modem only uses ~16 kHz of
 /// bandwidth for ±5 kHz NBFM (Carson rule), so this leaves more than
-/// 13× margin and frees the AD9361's HB chain to do most of the
+/// 14× margin and frees the AD9361's HB chain to do most of the
 /// shaping.
 ///
 /// Window is Hamming for a clean ~52 dB stopband; coefficients are
@@ -367,7 +422,7 @@ const FIR_QUANT_PEAK: f64 = 32_000.0;
 pub fn design_decim4_lpf() -> [i16; FIR_TAP_COUNT] {
     // Normalized cutoff (-6 dB point) in FIR-rate units. 0.10 means the
     // passband edge sits at 10 % of the FIR-rate, which at the
-    // worst-case rate of 2.112 MS/s is 211 kHz — comfortably above any
+    // worst-case rate of 2.304 MS/s is 230 kHz — comfortably above any
     // realistic NBFM channel even at the FIR's input.
     const FC_NORM: f64 = 0.10;
 

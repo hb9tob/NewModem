@@ -11,5 +11,8 @@ industrial-io = "0.6"
 num-complex = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+hound = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"

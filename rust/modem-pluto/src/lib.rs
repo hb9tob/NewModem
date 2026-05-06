@@ -12,21 +12,30 @@
 //! * **RX**: [`rx::start`] returns `(CaptureHandle, Receiver<Vec<f32>>)`,
 //!   the same shape as `modem_io::cpal_capture::start`. The capture
 //!   thread reads S12-in-S16 from `cf-ad9361-lpc`, runs
-//!   [`modem_sdr_dsp::decimator::PolyphaseDecimator`] (×11 → 48 kHz),
 //!   [`modem_sdr_dsp::fm_demod::QuadratureDemod`],
+//!   [`modem_sdr_dsp::decimator::PolyphaseDecimator`] (÷12 → 48 kHz),
 //!   [`modem_sdr_dsp::audio_filters::DeemphasisLpf`], then
 //!   [`modem_sdr_dsp::audio_filters::SubAudioHpf`].
 //!
 //! ## Sample-rate strategy
 //!
-//! AD9363 BBPLL on stock Pluto firmware bottoms out at ~520 kSa/s, so
-//! the driver targets **528 kSa/s = 48 × 11** (the lowest rate that
-//! gives an integer ÷N to the modem's locked 48 kHz). Reaching 528
-//! requires loading a 4× decimating FIR into `iio:device0/filter_fir_config`
-//! and asserting `filter_fir_en = 1` on the relevant per-channel
-//! attributes — without that step `sampling_frequency = 528000` fails
-//! with `EINVAL`. If 528 still refuses to lock, the driver falls back
-//! to **960 kSa/s = 48 × 20**, which the AD9363 takes natively.
+//! Project convention is to pick SDR rates so the ÷N to the modem's
+//! locked 48 kHz audio is a **small-prime composite** — no odd and no
+//! prime factors above 3. That lets the polyphase decim/interp
+//! decompose into cheap multi-stage half-band filters (and matches
+//! the AD9361's own internal HB chain, which runs in powers of 2).
+//!
+//! The driver therefore targets **576 kSa/s = 48 × 12** (12 = 2²·3,
+//! all small primes), reaching it via the AD9361's 4× FIR — stock
+//! Pluto firmware floors the BBPLL at ~2.083 MS/s without a custom
+//! FIR loaded, so the driver writes a 128-tap LPF into
+//! `iio:device0/filter_fir_config` and asserts `filter_fir_en = 1` on
+//! the per-channel attributes; without that step
+//! `sampling_frequency = 576000` fails with `EINVAL`.
+//!
+//! If 576 refuses to lock, the driver falls back to **2304 kSa/s =
+//! 48 × 48** (48 = 2⁴·3 — also clean, doesn't need the FIR-loading
+//! dance because it sits above the 2.083 MS/s native floor).
 //!
 //! ## Status
 //!
@@ -37,7 +46,8 @@
 //!   Hamming-windowed sinc FIR via [`device::design_decim4_lpf`],
 //!   formats it with [`device::format_fir_blob`], writes it into
 //!   `filter_fir_config`, enables per-direction `filter_fir_en`, and
-//!   negotiates 528 kSa/s (preferred) or 960 kSa/s (fallback).
+//!   negotiates 576 kSa/s (preferred, ratio ÷12) or 2304 kSa/s
+//!   (fallback, ratio ÷48) — both clean small-prime composites of 48.
 //! * Task #11 (streaming RX/TX through `modem-sdr-dsp` + CLI flags +
 //!   loopback test): pending — `rx::start` and the TX submit path
 //!   still return `PlutoError::NotImplemented`.
@@ -54,17 +64,21 @@ pub use error::PlutoError;
 /// `ip:pluto.local` is the network-mode equivalent that also works.
 pub const DEFAULT_URI: &str = "usb:1.6.5";
 
-/// Preferred AD9363 sample rate, in samples per second. Decimation
-/// ratio against the modem's 48 kHz audio rate is 11.
-pub const PREFERRED_SAMPLE_RATE_HZ: u64 = 528_000;
+/// Preferred AD9363 sample rate, in samples per second. The ratio
+/// against the modem's 48 kHz audio rate is **12 = 2²·3** — small
+/// primes only, no odd factors, decomposes cleanly into multi-stage
+/// half-band filters.
+pub const PREFERRED_SAMPLE_RATE_HZ: u64 = 576_000;
 
 /// Fallback AD9363 sample rate if the BBPLL refuses to lock at the
-/// preferred rate. Decimation ratio is 20.
-pub const FALLBACK_SAMPLE_RATE_HZ: u64 = 960_000;
+/// preferred rate. The ratio is **48 = 2⁴·3** — also clean, sits
+/// above the AD9361's 2.083 MS/s native floor so no FIR loading
+/// dance is needed if the chip is being stubborn at 576.
+pub const FALLBACK_SAMPLE_RATE_HZ: u64 = 2_304_000;
 
 /// Decimation / interpolation ratio for [`PREFERRED_SAMPLE_RATE_HZ`]
 /// against [`modem_sdr_dsp::AUDIO_RATE`].
-pub const PREFERRED_RATIO: usize = 11;
+pub const PREFERRED_RATIO: usize = 12;
 
 /// Decimation / interpolation ratio for [`FALLBACK_SAMPLE_RATE_HZ`].
-pub const FALLBACK_RATIO: usize = 20;
+pub const FALLBACK_RATIO: usize = 48;

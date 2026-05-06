@@ -3,39 +3,37 @@
 PlutoSDR (ADALM-PLUTO / AD9363) backend for the NBFM modem. Streams I/Q
 through libiio and runs the radio-faithful TX/RX chain from
 [`modem-sdr-dsp`](../modem-sdr-dsp). Plugs into `modem-worker` through
-the same seams the cpal soundcard backend uses (`SampleSink` for TX,
-`mpsc::Receiver<Vec<f32>>` for RX).
-
-> **Status**: scaffold (task #9 of the SDR plan). The crate compiles,
-> the module shapes are pinned, every entry point that would touch
-> hardware returns `PlutoError::NotImplemented` until tasks #10 and
-> #11 land.
+the same seams the cpal soundcard backend uses (`SampleSink`-shaped
+TX, `mpsc::Receiver<Vec<f32>>` RX).
 
 ## Why Pluto first
 
-- TX is the killer feature — RF loopback (TX SMA → 30 dB pad → RX SMA)
-  makes the entire DSP chain ground-truthable in software, no radio
-  appliance needed.
+- TX is the killer feature — RF loopback (TX SMA → 30 dB pad → RX SMA,
+  or AD9361 FPGA-internal digital loopback) makes the entire DSP chain
+  ground-truthable in software, no radio appliance needed.
 - libiio is open and stable (MIT, Analog Devices). No daemon, no
   proprietary install.
-- Once the 528-kSa/s ↔ 48-kHz chain is proven here, the same DSP plugs
+- Once the 576-kSa/s ↔ 48-kHz chain is proven here, the same DSP plugs
   straight into RTL-SDR and SDRplay (RX-only, deferred).
 
 ## Sample-rate strategy
 
-The modem core is hard-locked to 48 kHz mono f32 audio. To keep the
-path single-stage polyphase, the AD9363 is programmed at the **lowest
-rate that gives an integer ÷N to 48 kHz**:
+The modem core is hard-locked to 48 kHz mono f32 audio. Project
+convention is to pick SDR rates so the integer ÷N to 48 kHz is a
+**small-prime composite** — only 2s and 3s, no odd factors and no
+primes above 3. That lets the polyphase resamplers decompose into
+cheap multi-stage half-band filters and matches the AD9361's own
+internal HB chain.
 
-| Rate | Ratio | Notes |
-|---|---|---|
-| **528 kSa/s** | 11 | Preferred. Requires a 4× decimating FIR loaded into `iio:device0/filter_fir_config`. |
-| 960 kSa/s | 20 | Fallback if the BBPLL refuses 528. Native AD9363 rate, no FIR-loading dance. |
+| Rate | Ratio | Factors | Notes |
+|---|---|---|---|
+| **576 kSa/s** | 12 | 2² · 3 | Preferred. Requires a 4× FIR loaded into `iio:device0/filter_fir_config` (the AD9361 BBPLL floors at 2.083 MS/s without it). |
+| 2304 kSa/s | 48 | 2⁴ · 3 | Fallback if the BBPLL refuses 576. Sits above the 2.083 MS/s native floor so no FIR-loading dance is strictly required. |
 
 Both rates are well above Carson's-rule bandwidth for ±5 kHz NBFM
 (~16 kHz).
 
-### The mandatory FIR-loading step (528 kSa/s only)
+### The mandatory FIR-loading step (576 kSa/s only)
 
 Stock Pluto firmware limits the BBPLL to ~2.083 MS/s without a custom
 FIR loaded. The libiio sequence the driver runs at startup is:
@@ -44,10 +42,10 @@ FIR loaded. The libiio sequence the driver runs at startup is:
 write iio:device0/filter_fir_config  ← 4× decimating FIR taps
 write in_voltage_filter_fir_en        ← 1
 write out_voltage_filter_fir_en       ← 1
-write sampling_frequency              ← 528000
+write sampling_frequency              ← 576000
 ```
 
-If the final write returns `EINVAL`, the driver retries at 960 kSa/s.
+If the final write returns `EINVAL`, the driver retries at 2304 kSa/s.
 
 ## Installation
 
@@ -92,9 +90,19 @@ math; this crate just orchestrates them. The blocks used here are:
 - TX: `interpolator::PolyphaseInterpolator`, then
   `pm_mod::PhaseMod` (radio-faithful PM — built-in +6 dB/oct
   preemphasis matches an NBFM transceiver).
-- RX: `decimator::PolyphaseDecimator`, then `fm_demod::QuadratureDemod`,
-  then `audio_filters::DeemphasisLpf` and `audio_filters::SubAudioHpf`.
+- RX: `fm_demod::QuadratureDemod`, then
+  `decimator::PolyphaseDecimator`, then
+  `audio_filters::DeemphasisLpf` and `audio_filters::SubAudioHpf`.
 
-The 35 unit + integration tests in `modem-sdr-dsp` are the regression
-baseline these calibration values get tuned against once Pluto-↔-radio
-loopback runs.
+## Running the live tests
+
+```bash
+# Verify device::open and FIR loading on the plugged-in Pluto:
+cargo run -p modem-pluto --example probe_open
+
+# Full end-to-end loopback (uses AD9361 FPGA digital loopback,
+# no RF cable needed): pushes a 1 kHz tone through TX,
+# captures it through RX, asserts ZC-rate matches:
+cargo run -p modem-pluto --example loopback_demo
+# Captured audio is dumped to /tmp/pluto_loopback.wav for inspection.
+```

@@ -2949,6 +2949,7 @@ dependencies = [
 name = "modem-pluto"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "industrial-io",
  "modem-sdr-dsp",
  "num-complex",
