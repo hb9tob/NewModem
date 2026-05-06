@@ -3856,6 +3856,7 @@ function setupKioskMode() {
 
 async function init() {
   setupKioskMode();
+  setupSelectPicker();
   setupVirtKeyboard();
   setupTabs();
   setupLightbox();
@@ -3893,6 +3894,141 @@ async function init() {
   setInterval(refreshOverdriveChip, 200);
   // Auto-start RX capture if a device is configured.
   await tryAutoStartCapture();
+}
+
+// ─── Touch-friendly <select> picker (kiosk) ───────────────────────
+//
+// WebKitGTK on Wayland renders `<select>` as a native popup whose
+// height is capped to ~5-6 rows on the 800x480 Pi DSI panel. With
+// 10 entries in `tx-mode` / `rx-forced-profile` the bottom of the
+// list (where the experimental profiles live) is unreachable on a
+// touchscreen — the popup is scrollable in theory but the affordance
+// is invisible, so the user thinks the experimentals are gone.
+//
+// Fix: in kiosk mode we capture `mousedown` on every `<select>`
+// before the engine opens its popup, and present a fullscreen modal
+// instead — same options, ≥48 px tap targets, scroll obvious. Off
+// kiosk this stays dormant, so the desktop UX is untouched.
+//
+// Opt-out: `data-select-picker-skip="1"` on the `<select>`.
+
+const selectPicker = {
+  modal: null,
+  labelEl: null,
+  listEl: null,
+  closeEl: null,
+  target: null,
+};
+
+function setupSelectPicker() {
+  selectPicker.modal = document.getElementById("select-picker-modal");
+  selectPicker.labelEl = document.getElementById("select-picker-label");
+  selectPicker.listEl = document.getElementById("select-picker-list");
+  selectPicker.closeEl = document.getElementById("select-picker-cancel");
+  if (!selectPicker.modal) return;
+
+  // Capture phase — must run before WebKitGTK opens its native popup.
+  // Mousedown is the right hook: click is fired AFTER the native
+  // popup has already opened (and consumed the gesture on touch).
+  document.addEventListener("mousedown", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    let el = e.target;
+    if (el instanceof HTMLOptionElement) el = el.parentElement;
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled) return;
+    if (el.dataset.selectPickerSkip === "1") return;
+    if (selectPicker.modal.contains(el)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.blur();
+    openSelectPicker(el);
+  }, /*capture=*/true);
+
+  // Same hook on `keydown` Space/Enter, in case the select is
+  // reached by Tab (the kiosk has no keyboard, but the desktop devs
+  // can still keyboard-navigate).
+  document.addEventListener("keydown", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    if (e.key !== " " && e.key !== "Enter" && e.key !== "ArrowDown") return;
+    const el = e.target;
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled || el.dataset.selectPickerSkip === "1") return;
+    e.preventDefault();
+    openSelectPicker(el);
+  }, /*capture=*/true);
+
+  selectPicker.closeEl.addEventListener("click", closeSelectPicker);
+  selectPicker.modal.addEventListener("click", (e) => {
+    if (e.target === selectPicker.modal) closeSelectPicker();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (selectPicker.modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeSelectPicker();
+    }
+  });
+}
+
+function selectLabel(sel) {
+  // Surrounding <label>'s text minus the <select>'s current option text,
+  // falls back to <legend>, then to the id. Matches the virtKb pattern.
+  const lab = sel.closest("label");
+  if (lab) {
+    const txt = (lab.textContent || "")
+      .replace(sel.options[sel.selectedIndex]?.textContent || "", "")
+      .trim();
+    if (txt) return txt.replace(/\s+/g, " ").slice(0, 80);
+  }
+  const fs = sel.closest("fieldset");
+  const lg = fs && fs.querySelector("legend");
+  if (lg && lg.textContent) return lg.textContent.trim().slice(0, 80);
+  return sel.id || "Choisir";
+}
+
+function openSelectPicker(sel) {
+  selectPicker.target = sel;
+  selectPicker.labelEl.textContent = selectLabel(sel);
+  const list = selectPicker.listEl;
+  list.innerHTML = "";
+  for (const opt of sel.options) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "select-picker-row";
+    if (opt.classList.contains("experimental-option")) {
+      row.classList.add("select-picker-experimental");
+    }
+    if (opt.value === sel.value) {
+      row.classList.add("select-picker-current");
+    }
+    if (opt.disabled) row.classList.add("select-picker-disabled");
+    row.dataset.value = opt.value;
+    row.textContent = opt.textContent;
+    if (opt.disabled) row.disabled = true;
+    row.addEventListener("click", () => {
+      const target = selectPicker.target;
+      if (target && target.value !== opt.value) {
+        target.value = opt.value;
+        // Notify the rest of the app exactly as the native popup does.
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      closeSelectPicker();
+    });
+    list.appendChild(row);
+  }
+  selectPicker.modal.hidden = false;
+  // Scroll the current selection into view so opening on a long list
+  // (10 modem profiles, 39 CTCSS tones) doesn't always start from top.
+  const cur = list.querySelector(".select-picker-current");
+  if (cur) cur.scrollIntoView({ block: "center" });
+}
+
+function closeSelectPicker() {
+  if (!selectPicker.modal || selectPicker.modal.hidden) return;
+  selectPicker.modal.hidden = true;
+  selectPicker.target = null;
+  selectPicker.listEl.innerHTML = "";
 }
 
 // ─── Native virtual keyboard (kiosk text/number entry) ────────────

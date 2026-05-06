@@ -1481,6 +1481,96 @@ main {
   pointer-events: none;
 }
 
+/* ─── Touch-friendly <select> picker (kiosk) ─── */
+/*
+   Replaces the native WebKitGTK popup which caps at ~5-6 visible rows
+   on 480 px and hides the bottom of long lists (10 modem profiles, 39
+   CTCSS tones). Same layout pattern as `.virt-keyboard-modal` — fixed
+   overlay, centered panel, scrollable list, ≥48 px touch rows.
+*/
+.select-picker-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 260;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  touch-action: manipulation;
+}
+.select-picker-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.6rem;
+  width: 100%;
+  max-width: 600px;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.select-picker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: #9ccc65;
+}
+.select-picker-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.select-picker-close {
+  font-size: 1.4rem;
+  color: #ef5350;
+  cursor: pointer;
+  padding: 0.1rem 0.5rem;
+  user-select: none;
+}
+.select-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  /* Scrollbar visible at finger-grabbable size — same as the kiosk
+     media-query rule. */
+  scrollbar-width: thin;
+}
+.select-picker-list::-webkit-scrollbar { width: 12px; }
+.select-picker-list::-webkit-scrollbar-thumb { background: #555; border-radius: 6px; }
+.select-picker-list::-webkit-scrollbar-thumb:hover { background: #777; }
+.select-picker-row {
+  min-height: 48px;
+  padding: 0.55rem 0.8rem;
+  background: #2a3845;
+  color: #e0e0e0;
+  border: 1px solid #4a5868;
+  border-radius: 4px;
+  text-align: left;
+  font-family: ui-monospace, monospace;
+  font-size: 0.95rem;
+  cursor: pointer;
+  user-select: none;
+}
+.select-picker-row:hover { background: #34495a; }
+.select-picker-row:active { background: #4a90c8; color: #fff; }
+.select-picker-row.select-picker-current {
+  outline: 2px solid #9ccc65;
+  outline-offset: -2px;
+}
+.select-picker-row.select-picker-experimental {
+  color: #ff6b4a;
+  background: #2a1a14;
+  border-color: #6a3030;
+  font-weight: bold;
+}
+.select-picker-row.select-picker-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ─── Native virtual keyboard (kiosk text/number entry) ─── */
 /*
    Modal overlay that auto-opens when an input is focused while body

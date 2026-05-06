@@ -619,6 +619,25 @@
     that frequency / gain inputs use. Trigger logic + key handlers live
     in main.js (search "virtKeyboard").
   -->
+  <!--
+    Touch-friendly select picker for kiosk mode. The native WebKitGTK
+    `<select>` popup tops out at ~5-6 visible rows on the 480 px Pi
+    DSI screen, hiding the experimental profiles at the bottom of
+    `tx-mode` / `rx-forced-profile` (cf. setupSelectPicker in main.js).
+    On kiosk we intercept the open and present this fullscreen list
+    instead — same options, big tap targets, scrollable.
+  -->
+  <div id="select-picker-modal" class="select-picker-modal" hidden>
+    <div class="select-picker-panel">
+      <div class="select-picker-header">
+        <span class="select-picker-label" id="select-picker-label">—</span>
+        <span class="select-picker-close" id="select-picker-cancel" title="Annuler">✕</span>
+      </div>
+      <div class="select-picker-list" id="select-picker-list">
+        <!-- Rows injected by openSelectPicker(). -->
+      </div>
+    </div>
+  </div>
   <div id="virt-keyboard-modal" class="virt-keyboard-modal" hidden>
     <div class="virt-kb-panel">
       <div class="virt-kb-header">
