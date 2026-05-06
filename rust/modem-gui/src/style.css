@@ -1589,6 +1589,19 @@ main {
   background: #34465a;
   font-size: 0.85rem;
 }
+/* Frequency keypad enrichments: distinct visual cue so the user
+   sees the favorites + step rows aren't part of the digit grid. */
+.virt-kb-favs .virt-kb-key {
+  background: #2d4256;
+  border-color: #5e8aaf;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.95rem;
+}
+.virt-kb-step-row .virt-kb-key {
+  background: #2d4256;
+  border-color: #5e8aaf;
+  font-size: 1rem;
+}
 .virt-kb-actions {
   display: flex;
   gap: 0.5rem;

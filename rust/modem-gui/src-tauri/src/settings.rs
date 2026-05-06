@@ -186,6 +186,13 @@ pub struct Settings {
     /// French / Swiss 2 m repeater pilot.
     #[serde(default = "default_pluto_tx_ctcss_freq_hz")]
     pub pluto_tx_ctcss_freq_hz: f32,
+    /// MRU list of recently-used Pluto frequencies, in Hz. Auto-fed
+    /// from the on-screen frequency keypad on every Valider press;
+    /// the GUI surfaces the list as a row of quick-pick buttons at
+    /// the top of the keypad. Capped at 6 entries (most recent
+    /// first); deduplicated on insert. Empty on first run.
+    #[serde(default)]
+    pub pluto_freq_favorites: Vec<u64>,
 }
 
 impl Settings {
@@ -317,6 +324,7 @@ impl Default for Settings {
             pluto_tx_deviation_offset_hz: default_pluto_tx_deviation_offset_hz(),
             pluto_tx_ctcss_enabled: false,
             pluto_tx_ctcss_freq_hz: default_pluto_tx_ctcss_freq_hz(),
+            pluto_freq_favorites: Vec::new(),
         }
     }
 }

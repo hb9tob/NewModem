@@ -4022,15 +4022,25 @@ function openVirtKeyboard(input) {
 
 function closeVirtKeyboard(commit) {
   if (!virtKb.modal || virtKb.modal.hidden) return;
-  if (commit && virtKb.target) {
-    const max = parseInt(virtKb.target.getAttribute("maxlength") || "0", 10);
+  const target = virtKb.target;
+  if (commit && target) {
+    const max = parseInt(target.getAttribute("maxlength") || "0", 10);
     let out = virtKb.draft;
     if (max > 0) out = out.slice(0, max);
-    virtKb.target.value = out;
+    target.value = out;
     // Notify any change listener wired by the rest of the app
     // (persistSettings, refreshTxEstimate, …).
-    virtKb.target.dispatchEvent(new Event("input", { bubbles: true }));
-    virtKb.target.dispatchEvent(new Event("change", { bubbles: true }));
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    // Frequency inputs : add the validated value to the MRU
+    // favorites so the next keypad open offers it as a quick-pick.
+    if (isFreqInputId(target.id)) {
+      const mhz = parseFloat(out);
+      if (Number.isFinite(mhz) && mhz > 0) {
+        // fire-and-forget — own save flush, doesn't block close.
+        pushFreqMru(mhz);
+      }
+    }
   }
   virtKb.modal.hidden = true;
   virtKb.target = null;
@@ -4053,6 +4063,13 @@ function renderVirtKeyboardLayout() {
   const rows = virtKb.rowsEl;
   rows.innerHTML = "";
   if (virtKb.layout === "numeric") {
+    // Extra rows for frequency inputs: MRU favorites + step buttons.
+    // Detected by input id; falls back to a plain numeric pad for any
+    // other `<input type="number">` (gain dB, attenuation, etc).
+    if (isFreqInputId(virtKb.target?.id)) {
+      renderVirtKbFavoritesRow();
+      renderVirtKbStepRow();
+    }
     for (const row of VIRT_KB_NUMERIC_ROWS) {
       const r = document.createElement("div");
       r.className = "virt-kb-row";
@@ -4162,6 +4179,119 @@ function refreshVirtKbDisplay() {
   // Replace ` ` to keep an empty draft visible (otherwise the
   // height collapses).
   virtKb.displayEl.textContent = virtKb.draft.length ? virtKb.draft : " ";
+}
+
+// ─── Frequency-keypad enrichments (MRU favorites + step buttons) ──
+//
+// Active only when the focused input is a Pluto frequency field
+// (id starts with `pluto-rx-freq-` or `pluto-tx-freq-`). The MRU
+// row mirrors `currentSettings.pluto_freq_favorites` (Hz, capped
+// at 6, most-recent-first). Step buttons add/subtract a multiple
+// of kHz to the displayed MHz value, picked from a 5 / 6.25 / 12.5
+// / 25 kHz selector — the standard channel rasters in amateur and
+// PMR repeater plans. The pick survives keypad close/re-open via
+// `virtKb.stepKHz`.
+const FREQ_INPUT_ID_PREFIX = ["pluto-rx-freq-", "pluto-tx-freq-"];
+const STEP_OPTIONS_KHZ = [5.0, 6.25, 12.5, 25.0];
+virtKb.stepKHz = 6.25;
+
+function isFreqInputId(id) {
+  if (!id) return false;
+  return FREQ_INPUT_ID_PREFIX.some(p => id.startsWith(p));
+}
+
+function renderVirtKbFavoritesRow() {
+  const favs = (currentSettings && Array.isArray(currentSettings.pluto_freq_favorites))
+    ? currentSettings.pluto_freq_favorites : [];
+  if (favs.length === 0) return;
+  const row = document.createElement("div");
+  row.className = "virt-kb-row virt-kb-favs";
+  for (const hz of favs) {
+    const mhz = (hz / 1e6).toFixed(3);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "virt-kb-key special";
+    b.textContent = mhz;
+    b.title = `Charger ${mhz} MHz`;
+    b.addEventListener("click", () => {
+      // Strip trailing zeros so "145.500" displays compact, but
+      // keep the decimal point so the user knows it's fractional.
+      virtKb.draft = mhz.replace(/0+$/, "").replace(/\.$/, "");
+      refreshVirtKbDisplay();
+    });
+    row.appendChild(b);
+  }
+  virtKb.rowsEl.appendChild(row);
+}
+
+function renderVirtKbStepRow() {
+  const row = document.createElement("div");
+  row.className = "virt-kb-row virt-kb-step-row";
+  // Step selector — taps cycle through STEP_OPTIONS_KHZ.
+  const stepBtn = document.createElement("button");
+  stepBtn.type = "button";
+  stepBtn.className = "virt-kb-key special wide-2";
+  stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
+  stepBtn.title = "Cycle 5 / 6.25 / 12.5 / 25 kHz";
+  stepBtn.addEventListener("click", () => {
+    const idx = STEP_OPTIONS_KHZ.indexOf(virtKb.stepKHz);
+    virtKb.stepKHz = STEP_OPTIONS_KHZ[(idx + 1) % STEP_OPTIONS_KHZ.length];
+    stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
+  });
+  row.appendChild(stepBtn);
+
+  const minusBtn = document.createElement("button");
+  minusBtn.type = "button";
+  minusBtn.className = "virt-kb-key";
+  minusBtn.textContent = "−";
+  minusBtn.addEventListener("click", () => stepDraft(-1));
+  row.appendChild(minusBtn);
+
+  const plusBtn = document.createElement("button");
+  plusBtn.type = "button";
+  plusBtn.className = "virt-kb-key";
+  plusBtn.textContent = "+";
+  plusBtn.addEventListener("click", () => stepDraft(+1));
+  row.appendChild(plusBtn);
+
+  virtKb.rowsEl.appendChild(row);
+}
+
+function stepDraft(direction) {
+  // Parse the current draft as MHz (accept partials like "145." or
+  // ""). Empty / unparseable → start from 0.
+  const cur = parseFloat(virtKb.draft);
+  const start = Number.isFinite(cur) ? cur : 0;
+  const deltaMHz = (virtKb.stepKHz / 1000.0) * direction;
+  const next = start + deltaMHz;
+  // 5 decimals = 10 Hz precision, more than enough for amateur
+  // channel rasters. Trim trailing zeros for compact display.
+  let fixed = next.toFixed(5).replace(/0+$/, "").replace(/\.$/, "");
+  if (fixed === "" || fixed === "-") fixed = "0";
+  virtKb.draft = fixed;
+  refreshVirtKbDisplay();
+}
+
+/// Push the freshly-validated frequency (MHz) onto the MRU. Dedup
+/// on Hz equality, prepend, cap at 6. Persists via save_settings
+/// so the next keypad open already shows it.
+async function pushFreqMru(mhz) {
+  if (!Number.isFinite(mhz) || mhz <= 0) return;
+  const hz = Math.round(mhz * 1e6);
+  const list = Array.isArray(currentSettings.pluto_freq_favorites)
+    ? currentSettings.pluto_freq_favorites.slice() : [];
+  const idx = list.indexOf(hz);
+  if (idx !== -1) list.splice(idx, 1);
+  list.unshift(hz);
+  while (list.length > 6) list.pop();
+  currentSettings.pluto_freq_favorites = list;
+  if (window.__TAURI__ && window.__TAURI__.core) {
+    try {
+      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
+    } catch (err) {
+      console.warn("save favorites:", err);
+    }
+  }
 }
 
 if (document.readyState === "loading") {
