@@ -37,7 +37,7 @@
         <button id="btn-start" disabled>Démarrer</button>
         <button id="btn-stop" disabled>Arrêter</button>
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
-        <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
+        <span id="rx-device-label" class="rx-device-label" title="Périphérique sélectionné dans les Paramètres">—</span>
       </div>
       <div class="rx-force-bar" id="rx-force-bar" hidden>
         <label>
@@ -277,7 +277,7 @@
       <div class="settings-form">
         <div id="settings-rx-warn" class="settings-warn" hidden>
           <span class="settings-warn-text">
-            ⚠ Le RX est en cours. Pour modifier la carte son RX ou
+            ⚠ Le RX est en cours. Pour modifier le périphérique RX ou
             la désemphase, il faut d'abord arrêter la réception.
           </span>
           <button type="button" id="settings-stop-rx-btn">Arrêter le RX</button>
@@ -288,7 +288,7 @@
           <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
         <fieldset>
-          <legend>Carte son réception (RX)</legend>
+          <legend>Périphérique réception (RX)</legend>
           <select id="rx-device-select">
             <option>Chargement…</option>
           </select>
@@ -345,7 +345,7 @@
           </p>
         </fieldset>
         <fieldset>
-          <legend>Carte son émission (TX)</legend>
+          <legend>Périphérique émission (TX)</legend>
           <select id="tx-device-select">
             <option>Chargement…</option>
           </select>
@@ -356,7 +356,7 @@
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
             Boost des aigus dès ~212 Hz (~+13 dB à 1 kHz, ~+18 dB à 2.7 kHz,
             plateau +20 dB). Le signal est re-normalisé après filtrage pour
-            ne pas écrêter la carte son. À activer si la chaîne audio TX
+            ne pas écrêter la sortie TX. À activer si la chaîne audio TX
             n'effectue pas elle-même la pré-emphase.
           </p>
         </fieldset>
@@ -491,7 +491,7 @@
           <fieldset>
             <legend>Atténuation appliquée à ma TX</legend>
             <p class="tx-hint">
-              Réduit le niveau du WAV transmis avant la carte son. Gain
+              Réduit le niveau du WAV transmis avant la sortie TX. Gain
               appliqué : <span id="att-gain-info">×1.000 (0 dB)</span>.
             </p>
             <div class="channel-att-row">

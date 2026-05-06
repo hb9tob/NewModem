@@ -518,7 +518,7 @@ fn tx_start(
         return Err("indicatif vide (Paramètres → Indicatif)".into());
     }
     if args.tx_device.trim().is_empty() {
-        return Err("carte son TX non sélectionnée (Paramètres)".into());
+        return Err("périphérique TX non sélectionné (Paramètres)".into());
     }
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
@@ -593,7 +593,7 @@ fn tx_more(
         return Err("indicatif vide (Paramètres → Indicatif)".into());
     }
     if args.tx_device.trim().is_empty() {
-        return Err("carte son TX non sélectionnée (Paramètres)".into());
+        return Err("périphérique TX non sélectionné (Paramètres)".into());
     }
     if args.count == 0 {
         return Err("choisir un nombre de blocs > 0".into());

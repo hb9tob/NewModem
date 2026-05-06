@@ -598,7 +598,7 @@ function populateDeviceSelect(selectId, devices, savedName, plutoDevices) {
   const pluto = plutoDevices || [];
   if (audio.length === 0 && pluto.length === 0) {
     const opt = document.createElement("option");
-    opt.textContent = "aucune carte détectée";
+    opt.textContent = "aucun périphérique détecté";
     opt.value = "";
     select.appendChild(opt);
     return null;
