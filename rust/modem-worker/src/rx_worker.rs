@@ -285,11 +285,66 @@ const MAX_SESSION_SECONDS: u64 = 25 * 60;
 /// preamble already partially landing in this tick to still be detected.
 const PREROLL_SECONDS: usize = 2;
 
-/// While capturing, keep only this many seconds of trailing audio. Must
-/// cover at least 2 × V3 preamble period on the slowest profile (ULTRA
-/// emits one cycle every ~4.6 s). 15 s leaves comfortable margin for
-/// late-entry / marker jitter without letting rx_v3 grow unbounded.
-const CAPTURE_WINDOW_SECONDS: usize = 15;
+// Historical note: a `CAPTURE_WINDOW_SECONDS = 15` rolling trim used
+// to bound the in-memory buffer during a session. Replaced by
+// [`SESSION_HARD_CAP_SECONDS`] (much larger, only catches pathological
+// cases) plus per-tick scan bounding via [`scan_window_seconds`].
+// This change fixed the data-loss cascade on long HIGH+ bursts where
+// a single slow rx_v3 tick (1.3 s on a Pi 5) put us in realtime
+// debt and the rolling trim then dropped audio that hadn't been
+// decoded yet.
+
+/// Maximum audio (in seconds) `rx_v3_after` is asked to scan per tick.
+/// Profile-dependent — the cost of `rx_v3_after` scales linearly with
+/// input length (downmix + matched filter + preamble cross-corr run
+/// over the whole input), so once the unbounded session_buffer grows
+/// past tens of seconds, scanning the whole thing every 1 s tick
+/// would push CPU past realtime on slower hardware. Capping the
+/// scan keeps each tick at predictable cost regardless of burst length.
+///
+/// `rx_v3_after` needs **two** consecutive preambles in its scan
+/// window to have a "closed" superframe to decode (the second
+/// preamble is the right boundary of the first window). The window
+/// must therefore cover at least 2 × the profile's cycle period,
+/// with margin for sync jitter and late-entry.
+///
+/// Per-profile preamble periods (one V3 cycle, at 48 kHz audio):
+///
+/// | profile  | symbol rate | one cycle | window (this fn) |
+/// |----------|------------:|----------:|------------------:|
+/// | HIGH+    | ≈ 6000 Bd   | ≈ 0.4 s   | 4 s               |
+/// | HIGH56   | ≈ 5000 Bd   | ≈ 0.5 s   | 4 s               |
+/// | HIGH     | ≈ 4000 Bd   | ≈ 0.7 s   | 4 s               |
+/// | NORMAL   | ≈ 3000 Bd   | ≈ 0.9 s   | 4 s               |
+/// | ROBUST   | ≈ 1500 Bd   | ≈ 1.8 s   | 4 s               |
+/// | ULTRA    | ≈ 500 Bd    | ≈ 4.6 s   | 12 s              |
+///
+/// Only **ULTRA** gets the extended window (2 × 4.6 = 9.2 s minimum,
+/// rounded up to 12 s for margin); every other profile fits 5+ closed
+/// windows in 4 s, which is plenty. Keeping the fast-profile window
+/// short matters because on HIGH+ a 12 s slice is 30× the cycle period,
+/// but the per-tick scan still pays the linear downmix/MF cost over
+/// the whole slice — saving 2/3 of that cost is worth the change.
+const SCAN_WINDOW_FAST_SECONDS: usize = 4;
+const SCAN_WINDOW_ULTRA_SECONDS: usize = 12;
+
+/// Pick the scan window based on the live profile so ULTRA gets enough
+/// audio to see two preambles, but every other profile keeps its lean
+/// 4 s window. See [`SCAN_WINDOW_FAST_SECONDS`] for the table.
+fn scan_window_seconds(profile: ProfileIndex) -> usize {
+    match profile {
+        ProfileIndex::Ultra => SCAN_WINDOW_ULTRA_SECONDS,
+        _ => SCAN_WINDOW_FAST_SECONDS,
+    }
+}
+
+/// Hard cap on the in-memory audio buffer during a session. Defends
+/// against pathological cases where `session_active` never clears
+/// (sender disappears without EOT, profile-detect loop, etc.). Five
+/// minutes at 48 kHz f32 mono = ~57 MB; below the practical RAM
+/// budget on any target. Bursts longer than this are unsupported by
+/// the V3 modem anyway (`MAX_SESSION_SECONDS`).
+const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 
 /// Fall back to Idle if no preamble has been seen for this long while
 /// Capturing — covers the case where the sender disappears mid-burst without
@@ -308,7 +363,7 @@ struct WorkerState {
     /// post-decode header refine. Required for HIGH+/FAST.
     forced: bool,
     /// Accumulated audio for the current capture. Rolled to PREROLL_SECONDS
-    /// while Idle (cheap noise buffer) ; bounded to CAPTURE_WINDOW_SECONDS
+    /// while Idle (cheap noise buffer) ; bounded to SESSION_HARD_CAP_SECONDS
     /// while Capturing so rx_v3 stays fast even on long salves.
     session_buffer: Vec<f32>,
     /// Disk-persistent store of decoded codewords, per session_id.
@@ -494,19 +549,31 @@ fn run_worker(
             filter.process(&mut batch);
         }
 
-        // Append + rolling trim. Idle = PREROLL_SECONDS (just enough for a
-        // preamble landing across batch boundaries). Capturing =
-        // CAPTURE_WINDOW_SECONDS (≥ 2 × V3 preamble period, bounds rx_v3 CPU).
+        // Append. Trim policy:
+        //   - Idle  : PREROLL_SECONDS rolling window — just enough for a
+        //             preamble landing across batch boundaries.
+        //   - Active: NO ROLLING TRIM. The buffer grows freely until the
+        //             burst ends. This is the realtime-margin fix —
+        //             previously a single slow batch (e.g. rx_v3
+        //             spending 1.3 s on a 14 s buffer) instantly put
+        //             us 1.3 s in debt, and the rolling trim then
+        //             dropped the audio we hadn't decoded yet,
+        //             cascading into LDPC failures and more CPU.
+        //             rx_v3_after's per-tick CPU is bounded separately
+        //             by SCAN_WINDOW_SECONDS, so an unbounded buffer
+        //             does NOT make the scan slower.
+        //   - Both  : SESSION_HARD_CAP_SECONDS catches pathological
+        //             "session never closes" cases.
         state.session_buffer.extend_from_slice(&batch);
-        let keep_secs = if state.session_active {
-            CAPTURE_WINDOW_SECONDS
+        let cap_secs = if state.session_active {
+            SESSION_HARD_CAP_SECONDS
         } else {
             PREROLL_SECONDS
         };
-        let keep = AUDIO_RATE as usize * keep_secs;
+        let cap = AUDIO_RATE as usize * cap_secs;
         let len = state.session_buffer.len();
-        if len > keep {
-            state.session_buffer.drain(..len - keep);
+        if len > cap {
+            state.session_buffer.drain(..len - cap);
         }
 
         maintenance_tick(&*sink, &save_dir, &mut state);
@@ -699,7 +766,7 @@ fn scan_and_route(
     let buf_start_abs = state
         .total_samples
         .saturating_sub(state.session_buffer.len() as u64);
-    let skip_rel = match state.last_closed_preamble_abs {
+    let skip_rel_full = match state.last_closed_preamble_abs {
         Some(abs) if abs > buf_start_abs => {
             // +1 to exclude the watermark itself (we've already decoded it).
             (abs - buf_start_abs + 1) as usize
@@ -707,8 +774,29 @@ fn scan_and_route(
         _ => 0,
     };
 
+    // Bound what `rx_v3_after` actually scans to a sliding window of
+    // the most recent profile-appropriate audio (4 s for fast profiles,
+    // 12 s for ULTRA — see `scan_window_seconds`). `rx_v3_after`'s cost
+    // (downmix + matched filter + preamble cross-corr + per-window
+    // decode) scales with input length, so on a long-burst session the
+    // per-tick scan cost would otherwise grow without bound. With this
+    // cap, every tick scans at most this profile's window of audio
+    // regardless of how much the buffer holds. Closed-window decodes
+    // are still routed to the SessionStore at the same per-tick
+    // cadence; previously decoded codewords accumulate there
+    // independently of the scan window.
+    let scan_cap = AUDIO_RATE as usize * scan_window_seconds(state.profile);
+    let scan_start = state.session_buffer.len().saturating_sub(scan_cap);
+    let scan_window = &state.session_buffer[scan_start..];
+    // Translate the skip from "buffer-relative" to "scan-window-relative".
+    // If the watermark sits *before* the scan window's start, skip_rel
+    // becomes 0 (we still want rx_v3 to see the window's leading
+    // preamble). If the watermark is inside the scan window, the skip
+    // shrinks accordingly.
+    let skip_rel = skip_rel_full.saturating_sub(scan_start);
+
     let t_rx_v3_start = Instant::now();
-    let rx_v3_opt = rx_v2::rx_v3_after(&state.session_buffer, &config, skip_rel);
+    let rx_v3_opt = rx_v2::rx_v3_after(scan_window, &config, skip_rel);
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
@@ -827,8 +915,9 @@ fn scan_and_route(
     // buffer is trimmed to 2 s, which is too short to decode the meta CW
     // (needs ~0.7 s post-preamble including pilots). Golay(24,12) with 3
     // correctable bits per block is reliable enough to trust as a preamble
-    // confirmation ; once active, the buffer grows to CAPTURE_WINDOW_SECONDS
-    // and subsequent ticks will populate the meta.
+    // confirmation ; once active, the buffer grows freely (capped only
+    // by SESSION_HARD_CAP_SECONDS, ~5 min) and subsequent ticks will
+    // populate the meta.
     let header_ok = result
         .header
         .as_ref()
@@ -976,8 +1065,9 @@ fn scan_and_route(
     // burst (pct > 0), convergence fires at K while the tail repair packets
     // are still on the wire, and the 2-s preroll usually strips the last
     // periodic preamble so those tail ESIs never get latched in the next
-    // scan. CAPTURE_WINDOW_SECONDS (15 s) is already the hard cap, so
-    // dropping the early trim costs at most one slightly-slower scan.
+    // scan. Now that the per-tick scan is bounded by `scan_window_seconds`
+    // independently of buffer size, dropping the early trim costs nothing
+    // — it just leaves more recent samples accessible to RaptorQ.
     if eot_seen {
         state.trim_buffer_to_preroll();
     }
