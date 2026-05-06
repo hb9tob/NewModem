@@ -2929,6 +2929,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "modem-sdr-dsp"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+]
+
+[[package]]
 name = "modem-worker"
 version = "0.1.0"
 dependencies = [
