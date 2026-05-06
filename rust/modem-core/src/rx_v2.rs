@@ -65,15 +65,18 @@ pub struct RxV2Result {
     /// concatenates these into a phase-vs-position plot to diagnose drift
     /// or phase noise that the linear pilot interpolation can't track.
     pub pilot_phase_segments: Vec<Vec<f32>>,
-    /// Offset (in samples, relative to the input slice) of the last preamble
-    /// whose window was fully closed and decoded by `rx_v3` in this call.
-    /// Callers that maintain a sliding capture buffer can persist this
-    /// position (translated to absolute samples) and skip re-decoding the
-    /// same closed windows on subsequent ticks.
-    /// `None` for `rx_v2_single` results (single window, no concept of
-    /// "closed vs open"), or for `rx_v3` calls where fewer than 2 preambles
-    /// were found (no closed window to mark done).
-    pub last_closed_preamble_offset: Option<usize>,
+    /// Offset (in samples, relative to the input slice) of the LAST preamble
+    /// found by `rx_v3` in this call — closed or open. Callers maintaining a
+    /// rolling capture buffer can drain everything before
+    /// `last_preamble_offset - margin` after a successful scan: closed
+    /// windows are already routed to the store, and the open one is rebuilt
+    /// from the preserved P_last (+ MF pre-roll margin) on the next tick when
+    /// the next preamble lands. The buffer becomes a self-purging queue that
+    /// tracks the live preamble cadence — no more guess-the-period
+    /// scan-window heuristic.
+    /// `None` for `rx_v2_single` (single-window, no preamble walking) or
+    /// `rx_v3_after` calls where no preamble was found at all.
+    pub last_preamble_offset: Option<usize>,
 }
 
 /// Cheap preamble presence probe — intended for the RX worker's Idle gate.
@@ -821,7 +824,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         eot_seen,
         constellation_sample,
         pilot_phase_segments,
-        last_closed_preamble_offset: None,
+        last_preamble_offset: None,
     })
 }
 
@@ -1015,14 +1018,12 @@ pub fn rx_v3_after(
     };
     let data_blocks_recovered = merged.len();
 
-    // Closed window watermark : positions kept after `skip_until` filter,
-    // all but the last one were treated as closed (had a P_{i+1} after).
-    // The last closed = positions[len-2] when len ≥ 2.
-    let last_closed_preamble_offset = if positions.len() >= 2 {
-        Some(positions[positions.len() - 2])
-    } else {
-        None
-    };
+    // Position of the last preamble seen in this scan. Always set when
+    // we got here (early-return guarantees `positions` is non-empty after
+    // the skip_until filter, so `.last()` is Some). The caller (rx_worker)
+    // uses this to truncate its rolling capture buffer right behind P_last,
+    // turning the buffer into a self-purging queue.
+    let last_preamble_offset = positions.last().copied();
 
     Some(RxV2Result {
         data: assembled,
@@ -1038,7 +1039,7 @@ pub fn rx_v3_after(
         eot_seen,
         constellation_sample: last_constellation,
         pilot_phase_segments: last_pilot_phases,
-        last_closed_preamble_offset,
+        last_preamble_offset,
     })
 }
 
