@@ -30,6 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefer_low_rate: true,
         rx_max_deviation_hz: 5000.0,
         tx_deviation_hz: 5000.0,
+        ctcss_freq_hz: 0.0,
+        ctcss_level: 0.1,
     };
 
     println!("opening Pluto at {}", config.uri);

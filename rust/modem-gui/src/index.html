@@ -381,6 +381,26 @@
               Fine-tune ±2 kHz autour du preset. Certains relais clippent
               dès ~4.2 kHz, d'autres tolèrent jusqu'à 6 kHz.
             </p>
+            <div class="pluto-row" style="margin-top: 0.7rem;">
+              <label class="ptt-row" style="margin: 0;">
+                <input type="checkbox" id="pluto-tx-ctcss-enabled">
+                CTCSS (squelch relais)
+              </label>
+              <label class="pluto-field">
+                Tonalité :
+                <select id="pluto-tx-ctcss-freq">
+                  <!-- 39 EIA standard tones, populated dynamically by main.js
+                       so the table stays in sync with modem-sdr-dsp's
+                       EIA_CTCSS_TONES_HZ. Default selection: 88.5 Hz. -->
+                </select>
+              </label>
+            </div>
+            <p class="tx-hint" style="margin: 0.4rem 0 0;">
+              Tone sub-audible (~10&nbsp;% de la déviation = ±500 Hz à 5 kHz)
+              ajouté à l'audio TX. Ouvre le squelch des relais
+              CTCSS-protégés. Le récepteur le filtre automatiquement
+              avant l'écoute.
+            </p>
           </div>
         </fieldset>
         <fieldset>

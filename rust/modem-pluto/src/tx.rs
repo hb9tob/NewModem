@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use num_complex::Complex32;
 
+use modem_sdr_dsp::ctcss_gen::CtcssToneGen;
 use modem_sdr_dsp::interpolator::PolyphaseInterpolator;
 use modem_sdr_dsp::pm_mod::PhaseMod;
 
@@ -258,6 +259,26 @@ fn run_tx_loop(
     let k_p = (session.tx_deviation_hz / 5000.0) * PhaseMod::DEFAULT_K_P;
     let pm = PhaseMod::new(k_p);
 
+    // CTCSS sub-audible tone for repeater squelch. Built only if
+    // configured; the audio loop calls `process_add` on each chunk
+    // so the tone is summed into the voice *before* the polyphase
+    // interpolator and PhaseMod — i.e. it goes through the FM
+    // modulator like any other audio component, embedded in the
+    // carrier deviation. The receiver's `SubAudioHpf` rejects it
+    // post-demodulation so it never reaches the listener's audio.
+    // See `modem_sdr_dsp::ctcss_gen` for the level / deviation
+    // tradeoff (0.1 amplitude = ~10 % of carrier deviation =
+    // ±500 Hz on 5 kHz NBFM, the conventional CTCSS pilot level).
+    let mut ctcss = if session.ctcss_freq_hz > 0.0 {
+        Some(CtcssToneGen::new(
+            session.ctcss_freq_hz,
+            modem_sdr_dsp::AUDIO_RATE as f32,
+            session.ctcss_level,
+        ))
+    } else {
+        None
+    };
+
     let mut last_tick = std::time::Instant::now();
     let mut total_iq_pushed: u64 = 0;
     let mut push_errors: u64 = 0;
@@ -277,6 +298,14 @@ fn run_tx_loop(
         // carrier — silent on the receive side, no audible artifact.
         if chunk.len() < TX_CHUNK_AUDIO_SAMPLES {
             chunk.resize(TX_CHUNK_AUDIO_SAMPLES, 0.0);
+        }
+
+        // Mix in the CTCSS sub-audible tone *before* interpolation —
+        // the tone shares the audio bandwidth budget and gets
+        // modulated by PhaseMod just like the voice. Disabled if
+        // `ctcss_freq_hz = 0.0`.
+        if let Some(ref mut t) = ctcss {
+            t.process_add(&mut chunk);
         }
 
         // Audio → IF rate via polyphase interpolation.

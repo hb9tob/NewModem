@@ -175,6 +175,17 @@ pub struct Settings {
     /// at ~4.2 kHz, others tolerate up to 6 kHz). Default 0.
     #[serde(default = "default_pluto_tx_deviation_offset_hz")]
     pub pluto_tx_deviation_offset_hz: i32,
+    /// Whether the CTCSS sub-audible tone is mixed into the TX
+    /// audio. Off by default — most simplex contacts and many
+    /// repeaters don't need it. Enable when transmitting through a
+    /// CTCSS-protected repeater.
+    #[serde(default)]
+    pub pluto_tx_ctcss_enabled: bool,
+    /// CTCSS tone frequency in Hz. One of the 39 EIA standard
+    /// values (67.0 – 254.1 Hz). Default 88.5 Hz, the most common
+    /// French / Swiss 2 m repeater pilot.
+    #[serde(default = "default_pluto_tx_ctcss_freq_hz")]
+    pub pluto_tx_ctcss_freq_hz: f32,
 }
 
 impl Settings {
@@ -261,6 +272,10 @@ fn default_pluto_tx_deviation_offset_hz() -> i32 {
     0
 }
 
+fn default_pluto_tx_ctcss_freq_hz() -> f32 {
+    88.5
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -300,6 +315,8 @@ impl Default for Settings {
             pluto_rx_deviation_hz: default_pluto_rx_deviation_hz(),
             pluto_tx_deviation_preset_hz: default_pluto_tx_deviation_preset_hz(),
             pluto_tx_deviation_offset_hz: default_pluto_tx_deviation_offset_hz(),
+            pluto_tx_ctcss_enabled: false,
+            pluto_tx_ctcss_freq_hz: default_pluto_tx_ctcss_freq_hz(),
         }
     }
 }

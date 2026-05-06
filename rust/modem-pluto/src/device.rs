@@ -89,6 +89,21 @@ pub struct PlutoConfig {
     /// the air. Linearly scales `PhaseMod::DEFAULT_K_P` from the 5000 Hz
     /// calibration. Default 5000.
     pub tx_deviation_hz: f32,
+    /// CTCSS sub-audible tone frequency in Hz, mixed into the TX
+    /// audio to open repeater squelches. `0.0` = disabled (no tone
+    /// added). Otherwise one of the 39 EIA standard values
+    /// (67.0 Hz – 254.1 Hz, see
+    /// [`modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`]). The tone is
+    /// added in front of the polyphase interpolator so it goes
+    /// through the PhaseMod just like the voice — the receiver's
+    /// `SubAudioHpf` rejects it post-demodulation. Default 0.0.
+    pub ctcss_freq_hz: f32,
+    /// Linear amplitude of the CTCSS tone vs the unit-amplitude
+    /// voice signal. `0.1` (= -20 dB) gives ±500 Hz deviation on
+    /// a 5 kHz NBFM channel — the conventional 10 % CTCSS pilot
+    /// level. Bump to ~0.2 for narrower channels (NFM 2.5 kHz).
+    /// Default 0.1.
+    pub ctcss_level: f32,
 }
 
 impl Default for PlutoConfig {
@@ -104,6 +119,8 @@ impl Default for PlutoConfig {
             prefer_low_rate: true,
             rx_max_deviation_hz: 5000.0,
             tx_deviation_hz: 5000.0,
+            ctcss_freq_hz: 0.0,
+            ctcss_level: 0.1,
         }
     }
 }
@@ -204,6 +221,14 @@ pub struct PlutoSession {
     /// `tx::run_tx` to scale the `PhaseMod`'s `k_p` from its 5 kHz
     /// calibration. Same rationale as `rx_max_deviation_hz`.
     pub tx_deviation_hz: f32,
+    /// CTCSS sub-audible tone frequency, copied from the
+    /// [`PlutoConfig`]. `0.0` disables CTCSS. Read by `tx::run_tx`
+    /// to construct the [`modem_sdr_dsp::ctcss_gen::CtcssToneGen`]
+    /// once at session start.
+    pub ctcss_freq_hz: f32,
+    /// Linear CTCSS amplitude (default 0.1 = -20 dB). Same rationale
+    /// as `ctcss_freq_hz`.
+    pub ctcss_level: f32,
 }
 
 impl std::fmt::Debug for PlutoSession {
@@ -415,6 +440,8 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
         negotiated_rate,
         rx_max_deviation_hz: config.rx_max_deviation_hz,
         tx_deviation_hz: config.tx_deviation_hz,
+        ctcss_freq_hz: config.ctcss_freq_hz,
+        ctcss_level: config.ctcss_level,
     })
 }
 

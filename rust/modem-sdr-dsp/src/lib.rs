@@ -35,6 +35,7 @@
 pub mod traits;
 
 pub mod audio_filters;
+pub mod ctcss_gen;
 pub mod decimator;
 pub mod emphasis;
 pub mod fir;

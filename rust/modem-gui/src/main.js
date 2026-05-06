@@ -661,6 +661,30 @@ function refreshPlutoPanelVisibility() {
   refresh("tx-device-select", "pluto-tx-config");
 }
 
+/// EIA standard CTCSS tones (39 values, in Hz). Mirror of
+/// `modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`. Order matches
+/// repeater documentation conventions (low → high).
+const EIA_CTCSS_TONES_HZ = [
+  67.0, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8,
+  97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8,
+  136.5, 141.3, 146.2, 151.4, 156.7, 162.2, 167.9, 173.8, 179.9, 186.2,
+  192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3, 254.1,
+];
+
+/// Populate the CTCSS frequency dropdown with all 39 EIA tones, once
+/// at GUI init. The currently-saved value is selected on the next
+/// loadSettings() pass.
+function populateCtcssDropdown() {
+  const sel = document.getElementById("pluto-tx-ctcss-freq");
+  if (!sel || sel.children.length > 0) return;
+  for (const f of EIA_CTCSS_TONES_HZ) {
+    const opt = document.createElement("option");
+    opt.value = String(f);
+    opt.textContent = `${f.toFixed(1)} Hz`;
+    sel.appendChild(opt);
+  }
+}
+
 /// Recompute and display the effective TX deviation = preset + offset,
 /// as both the visible "5.0 kHz" label and the slider's tooltip.
 /// Called from radio/slider change handlers.
@@ -794,6 +818,20 @@ async function loadSettings() {
   const txOffsetSlider = document.getElementById("pluto-tx-dev-offset");
   if (txOffsetSlider) txOffsetSlider.value = String(txOffset);
   refreshPlutoTxDeviationLabel();
+  // CTCSS : enable checkbox + tone dropdown.
+  const ctcssEn = document.getElementById("pluto-tx-ctcss-enabled");
+  if (ctcssEn) ctcssEn.checked = !!currentSettings.pluto_tx_ctcss_enabled;
+  const ctcssFreq = document.getElementById("pluto-tx-ctcss-freq");
+  if (ctcssFreq) {
+    const f = currentSettings.pluto_tx_ctcss_freq_hz ?? 88.5;
+    // Snap to nearest EIA tone if the saved value drifted (e.g. user
+    // hand-edited settings.json with a non-standard frequency).
+    const closest = EIA_CTCSS_TONES_HZ.reduce(
+      (best, t) => (Math.abs(t - f) < Math.abs(best - f) ? t : best),
+      EIA_CTCSS_TONES_HZ[0]
+    );
+    ctcssFreq.value = String(closest);
+  }
   applyTxSettingsToUI();
 }
 
@@ -1119,6 +1157,16 @@ async function persistSettings() {
       currentSettings.pluto_tx_deviation_offset_hz = v;
     }
   }
+  // CTCSS — sub-audible tone for repeater squelch.
+  const ctcssEn = document.getElementById("pluto-tx-ctcss-enabled");
+  if (ctcssEn) currentSettings.pluto_tx_ctcss_enabled = !!ctcssEn.checked;
+  const ctcssFreq = document.getElementById("pluto-tx-ctcss-freq");
+  if (ctcssFreq && ctcssFreq.value) {
+    const f = parseFloat(ctcssFreq.value);
+    if (Number.isFinite(f) && f >= 67.0 && f <= 254.1) {
+      currentSettings.pluto_tx_ctcss_freq_hz = f;
+    }
+  }
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -1172,6 +1220,13 @@ function setupSettingsTab() {
     txOffset.addEventListener("input", refreshPlutoTxDeviationLabel);
     txOffset.addEventListener("change", persistSettings);
   }
+  // CTCSS dropdown is populated once (39 fixed EIA tones), then
+  // its value + the enable checkbox persist on every change.
+  populateCtcssDropdown();
+  ["pluto-tx-ctcss-enabled", "pluto-tx-ctcss-freq"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", persistSettings);
+  });
   if (txSel) {
     txSel.addEventListener("change", () => {
       refreshPlutoPanelVisibility();

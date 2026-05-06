@@ -280,6 +280,12 @@ fn build_pluto_config(uri: &str, cfg: &settings::Settings) -> modem_pluto::devic
         prefer_low_rate: true,
         rx_max_deviation_hz: cfg.pluto_rx_deviation_hz as f32,
         tx_deviation_hz: cfg.effective_pluto_tx_deviation_hz() as f32,
+        ctcss_freq_hz: if cfg.pluto_tx_ctcss_enabled {
+            cfg.pluto_tx_ctcss_freq_hz
+        } else {
+            0.0
+        },
+        ctcss_level: 0.1,
     }
 }
 
