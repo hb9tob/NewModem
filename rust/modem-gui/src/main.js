@@ -590,11 +590,13 @@ function ensureOverlaySlots() {
   }
 }
 
-function populateDeviceSelect(selectId, devices, savedName) {
+function populateDeviceSelect(selectId, devices, savedName, plutoDevices) {
   const select = document.getElementById(selectId);
   if (!select) return null;
   select.innerHTML = "";
-  if (!devices || devices.length === 0) {
+  const audio = devices || [];
+  const pluto = plutoDevices || [];
+  if (audio.length === 0 && pluto.length === 0) {
     const opt = document.createElement("option");
     opt.textContent = "aucune carte détectée";
     opt.value = "";
@@ -602,7 +604,7 @@ function populateDeviceSelect(selectId, devices, savedName) {
     return null;
   }
   let preferred = null;
-  for (const dev of devices) {
+  for (const dev of audio) {
     const opt = document.createElement("option");
     opt.value = dev.name;
     const range = dev.max_sample_rate > 0
@@ -613,17 +615,44 @@ function populateDeviceSelect(selectId, devices, savedName) {
     const tagErr = dev.error ? ` [${dev.error}]` : "";
     opt.textContent = `${dev.friendly_name} — ${range}${tag48}${tagDef}${tagErr}`;
     opt.dataset.supports48k = dev.supports_48k ? "1" : "0";
+    opt.dataset.kind = "audio";
     select.appendChild(opt);
     if (preferred === null && dev.supports_48k) preferred = dev;
     if (dev.is_default && dev.supports_48k) preferred = dev;
   }
+  // Pluto entries — synthetic device names like `pluto:usb:1.6.5`. The
+  // backend's start_capture routes on the prefix and opens libiio
+  // instead of cpal. Pluto entries always claim 48 kHz support
+  // because the modem-pluto chain decimates the AD9361 IF down to
+  // exactly 48 kHz before the worker sees a single sample.
+  for (const dev of pluto) {
+    const opt = document.createElement("option");
+    opt.value = dev.name;
+    opt.textContent = `${dev.friendly_name} ✓48k [SDR]`;
+    opt.dataset.supports48k = "1";
+    opt.dataset.kind = "pluto";
+    select.appendChild(opt);
+  }
   // Priority: saved value if still available, otherwise the preferred one.
-  if (savedName && devices.some(d => d.name === savedName)) {
+  if (savedName && (audio.some(d => d.name === savedName)
+      || pluto.some(d => d.name === savedName))) {
     select.value = savedName;
   } else if (preferred) {
     select.value = preferred.name;
   }
   return select.value || null;
+}
+
+/// Show or hide the Pluto-specific settings fieldset based on whether
+/// the currently-selected RX device is a Pluto. Called whenever
+/// `rx-device-select` changes and at startup.
+function refreshPlutoPanelVisibility() {
+  const sel = document.getElementById("rx-device-select");
+  const panel = document.getElementById("pluto-config");
+  if (!sel || !panel) return;
+  const opt = sel.options[sel.selectedIndex];
+  const isPluto = !!(opt && opt.dataset && opt.dataset.kind === "pluto");
+  panel.hidden = !isPluto;
 }
 
 function refreshRxDeviceLabel() {
@@ -654,16 +683,25 @@ async function loadDevices() {
   }
   const { invoke } = window.__TAURI__.core;
   try {
-    const [rxDevices, txDevices] = await Promise.all([
+    // Pluto enumeration is best-effort: libiio may not find any Plutos
+    // (none plugged in / network mode disabled) — that surfaces as an
+    // empty list, not an error, so the dropdown still loads cleanly.
+    const [rxDevices, txDevices, plutoDevices] = await Promise.all([
       invoke("list_audio_devices"),
       invoke("list_output_audio_devices"),
+      invoke("list_pluto_devices").catch(err => {
+        console.warn("list_pluto_devices failed:", err);
+        return [];
+      }),
     ]);
-    populateDeviceSelect("rx-device-select", rxDevices, currentSettings.rx_device);
+    populateDeviceSelect("rx-device-select", rxDevices, currentSettings.rx_device, plutoDevices);
     populateDeviceSelect("tx-device-select", txDevices, currentSettings.tx_device);
     const n48 = rxDevices.filter(d => d.supports_48k).length;
-    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX`;
+    const plutoTag = plutoDevices.length > 0 ? ` · ${plutoDevices.length} Pluto` : "";
+    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${plutoTag}`;
     refreshRxDeviceLabel();
     refreshStartButtonFromRx();
+    refreshPlutoPanelVisibility();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
@@ -708,6 +746,22 @@ async function loadSettings() {
   if (preemph) preemph.checked = !!currentSettings.tx_preemphasis_enabled;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
+
+  // Pluto-specific knobs — populated whenever Settings load. Frequencies
+  // are stored in Hz on the Rust side and shown as MHz to the user.
+  const plutoRxFreq = document.getElementById("pluto-rx-freq-mhz");
+  if (plutoRxFreq) plutoRxFreq.value =
+    ((currentSettings.pluto_rx_freq_hz ?? 145_500_000) / 1e6).toFixed(3);
+  const plutoTxFreq = document.getElementById("pluto-tx-freq-mhz");
+  if (plutoTxFreq) plutoTxFreq.value =
+    ((currentSettings.pluto_tx_freq_hz ?? 145_500_000) / 1e6).toFixed(3);
+  const plutoRxMode = document.getElementById("pluto-rx-gain-mode");
+  if (plutoRxMode) plutoRxMode.value =
+    currentSettings.pluto_rx_gain_mode || "slow_attack";
+  const plutoRxGain = document.getElementById("pluto-rx-gain-db");
+  if (plutoRxGain) plutoRxGain.value = String(currentSettings.pluto_rx_gain_db ?? 30);
+  const plutoTxAtt = document.getElementById("pluto-tx-att-db");
+  if (plutoTxAtt) plutoTxAtt.value = String(currentSettings.pluto_tx_attenuation_db ?? 30);
   applyTxSettingsToUI();
 }
 
@@ -977,6 +1031,41 @@ async function persistSettings() {
   if (preemph) currentSettings.tx_preemphasis_enabled = !!preemph.checked;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
+
+  // Pluto knobs — read MHz, persist Hz. Reject NaN/negative so a
+  // half-typed value doesn't poison settings.json.
+  const plutoRxFreq = document.getElementById("pluto-rx-freq-mhz");
+  if (plutoRxFreq) {
+    const mhz = parseFloat(plutoRxFreq.value);
+    if (Number.isFinite(mhz) && mhz > 0) {
+      currentSettings.pluto_rx_freq_hz = Math.round(mhz * 1e6);
+    }
+  }
+  const plutoTxFreq = document.getElementById("pluto-tx-freq-mhz");
+  if (plutoTxFreq) {
+    const mhz = parseFloat(plutoTxFreq.value);
+    if (Number.isFinite(mhz) && mhz > 0) {
+      currentSettings.pluto_tx_freq_hz = Math.round(mhz * 1e6);
+    }
+  }
+  const plutoRxMode = document.getElementById("pluto-rx-gain-mode");
+  if (plutoRxMode && plutoRxMode.value) {
+    currentSettings.pluto_rx_gain_mode = plutoRxMode.value;
+  }
+  const plutoRxGain = document.getElementById("pluto-rx-gain-db");
+  if (plutoRxGain) {
+    const v = parseInt(plutoRxGain.value, 10);
+    if (Number.isFinite(v) && v >= -3 && v <= 71) {
+      currentSettings.pluto_rx_gain_db = v;
+    }
+  }
+  const plutoTxAtt = document.getElementById("pluto-tx-att-db");
+  if (plutoTxAtt) {
+    const v = parseFloat(plutoTxAtt.value);
+    if (Number.isFinite(v) && v >= 0 && v <= 89.75) {
+      currentSettings.pluto_tx_attenuation_db = v;
+    }
+  }
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -1002,9 +1091,17 @@ function setupSettingsTab() {
     rxSel.addEventListener("change", () => {
       refreshRxDeviceLabel();
       refreshStartButtonFromRx();
+      refreshPlutoPanelVisibility();
       persistSettings();
     });
   }
+  // Pluto-specific inputs — persist on every change so the next
+  // start_capture picks up new freq / gain without reload.
+  ["pluto-rx-freq-mhz", "pluto-tx-freq-mhz", "pluto-rx-gain-mode",
+   "pluto-rx-gain-db", "pluto-tx-att-db"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", persistSettings);
+  });
   if (txSel) {
     txSel.addEventListener("change", persistSettings);
   }

@@ -21,7 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| modem_pluto::DEFAULT_URI.to_string());
     let config = PlutoConfig {
         uri,
-        center_freq_hz: 145_500_000,
+        rx_freq_hz: 145_500_000,
+        tx_freq_hz: 145_500_000,
+        rx_gain_mode: modem_pluto::device::RxGainMode::Manual,
         rx_gain_db: 30,
         tx_attenuation_db: 30.0, // safe, way below max output
         rf_bandwidth_hz: 200_000,

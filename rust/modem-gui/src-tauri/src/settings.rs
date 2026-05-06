@@ -118,6 +118,43 @@ pub struct Settings {
     /// the user's preferences are preserved.
     #[serde(default)]
     pub overlay_default_seeded: bool,
+
+    // ───── PlutoSDR controls ─────────────────────────────────────────
+    //
+    // RX and TX have separate LO frequencies on the AD9361 (split-band
+    // operation is common on amateur duplex repeaters: RX one freq,
+    // TX a paired offset). The GUI exposes both independently. TX
+    // power on Pluto is `hardwaregain` on the TX baseband channel,
+    // expressed as attenuation in dB (positive = more attenuation).
+    /// Pluto RX_LO frequency in Hz. Default 145.5 MHz (2 m ham band).
+    #[serde(default = "default_pluto_rx_freq_hz")]
+    pub pluto_rx_freq_hz: u64,
+    /// Pluto TX_LO frequency in Hz. Default 145.5 MHz (= RX, simplex).
+    /// Set independently for repeater duplex (e.g. RX 145.625 / TX
+    /// 145.025 with a 600 kHz negative shift).
+    #[serde(default = "default_pluto_tx_freq_hz")]
+    pub pluto_tx_freq_hz: u64,
+    /// Pluto RX gain control mode. One of the AD9361 strings
+    /// `manual` / `fast_attack` / `slow_attack` / `hybrid` (the
+    /// chip's `gain_control_mode_available` set). Default
+    /// `slow_attack` — what the AD9361 driver itself defaults to,
+    /// nice smooth tracking for ham-band receive. Switch to
+    /// `manual` and tune `pluto_rx_gain_db` for lab work where
+    /// the input level is known.
+    #[serde(default = "default_pluto_rx_gain_mode")]
+    pub pluto_rx_gain_mode: String,
+    /// Pluto RX manual gain in dB. Range `[-3, 71]` step 1 dB on
+    /// the AD9363. Default 30. Only honoured when
+    /// `pluto_rx_gain_mode = "manual"` — in any AGC mode the chip
+    /// picks gain on its own.
+    #[serde(default = "default_pluto_rx_gain_db")]
+    pub pluto_rx_gain_db: i32,
+    /// Pluto TX attenuation in dB (positive = more attenuation, less
+    /// output power). Range `[0, 89.75]` step 0.25 dB. Default 30
+    /// (a safe medium-power value — full power at 0 can saturate
+    /// nearby receivers without an antenna isolator).
+    #[serde(default = "default_pluto_tx_attenuation_db")]
+    pub pluto_tx_attenuation_db: f64,
 }
 
 fn default_tx_quality() -> u32 {
@@ -160,6 +197,26 @@ fn default_tx_history_max() -> u32 {
     100
 }
 
+fn default_pluto_rx_freq_hz() -> u64 {
+    145_500_000
+}
+
+fn default_pluto_tx_freq_hz() -> u64 {
+    145_500_000
+}
+
+fn default_pluto_rx_gain_mode() -> String {
+    "slow_attack".to_string()
+}
+
+fn default_pluto_rx_gain_db() -> i32 {
+    30
+}
+
+fn default_pluto_tx_attenuation_db() -> f64 {
+    30.0
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -191,6 +248,11 @@ impl Default for Settings {
             overlays: default_overlay_slots(),
             active_overlay: 0,
             overlay_default_seeded: false,
+            pluto_rx_freq_hz: default_pluto_rx_freq_hz(),
+            pluto_tx_freq_hz: default_pluto_tx_freq_hz(),
+            pluto_rx_gain_mode: default_pluto_rx_gain_mode(),
+            pluto_rx_gain_db: default_pluto_rx_gain_db(),
+            pluto_tx_attenuation_db: default_pluto_tx_attenuation_db(),
         }
     }
 }

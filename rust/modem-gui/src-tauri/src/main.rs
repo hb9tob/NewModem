@@ -21,8 +21,34 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+/// Synthetic prefix the GUI uses to flag a Pluto entry in the
+/// (otherwise cpal-only) device dropdown. The real libiio URI follows.
+const PLUTO_DEVICE_PREFIX: &str = "pluto:";
+
+/// Active RX backend. Dropping either variant releases the underlying
+/// hardware; `stop_capture` matches on the variant to call the right
+/// teardown.
+enum CaptureKind {
+    /// cpal soundcard input (the legacy default, used unless the
+    /// device name carries the [`PLUTO_DEVICE_PREFIX`]).
+    Cpal(CaptureHandle),
+    /// PlutoSDR via libiio. The capture thread runs the radio-faithful
+    /// demod chain from `modem-sdr-dsp`; the worker downstream sees
+    /// the same 48 kHz mono `Vec<f32>` stream as the cpal path.
+    Pluto(modem_pluto::rx::CaptureHandle),
+}
+
+impl CaptureKind {
+    fn stop(self) {
+        match self {
+            CaptureKind::Cpal(h) => h.stop(),
+            CaptureKind::Pluto(h) => h.stop(),
+        }
+    }
+}
+
 struct CaptureSession {
-    capture: CaptureHandle,
+    capture: CaptureKind,
     worker: WorkerHandle,
     device_name: String,
 }
@@ -66,6 +92,65 @@ fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
 #[tauri::command]
 fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_output_devices().map_err(|e| e.to_string())
+}
+
+/// Pluto entry surfaced to the RX device dropdown. Names follow the
+/// convention `pluto:<libiio-uri>` so the backend's `start_capture`
+/// can route on the prefix without a separate "kind" parameter — that
+/// keeps the existing `device_name: String` Tauri contract intact.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlutoDeviceInfo {
+    /// Synthetic device name, e.g. `pluto:usb:1.6.5`. The frontend
+    /// stores this in `currentSettings.rx_device` like any other
+    /// device name; the backend recognises the `pluto:` prefix in
+    /// `start_capture` and opens the SDR backend instead of cpal.
+    name: String,
+    /// Raw libiio URI (without the `pluto:` prefix). Useful when the
+    /// frontend wants to display "USB 1.6.5" or "ip:pluto.local".
+    uri: String,
+    /// Vendor / model string libiio reports (typically
+    /// `"PlutoSDR (ADALM-PLUTO)"` for an ADALM-PLUTO).
+    description: String,
+    /// Single line for the dropdown.
+    friendly_name: String,
+}
+
+/// Scan USB libiio backends for connected Plutos. Network-mode Plutos
+/// (`ip:pluto.local`) aren't listed here — those are entered manually
+/// in Settings for now. Empty result + no error means "libiio works
+/// but no Pluto plugged in".
+#[tauri::command]
+fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
+    let scan = match industrial_io::ScanContext::new_usb() {
+        Ok(s) => s,
+        Err(e) => {
+            // libiio not loadable / USB backend disabled — surface as
+            // an empty list rather than an error so the GUI just shows
+            // "no Pluto found" instead of a red banner.
+            eprintln!("[pluto] USB scan unavailable: {e}");
+            return Ok(Vec::new());
+        }
+    };
+    let mut out = Vec::new();
+    for (uri, descr) in scan.iter() {
+        // Only keep entries whose description matches a Pluto. libiio
+        // can list other AD9361-class boards too — skip those.
+        let is_pluto = descr.contains("PlutoSDR")
+            || descr.contains("ADALM-PLUTO")
+            || descr.contains("AD9363")
+            || descr.contains("AD9361");
+        if !is_pluto {
+            continue;
+        }
+        let friendly_name = format!("Pluto SDR — {uri}");
+        out.push(PlutoDeviceInfo {
+            name: format!("pluto:{uri}"),
+            uri,
+            description: descr,
+            friendly_name,
+        });
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -200,9 +285,40 @@ fn start_capture(
             profile_idx.name()
         ));
     }
-    let (capture, samples) = cpal_capture::start(&device_name)?;
-    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let cfg = settings::load();
+    // Route on the device-name prefix: Pluto entries arrive as
+    // `pluto:<libiio-uri>` (built by `list_pluto_devices`). Anything
+    // else is a cpal soundcard. Both branches emit the same shape:
+    // mpsc::Receiver<Vec<f32>> at 48 kHz mono — the rx_worker doesn't
+    // know which backend produced the samples.
+    let (capture, samples) =
+        if let Some(uri) = device_name.strip_prefix(PLUTO_DEVICE_PREFIX) {
+            // Default to slow_attack if Settings ever carries an
+            // unrecognised mode string — the chip would reject the
+            // raw libiio write anyway, but defaulting saves the user
+            // a trip to the Settings panel.
+            let rx_mode = modem_pluto::device::RxGainMode::from_iio_str(
+                &cfg.pluto_rx_gain_mode,
+            )
+            .unwrap_or(modem_pluto::device::RxGainMode::SlowAttack);
+            let pcfg = modem_pluto::device::PlutoConfig {
+                uri: uri.to_string(),
+                rx_freq_hz: cfg.pluto_rx_freq_hz,
+                tx_freq_hz: cfg.pluto_tx_freq_hz,
+                rx_gain_mode: rx_mode,
+                rx_gain_db: cfg.pluto_rx_gain_db,
+                tx_attenuation_db: cfg.pluto_tx_attenuation_db,
+                rf_bandwidth_hz: 200_000,
+                prefer_low_rate: true,
+            };
+            let (h, rx) = modem_pluto::rx::start(&pcfg)
+                .map_err(|e| format!("Pluto open ({uri}): {e}"))?;
+            (CaptureKind::Pluto(h), rx)
+        } else {
+            let (h, rx) = cpal_capture::start(&device_name)?;
+            (CaptureKind::Cpal(h), rx)
+        };
+    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
         samples,
         sink,
@@ -224,9 +340,9 @@ fn start_capture(
 fn stop_capture(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     if let Some(session) = guard.take() {
-        // Drop the capture first : that closes the stream and disconnects
-        // the mpsc channel, so the worker's recv() returns and the thread
-        // exits naturally.
+        // Drop the capture first : that closes the stream / cancels
+        // the libiio buffer pump and disconnects the mpsc channel, so
+        // the worker's recv() returns and the thread exits naturally.
         session.capture.stop();
         session.worker.stop();
     }
@@ -992,6 +1108,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
+            list_pluto_devices,
             list_modem_profiles,
             list_serial_ports,
             ptt_status,

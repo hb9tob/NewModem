@@ -47,10 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| modem_pluto::DEFAULT_URI.to_string());
     let config = PlutoConfig {
         uri: uri.clone(),
-        // The center freq doesn't matter for FPGA loopback (the analog
-        // front-end is bypassed) but the AD9361 still wants a valid
-        // tuner setting. 145.5 MHz is a fine ham-band default.
-        center_freq_hz: 145_500_000,
+        // The freqs don't matter for FPGA loopback (the analog
+        // front-end is bypassed) but the AD9361 still wants valid
+        // tuner settings. 145.5 MHz is a fine ham-band default.
+        rx_freq_hz: 145_500_000,
+        tx_freq_hz: 145_500_000,
+        rx_gain_mode: modem_pluto::device::RxGainMode::Manual,
         rx_gain_db: 30,
         tx_attenuation_db: 30.0,
         rf_bandwidth_hz: 200_000,

@@ -1066,6 +1066,29 @@ main {
 .ptt-refresh:hover {
   background: #383838;
 }
+
+/* PlutoSDR settings fieldset — RX/TX freq pair, AGC mode, gain knobs.
+   Two flex rows so freqs sit side-by-side, gain mode + values wrap as
+   the column shrinks. Styling mirrors .ptt-config / .ptt-line spacing
+   so the panel slots naturally between the cpal-RX and cpal-TX
+   blocks. */
+.pluto-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.3rem;
+  font-size: 0.85rem;
+}
+.pluto-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.pluto-field input[type="number"] {
+  width: 7em;
+  text-align: right;
+}
 .ptt-status {
   font-size: 0.8rem;
   margin-top: 0.4rem;

@@ -38,18 +38,34 @@ pub mod iio_names {
 
 /// Static configuration the driver applies after opening a context.
 /// The defaults match a typical 2 m amateur-radio NBFM setup; the CLI
-/// / GUI override `center_freq_hz` and `rx_gain_db` per session.
+/// / GUI override the freq + gain fields per session.
+///
+/// RX and TX have **independent** LOs on the AD9361 (`altvoltage0` =
+/// RX_LO, `altvoltage1` = TX_LO). Set them to the same value for
+/// simplex; offset them for repeater duplex (e.g. RX 145.625 MHz /
+/// TX 145.025 MHz on a 2 m repeater with a -600 kHz shift).
 #[derive(Clone, Debug)]
 pub struct PlutoConfig {
     /// libiio URI, e.g. `"usb:1.6.5"` or `"ip:pluto.local"`.
     pub uri: String,
-    /// Tuner LO. Same value used for RX and TX.
-    pub center_freq_hz: u64,
+    /// RX_LO frequency in Hz.
+    pub rx_freq_hz: u64,
+    /// TX_LO frequency in Hz. May differ from `rx_freq_hz` for
+    /// repeater duplex.
+    pub tx_freq_hz: u64,
+    /// AD9361 AGC mode. One of `manual`, `fast_attack`, `slow_attack`,
+    /// `hybrid` (the chip's `gain_control_mode_available` set). Only
+    /// when this is `manual` does [`Self::rx_gain_db`] take effect; in
+    /// the three AGC modes the AD9361 picks gain dynamically.
+    pub rx_gain_mode: RxGainMode,
     /// Manual RX gain in dB. Range `[-3, 71]` step 1 dB on the AD9363.
+    /// Only honoured when [`Self::rx_gain_mode`] is
+    /// [`RxGainMode::Manual`].
     pub rx_gain_db: i32,
     /// TX attenuation in dB (positive value = more attenuation; the
     /// AD9361 driver internally writes it as a negative `hardwaregain`).
-    /// Range `[0.0, 89.75]` dB step 0.25.
+    /// Range `[0.0, 89.75]` dB step 0.25. Lower value = more output
+    /// power; 0 dB = full Pluto rated output (~7 dBm).
     pub tx_attenuation_db: f64,
     /// AD9361 RF bandwidth, in Hz. 200 kHz is comfortable for ±5 kHz
     /// deviation NBFM; the 4× FIR + decimation chain shapes the rest.
@@ -66,11 +82,58 @@ impl Default for PlutoConfig {
     fn default() -> Self {
         Self {
             uri: crate::DEFAULT_URI.to_string(),
-            center_freq_hz: 145_500_000,
+            rx_freq_hz: 145_500_000,
+            tx_freq_hz: 145_500_000,
+            rx_gain_mode: RxGainMode::Manual,
             rx_gain_db: 30,
             tx_attenuation_db: 10.0,
             rf_bandwidth_hz: 200_000,
             prefer_low_rate: true,
+        }
+    }
+}
+
+/// AD9361 RX gain control modes. Maps directly to the strings the
+/// libiio attribute `voltage0/gain_control_mode` accepts.
+///
+/// Recommendations:
+/// * **Manual** — best when the operator knows the expected RF level
+///   (lab tests, fixed-power loopback). Uses [`PlutoConfig::rx_gain_db`].
+/// * **SlowAttack** — the AD9361 driver's own default. Smooth gain
+///   tracking; fine for stable HAM-band receive.
+/// * **FastAttack** — reacts quickly to bursty signals. Good for
+///   intermittent transmissions but can pump on noise.
+/// * **Hybrid** — ADI's compromise; works well for speech / NBFM
+///   audio with occasional level swings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxGainMode {
+    Manual,
+    FastAttack,
+    SlowAttack,
+    Hybrid,
+}
+
+impl RxGainMode {
+    /// libiio attribute string for this mode.
+    pub fn as_iio_str(&self) -> &'static str {
+        match self {
+            RxGainMode::Manual => "manual",
+            RxGainMode::FastAttack => "fast_attack",
+            RxGainMode::SlowAttack => "slow_attack",
+            RxGainMode::Hybrid => "hybrid",
+        }
+    }
+
+    /// Parse from the same string set the libiio attribute reports.
+    /// Returns `None` for any unknown value (caller decides whether
+    /// to fall back to a default or surface an error).
+    pub fn from_iio_str(s: &str) -> Option<Self> {
+        match s {
+            "manual" => Some(Self::Manual),
+            "fast_attack" => Some(Self::FastAttack),
+            "slow_attack" => Some(Self::SlowAttack),
+            "hybrid" => Some(Self::Hybrid),
+            _ => None,
         }
     }
 }
@@ -248,21 +311,29 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
             detail: "TX_LO channel not present".into(),
         })?;
 
-    // --- RX gain: switch to manual mode then write the requested gain.
+    // --- RX gain: program the chosen AGC mode, then in `manual` mode
+    // also push the explicit gain. In any AGC mode we leave the chip
+    // to do its thing — writing `hardwaregain` in non-manual modes
+    // would be ignored by the driver anyway.
     rx_chan
-        .attr_write_str("gain_control_mode", "manual")
+        .attr_write_str("gain_control_mode", config.rx_gain_mode.as_iio_str())
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/gain_control_mode",
-            detail: format!("manual mode rejected: {e}"),
+            detail: format!(
+                "mode '{}' rejected: {e}",
+                config.rx_gain_mode.as_iio_str()
+            ),
         })?;
-    rx_chan
-        .attr_write_int("hardwaregain", config.rx_gain_db as i64)
-        .map_err(|e| PlutoError::Attribute {
-            device: iio_names::PHY,
-            attr: "voltage0/hardwaregain (RX)",
-            detail: format!("rx_gain_db = {} rejected: {e}", config.rx_gain_db),
-        })?;
+    if config.rx_gain_mode == RxGainMode::Manual {
+        rx_chan
+            .attr_write_int("hardwaregain", config.rx_gain_db as i64)
+            .map_err(|e| PlutoError::Attribute {
+                device: iio_names::PHY,
+                attr: "voltage0/hardwaregain (RX)",
+                detail: format!("rx_gain_db = {} rejected: {e}", config.rx_gain_db),
+            })?;
+    }
 
     // --- TX attenuation: AD9361 driver expects a negative value in dB.
     let tx_hw_gain = -config.tx_attenuation_db.abs();
@@ -292,18 +363,18 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
 
     // --- LO frequencies.
     rx_lo
-        .attr_write_int("frequency", config.center_freq_hz as i64)
+        .attr_write_int("frequency", config.rx_freq_hz as i64)
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "altvoltage0/frequency (RX_LO)",
-            detail: format!("{} Hz rejected: {e}", config.center_freq_hz),
+            detail: format!("{} Hz rejected: {e}", config.rx_freq_hz),
         })?;
     tx_lo
-        .attr_write_int("frequency", config.center_freq_hz as i64)
+        .attr_write_int("frequency", config.tx_freq_hz as i64)
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "altvoltage1/frequency (TX_LO)",
-            detail: format!("{} Hz rejected: {e}", config.center_freq_hz),
+            detail: format!("{} Hz rejected: {e}", config.tx_freq_hz),
         })?;
 
     // --- FIR: load taps, enable per-direction, then negotiate rate.

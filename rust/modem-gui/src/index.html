@@ -304,6 +304,46 @@
             insuffisamment) la désemphase.
           </p>
         </fieldset>
+        <fieldset id="pluto-config" hidden>
+          <legend>PlutoSDR — fréquences et gain</legend>
+          <div class="pluto-row">
+            <label class="pluto-field">
+              Fréquence RX (MHz) :
+              <input type="number" id="pluto-rx-freq-mhz" step="0.001" min="70" max="6000">
+            </label>
+            <label class="pluto-field">
+              Fréquence TX (MHz) :
+              <input type="number" id="pluto-tx-freq-mhz" step="0.001" min="70" max="6000">
+            </label>
+          </div>
+          <div class="pluto-row">
+            <label class="pluto-field">
+              Mode AGC :
+              <select id="pluto-rx-gain-mode">
+                <option value="manual">manual (gain fixe)</option>
+                <option value="fast_attack">fast_attack (rapide)</option>
+                <option value="slow_attack">slow_attack (lent)</option>
+                <option value="hybrid">hybrid (mixte)</option>
+              </select>
+            </label>
+            <label class="pluto-field">
+              Gain RX (dB) :
+              <input type="number" id="pluto-rx-gain-db" min="-3" max="71" step="1">
+            </label>
+            <label class="pluto-field">
+              Atténuation TX (dB) :
+              <input type="number" id="pluto-tx-att-db" min="0" max="89.75" step="0.25">
+            </label>
+          </div>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Fréquences RX et TX réglables indépendamment (relais duplex :
+            RX 145.625 / TX 145.025 par exemple). Mode AGC : <code>manual</code>
+            applique le gain fixé ci-dessus, les trois autres laissent
+            l'AD9361 ajuster dynamiquement. Atténuation TX : 0 dB =
+            puissance maximale (~7 dBm), 30 dB = ~−23 dBm (sûr pour les
+            tests sans antenne / coupleur).
+          </p>
+        </fieldset>
         <fieldset>
           <legend>Carte son émission (TX)</legend>
           <select id="tx-device-select">

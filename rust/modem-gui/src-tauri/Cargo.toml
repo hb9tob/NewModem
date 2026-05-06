@@ -15,7 +15,9 @@ tauri-build = { version = "2", features = [] }
 modem-core = { path = "../../modem-core" }
 modem-framing = { path = "../../modem-framing" }
 modem-io = { path = "../../modem-io" }
+modem-pluto = { path = "../../modem-pluto" }
 modem-worker = { path = "../../modem-worker" }
+industrial-io = "0.6"
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 zstd = "0.13"
