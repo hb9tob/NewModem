@@ -28,15 +28,19 @@
 //! with `EINVAL`. If 528 still refuses to lock, the driver falls back
 //! to **960 kSa/s = 48 × 20**, which the AD9363 takes natively.
 //!
-//! ## Scaffold pass
+//! ## Status
 //!
-//! This is the crate skeleton landing in task #9 of the SDR plan
-//! (`/home/hb9tob/.claude/plans/ok-j-aimerais-valuer-la-goofy-milner.md`).
-//! The module shells compile but every public entry point that would
-//! touch real hardware returns [`PlutoError::NotImplemented`]. The
-//! library is wired into the workspace so `cargo build -p modem-pluto`
-//! and `cargo check --workspace` stay green; FIR loading + streaming
-//! land in tasks #10 and #11.
+//! * Task #9 (scaffold): done.
+//! * Task #10 (device discovery + FIR loading): [`device::open`] is
+//!   live — it opens the libiio context, locates the three IIO
+//!   devices, programs gain / freq / bandwidth, computes a 128-tap
+//!   Hamming-windowed sinc FIR via [`device::design_decim4_lpf`],
+//!   formats it with [`device::format_fir_blob`], writes it into
+//!   `filter_fir_config`, enables per-direction `filter_fir_en`, and
+//!   negotiates 528 kSa/s (preferred) or 960 kSa/s (fallback).
+//! * Task #11 (streaming RX/TX through `modem-sdr-dsp` + CLI flags +
+//!   loopback test): pending — `rx::start` and the TX submit path
+//!   still return `PlutoError::NotImplemented`.
 
 pub mod device;
 pub mod error;
