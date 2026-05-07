@@ -14,8 +14,8 @@ Pour la conception du modem et la caractérisation du canal : voir le
 
 | Onglet | Rôle |
 |---|---|
-| **RX** | Réception continue, level-meter, constellation, progression RaptorQ, capture brute WAV |
-| **TX** | Compression AVIF (drag-drop), choix du mode modem, émission + "TX more" pour blocs repair |
+| **RX** | Réception continue, level-meter, constellation, progression RaptorQ, capture brute WAV, **lecture d'un WAV depuis le disque** (▶ Lire WAV) |
+| **TX** | Compression AVIF (drag-drop), choix du mode modem, émission + "TX more" pour blocs repair, **option de sauvegarde du WAV émis** |
 | **Sessions** | Sessions RaptorQ persistées 24 h (meta, packets.blob, fichier décodé le cas échéant) |
 | **Canal** | Estimateur de canal — phase A livrée (cascade ATT), phases B/C planifiées |
 | **Paramètres** | Indicatif, cartes son RX/TX, **PTT série** |
@@ -74,6 +74,65 @@ bavarde en fin.
 
 ---
 
+## Fichiers WAV — sauvegarde TX et lecture RX
+
+Deux flux WAV optionnels pour le debug offline et l'analyse a posteriori
+d'un QSO. Aucun n'est activé par défaut.
+
+### Sauvegarder le WAV émis (TX)
+
+**Paramètres → Périphérique émission (TX) → "Sauver le WAV émis dans
+tx_history/"**
+
+Quand la case est cochée, chaque émission (initiale + chaque "TX
+more") écrit l'audio synthétisé sur disque, **après** pré-emphase et
+atténuation cascade — c'est-à-dire exactement ce qui part vers la carte
+son ou la Pluto. Format : mono 48 kHz int16, lisible directement par
+Audacity, GNU Radio ou `nbfm-modem rx --input <wav>`.
+
+Emplacement : `<save_dir>/tx_history/tx-<ts>-<filename>.wav` à côté du
+fichier source archivé par `archive_payload`. Pour un burst "TX more"
+le suffixe `-r<esi_start>` évite d'écraser le WAV initial.
+
+Activable / désactivable à chaud — pas besoin de redémarrer l'app. Le
+toggle pèse zéro CPU sur la chaîne TX (le buffer encodé est déjà en
+mémoire ; on l'écrit en parallèle de la lecture).
+
+### Lire un WAV depuis le disque (RX)
+
+**Onglet RX → bouton ▶ Lire WAV**
+
+Permet de rejouer un WAV 48 kHz mono à travers le démod modem comme
+s'il s'agissait d'un flux live (utile pour rejouer une capture brute
+faite plus tôt avec ⏺ capture brute, ou pour valider une régression
+sur un enregistrement OTA archivé).
+
+Détails internes :
+
+- Le fichier est lu en RAM côté backend, décodé en `Vec<f32>`, puis
+  poussé vers le rx_worker par batches de 500 ms (24 000 échantillons)
+  via `mpsc::channel`. Le rythme **temps-réel** est important — la
+  détection de silence et l'intervalle de scan du worker sont
+  wall-clock based ; balancer le buffer d'un coup dégénérerait en un
+  seul gros scan au lieu de décodes incrémentaux.
+- Le profil utilisé est celui sélectionné dans **RX → Forcer un
+  profil** (sinon HIGH par défaut, auto-détection raffine).
+- Pendant la lecture, la barre d'outils RX se comporte comme une
+  capture live : level-meter actif, constellation, progression
+  RaptorQ, événement `wav_playback_done` émis quand le pacer atteint
+  la fin du fichier.
+- Refuse de démarrer si une capture live est déjà en cours — arrêter
+  d'abord avec ⏹ Arrêter.
+
+⚠ **Caveat performance** — le transfert frontend → backend passe par
+un IPC JSON-array (~3× la taille du fichier en texte). Une capture de
+30 s (≈ 2,9 Mo) charge instantanément ; une capture de 5 min (≈ 28 Mo)
+fige le GUI quelques secondes au démarrage. Une route binaire (path
+direct ou `tauri-plugin-dialog`) sera ajoutée le jour où ça gêne en
+usage normal.
+
+---
+
 ## Onglet Canal — phase A (cascade ATT)
 
 Outil de réglage du niveau d'émission basé sur les rapports oraux des
@@ -124,6 +183,32 @@ En phase B, les valeurs mesurées automatiquement côté RX alimentent
 directement le cartouche "atténuation recommandée" de la colonne RX de
 chaque station réceptrice, pour transmission orale (ou, en phase
 suivante, OTA).
+
+---
+
+## Indicateurs σ² (RX)
+
+Trois affichages de variance de bruit, tous calculés sur les **symboles
+de trame uniquement** (résidus des décisions dures sur les data symbols
+post-égalisation), pilotes et préambule **exclus** :
+
+- **Barre du haut** (`σ²=…`) — valeur instantanée de la fenêtre courante.
+- **Diagramme d'erreur de phase** (overlay constellation, `σ²=… (Y.Y dB)`)
+  — même valeur instantanée + SNR implicite.
+- **Bandeau du fichier reçu** (`σ² moyen : … (Y.Y dB)`) — moyenne
+  cumulée sur tous les ticks de décode qui ont contribué à la session.
+  C'est la valeur qu'on rapporte après coup ; elle reste stable même
+  si une fenêtre isolée a vu un fade.
+
+Le σ² des pilotes (estimateur statistiquement optimal) reste utilisé
+en interne comme échelle LLR du soft demod — invisible dans l'UI mais
+toujours actif sur la chaîne de décodage.
+
+⚠ Biais — le σ² basé décisions dures est légèrement **sous-estimé à
+faible SNR** (les décisions erronées rapprochent artificiellement le
+résidu du point constellation faux). Acceptable pour un indicateur
+live ; ne pas l'utiliser comme métrique de référence sous le seuil
+LDPC.
 
 ---
 

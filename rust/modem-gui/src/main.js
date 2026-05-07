@@ -550,6 +550,7 @@ let currentSettings = {
   ptt_dtr_tx_high: true,
   tx_attenuation_db: 0,
   tx_preemphasis_enabled: false,
+  tx_save_wav: false,
   rx_deemphasis_enabled: false,
   collector_url: "",
   tx_quality: 10,
@@ -776,7 +777,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, rx_deemphasis_enabled: false, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -800,6 +801,8 @@ async function loadSettings() {
   if (histMax) histMax.value = String(currentSettings.tx_history_max ?? 100);
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.checked = !!currentSettings.tx_preemphasis_enabled;
+  const saveWav = document.getElementById("tx-save-wav-enabled");
+  if (saveWav) saveWav.checked = !!currentSettings.tx_save_wav;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
 
@@ -1111,6 +1114,8 @@ async function persistSettings() {
   }
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) currentSettings.tx_preemphasis_enabled = !!preemph.checked;
+  const saveWav = document.getElementById("tx-save-wav-enabled");
+  if (saveWav) currentSettings.tx_save_wav = !!saveWav.checked;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
 
@@ -1247,6 +1252,8 @@ function setupSettingsTab() {
   }
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.addEventListener("change", persistSettings);
+  const saveWav = document.getElementById("tx-save-wav-enabled");
+  if (saveWav) saveWav.addEventListener("change", persistSettings);
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.addEventListener("change", persistSettings);
   const stopRxBtn = document.getElementById("settings-stop-rx-btn");
@@ -1373,6 +1380,77 @@ async function tryAutoStartCapture() {
   if (txStopBtn && !txStopBtn.disabled) return;
   if (startBtn.disabled) return;
   await startCapture();
+}
+
+// ─── WAV-file replay (offline RX from a recorded capture) ─────────
+//
+// The Rust side exposes `start_capture_from_wav` which spins up a
+// paced sender thread (500 ms batches at 48 kHz) feeding the same
+// `Receiver<Vec<f32>>` the rx_worker reads from cpal/Pluto. The UI
+// flow mirrors `startCapture` so the user gets the same
+// state-chip / progress / level-meter behaviour with a WAV source.
+function setupWavPlayback() {
+  const btn = document.getElementById("btn-play-wav");
+  const input = document.getElementById("rx-wav-input");
+  if (!btn || !input) return;
+  btn.addEventListener("click", () => {
+    // Reset value so re-picking the same file still fires `change`.
+    input.value = "";
+    input.click();
+  });
+  input.addEventListener("change", () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (file) startCaptureFromWav(file);
+  });
+  // Frontend echo of the pacer-finished event — flip the buttons back
+  // so the user knows the file finished playing without having to
+  // manually press Stop. The backend leaves the worker running for a
+  // few seconds so any in-flight decode finalises naturally.
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("wav_playback_done", () => {
+      logEvent("wav_playback_done", null);
+    });
+  }
+}
+
+async function startCaptureFromWav(file) {
+  const { invoke } = window.__TAURI__.core;
+  const status = document.getElementById("status");
+  // Refuse to start a WAV replay when a live RX is already in flight —
+  // the backend rejects it anyway, but this surfaces a clearer message
+  // and avoids spending seconds reading the file for nothing.
+  const stopBtn = document.getElementById("btn-stop");
+  if (stopBtn && !stopBtn.disabled) {
+    status.textContent = "arrêter d'abord la capture en cours";
+    status.style.color = "#ef5350";
+    return;
+  }
+  status.textContent = `chargement ${file.name}…`;
+  status.style.color = "#90caf9";
+  try {
+    const buf = await file.arrayBuffer();
+    // JSON-array IPC (same pattern as set_tx_source) — Tauri 2 doesn't
+    // wire raw-binary arguments by default in this codebase. For long
+    // captures (tens of MB) the transfer is the bottleneck; the user
+    // sees a "chargement" status while it happens.
+    const bytes = Array.from(new Uint8Array(buf));
+    const forced = !!currentSettings.rx_force_mode;
+    const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
+    await invoke("start_capture_from_wav", { args: { bytes, profile, forced } });
+    status.textContent = `lecture WAV : ${file.name}`;
+    status.style.color = "#ffb74d";
+    document.getElementById("btn-start").disabled = true;
+    document.getElementById("btn-stop").disabled = false;
+    const rxSel = document.getElementById("rx-device-select");
+    if (rxSel) rxSel.disabled = true;
+    refreshSettingsRxWarn();
+    logEvent("wav_playback_start", { file: file.name, profile, forced });
+  } catch (err) {
+    status.textContent = `erreur lecture WAV : ${err}`;
+    status.style.color = "#ef5350";
+    logEvent("wav_playback_error", { message: String(err) });
+  }
 }
 
 async function stopCapture() {
@@ -3954,6 +4032,7 @@ async function init() {
   document.getElementById("btn-start").addEventListener("click", startCapture);
   document.getElementById("btn-stop").addEventListener("click", stopCapture);
   document.getElementById("btn-raw").addEventListener("click", toggleRawRecording);
+  setupWavPlayback();
   window.addEventListener("resize", redrawAll);
   document
     .getElementById("btn-sessions-refresh")

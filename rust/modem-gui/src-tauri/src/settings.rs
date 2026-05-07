@@ -84,6 +84,14 @@ pub struct Settings {
     /// are purged on each archive.
     #[serde(default = "default_tx_history_max")]
     pub tx_history_max: u32,
+    /// If true, the TX worker writes the synthesised audio to a WAV
+    /// (mono, 48 kHz, int16) under `<save_dir>/tx_history/` next to the
+    /// archived source. The legacy in-process pipeline dropped the
+    /// intermediate WAV; this toggle reinstates it for users who want
+    /// to inspect / replay the on-air signal offline. Default false —
+    /// keeps disk usage bounded for kiosk operators.
+    #[serde(default)]
+    pub tx_save_wav: bool,
     /// Lock the RX onto a specific profile (bypassing the FFT-gate
     /// auto-detection). Required to decode experimental profiles
     /// (MEGA, FAST, HIGH++, HIGH+56) that are absent from
@@ -308,6 +316,7 @@ impl Default for Settings {
             tx_speed: default_tx_speed(),
             tx_more_count: default_tx_more_count(),
             tx_history_max: default_tx_history_max(),
+            tx_save_wav: false,
             rx_force_mode: false,
             rx_forced_profile: default_rx_forced_profile(),
             experimental_modes_enabled: false,

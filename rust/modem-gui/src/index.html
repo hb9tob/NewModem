@@ -37,6 +37,8 @@
         <button id="btn-start" disabled>Démarrer</button>
         <button id="btn-stop" disabled>Arrêter</button>
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
+        <button id="btn-play-wav" class="btn-raw" title="Lire un fichier WAV 48 kHz mono à la place du flux audio">▶ Lire WAV</button>
+        <input type="file" id="rx-wav-input" accept=".wav,audio/wav,audio/x-wav" hidden>
         <span id="rx-device-label" class="rx-device-label" title="Périphérique sélectionné dans les Paramètres">—</span>
       </div>
       <div class="rx-force-bar" id="rx-force-bar" hidden>
@@ -351,6 +353,15 @@
             plateau +20 dB). Le signal est re-normalisé après filtrage pour
             ne pas écrêter la sortie TX. À activer si la chaîne audio TX
             n'effectue pas elle-même la pré-emphase.
+          </p>
+          <label class="ptt-row" style="margin-top: 0.5rem;">
+            <input type="checkbox" id="tx-save-wav-enabled">
+            Sauver le WAV émis dans tx_history/
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Écrit l'audio synthétisé (mono 48 kHz int16, post pré-emphase
+            et atténuation) à côté du fichier source archivé. Désactivé
+            par défaut.
           </p>
           <div id="pluto-tx-config" class="pluto-subgroup" hidden>
             <div class="pluto-row">

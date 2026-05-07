@@ -36,6 +36,14 @@ enum CaptureKind {
     /// demod chain from `modem-sdr-dsp`; the worker downstream sees
     /// the same 48 kHz mono `Vec<f32>` stream as the cpal path.
     Pluto(modem_pluto::rx::CaptureHandle),
+    /// Synthetic capture: a paced thread streams f32 samples loaded
+    /// from a WAV file through the same `mpsc::Receiver<Vec<f32>>`
+    /// interface the worker expects from cpal/Pluto. Used to replay
+    /// captured audio (offline debug, regression testing).
+    WavFile {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
 }
 
 impl CaptureKind {
@@ -43,6 +51,12 @@ impl CaptureKind {
         match self {
             CaptureKind::Cpal(h) => h.stop(),
             CaptureKind::Pluto(h) => h.stop(),
+            CaptureKind::WavFile { stop, thread } => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(t) = thread {
+                    let _ = t.join();
+                }
+            }
         }
     }
 }
@@ -301,27 +315,8 @@ fn start_capture(
     if guard.is_some() {
         return Err("capture already running".into());
     }
-    let profile_idx = match profile.as_deref().unwrap_or("HIGH").to_uppercase().as_str() {
-        "MEGA" => modem_core::profile::ProfileIndex::Mega,
-        "HIGH" => modem_core::profile::ProfileIndex::High,
-        "NORMAL" => modem_core::profile::ProfileIndex::Normal,
-        "ROBUST" => modem_core::profile::ProfileIndex::Robust,
-        "ULTRA" => modem_core::profile::ProfileIndex::Ultra,
-        // EXPERIMENTAL : seulement utilisable si forced=true.
-        "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
-        "FAST" => modem_core::profile::ProfileIndex::Fast,
-        "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
-        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix,
-        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix,
-        other => return Err(format!("unknown profile '{other}'")),
-    };
     let forced = forced.unwrap_or(false);
-    if profile_idx.is_experimental() && !forced {
-        return Err(format!(
-            "profil '{}' est expérimental, requiert forced=true",
-            profile_idx.name()
-        ));
-    }
+    let profile_idx = resolve_profile(profile.as_deref().unwrap_or("HIGH"), forced)?;
     let cfg = settings::load();
     // Route on the device-name prefix: Pluto entries arrive as
     // `pluto:<libiio-uri>` (built by `list_pluto_devices`). Anything
@@ -352,6 +347,164 @@ fn start_capture(
         capture,
         worker,
         device_name,
+    });
+    Ok(())
+}
+
+/// Resolve a profile name (case-insensitive, accepts both
+/// `HIGH+`/`HIGHPLUS` style aliases) and reject experimental profiles
+/// when `forced=false`. Shared by `start_capture` and
+/// `start_capture_from_wav` so the WAV replay path mirrors the live
+/// capture path's gating exactly.
+fn resolve_profile(name: &str, forced: bool) -> Result<modem_core::profile::ProfileIndex, String> {
+    let p = match name.to_uppercase().as_str() {
+        "MEGA" => modem_core::profile::ProfileIndex::Mega,
+        "HIGH" => modem_core::profile::ProfileIndex::High,
+        "NORMAL" => modem_core::profile::ProfileIndex::Normal,
+        "ROBUST" => modem_core::profile::ProfileIndex::Robust,
+        "ULTRA" => modem_core::profile::ProfileIndex::Ultra,
+        "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
+        "FAST" => modem_core::profile::ProfileIndex::Fast,
+        "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
+        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix,
+        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix,
+        other => return Err(format!("unknown profile '{other}'")),
+    };
+    if p.is_experimental() && !forced {
+        return Err(format!(
+            "profil '{}' est expérimental, requiert forced=true",
+            p.name()
+        ));
+    }
+    Ok(p)
+}
+
+#[derive(serde::Deserialize)]
+struct StartCaptureFromWavArgs {
+    /// WAV file content as raw bytes (read by the frontend via
+    /// `file.arrayBuffer()`). Must be mono, 48 kHz, int8/int16/int24
+    /// or float32 — the modem chain only handles 48 kHz audio.
+    bytes: Vec<u8>,
+    profile: Option<String>,
+    forced: Option<bool>,
+}
+
+/// Replay a WAV file as if it were live audio: the bytes are decoded
+/// into f32 samples and a paced helper thread pushes 500 ms batches
+/// through an `mpsc::channel` to the rx_worker. Real-time pacing is
+/// important — the worker's silence detection and 1 s scan interval
+/// are wall-clock based, so dumping the whole buffer at once would
+/// produce one giant scan instead of incremental decodes.
+#[tauri::command]
+fn start_capture_from_wav(
+    args: StartCaptureFromWavArgs,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    if guard.is_some() {
+        return Err("capture already running".into());
+    }
+    let forced = args.forced.unwrap_or(false);
+    let profile_idx = resolve_profile(args.profile.as_deref().unwrap_or("HIGH"), forced)?;
+
+    // Parse the WAV from in-memory bytes. hound::WavReader::new takes
+    // any `Read`, so a `Cursor<Vec<u8>>` works without writing a temp
+    // file.
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(args.bytes))
+        .map_err(|e| format!("WAV parse: {e}"))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 48_000 {
+        return Err(format!(
+            "WAV doit être à 48 kHz (vu : {} Hz)",
+            spec.sample_rate
+        ));
+    }
+    if spec.channels != 1 {
+        return Err(format!(
+            "WAV doit être mono (vu : {} canaux)",
+            spec.channels
+        ));
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            // Same convention as modem-cli's read_wav: scale by
+            // 2^(bps-1) so a max-amplitude sample lands on ±1.0.
+            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.unwrap_or(0) as f32 / max_val)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|s| s.unwrap_or(0.0))
+            .collect(),
+    };
+    if samples.is_empty() {
+        return Err("WAV vide".into());
+    }
+
+    // Build the channel + paced sender. Pacing constants chosen to
+    // match what cpal_capture / Pluto produce on a live channel.
+    let (tx_chan, rx_chan) = std::sync::mpsc::channel::<Vec<f32>>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let app_for_done = app.clone();
+    let pacer = std::thread::spawn(move || {
+        // ~500 ms at 48 kHz → matches rx_worker's BATCH_TARGET_SAMPLES
+        // so each delivered batch triggers (at most) one scan.
+        const BATCH: usize = 24_000;
+        const PERIOD: std::time::Duration = std::time::Duration::from_millis(500);
+        let start = std::time::Instant::now();
+        let mut batch_idx: u32 = 0;
+        let mut i = 0usize;
+        while i < samples.len()
+            && !stop_thread.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let end = (i + BATCH).min(samples.len());
+            // tx_chan.send fails when the worker has dropped the
+            // receiver (stop_capture scenario) — exit cleanly.
+            if tx_chan.send(samples[i..end].to_vec()).is_err() {
+                break;
+            }
+            i = end;
+            batch_idx += 1;
+            // Pace to next "real-time" tick so the worker's wall-clock
+            // gates (silence threshold, scan interval) behave like a
+            // live capture.
+            let target = start + PERIOD * batch_idx;
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+        }
+        // Drop the sender: the worker's recv() will return Err and
+        // the worker thread exits naturally.
+        drop(tx_chan);
+        // Tell the frontend the playback finished — it can flip the
+        // toolbar buttons back without waiting for `stop_capture`.
+        let _ = tauri::Emitter::emit(&app_for_done, "wav_playback_done", ());
+    });
+
+    let cfg = settings::load();
+    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
+    let worker = rx_worker::spawn(
+        rx_chan,
+        sink,
+        state.save_dir.clone(),
+        state.wav_sink.clone(),
+        profile_idx,
+        forced,
+        cfg.rx_deemphasis_enabled,
+    );
+    *guard = Some(CaptureSession {
+        capture: CaptureKind::WavFile {
+            stop,
+            thread: Some(pacer),
+        },
+        worker,
+        device_name: "wav-file".to_string(),
     });
     Ok(())
 }
@@ -539,6 +692,7 @@ fn tx_start(
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let history_max = cfg.tx_history_max;
+    let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
     let repair_pct = args.repair_pct.unwrap_or(30);
     // Build the Pluto config only if the selected TX device is a
     // Pluto. The worker uses `Option::is_some` to route between the
@@ -571,6 +725,7 @@ fn tx_start(
         pluto_config,
         state.ptt.clone(),
         tx_sink,
+        save_wav_dir,
     );
     *tx_guard = Some(handle);
     Ok(())
@@ -624,6 +779,7 @@ fn tx_more(
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
+    let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
     let pluto_config = args
         .tx_device
         .strip_prefix(PLUTO_DEVICE_PREFIX)
@@ -643,6 +799,7 @@ fn tx_more(
         pluto_config,
         state.ptt.clone(),
         tx_sink,
+        save_wav_dir,
     );
     *tx_guard = Some(handle);
     Ok(())
@@ -1148,6 +1305,7 @@ fn main() {
             get_settings,
             save_settings,
             start_capture,
+            start_capture_from_wav,
             stop_capture,
             get_save_dir,
             set_save_dir,
