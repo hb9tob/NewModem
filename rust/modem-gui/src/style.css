@@ -92,6 +92,11 @@ body {
   min-width: 130px;
   display: inline-block;
   text-align: left;
+  /* Preserve the leading spaces produced by padStart() so the digits
+     stay right-aligned to a fixed column. Without this, HTML collapses
+     the spaces and the "-" shifts the whole string by one character
+     when db crosses 0 dB, which reads as flicker on screen. */
+  white-space: pre;
 }
 .level-bar {
   display: inline-block;
@@ -2075,6 +2080,32 @@ select option.experimental-option {
    ============================================================ */
 .kiosk-only { display: none; }
 body.kiosk-mode .kiosk-only { display: inline-flex; }
+
+/* Kiosk info toast — JS-driven (showKioskInfoToast in main.js)
+   replacement for the native title-based tooltip on the TX button.
+   The native WebKitGTK tooltip is sticky on touchscreens; this one
+   auto-fades after 5 s under our control. */
+.kiosk-info-toast {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(20, 20, 20, 0.94);
+  color: #f0f0f0;
+  border: 1px solid #555;
+  border-radius: 6px;
+  padding: 10px 16px;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  max-width: 80vw;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease-out;
+  z-index: 10000;
+}
+.kiosk-info-toast.show { opacity: 1; }
 
 /* ============================================================
    Small-screen layout — Raspberry Pi 7" 800x480 and similar.

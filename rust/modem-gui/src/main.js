@@ -2479,6 +2479,14 @@ function refreshTxButtons() {
     btnTx.title = "";
   }
   btnTx.classList.toggle("tx-btn-warn", warn && !txState.txActive);
+  // Kiosk: WebKitGTK on the Pi 7" touchscreen turns the native
+  // title-based tooltip into a sticky bubble that doesn't auto-hide
+  // on tap-release. We suppress it here and show a JS-controlled
+  // toast (showKioskInfoToast) on TX press instead. Desktop hover
+  // tooltips are unaffected.
+  if (document.body.classList.contains("kiosk-mode")) {
+    btnTx.removeAttribute("title");
+  }
 }
 
 function txFormatBytes(n) {
@@ -2489,12 +2497,15 @@ function txFormatBytes(n) {
 }
 
 // TX button tooltip: duration, N emitted, K required, K threshold.
+// `dur` is `est.duration_s` (raw float seconds); we always format it
+// through fmtSeconds so the bubble shows M:SS (rounded to whole
+// seconds) instead of "18.453123…".
 function txButtonTitle(est, dur, longTx) {
   if (!est) return "";
   const base = longTx ? `transmission longue (> 2 min) — durée ` : `durée `;
   const k = est.k_source;
   const n = est.n_initial ?? est.total_blocks;
-  const parts = [`${base}${dur}, ${n} blocs émis`];
+  const parts = [`${base}${fmtSeconds(dur)}, ${n} blocs émis`];
   if (k != null && k !== n) {
     parts.push(`K=${k} nécessaires au décodage`);
   }
@@ -3253,12 +3264,50 @@ function setupTxTab() {
 }
 
 // ────────────────────────────────────────────── TX orchestration (RX↔TX)
+// Kiosk info toast — JS-controlled replacement for the native
+// title-based tooltip on the TX button. WebKitGTK on the Pi 7"
+// touchscreen keeps the native tooltip sticky on tap-release; we
+// own the timing here and auto-hide after `durationMs`. No-op
+// outside kiosk mode (desktop keeps the native hover tooltip).
+let kioskInfoToastTimer = null;
+function showKioskInfoToast(text, durationMs = 5000) {
+  if (!document.body.classList.contains("kiosk-mode")) return;
+  if (!text) return;
+  let el = document.getElementById("kiosk-info-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "kiosk-info-toast";
+    el.className = "kiosk-info-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  // Force reflow so the fade-in transition runs again on rapid
+  // re-show (e.g. user taps TX twice in a row).
+  void el.offsetWidth;
+  el.classList.add("show");
+  if (kioskInfoToastTimer) clearTimeout(kioskInfoToastTimer);
+  kioskInfoToastTimer = setTimeout(() => {
+    el.classList.remove("show");
+    kioskInfoToastTimer = null;
+  }, durationMs);
+}
+
 async function txStart() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   if (txState.txActive) return;
   if (!txState.estimate) {
     logEvent("tx_start_skipped", { reason: "pas d'estimation (compresse d'abord)" });
     return;
+  }
+  // Kiosk: show a transient info bubble (auto-hides after 5 s) with
+  // the same content the desktop hover tooltip carries. The "long
+  // transmission" wording uses the same threshold as refreshTxButtons
+  // (file vs image mode have distinct warn/hard limits).
+  {
+    const est = txState.estimate;
+    const dur = est.duration_s;
+    const warnSeconds = txState.fileMode ? TX_FILE_WARN_SECONDS : TX_WARN_SECONDS;
+    showKioskInfoToast(txButtonTitle(est, dur, dur > warnSeconds));
   }
   const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
