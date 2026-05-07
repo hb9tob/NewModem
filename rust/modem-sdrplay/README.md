@@ -66,7 +66,8 @@ works unchanged.
 | `dab_notch: bool` | `RspDuoTunerParams.rfDabNotchEnable` | DAB band-III stop (~174–240 MHz) |
 | `rf_freq_hz: u64` | `tunerParams.rfFreq.rfHz` | LO frequency, default 145.5 MHz |
 | `lna_state: u8` | `tunerParams.gain.LNAstate` | 0 = least atten / most gain. RSPduo VHF table has 10 states |
-| `if_gain_reduction_db: i32` | `tunerParams.gain.gRdB` | IF reduction, range 20–59. Default 40. |
+| `if_gain_reduction_db: i32` | `tunerParams.gain.gRdB` | IF reduction, range 20–59. Default 40. Ignored when `agc_mode != Disable`. |
+| `agc_mode: AgcMode` | `ctrlParams.agc.enable` | `Disable` (manual gain), `Slow` (5 Hz), `Mid` (50 Hz, SDRplay default), `Fast` (100 Hz). LNA state stays manual whatever the AGC mode. |
 
 ## Status
 
@@ -75,8 +76,13 @@ works unchanged.
   → PolyphaseDecimator → DeemphasisLpf → SubAudioHpf). Validated on
   a real RSPduo at 145 MHz: 240 000 audio samples in 5 s = exact
   48 kHz, 0 frame errors.
-- Phase 2 — GUI integration: pending (mirror Pluto's `pluto:` device
-  prefix, settings fieldset, freq keypad share).
+- Phase 2 — GUI integration: **done**. `sdrplay:<serial>` device
+  entries appear in the RX dropdown next to Pluto and cpal entries;
+  `start_capture` routes on the prefix. Settings panel exposes
+  every knob in [`SdrplayConfig`] including the AGC mode dropdown
+  (`disable` / `slow 5 Hz` / `mid 50 Hz` / `fast 100 Hz`). Freq
+  keypad has its own per-radio MRU bucket so SDRplay favorites
+  don't bleed into Pluto's.
 - Phase 3 — live retune via `sdrplay_api_Update`: pending. Borrowing
   the band-aware LNA-state → dB table from
   [gr-sdrplay3](https://github.com/fventuri/gr-sdrplay3) for the

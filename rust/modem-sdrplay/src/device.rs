@@ -42,6 +42,28 @@ pub enum AntennaPort {
     Fifty,
 }
 
+/// IF gain AGC loop bandwidth. Maps onto `sdrplay_api_AgcControlT`
+/// — when the AGC is enabled, the daemon adjusts `gRdB` automatically
+/// to hold the IF level at `setPoint_dBfs` (default −60 dBFS); the
+/// value the GUI surfaces in `if_gain_reduction_db` is then ignored.
+/// LNA state is independent of the AGC and stays under operator
+/// control whatever the AGC mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgcMode {
+    /// AGC off — manual gain only. Use [`SdrplayConfig::if_gain_reduction_db`]
+    /// to drive `gRdB` directly.
+    Disable,
+    /// 5 Hz loop bandwidth — slow tracking, immune to short bursts,
+    /// useful when an HF preamp's level varies on-air ducting timescales.
+    Slow,
+    /// 50 Hz loop bandwidth — SDRplay's own default. Good general-
+    /// purpose response on amateur VHF / UHF.
+    Mid,
+    /// 100 Hz loop bandwidth — fastest, follows fade quickly but can
+    /// pump on strong adjacent-channel transients.
+    Fast,
+}
+
 /// SDRplay RSPduo configuration the GUI / CLI pass into [`open`].
 /// Maps onto a subset of `sdrplay_api_DevParamsT` +
 /// `sdrplay_api_TunerParamsT` + `sdrplay_api_RspDuoTunerParamsT` —
@@ -80,8 +102,17 @@ pub struct SdrplayConfig {
     /// is a safe mid-band default.
     pub lna_state: u8,
     /// IF reduction in dB ("gain reduction"). Range typically
-    /// 20 – 59. Default 40.
+    /// 20 – 59. Default 40. Ignored when `agc_mode` is anything
+    /// other than [`AgcMode::Disable`] — the daemon manages it.
     pub if_gain_reduction_db: i32,
+    /// IF AGC loop bandwidth. [`AgcMode::Disable`] gives the
+    /// operator full control of `if_gain_reduction_db`; the three
+    /// active modes let the daemon track the on-air level and
+    /// override `gRdB` at the chosen rate. LNA state stays manual
+    /// in every mode. Default [`AgcMode::Disable`] so the GUI
+    /// gain slider does what it says by default; flip to `Mid` for
+    /// hands-off operation.
+    pub agc_mode: AgcMode,
     /// Maximum FM deviation expected on air, in Hz. 5000 = NBFM
     /// standard. Drives the QuadratureDemod gain in the DSP chain.
     pub max_deviation_hz: f32,
@@ -101,6 +132,7 @@ impl Default for SdrplayConfig {
             decimation: PREFERRED_DECIMATION,
             lna_state: 4,
             if_gain_reduction_db: 40,
+            agc_mode: AgcMode::Disable,
             max_deviation_hz: 5_000.0,
         }
     }
@@ -361,7 +393,12 @@ fn program_params(
         // Wide-band lowpass mode — keeps the IF filter centred for
         // even-decimation factors.
         ctrl.decimation.wideBandSignal = 1;
-        ctrl.agc.enable = sdrplay_api_AgcControlT::sdrplay_api_AGC_DISABLE;
+        ctrl.agc.enable = match config.agc_mode {
+            AgcMode::Disable => sdrplay_api_AgcControlT::sdrplay_api_AGC_DISABLE,
+            AgcMode::Slow => sdrplay_api_AgcControlT::sdrplay_api_AGC_5HZ,
+            AgcMode::Mid => sdrplay_api_AgcControlT::sdrplay_api_AGC_50HZ,
+            AgcMode::Fast => sdrplay_api_AgcControlT::sdrplay_api_AGC_100HZ,
+        };
 
         // RSPduo-specific knobs live on the rx channel's
         // rspDuoTunerParams (cf. sdrplay_api_rspDuo.h).

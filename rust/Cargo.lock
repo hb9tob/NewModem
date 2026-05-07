@@ -2968,6 +2968,7 @@ dependencies = [
  "modem-framing",
  "modem-io",
  "modem-pluto",
+ "modem-sdrplay",
  "modem-worker",
  "ravif",
  "reqwest 0.12.28",

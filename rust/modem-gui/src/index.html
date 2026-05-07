@@ -338,6 +338,71 @@
               en-dessous de la déviation réelle de l'air écrête le son.
             </p>
           </div>
+          <div id="sdrplay-rx-config" class="pluto-subgroup" hidden>
+            <div class="pluto-row">
+              <label class="pluto-field">
+                Fréquence RX (MHz) :
+                <input type="number" id="sdrplay-rx-freq-mhz" step="0.001" min="0.001" max="2000">
+              </label>
+            </div>
+            <div class="pluto-row">
+              <span class="pluto-field-label">Tuner :</span>
+              <label class="pluto-field"><input type="radio" name="sdrplay-tuner" value="A"> A (Hi-Z + 50 Ω)</label>
+              <label class="pluto-field"><input type="radio" name="sdrplay-tuner" value="B" checked> B (50 Ω + bias-T)</label>
+            </div>
+            <div class="pluto-row" id="sdrplay-antenna-row">
+              <span class="pluto-field-label">Port (Tuner A) :</span>
+              <label class="pluto-field"><input type="radio" name="sdrplay-antenna" value="hiz"> Hi-Z (1 kHz–60 MHz)</label>
+              <label class="pluto-field"><input type="radio" name="sdrplay-antenna" value="fifty" checked> 50 Ω (60 MHz–2 GHz)</label>
+            </div>
+            <div class="pluto-row">
+              <label class="pluto-field">
+                AGC :
+                <select id="sdrplay-agc-mode">
+                  <option value="disable">manuel (gain fixe)</option>
+                  <option value="slow">lent (5 Hz)</option>
+                  <option value="mid">moyen (50 Hz, défaut SDRplay)</option>
+                  <option value="fast">rapide (100 Hz)</option>
+                </select>
+              </label>
+            </div>
+            <div class="pluto-row">
+              <label class="pluto-field">
+                LNA state :
+                <input type="number" id="sdrplay-lna-state" min="0" max="9" step="1">
+              </label>
+              <label class="pluto-field">
+                IF gRdB :
+                <input type="number" id="sdrplay-if-grdb" min="20" max="59" step="1">
+              </label>
+            </div>
+            <div class="pluto-row">
+              <label class="pluto-field">
+                <input type="checkbox" id="sdrplay-bias-t">
+                Bias-T port B (+5 V pour préampli externe)
+              </label>
+            </div>
+            <div class="pluto-row">
+              <label class="pluto-field">
+                <input type="checkbox" id="sdrplay-fm-notch">
+                Filtre rejet FM (88–108 MHz)
+              </label>
+              <label class="pluto-field">
+                <input type="checkbox" id="sdrplay-dab-notch">
+                Filtre rejet DAB (174–240 MHz)
+              </label>
+            </div>
+            <div class="pluto-row">
+              <span class="pluto-field-label">Déviation RX :</span>
+              <label class="pluto-field"><input type="radio" name="sdrplay-rx-dev" value="5000" checked> 5 kHz</label>
+              <label class="pluto-field"><input type="radio" name="sdrplay-rx-dev" value="2500"> 2.5 kHz</label>
+            </div>
+            <p class="tx-hint" style="margin: 0.4rem 0 0;">
+              LNA state 0 = atténuation min / gain max ; 9 = atténuation max.
+              gRdB ignoré si AGC ≠ manuel — le démon SDRplay le pilote.
+              Le bias-T n'agit que sur le port Tuner B (Tuner A non concerné).
+            </p>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Périphérique émission (TX)</legend>

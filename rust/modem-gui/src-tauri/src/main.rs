@@ -25,6 +25,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// (otherwise cpal-only) device dropdown. The real libiio URI follows.
 const PLUTO_DEVICE_PREFIX: &str = "pluto:";
 
+/// Synthetic prefix for SDRplay RSPduo entries in the same device
+/// dropdown. The serial number follows (e.g. `sdrplay:22340A2A34`),
+/// matching what `sdrplay_api_GetDevices` reports.
+const SDRPLAY_DEVICE_PREFIX: &str = "sdrplay:";
+
 /// Active RX backend. Dropping either variant releases the underlying
 /// hardware; `stop_capture` matches on the variant to call the right
 /// teardown.
@@ -36,6 +41,10 @@ enum CaptureKind {
     /// demod chain from `modem-sdr-dsp`; the worker downstream sees
     /// the same 48 kHz mono `Vec<f32>` stream as the cpal path.
     Pluto(modem_pluto::rx::CaptureHandle),
+    /// SDRplay RSPduo via the closed-binary SDRplay API daemon. Same
+    /// 48 kHz mono `Vec<f32>` shape as Pluto — the rx_worker doesn't
+    /// know which radio fed it.
+    Sdrplay(modem_sdrplay::rx::CaptureHandle),
     /// Synthetic capture: a paced thread streams f32 samples loaded
     /// from a WAV file through the same `mpsc::Receiver<Vec<f32>>`
     /// interface the worker expects from cpal/Pluto. Used to replay
@@ -51,6 +60,7 @@ impl CaptureKind {
         match self {
             CaptureKind::Cpal(h) => h.stop(),
             CaptureKind::Pluto(h) => h.stop(),
+            CaptureKind::Sdrplay(h) => h.stop(),
             CaptureKind::WavFile { stop, thread } => {
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(t) = thread {
@@ -170,6 +180,49 @@ fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
     }
     eprintln!("[pluto] returning {} entries", out.len());
     Ok(out)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SdrplayDeviceInfo {
+    /// Synthetic device name, e.g. `sdrplay:22340A2A34`. Stored in
+    /// `currentSettings.rx_device` like any other device name; the
+    /// backend recognises the `sdrplay:` prefix in `start_capture`
+    /// and opens the SDRplay backend instead of cpal/Pluto.
+    name: String,
+    /// Bare serial number reported by `sdrplay_api_GetDevices`.
+    serial: String,
+    /// Single line for the dropdown.
+    friendly_name: String,
+}
+
+/// Enumerate every RSPduo / RSP visible to the SDRplay daemon. An
+/// empty result + no error means "the API is reachable but no
+/// device on USB" (or the daemon isn't running). We don't surface
+/// daemon-down as a hard error — the user might just not have
+/// installed the SDRplay API yet, and the rest of the GUI should
+/// still function.
+#[tauri::command]
+fn list_sdrplay_devices() -> Result<Vec<SdrplayDeviceInfo>, String> {
+    eprintln!("[sdrplay] list_sdrplay_devices invoked");
+    let serials = match modem_sdrplay::list_serials() {
+        Ok(v) => v,
+        Err(e) => {
+            // API not loadable / daemon not running — surface as an
+            // empty list so the dropdown just shows "no SDRplay" and
+            // doesn't red-banner the whole GUI.
+            eprintln!("[sdrplay] list unavailable: {e}");
+            return Ok(Vec::new());
+        }
+    };
+    eprintln!("[sdrplay] {} serial(s): {:?}", serials.len(), serials);
+    Ok(serials
+        .into_iter()
+        .map(|s| SdrplayDeviceInfo {
+            name: format!("{SDRPLAY_DEVICE_PREFIX}{s}"),
+            serial: s.clone(),
+            friendly_name: format!("SDRplay RSPduo — {s}"),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -303,6 +356,43 @@ fn build_pluto_config(uri: &str, cfg: &settings::Settings) -> modem_pluto::devic
     }
 }
 
+/// Build a [`modem_sdrplay::SdrplayConfig`] from the persistent
+/// [`settings::Settings`] for a given RSPduo serial. The settings
+/// strings are interpreted permissively (case-insensitive, falling
+/// back to defaults on unknown values) so a stale settings.json
+/// from an earlier API version doesn't lock the user out.
+fn build_sdrplay_config(serial: &str, cfg: &settings::Settings) -> modem_sdrplay::SdrplayConfig {
+    let tuner = match cfg.sdrplay_tuner.to_ascii_uppercase().as_str() {
+        "A" => modem_sdrplay::Tuner::A,
+        _ => modem_sdrplay::Tuner::B,
+    };
+    let antenna = match cfg.sdrplay_antenna.to_ascii_lowercase().as_str() {
+        "hiz" => modem_sdrplay::AntennaPort::Hiz,
+        _ => modem_sdrplay::AntennaPort::Fifty,
+    };
+    let agc_mode = match cfg.sdrplay_agc_mode.to_ascii_lowercase().as_str() {
+        "slow" => modem_sdrplay::AgcMode::Slow,
+        "mid" => modem_sdrplay::AgcMode::Mid,
+        "fast" => modem_sdrplay::AgcMode::Fast,
+        _ => modem_sdrplay::AgcMode::Disable,
+    };
+    modem_sdrplay::SdrplayConfig {
+        serial: serial.to_string(),
+        tuner,
+        antenna,
+        bias_t: cfg.sdrplay_bias_t,
+        fm_notch: cfg.sdrplay_fm_notch,
+        dab_notch: cfg.sdrplay_dab_notch,
+        rf_freq_hz: cfg.sdrplay_rx_freq_hz,
+        sample_rate_hz: modem_sdrplay::PREFERRED_SAMPLE_RATE_HZ as f64,
+        decimation: modem_sdrplay::PREFERRED_DECIMATION,
+        lna_state: cfg.sdrplay_lna_state,
+        if_gain_reduction_db: cfg.sdrplay_if_gain_reduction_db,
+        agc_mode,
+        max_deviation_hz: cfg.sdrplay_rx_deviation_hz as f32,
+    }
+}
+
 #[tauri::command]
 fn start_capture(
     device_name: String,
@@ -319,16 +409,22 @@ fn start_capture(
     let profile_idx = resolve_profile(profile.as_deref().unwrap_or("HIGH"), forced)?;
     let cfg = settings::load();
     // Route on the device-name prefix: Pluto entries arrive as
-    // `pluto:<libiio-uri>` (built by `list_pluto_devices`). Anything
-    // else is a cpal soundcard. Both branches emit the same shape:
-    // mpsc::Receiver<Vec<f32>> at 48 kHz mono — the rx_worker doesn't
-    // know which backend produced the samples.
+    // `pluto:<libiio-uri>` (built by `list_pluto_devices`), SDRplay
+    // entries as `sdrplay:<serial>` (from `list_sdrplay_devices`),
+    // anything else is a cpal soundcard. Every branch emits the
+    // same shape: `mpsc::Receiver<Vec<f32>>` at 48 kHz mono — the
+    // rx_worker doesn't know which backend produced the samples.
     let (capture, samples) =
         if let Some(uri) = device_name.strip_prefix(PLUTO_DEVICE_PREFIX) {
             let pcfg = build_pluto_config(uri, &cfg);
             let (h, rx) = modem_pluto::rx::start(&pcfg)
                 .map_err(|e| format!("Pluto open ({uri}): {e}"))?;
             (CaptureKind::Pluto(h), rx)
+        } else if let Some(serial) = device_name.strip_prefix(SDRPLAY_DEVICE_PREFIX) {
+            let scfg = build_sdrplay_config(serial, &cfg);
+            let (h, rx) = modem_sdrplay::rx::start(&scfg)
+                .map_err(|e| format!("SDRplay open ({serial}): {e}"))?;
+            (CaptureKind::Sdrplay(h), rx)
         } else {
             let (h, rx) = cpal_capture::start(&device_name)?;
             (CaptureKind::Cpal(h), rx)
@@ -1299,6 +1395,7 @@ fn main() {
             list_audio_devices,
             list_output_audio_devices,
             list_pluto_devices,
+            list_sdrplay_devices,
             list_modem_profiles,
             list_serial_ports,
             ptt_status,

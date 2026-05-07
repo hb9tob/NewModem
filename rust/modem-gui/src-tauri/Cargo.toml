@@ -16,6 +16,7 @@ modem-core = { path = "../../modem-core" }
 modem-framing = { path = "../../modem-framing" }
 modem-io = { path = "../../modem-io" }
 modem-pluto = { path = "../../modem-pluto" }
+modem-sdrplay = { path = "../../modem-sdrplay" }
 modem-worker = { path = "../../modem-worker" }
 industrial-io = "0.6"
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }

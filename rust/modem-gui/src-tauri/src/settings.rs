@@ -201,6 +201,66 @@ pub struct Settings {
     /// first); deduplicated on insert. Empty on first run.
     #[serde(default)]
     pub pluto_freq_favorites: Vec<u64>,
+
+    // ───── SDRplay RSPduo controls ───────────────────────────────────
+    //
+    // RX-only — RSPduo is RX-only hardware. Kept in the same
+    // settings.json so the GUI can switch between Pluto and SDRplay
+    // without losing state on either side. Backend `start_capture`
+    // routes on the device-name prefix (`sdrplay:` vs `pluto:`).
+    /// Tuner half of the RSPduo to use in single-tuner mode.
+    /// `"A"` (Tuner 1, has both Hi-Z and 50 Ω ports) or `"B"`
+    /// (Tuner 2, single 50 Ω port — and the only one with a
+    /// bias-T). Default `"B"` because the bias-T-on-port-B is
+    /// where most external preamps end up.
+    #[serde(default = "default_sdrplay_tuner")]
+    pub sdrplay_tuner: String,
+    /// Antenna port on Tuner A. `"hiz"` = AMPORT_1 (1 kHz-60 MHz),
+    /// `"fifty"` = AMPORT_2 (60 MHz-2 GHz). Ignored when
+    /// `sdrplay_tuner = "B"`. Default `"fifty"` for VHF amateur.
+    #[serde(default = "default_sdrplay_antenna")]
+    pub sdrplay_antenna: String,
+    /// **Bias-T on Tuner B's port.** Pushes +5 V DC up the
+    /// antenna cable to power external preamps. RSPduo only
+    /// exposes bias-T on Tuner B; turning it on while
+    /// `sdrplay_tuner = "A"` has no effect on the active path.
+    /// Default false — leaving DC on the cable when nothing
+    /// expects it can damage some receivers.
+    #[serde(default)]
+    pub sdrplay_bias_t: bool,
+    /// Broadcast-FM rejection notch (~88-108 MHz). Default false.
+    #[serde(default)]
+    pub sdrplay_fm_notch: bool,
+    /// DAB band-III rejection notch (~174-240 MHz). Default false.
+    #[serde(default)]
+    pub sdrplay_dab_notch: bool,
+    /// RSPduo RX LO frequency in Hz. Default 145.5 MHz.
+    #[serde(default = "default_sdrplay_rx_freq_hz")]
+    pub sdrplay_rx_freq_hz: u64,
+    /// LNA state index. RSPduo's VHF table has 10 states,
+    /// 0 = least attenuation = most gain. Default 4 (mid-band).
+    #[serde(default = "default_sdrplay_lna_state")]
+    pub sdrplay_lna_state: u8,
+    /// IF gain reduction in dB. Range 20-59 (the chip's
+    /// `gRdB`). Ignored when `sdrplay_agc_mode != "disable"`
+    /// (the daemon manages it). Default 40.
+    #[serde(default = "default_sdrplay_if_gain_reduction_db")]
+    pub sdrplay_if_gain_reduction_db: i32,
+    /// AGC loop bandwidth, mapped onto `sdrplay_api_AgcControlT`:
+    /// `"disable"` → manual gain only (default), `"slow"` = 5 Hz,
+    /// `"mid"` = 50 Hz (the SDRplay default), `"fast"` = 100 Hz.
+    /// LNA state stays manual whatever the AGC mode.
+    #[serde(default = "default_sdrplay_agc_mode")]
+    pub sdrplay_agc_mode: String,
+    /// Maximum FM deviation expected on air (Hz). 5000 = NBFM
+    /// standard, 2500 = narrow NFM. Drives the QuadratureDemod
+    /// gain in the DSP chain.
+    #[serde(default = "default_sdrplay_rx_deviation_hz")]
+    pub sdrplay_rx_deviation_hz: u32,
+    /// MRU list of recently-used SDRplay frequencies (mirror of
+    /// `pluto_freq_favorites` for the SDRplay-tab freq keypad).
+    #[serde(default)]
+    pub sdrplay_freq_favorites: Vec<u64>,
 }
 
 impl Settings {
@@ -291,6 +351,28 @@ fn default_pluto_tx_ctcss_freq_hz() -> f32 {
     88.5
 }
 
+fn default_sdrplay_tuner() -> String {
+    "B".to_string()
+}
+fn default_sdrplay_antenna() -> String {
+    "fifty".to_string()
+}
+fn default_sdrplay_rx_freq_hz() -> u64 {
+    145_500_000
+}
+fn default_sdrplay_lna_state() -> u8 {
+    4
+}
+fn default_sdrplay_if_gain_reduction_db() -> i32 {
+    40
+}
+fn default_sdrplay_agc_mode() -> String {
+    "disable".to_string()
+}
+fn default_sdrplay_rx_deviation_hz() -> u32 {
+    5000
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -334,6 +416,17 @@ impl Default for Settings {
             pluto_tx_ctcss_enabled: false,
             pluto_tx_ctcss_freq_hz: default_pluto_tx_ctcss_freq_hz(),
             pluto_freq_favorites: Vec::new(),
+            sdrplay_tuner: default_sdrplay_tuner(),
+            sdrplay_antenna: default_sdrplay_antenna(),
+            sdrplay_bias_t: false,
+            sdrplay_fm_notch: false,
+            sdrplay_dab_notch: false,
+            sdrplay_rx_freq_hz: default_sdrplay_rx_freq_hz(),
+            sdrplay_lna_state: default_sdrplay_lna_state(),
+            sdrplay_if_gain_reduction_db: default_sdrplay_if_gain_reduction_db(),
+            sdrplay_agc_mode: default_sdrplay_agc_mode(),
+            sdrplay_rx_deviation_hz: default_sdrplay_rx_deviation_hz(),
+            sdrplay_freq_favorites: Vec::new(),
         }
     }
 }

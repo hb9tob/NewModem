@@ -603,13 +603,14 @@ function ensureOverlaySlots() {
   }
 }
 
-function populateDeviceSelect(selectId, devices, savedName, plutoDevices) {
+function populateDeviceSelect(selectId, devices, savedName, plutoDevices, sdrplayDevices) {
   const select = document.getElementById(selectId);
   if (!select) return null;
   select.innerHTML = "";
   const audio = devices || [];
   const pluto = plutoDevices || [];
-  if (audio.length === 0 && pluto.length === 0) {
+  const sdrplay = sdrplayDevices || [];
+  if (audio.length === 0 && pluto.length === 0 && sdrplay.length === 0) {
     const opt = document.createElement("option");
     opt.textContent = "aucun périphérique détecté";
     opt.value = "";
@@ -646,9 +647,23 @@ function populateDeviceSelect(selectId, devices, savedName, plutoDevices) {
     opt.dataset.kind = "pluto";
     select.appendChild(opt);
   }
+  // SDRplay entries — synthetic names `sdrplay:<serial>`. RX-only
+  // hardware, so we only populate this on RX selects (the loop body
+  // doesn't gate on selectId because the TX list comes back empty
+  // for SDRplay anyway: list_sdrplay_devices is RX-only). Same 48k
+  // claim as Pluto: the modem-sdrplay chain emits exactly 48 kHz.
+  for (const dev of sdrplay) {
+    const opt = document.createElement("option");
+    opt.value = dev.name;
+    opt.textContent = `${dev.friendly_name} ✓48k [SDR]`;
+    opt.dataset.supports48k = "1";
+    opt.dataset.kind = "sdrplay";
+    select.appendChild(opt);
+  }
   // Priority: saved value if still available, otherwise the preferred one.
   if (savedName && (audio.some(d => d.name === savedName)
-      || pluto.some(d => d.name === savedName))) {
+      || pluto.some(d => d.name === savedName)
+      || sdrplay.some(d => d.name === savedName))) {
     select.value = savedName;
   } else if (preferred) {
     select.value = preferred.name;
@@ -656,22 +671,37 @@ function populateDeviceSelect(selectId, devices, savedName, plutoDevices) {
   return select.value || null;
 }
 
-/// Show or hide the Pluto-specific settings sub-panels based on
-/// whether the currently-selected RX/TX device is a Pluto. Called
-/// whenever rx/tx-device-select changes and at startup. Each
-/// direction has its own `pluto-*-config` block now (no more single
-/// shared `pluto-config` fieldset).
+/// Show or hide the SDR-specific settings sub-panels based on
+/// whether the currently-selected RX/TX device is a Pluto or an
+/// SDRplay. Each combination has its own `*-rx-config` block in
+/// `index.html`; this routine flips `hidden` accordingly. Called
+/// whenever a device select changes and at startup.
 function refreshPlutoPanelVisibility() {
-  const refresh = (selectId, panelId) => {
+  const showFor = (selectId, kindToPanel) => {
     const sel = document.getElementById(selectId);
-    const panel = document.getElementById(panelId);
-    if (!sel || !panel) return;
+    if (!sel) return;
     const opt = sel.options[sel.selectedIndex];
-    const isPluto = !!(opt && opt.dataset && opt.dataset.kind === "pluto");
-    panel.hidden = !isPluto;
+    const kind = opt && opt.dataset && opt.dataset.kind;
+    for (const [k, panelId] of Object.entries(kindToPanel)) {
+      const panel = document.getElementById(panelId);
+      if (panel) panel.hidden = (kind !== k);
+    }
   };
-  refresh("rx-device-select", "pluto-rx-config");
-  refresh("tx-device-select", "pluto-tx-config");
+  showFor("rx-device-select", {
+    pluto: "pluto-rx-config",
+    sdrplay: "sdrplay-rx-config",
+  });
+  // TX has only Pluto for now (RSPduo is RX-only hardware).
+  showFor("tx-device-select", { pluto: "pluto-tx-config" });
+  // Tuner-A vs Tuner-B sub-toggle on the SDRplay panel: the
+  // antenna-port radios only matter when Tuner A is selected. Hide
+  // the row otherwise so the user doesn't think Tuner B has a port
+  // choice (it's hard-wired 50 Ω).
+  const antennaRow = document.getElementById("sdrplay-antenna-row");
+  if (antennaRow) {
+    const tunerA = document.querySelector('input[name="sdrplay-tuner"]:checked');
+    antennaRow.hidden = !(tunerA && tunerA.value === "A");
+  }
 }
 
 /// EIA standard CTCSS tones (39 values, in Hz). Mirror of
@@ -740,22 +770,34 @@ async function loadDevices() {
   }
   const { invoke } = window.__TAURI__.core;
   try {
-    // Pluto enumeration is best-effort: libiio may not find any Plutos
-    // (none plugged in / network mode disabled) — that surfaces as an
+    // SDR enumeration is best-effort: libiio / SDRplay may not find any
+    // device (none plugged in, daemon down, ...). Each surfaces as an
     // empty list, not an error, so the dropdown still loads cleanly.
-    const [rxDevices, txDevices, plutoDevices] = await Promise.all([
+    const [rxDevices, txDevices, plutoDevices, sdrplayDevices] = await Promise.all([
       invoke("list_audio_devices"),
       invoke("list_output_audio_devices"),
       invoke("list_pluto_devices").catch(err => {
         console.warn("list_pluto_devices failed:", err);
         return [];
       }),
+      invoke("list_sdrplay_devices").catch(err => {
+        console.warn("list_sdrplay_devices failed:", err);
+        return [];
+      }),
     ]);
-    populateDeviceSelect("rx-device-select", rxDevices, currentSettings.rx_device, plutoDevices);
-    populateDeviceSelect("tx-device-select", txDevices, currentSettings.tx_device, plutoDevices);
+    populateDeviceSelect(
+      "rx-device-select", rxDevices, currentSettings.rx_device,
+      plutoDevices, sdrplayDevices,
+    );
+    // SDRplay is RX-only; TX dropdown only gets Pluto + cpal entries.
+    populateDeviceSelect(
+      "tx-device-select", txDevices, currentSettings.tx_device,
+      plutoDevices, [],
+    );
     const n48 = rxDevices.filter(d => d.supports_48k).length;
     const plutoTag = plutoDevices.length > 0 ? ` · ${plutoDevices.length} Pluto` : "";
-    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${plutoTag}`;
+    const sdrplayTag = sdrplayDevices.length > 0 ? ` · ${sdrplayDevices.length} SDRplay` : "";
+    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${plutoTag}${sdrplayTag}`;
     refreshRxDeviceLabel();
     refreshStartButtonFromRx();
     refreshPlutoPanelVisibility();
@@ -847,6 +889,33 @@ async function loadSettings() {
     );
     ctcssFreq.value = String(closest);
   }
+  // SDRplay RSPduo knobs — same MHz-in-UI/Hz-on-disk convention as
+  // Pluto. Field IDs all start with `sdrplay-` so the freq keypad
+  // hook can extend its allowlist with that prefix.
+  const sdrRxFreq = document.getElementById("sdrplay-rx-freq-mhz");
+  if (sdrRxFreq) sdrRxFreq.value =
+    ((currentSettings.sdrplay_rx_freq_hz ?? 145_500_000) / 1e6).toFixed(3);
+  const sdrTuner = currentSettings.sdrplay_tuner || "B";
+  const sdrTunerRadio = document.querySelector(`input[name="sdrplay-tuner"][value="${sdrTuner}"]`);
+  if (sdrTunerRadio) sdrTunerRadio.checked = true;
+  const sdrAnt = currentSettings.sdrplay_antenna || "fifty";
+  const sdrAntRadio = document.querySelector(`input[name="sdrplay-antenna"][value="${sdrAnt}"]`);
+  if (sdrAntRadio) sdrAntRadio.checked = true;
+  const sdrAgc = document.getElementById("sdrplay-agc-mode");
+  if (sdrAgc) sdrAgc.value = currentSettings.sdrplay_agc_mode || "disable";
+  const sdrLna = document.getElementById("sdrplay-lna-state");
+  if (sdrLna) sdrLna.value = String(currentSettings.sdrplay_lna_state ?? 4);
+  const sdrGr = document.getElementById("sdrplay-if-grdb");
+  if (sdrGr) sdrGr.value = String(currentSettings.sdrplay_if_gain_reduction_db ?? 40);
+  const sdrBias = document.getElementById("sdrplay-bias-t");
+  if (sdrBias) sdrBias.checked = !!currentSettings.sdrplay_bias_t;
+  const sdrFm = document.getElementById("sdrplay-fm-notch");
+  if (sdrFm) sdrFm.checked = !!currentSettings.sdrplay_fm_notch;
+  const sdrDab = document.getElementById("sdrplay-dab-notch");
+  if (sdrDab) sdrDab.checked = !!currentSettings.sdrplay_dab_notch;
+  const sdrDev = currentSettings.sdrplay_rx_deviation_hz ?? 5000;
+  const sdrDevRadio = document.querySelector(`input[name="sdrplay-rx-dev"][value="${sdrDev}"]`);
+  if (sdrDevRadio) sdrDevRadio.checked = true;
   applyTxSettingsToUI();
 }
 
@@ -1184,6 +1253,51 @@ async function persistSettings() {
       currentSettings.pluto_tx_ctcss_freq_hz = f;
     }
   }
+  // SDRplay RSPduo knobs.
+  const sdrRxFreq = document.getElementById("sdrplay-rx-freq-mhz");
+  if (sdrRxFreq) {
+    const mhz = parseFloat(sdrRxFreq.value);
+    if (Number.isFinite(mhz) && mhz > 0) {
+      currentSettings.sdrplay_rx_freq_hz = Math.round(mhz * 1e6);
+    }
+  }
+  const sdrTunerRadio = document.querySelector('input[name="sdrplay-tuner"]:checked');
+  if (sdrTunerRadio && (sdrTunerRadio.value === "A" || sdrTunerRadio.value === "B")) {
+    currentSettings.sdrplay_tuner = sdrTunerRadio.value;
+  }
+  const sdrAntRadio = document.querySelector('input[name="sdrplay-antenna"]:checked');
+  if (sdrAntRadio && (sdrAntRadio.value === "hiz" || sdrAntRadio.value === "fifty")) {
+    currentSettings.sdrplay_antenna = sdrAntRadio.value;
+  }
+  const sdrAgc = document.getElementById("sdrplay-agc-mode");
+  if (sdrAgc && ["disable","slow","mid","fast"].includes(sdrAgc.value)) {
+    currentSettings.sdrplay_agc_mode = sdrAgc.value;
+  }
+  const sdrLna = document.getElementById("sdrplay-lna-state");
+  if (sdrLna) {
+    const v = parseInt(sdrLna.value, 10);
+    if (Number.isFinite(v) && v >= 0 && v <= 9) {
+      currentSettings.sdrplay_lna_state = v;
+    }
+  }
+  const sdrGr = document.getElementById("sdrplay-if-grdb");
+  if (sdrGr) {
+    const v = parseInt(sdrGr.value, 10);
+    if (Number.isFinite(v) && v >= 20 && v <= 59) {
+      currentSettings.sdrplay_if_gain_reduction_db = v;
+    }
+  }
+  const sdrBias = document.getElementById("sdrplay-bias-t");
+  if (sdrBias) currentSettings.sdrplay_bias_t = !!sdrBias.checked;
+  const sdrFm = document.getElementById("sdrplay-fm-notch");
+  if (sdrFm) currentSettings.sdrplay_fm_notch = !!sdrFm.checked;
+  const sdrDab = document.getElementById("sdrplay-dab-notch");
+  if (sdrDab) currentSettings.sdrplay_dab_notch = !!sdrDab.checked;
+  const sdrDevRadio = document.querySelector('input[name="sdrplay-rx-dev"]:checked');
+  if (sdrDevRadio) {
+    const v = parseInt(sdrDevRadio.value, 10);
+    if (v === 2500 || v === 5000) currentSettings.sdrplay_rx_deviation_hz = v;
+  }
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -1216,9 +1330,30 @@ function setupSettingsTab() {
   // Pluto-specific inputs — persist on every change so the next
   // start_capture picks up new freq / gain without reload.
   ["pluto-rx-freq-mhz", "pluto-tx-freq-mhz", "pluto-rx-gain-mode",
-   "pluto-rx-gain-db", "pluto-tx-att-db"].forEach(id => {
+   "pluto-rx-gain-db", "pluto-tx-att-db",
+   "sdrplay-rx-freq-mhz", "sdrplay-agc-mode", "sdrplay-lna-state",
+   "sdrplay-if-grdb"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener("change", persistSettings);
+  });
+  // SDRplay checkboxes (bias-T, FM/DAB notches) — same pattern.
+  ["sdrplay-bias-t", "sdrplay-fm-notch", "sdrplay-dab-notch"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", persistSettings);
+  });
+  // SDRplay tuner / antenna / deviation radios. Tuner change toggles
+  // visibility of the antenna-port row (Tuner B has no port choice).
+  document.querySelectorAll('input[name="sdrplay-tuner"]').forEach(r => {
+    r.addEventListener("change", () => {
+      refreshPlutoPanelVisibility();
+      persistSettings();
+    });
+  });
+  document.querySelectorAll('input[name="sdrplay-antenna"]').forEach(r => {
+    r.addEventListener("change", persistSettings);
+  });
+  document.querySelectorAll('input[name="sdrplay-rx-dev"]').forEach(r => {
+    r.addEventListener("change", persistSettings);
   });
   // Deviation radios — persist on selection change.
   document.querySelectorAll('input[name="pluto-rx-dev"]').forEach(r => {
@@ -4325,7 +4460,7 @@ function closeVirtKeyboard(commit) {
       const mhz = parseFloat(out);
       if (Number.isFinite(mhz) && mhz > 0) {
         // fire-and-forget — own save flush, doesn't block close.
-        pushFreqMru(mhz);
+        pushFreqMru(mhz, target.id);
       }
     }
   }
@@ -4470,15 +4605,17 @@ function refreshVirtKbDisplay() {
 
 // ─── Frequency-keypad enrichments (MRU favorites + step buttons) ──
 //
-// Active only when the focused input is a Pluto frequency field
-// (id starts with `pluto-rx-freq-` or `pluto-tx-freq-`). The MRU
-// row mirrors `currentSettings.pluto_freq_favorites` (Hz, capped
-// at 6, most-recent-first). Step buttons add/subtract a multiple
-// of kHz to the displayed MHz value, picked from a 5 / 6.25 / 12.5
-// / 25 kHz selector — the standard channel rasters in amateur and
-// PMR repeater plans. The pick survives keypad close/re-open via
-// `virtKb.stepKHz`.
-const FREQ_INPUT_ID_PREFIX = ["pluto-rx-freq-", "pluto-tx-freq-"];
+// Active when the focused input is an SDR frequency field
+// (id starts with `pluto-rx-freq-` / `pluto-tx-freq-` for the Pluto
+// path or `sdrplay-rx-freq-` for the RSPduo path). The MRU row
+// mirrors the per-radio favorites array (Hz, capped at 6, most-
+// recent-first) — Pluto and SDRplay get separate MRU lists so 2 m
+// repeaters don't bleed into HF receive favorites. Step buttons
+// add/subtract a multiple of kHz to the displayed MHz value, picked
+// from a 5 / 6.25 / 12.5 / 25 kHz selector — the standard channel
+// rasters in amateur and PMR repeater plans. The pick survives
+// keypad close/re-open via `virtKb.stepKHz`.
+const FREQ_INPUT_ID_PREFIX = ["pluto-rx-freq-", "pluto-tx-freq-", "sdrplay-rx-freq-"];
 const STEP_OPTIONS_KHZ = [5.0, 6.25, 12.5, 25.0];
 virtKb.stepKHz = 6.25;
 
@@ -4487,9 +4624,20 @@ function isFreqInputId(id) {
   return FREQ_INPUT_ID_PREFIX.some(p => id.startsWith(p));
 }
 
+/// Pick which MRU favorites list applies to a given freq input id.
+/// SDRplay fields read/write `sdrplay_freq_favorites`; everything
+/// else (Pluto or unknown) uses `pluto_freq_favorites`.
+function freqMruKeyForId(id) {
+  return id && id.startsWith("sdrplay-") ? "sdrplay_freq_favorites" : "pluto_freq_favorites";
+}
+
 function renderVirtKbFavoritesRow() {
-  const favs = (currentSettings && Array.isArray(currentSettings.pluto_freq_favorites))
-    ? currentSettings.pluto_freq_favorites : [];
+  // Pick the right MRU list based on which freq input opened the
+  // keypad — keeps Pluto and SDRplay favorites separate.
+  const targetId = (virtKb.target && virtKb.target.id) || "";
+  const key = freqMruKeyForId(targetId);
+  const favs = (currentSettings && Array.isArray(currentSettings[key]))
+    ? currentSettings[key] : [];
   if (favs.length === 0) return;
   const row = document.createElement("div");
   row.className = "virt-kb-row virt-kb-favs";
@@ -4561,17 +4709,21 @@ function stepDraft(direction) {
 
 /// Push the freshly-validated frequency (MHz) onto the MRU. Dedup
 /// on Hz equality, prepend, cap at 6. Persists via save_settings
-/// so the next keypad open already shows it.
-async function pushFreqMru(mhz) {
+/// so the next keypad open already shows it. The MRU bucket is
+/// chosen by which input the user was editing — Pluto fields land
+/// in `pluto_freq_favorites`, SDRplay fields in
+/// `sdrplay_freq_favorites`.
+async function pushFreqMru(mhz, targetId) {
   if (!Number.isFinite(mhz) || mhz <= 0) return;
   const hz = Math.round(mhz * 1e6);
-  const list = Array.isArray(currentSettings.pluto_freq_favorites)
-    ? currentSettings.pluto_freq_favorites.slice() : [];
+  const key = freqMruKeyForId(targetId || "");
+  const list = Array.isArray(currentSettings[key])
+    ? currentSettings[key].slice() : [];
   const idx = list.indexOf(hz);
   if (idx !== -1) list.splice(idx, 1);
   list.unshift(hz);
   while (list.length > 6) list.pop();
-  currentSettings.pluto_freq_favorites = list;
+  currentSettings[key] = list;
   if (window.__TAURI__ && window.__TAURI__.core) {
     try {
       await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
