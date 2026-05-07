@@ -39,7 +39,20 @@ pub struct RxV2Result {
     pub total_blocks: usize,
     pub segments_decoded: usize,
     pub segments_lost: usize,
+    /// Pilot-residual σ². Computed from the LS-fit residuals on KNOWN
+    /// pilot symbols (statistically optimal noise-variance estimator,
+    /// used as the LLR scale by the soft demod). Includes pilots from
+    /// every segment in the window, including meta.
     pub sigma2: f64,
+    /// Data-symbol σ², computed from hard-decision residuals on the
+    /// post-equalisation DATA symbols of non-meta segments only. This
+    /// is the value the GUI surfaces as "frame noise" — it excludes
+    /// pilot/preamble overhead so the operator sees what the actual
+    /// payload symbols look like to the demod. Slightly biased low at
+    /// low SNR (wrong decisions reduce the residual artificially) but
+    /// good enough for a live indicator. Falls back to `sigma2` when
+    /// no data segments were processed.
+    pub sigma2_data: f64,
     /// Unique DATA ESIs recovered (excludes meta-segment blocks, which are
     /// framing overhead rather than payload content). This is the metric
     /// the GUI should display as real decode progress.
@@ -595,6 +608,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let mut segments_lost: usize = 0;
     let mut sigma2_sum: f64 = 0.0;
     let mut sigma2_count: usize = 0;
+    // Hard-decision data-symbol σ² accumulators. Populated alongside
+    // the pilot σ² but only on non-meta segments and only over actual
+    // data symbols (post-equalisation). Surfaced separately to the GUI.
+    let mut sigma2_data_sum: f64 = 0.0;
+    let mut sigma2_data_count: usize = 0;
     const MAX_CONSTELLATION_POINTS: usize = 500;
     let mut constellation_sample: Vec<[f32; 2]> = Vec::new();
     // Pilot LS smoothed phases per data segment, in temporal order. Meta
@@ -709,6 +727,20 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             pilot_phase_segments.push(seg_pilot_phases);
         }
 
+        // Data-symbol σ² (frame-only, hard-decision residuals). Skip meta
+        // segments — the GUI metric is meant to track payload-symbol
+        // quality, and meta is framing overhead. Use the n_cw*syms_per_cw
+        // prefix only (track_segment may have over-allocated on the last
+        // pilot group).
+        if !marker_payload.is_meta() {
+            let n_data_syms = (n_cw * syms_per_cw).min(seg_data_syms.len());
+            for &y in &seg_data_syms[..n_data_syms] {
+                let d = constellation.hard_decision(y);
+                sigma2_data_sum += (y - d).norm_sqr();
+                sigma2_data_count += 1;
+            }
+        }
+
         // Sample post-equalised DATA symbols for the constellation scatter
         // plot. Meta segments are excluded (their content is the AppHeader
         // replicated, would bias the cloud toward a subset of constellation
@@ -807,6 +839,13 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     } else {
         1.0
     };
+    // Falls back to the pilot σ² when no data segments contributed —
+    // the GUI then has at least a sane number to display.
+    let sigma2_data = if sigma2_data_count > 0 {
+        (sigma2_data_sum / sigma2_data_count as f64).max(1e-6)
+    } else {
+        sigma2
+    };
 
     let data_blocks_recovered = cw_bytes.len();
     let eot_seen = decoded_header.flags & header::FLAG_EOT != 0;
@@ -819,6 +858,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         segments_decoded,
         segments_lost,
         sigma2,
+        sigma2_data,
         data_blocks_recovered,
         cw_bytes_map: cw_bytes,
         eot_seen,
@@ -900,6 +940,8 @@ pub fn rx_v3_after(
     let mut segs_lost = 0usize;
     let mut sigma2_sum = 0.0f64;
     let mut sigma2_count = 0usize;
+    let mut sigma2_data_sum = 0.0f64;
+    let mut sigma2_data_count = 0usize;
     let mut eot_seen = false;
     let mut last_constellation: Vec<[f32; 2]> = Vec::new();
     let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
@@ -964,6 +1006,8 @@ pub fn rx_v3_after(
         segs_lost += r.segments_lost;
         sigma2_sum += r.sigma2;
         sigma2_count += 1;
+        sigma2_data_sum += r.sigma2_data;
+        sigma2_data_count += 1;
         if r.eot_seen {
             eot_seen = true;
         }
@@ -1016,6 +1060,11 @@ pub fn rx_v3_after(
     } else {
         1.0
     };
+    let sigma2_data = if sigma2_data_count > 0 {
+        sigma2_data_sum / sigma2_data_count as f64
+    } else {
+        sigma2
+    };
     let data_blocks_recovered = merged.len();
 
     // Position of the last preamble seen in this scan. Always set when
@@ -1034,6 +1083,7 @@ pub fn rx_v3_after(
         segments_decoded: segs_decoded,
         segments_lost: segs_lost,
         sigma2,
+        sigma2_data,
         data_blocks_recovered,
         cw_bytes_map: merged,
         eot_seen,

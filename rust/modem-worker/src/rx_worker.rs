@@ -140,7 +140,13 @@ struct V2ProgressPayload {
     blocks_converged: usize,
     blocks_total: usize,
     blocks_expected: usize,
+    /// Pilot-residual σ² (kept for backward compat / debug). The GUI
+    /// surfaces `sigma2_data` instead, which excludes pilot+preamble
+    /// overhead. See RxV2Result for the full definition.
     sigma2: f64,
+    /// Hard-decision data-symbol σ² for the current window (frame-only,
+    /// instantaneous). What the top bar and phase-error overlay display.
+    sigma2_data: f64,
     converged_bitmap: Vec<u8>,
     constellation_sample: Vec<[f32; 2]>,
     /// Pilot LS smoothed phases per data segment (radians) for the most
@@ -154,7 +160,11 @@ struct FileCompletePayload {
     callsign: String,
     mime_type: u8,
     saved_path: String,
+    /// Pilot-residual σ² of the last contributing window (legacy).
     sigma2: f64,
+    /// Mean data-symbol σ² across every decode tick that contributed
+    /// to this session. Surfaced in the GUI file panel as "moyenne".
+    sigma2_data_avg: f64,
     size: usize,
 }
 
@@ -349,6 +359,11 @@ struct WorkerState {
     announced_sessions: HashSet<u32>,
     /// Last `received` count emitted per session, for progress rate-limiting.
     last_progress: std::collections::HashMap<u32, u32>,
+    /// Running mean of `result.sigma2_data` per session (sum + count).
+    /// Accumulated on every successful decode tick that touches the
+    /// session, drained on `file_complete` so the GUI receives the
+    /// across-the-burst average rather than the last window's value.
+    sigma2_data_running: std::collections::HashMap<u32, (f64, u32)>,
     /// First decoded protocol header, for legacy `header` event emission.
     header: Option<Header>,
     last_scan_at: Instant,
@@ -383,6 +398,7 @@ impl WorkerState {
             store,
             announced_sessions: HashSet::new(),
             last_progress: std::collections::HashMap::new(),
+            sigma2_data_running: std::collections::HashMap::new(),
             header: None,
             last_scan_at: now,
             last_audio_above_silence_at: now,
@@ -933,8 +949,23 @@ fn scan_and_route(
             },
         );
         if let Some(df) = state.store.peek_decoded(ah, state.profile) {
-            emit_decoded_file(sink, save_dir, &df, result.sigma2);
+            // Re-announce of an already-decoded session : we don't have
+            // a running mean (this is a peek, not a fresh decode), so
+            // pass the current window's sigma2_data as a best-effort.
+            emit_decoded_file(sink, save_dir, &df, result.sigma2, result.sigma2_data);
         }
+    }
+
+    // Accumulate the running mean of sigma2_data for this session : every
+    // tick that produced an AppHeader (and therefore a valid `result`)
+    // contributes one sample. Drained when the file completes (below).
+    {
+        let entry = state
+            .sigma2_data_running
+            .entry(ah.session_id)
+            .or_insert((0.0, 0));
+        entry.0 += result.sigma2_data;
+        entry.1 += 1;
     }
 
     // Route the packets to the disk store.
@@ -961,6 +992,7 @@ fn scan_and_route(
         // store (not the sliding rx_v3 window, which would only show the
         // last few seconds of ESIs and appear to "scroll").
         let sigma2 = result.sigma2;
+        let sigma2_data = result.sigma2_data;
         let expected = outcome.needed as usize;
         sink.emit(
             "v2_progress",
@@ -969,6 +1001,7 @@ fn scan_and_route(
                 blocks_total: result.total_blocks,
                 blocks_expected: expected,
                 sigma2,
+                sigma2_data,
                 converged_bitmap: outcome.seen_bitmap.clone(),
                 constellation_sample: result.constellation_sample.clone(),
                 pilot_phase_segments: result.pilot_phase_segments.clone(),
@@ -978,8 +1011,15 @@ fn scan_and_route(
 
     // A freshly-decoded file : emit session_decoded, copy to save_dir root
     // under the envelope filename, and emit the legacy file_complete event.
+    // The `sigma2_data` attached to file_complete is the running mean over
+    // every tick that contributed to this session.
     if let Some(df) = outcome.decoded {
-        emit_decoded_file(sink, save_dir, &df, result.sigma2);
+        let avg_sigma2_data = state
+            .sigma2_data_running
+            .get(&df.session_id)
+            .map(|&(sum, n)| if n > 0 { sum / n as f64 } else { result.sigma2_data })
+            .unwrap_or(result.sigma2_data);
+        emit_decoded_file(sink, save_dir, &df, result.sigma2, avg_sigma2_data);
     }
 
     // Free the in-memory audio buffer only once the TX explicitly signalled
@@ -1028,6 +1068,7 @@ fn emit_decoded_file(
     save_dir: &Arc<Mutex<PathBuf>>,
     df: &session_store::DecodedFile,
     sigma2: f64,
+    sigma2_data_avg: f64,
 ) {
     if let Some(fname) = df.meta.filename.clone() {
         sink.emit(
@@ -1090,6 +1131,7 @@ fn emit_decoded_file(
                     mime_type: final_mime,
                     saved_path: path.to_string_lossy().into_owned(),
                     sigma2,
+                    sigma2_data_avg,
                     size: final_content.len(),
                 },
             );

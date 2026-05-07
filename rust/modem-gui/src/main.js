@@ -247,12 +247,24 @@ function showCurrentFile(payload) {
   const info = document.getElementById("current-info");
   const wrap = document.getElementById("current-image-wrap");
   const mime = MIME_TYPES[payload.mime_type] || "application/octet-stream";
+  // σ² shown in the file panel is the running mean over every decode
+  // tick that contributed to the session (data-symbol residuals only,
+  // pilots/preamble excluded). We label it as such and surface the
+  // implied SNR in dB. Falls back to the legacy single-window σ² if
+  // the worker isn't emitting the new field yet.
+  const sigAvg = Number.isFinite(payload.sigma2_data_avg)
+    ? payload.sigma2_data_avg
+    : payload.sigma2;
+  const sigStr = Number.isFinite(sigAvg) ? sigAvg.toFixed(4) : "—";
+  const snrStr = Number.isFinite(sigAvg) && sigAvg > 0
+    ? `${(-10 * Math.log10(sigAvg)).toFixed(1)} dB`
+    : "— dB";
   info.innerHTML =
     `<strong>De :</strong> ${payload.callsign || "?"} · ` +
     `<strong>Nom :</strong> ${payload.filename} · ` +
     `<strong>Taille :</strong> ${payload.size} o · ` +
     `<strong>MIME :</strong> ${mime} · ` +
-    `<strong>σ² :</strong> ${payload.sigma2.toFixed(4)} · ` +
+    `<strong>σ² moyen :</strong> ${sigStr} (${snrStr}) · ` +
     `<code>${payload.saved_path}</code>`;
   wrap.innerHTML = "";
   if (isImageMime(payload.mime_type)) {
@@ -1805,6 +1817,11 @@ function updateV2Marker(payload) {
 }
 
 // ─────────────────────────────── Per-block progress + constellation state
+// `sigma2` here means the per-window data-symbol σ² (frame-only,
+// hard-decision residuals — what `result.sigma2_data` carries on the
+// Rust side). The pilot-residual σ² stays internal to the demod (LLR
+// scale) and is not surfaced to the operator. Field is kept named
+// `sigma2` because every consumer of `lastProgress` already expects it.
 let lastProgress = {
   bitmap: null,
   expected: 0,
@@ -1880,11 +1897,17 @@ function updateV2Progress(payload) {
   const bitmap = bm
     ? new Uint8Array(bm)
     : new Uint8Array(Math.ceil((payload.blocks_expected || 0) / 8));
+  // Prefer `sigma2_data` (frame-only, hard-decision residuals) when the
+  // worker provides it. Fall back to `sigma2` (pilot-residual) for
+  // older payloads so a partial rebuild doesn't blank the indicator.
+  const sigmaInst = Number.isFinite(payload.sigma2_data)
+    ? payload.sigma2_data
+    : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null);
   lastProgress = {
     bitmap,
     expected: payload.blocks_expected || 0,
     converged: payload.blocks_converged || 0,
-    sigma2: Number.isFinite(payload.sigma2) ? payload.sigma2 : null,
+    sigma2: sigmaInst,
   };
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
