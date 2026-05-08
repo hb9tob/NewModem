@@ -88,10 +88,18 @@ pub struct AgcMode {
     /// (per CLAUDE.md). Examples: `"Manuel (gain fixe)"`,
     /// `"AGC rapide"`, `"AGC lente (défaut SDRplay)"`.
     pub label: String,
-    /// True ⇒ the manual-gain selector should remain enabled while
-    /// this mode is selected. The "manual" mode of every backend
+    /// True ⇒ all manual-gain inputs stay enabled (i.e. the mode
+    /// is really "AGC off"). The "manual" mode of every backend
     /// sets this to `true`; AGC modes set it to `false`.
     pub manual: bool,
+    /// Only meaningful when `manual = false` and the backend uses
+    /// [`ManualGainShape::LnaPlusIf`]. True ⇒ the AGC loop only
+    /// touches the IF gain reduction (`gRdB`); the LNA-state input
+    /// stays operator-controlled. SDRplay AGC modes (slow/mid/fast)
+    /// set this to `true`. The frontend keys the LNA `<input>`'s
+    /// `disabled` attribute off this flag.
+    #[serde(default)]
+    pub keeps_lna_manual: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -59,7 +59,7 @@ pub mod rx;
 
 pub use backend::{SdrplayBackend, SdrplayDevice};
 pub use device::{
-    list_serials, open, AgcMode, AntennaPort, SdrplayConfig, SdrplaySession, Tuner,
-    PREFERRED_AUDIO_RATIO, PREFERRED_DECIMATION, PREFERRED_SAMPLE_RATE_HZ,
+    list_devices_meta, list_serials, open, AgcMode, AntennaPort, SdrplayConfig, SdrplayHardware,
+    SdrplaySession, Tuner, PREFERRED_AUDIO_RATIO, PREFERRED_DECIMATION, PREFERRED_SAMPLE_RATE_HZ,
 };
 pub use error::SdrplayError;

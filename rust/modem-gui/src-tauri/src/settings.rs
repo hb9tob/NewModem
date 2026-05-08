@@ -169,6 +169,7 @@ pub fn default_sdr_config_for(backend_id: &str) -> SdrConfig {
                 // explicitly when running level-calibrated lab work.
                 gain: GainSetting::AgcMode {
                     id: "slow_attack".into(),
+                    lna_state: None,
                 },
                 max_deviation_hz: 5_000.0,
                 tx_deviation_hz: 5_000.0,

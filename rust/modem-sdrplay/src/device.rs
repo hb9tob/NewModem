@@ -1,10 +1,20 @@
-//! Open + configure an SDRplay RSPduo for receive.
+//! Open + configure any SDRplay RX device (RSPduo, RSP1A, …) for receive.
 //!
 //! Mirrors `modem_pluto::device`'s split: a [`SdrplayConfig`] describes
 //! the front-end knobs the GUI lets the user touch, [`open`] turns it
 //! into a live [`SdrplaySession`] (device selected on the daemon side,
 //! params programmed) ready for [`crate::rx::start`] to drape an I/Q
 //! callback over via `sdrplay_api_Init`.
+//!
+//! Hardware variants — the daemon's `GetDevices` call returns a `hwVer`
+//! byte we map to [`SdrplayHardware`]. [`open`] branches on it so:
+//!  * **RSPduo** uses `rspDuoMode = Single_Tuner`, `rspDuoTunerParams`
+//!    for bias-T / antenna port / FM/DAB notches.
+//!  * **RSP1A** ignores `rspDuoMode`, always picks `Tuner::A`, uses
+//!    `rsp1aTunerParams.biasTEnable` and `devParams.rsp1aParams` for
+//!    the FM / DAB notches; antenna port is fixed at 50 Ω SMA.
+//! Other variants (RSP1, RSP2, RSPdx, RSP1B) surface as
+//! [`SdrplayError::Api`] until they grow their own branch.
 
 use std::os::raw::c_uint;
 use std::ptr;
@@ -19,14 +29,89 @@ use crate::api::{
 };
 use crate::error::SdrplayError;
 
+/// SDRplay hardware family — derived from `sdrplay_api_DeviceT::hwVer`.
+/// The daemon tells us which device is on the bus; we use that to
+/// branch the params programming and to skip incompatible knobs (e.g.
+/// `rspDuoMode` is meaningless on RSP1A).
+///
+/// `hwVer` constants come from SDRplay's `sdrplay_api.h`:
+/// ```text
+/// SDRPLAY_RSP1_ID    = 1
+/// SDRPLAY_RSP2_ID    = 2
+/// SDRPLAY_RSPduo_ID  = 3
+/// SDRPLAY_RSPdx_ID   = 4
+/// SDRPLAY_RSP1B_ID   = 6
+/// SDRPLAY_RSPdxR2_ID = 7
+/// SDRPLAY_RSP1A_ID   = 255
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdrplayHardware {
+    Rsp1,
+    Rsp1a,
+    Rsp1b,
+    Rsp2,
+    RspDuo,
+    RspDx,
+    RspDxR2,
+    /// Hardware byte the daemon returned but we don't program yet —
+    /// `open()` rejects it with a clear error so the GUI shows the
+    /// device but refuses to start streaming.
+    Unsupported(u8),
+}
+
+impl SdrplayHardware {
+    pub fn from_hw_ver(hw_ver: u8) -> Self {
+        match hw_ver {
+            1 => Self::Rsp1,
+            2 => Self::Rsp2,
+            3 => Self::RspDuo,
+            4 => Self::RspDx,
+            6 => Self::Rsp1b,
+            7 => Self::RspDxR2,
+            255 => Self::Rsp1a,
+            v => Self::Unsupported(v),
+        }
+    }
+
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            Self::Rsp1 => "RSP1",
+            Self::Rsp1a => "RSP1A",
+            Self::Rsp1b => "RSP1B",
+            Self::Rsp2 => "RSP2",
+            Self::RspDuo => "RSPduo",
+            Self::RspDx => "RSPdx",
+            Self::RspDxR2 => "RSPdx-R2",
+            Self::Unsupported(_) => "SDRplay",
+        }
+    }
+
+    /// True when the device exposes a Tuner-A / Tuner-B selector
+    /// (i.e. the GUI should surface the `tuner` extras dropdown).
+    /// RSPduo is the only multi-tuner part in the family.
+    pub fn has_tuner_selector(&self) -> bool {
+        matches!(self, Self::RspDuo)
+    }
+
+    /// True when the device has a user-selectable antenna port. The
+    /// RSPduo's tuner-A has Hi-Z vs 50 Ω; RSPdx has three. RSP1A
+    /// only has a single SMA so the GUI hides the dropdown.
+    pub fn has_antenna_selector(&self) -> bool {
+        matches!(self, Self::RspDuo | Self::RspDx | Self::RspDxR2 | Self::Rsp2)
+    }
+}
+
 /// Tuner half of an RSPduo. Single-tuner mode is enough for our 2 m
-/// NBFM RX use case — diversity / dual-RX is a follow-up.
+/// NBFM RX use case — diversity / dual-RX is a follow-up. On non-
+/// RSPduo devices [`Tuner::A`] is the only meaningful value (the
+/// daemon ignores Tuner-B selection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tuner {
-    /// Tuner 1. Has both the AM (Hi-Z) port and a 50 Ω port.
+    /// Tuner 1. Has both the AM (Hi-Z) port and a 50 Ω port (RSPduo);
+    /// the only tuner on RSP1 / RSP1A / RSP1B.
     A,
     /// Tuner 2. Single 50 Ω antenna. The bias-T runs on this port,
-    /// so external preamps land here.
+    /// so external preamps land here. RSPduo only.
     B,
 }
 
@@ -64,22 +149,30 @@ pub enum AgcMode {
     Fast,
 }
 
-/// SDRplay RSPduo configuration the GUI / CLI pass into [`open`].
+/// SDRplay device configuration the GUI / CLI pass into [`open`].
 /// Maps onto a subset of `sdrplay_api_DevParamsT` +
-/// `sdrplay_api_TunerParamsT` + `sdrplay_api_RspDuoTunerParamsT` —
-/// only the knobs we actually expose to the operator.
+/// `sdrplay_api_TunerParamsT` + the per-device sub-struct (RSPduo:
+/// `RspDuoTunerParamsT`; RSP1A: `Rsp1aTunerParamsT` +
+/// `Rsp1aParamsT`) — only the knobs we actually expose to the operator.
 #[derive(Debug, Clone)]
 pub struct SdrplayConfig {
-    /// RSPduo serial (e.g. `2401024C13`). Empty = first device the
-    /// daemon hands back.
+    /// Device serial (e.g. `2401024C13` for RSPduo,
+    /// `1500R76GR1` for RSP1A). Empty = first device the daemon
+    /// hands back.
     pub serial: String,
-    /// Which tuner half to bind in single-tuner mode.
+    /// Which tuner half to bind in single-tuner mode. Ignored on
+    /// devices without a tuner selector — `open()` overrides this
+    /// to [`Tuner::A`] before programming.
     pub tuner: Tuner,
-    /// Antenna port on Tuner A. Ignored when `tuner == Tuner::B`.
+    /// Antenna port. Honoured only on the RSPduo (Tuner A's
+    /// AMPORT_1 / AMPORT_2). Ignored on RSP1A — that part has a
+    /// single SMA and the daemon doesn't model an antenna selector.
     pub antenna: AntennaPort,
-    /// **Bias-T on tuner 2's port.** RSPduo only exposes bias-T on
-    /// Tuner B; turning it on with `tuner == Tuner::A` selected has
-    /// no effect on the active path. Default false.
+    /// Bias-T on the active port. Wiring depends on hardware:
+    /// RSPduo only exposes bias-T on Tuner B; RSP1A has bias-T on
+    /// its single SMA port. The backend writes it onto whichever
+    /// `*_TunerParamsT.biasTEnable` field the active hardware uses.
+    /// Default false.
     pub bias_t: bool,
     /// Broadcast-FM rejection notch (~88 – 108 MHz). Default false.
     pub fm_notch: bool,
@@ -122,6 +215,10 @@ impl Default for SdrplayConfig {
     fn default() -> Self {
         SdrplayConfig {
             serial: String::new(),
+            // RSPduo-friendly default — Tuner B + 50 Ω. `open()`
+            // overrides `tuner` to A when the daemon reports a non-
+            // RSPduo device anyway, so single-tuner parts (RSP1A)
+            // don't care what's set here.
             tuner: Tuner::B,
             antenna: AntennaPort::Fifty,
             bias_t: false,
@@ -164,6 +261,10 @@ pub struct SdrplaySession {
     /// programs everything once at open.
     #[allow(dead_code)]
     pub(crate) params: *mut sdrplay_api_DeviceParamsT,
+    /// Hardware family the daemon reported at `GetDevices` time.
+    /// Captured here so a future `update_*` call programs into the
+    /// right per-device sub-struct without re-querying.
+    pub hardware: SdrplayHardware,
     /// Echo of the input config so [`crate::rx`] can rebuild the DSP
     /// chain (deviation, audio ratio).
     pub config: SdrplayConfig,
@@ -192,9 +293,21 @@ impl Drop for SdrplaySession {
     }
 }
 
-/// Enumerate every RSPduo / RSP visible to the daemon. Returns the
-/// serial-number list — the GUI surfaces them as `sdrplay:<serial>`.
+/// Enumerate every SDRplay device visible to the daemon. Returns
+/// the serial-number list — the GUI surfaces them as
+/// `sdrplay:<serial>`. Use [`list_devices_meta`] when you also need
+/// the hardware family (for friendly names / capability gating).
 pub fn list_serials() -> Result<Vec<String>, SdrplayError> {
+    Ok(list_devices_meta()?
+        .into_iter()
+        .map(|(serial, _)| serial)
+        .collect())
+}
+
+/// Enumerate visible devices with their `(serial, hardware)` pair.
+/// The backend uses this to label devices ("SDRplay RSP1A — …" vs
+/// "SDRplay RSPduo — …") in the GUI dropdown.
+pub fn list_devices_meta() -> Result<Vec<(String, SdrplayHardware)>, SdrplayError> {
     // SAFETY: `sdrplay_api_Open` is reference-counted on the daemon
     // side, the `[DeviceT; 8]` fits the API's documented max device
     // count, and `numDevs` is initialised to 0 before being passed
@@ -218,7 +331,12 @@ pub fn list_serials() -> Result<Vec<String>, SdrplayError> {
 
     Ok(devices[..n_devs as usize]
         .iter()
-        .map(|d| cstr_field_to_string(&d.SerNo))
+        .map(|d| {
+            (
+                cstr_field_to_string(&d.SerNo),
+                SdrplayHardware::from_hw_ver(d.hwVer),
+            )
+        })
         .collect())
 }
 
@@ -271,15 +389,43 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
     };
     let mut device = devices[pick_idx];
 
-    // Pre-SelectDevice fields on the DeviceT itself: forces the
-    // RSPduo into single-tuner mode on the requested half. The
-    // daemon uses these to negotiate internal routing.
-    device.rspDuoMode = sdrplay_api_RspDuoModeT::sdrplay_api_RspDuoMode_Single_Tuner;
-    device.tuner = match config.tuner {
+    // Identify the hardware family from the byte the daemon set in
+    // `hwVer`. Branches everything below: pre-Select fields on the
+    // DeviceT, the per-tuner sub-struct in `program_params`, and
+    // the GUI-side capability gating once `SdrplaySession.hardware`
+    // bubbles back up.
+    let hardware = SdrplayHardware::from_hw_ver(device.hwVer);
+    if let SdrplayHardware::Unsupported(v) = hardware {
+        let _ = unsafe { sdrplay_api_Close() };
+        return Err(SdrplayError::Api {
+            call: "GetDevices",
+            code: -1,
+            api_message: format!(
+                "unsupported SDRplay hardware (hwVer={v}); RSPduo and RSP1A are wired"
+            ),
+        });
+    }
+
+    // Pre-SelectDevice fields on the DeviceT itself.
+    //   * RSPduo → set `rspDuoMode = Single_Tuner` and forward the
+    //     master sample rate via `rspDuoSampleFreq`. The daemon
+    //     uses these to negotiate internal routing.
+    //   * Other parts → leave `rspDuoMode` at `Unknown` (= 0); they
+    //     have a single tuner, so we always map to Tuner-A even if
+    //     the GUI-persisted config says B.
+    let effective_tuner = if hardware.has_tuner_selector() {
+        config.tuner
+    } else {
+        Tuner::A
+    };
+    if matches!(hardware, SdrplayHardware::RspDuo) {
+        device.rspDuoMode = sdrplay_api_RspDuoModeT::sdrplay_api_RspDuoMode_Single_Tuner;
+        device.rspDuoSampleFreq = config.sample_rate_hz;
+    }
+    device.tuner = match effective_tuner {
         Tuner::A => sdrplay_api_TunerSelectT::sdrplay_api_Tuner_A,
         Tuner::B => sdrplay_api_TunerSelectT::sdrplay_api_Tuner_B,
     };
-    device.rspDuoSampleFreq = config.sample_rate_hz;
 
     // Phase 3 — atomic select+program against the locked API.
     // SAFETY: Lock / Unlock pair guarantees the daemon serialises
@@ -323,7 +469,11 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
         });
     }
 
-    if let Err(e) = program_params(params, config) {
+    // Pass the resolved hardware + tuner down to params programming
+    // so it knows whether to write to RspDuo / Rsp1a sub-structs.
+    let mut effective_config = config.clone();
+    effective_config.tuner = effective_tuner;
+    if let Err(e) = program_params(params, &effective_config, hardware) {
         let _ = unsafe { sdrplay_api_ReleaseDevice(&mut device as *mut _) };
         let _ = unsafe { sdrplay_api_Close() };
         return Err(e);
@@ -332,7 +482,8 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
     Ok(SdrplaySession {
         device,
         params,
-        config: config.clone(),
+        hardware,
+        config: effective_config,
     })
 }
 
@@ -340,9 +491,15 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
 /// [`open`] before streaming starts; mutating these fields later
 /// requires `sdrplay_api_Update` (a follow-up — for the modem use
 /// case we only need to set everything once at open).
+///
+/// Common fields (`fsHz`, `rfHz`, gain table, bandwidth, decimation,
+/// AGC) are programmed identically on every device. Bias-T, antenna
+/// port and FM/DAB notches live on per-device sub-structs and
+/// branch on `hardware`.
 fn program_params(
     params: *mut sdrplay_api_DeviceParamsT,
     config: &SdrplayConfig,
+    hardware: SdrplayHardware,
 ) -> Result<(), SdrplayError> {
     // SAFETY: `params` came directly out of `GetDeviceParams`; the
     // daemon guarantees the entire tree (devParams + per-tuner
@@ -360,12 +517,19 @@ fn program_params(
         }
         (*dev_params).fsFreq.fsHz = config.sample_rate_hz;
 
-        // The active RX channel struct depends on which tuner is
-        // selected. RSPduo single-tuner-on-B uses the rxChannelB
-        // slot; on tuner A it's rxChannelA. (Either pointer can be
-        // null when the corresponding tuner isn't selected in the
-        // current mode — but in single-tuner mode the daemon sets
-        // the chosen one.)
+        // FM / DAB notch lives on the device-level sub-struct for
+        // RSP1A (`rsp1aParams`); on RSPduo the same notches live on
+        // the rxChannel sub-struct (handled below). Programmed here
+        // so we touch `dev_params` exactly once.
+        if matches!(hardware, SdrplayHardware::Rsp1a) {
+            let rsp1a = &mut (*dev_params).rsp1aParams;
+            rsp1a.rfNotchEnable = if config.fm_notch { 1 } else { 0 };
+            rsp1a.rfDabNotchEnable = if config.dab_notch { 1 } else { 0 };
+        }
+
+        // The active RX channel struct depends on which tuner the
+        // daemon assigned. RSPduo's single-tuner-on-B path uses the
+        // rxChannelB slot; everywhere else we always read rxChannelA.
         let rx_chan_ptr = match config.tuner {
             Tuner::A => (*params).rxChannelA,
             Tuner::B => (*params).rxChannelB,
@@ -400,18 +564,49 @@ fn program_params(
             AgcMode::Fast => sdrplay_api_AgcControlT::sdrplay_api_AGC_100HZ,
         };
 
-        // RSPduo-specific knobs live on the rx channel's
-        // rspDuoTunerParams (cf. sdrplay_api_rspDuo.h).
-        let duo = &mut (*rx_chan_ptr).rspDuoTunerParams;
-        duo.biasTEnable = if config.bias_t { 1 } else { 0 };
-        duo.tuner1AmPortSel = match config.antenna {
-            AntennaPort::Hiz => sdrplay_api_RspDuo_AmPortSelectT::sdrplay_api_RspDuo_AMPORT_1,
-            AntennaPort::Fifty => sdrplay_api_RspDuo_AmPortSelectT::sdrplay_api_RspDuo_AMPORT_2,
-        };
-        duo.rfNotchEnable = if config.fm_notch { 1 } else { 0 };
-        duo.rfDabNotchEnable = if config.dab_notch { 1 } else { 0 };
-        // tuner1AmNotchEnable left at 0 — only affects the AM (Hi-Z)
-        // port we don't use for VHF.
+        // Bias-T + antenna port + FM/DAB notch — wiring depends on
+        // hardware. Each branch writes only the fields it owns.
+        match hardware {
+            SdrplayHardware::RspDuo => {
+                // cf. sdrplay_api_rspDuo.h
+                let duo = &mut (*rx_chan_ptr).rspDuoTunerParams;
+                duo.biasTEnable = if config.bias_t { 1 } else { 0 };
+                duo.tuner1AmPortSel = match config.antenna {
+                    AntennaPort::Hiz => {
+                        sdrplay_api_RspDuo_AmPortSelectT::sdrplay_api_RspDuo_AMPORT_1
+                    }
+                    AntennaPort::Fifty => {
+                        sdrplay_api_RspDuo_AmPortSelectT::sdrplay_api_RspDuo_AMPORT_2
+                    }
+                };
+                duo.rfNotchEnable = if config.fm_notch { 1 } else { 0 };
+                duo.rfDabNotchEnable = if config.dab_notch { 1 } else { 0 };
+                // tuner1AmNotchEnable left at 0 — only affects the AM
+                // (Hi-Z) port we don't use for VHF.
+            }
+            SdrplayHardware::Rsp1a => {
+                // cf. sdrplay_api_rsp1a.h. Notches sat on `dev_params`
+                // (above); only bias-T lives on the rxChannel struct.
+                // Antenna port has no GUI counterpart on RSP1A — the
+                // single SMA is hard-wired.
+                let rsp1a = &mut (*rx_chan_ptr).rsp1aTunerParams;
+                rsp1a.biasTEnable = if config.bias_t { 1 } else { 0 };
+            }
+            other => {
+                // `open()` already filters `Unsupported(_)` out, but
+                // RSP1 / RSP2 / RSPdx / RSPdxR2 / RSP1B don't have
+                // their per-device branches yet. Surface as a clear
+                // error rather than silently skip the bias-T write.
+                return Err(SdrplayError::Api {
+                    call: "program_params",
+                    code: -1,
+                    api_message: format!(
+                        "no per-device programming wired for {} yet",
+                        other.short_name()
+                    ),
+                });
+            }
+        }
     }
     Ok(())
 }

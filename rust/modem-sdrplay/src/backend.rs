@@ -1,9 +1,11 @@
-//! `modem_sdr::SdrBackend` implementation for the SDRplay RSPduo.
+//! `modem_sdr::SdrBackend` implementation for SDRplay RX devices
+//! (RSPduo + RSP1A wired today; RSP1 / RSP2 / RSPdx scaffolded but
+//! gated off until their per-device sub-struct programming lands).
 //!
 //! [`SdrplayBackend`] is a zero-sized type that registers in
 //! `modem-gui/src-tauri/src/sdr_registry.rs` behind the `sdrplay`
-//! cargo feature. RSPduo is **RX-only** — `tx_sink()` returns `None`
-//! and the static [`BackendCapabilities`] reflects this.
+//! cargo feature. The whole family is **RX-only** — `tx_sink()`
+//! returns `None` and the static [`BackendCapabilities`] reflects this.
 //!
 //! [`SdrplayDevice`] is the [`SdrDevice`] wrapper around an opened
 //! daemon-side device handle. Construction calls
@@ -15,9 +17,10 @@
 //!
 //! ## SDRplay-specific keys recognized in [`SdrConfig::backend_extras`]
 //!
-//! - `tuner: "A" | "B"` — required (no default). Selects the RSPduo
-//!   tuner half. Default at the GUI layer is `"B"` for VHF (matches
-//!   `SdrplayConfig::default()`).
+//! - `tuner: "A" | "B"` — RSPduo only (the only multi-tuner part in
+//!   the family). Optional; defaults to `"A"`. On RSP1A and other
+//!   single-tuner parts the value is ignored — `device::open`
+//!   overrides it to A before programming.
 //! - `decimation: u32` — API-internal decimation factor (1, 2, 4, 8,
 //!   16, 32). Default `4` (yields a 576 kS/s host I/Q rate from the
 //!   2.304 MS/s master clock — same rate as Pluto, same downstream
@@ -44,7 +47,7 @@ use crate::rx;
 /// code uses, so a saved `device_name = "sdrplay:22340A2A34"` parses
 /// back to (this backend, "22340A2A34") through the registry.
 pub const BACKEND_ID: &str = "sdrplay";
-const DISPLAY_NAME: &str = "SDRplay RSPduo";
+const DISPLAY_NAME: &str = "SDRplay";
 
 static SDRPLAY_CAPS: OnceLock<BackendCapabilities> = OnceLock::new();
 
@@ -67,25 +70,35 @@ fn sdrplay_capabilities() -> &'static BackendCapabilities {
             if_grdb_step: 1,
         },
         agc_modes: vec![
+            // SDRplay AGC only manages `gRdB` (IF gain reduction);
+            // the LNA state stays operator-controlled in every AGC
+            // mode (cf. `device::program_params` — `ctrl.agc.enable`
+            // does not touch `tuner_params.gain.LNAstate`). The
+            // `keeps_lna_manual` flag tells the GUI to leave the
+            // LNA-state `<input>` enabled while disabling IF gRdB.
             SdrAgcModeDescriptor {
                 id: "disable".into(),
                 label: "Manuel (gain fixe)".into(),
                 manual: true,
+                keeps_lna_manual: false,
             },
             SdrAgcModeDescriptor {
                 id: "slow".into(),
                 label: "AGC lente (5 Hz)".into(),
                 manual: false,
+                keeps_lna_manual: true,
             },
             SdrAgcModeDescriptor {
                 id: "mid".into(),
                 label: "AGC moyenne (50 Hz, défaut SDRplay)".into(),
                 manual: false,
+                keeps_lna_manual: true,
             },
             SdrAgcModeDescriptor {
                 id: "fast".into(),
                 label: "AGC rapide (100 Hz)".into(),
                 manual: false,
+                keeps_lna_manual: true,
             },
         ],
         antennas: vec![
@@ -134,19 +147,21 @@ impl SdrBackend for SdrplayBackend {
     fn list_devices(&self) -> Result<Vec<DeviceDescriptor>, SdrError> {
         // Daemon failures (not running, not installed, no device on
         // bus) are surfaced as an empty list — same UX as the libiio
-        // path on Pluto.
-        let serials = match device::list_serials() {
+        // path on Pluto. We want the friendly name to mention the
+        // actual hardware (RSPduo / RSP1A / …) so the user can tell
+        // them apart in the dropdown without looking at the serial.
+        let metas = match device::list_devices_meta() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[sdrplay] list_serials unavailable: {e}");
+                eprintln!("[sdrplay] list_devices_meta unavailable: {e}");
                 return Ok(Vec::new());
             }
         };
-        Ok(serials
+        Ok(metas
             .into_iter()
-            .map(|s| {
-                let friendly = format!("SDRplay RSPduo — {s}");
-                DeviceDescriptor::new(BACKEND_ID, s, friendly)
+            .map(|(serial, hw)| {
+                let friendly = format!("SDRplay {} — {serial}", hw.short_name());
+                DeviceDescriptor::new(BACKEND_ID, serial, friendly)
             })
             .collect())
     }
@@ -240,12 +255,16 @@ pub fn build_sdrplay_config(
                 detail: format!("SDRplay expects Manual::LnaPlusIf, got {other:?}"),
             });
         }
-        GainSetting::AgcMode { id } => {
+        GainSetting::AgcMode { id, lna_state } => {
             let mode = parse_agc_mode(id)?;
-            // When AGC is on, gRdB is daemon-managed but
-            // SdrplayConfig still wants a value — pass a sane default
-            // and leave LNA at the typical mid-band index.
-            (4, 40, mode)
+            // gRdB is daemon-managed under AGC, but SdrplayConfig
+            // still wants an i32 — pass a sane default. The LNA
+            // state stays operator-controlled (the daemon's AGC
+            // loop does not touch `tuner_params.gain.LNAstate`):
+            // honour the GUI's hint when it sent one, else fall
+            // back to the typical mid-band index 4.
+            let lna = lna_state.unwrap_or(4);
+            (lna, 40, mode)
         }
     };
 
@@ -254,9 +273,12 @@ pub fn build_sdrplay_config(
     // settings on Tuner B anyway.
     let antenna = parse_antenna(&cfg.antenna)?;
 
-    // Tuner is required (no sensible default — picking the wrong
-    // tuner would silently send the user to the wrong RF path). Read
-    // from backend_extras.
+    // Tuner extras — optional. The RSPduo is the only multi-tuner
+    // part, and `device::open` overrides this to Tuner::A on every
+    // single-tuner device anyway. We default to A here so an RSP1A
+    // config (which has no `tuner` extras key) builds cleanly; an
+    // explicit invalid string still errors out so a typo on RSPduo
+    // surfaces immediately.
     let tuner = match cfg
         .backend_extras
         .get("tuner")
@@ -271,12 +293,7 @@ pub fn build_sdrplay_config(
                 detail: format!("expected 'A' or 'B', got '{other}'"),
             });
         }
-        None => {
-            return Err(SdrError::InvalidConfig {
-                field: "backend_extras.tuner",
-                detail: "RSPduo requires tuner = 'A' or 'B'".into(),
-            });
-        }
+        None => Tuner::A,
     };
 
     // Decimation — defaults to PREFERRED_DECIMATION (4) so the host

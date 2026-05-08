@@ -60,25 +60,31 @@ fn pluto_capabilities() -> &'static BackendCapabilities {
             step_db: 1,
         },
         agc_modes: vec![
+            // Pluto runs the DbContinuous shape — no LNA-state input
+            // to keep enabled, so `keeps_lna_manual = false` everywhere.
             AgcMode {
                 id: "manual".into(),
                 label: "Manuel (gain fixe)".into(),
                 manual: true,
+                keeps_lna_manual: false,
             },
             AgcMode {
                 id: "fast_attack".into(),
                 label: "AGC rapide".into(),
                 manual: false,
+                keeps_lna_manual: false,
             },
             AgcMode {
                 id: "slow_attack".into(),
                 label: "AGC lente (défaut driver)".into(),
                 manual: false,
+                keeps_lna_manual: false,
             },
             AgcMode {
                 id: "hybrid".into(),
                 label: "AGC hybride".into(),
                 manual: false,
+                keeps_lna_manual: false,
             },
         ],
         antennas: vec![],
@@ -228,7 +234,9 @@ pub fn build_pluto_config(
                 detail: format!("Pluto expects Manual::Db, got {other:?}"),
             });
         }
-        GainSetting::AgcMode { id } => {
+        GainSetting::AgcMode { id, .. } => {
+            // `lna_state` is irrelevant on the AD9361 (DbContinuous shape);
+            // we accept the field on the wire but ignore its value.
             let mode = RxGainMode::from_iio_str(id).ok_or_else(|| SdrError::InvalidConfig {
                 field: "gain",
                 detail: format!("unknown AGC mode '{id}' for Pluto"),

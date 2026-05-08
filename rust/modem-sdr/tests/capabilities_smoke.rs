@@ -32,11 +32,13 @@ fn dummy_caps() -> BackendCapabilities {
                 id: "manual".into(),
                 label: "Manuel".into(),
                 manual: true,
+                keeps_lna_manual: false,
             },
             AgcMode {
                 id: "fast_attack".into(),
                 label: "AGC rapide".into(),
                 manual: false,
+                keeps_lna_manual: false,
             },
         ],
         antennas: vec![],
@@ -113,11 +115,32 @@ fn gain_setting_variants_round_trip() {
         GainSetting::Manual(ManualGainValue::Discrete { step_idx: 7 }),
         GainSetting::AgcMode {
             id: "slow_attack".into(),
+            lna_state: None,
+        },
+        GainSetting::AgcMode {
+            id: "mid".into(),
+            lna_state: Some(7),
         },
     ];
     for g in values {
         let json = serde_json::to_string(&g).expect("gain serialize");
         let _back: GainSetting = serde_json::from_str(&json).expect("gain deserialize");
+    }
+}
+
+#[test]
+fn legacy_agc_mode_json_without_lna_state_deserializes() {
+    // Old persisted GUI settings.json predates the `lna_state`
+    // overlay on the AGC variant. Make sure they still load —
+    // the missing field defaults to `None` (cf. `#[serde(default)]`).
+    let legacy = r#"{"kind":"agc_mode","id":"mid"}"#;
+    let g: GainSetting = serde_json::from_str(legacy).expect("legacy gain deserialize");
+    match g {
+        GainSetting::AgcMode { id, lna_state } => {
+            assert_eq!(id, "mid");
+            assert!(lna_state.is_none());
+        }
+        _ => panic!("expected AgcMode variant"),
     }
 }
 

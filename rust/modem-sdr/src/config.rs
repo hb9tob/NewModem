@@ -110,8 +110,16 @@ pub enum GainSetting {
     /// `ManualGainShape`.
     Manual(ManualGainValue),
     /// Backend-named AGC mode. `id` must match one of
-    /// `BackendCapabilities::agc_modes[].id`.
-    AgcMode { id: String },
+    /// `BackendCapabilities::agc_modes[].id`. `lna_state` is only
+    /// honoured when the matching `AgcMode` capability has
+    /// `keeps_lna_manual = true` (today: SDRplay AGC modes only).
+    /// `None` everywhere else; the backend falls back to its own
+    /// mid-band default.
+    AgcMode {
+        id: String,
+        #[serde(default)]
+        lna_state: Option<u8>,
+    },
 }
 
 impl Default for GainSetting {

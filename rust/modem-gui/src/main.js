@@ -898,6 +898,10 @@ function buildAgcRow(direction, backendId, caps, cfg) {
     opt.value = mode.id;
     opt.textContent = mode.label;
     opt.dataset.manual = mode.manual ? "1" : "0";
+    // Per-mode "AGC keeps LNA manual" hint — SDRplay's AGC loop
+    // only manages IF gRdB. Stashed on the option so buildGainRow
+    // can read it back without re-walking caps.
+    opt.dataset.keepsLna = mode.keeps_lna_manual ? "1" : "0";
     sel.appendChild(opt);
   }
   const gain = cfg.gain || {};
@@ -913,7 +917,15 @@ function buildAgcRow(direction, backendId, caps, cfg) {
     if (isManual) {
       cfg.gain = manualGainFromShape(caps.manual_gain, cfg.gain);
     } else {
-      cfg.gain = { kind: "agc_mode", id: sel.value };
+      // Carry the LNA state across the manual→AGC transition so
+      // SDRplay backends that keep the LNA operator-controlled
+      // (`keeps_lna_manual`) reuse the user's setpoint instead of
+      // snapping back to the mid-band default. Pluto / DbContinuous
+      // backends ignore the field anyway.
+      const lna = readLnaStateFromGain(cfg.gain);
+      cfg.gain = lna != null
+        ? { kind: "agc_mode", id: sel.value, lna_state: lna }
+        : { kind: "agc_mode", id: sel.value };
     }
     persistSettings();
     refreshSdrPanels();   // re-render so the gain row's enable/disable matches.
@@ -923,6 +935,30 @@ function buildAgcRow(direction, backendId, caps, cfg) {
   return row;
 }
 
+/// Pull the LNA state out of either gain shape — the manual
+/// `lna_plus_if` payload, or the AGC variant's `lna_state` overlay.
+/// Returns `null` when the current gain has no LNA dimension (e.g.
+/// continuous-dB Pluto config).
+function readLnaStateFromGain(gain) {
+  if (!gain) return null;
+  if (gain.kind === "manual" && gain.shape === "lna_plus_if" && Number.isFinite(gain.lna_state)) {
+    return gain.lna_state;
+  }
+  if (gain.kind === "agc_mode" && Number.isFinite(gain.lna_state)) {
+    return gain.lna_state;
+  }
+  return null;
+}
+
+/// True when the active AGC mode advertises `keeps_lna_manual`.
+/// Used by `buildGainRow` to decide whether the LNA `<input>`
+/// should stay enabled while AGC is on.
+function agcModeKeepsLnaManual(caps, cfg) {
+  if (!cfg.gain || cfg.gain.kind !== "agc_mode") return false;
+  const mode = (caps.agc_modes || []).find(m => m.id === cfg.gain.id);
+  return !!(mode && mode.keeps_lna_manual);
+}
+
 function manualGainFromShape(shape, current) {
   if (current && current.kind === "manual") {
     if (shape && shape.DbContinuous && current.shape === "db") return current;
@@ -930,7 +966,20 @@ function manualGainFromShape(shape, current) {
     if (shape && shape.DbDiscrete && current.shape === "discrete") return current;
   }
   if (shape && shape.DbContinuous) return { kind: "manual", shape: "db", db: 0 };
-  if (shape && shape.LnaPlusIf) return { kind: "manual", shape: "lna_plus_if", lna_state: 4, if_grdb: 40 };
+  if (shape && shape.LnaPlusIf) {
+    // Carry the LNA state across the AGC→manual transition: SDRplay's
+    // AGC mode keeps `lna_state` operator-controlled, so flipping back
+    // to "Manuel (gain fixe)" should preserve it instead of snapping to
+    // the mid-band default. IF gRdB starts back at 40 either way (the
+    // daemon was managing it under AGC, we don't have a "last value").
+    const lna = readLnaStateFromGain(current);
+    return {
+      kind: "manual",
+      shape: "lna_plus_if",
+      lna_state: lna != null ? lna : 4,
+      if_grdb: 40,
+    };
+  }
   if (shape && shape.DbDiscrete) return { kind: "manual", shape: "discrete", step_idx: 0 };
   return { kind: "manual", shape: "db", db: 0 };
 }
@@ -939,6 +988,11 @@ function buildGainRow(direction, backendId, caps, cfg) {
   const row = makeRow();
   const shape = caps.manual_gain;
   const isAgc = !!(cfg.gain && cfg.gain.kind === "agc_mode");
+  // For the LnaPlusIf shape (SDRplay), the LNA-state input stays
+  // editable under AGC iff the active AGC mode advertises
+  // `keeps_lna_manual`. The IF gRdB input is always daemon-managed
+  // under AGC (only `disable` re-enables it via `manual: true`).
+  const lnaStaysManual = isAgc && agcModeKeepsLnaManual(caps, cfg);
   if (shape && shape.DbContinuous) {
     const r = shape.DbContinuous;
     const label = document.createElement("label");
@@ -965,8 +1019,11 @@ function buildGainRow(direction, backendId, caps, cfg) {
     lnaInput.type = "number";
     lnaInput.id = `sdr-${direction}-gain-lna-${backendId}`;
     lnaInput.min = "0"; lnaInput.max = String(r.lna_states - 1); lnaInput.step = "1";
-    lnaInput.disabled = isAgc;
-    if (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if") lnaInput.value = String(cfg.gain.lna_state);
+    lnaInput.disabled = isAgc && !lnaStaysManual;
+    // Populate from manual.lna_state OR agc_mode.lna_state — both
+    // shapes carry the operator's setpoint (cf. `readLnaStateFromGain`).
+    const lnaCurrent = readLnaStateFromGain(cfg.gain);
+    if (lnaCurrent != null) lnaInput.value = String(lnaCurrent);
     lnaInput.dataset.sdrField = "gain.lna_state";
     lnaInput.dataset.sdrTransform = "manual_lna";
     lnaInput.dataset.backend = backendId;
@@ -1183,7 +1240,15 @@ function applySdrFieldUpdate(cfg, field, transform, el) {
     }
     case "manual_lna": {
       const v = parseInt(el.value, 10);
-      if (Number.isFinite(v)) {
+      if (!Number.isFinite(v)) break;
+      // When AGC is engaged AND the mode keeps LNA operator-controlled
+      // (SDRplay AGC), update the agc_mode variant's lna_state overlay
+      // in place — don't switch back to a `manual` payload, that would
+      // disengage the AGC. Otherwise the user is in pure manual mode
+      // and we just patch the LnaPlusIf payload like before.
+      if (cfg.gain && cfg.gain.kind === "agc_mode") {
+        cfg.gain = { ...cfg.gain, lna_state: v };
+      } else {
         const cur = (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if")
           ? cfg.gain : { kind: "manual", shape: "lna_plus_if", lna_state: 0, if_grdb: 40 };
         cfg.gain = { ...cur, lna_state: v };

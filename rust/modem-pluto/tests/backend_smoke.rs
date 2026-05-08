@@ -72,6 +72,7 @@ fn build_pluto_config_maps_agc() {
         device_id: "usb:1.6.5".into(),
         gain: GainSetting::AgcMode {
             id: "fast_attack".into(),
+            lna_state: None,
         },
         ..SdrConfig::default()
     };
