@@ -312,6 +312,11 @@ pub fn list_serials() -> Result<Vec<String>, SdrplayError> {
 /// The backend uses this to label devices ("SDRplay RSP1A — …" vs
 /// "SDRplay RSPduo — …") in the GUI dropdown.
 pub fn list_devices_meta() -> Result<Vec<(String, SdrplayHardware)>, SdrplayError> {
+    // Delay-load guard (Windows): if sdrplay_api.dll isn't installed
+    // at all, surface DllMissing rather than crash on the first API
+    // call. No-op on Linux (ELF loader catches it at startup).
+    crate::runtime_guard::ensure_dll_loadable()?;
+
     // SAFETY: `sdrplay_api_Open` is reference-counted on the daemon
     // side, the `[DeviceT; 8]` fits the API's documented max device
     // count, and `numDevs` is initialised to 0 before being passed
@@ -349,6 +354,11 @@ pub fn list_devices_meta() -> Result<Vec<(String, SdrplayHardware)>, SdrplayErro
 /// [`crate::rx::start`] which calls `sdrplay_api_Init` with the
 /// callback functions.
 pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
+    // Delay-load guard mirrors `list_devices_meta`. Defensive: any
+    // direct caller that skips enumeration still hits a typed error
+    // rather than a delay-load SEH crash on Windows.
+    crate::runtime_guard::ensure_dll_loadable()?;
+
     // Phase 1 — connect to the daemon and discover devices.
     // SAFETY: see `list_serials`. Same bounded fixed-size array
     // pattern, same daemon-owned lifecycle.

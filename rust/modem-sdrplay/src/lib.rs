@@ -56,6 +56,7 @@ pub mod backend;
 pub mod device;
 pub mod error;
 pub mod rx;
+mod runtime_guard;
 
 pub use backend::{SdrplayBackend, SdrplayDevice};
 pub use device::{

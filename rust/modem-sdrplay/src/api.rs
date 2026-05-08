@@ -77,6 +77,12 @@ pub(crate) fn check_open(err: sdrplay_api_ErrT) -> Result<(), SdrplayError> {
 /// (refcounted on the daemon side, harmless if already open),
 /// query, close. Returns 0.0 if anything fails.
 pub fn api_version() -> f32 {
+    // Delay-load guard (Windows): bail out cleanly if the SDK isn't
+    // installed instead of triggering an uncatchable SEH on Open.
+    if crate::runtime_guard::ensure_dll_loadable().is_err() {
+        return 0.0;
+    }
+
     // SAFETY: Open / ApiVersion / Close form a self-contained
     // critical section against the API. Open is reference-counted
     // on the daemon side so nesting it inside a caller that has

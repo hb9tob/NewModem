@@ -12,6 +12,20 @@ pub enum SdrplayError {
     #[error("sdrplay_api_Open failed: code={code} ({api_message})")]
     Open { code: i32, api_message: String },
 
+    /// The closed-binary `sdrplay_api.dll` (Windows) isn't loadable at
+    /// runtime — the SDRplay SDK 3.x isn't installed on this host.
+    /// Surfaced via the delay-load runtime guard so the GUI degrades
+    /// gracefully (empty SDRplay device list) instead of dying with
+    /// `STATUS_DELAYLOAD_DLL_NOTFOUND` at the first API call. On Linux
+    /// the ELF loader catches this case at process start, so the
+    /// variant is Windows-only in practice.
+    #[error(
+        "SDRplay API library not loaded — install the SDK from \
+         https://www.sdrplay.com/api/ (RX hardware will appear once \
+         sdrplay_api.dll is reachable)"
+    )]
+    DllMissing,
+
     /// `sdrplay_api_GetDevices` returned 0 devices. RSPduo not on USB,
     /// udev rule missing (`/etc/udev/rules.d/66-sdrplay.rules`), or
     /// the daemon is running as a user that can't see the USB device.

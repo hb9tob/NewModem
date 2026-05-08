@@ -41,7 +41,9 @@ bogus bias-T checkbox on the RSP1, no Hi-Z dropdown on the RSP1A.
 
 The SDRplay API isn't redistributable, so this crate doesn't bundle
 it. Grab the installer from <https://www.sdrplay.com/api/> (free,
-account-walled), and run it once:
+account-walled).
+
+### Linux
 
 ```bash
 chmod +x SDRplay_RSP_API-Linux-ARM64-3.X.run    # ARM (Pi)
@@ -51,19 +53,37 @@ sudo systemctl enable --now sdrplay
 systemctl status sdrplay                         # "active (running)"
 ```
 
-That installs:
+Installs:
 - `/usr/local/lib/libsdrplay_api.so.3.X` (+ symlinks)
 - `/usr/local/include/sdrplay_api*.h`
 - `/opt/sdrplay_api/sdrplay_apiService` (the daemon)
 - `/etc/udev/rules.d/66-sdrplay.rules` (USB permissions)
 
-`build.rs` runs `bindgen` against the C headers at
-`/usr/local/include` by default. Override the lookup with
-`SDRPLAY_API_INCLUDE_DIR` / `SDRPLAY_API_LIB_DIR` env vars.
-
-End-to-end install procedure for Linux (including troubleshooting and
-udev re-tagging) lives in the top-level
+End-to-end Linux procedure (troubleshooting, udev re-tagging) lives
+in the top-level
 [`README.md`](../../README.md#sdrplay-api-install-linux).
+
+### Windows 10 / 11 (MSVC)
+
+Run the `.msi` installer from the SDRplay download page. It drops:
+
+- `C:\Program Files\SDRplay\API\inc\sdrplay_api.h` (+ companions)
+- `C:\Program Files\SDRplay\API\x64\sdrplay_api.lib` (import lib)
+- `C:\Program Files\SDRplay\API\x64\sdrplay_api.dll` (runtime)
+- `C:\Program Files\SDRplay\sdrplay_apiService.exe` registered as a
+  Windows service (`Get-Service sdrplay_apiService` → `Running`)
+
+Build also needs `libclang.dll` for `bindgen` —
+`winget install LLVM.LLVM` if not yet present (drops it under
+`C:\Program Files\LLVM\bin`). If `libclang.dll` lives elsewhere,
+point `LIBCLANG_PATH` at its directory.
+
+### Both OS — env-var overrides
+
+`build.rs` looks for the headers under the OS default and links
+against the SDK's `dylib`. Override via `SDRPLAY_API_INCLUDE_DIR` /
+`SDRPLAY_API_LIB_DIR` for portable installs (Linux `/opt/...`,
+Windows SDK extracted outside Program Files).
 
 ## Sample-rate strategy
 

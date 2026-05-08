@@ -164,6 +164,55 @@ support SDRplay au build (cas d'un installeur ARM-only sans accès aux
 headers), désactiver la feature : `cargo tauri build --no-default-features
 --features pluto`.
 
+#### Installation de l'API SDRplay (Windows 10/11 MSVC)
+
+L'API 3.x livre un **installeur `.msi`** sur la même page
+<https://www.sdrplay.com/api/> (compte gratuit). Lancer l'installeur,
+accepter l'EULA — il pose :
+
+- `C:\Program Files\SDRplay\API\inc\sdrplay_api.h` et compagnons
+- `C:\Program Files\SDRplay\API\x64\sdrplay_api.lib` (import library MSVC)
+- `C:\Program Files\SDRplay\API\x64\sdrplay_api.dll` (runtime)
+- `C:\Program Files\SDRplay\sdrplay_apiService.exe` enregistré comme
+  service Windows (`Get-Service sdrplay_apiService` doit retourner
+  `Running`)
+
+Le build a aussi besoin de **`libclang.dll`** (utilisé par `bindgen`
+pour parser les headers C) — installation typique :
+
+```powershell
+winget install --id LLVM.LLVM -e
+```
+
+Le DLL atterrit sous `C:\Program Files\LLVM\bin\libclang.dll`. Si
+votre installation LLVM est ailleurs, exporter `LIBCLANG_PATH` vers
+le dossier qui contient `libclang.dll` avant `cargo build`.
+
+**Override des chemins SDRplay** (cas portable installé hors
+`Program Files`) — mêmes variables qu'en Linux :
+
+```powershell
+$env:SDRPLAY_API_INCLUDE_DIR = "D:\sdks\SDRplay\inc"
+$env:SDRPLAY_API_LIB_DIR     = "D:\sdks\SDRplay\x64"
+cargo build -p modem-sdrplay
+```
+
+À l'exécution, le binaire `nbfm-modem-gui.exe` est lié avec
+**`/DELAYLOAD:sdrplay_api.dll`** : la DLL n'est chargée qu'au premier
+appel SDRplay, pas au démarrage. Conséquence pratique pour les
+utilisateurs **sans SDRplay** : la GUI lance normalement, montre les
+backends Pluto et carte son, et la liste SDRplay reste simplement
+vide (un garde `LoadLibraryW` détecte le DLL manquant et le backend
+retourne une liste vide au lieu de planter sur
+`STATUS_DELAYLOAD_DLL_NOTFOUND`). Aucune popup d'erreur Windows au
+lancement.
+
+Pour les utilisateurs **avec SDRplay** : Windows résout
+`sdrplay_api.dll` via le PATH habituel. L'installeur SDRplay ajoute
+`C:\Program Files\SDRplay\API\x64\` au PATH système ; si ce n'est
+pas le cas (installation portable), copier le DLL à côté de
+l'exécutable.
+
 ### ⚠ Carte son sous Windows — vérifier le format à 48 kHz
 
 **Symptôme** : votre carte son (typiquement **SignaLink USB**, ou tout autre
@@ -526,6 +575,53 @@ it on another, both need the API. To skip SDRplay support at build
 time (ARM-only setup with no access to the headers, for instance),
 disable the feature: `cargo tauri build --no-default-features
 --features pluto`.
+
+#### SDRplay API install (Windows 10/11 MSVC)
+
+API 3.x ships a **`.msi` installer** on the same page —
+<https://www.sdrplay.com/api/> (free account). Run the installer,
+accept the EULA — it lays down:
+
+- `C:\Program Files\SDRplay\API\inc\sdrplay_api.h` and friends
+- `C:\Program Files\SDRplay\API\x64\sdrplay_api.lib` (MSVC import lib)
+- `C:\Program Files\SDRplay\API\x64\sdrplay_api.dll` (runtime)
+- `C:\Program Files\SDRplay\sdrplay_apiService.exe` registered as a
+  Windows service (`Get-Service sdrplay_apiService` should return
+  `Running`)
+
+Build also needs **`libclang.dll`** (used by `bindgen` to parse the
+C headers) — typical install:
+
+```powershell
+winget install --id LLVM.LLVM -e
+```
+
+The DLL ends up at `C:\Program Files\LLVM\bin\libclang.dll`. If your
+LLVM lives elsewhere, point `LIBCLANG_PATH` at the folder containing
+`libclang.dll` before `cargo build`.
+
+**SDRplay path overrides** (portable install outside `Program Files`)
+— same env vars as on Linux:
+
+```powershell
+$env:SDRPLAY_API_INCLUDE_DIR = "D:\sdks\SDRplay\inc"
+$env:SDRPLAY_API_LIB_DIR     = "D:\sdks\SDRplay\x64"
+cargo build -p modem-sdrplay
+```
+
+At runtime the `nbfm-modem-gui.exe` binary is linked with
+**`/DELAYLOAD:sdrplay_api.dll`**: the DLL is loaded lazily on the
+first SDRplay call, not at process start. Practical effect for users
+**without SDRplay**: the GUI launches normally, shows the Pluto and
+sound-card backends, and the SDRplay device list stays empty
+(a `LoadLibraryW` guard detects the missing DLL and the backend
+returns an empty list instead of crashing on
+`STATUS_DELAYLOAD_DLL_NOTFOUND`). No Windows error popup at launch.
+
+For users **with SDRplay**: Windows resolves `sdrplay_api.dll`
+through the usual PATH lookup. The SDRplay installer adds
+`C:\Program Files\SDRplay\API\x64\` to system PATH; if it doesn't
+(portable install), copy the DLL next to the executable.
 
 ### ⚠ Sound card on Windows — make sure the default format is 48 kHz
 
