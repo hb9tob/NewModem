@@ -52,11 +52,14 @@
 //!   loopback test): pending — `rx::start` and the TX submit path
 //!   still return `PlutoError::NotImplemented`.
 
+pub mod backend;
 pub mod device;
 pub mod error;
 pub mod rx;
+pub mod sample_sink_adapter;
 pub mod tx;
 
+pub use backend::{PlutoBackend, PlutoDevice};
 pub use error::PlutoError;
 
 /// Default Pluto IIO context URI on this Pi 5 — the device shows up on

@@ -305,104 +305,15 @@
             filtré. À activer si le récepteur radio n'applique pas (ou
             insuffisamment) la désemphase.
           </p>
-          <div id="pluto-rx-config" class="pluto-subgroup" hidden>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                Fréquence RX (MHz) :
-                <input type="number" id="pluto-rx-freq-mhz" step="0.001" min="70" max="6000">
-              </label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                AGC :
-                <select id="pluto-rx-gain-mode">
-                  <option value="manual">manual (gain fixe)</option>
-                  <option value="fast_attack">fast_attack (rapide)</option>
-                  <option value="slow_attack">slow_attack (lent)</option>
-                  <option value="hybrid">hybrid (mixte)</option>
-                </select>
-              </label>
-              <label class="pluto-field">
-                Gain RX (dB) :
-                <input type="number" id="pluto-rx-gain-db" min="-3" max="71" step="1">
-              </label>
-            </div>
-            <div class="pluto-row">
-              <span class="pluto-field-label">Déviation RX :</span>
-              <label class="pluto-field"><input type="radio" name="pluto-rx-dev" value="5000" checked> 5 kHz</label>
-              <label class="pluto-field"><input type="radio" name="pluto-rx-dev" value="2500"> 2.5 kHz</label>
-            </div>
-            <p class="tx-hint" style="margin: 0.4rem 0 0;">
-              5 kHz = NBFM standard, 2.5 kHz = relais étroits (NFM). Le gain
-              du discriminateur s'adapte automatiquement ; choisir une valeur
-              en-dessous de la déviation réelle de l'air écrête le son.
-            </p>
-          </div>
-          <div id="sdrplay-rx-config" class="pluto-subgroup" hidden>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                Fréquence RX (MHz) :
-                <input type="number" id="sdrplay-rx-freq-mhz" step="0.001" min="0.001" max="2000">
-              </label>
-            </div>
-            <div class="pluto-row">
-              <span class="pluto-field-label">Tuner :</span>
-              <label class="pluto-field"><input type="radio" name="sdrplay-tuner" value="A"> A (Hi-Z + 50 Ω)</label>
-              <label class="pluto-field"><input type="radio" name="sdrplay-tuner" value="B" checked> B (50 Ω + bias-T)</label>
-            </div>
-            <div class="pluto-row" id="sdrplay-antenna-row">
-              <span class="pluto-field-label">Port (Tuner A) :</span>
-              <label class="pluto-field"><input type="radio" name="sdrplay-antenna" value="hiz"> Hi-Z (1 kHz–60 MHz)</label>
-              <label class="pluto-field"><input type="radio" name="sdrplay-antenna" value="fifty" checked> 50 Ω (60 MHz–2 GHz)</label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                AGC :
-                <select id="sdrplay-agc-mode">
-                  <option value="disable">manuel (gain fixe)</option>
-                  <option value="slow">lent (5 Hz)</option>
-                  <option value="mid">moyen (50 Hz, défaut SDRplay)</option>
-                  <option value="fast">rapide (100 Hz)</option>
-                </select>
-              </label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                LNA state :
-                <input type="number" id="sdrplay-lna-state" min="0" max="9" step="1">
-              </label>
-              <label class="pluto-field">
-                IF gRdB :
-                <input type="number" id="sdrplay-if-grdb" min="20" max="59" step="1">
-              </label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                <input type="checkbox" id="sdrplay-bias-t">
-                Bias-T port B (+5 V pour préampli externe)
-              </label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                <input type="checkbox" id="sdrplay-fm-notch">
-                Filtre rejet FM (88–108 MHz)
-              </label>
-              <label class="pluto-field">
-                <input type="checkbox" id="sdrplay-dab-notch">
-                Filtre rejet DAB (174–240 MHz)
-              </label>
-            </div>
-            <div class="pluto-row">
-              <span class="pluto-field-label">Déviation RX :</span>
-              <label class="pluto-field"><input type="radio" name="sdrplay-rx-dev" value="5000" checked> 5 kHz</label>
-              <label class="pluto-field"><input type="radio" name="sdrplay-rx-dev" value="2500"> 2.5 kHz</label>
-            </div>
-            <p class="tx-hint" style="margin: 0.4rem 0 0;">
-              LNA state 0 = atténuation min / gain max ; 9 = atténuation max.
-              gRdB ignoré si AGC ≠ manuel — le démon SDRplay le pilote.
-              Le bias-T n'agit que sur le port Tuner B (Tuner A non concerné).
-            </p>
-          </div>
+          <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
+               in main.js fills this from `BackendCapabilities` of the
+               currently-selected SDR backend. Adding a new backend is
+               an `impl SdrBackend` + a cfg-feature line in
+               `sdr_registry.rs` — no HTML changes here. -->
+          <fieldset id="sdr-rx-panel" class="pluto-subgroup" hidden>
+            <div class="sdr-panel-rows" id="sdr-rx-rows"></div>
+            <p class="tx-hint" id="sdr-rx-hint" style="margin: 0.4rem 0 0;"></p>
+          </fieldset>
         </fieldset>
         <fieldset>
           <legend>Périphérique émission (TX)</legend>
@@ -428,56 +339,14 @@
             et atténuation) à côté du fichier source archivé. Désactivé
             par défaut.
           </p>
-          <div id="pluto-tx-config" class="pluto-subgroup" hidden>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                Fréquence TX (MHz) :
-                <input type="number" id="pluto-tx-freq-mhz" step="0.001" min="70" max="6000">
-              </label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field">
-                Atténuation TX (dB) :
-                <input type="number" id="pluto-tx-att-db" min="0" max="89.75" step="0.25">
-              </label>
-            </div>
-            <div class="pluto-row">
-              <span class="pluto-field-label">Déviation TX :</span>
-              <label class="pluto-field"><input type="radio" name="pluto-tx-dev-preset" value="5000" checked> 5 kHz</label>
-              <label class="pluto-field"><input type="radio" name="pluto-tx-dev-preset" value="2500"> 2.5 kHz</label>
-            </div>
-            <div class="pluto-row">
-              <label class="pluto-field" style="flex: 1;">
-                Fine-tune :
-                <input type="range" id="pluto-tx-dev-offset" min="-2000" max="2000" step="100" value="0" style="flex: 1;">
-              </label>
-              <span id="pluto-tx-dev-effective" class="pluto-field-value">5.0 kHz</span>
-            </div>
-            <p class="tx-hint" style="margin: 0.4rem 0 0;">
-              Fine-tune ±2 kHz autour du preset. Certains relais clippent
-              dès ~4.2 kHz, d'autres tolèrent jusqu'à 6 kHz.
-            </p>
-            <div class="pluto-row" style="margin-top: 0.7rem;">
-              <label class="ptt-row" style="margin: 0;">
-                <input type="checkbox" id="pluto-tx-ctcss-enabled">
-                CTCSS (squelch relais)
-              </label>
-              <label class="pluto-field">
-                Tonalité :
-                <select id="pluto-tx-ctcss-freq">
-                  <!-- 39 EIA standard tones, populated dynamically by main.js
-                       so the table stays in sync with modem-sdr-dsp's
-                       EIA_CTCSS_TONES_HZ. Default selection: 88.5 Hz. -->
-                </select>
-              </label>
-            </div>
-            <p class="tx-hint" style="margin: 0.4rem 0 0;">
-              Tone sub-audible (~10&nbsp;% de la déviation = ±500 Hz à 5 kHz)
-              ajouté à l'audio TX. Ouvre le squelch des relais
-              CTCSS-protégés. Le récepteur le filtre automatiquement
-              avant l'écoute.
-            </p>
-          </div>
+          <!-- Generic SDR TX panel — filled by `renderSdrPanel("tx")`.
+               Hidden when the selected TX device is RX-only or a cpal
+               soundcard; populated with freq / attenuation / deviation /
+               CTCSS rows when the backend's capabilities advertise them. -->
+          <fieldset id="sdr-tx-panel" class="pluto-subgroup" hidden>
+            <div class="sdr-panel-rows" id="sdr-tx-rows"></div>
+            <p class="tx-hint" id="sdr-tx-hint" style="margin: 0.4rem 0 0;"></p>
+          </fieldset>
         </fieldset>
         <fieldset>
           <legend>PTT (RTS/DTR sur port série)</legend>

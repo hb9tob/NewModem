@@ -33,9 +33,7 @@ use modem_framing::{
     payload_envelope::PayloadEnvelope,
     raptorq_codec::k_from_payload,
 };
-use modem_io::{CpalSink, SampleSink};
-use modem_pluto::device::PlutoConfig;
-use modem_pluto::tx::PlutoSink;
+use modem_io::SampleSink;
 use modem_sdr_dsp::emphasis::preemphasis_nbfm_48k;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -233,7 +231,7 @@ pub fn spawn_more(
     count: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
-    pluto_config: Option<PlutoConfig>,
+    tx_sink: Arc<dyn SampleSink>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
     // Where to dump the synthesised WAV (mono, 48 kHz, int16) before
@@ -285,7 +283,7 @@ pub fn spawn_more(
             wav_path,
             attenuation_db,
             preemphasis_enabled,
-            pluto_config,
+            tx_sink,
             stop_thread,
             ptt,
             sink,
@@ -310,7 +308,7 @@ pub fn spawn(
     repair_pct: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
-    pluto_config: Option<PlutoConfig>,
+    tx_sink: Arc<dyn SampleSink>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
     // See `spawn_more::save_wav_dir`. Same semantics for the initial
@@ -390,7 +388,7 @@ pub fn spawn(
             wav_path,
             attenuation_db,
             preemphasis_enabled,
-            pluto_config,
+            tx_sink,
             stop_thread,
             ptt,
             sink,
@@ -533,33 +531,6 @@ fn ptt_release(ptt: &SharedPtt) {
     }
 }
 
-/// Erased TX-stream handle so the polling loop in `run_playback`
-/// works against either `cpal::PlaybackHandle` or
-/// `modem_pluto::tx::TxJob`. Both already expose `pos`, `is_done`,
-/// and a drop-on-stop semantic — this trait just unifies the call
-/// sites without paying the cost of `dyn` dispatch on every poll
-/// (one virtual call per 100 ms tick is free).
-trait TxStream {
-    fn pos(&self) -> usize;
-    fn is_done(&self) -> bool;
-}
-impl TxStream for modem_io::PlaybackHandle {
-    fn pos(&self) -> usize {
-        modem_io::PlaybackHandle::pos(self)
-    }
-    fn is_done(&self) -> bool {
-        modem_io::PlaybackHandle::is_done(self)
-    }
-}
-impl TxStream for modem_pluto::tx::TxJob {
-    fn pos(&self) -> usize {
-        modem_pluto::tx::TxJob::pos(self)
-    }
-    fn is_done(&self) -> bool {
-        modem_pluto::tx::TxJob::is_done(self)
-    }
-}
-
 fn run_playback(
     device_name: &str,
     mut samples: Vec<f32>,
@@ -568,7 +539,7 @@ fn run_playback(
     wav_path: String,
     attenuation_db: f32,
     preemphasis_enabled: bool,
-    pluto_config: Option<PlutoConfig>,
+    tx_sink: Arc<dyn SampleSink>,
     stop: Arc<AtomicBool>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
@@ -621,43 +592,27 @@ fn run_playback(
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
     }
 
-    // Route on `pluto_config`: if `Some`, the device is a Pluto
-    // (frontend prefixed it with `pluto:` and the Tauri layer built a
-    // PlutoConfig from settings); send the audio through the Pluto
-    // FM modulator chain. Otherwise the cpal sound-card path. Both
-    // return a handle erased to `Box<dyn TxStream>` so the polling
-    // loop below stays identical.
-    let handle: Box<dyn TxStream> = if let Some(pcfg) = pluto_config {
-        match PlutoSink::new(pcfg).play_buffer(samples) {
-            Ok(h) => Box::new(h),
-            Err(e) => {
-                if ptt_engaged {
-                    ptt_release(&ptt);
-                }
-                sink.emit(
-                    "tx_error",
-                    TxErrorEvent {
-                        message: format!("Pluto TX: {e}"),
-                    },
-                );
-                return;
+    // The Tauri layer resolved `tx_sink` upfront (Pluto SampleSink for a
+    // composite SDR device name, or CpalSink for a plain cpal name). Both
+    // implementations return `modem_io::PlaybackHandle`, so the polling
+    // loop below is uniform — one trait dispatch on `play_buffer`, then
+    // direct method calls on the handle. The `device_name` arg is
+    // ignored by the Pluto adapter (it already knows its libiio URI from
+    // the SdrConfig that built the sink) but kept for the cpal sink
+    // which still needs it for device lookup.
+    let handle = match tx_sink.play_buffer(device_name, AUDIO_RATE, samples) {
+        Ok(h) => h,
+        Err(e) => {
+            if ptt_engaged {
+                ptt_release(&ptt);
             }
-        }
-    } else {
-        match CpalSink.play_buffer(device_name, AUDIO_RATE, samples) {
-            Ok(h) => Box::new(h),
-            Err(e) => {
-                if ptt_engaged {
-                    ptt_release(&ptt);
-                }
-                sink.emit(
-                    "tx_error",
-                    TxErrorEvent {
-                        message: e.to_string(),
-                    },
-                );
-                return;
-            }
+            sink.emit(
+                "tx_error",
+                TxErrorEvent {
+                    message: e.to_string(),
+                },
+            );
+            return;
         }
     };
 

@@ -1,6 +1,22 @@
 use crate::overlay::{default_overlay_slots, Overlay};
+use modem_sdr::{GainSetting, ManualGainValue, SdrConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Bumped every time the SDR-related portion of `Settings` changes
+/// shape. On load, values < `SETTINGS_SCHEMA_VERSION` trigger a
+/// targeted reset of the SDR fields (`rx_device`, `tx_device`,
+/// `sdr_settings`); all other fields (callsign, PTT, overlays,
+/// preprocessing toggles, …) are preserved.
+///
+/// History:
+///   1 → settings.json before the SDR-agnostic refactor (35 scattered
+///       `pluto_*` / `sdrplay_*` fields). Reading such a file dumps
+///       those fields into the new SdrSettings via reset.
+///   2 → SDR-agnostic schema (this release): `sdr_settings:
+///       SdrSettings` with one entry per backend.
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 
 fn default_true() -> bool {
     true
@@ -9,9 +25,19 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Settings-file schema version. New fields default to 0 on
+    /// missing → triggers a one-time SDR reset on first run after
+    /// upgrade. See [`SETTINGS_SCHEMA_VERSION`].
+    pub settings_schema_version: u32,
+
     pub callsign: String,
+    /// Composite device name produced by `SdrBackend::list_devices`,
+    /// e.g. `"pluto:usb:1.6.5"`, `"sdrplay:22340A2A34"`, or a plain
+    /// cpal name like `"USB Audio (hw:1,0)"`. The registry's
+    /// `parse_composite_name` distinguishes the two.
     pub rx_device: String,
     pub tx_device: String,
+
     pub ptt_enabled: bool,
     pub ptt_port: String,
     #[serde(default = "default_true")]
@@ -23,359 +49,206 @@ pub struct Settings {
     pub ptt_rts_tx_high: bool,
     #[serde(default = "default_true")]
     pub ptt_dtr_tx_high: bool,
+
     /// Attenuation applied to the TX WAV before sending it to the sound
-    /// card, in dB (<= 0). Filled in by the Channel tab (ATT cascade).
-    /// Applied gain: `10^(att/20)`. Default: 0 dB (no attenuation).
+    /// card / SDR sink, in dB (<= 0). Filled in by the Channel tab (ATT
+    /// cascade). Applied gain: `10^(att/20)`. Default: 0 dB. Worker-level
+    /// (not SDR-specific) — applied uniformly to every TX path.
     pub tx_attenuation_db: f32,
     /// If true, applies an NBFM pre-emphasis +6 dB/octave shelf
-    /// (tau1 = 750 us / tau2 = 75 us, breakpoints ~212 Hz and ~2.12 kHz)
-    /// to the WAV before sending it to the sound card. Useful to
-    /// compensate a TX audio chain that de-emphasizes too aggressively,
-    /// or to recover the slope expected by a transceiver whose internal
-    /// pre-emphasis is absent. The filtered signal is re-normalized to
-    /// peak 0.9 to avoid sound-card clipping. Default: false.
+    /// (tau1 = 750 us / tau2 = 75 us) to the WAV before sending it to
+    /// the sink. Worker-level — see `tx_worker::run_playback`.
     #[serde(default)]
     pub tx_preemphasis_enabled: bool,
-    /// If true, applies an NBFM de-emphasis -6 dB/octave shelf
-    /// (mathematical inverse of `tx_preemphasis_enabled`, same break
-    /// points ~212 Hz / ~2.12 kHz, plateau -20 dB) to the captured
-    /// audio on the path going to the modem demodulator. The raw WAV
-    /// capture and the audio level meter stay on the unfiltered signal.
-    /// Useful when the receiving transceiver does not apply enough
-    /// de-emphasis (or none) and the high-frequency boost from the
-    /// transmitter side hurts EVM. Default: false.
+    /// If true, applies an NBFM de-emphasis -6 dB/octave shelf to the
+    /// captured audio on the path going to the modem demodulator.
+    /// Worker-level — see `rx_worker::spawn`.
     #[serde(default)]
     pub rx_deemphasis_enabled: bool,
-    /// Base URL of the Phase-D collector (e.g. `https://hb9tob-modem.duckdns.org`).
-    /// If empty, the post-raw-capture prompt does not appear and submission
-    /// is disabled for the session.
+
+    /// Base URL of the Phase-D collector. If empty, the post-raw-capture
+    /// prompt does not appear and submission is disabled for the session.
     pub collector_url: String,
     /// AVIF quality remembered across sessions (0-100). Default 10:
     /// compact file for slow NBFM passes.
     #[serde(default = "default_tx_quality")]
     pub tx_quality: u32,
-    /// Percentage of RaptorQ repair blocks added to the initial burst
-    /// (0, 5, 10, 20, ...). Default 5: modest redundancy, the user can
-    /// raise it as needed.
+    /// Percentage of RaptorQ repair blocks added to the initial burst.
     #[serde(default = "default_tx_repair_pct")]
     pub tx_repair_pct: u32,
-    /// Modem mode selected in the TX panel. Standard profiles:
-    /// ULTRA / ROBUST / NORMAL / HIGH / HIGH56 / HIGH+. Experimental
-    /// profiles (visible only when `experimental_modes_enabled`):
-    /// MEGA / FAST / HIGH++ / HIGH+56. Default HIGH56.
     #[serde(default = "default_tx_mode")]
     pub tx_mode: String,
-    /// Resize choice (`none`, `1920x1024`, `800x600`, `free`).
     #[serde(default = "default_tx_resize")]
     pub tx_resize: String,
-    /// Dimensions entered in `free` mode.
     #[serde(default = "default_tx_free_w")]
     pub tx_free_w: u32,
     #[serde(default = "default_tx_free_h")]
     pub tx_free_h: u32,
-    /// AVIF encoder speed, 1..=10.
     #[serde(default = "default_tx_speed")]
     pub tx_speed: u32,
-    /// Number of additional blocks for TX more (1..).
     #[serde(default = "default_tx_more_count")]
     pub tx_more_count: u32,
-    /// Maximum size of the TX history (number of files retained in
-    /// `<save_dir>/tx_history/`). Default 100. Beyond that, older files
-    /// are purged on each archive.
     #[serde(default = "default_tx_history_max")]
     pub tx_history_max: u32,
-    /// If true, the TX worker writes the synthesised audio to a WAV
-    /// (mono, 48 kHz, int16) under `<save_dir>/tx_history/` next to the
-    /// archived source. The legacy in-process pipeline dropped the
-    /// intermediate WAV; this toggle reinstates it for users who want
-    /// to inspect / replay the on-air signal offline. Default false —
-    /// keeps disk usage bounded for kiosk operators.
     #[serde(default)]
     pub tx_save_wav: bool,
-    /// Lock the RX onto a specific profile (bypassing the FFT-gate
-    /// auto-detection). Required to decode experimental profiles
-    /// (MEGA, FAST, HIGH++, HIGH+56) that are absent from
-    /// `PROBE_TEMPLATES`. Default false.
     #[serde(default)]
     pub rx_force_mode: bool,
-    /// Profile to force on the RX side when `rx_force_mode = true`.
-    /// Ignored otherwise. Default HIGH56 (the recommended standard
-    /// profile).
     #[serde(default = "default_rx_forced_profile")]
     pub rx_forced_profile: String,
-    /// Show/hide experimental profiles in the TX and RX combos plus
-    /// the "Force a profile" option on RX startup. Default false: the
-    /// user discovers the app with only standard profiles exposed.
-    /// Toggleable from the Settings tab.
     #[serde(default)]
     pub experimental_modes_enabled: bool,
-    /// Five fixed overlay slots. Slot 0 is the immutable "Aucun" entry
-    /// (no overlay applied); slots 1..=4 are user-editable templates
-    /// for callsign / club logo / etc. Baked into the resized image
-    /// inside `compress_avif` so the preview and the transmitted bytes
-    /// match.
     #[serde(default = "default_overlay_slots")]
     pub overlays: Vec<Overlay>,
-    /// Index of the currently active slot (0..=4). 0 means no overlay.
     #[serde(default)]
     pub active_overlay: u32,
-    /// Set to `true` once the bundled default overlay (logo on slot 1)
-    /// has been written to disk and seeded into the settings. Stays
-    /// `false` on legacy `settings.json` files so the first run after
-    /// an upgrade installs the default overlay even when the rest of
-    /// the user's preferences are preserved.
     #[serde(default)]
     pub overlay_default_seeded: bool,
 
-    // ───── PlutoSDR controls ─────────────────────────────────────────
-    //
-    // RX and TX have separate LO frequencies on the AD9361 (split-band
-    // operation is common on amateur duplex repeaters: RX one freq,
-    // TX a paired offset). The GUI exposes both independently. TX
-    // power on Pluto is `hardwaregain` on the TX baseband channel,
-    // expressed as attenuation in dB (positive = more attenuation).
-    /// Pluto RX_LO frequency in Hz. Default 145.5 MHz (2 m ham band).
-    #[serde(default = "default_pluto_rx_freq_hz")]
-    pub pluto_rx_freq_hz: u64,
-    /// Pluto TX_LO frequency in Hz. Default 145.5 MHz (= RX, simplex).
-    /// Set independently for repeater duplex (e.g. RX 145.625 / TX
-    /// 145.025 with a 600 kHz negative shift).
-    #[serde(default = "default_pluto_tx_freq_hz")]
-    pub pluto_tx_freq_hz: u64,
-    /// Pluto RX gain control mode. One of the AD9361 strings
-    /// `manual` / `fast_attack` / `slow_attack` / `hybrid` (the
-    /// chip's `gain_control_mode_available` set). Default
-    /// `slow_attack` — what the AD9361 driver itself defaults to,
-    /// nice smooth tracking for ham-band receive. Switch to
-    /// `manual` and tune `pluto_rx_gain_db` for lab work where
-    /// the input level is known.
-    #[serde(default = "default_pluto_rx_gain_mode")]
-    pub pluto_rx_gain_mode: String,
-    /// Pluto RX manual gain in dB. Range `[-3, 71]` step 1 dB on
-    /// the AD9363. Default 30. Only honoured when
-    /// `pluto_rx_gain_mode = "manual"` — in any AGC mode the chip
-    /// picks gain on its own.
-    #[serde(default = "default_pluto_rx_gain_db")]
-    pub pluto_rx_gain_db: i32,
-    /// Pluto TX attenuation in dB (positive = more attenuation, less
-    /// output power). Range `[0, 89.75]` step 0.25 dB. Default 30
-    /// (a safe medium-power value — full power at 0 can saturate
-    /// nearby receivers without an antenna isolator).
-    #[serde(default = "default_pluto_tx_attenuation_db")]
-    pub pluto_tx_attenuation_db: f64,
-    /// Pluto RX FM max deviation in Hz. `5000` = NBFM standard,
-    /// `2500` = narrow NFM (some repeaters / PMR-style channels).
-    /// The discriminator gain scales as `1 / max_deviation`; picking
-    /// it below the actual on-air deviation soft-clips the audio,
-    /// above attenuates it. Default 5000.
-    #[serde(default = "default_pluto_rx_deviation_hz")]
-    pub pluto_rx_deviation_hz: u32,
-    /// Pluto TX FM deviation preset in Hz, before the fine-tune
-    /// offset. `5000` = NBFM, `2500` = narrow NFM. The effective
-    /// deviation passed to the modulator is
-    /// [`Self::effective_pluto_tx_deviation_hz`] = preset + offset.
-    /// Default 5000.
-    #[serde(default = "default_pluto_tx_deviation_preset_hz")]
-    pub pluto_tx_deviation_preset_hz: u32,
-    /// Fine-tune offset around the TX deviation preset, in Hz.
-    /// Range `[-2000, +2000]`. Lets the operator dial in a value
-    /// that the local repeater accepts without clipping (some clip
-    /// at ~4.2 kHz, others tolerate up to 6 kHz). Default 0.
-    #[serde(default = "default_pluto_tx_deviation_offset_hz")]
-    pub pluto_tx_deviation_offset_hz: i32,
-    /// Whether the CTCSS sub-audible tone is mixed into the TX
-    /// audio. Off by default — most simplex contacts and many
-    /// repeaters don't need it. Enable when transmitting through a
-    /// CTCSS-protected repeater.
+    /// Per-backend SDR config and MRU favourites. Keyed by
+    /// `SdrBackend::id()`. Replaces the 35 scattered `pluto_*` /
+    /// `sdrplay_*` fields the legacy schema carried.
     #[serde(default)]
-    pub pluto_tx_ctcss_enabled: bool,
-    /// CTCSS tone frequency in Hz. One of the 39 EIA standard
-    /// values (67.0 – 254.1 Hz). Default 88.5 Hz, the most common
-    /// French / Swiss 2 m repeater pilot.
-    #[serde(default = "default_pluto_tx_ctcss_freq_hz")]
-    pub pluto_tx_ctcss_freq_hz: f32,
-    /// MRU list of recently-used Pluto frequencies, in Hz. Auto-fed
-    /// from the on-screen frequency keypad on every Valider press;
-    /// the GUI surfaces the list as a row of quick-pick buttons at
-    /// the top of the keypad. Capped at 6 entries (most recent
-    /// first); deduplicated on insert. Empty on first run.
-    #[serde(default)]
-    pub pluto_freq_favorites: Vec<u64>,
+    pub sdr_settings: SdrSettings,
+}
 
-    // ───── SDRplay RSPduo controls ───────────────────────────────────
-    //
-    // RX-only — RSPduo is RX-only hardware. Kept in the same
-    // settings.json so the GUI can switch between Pluto and SDRplay
-    // without losing state on either side. Backend `start_capture`
-    // routes on the device-name prefix (`sdrplay:` vs `pluto:`).
-    /// Tuner half of the RSPduo to use in single-tuner mode.
-    /// `"A"` (Tuner 1, has both Hi-Z and 50 Ω ports) or `"B"`
-    /// (Tuner 2, single 50 Ω port — and the only one with a
-    /// bias-T). Default `"B"` because the bias-T-on-port-B is
-    /// where most external preamps end up.
-    #[serde(default = "default_sdrplay_tuner")]
-    pub sdrplay_tuner: String,
-    /// Antenna port on Tuner A. `"hiz"` = AMPORT_1 (1 kHz-60 MHz),
-    /// `"fifty"` = AMPORT_2 (60 MHz-2 GHz). Ignored when
-    /// `sdrplay_tuner = "B"`. Default `"fifty"` for VHF amateur.
-    #[serde(default = "default_sdrplay_antenna")]
-    pub sdrplay_antenna: String,
-    /// **Bias-T on Tuner B's port.** Pushes +5 V DC up the
-    /// antenna cable to power external preamps. RSPduo only
-    /// exposes bias-T on Tuner B; turning it on while
-    /// `sdrplay_tuner = "A"` has no effect on the active path.
-    /// Default false — leaving DC on the cable when nothing
-    /// expects it can damage some receivers.
+/// SDR-side persistent state. One entry per registered backend.
+/// Empty map = first run after the schema-2 reset; the GUI seeds
+/// each entry on demand via [`Settings::sdr_config_for`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SdrSettings {
     #[serde(default)]
-    pub sdrplay_bias_t: bool,
-    /// Broadcast-FM rejection notch (~88-108 MHz). Default false.
+    pub backends: HashMap<String, BackendSettings>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackendSettings {
     #[serde(default)]
-    pub sdrplay_fm_notch: bool,
-    /// DAB band-III rejection notch (~174-240 MHz). Default false.
+    pub config: SdrConfig,
+    /// MRU list of recently-used frequencies, in Hz (most-recent
+    /// first, capped at 6, deduplicated on insert). Replaces the
+    /// legacy `pluto_freq_favorites` + `sdrplay_freq_favorites`.
     #[serde(default)]
-    pub sdrplay_dab_notch: bool,
-    /// RSPduo RX LO frequency in Hz. Default 145.5 MHz.
-    #[serde(default = "default_sdrplay_rx_freq_hz")]
-    pub sdrplay_rx_freq_hz: u64,
-    /// LNA state index. RSPduo's VHF table has 10 states,
-    /// 0 = least attenuation = most gain. Default 4 (mid-band).
-    #[serde(default = "default_sdrplay_lna_state")]
-    pub sdrplay_lna_state: u8,
-    /// IF gain reduction in dB. Range 20-59 (the chip's
-    /// `gRdB`). Ignored when `sdrplay_agc_mode != "disable"`
-    /// (the daemon manages it). Default 40.
-    #[serde(default = "default_sdrplay_if_gain_reduction_db")]
-    pub sdrplay_if_gain_reduction_db: i32,
-    /// AGC loop bandwidth, mapped onto `sdrplay_api_AgcControlT`:
-    /// `"disable"` → manual gain only (default), `"slow"` = 5 Hz,
-    /// `"mid"` = 50 Hz (the SDRplay default), `"fast"` = 100 Hz.
-    /// LNA state stays manual whatever the AGC mode.
-    #[serde(default = "default_sdrplay_agc_mode")]
-    pub sdrplay_agc_mode: String,
-    /// Maximum FM deviation expected on air (Hz). 5000 = NBFM
-    /// standard, 2500 = narrow NFM. Drives the QuadratureDemod
-    /// gain in the DSP chain.
-    #[serde(default = "default_sdrplay_rx_deviation_hz")]
-    pub sdrplay_rx_deviation_hz: u32,
-    /// MRU list of recently-used SDRplay frequencies (mirror of
-    /// `pluto_freq_favorites` for the SDRplay-tab freq keypad).
-    #[serde(default)]
-    pub sdrplay_freq_favorites: Vec<u64>,
+    pub freq_favorites: Vec<u64>,
 }
 
 impl Settings {
-    /// Effective TX deviation in Hz = preset + fine-tune offset,
-    /// clamped to a sane range (500 Hz min, 8 kHz max). Always use
-    /// this accessor when feeding `PlutoConfig::tx_deviation_hz`;
-    /// callers must NOT add preset+offset themselves to keep the
-    /// clamp policy in one place.
-    pub fn effective_pluto_tx_deviation_hz(&self) -> u32 {
-        let raw = self.pluto_tx_deviation_preset_hz as i32 + self.pluto_tx_deviation_offset_hz;
-        raw.clamp(500, 8000) as u32
+    /// Build the [`SdrConfig`] to hand to a particular backend. If
+    /// `sdr_settings.backends` carries an entry for `backend_id`, that
+    /// stored config is the seed; otherwise we synthesize the
+    /// historical default for that backend (see
+    /// [`default_sdr_config_for`]). In both cases the `device_id`
+    /// field is overwritten with the live composite parse so
+    /// `<backend>:<device_id>` round-trips losslessly.
+    pub fn sdr_config_for(&self, backend_id: &str, device_id: &str) -> SdrConfig {
+        let mut cfg = self
+            .sdr_settings
+            .backends
+            .get(backend_id)
+            .map(|bs| bs.config.clone())
+            .unwrap_or_else(|| default_sdr_config_for(backend_id));
+        cfg.backend_id = backend_id.to_string();
+        cfg.device_id = device_id.to_string();
+        cfg
+    }
+}
+
+/// Historical defaults for known backends. Keys come from the
+/// `SdrBackend::id()` of each compiled-in impl. Unknown IDs get a
+/// barely-useful blank config; the GUI's first save replaces it.
+pub fn default_sdr_config_for(backend_id: &str) -> SdrConfig {
+    match backend_id {
+        "pluto" => {
+            let mut cfg = SdrConfig {
+                backend_id: "pluto".into(),
+                device_id: String::new(),
+                rx_freq_hz: 145_500_000,
+                tx_freq_hz: 145_500_000,
+                // The AD9361 driver's own default — smooth tracking
+                // for ham-band receive. The user picks "Manual"
+                // explicitly when running level-calibrated lab work.
+                gain: GainSetting::AgcMode {
+                    id: "slow_attack".into(),
+                },
+                max_deviation_hz: 5_000.0,
+                tx_deviation_hz: 5_000.0,
+                rf_bandwidth_hz: Some(200_000),
+                ..SdrConfig::default()
+            };
+            cfg.backend_extras.insert(
+                "tx_attenuation_db".into(),
+                serde_json::json!(30.0),
+            );
+            cfg.backend_extras
+                .insert("prefer_low_rate".into(), serde_json::json!(true));
+            cfg
+        }
+        "sdrplay" => {
+            let mut cfg = SdrConfig {
+                backend_id: "sdrplay".into(),
+                device_id: String::new(),
+                rx_freq_hz: 145_500_000,
+                tx_freq_hz: 145_500_000,
+                // RSPduo VHF-default — LNA mid-band, IF gRdB at 40,
+                // AGC off (manual gain). Maps onto SdrplayConfig
+                // (lna_state=4, if_gain_reduction_db=40, AgcMode::Disable).
+                gain: GainSetting::Manual(ManualGainValue::LnaPlusIf {
+                    lna_state: 4,
+                    if_grdb: 40,
+                }),
+                max_deviation_hz: 5_000.0,
+                tx_deviation_hz: 5_000.0,
+                antenna: "fifty".into(),
+                ..SdrConfig::default()
+            };
+            cfg.backend_extras
+                .insert("tuner".into(), serde_json::json!("B"));
+            cfg.backend_extras
+                .insert("decimation".into(), serde_json::json!(4));
+            cfg
+        }
+        _ => SdrConfig {
+            backend_id: backend_id.to_string(),
+            ..SdrConfig::default()
+        },
     }
 }
 
 fn default_tx_quality() -> u32 {
     10
 }
-
 fn default_tx_repair_pct() -> u32 {
     5
 }
-
 fn default_tx_mode() -> String {
     "HIGH56".to_string()
 }
-
 fn default_rx_forced_profile() -> String {
     "HIGH56".to_string()
 }
-
 fn default_tx_resize() -> String {
     "800x600".to_string()
 }
-
 fn default_tx_free_w() -> u32 {
     800
 }
-
 fn default_tx_free_h() -> u32 {
     600
 }
-
 fn default_tx_speed() -> u32 {
     6
 }
-
 fn default_tx_more_count() -> u32 {
     5
 }
-
 fn default_tx_history_max() -> u32 {
     100
-}
-
-fn default_pluto_rx_freq_hz() -> u64 {
-    145_500_000
-}
-
-fn default_pluto_tx_freq_hz() -> u64 {
-    145_500_000
-}
-
-fn default_pluto_rx_gain_mode() -> String {
-    "slow_attack".to_string()
-}
-
-fn default_pluto_rx_gain_db() -> i32 {
-    30
-}
-
-fn default_pluto_tx_attenuation_db() -> f64 {
-    30.0
-}
-
-fn default_pluto_rx_deviation_hz() -> u32 {
-    5000
-}
-
-fn default_pluto_tx_deviation_preset_hz() -> u32 {
-    5000
-}
-
-fn default_pluto_tx_deviation_offset_hz() -> i32 {
-    0
-}
-
-fn default_pluto_tx_ctcss_freq_hz() -> f32 {
-    88.5
-}
-
-fn default_sdrplay_tuner() -> String {
-    "B".to_string()
-}
-fn default_sdrplay_antenna() -> String {
-    "fifty".to_string()
-}
-fn default_sdrplay_rx_freq_hz() -> u64 {
-    145_500_000
-}
-fn default_sdrplay_lna_state() -> u8 {
-    4
-}
-fn default_sdrplay_if_gain_reduction_db() -> i32 {
-    40
-}
-fn default_sdrplay_agc_mode() -> String {
-    "disable".to_string()
-}
-fn default_sdrplay_rx_deviation_hz() -> u32 {
-    5000
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            settings_schema_version: SETTINGS_SCHEMA_VERSION,
             callsign: String::new(),
             rx_device: String::new(),
             tx_device: String::new(),
@@ -405,28 +278,7 @@ impl Default for Settings {
             overlays: default_overlay_slots(),
             active_overlay: 0,
             overlay_default_seeded: false,
-            pluto_rx_freq_hz: default_pluto_rx_freq_hz(),
-            pluto_tx_freq_hz: default_pluto_tx_freq_hz(),
-            pluto_rx_gain_mode: default_pluto_rx_gain_mode(),
-            pluto_rx_gain_db: default_pluto_rx_gain_db(),
-            pluto_tx_attenuation_db: default_pluto_tx_attenuation_db(),
-            pluto_rx_deviation_hz: default_pluto_rx_deviation_hz(),
-            pluto_tx_deviation_preset_hz: default_pluto_tx_deviation_preset_hz(),
-            pluto_tx_deviation_offset_hz: default_pluto_tx_deviation_offset_hz(),
-            pluto_tx_ctcss_enabled: false,
-            pluto_tx_ctcss_freq_hz: default_pluto_tx_ctcss_freq_hz(),
-            pluto_freq_favorites: Vec::new(),
-            sdrplay_tuner: default_sdrplay_tuner(),
-            sdrplay_antenna: default_sdrplay_antenna(),
-            sdrplay_bias_t: false,
-            sdrplay_fm_notch: false,
-            sdrplay_dab_notch: false,
-            sdrplay_rx_freq_hz: default_sdrplay_rx_freq_hz(),
-            sdrplay_lna_state: default_sdrplay_lna_state(),
-            sdrplay_if_gain_reduction_db: default_sdrplay_if_gain_reduction_db(),
-            sdrplay_agc_mode: default_sdrplay_agc_mode(),
-            sdrplay_rx_deviation_hz: default_sdrplay_rx_deviation_hz(),
-            sdrplay_freq_favorites: Vec::new(),
+            sdr_settings: SdrSettings::default(),
         }
     }
 }
@@ -457,10 +309,25 @@ fn settings_path() -> PathBuf {
 
 pub fn load() -> Settings {
     let path = settings_path();
-    std::fs::read_to_string(&path)
+    let mut s: Settings = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if s.settings_schema_version < SETTINGS_SCHEMA_VERSION {
+        eprintln!(
+            "[settings] schema upgrade {} → {}: SDR settings reset to defaults",
+            s.settings_schema_version, SETTINGS_SCHEMA_VERSION,
+        );
+        // Reset only the SDR-touched fields. Everything else
+        // (callsign, PTT config, overlays, channel ATT, …) survives
+        // the upgrade.
+        s.rx_device = String::new();
+        s.tx_device = String::new();
+        s.sdr_settings = SdrSettings::default();
+        s.settings_schema_version = SETTINGS_SCHEMA_VERSION;
+        let _ = save(&s);
+    }
+    s
 }
 
 pub fn save(s: &Settings) -> Result<(), String> {

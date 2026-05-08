@@ -7,12 +7,15 @@ publish = false
 
 [dependencies]
 modem-sdr-dsp = { path = "../modem-sdr-dsp" }
+modem-sdr = { path = "../modem-sdr" }
+modem-io = { path = "../modem-io" }
 industrial-io = "0.6"
 num-complex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 hound = { workspace = true }
+serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

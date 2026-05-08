@@ -603,14 +603,26 @@ function ensureOverlaySlots() {
   }
 }
 
-function populateDeviceSelect(selectId, devices, savedName, plutoDevices, sdrplayDevices) {
+/// Populate a device dropdown with cpal soundcards followed by every
+/// SDR backend's live devices. SDR entries are filtered by direction
+/// — backends with `tx_supported=false` don't appear on the TX list.
+/// Each `<option>` carries `data-backend="<id>"` (or `"audio"` for
+/// cpal); `renderSdrPanel` reads that attribute to know which
+/// capabilities to render.
+///
+/// `backendDevices` is a `Map<backend_id, DeviceDescriptor[]>`
+/// produced by parallel `list_sdr_devices` calls in `loadDevices`.
+function populateDeviceSelect(selectId, devices, savedName, backendDevices, direction) {
   const select = document.getElementById(selectId);
   if (!select) return null;
   select.innerHTML = "";
   const audio = devices || [];
-  const pluto = plutoDevices || [];
-  const sdrplay = sdrplayDevices || [];
-  if (audio.length === 0 && pluto.length === 0 && sdrplay.length === 0) {
+  const sdrCount = (() => {
+    let n = 0;
+    for (const [, devs] of backendDevices || []) n += (devs || []).length;
+    return n;
+  })();
+  if (audio.length === 0 && sdrCount === 0) {
     const opt = document.createElement("option");
     opt.textContent = "aucun périphérique détecté";
     opt.value = "";
@@ -629,41 +641,33 @@ function populateDeviceSelect(selectId, devices, savedName, plutoDevices, sdrpla
     const tagErr = dev.error ? ` [${dev.error}]` : "";
     opt.textContent = `${dev.friendly_name} — ${range}${tag48}${tagDef}${tagErr}`;
     opt.dataset.supports48k = dev.supports_48k ? "1" : "0";
-    opt.dataset.kind = "audio";
+    opt.dataset.backend = "audio";
     select.appendChild(opt);
     if (preferred === null && dev.supports_48k) preferred = dev;
     if (dev.is_default && dev.supports_48k) preferred = dev;
   }
-  // Pluto entries — synthetic device names like `pluto:usb:1.6.5`. The
-  // backend's start_capture routes on the prefix and opens libiio
-  // instead of cpal. Pluto entries always claim 48 kHz support
-  // because the modem-pluto chain decimates the AD9361 IF down to
-  // exactly 48 kHz before the worker sees a single sample.
-  for (const dev of pluto) {
-    const opt = document.createElement("option");
-    opt.value = dev.name;
-    opt.textContent = `${dev.friendly_name} ✓48k [SDR]`;
-    opt.dataset.supports48k = "1";
-    opt.dataset.kind = "pluto";
-    select.appendChild(opt);
+  for (const [backendId, devs] of backendDevices || []) {
+    const info = sdrBackends.get(backendId);
+    if (!info) continue;
+    const supported = direction === "rx" ? info.capabilities.rx_supported : info.capabilities.tx_supported;
+    if (!supported) continue;
+    for (const dev of devs) {
+      const opt = document.createElement("option");
+      opt.value = dev.composite_name;
+      opt.textContent = `${dev.friendly_name} ✓48k [SDR]`;
+      opt.dataset.supports48k = "1";
+      opt.dataset.backend = backendId;
+      select.appendChild(opt);
+    }
   }
-  // SDRplay entries — synthetic names `sdrplay:<serial>`. RX-only
-  // hardware, so we only populate this on RX selects (the loop body
-  // doesn't gate on selectId because the TX list comes back empty
-  // for SDRplay anyway: list_sdrplay_devices is RX-only). Same 48k
-  // claim as Pluto: the modem-sdrplay chain emits exactly 48 kHz.
-  for (const dev of sdrplay) {
-    const opt = document.createElement("option");
-    opt.value = dev.name;
-    opt.textContent = `${dev.friendly_name} ✓48k [SDR]`;
-    opt.dataset.supports48k = "1";
-    opt.dataset.kind = "sdrplay";
-    select.appendChild(opt);
+  // Priority: saved value if still in the list, otherwise the preferred cpal entry.
+  let savedFound = false;
+  if (savedName) {
+    for (let i = 0; i < select.options.length; i++) {
+      if (select.options[i].value === savedName) { savedFound = true; break; }
+    }
   }
-  // Priority: saved value if still available, otherwise the preferred one.
-  if (savedName && (audio.some(d => d.name === savedName)
-      || pluto.some(d => d.name === savedName)
-      || sdrplay.some(d => d.name === savedName))) {
+  if (savedFound) {
     select.value = savedName;
   } else if (preferred) {
     select.value = preferred.name;
@@ -671,42 +675,23 @@ function populateDeviceSelect(selectId, devices, savedName, plutoDevices, sdrpla
   return select.value || null;
 }
 
-/// Show or hide the SDR-specific settings sub-panels based on
-/// whether the currently-selected RX/TX device is a Pluto or an
-/// SDRplay. Each combination has its own `*-rx-config` block in
-/// `index.html`; this routine flips `hidden` accordingly. Called
-/// whenever a device select changes and at startup.
-function refreshPlutoPanelVisibility() {
-  const showFor = (selectId, kindToPanel) => {
-    const sel = document.getElementById(selectId);
-    if (!sel) return;
-    const opt = sel.options[sel.selectedIndex];
-    const kind = opt && opt.dataset && opt.dataset.kind;
-    for (const [k, panelId] of Object.entries(kindToPanel)) {
-      const panel = document.getElementById(panelId);
-      if (panel) panel.hidden = (kind !== k);
-    }
-  };
-  showFor("rx-device-select", {
-    pluto: "pluto-rx-config",
-    sdrplay: "sdrplay-rx-config",
-  });
-  // TX has only Pluto for now (RSPduo is RX-only hardware).
-  showFor("tx-device-select", { pluto: "pluto-tx-config" });
-  // Tuner-A vs Tuner-B sub-toggle on the SDRplay panel: the
-  // antenna-port radios only matter when Tuner A is selected. Hide
-  // the row otherwise so the user doesn't think Tuner B has a port
-  // choice (it's hard-wired 50 Ω).
-  const antennaRow = document.getElementById("sdrplay-antenna-row");
-  if (antennaRow) {
-    const tunerA = document.querySelector('input[name="sdrplay-tuner"]:checked');
-    antennaRow.hidden = !(tunerA && tunerA.value === "A");
-  }
-}
+// ─── SDR-agnostic panel rendering ────────────────────────────────
+//
+// Every per-backend control (frequency input min/max, AGC dropdown
+// options, antenna selector, gain row layout, feature checkboxes,
+// CTCSS tone picker, …) is built from `BackendCapabilities`
+// returned by the Tauri command `list_sdr_backends`. The frontend
+// has zero hardcoded knowledge of "Pluto" or "SDRplay" except for
+// the small whitelist in `buildBackendExtrasRow`.
+
+/// Cache of every compiled-in backend's static descriptor. Keyed by
+/// `id`; values are `{id, display_name, capabilities}` shipped from
+/// `sdr_registry::registered_backends`. Loaded once at startup.
+let sdrBackends = new Map();
 
 /// EIA standard CTCSS tones (39 values, in Hz). Mirror of
-/// `modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`. Order matches
-/// repeater documentation conventions (low → high).
+/// `modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`. Used by every
+/// backend whose `capabilities.features.ctcss_tx === true`.
 const EIA_CTCSS_TONES_HZ = [
   67.0, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8,
   97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8,
@@ -714,32 +699,523 @@ const EIA_CTCSS_TONES_HZ = [
   192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3, 254.1,
 ];
 
-/// Populate the CTCSS frequency dropdown with all 39 EIA tones, once
-/// at GUI init. The currently-saved value is selected on the next
-/// loadSettings() pass.
-function populateCtcssDropdown() {
-  const sel = document.getElementById("pluto-tx-ctcss-freq");
-  if (!sel || sel.children.length > 0) return;
+async function loadSdrBackends() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    const backends = await invoke("list_sdr_backends");
+    sdrBackends = new Map(backends.map(b => [b.id, b]));
+  } catch (err) {
+    console.error("list_sdr_backends:", err);
+    sdrBackends = new Map();
+  }
+}
+
+/// Read the `data-backend` attribute of the currently-selected
+/// option on a device dropdown. Returns the backend ID for SDR
+/// entries or `null` for cpal soundcard entries (which carry
+/// `data-backend = "audio"`).
+function getSelectedBackendId(selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel) return null;
+  const opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.dataset) return null;
+  const b = opt.dataset.backend;
+  return (b && b !== "audio") ? b : null;
+}
+
+/// Ensure `currentSettings.sdr_settings.backends[backendId]` exists,
+/// seeding from the per-backend defaults table (mirror of
+/// `default_sdr_config_for` in `settings.rs`) on first selection.
+function ensureBackendConfig(backendId) {
+  if (!currentSettings.sdr_settings) currentSettings.sdr_settings = { backends: {} };
+  if (!currentSettings.sdr_settings.backends) currentSettings.sdr_settings.backends = {};
+  let entry = currentSettings.sdr_settings.backends[backendId];
+  if (!entry) {
+    entry = { config: makeDefaultSdrConfig(backendId), freq_favorites: [] };
+    currentSettings.sdr_settings.backends[backendId] = entry;
+  }
+  if (!entry.config) entry.config = makeDefaultSdrConfig(backendId);
+  if (!entry.freq_favorites) entry.freq_favorites = [];
+  return entry.config;
+}
+
+function ensureBackendEntry(backendId) {
+  ensureBackendConfig(backendId);
+  return currentSettings.sdr_settings.backends[backendId];
+}
+
+function makeDefaultSdrConfig(backendId) {
+  if (backendId === "pluto") {
+    return {
+      backend_id: "pluto", device_id: "",
+      rx_freq_hz: 145_500_000, tx_freq_hz: 145_500_000,
+      gain: { kind: "agc_mode", id: "slow_attack" },
+      max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+      antenna: "",
+      bias_t: false, fm_notch: false, dab_notch: false,
+      ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+      rf_bandwidth_hz: 200_000,
+      backend_extras: { tx_attenuation_db: 30.0, prefer_low_rate: true },
+    };
+  }
+  if (backendId === "sdrplay") {
+    return {
+      backend_id: "sdrplay", device_id: "",
+      rx_freq_hz: 145_500_000, tx_freq_hz: 145_500_000,
+      gain: { kind: "manual", shape: "lna_plus_if", lna_state: 4, if_grdb: 40 },
+      max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+      antenna: "fifty",
+      bias_t: false, fm_notch: false, dab_notch: false,
+      ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+      rf_bandwidth_hz: null,
+      backend_extras: { tuner: "B", decimation: 4 },
+    };
+  }
+  return {
+    backend_id: backendId, device_id: "",
+    rx_freq_hz: 0, tx_freq_hz: 0,
+    gain: { kind: "manual", shape: "db", db: 0 },
+    max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+    antenna: "",
+    bias_t: false, fm_notch: false, dab_notch: false,
+    ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+    rf_bandwidth_hz: null,
+    backend_extras: {},
+  };
+}
+
+/// Build the SDR panel rows for a direction ("rx" or "tx") from the
+/// currently-selected device's backend capabilities. Hidden when
+/// the selection is a cpal card or an RX-only backend on the TX
+/// panel.
+function renderSdrPanel(direction) {
+  const panel = document.getElementById(`sdr-${direction}-panel`);
+  const rowsEl = document.getElementById(`sdr-${direction}-rows`);
+  const hintEl = document.getElementById(`sdr-${direction}-hint`);
+  if (!panel || !rowsEl) return;
+  const backendId = getSelectedBackendId(`${direction}-device-select`);
+  const info = backendId ? sdrBackends.get(backendId) : null;
+  if (!info) {
+    panel.hidden = true;
+    rowsEl.innerHTML = "";
+    if (hintEl) hintEl.textContent = "";
+    return;
+  }
+  const caps = info.capabilities;
+  const supported = direction === "rx" ? caps.rx_supported : caps.tx_supported;
+  if (!supported) {
+    panel.hidden = true;
+    rowsEl.innerHTML = "";
+    if (hintEl) hintEl.textContent = "";
+    return;
+  }
+  panel.hidden = false;
+  panel.dataset.backend = backendId;
+  const cfg = ensureBackendConfig(backendId);
+  rowsEl.innerHTML = "";
+  rowsEl.appendChild(buildFreqRow(direction, backendId, caps, cfg));
+  if (caps.agc_modes && caps.agc_modes.length > 0) {
+    rowsEl.appendChild(buildAgcRow(direction, backendId, caps, cfg));
+  }
+  rowsEl.appendChild(buildGainRow(direction, backendId, caps, cfg));
+  if (direction === "rx" && caps.antennas && caps.antennas.length > 0) {
+    rowsEl.appendChild(buildAntennaRow(backendId, caps, cfg));
+  }
+  if (hasFeatureToggles(caps)) {
+    rowsEl.appendChild(buildFeatureRow(direction, backendId, caps, cfg));
+  }
+  rowsEl.appendChild(buildDeviationRow(direction, backendId, cfg));
+  if (direction === "tx" && caps.features.ctcss_tx) {
+    rowsEl.appendChild(buildCtcssRow(backendId, cfg));
+  }
+  if (direction === "tx") {
+    rowsEl.appendChild(buildTxAttenuationRow(backendId, cfg));
+  }
+  rowsEl.appendChild(buildBackendExtrasRow(direction, backendId, cfg));
+  if (hintEl) hintEl.textContent = "";
+}
+
+function refreshSdrPanels() {
+  renderSdrPanel("rx");
+  renderSdrPanel("tx");
+}
+
+function hasFeatureToggles(caps) {
+  const f = caps.features;
+  return !!(f && (f.bias_t || f.fm_notch || f.dab_notch));
+}
+
+function makeRow() {
+  const r = document.createElement("div");
+  r.className = "pluto-row";
+  return r;
+}
+function makeFieldLabel(text) {
+  const s = document.createElement("span");
+  s.className = "pluto-field-label";
+  s.textContent = text;
+  return s;
+}
+
+function buildFreqRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  const range = direction === "rx" ? caps.rx_freq_range_hz : caps.tx_freq_range_hz;
+  const minMhz = range ? (range[0] / 1e6) : 0.001;
+  const maxMhz = range ? (range[1] / 1e6) : 6000;
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  label.textContent = direction === "rx" ? "Fréquence RX (MHz) : " : "Fréquence TX (MHz) : ";
+  const input = document.createElement("input");
+  input.type = "number";
+  input.id = `sdr-${direction}-freq-${backendId}`;
+  input.step = "0.001";
+  input.min = String(minMhz);
+  input.max = String(maxMhz);
+  const fieldHz = direction === "rx" ? "rx_freq_hz" : "tx_freq_hz";
+  if (Number.isFinite(cfg[fieldHz]) && cfg[fieldHz] > 0) {
+    input.value = (cfg[fieldHz] / 1e6).toFixed(3);
+  }
+  input.dataset.sdrField = fieldHz;
+  input.dataset.sdrTransform = "mhz_to_hz";
+  input.dataset.backend = backendId;
+  input.addEventListener("change", onSdrFieldChange);
+  label.appendChild(input);
+  row.appendChild(label);
+  return row;
+}
+
+function buildAgcRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  label.textContent = "AGC : ";
+  const sel = document.createElement("select");
+  sel.id = `sdr-${direction}-agc-${backendId}`;
+  sel.dataset.backend = backendId;
+  for (const mode of caps.agc_modes) {
+    const opt = document.createElement("option");
+    opt.value = mode.id;
+    opt.textContent = mode.label;
+    opt.dataset.manual = mode.manual ? "1" : "0";
+    sel.appendChild(opt);
+  }
+  const gain = cfg.gain || {};
+  if (gain.kind === "agc_mode" && gain.id) {
+    sel.value = gain.id;
+  } else if (gain.kind === "manual") {
+    const m = caps.agc_modes.find(x => x.manual);
+    if (m) sel.value = m.id;
+  }
+  sel.addEventListener("change", () => {
+    const opt = sel.options[sel.selectedIndex];
+    const isManual = opt && opt.dataset.manual === "1";
+    if (isManual) {
+      cfg.gain = manualGainFromShape(caps.manual_gain, cfg.gain);
+    } else {
+      cfg.gain = { kind: "agc_mode", id: sel.value };
+    }
+    persistSettings();
+    refreshSdrPanels();   // re-render so the gain row's enable/disable matches.
+  });
+  label.appendChild(sel);
+  row.appendChild(label);
+  return row;
+}
+
+function manualGainFromShape(shape, current) {
+  if (current && current.kind === "manual") {
+    if (shape && shape.DbContinuous && current.shape === "db") return current;
+    if (shape && shape.LnaPlusIf && current.shape === "lna_plus_if") return current;
+    if (shape && shape.DbDiscrete && current.shape === "discrete") return current;
+  }
+  if (shape && shape.DbContinuous) return { kind: "manual", shape: "db", db: 0 };
+  if (shape && shape.LnaPlusIf) return { kind: "manual", shape: "lna_plus_if", lna_state: 4, if_grdb: 40 };
+  if (shape && shape.DbDiscrete) return { kind: "manual", shape: "discrete", step_idx: 0 };
+  return { kind: "manual", shape: "db", db: 0 };
+}
+
+function buildGainRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  const shape = caps.manual_gain;
+  const isAgc = !!(cfg.gain && cfg.gain.kind === "agc_mode");
+  if (shape && shape.DbContinuous) {
+    const r = shape.DbContinuous;
+    const label = document.createElement("label");
+    label.className = "pluto-field";
+    label.textContent = direction === "rx" ? "Gain RX (dB) : " : "Gain TX (dB) : ";
+    const input = document.createElement("input");
+    input.type = "number";
+    input.id = `sdr-${direction}-gain-db-${backendId}`;
+    input.min = String(r.min_db); input.max = String(r.max_db); input.step = String(r.step_db);
+    input.disabled = isAgc;
+    if (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "db") input.value = String(cfg.gain.db);
+    input.dataset.sdrField = "gain.db";
+    input.dataset.sdrTransform = "manual_db";
+    input.dataset.backend = backendId;
+    input.addEventListener("change", onSdrFieldChange);
+    label.appendChild(input);
+    row.appendChild(label);
+  } else if (shape && shape.LnaPlusIf) {
+    const r = shape.LnaPlusIf;
+    const lnaLabel = document.createElement("label");
+    lnaLabel.className = "pluto-field";
+    lnaLabel.textContent = "LNA state : ";
+    const lnaInput = document.createElement("input");
+    lnaInput.type = "number";
+    lnaInput.id = `sdr-${direction}-gain-lna-${backendId}`;
+    lnaInput.min = "0"; lnaInput.max = String(r.lna_states - 1); lnaInput.step = "1";
+    lnaInput.disabled = isAgc;
+    if (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if") lnaInput.value = String(cfg.gain.lna_state);
+    lnaInput.dataset.sdrField = "gain.lna_state";
+    lnaInput.dataset.sdrTransform = "manual_lna";
+    lnaInput.dataset.backend = backendId;
+    lnaInput.addEventListener("change", onSdrFieldChange);
+    lnaLabel.appendChild(lnaInput);
+    row.appendChild(lnaLabel);
+
+    const ifLabel = document.createElement("label");
+    ifLabel.className = "pluto-field";
+    ifLabel.textContent = "IF gRdB : ";
+    const ifInput = document.createElement("input");
+    ifInput.type = "number";
+    ifInput.id = `sdr-${direction}-gain-if-${backendId}`;
+    ifInput.min = String(r.if_grdb_range[0]); ifInput.max = String(r.if_grdb_range[1]); ifInput.step = String(r.if_grdb_step);
+    ifInput.disabled = isAgc;
+    if (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if") ifInput.value = String(cfg.gain.if_grdb);
+    ifInput.dataset.sdrField = "gain.if_grdb";
+    ifInput.dataset.sdrTransform = "manual_if";
+    ifInput.dataset.backend = backendId;
+    ifInput.addEventListener("change", onSdrFieldChange);
+    ifLabel.appendChild(ifInput);
+    row.appendChild(ifLabel);
+  }
+  return row;
+}
+
+function buildAntennaRow(backendId, caps, cfg) {
+  const row = makeRow();
+  row.appendChild(makeFieldLabel("Port antenne :"));
+  const sel = document.createElement("select");
+  sel.id = `sdr-rx-antenna-${backendId}`;
+  sel.dataset.sdrField = "antenna";
+  sel.dataset.sdrTransform = "string";
+  sel.dataset.backend = backendId;
+  for (const a of caps.antennas) {
+    const opt = document.createElement("option");
+    opt.value = a.id;
+    opt.textContent = a.label;
+    sel.appendChild(opt);
+  }
+  if (cfg.antenna) sel.value = cfg.antenna;
+  sel.addEventListener("change", onSdrFieldChange);
+  row.appendChild(sel);
+  return row;
+}
+
+function buildFeatureRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", "Bias-T (+5 V vers préampli)", !!cfg.bias_t));
+  if (caps.features.fm_notch) row.appendChild(makeCheckbox(backendId, "fm_notch", "Filtre rejet FM (88-108 MHz)", !!cfg.fm_notch));
+  if (caps.features.dab_notch) row.appendChild(makeCheckbox(backendId, "dab_notch", "Filtre rejet DAB (174-240 MHz)", !!cfg.dab_notch));
+  return row;
+}
+
+function makeCheckbox(backendId, fieldName, labelText, checked) {
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  const cb = document.createElement("input");
+  cb.type = "checkbox"; cb.checked = checked;
+  cb.dataset.sdrField = fieldName;
+  cb.dataset.sdrTransform = "bool";
+  cb.dataset.backend = backendId;
+  cb.addEventListener("change", onSdrFieldChange);
+  label.appendChild(cb);
+  label.appendChild(document.createTextNode(" " + labelText));
+  return label;
+}
+
+function buildDeviationRow(direction, backendId, cfg) {
+  const row = makeRow();
+  row.appendChild(makeFieldLabel(direction === "rx" ? "Déviation RX :" : "Déviation TX :"));
+  const fieldHz = direction === "rx" ? "max_deviation_hz" : "tx_deviation_hz";
+  const cur = cfg[fieldHz] != null ? cfg[fieldHz] : 5000;
+  for (const v of [5000, 2500]) {
+    const label = document.createElement("label");
+    label.className = "pluto-field";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = `sdr-${direction}-dev-${backendId}`;
+    radio.value = String(v);
+    radio.checked = (Math.round(cur) === v);
+    radio.dataset.sdrField = fieldHz;
+    radio.dataset.sdrTransform = "float";
+    radio.dataset.backend = backendId;
+    radio.addEventListener("change", onSdrFieldChange);
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(v === 5000 ? " 5 kHz" : " 2.5 kHz"));
+    row.appendChild(label);
+  }
+  return row;
+}
+
+function buildCtcssRow(backendId, cfg) {
+  const row = makeRow();
+  const cbLabel = document.createElement("label");
+  cbLabel.className = "pluto-field";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = (cfg.ctcss_freq_hz > 0);
+  cb.dataset.backend = backendId;
+  cbLabel.appendChild(cb);
+  cbLabel.appendChild(document.createTextNode(" CTCSS (squelch relais)"));
+  row.appendChild(cbLabel);
+  const toneLabel = document.createElement("label");
+  toneLabel.className = "pluto-field";
+  toneLabel.textContent = "Tonalité : ";
+  const sel = document.createElement("select");
+  sel.id = `sdr-tx-ctcss-tone-${backendId}`;
   for (const f of EIA_CTCSS_TONES_HZ) {
     const opt = document.createElement("option");
     opt.value = String(f);
     opt.textContent = `${f.toFixed(1)} Hz`;
     sel.appendChild(opt);
   }
+  const cur = cfg.ctcss_freq_hz > 0 ? cfg.ctcss_freq_hz : 88.5;
+  const closest = EIA_CTCSS_TONES_HZ.reduce(
+    (best, t) => (Math.abs(t - cur) < Math.abs(best - cur) ? t : best),
+    EIA_CTCSS_TONES_HZ[0]);
+  sel.value = String(closest);
+  sel.addEventListener("change", () => {
+    if (cb.checked) {
+      cfg.ctcss_freq_hz = parseFloat(sel.value);
+      persistSettings();
+    }
+  });
+  cb.addEventListener("change", () => {
+    cfg.ctcss_freq_hz = cb.checked ? parseFloat(sel.value) : 0.0;
+    persistSettings();
+  });
+  toneLabel.appendChild(sel);
+  row.appendChild(toneLabel);
+  return row;
 }
 
-/// Recompute and display the effective TX deviation = preset + offset,
-/// as both the visible "5.0 kHz" label and the slider's tooltip.
-/// Called from radio/slider change handlers.
-function refreshPlutoTxDeviationLabel() {
-  const presetEl = document.querySelector('input[name="pluto-tx-dev-preset"]:checked');
-  const offsetEl = document.getElementById("pluto-tx-dev-offset");
-  const out = document.getElementById("pluto-tx-dev-effective");
-  if (!presetEl || !offsetEl || !out) return;
-  const preset = parseInt(presetEl.value, 10) || 5000;
-  const offset = parseInt(offsetEl.value, 10) || 0;
-  const eff = Math.max(500, Math.min(8000, preset + offset));
-  out.textContent = (eff / 1000).toFixed(1) + " kHz";
+function buildTxAttenuationRow(backendId, cfg) {
+  const row = makeRow();
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  label.textContent = "Atténuation TX (dB) : ";
+  const input = document.createElement("input");
+  input.type = "number";
+  input.id = `sdr-tx-att-${backendId}`;
+  input.min = "0"; input.max = "89.75"; input.step = "0.25";
+  const cur = (cfg.backend_extras && cfg.backend_extras.tx_attenuation_db != null)
+    ? cfg.backend_extras.tx_attenuation_db : 30.0;
+  input.value = String(cur);
+  input.dataset.sdrField = "backend_extras.tx_attenuation_db";
+  input.dataset.sdrTransform = "extras_float";
+  input.dataset.backend = backendId;
+  input.addEventListener("change", onSdrFieldChange);
+  label.appendChild(input);
+  row.appendChild(label);
+  return row;
+}
+
+function buildBackendExtrasRow(direction, backendId, cfg) {
+  // The only place the frontend has per-backend knowledge:
+  // SDRplay tuner A/B (RX). All other backend_extras keys are
+  // managed under the hood (defaults from `makeDefaultSdrConfig`).
+  const row = makeRow();
+  if (backendId === "sdrplay" && direction === "rx") {
+    row.appendChild(makeFieldLabel("Tuner :"));
+    const cur = (cfg.backend_extras && cfg.backend_extras.tuner) || "B";
+    for (const v of ["A", "B"]) {
+      const label = document.createElement("label");
+      label.className = "pluto-field";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = `sdr-extras-tuner-${backendId}`;
+      radio.value = v;
+      radio.checked = (cur === v);
+      radio.dataset.sdrField = "backend_extras.tuner";
+      radio.dataset.sdrTransform = "extras_string";
+      radio.dataset.backend = backendId;
+      radio.addEventListener("change", onSdrFieldChange);
+      label.appendChild(radio);
+      label.appendChild(document.createTextNode(` ${v} (${v === "A" ? "Hi-Z + 50 Ω" : "50 Ω + bias-T"})`));
+      row.appendChild(label);
+    }
+  }
+  return row;
+}
+
+/// Generic change handler: read `data-sdr-field` + `-transform`,
+/// write the parsed value back into the per-backend config and
+/// persist immediately.
+function onSdrFieldChange(evt) {
+  const el = evt.currentTarget;
+  const backendId = el.dataset.backend;
+  if (!backendId) return;
+  const cfg = ensureBackendConfig(backendId);
+  applySdrFieldUpdate(cfg, el.dataset.sdrField, el.dataset.sdrTransform, el);
+  persistSettings();
+}
+
+function applySdrFieldUpdate(cfg, field, transform, el) {
+  switch (transform) {
+    case "mhz_to_hz": {
+      const m = parseFloat(el.value);
+      if (Number.isFinite(m) && m > 0) cfg[field] = Math.round(m * 1e6);
+      break;
+    }
+    case "string": cfg[field] = el.value; break;
+    case "bool":   cfg[field] = !!el.checked; break;
+    case "float": {
+      const v = parseFloat(el.value);
+      if (Number.isFinite(v)) cfg[field] = v;
+      break;
+    }
+    case "manual_db": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) cfg.gain = { kind: "manual", shape: "db", db: v };
+      break;
+    }
+    case "manual_lna": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) {
+        const cur = (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if")
+          ? cfg.gain : { kind: "manual", shape: "lna_plus_if", lna_state: 0, if_grdb: 40 };
+        cfg.gain = { ...cur, lna_state: v };
+      }
+      break;
+    }
+    case "manual_if": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) {
+        const cur = (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if")
+          ? cfg.gain : { kind: "manual", shape: "lna_plus_if", lna_state: 4, if_grdb: 40 };
+        cfg.gain = { ...cur, if_grdb: v };
+      }
+      break;
+    }
+    case "extras_float": {
+      const v = parseFloat(el.value);
+      const key = field.split(".")[1];
+      if (Number.isFinite(v)) {
+        if (!cfg.backend_extras) cfg.backend_extras = {};
+        cfg.backend_extras[key] = v;
+      }
+      break;
+    }
+    case "extras_string": {
+      const key = field.split(".")[1];
+      if (!cfg.backend_extras) cfg.backend_extras = {};
+      cfg.backend_extras[key] = el.value;
+      break;
+    }
+    default: break;
+  }
 }
 
 function refreshRxDeviceLabel() {
@@ -770,37 +1246,41 @@ async function loadDevices() {
   }
   const { invoke } = window.__TAURI__.core;
   try {
-    // SDR enumeration is best-effort: libiio / SDRplay may not find any
-    // device (none plugged in, daemon down, ...). Each surfaces as an
-    // empty list, not an error, so the dropdown still loads cleanly.
-    const [rxDevices, txDevices, plutoDevices, sdrplayDevices] = await Promise.all([
+    // cpal soundcard lists in parallel; per-backend SDR device lists
+    // come next (one Tauri call per registered backend, fanned out).
+    const [rxDevices, txDevices] = await Promise.all([
       invoke("list_audio_devices"),
       invoke("list_output_audio_devices"),
-      invoke("list_pluto_devices").catch(err => {
-        console.warn("list_pluto_devices failed:", err);
-        return [];
-      }),
-      invoke("list_sdrplay_devices").catch(err => {
-        console.warn("list_sdrplay_devices failed:", err);
-        return [];
-      }),
     ]);
-    populateDeviceSelect(
-      "rx-device-select", rxDevices, currentSettings.rx_device,
-      plutoDevices, sdrplayDevices,
+    const backendDevices = new Map();
+    const backendTags = [];
+    await Promise.all(
+      Array.from(sdrBackends.keys()).map(async (id) => {
+        try {
+          const list = await invoke("list_sdr_devices", { backendId: id });
+          backendDevices.set(id, list);
+          if (list.length > 0) {
+            const info = sdrBackends.get(id);
+            backendTags.push(` · ${list.length} ${info ? info.display_name : id}`);
+          }
+        } catch (err) {
+          console.warn(`list_sdr_devices(${id}):`, err);
+          backendDevices.set(id, []);
+        }
+      })
     );
-    // SDRplay is RX-only; TX dropdown only gets Pluto + cpal entries.
     populateDeviceSelect(
-      "tx-device-select", txDevices, currentSettings.tx_device,
-      plutoDevices, [],
+      "rx-device-select", rxDevices, currentSettings.rx_device, backendDevices, "rx",
+    );
+    populateDeviceSelect(
+      "tx-device-select", txDevices, currentSettings.tx_device, backendDevices, "tx",
     );
     const n48 = rxDevices.filter(d => d.supports_48k).length;
-    const plutoTag = plutoDevices.length > 0 ? ` · ${plutoDevices.length} Pluto` : "";
-    const sdrplayTag = sdrplayDevices.length > 0 ? ` · ${sdrplayDevices.length} SDRplay` : "";
-    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${plutoTag}${sdrplayTag}`;
+    status.textContent =
+      `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${backendTags.join("")}`;
     refreshRxDeviceLabel();
     refreshStartButtonFromRx();
-    refreshPlutoPanelVisibility();
+    refreshSdrPanels();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
@@ -848,74 +1328,11 @@ async function loadSettings() {
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
 
-  // Pluto-specific knobs — populated whenever Settings load. Frequencies
-  // are stored in Hz on the Rust side and shown as MHz to the user.
-  const plutoRxFreq = document.getElementById("pluto-rx-freq-mhz");
-  if (plutoRxFreq) plutoRxFreq.value =
-    ((currentSettings.pluto_rx_freq_hz ?? 145_500_000) / 1e6).toFixed(3);
-  const plutoTxFreq = document.getElementById("pluto-tx-freq-mhz");
-  if (plutoTxFreq) plutoTxFreq.value =
-    ((currentSettings.pluto_tx_freq_hz ?? 145_500_000) / 1e6).toFixed(3);
-  const plutoRxMode = document.getElementById("pluto-rx-gain-mode");
-  if (plutoRxMode) plutoRxMode.value =
-    currentSettings.pluto_rx_gain_mode || "slow_attack";
-  const plutoRxGain = document.getElementById("pluto-rx-gain-db");
-  if (plutoRxGain) plutoRxGain.value = String(currentSettings.pluto_rx_gain_db ?? 30);
-  const plutoTxAtt = document.getElementById("pluto-tx-att-db");
-  if (plutoTxAtt) plutoTxAtt.value = String(currentSettings.pluto_tx_attenuation_db ?? 30);
-  // FM deviation : RX preset (5/2.5 kHz radio), TX preset (radio) +
-  // fine-tune offset (slider), and the live "X.X kHz" effective label.
-  const rxDev = currentSettings.pluto_rx_deviation_hz ?? 5000;
-  const rxRadio = document.querySelector(`input[name="pluto-rx-dev"][value="${rxDev}"]`);
-  if (rxRadio) rxRadio.checked = true;
-  const txPreset = currentSettings.pluto_tx_deviation_preset_hz ?? 5000;
-  const txPresetRadio = document.querySelector(`input[name="pluto-tx-dev-preset"][value="${txPreset}"]`);
-  if (txPresetRadio) txPresetRadio.checked = true;
-  const txOffset = currentSettings.pluto_tx_deviation_offset_hz ?? 0;
-  const txOffsetSlider = document.getElementById("pluto-tx-dev-offset");
-  if (txOffsetSlider) txOffsetSlider.value = String(txOffset);
-  refreshPlutoTxDeviationLabel();
-  // CTCSS : enable checkbox + tone dropdown.
-  const ctcssEn = document.getElementById("pluto-tx-ctcss-enabled");
-  if (ctcssEn) ctcssEn.checked = !!currentSettings.pluto_tx_ctcss_enabled;
-  const ctcssFreq = document.getElementById("pluto-tx-ctcss-freq");
-  if (ctcssFreq) {
-    const f = currentSettings.pluto_tx_ctcss_freq_hz ?? 88.5;
-    // Snap to nearest EIA tone if the saved value drifted (e.g. user
-    // hand-edited settings.json with a non-standard frequency).
-    const closest = EIA_CTCSS_TONES_HZ.reduce(
-      (best, t) => (Math.abs(t - f) < Math.abs(best - f) ? t : best),
-      EIA_CTCSS_TONES_HZ[0]
-    );
-    ctcssFreq.value = String(closest);
-  }
-  // SDRplay RSPduo knobs — same MHz-in-UI/Hz-on-disk convention as
-  // Pluto. Field IDs all start with `sdrplay-` so the freq keypad
-  // hook can extend its allowlist with that prefix.
-  const sdrRxFreq = document.getElementById("sdrplay-rx-freq-mhz");
-  if (sdrRxFreq) sdrRxFreq.value =
-    ((currentSettings.sdrplay_rx_freq_hz ?? 145_500_000) / 1e6).toFixed(3);
-  const sdrTuner = currentSettings.sdrplay_tuner || "B";
-  const sdrTunerRadio = document.querySelector(`input[name="sdrplay-tuner"][value="${sdrTuner}"]`);
-  if (sdrTunerRadio) sdrTunerRadio.checked = true;
-  const sdrAnt = currentSettings.sdrplay_antenna || "fifty";
-  const sdrAntRadio = document.querySelector(`input[name="sdrplay-antenna"][value="${sdrAnt}"]`);
-  if (sdrAntRadio) sdrAntRadio.checked = true;
-  const sdrAgc = document.getElementById("sdrplay-agc-mode");
-  if (sdrAgc) sdrAgc.value = currentSettings.sdrplay_agc_mode || "disable";
-  const sdrLna = document.getElementById("sdrplay-lna-state");
-  if (sdrLna) sdrLna.value = String(currentSettings.sdrplay_lna_state ?? 4);
-  const sdrGr = document.getElementById("sdrplay-if-grdb");
-  if (sdrGr) sdrGr.value = String(currentSettings.sdrplay_if_gain_reduction_db ?? 40);
-  const sdrBias = document.getElementById("sdrplay-bias-t");
-  if (sdrBias) sdrBias.checked = !!currentSettings.sdrplay_bias_t;
-  const sdrFm = document.getElementById("sdrplay-fm-notch");
-  if (sdrFm) sdrFm.checked = !!currentSettings.sdrplay_fm_notch;
-  const sdrDab = document.getElementById("sdrplay-dab-notch");
-  if (sdrDab) sdrDab.checked = !!currentSettings.sdrplay_dab_notch;
-  const sdrDev = currentSettings.sdrplay_rx_deviation_hz ?? 5000;
-  const sdrDevRadio = document.querySelector(`input[name="sdrplay-rx-dev"][value="${sdrDev}"]`);
-  if (sdrDevRadio) sdrDevRadio.checked = true;
+  // SDR controls are built on demand by `renderSdrPanel` (called
+  // from `loadDevices` once the dropdown selection is known). The
+  // per-backend config is kept in `currentSettings.sdr_settings.backends[id]`
+  // and surfaced through `data-sdr-field` inputs — no per-backend
+  // load block here.
   applyTxSettingsToUI();
 }
 
@@ -1188,116 +1605,10 @@ async function persistSettings() {
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
 
-  // Pluto knobs — read MHz, persist Hz. Reject NaN/negative so a
-  // half-typed value doesn't poison settings.json.
-  const plutoRxFreq = document.getElementById("pluto-rx-freq-mhz");
-  if (plutoRxFreq) {
-    const mhz = parseFloat(plutoRxFreq.value);
-    if (Number.isFinite(mhz) && mhz > 0) {
-      currentSettings.pluto_rx_freq_hz = Math.round(mhz * 1e6);
-    }
-  }
-  const plutoTxFreq = document.getElementById("pluto-tx-freq-mhz");
-  if (plutoTxFreq) {
-    const mhz = parseFloat(plutoTxFreq.value);
-    if (Number.isFinite(mhz) && mhz > 0) {
-      currentSettings.pluto_tx_freq_hz = Math.round(mhz * 1e6);
-    }
-  }
-  const plutoRxMode = document.getElementById("pluto-rx-gain-mode");
-  if (plutoRxMode && plutoRxMode.value) {
-    currentSettings.pluto_rx_gain_mode = plutoRxMode.value;
-  }
-  const plutoRxGain = document.getElementById("pluto-rx-gain-db");
-  if (plutoRxGain) {
-    const v = parseInt(plutoRxGain.value, 10);
-    if (Number.isFinite(v) && v >= -3 && v <= 71) {
-      currentSettings.pluto_rx_gain_db = v;
-    }
-  }
-  const plutoTxAtt = document.getElementById("pluto-tx-att-db");
-  if (plutoTxAtt) {
-    const v = parseFloat(plutoTxAtt.value);
-    if (Number.isFinite(v) && v >= 0 && v <= 89.75) {
-      currentSettings.pluto_tx_attenuation_db = v;
-    }
-  }
-  // FM deviation : RX preset radio, TX preset radio, TX fine-tune slider.
-  // Allowed presets are {2500, 5000} on both directions; offset clamped
-  // to [-2000, +2000]. Backend `effective_pluto_tx_deviation_hz` adds
-  // them and clamps to a sane band.
-  const rxDevRadio = document.querySelector('input[name="pluto-rx-dev"]:checked');
-  if (rxDevRadio) {
-    const v = parseInt(rxDevRadio.value, 10);
-    if (v === 2500 || v === 5000) currentSettings.pluto_rx_deviation_hz = v;
-  }
-  const txPresetRadio = document.querySelector('input[name="pluto-tx-dev-preset"]:checked');
-  if (txPresetRadio) {
-    const v = parseInt(txPresetRadio.value, 10);
-    if (v === 2500 || v === 5000) currentSettings.pluto_tx_deviation_preset_hz = v;
-  }
-  const txOffset = document.getElementById("pluto-tx-dev-offset");
-  if (txOffset) {
-    const v = parseInt(txOffset.value, 10);
-    if (Number.isFinite(v) && v >= -2000 && v <= 2000) {
-      currentSettings.pluto_tx_deviation_offset_hz = v;
-    }
-  }
-  // CTCSS — sub-audible tone for repeater squelch.
-  const ctcssEn = document.getElementById("pluto-tx-ctcss-enabled");
-  if (ctcssEn) currentSettings.pluto_tx_ctcss_enabled = !!ctcssEn.checked;
-  const ctcssFreq = document.getElementById("pluto-tx-ctcss-freq");
-  if (ctcssFreq && ctcssFreq.value) {
-    const f = parseFloat(ctcssFreq.value);
-    if (Number.isFinite(f) && f >= 67.0 && f <= 254.1) {
-      currentSettings.pluto_tx_ctcss_freq_hz = f;
-    }
-  }
-  // SDRplay RSPduo knobs.
-  const sdrRxFreq = document.getElementById("sdrplay-rx-freq-mhz");
-  if (sdrRxFreq) {
-    const mhz = parseFloat(sdrRxFreq.value);
-    if (Number.isFinite(mhz) && mhz > 0) {
-      currentSettings.sdrplay_rx_freq_hz = Math.round(mhz * 1e6);
-    }
-  }
-  const sdrTunerRadio = document.querySelector('input[name="sdrplay-tuner"]:checked');
-  if (sdrTunerRadio && (sdrTunerRadio.value === "A" || sdrTunerRadio.value === "B")) {
-    currentSettings.sdrplay_tuner = sdrTunerRadio.value;
-  }
-  const sdrAntRadio = document.querySelector('input[name="sdrplay-antenna"]:checked');
-  if (sdrAntRadio && (sdrAntRadio.value === "hiz" || sdrAntRadio.value === "fifty")) {
-    currentSettings.sdrplay_antenna = sdrAntRadio.value;
-  }
-  const sdrAgc = document.getElementById("sdrplay-agc-mode");
-  if (sdrAgc && ["disable","slow","mid","fast"].includes(sdrAgc.value)) {
-    currentSettings.sdrplay_agc_mode = sdrAgc.value;
-  }
-  const sdrLna = document.getElementById("sdrplay-lna-state");
-  if (sdrLna) {
-    const v = parseInt(sdrLna.value, 10);
-    if (Number.isFinite(v) && v >= 0 && v <= 9) {
-      currentSettings.sdrplay_lna_state = v;
-    }
-  }
-  const sdrGr = document.getElementById("sdrplay-if-grdb");
-  if (sdrGr) {
-    const v = parseInt(sdrGr.value, 10);
-    if (Number.isFinite(v) && v >= 20 && v <= 59) {
-      currentSettings.sdrplay_if_gain_reduction_db = v;
-    }
-  }
-  const sdrBias = document.getElementById("sdrplay-bias-t");
-  if (sdrBias) currentSettings.sdrplay_bias_t = !!sdrBias.checked;
-  const sdrFm = document.getElementById("sdrplay-fm-notch");
-  if (sdrFm) currentSettings.sdrplay_fm_notch = !!sdrFm.checked;
-  const sdrDab = document.getElementById("sdrplay-dab-notch");
-  if (sdrDab) currentSettings.sdrplay_dab_notch = !!sdrDab.checked;
-  const sdrDevRadio = document.querySelector('input[name="sdrplay-rx-dev"]:checked');
-  if (sdrDevRadio) {
-    const v = parseInt(sdrDevRadio.value, 10);
-    if (v === 2500 || v === 5000) currentSettings.sdrplay_rx_deviation_hz = v;
-  }
+  // SDR-specific config is mutated directly on
+  // `currentSettings.sdr_settings.backends[id].config` by the
+  // `data-sdr-field` listeners (`onSdrFieldChange`) before
+  // `persistSettings` runs — no per-backend reading block here.
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -1323,68 +1634,20 @@ function setupSettingsTab() {
     rxSel.addEventListener("change", () => {
       refreshRxDeviceLabel();
       refreshStartButtonFromRx();
-      refreshPlutoPanelVisibility();
+      refreshSdrPanels();
       persistSettings();
     });
   }
-  // Pluto-specific inputs — persist on every change so the next
-  // start_capture picks up new freq / gain without reload.
-  ["pluto-rx-freq-mhz", "pluto-tx-freq-mhz", "pluto-rx-gain-mode",
-   "pluto-rx-gain-db", "pluto-tx-att-db",
-   "sdrplay-rx-freq-mhz", "sdrplay-agc-mode", "sdrplay-lna-state",
-   "sdrplay-if-grdb"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.addEventListener("change", persistSettings);
-  });
-  // SDRplay checkboxes (bias-T, FM/DAB notches) — same pattern.
-  ["sdrplay-bias-t", "sdrplay-fm-notch", "sdrplay-dab-notch"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.addEventListener("change", persistSettings);
-  });
-  // SDRplay tuner / antenna / deviation radios. Tuner change toggles
-  // visibility of the antenna-port row (Tuner B has no port choice).
-  document.querySelectorAll('input[name="sdrplay-tuner"]').forEach(r => {
-    r.addEventListener("change", () => {
-      refreshPlutoPanelVisibility();
-      persistSettings();
-    });
-  });
-  document.querySelectorAll('input[name="sdrplay-antenna"]').forEach(r => {
-    r.addEventListener("change", persistSettings);
-  });
-  document.querySelectorAll('input[name="sdrplay-rx-dev"]').forEach(r => {
-    r.addEventListener("change", persistSettings);
-  });
-  // Deviation radios — persist on selection change.
-  document.querySelectorAll('input[name="pluto-rx-dev"]').forEach(r => {
-    r.addEventListener("change", persistSettings);
-  });
-  document.querySelectorAll('input[name="pluto-tx-dev-preset"]').forEach(r => {
-    r.addEventListener("change", () => {
-      refreshPlutoTxDeviationLabel();
-      persistSettings();
-    });
-  });
-  // TX fine-tune slider : live label update on `input`, persist on
-  // `change` (when the user releases the slider).
-  const txOffset = document.getElementById("pluto-tx-dev-offset");
-  if (txOffset) {
-    txOffset.addEventListener("input", refreshPlutoTxDeviationLabel);
-    txOffset.addEventListener("change", persistSettings);
-  }
-  // CTCSS dropdown is populated once (39 fixed EIA tones), then
-  // its value + the enable checkbox persist on every change.
-  populateCtcssDropdown();
-  ["pluto-tx-ctcss-enabled", "pluto-tx-ctcss-freq"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.addEventListener("change", persistSettings);
-  });
   if (txSel) {
     txSel.addEventListener("change", () => {
-      refreshPlutoPanelVisibility();
+      refreshSdrPanels();
       persistSettings();
     });
   }
+  // SDR-specific inputs are wired up at row-build time inside
+  // `renderSdrPanel` (each `data-sdr-field` input gets an
+  // `onSdrFieldChange` listener that mutates the per-backend config
+  // and calls `persistSettings`). Nothing to register here.
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.addEventListener("change", persistSettings);
   const saveWav = document.getElementById("tx-save-wav-enabled");
@@ -4151,6 +4414,7 @@ async function init() {
   setupCaptureSubmitPanel();
   setupHistoryTab();
   await loadSettings();
+  await loadSdrBackends();
   applyOverlaysToUI();
   setupChannelTab();
   await loadDevices();
@@ -4460,7 +4724,7 @@ function closeVirtKeyboard(commit) {
       const mhz = parseFloat(out);
       if (Number.isFinite(mhz) && mhz > 0) {
         // fire-and-forget — own save flush, doesn't block close.
-        pushFreqMru(mhz, target.id);
+        pushFreqMru(mhz, target);
       }
     }
   }
@@ -4605,17 +4869,15 @@ function refreshVirtKbDisplay() {
 
 // ─── Frequency-keypad enrichments (MRU favorites + step buttons) ──
 //
-// Active when the focused input is an SDR frequency field
-// (id starts with `pluto-rx-freq-` / `pluto-tx-freq-` for the Pluto
-// path or `sdrplay-rx-freq-` for the RSPduo path). The MRU row
-// mirrors the per-radio favorites array (Hz, capped at 6, most-
-// recent-first) — Pluto and SDRplay get separate MRU lists so 2 m
-// repeaters don't bleed into HF receive favorites. Step buttons
-// add/subtract a multiple of kHz to the displayed MHz value, picked
-// from a 5 / 6.25 / 12.5 / 25 kHz selector — the standard channel
-// rasters in amateur and PMR repeater plans. The pick survives
-// keypad close/re-open via `virtKb.stepKHz`.
-const FREQ_INPUT_ID_PREFIX = ["pluto-rx-freq-", "pluto-tx-freq-", "sdrplay-rx-freq-"];
+// Active when the focused input is an SDR frequency field. The new
+// dynamic-render scheme produces IDs like `sdr-rx-freq-<backend>`
+// or `sdr-tx-freq-<backend>` — one prefix matches every registered
+// backend. The MRU bucket is per-backend, picked off the input's
+// `data-backend` attribute (set when the row was built); step
+// buttons (5 / 6.25 / 12.5 / 25 kHz) work uniformly across all
+// backends. The pick survives keypad close/re-open via
+// `virtKb.stepKHz`.
+const FREQ_INPUT_ID_PREFIX = ["sdr-rx-freq-", "sdr-tx-freq-"];
 const STEP_OPTIONS_KHZ = [5.0, 6.25, 12.5, 25.0];
 virtKb.stepKHz = 6.25;
 
@@ -4624,20 +4886,27 @@ function isFreqInputId(id) {
   return FREQ_INPUT_ID_PREFIX.some(p => id.startsWith(p));
 }
 
-/// Pick which MRU favorites list applies to a given freq input id.
-/// SDRplay fields read/write `sdrplay_freq_favorites`; everything
-/// else (Pluto or unknown) uses `pluto_freq_favorites`.
-function freqMruKeyForId(id) {
-  return id && id.startsWith("sdrplay-") ? "sdrplay_freq_favorites" : "pluto_freq_favorites";
+/// Pick the per-backend MRU list. Reads the `data-backend`
+/// attribute on the input — set by the row builders to the backend
+/// ID. Returns the live array (mutable) so callers can splice.
+function backendIdForFreqInput(targetEl) {
+  if (!targetEl) return null;
+  return targetEl.dataset && targetEl.dataset.backend
+    ? targetEl.dataset.backend : null;
+}
+
+function freqFavoritesArray(backendId) {
+  if (!backendId) return [];
+  ensureBackendEntry(backendId);
+  const entry = currentSettings.sdr_settings.backends[backendId];
+  if (!Array.isArray(entry.freq_favorites)) entry.freq_favorites = [];
+  return entry.freq_favorites;
 }
 
 function renderVirtKbFavoritesRow() {
-  // Pick the right MRU list based on which freq input opened the
-  // keypad — keeps Pluto and SDRplay favorites separate.
-  const targetId = (virtKb.target && virtKb.target.id) || "";
-  const key = freqMruKeyForId(targetId);
-  const favs = (currentSettings && Array.isArray(currentSettings[key]))
-    ? currentSettings[key] : [];
+  const target = virtKb.target;
+  const backendId = backendIdForFreqInput(target);
+  const favs = backendId ? freqFavoritesArray(backendId) : [];
   if (favs.length === 0) return;
   const row = document.createElement("div");
   row.className = "virt-kb-row virt-kb-favs";
@@ -4707,23 +4976,21 @@ function stepDraft(direction) {
   refreshVirtKbDisplay();
 }
 
-/// Push the freshly-validated frequency (MHz) onto the MRU. Dedup
-/// on Hz equality, prepend, cap at 6. Persists via save_settings
-/// so the next keypad open already shows it. The MRU bucket is
-/// chosen by which input the user was editing — Pluto fields land
-/// in `pluto_freq_favorites`, SDRplay fields in
-/// `sdrplay_freq_favorites`.
-async function pushFreqMru(mhz, targetId) {
+/// Push a freshly-validated frequency (MHz) onto the per-backend
+/// MRU list. Dedup on Hz equality, prepend, cap at 6. Persists via
+/// `save_settings` so the next keypad open already shows it. The
+/// MRU bucket is the live array under
+/// `currentSettings.sdr_settings.backends[backendId].freq_favorites`.
+async function pushFreqMru(mhz, targetEl) {
   if (!Number.isFinite(mhz) || mhz <= 0) return;
+  const backendId = backendIdForFreqInput(targetEl);
+  if (!backendId) return;
   const hz = Math.round(mhz * 1e6);
-  const key = freqMruKeyForId(targetId || "");
-  const list = Array.isArray(currentSettings[key])
-    ? currentSettings[key].slice() : [];
+  const list = freqFavoritesArray(backendId);
   const idx = list.indexOf(hz);
   if (idx !== -1) list.splice(idx, 1);
   list.unshift(hz);
   while (list.length > 6) list.pop();
-  currentSettings[key] = list;
   if (window.__TAURI__ && window.__TAURI__.core) {
     try {
       await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });

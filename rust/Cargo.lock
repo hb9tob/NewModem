@@ -2955,19 +2955,18 @@ name = "modem-gui"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
- "cpal",
  "dirs 5.0.1",
  "hex",
  "hmac",
  "hound",
  "image",
  "imageproc",
- "industrial-io",
  "kamadak-exif",
  "modem-core",
  "modem-framing",
  "modem-io",
  "modem-pluto",
+ "modem-sdr",
  "modem-sdrplay",
  "modem-worker",
  "ravif",
@@ -2998,8 +2997,21 @@ version = "0.1.0"
 dependencies = [
  "hound",
  "industrial-io",
+ "modem-io",
+ "modem-sdr",
  "modem-sdr-dsp",
  "num-complex",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "modem-sdr"
+version = "0.1.0"
+dependencies = [
+ "modem-io",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -3015,8 +3027,11 @@ name = "modem-sdrplay"
 version = "0.1.0"
 dependencies = [
  "bindgen 0.69.5",
+ "modem-io",
+ "modem-sdr",
  "modem-sdr-dsp",
  "num-complex",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -3029,7 +3044,6 @@ dependencies = [
  "modem-core",
  "modem-framing",
  "modem-io",
- "modem-pluto",
  "modem-sdr-dsp",
  "serde",
  "serde_json",

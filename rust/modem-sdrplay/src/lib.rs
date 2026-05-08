@@ -52,10 +52,12 @@
 //! `pluto:` prefix gets a `sdrplay:` sibling.
 
 pub mod api;
+pub mod backend;
 pub mod device;
 pub mod error;
 pub mod rx;
 
+pub use backend::{SdrplayBackend, SdrplayDevice};
 pub use device::{
     list_serials, open, AgcMode, AntennaPort, SdrplayConfig, SdrplaySession, Tuner,
     PREFERRED_AUDIO_RATIO, PREFERRED_DECIMATION, PREFERRED_SAMPLE_RATE_HZ,

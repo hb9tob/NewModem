@@ -3,6 +3,7 @@
 mod collector_client;
 mod overlay;
 mod ptt;
+mod sdr_registry;
 mod settings;
 mod tx_encode;
 
@@ -11,6 +12,8 @@ use modem_worker::{rx_worker, tx_worker, EventSink};
 
 use modem_io::cpal_capture::{self, CaptureHandle};
 use modem_io::devices::{list_input_devices, list_output_devices, DeviceInfo};
+use modem_io::{CpalSink, SampleSink};
+use modem_sdr::{DeviceDescriptor, SdrCaptureHandle, SdrDevice};
 use ptt::SharedPtt;
 use settings::Settings;
 use modem_worker::tx_worker::TxHandle;
@@ -21,34 +24,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Synthetic prefix the GUI uses to flag a Pluto entry in the
-/// (otherwise cpal-only) device dropdown. The real libiio URI follows.
-const PLUTO_DEVICE_PREFIX: &str = "pluto:";
-
-/// Synthetic prefix for SDRplay RSPduo entries in the same device
-/// dropdown. The serial number follows (e.g. `sdrplay:22340A2A34`),
-/// matching what `sdrplay_api_GetDevices` reports.
-const SDRPLAY_DEVICE_PREFIX: &str = "sdrplay:";
-
-/// Active RX backend. Dropping either variant releases the underlying
-/// hardware; `stop_capture` matches on the variant to call the right
-/// teardown.
+/// Active RX backend. Dropping the variant releases the underlying
+/// hardware: capture thread Drop cascades through `SdrCaptureHandle`
+/// for SDRs; cpal Stream / WAV pacer Drop for the other paths.
 enum CaptureKind {
-    /// cpal soundcard input (the legacy default, used unless the
-    /// device name carries the [`PLUTO_DEVICE_PREFIX`]).
+    /// cpal soundcard input. Used when the device name doesn't parse
+    /// as a `<backend_id>:<device_id>` composite.
     Cpal(CaptureHandle),
-    /// PlutoSDR via libiio. The capture thread runs the radio-faithful
-    /// demod chain from `modem-sdr-dsp`; the worker downstream sees
-    /// the same 48 kHz mono `Vec<f32>` stream as the cpal path.
-    Pluto(modem_pluto::rx::CaptureHandle),
-    /// SDRplay RSPduo via the closed-binary SDRplay API daemon. Same
-    /// 48 kHz mono `Vec<f32>` shape as Pluto — the rx_worker doesn't
-    /// know which radio fed it.
-    Sdrplay(modem_sdrplay::rx::CaptureHandle),
+    /// Any registered SDR backend (Pluto, SDRplay, …). The boxed
+    /// device keeps the hardware handle alive while RX is running;
+    /// `SdrCaptureHandle` owns the capture thread and stops it on
+    /// drop. The worker downstream sees the same 48 kHz mono
+    /// `Vec<f32>` stream as the cpal path.
+    Sdr(Box<dyn SdrDevice>, SdrCaptureHandle),
     /// Synthetic capture: a paced thread streams f32 samples loaded
     /// from a WAV file through the same `mpsc::Receiver<Vec<f32>>`
-    /// interface the worker expects from cpal/Pluto. Used to replay
-    /// captured audio (offline debug, regression testing).
+    /// interface the worker expects from cpal / SDR backends. Used
+    /// to replay captured audio (offline debug, regression testing).
     WavFile {
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -59,8 +51,14 @@ impl CaptureKind {
     fn stop(self) {
         match self {
             CaptureKind::Cpal(h) => h.stop(),
-            CaptureKind::Pluto(h) => h.stop(),
-            CaptureKind::Sdrplay(h) => h.stop(),
+            CaptureKind::Sdr(dev, cap) => {
+                // Stop the capture stream first (its Drop joins the
+                // capture thread / calls Uninit), then release the
+                // device handle. Explicit drops keep the order
+                // unambiguous.
+                drop(cap);
+                drop(dev);
+            }
             CaptureKind::WavFile { stop, thread } => {
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(t) = thread {
@@ -118,111 +116,45 @@ fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_output_devices().map_err(|e| e.to_string())
 }
 
-/// Pluto entry surfaced to the RX device dropdown. Names follow the
-/// convention `pluto:<libiio-uri>` so the backend's `start_capture`
-/// can route on the prefix without a separate "kind" parameter — that
-/// keeps the existing `device_name: String` Tauri contract intact.
+/// Per-backend descriptor shipped to the GUI frontend at startup.
+/// Each compiled-in `SdrBackend` produces one entry; the frontend
+/// caches the list keyed by `id` and reads `capabilities` to
+/// dynamically build the per-backend RX/TX panels (frequency input
+/// min/max, AGC `<select>`, antenna selector, feature toggles, …).
+/// Replaces the legacy per-backend `list_pluto_devices` /
+/// `list_sdrplay_devices` commands.
 #[derive(Debug, Clone, serde::Serialize)]
-struct PlutoDeviceInfo {
-    /// Synthetic device name, e.g. `pluto:usb:1.6.5`. The frontend
-    /// stores this in `currentSettings.rx_device` like any other
-    /// device name; the backend recognises the `pluto:` prefix in
-    /// `start_capture` and opens the SDR backend instead of cpal.
-    name: String,
-    /// Raw libiio URI (without the `pluto:` prefix). Useful when the
-    /// frontend wants to display "USB 1.6.5" or "ip:pluto.local".
-    uri: String,
-    /// Vendor / model string libiio reports (typically
-    /// `"PlutoSDR (ADALM-PLUTO)"` for an ADALM-PLUTO).
-    description: String,
-    /// Single line for the dropdown.
-    friendly_name: String,
+struct SdrBackendInfo {
+    id: String,
+    display_name: String,
+    capabilities: modem_sdr::BackendCapabilities,
 }
 
-/// Scan USB libiio backends for connected Plutos. Network-mode Plutos
-/// (`ip:pluto.local`) aren't listed here — those are entered manually
-/// in Settings for now. Empty result + no error means "libiio works
-/// but no Pluto plugged in".
+/// Enumerate every SDR backend compiled into this binary, with its
+/// static capabilities. The frontend constructs the device dropdown
+/// `<optgroup>` headers and the per-backend control panels from the
+/// returned list — no hardcoded knowledge of "Pluto" or "SDRplay" in
+/// the frontend.
 #[tauri::command]
-fn list_pluto_devices() -> Result<Vec<PlutoDeviceInfo>, String> {
-    eprintln!("[pluto] list_pluto_devices invoked");
-    let scan = match industrial_io::ScanContext::new_usb() {
-        Ok(s) => s,
-        Err(e) => {
-            // libiio not loadable / USB backend disabled — surface as
-            // an empty list rather than an error so the GUI just shows
-            // "no Pluto found" instead of a red banner.
-            eprintln!("[pluto] USB scan unavailable: {e}");
-            return Ok(Vec::new());
-        }
-    };
-    eprintln!("[pluto] scan ok, len = {}", scan.len());
-    let mut out = Vec::new();
-    for (uri, descr) in scan.iter() {
-        eprintln!("[pluto] entry uri={uri:?} descr={descr:?}");
-        // Only keep entries whose description matches a Pluto. libiio
-        // can list other AD9361-class boards too — skip those.
-        let is_pluto = descr.contains("PlutoSDR")
-            || descr.contains("ADALM-PLUTO")
-            || descr.contains("AD9363")
-            || descr.contains("AD9361");
-        if !is_pluto {
-            eprintln!("[pluto]   -> skipped (not a Pluto)");
-            continue;
-        }
-        let friendly_name = format!("Pluto SDR — {uri}");
-        out.push(PlutoDeviceInfo {
-            name: format!("pluto:{uri}"),
-            uri,
-            description: descr,
-            friendly_name,
-        });
-    }
-    eprintln!("[pluto] returning {} entries", out.len());
-    Ok(out)
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct SdrplayDeviceInfo {
-    /// Synthetic device name, e.g. `sdrplay:22340A2A34`. Stored in
-    /// `currentSettings.rx_device` like any other device name; the
-    /// backend recognises the `sdrplay:` prefix in `start_capture`
-    /// and opens the SDRplay backend instead of cpal/Pluto.
-    name: String,
-    /// Bare serial number reported by `sdrplay_api_GetDevices`.
-    serial: String,
-    /// Single line for the dropdown.
-    friendly_name: String,
-}
-
-/// Enumerate every RSPduo / RSP visible to the SDRplay daemon. An
-/// empty result + no error means "the API is reachable but no
-/// device on USB" (or the daemon isn't running). We don't surface
-/// daemon-down as a hard error — the user might just not have
-/// installed the SDRplay API yet, and the rest of the GUI should
-/// still function.
-#[tauri::command]
-fn list_sdrplay_devices() -> Result<Vec<SdrplayDeviceInfo>, String> {
-    eprintln!("[sdrplay] list_sdrplay_devices invoked");
-    let serials = match modem_sdrplay::list_serials() {
-        Ok(v) => v,
-        Err(e) => {
-            // API not loadable / daemon not running — surface as an
-            // empty list so the dropdown just shows "no SDRplay" and
-            // doesn't red-banner the whole GUI.
-            eprintln!("[sdrplay] list unavailable: {e}");
-            return Ok(Vec::new());
-        }
-    };
-    eprintln!("[sdrplay] {} serial(s): {:?}", serials.len(), serials);
-    Ok(serials
-        .into_iter()
-        .map(|s| SdrplayDeviceInfo {
-            name: format!("{SDRPLAY_DEVICE_PREFIX}{s}"),
-            serial: s.clone(),
-            friendly_name: format!("SDRplay RSPduo — {s}"),
+fn list_sdr_backends() -> Vec<SdrBackendInfo> {
+    sdr_registry::registered_backends()
+        .iter()
+        .map(|b| SdrBackendInfo {
+            id: b.id().to_string(),
+            display_name: b.display_name().to_string(),
+            capabilities: b.capabilities().clone(),
         })
-        .collect())
+        .collect()
+}
+
+/// List the live devices visible to one specific SDR backend.
+/// Returns an empty `Vec` (not an error) when the backend itself is
+/// reachable but no hardware is plugged in — the GUI surfaces this
+/// as an empty group, not a red banner.
+#[tauri::command]
+fn list_sdr_devices(backend_id: String) -> Result<Vec<DeviceDescriptor>, String> {
+    let backend = sdr_registry::backend_by_id(&backend_id).map_err(|e| e.to_string())?;
+    backend.list_devices().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -324,72 +256,31 @@ fn ptt_status(state: State<'_, AppState>) -> PttStatusEvent {
     }
 }
 
-/// Build a [`modem_pluto::device::PlutoConfig`] from the persistent
-/// [`settings::Settings`] for a given libiio URI. Shared between the
-/// RX `start_capture` branch and the TX `tx_start` / `tx_more`
-/// branches so both directions see the same frequency / gain /
-/// deviation values from one source of truth (the Settings panel).
-fn build_pluto_config(uri: &str, cfg: &settings::Settings) -> modem_pluto::device::PlutoConfig {
-    // Default to slow_attack if Settings ever carries an
-    // unrecognised mode string — the chip would reject the
-    // raw libiio write anyway, but defaulting saves the user
-    // a trip to the Settings panel.
-    let rx_mode = modem_pluto::device::RxGainMode::from_iio_str(&cfg.pluto_rx_gain_mode)
-        .unwrap_or(modem_pluto::device::RxGainMode::SlowAttack);
-    modem_pluto::device::PlutoConfig {
-        uri: uri.to_string(),
-        rx_freq_hz: cfg.pluto_rx_freq_hz,
-        tx_freq_hz: cfg.pluto_tx_freq_hz,
-        rx_gain_mode: rx_mode,
-        rx_gain_db: cfg.pluto_rx_gain_db,
-        tx_attenuation_db: cfg.pluto_tx_attenuation_db,
-        rf_bandwidth_hz: 200_000,
-        prefer_low_rate: true,
-        rx_max_deviation_hz: cfg.pluto_rx_deviation_hz as f32,
-        tx_deviation_hz: cfg.effective_pluto_tx_deviation_hz() as f32,
-        ctcss_freq_hz: if cfg.pluto_tx_ctcss_enabled {
-            cfg.pluto_tx_ctcss_freq_hz
-        } else {
-            0.0
-        },
-        ctcss_level: 0.1,
-    }
-}
-
-/// Build a [`modem_sdrplay::SdrplayConfig`] from the persistent
-/// [`settings::Settings`] for a given RSPduo serial. The settings
-/// strings are interpreted permissively (case-insensitive, falling
-/// back to defaults on unknown values) so a stale settings.json
-/// from an earlier API version doesn't lock the user out.
-fn build_sdrplay_config(serial: &str, cfg: &settings::Settings) -> modem_sdrplay::SdrplayConfig {
-    let tuner = match cfg.sdrplay_tuner.to_ascii_uppercase().as_str() {
-        "A" => modem_sdrplay::Tuner::A,
-        _ => modem_sdrplay::Tuner::B,
-    };
-    let antenna = match cfg.sdrplay_antenna.to_ascii_lowercase().as_str() {
-        "hiz" => modem_sdrplay::AntennaPort::Hiz,
-        _ => modem_sdrplay::AntennaPort::Fifty,
-    };
-    let agc_mode = match cfg.sdrplay_agc_mode.to_ascii_lowercase().as_str() {
-        "slow" => modem_sdrplay::AgcMode::Slow,
-        "mid" => modem_sdrplay::AgcMode::Mid,
-        "fast" => modem_sdrplay::AgcMode::Fast,
-        _ => modem_sdrplay::AgcMode::Disable,
-    };
-    modem_sdrplay::SdrplayConfig {
-        serial: serial.to_string(),
-        tuner,
-        antenna,
-        bias_t: cfg.sdrplay_bias_t,
-        fm_notch: cfg.sdrplay_fm_notch,
-        dab_notch: cfg.sdrplay_dab_notch,
-        rf_freq_hz: cfg.sdrplay_rx_freq_hz,
-        sample_rate_hz: modem_sdrplay::PREFERRED_SAMPLE_RATE_HZ as f64,
-        decimation: modem_sdrplay::PREFERRED_DECIMATION,
-        lna_state: cfg.sdrplay_lna_state,
-        if_gain_reduction_db: cfg.sdrplay_if_gain_reduction_db,
-        agc_mode,
-        max_deviation_hz: cfg.sdrplay_rx_deviation_hz as f32,
+/// Resolve `device_name` to a `SampleSink` for TX. Composite SDR
+/// names (`<backend>:<device_id>` produced by the registry) open
+/// the device through `SdrBackend::open` and ask for `tx_sink()`;
+/// plain cpal device names (the legacy soundcard path) fall back
+/// to [`CpalSink`].
+///
+/// Backends that are RX-only return `None` from `tx_sink()` — we
+/// surface that to the GUI as a clean error so the operator knows
+/// to pick a different TX device.
+fn resolve_tx_sink(device_name: &str, cfg: &Settings) -> Result<Arc<dyn SampleSink>, String> {
+    if let Some((backend, device_id)) = sdr_registry::parse_composite_name(device_name) {
+        let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
+        let descriptor = DeviceDescriptor::new(
+            backend.id(),
+            device_id,
+            format!("{}:{device_id}", backend.id()),
+        );
+        let device = backend
+            .open(&descriptor, &sdr_cfg)
+            .map_err(|e| format!("{}: {e}", backend.id()))?;
+        device
+            .tx_sink()
+            .ok_or_else(|| format!("{} est RX uniquement", backend.id()))
+    } else {
+        Ok(Arc::new(CpalSink))
     }
 }
 
@@ -408,23 +299,29 @@ fn start_capture(
     let forced = forced.unwrap_or(false);
     let profile_idx = resolve_profile(profile.as_deref().unwrap_or("HIGH"), forced)?;
     let cfg = settings::load();
-    // Route on the device-name prefix: Pluto entries arrive as
-    // `pluto:<libiio-uri>` (built by `list_pluto_devices`), SDRplay
-    // entries as `sdrplay:<serial>` (from `list_sdrplay_devices`),
-    // anything else is a cpal soundcard. Every branch emits the
-    // same shape: `mpsc::Receiver<Vec<f32>>` at 48 kHz mono — the
-    // rx_worker doesn't know which backend produced the samples.
+    // Route on the composite device name. SDR devices arrive as
+    // `<backend_id>:<device_id>` (produced by `SdrBackend::list_devices`
+    // via `DeviceDescriptor::composite_name`); the registry parses it
+    // back into (backend, device_id). Plain strings (cpal device
+    // names like "USB Audio (hw:1,0)") fall through to the soundcard
+    // path. Every branch emits the same shape:
+    // `mpsc::Receiver<Vec<f32>>` at 48 kHz mono — the rx_worker
+    // doesn't know which backend produced the samples.
     let (capture, samples) =
-        if let Some(uri) = device_name.strip_prefix(PLUTO_DEVICE_PREFIX) {
-            let pcfg = build_pluto_config(uri, &cfg);
-            let (h, rx) = modem_pluto::rx::start(&pcfg)
-                .map_err(|e| format!("Pluto open ({uri}): {e}"))?;
-            (CaptureKind::Pluto(h), rx)
-        } else if let Some(serial) = device_name.strip_prefix(SDRPLAY_DEVICE_PREFIX) {
-            let scfg = build_sdrplay_config(serial, &cfg);
-            let (h, rx) = modem_sdrplay::rx::start(&scfg)
-                .map_err(|e| format!("SDRplay open ({serial}): {e}"))?;
-            (CaptureKind::Sdrplay(h), rx)
+        if let Some((backend, device_id)) = sdr_registry::parse_composite_name(&device_name) {
+            let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
+            let descriptor = DeviceDescriptor::new(
+                backend.id(),
+                device_id,
+                format!("{}:{device_id}", backend.id()),
+            );
+            let mut device = backend
+                .open(&descriptor, &sdr_cfg)
+                .map_err(|e| format!("{}: {e}", backend.id()))?;
+            let (cap_handle, rx) = device
+                .start_rx()
+                .map_err(|e| format!("{}: {e}", backend.id()))?;
+            (CaptureKind::Sdr(device, cap_handle), rx)
         } else {
             let (h, rx) = cpal_capture::start(&device_name)?;
             (CaptureKind::Cpal(h), rx)
@@ -790,13 +687,11 @@ fn tx_start(
     let history_max = cfg.tx_history_max;
     let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
     let repair_pct = args.repair_pct.unwrap_or(30);
-    // Build the Pluto config only if the selected TX device is a
-    // Pluto. The worker uses `Option::is_some` to route between the
-    // cpal sound-card path and the Pluto FM-mod chain.
-    let pluto_config = args
-        .tx_device
-        .strip_prefix(PLUTO_DEVICE_PREFIX)
-        .map(|uri| build_pluto_config(uri, &cfg));
+    // Resolve the SampleSink upfront on the Tauri thread. The worker
+    // thread only sees an `Arc<dyn SampleSink>` — no per-backend
+    // branching inside `tx_worker::run_playback`, no `Option<PlutoConfig>`
+    // sneaking through the call chain.
+    let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let archive_sink = TauriEventSink(app.clone());
     tx_worker::archive_payload(
         &save_dir,
@@ -807,7 +702,7 @@ fn tx_start(
         history_max,
         &archive_sink,
     );
-    let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
+    let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn(
         payload_path,
         args.mode,
@@ -818,9 +713,9 @@ fn tx_start(
         repair_pct,
         attenuation_db,
         preemphasis_enabled,
-        pluto_config,
+        audio_sink,
         state.ptt.clone(),
-        tx_sink,
+        event_sink,
         save_wav_dir,
     );
     *tx_guard = Some(handle);
@@ -876,11 +771,8 @@ fn tx_more(
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
-    let pluto_config = args
-        .tx_device
-        .strip_prefix(PLUTO_DEVICE_PREFIX)
-        .map(|uri| build_pluto_config(uri, &cfg));
-    let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
+    let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
+    let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn_more(
         payload_path,
         args.mode,
@@ -892,9 +784,9 @@ fn tx_more(
         args.count,
         attenuation_db,
         preemphasis_enabled,
-        pluto_config,
+        audio_sink,
         state.ptt.clone(),
-        tx_sink,
+        event_sink,
         save_wav_dir,
     );
     *tx_guard = Some(handle);
@@ -1394,8 +1286,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
-            list_pluto_devices,
-            list_sdrplay_devices,
+            list_sdr_backends,
+            list_sdr_devices,
             list_modem_profiles,
             list_serial_ports,
             ptt_status,

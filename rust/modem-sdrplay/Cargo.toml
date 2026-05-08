@@ -7,8 +7,13 @@ publish = false
 
 [dependencies]
 modem-sdr-dsp = { path = "../modem-sdr-dsp" }
+modem-sdr = { path = "../modem-sdr" }
+modem-io = { path = "../modem-io" }
 num-complex = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
 
 [build-dependencies]
 # bindgen runs on the SDRplay C headers (typically under /usr/local/include

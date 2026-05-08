@@ -11,20 +11,29 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Default = all backends compiled in. CI / Pi 5 / Linux desktop ship
+# this. A reduced "windows-min" build can `--no-default-features
+# --features pluto` once Phase E removes the direct-named-backend
+# code paths from main.rs / settings.rs.
+default = ["pluto", "sdrplay"]
+pluto = ["dep:modem-pluto"]
+sdrplay = ["dep:modem-sdrplay"]
+windows-min = ["pluto"]
+
 [dependencies]
 modem-core = { path = "../../modem-core" }
 modem-framing = { path = "../../modem-framing" }
 modem-io = { path = "../../modem-io" }
-modem-pluto = { path = "../../modem-pluto" }
-modem-sdrplay = { path = "../../modem-sdrplay" }
+modem-sdr = { path = "../../modem-sdr" }
+modem-pluto = { path = "../../modem-pluto", optional = true }
+modem-sdrplay = { path = "../../modem-sdrplay", optional = true }
 modem-worker = { path = "../../modem-worker" }
-industrial-io = "0.6"
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-cpal = "0.15"
 dirs = "5"
 hound = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
