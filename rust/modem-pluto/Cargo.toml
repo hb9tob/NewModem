@@ -5,33 +5,12 @@ edition = "2021"
 description = "PlutoSDR (ADALM-PLUTO / AD9363) backend for the NBFM modem. Streams I/Q via the iiod TCP protocol (pure Rust, no libiio FFI), runs the radio-faithful PM TX + LPF/HPF RX chain from modem-sdr-dsp, and exposes the same SampleSink (TX) and mpsc::Receiver<Vec<f32>> (RX) seams as the cpal soundcard backend."
 publish = false
 
-[features]
-# `legacy-iio` keeps the original `industrial-io`-based device / rx /
-# tx / backend modules in the build. They depend on the upstream
-# `libiio-sys` 0.4 which is `#[cfg(unix)]`-only, so this feature can
-# only be enabled on non-Windows targets — that's enforced by the
-# `target.'cfg(unix)'.dependencies` table below. The migration to the
-# pure-Rust iiod-TCP path is incremental: today the `iiod` module is
-# scaffolded and unit-tested, but the higher-level `device::open` /
-# `rx::start` / `tx::start` still call into industrial_io. As we port
-# them over, the legacy modules shrink, then the feature goes away.
-default = ["legacy-iio"]
-legacy-iio = ["dep:industrial-io"]
-
 [dependencies]
 modem-sdr-dsp = { path = "../modem-sdr-dsp" }
 modem-sdr = { path = "../modem-sdr" }
 modem-io = { path = "../modem-io" }
 num-complex = { workspace = true }
 thiserror = { workspace = true }
-
-# `industrial-io` only compiles under cfg(unix) — its `libiio-sys`
-# transitive dep is gated `#[cfg(unix)]` upstream, so even with the
-# `legacy-iio` feature on, building it on Windows would 194-error.
-# Restricting the dep to unix targets keeps Windows builds clean (and
-# drives the `iiod` module forward as the cross-platform path).
-[target.'cfg(unix)'.dependencies]
-industrial-io = { version = "0.6", optional = true }
 
 [dev-dependencies]
 hound = { workspace = true }

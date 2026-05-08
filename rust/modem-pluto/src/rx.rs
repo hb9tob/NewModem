@@ -1,9 +1,11 @@
-//! Pluto RX path: USB I/Q → 48 kHz mono `Vec<f32>` audio batches.
+//! Pluto RX path: iiod-TCP I/Q stream → 48 kHz mono `Vec<f32>` audio.
 //!
 //! Mirrors the shape of [`modem_io::cpal_capture`] so `modem-worker`
 //! can plug a Pluto into the same `Receiver<Vec<f32>>` consumer it
-//! already uses for the soundcard. The capture thread owns the libiio
-//! `Buffer`, runs the radio-faithful DSP chain straight after the
+//! already uses for the soundcard. The capture thread owns its own
+//! [`IiodClient`] (one TCP connection per stream — iiod allocates one
+//! server thread per client, the AD9361 hardware itself serializes
+//! contention), runs the radio-faithful DSP chain straight after the
 //! buffer pump, and forwards 48 kHz mono `Vec<f32>` batches over an
 //! mpsc.
 //!
@@ -19,10 +21,10 @@
 //!   → mpsc::Sender<Vec<f32>>
 //! ```
 //!
-//! The thread starts by re-running [`device::open`] inside itself —
-//! that way the (`!Send`) intermediate `Channel` handles never leave
-//! the worker, and `start()` only has to ship a `PlutoConfig` (which
-//! is `Clone + Send`) across the spawn boundary.
+//! The thread starts by re-running [`device::open`] inside itself,
+//! which programs the AD9361 over a transient control connection and
+//! returns a config snapshot. The streaming connection is then opened
+//! separately and lives for the duration of the capture.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -36,8 +38,9 @@ use modem_sdr_dsp::audio_filters::{DeemphasisLpf, SubAudioHpf};
 use modem_sdr_dsp::decimator::PolyphaseDecimator;
 use modem_sdr_dsp::fm_demod::QuadratureDemod;
 
-use crate::device::{self, NegotiatedRate, PlutoConfig};
+use crate::device::{self, NegotiatedRate, PlutoConfig, PlutoSession};
 use crate::error::PlutoError;
+use crate::iiod::IiodClient;
 
 /// Audio rate the chain produces. Locked to the modem core's
 /// `AUDIO_RATE`. Decimation ratio against the AD9361's IF rate is
@@ -45,23 +48,26 @@ use crate::error::PlutoError;
 /// fallback).
 pub const AUDIO_RATE: u32 = modem_sdr_dsp::AUDIO_RATE;
 
-/// libiio buffer size, in I/Q samples. At 576 kHz, 8192 samples is
-/// ~14 ms of latency per refill — small enough that the GUI feels
+/// IIO buffer size, in scan cycles (= I/Q sample pairs). At 576 kHz,
+/// 8192 is ~14 ms per refill — small enough that the GUI feels
 /// responsive but big enough that USB scheduling jitter doesn't
-/// starve the buffer. Multiple of 16 because libiio's
-/// `length_align_bytes` on `cf-ad9361-lpc` reads 8 (= 2 channels × 4
-/// bytes per i16 pair, rounded).
+/// starve the buffer. Multiple of 16 to match the AD9361 driver's
+/// `length_align_bytes` on `cf-ad9361-lpc`.
 const RX_BUFFER_SAMPLES: usize = 8192;
+
+/// Bytes per scan cycle on Pluto RX: I (i16 LE) + Q (i16 LE).
+const BYTES_PER_SCAN: usize = 4;
+
+/// Channel-enable mask for `cf-ad9361-lpc`. Bit 0 = voltage0 (I),
+/// bit 1 = voltage1 (Q). Both on for normal complex RX.
+const RX_CHANNEL_MASK: u32 = 0x0000_0003;
 
 /// Audio samples per `Vec<f32>` pushed into the worker mpsc. 1200
 /// samples = 25 ms at 48 kHz, which matches what the cpal soundcard
-/// backend delivers per callback (measured ~40 callbacks/s, ~1200
-/// samples each on the Pi 5 PulseAudio path). One refill of
-/// [`RX_BUFFER_SAMPLES`] produces ~683 audio samples after ÷12
-/// decimation, so we accumulate 2-3 refills' worth before flushing.
-/// Equalising the chunk shape between cpal and Pluto keeps the
-/// worker side homogeneous: same per-batch overhead, same mpsc
-/// pressure, no special case.
+/// backend delivers per callback. One refill of [`RX_BUFFER_SAMPLES`]
+/// produces ~683 audio samples after ÷12 decimation, so we accumulate
+/// 2-3 refills' worth before flushing. Equalising the chunk shape
+/// between cpal and Pluto keeps the worker side homogeneous.
 const TARGET_CHUNK_SAMPLES: usize = 1200;
 
 /// AD9361 / AD9363 RX path on Pluto outputs S12 in S16 LE — a 12-bit
@@ -70,8 +76,8 @@ const TARGET_CHUNK_SAMPLES: usize = 1200;
 const RX_S12_PEAK: f32 = 2047.0;
 
 /// How often the capture thread emits a status / error tick to stderr.
-/// Mirrors the throttling pattern from `modem_io::cpal_capture` (commit
-/// bab4311) so a USB hiccup doesn't flood the terminal.
+/// Mirrors the throttling pattern from `modem_io::cpal_capture` so a
+/// USB hiccup doesn't flood the terminal.
 const STATUS_TICK_PERIOD: Duration = Duration::from_secs(2);
 
 /// Live handle on a Pluto capture thread. Drop / call [`stop()`] to
@@ -81,8 +87,8 @@ pub struct CaptureHandle {
     pub thread: Option<JoinHandle<()>>,
     pub sample_rate: u32,
     pub channels: u16,
-    /// AD9363 sample rate that the BBPLL locked at — 528 kHz typically,
-    /// 960 kHz on fallback. Reported for the GUI / CLI.
+    /// AD9363 sample rate that the BBPLL locked at — typically 576 kHz
+    /// or 2304 kHz on fallback. Reported for the GUI / CLI.
     pub negotiated_iq_rate_hz: u64,
 }
 
@@ -139,11 +145,11 @@ pub fn start(config: &PlutoConfig) -> Result<(CaptureHandle, Receiver<Vec<f32>>)
     }
 }
 
-/// Same as [`start`] but takes an already-opened [`device::PlutoSession`].
-/// Used by the loopback test where one open Pluto serves both
+/// Same as [`start`] but takes an already-configured [`PlutoSession`].
+/// Used by the loopback test where one configured device serves both
 /// directions; production callers should prefer [`start`].
 pub fn start_on(
-    session: device::PlutoSession,
+    session: PlutoSession,
     sample_tx: Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
 ) -> Result<NegotiatedRate, PlutoError> {
@@ -168,73 +174,63 @@ fn run_capture(
     let _ = capture_loop(session, sample_tx, stop);
 }
 
-/// Inner loop. Returns once `stop` is set or the buffer pump fails.
+/// Inner loop. Returns once `stop` is set or the iiod stream fails.
 /// Used both by [`run_capture`] and by [`start_on`].
 fn capture_loop(
-    session: device::PlutoSession,
+    session: PlutoSession,
     sample_tx: Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
 ) -> Result<NegotiatedRate, PlutoError> {
-    use industrial_io::Direction;
+    // Open the streaming connection — distinct from the control
+    // connection that `device::open` used and dropped. iiod allocates
+    // one server thread per client, so this is contention-free.
+    let mut client = IiodClient::connect(&session.config.uri)?;
+    // Generous server-side timeout so a slow first refill (chip
+    // calibration) doesn't trip a benign error.
+    let _ = client.set_iiod_timeout(2000);
 
-    // Find the I and Q channels on the buffer-capable RX device.
-    // cf-ad9361-lpc exposes voltage0 (I) and voltage1 (Q), both input.
-    let i_chan = session
-        .rx_buffer_dev
-        .find_channel("voltage0", Direction::Input)
-        .ok_or(PlutoError::Attribute {
-            device: "cf-ad9361-lpc",
-            attr: "voltage0 (I)",
-            detail: "RX I channel not present".into(),
-        })?;
-    let q_chan = session
-        .rx_buffer_dev
-        .find_channel("voltage1", Direction::Input)
-        .ok_or(PlutoError::Attribute {
-            device: "cf-ad9361-lpc",
-            attr: "voltage1 (Q)",
-            detail: "RX Q channel not present".into(),
-        })?;
-    i_chan.enable();
-    q_chan.enable();
-
-    let mut buf = session
-        .rx_buffer_dev
-        .create_buffer(RX_BUFFER_SAMPLES, false)
-        .map_err(|e| PlutoError::Stream(format!("create RX buffer: {e}")))?;
+    client
+        .open_buffer(
+            crate::device::iio_names::RX_BUFFER,
+            RX_BUFFER_SAMPLES,
+            RX_CHANNEL_MASK,
+            false,
+        )
+        .map_err(|e| PlutoError::Stream(format!("OPEN cf-ad9361-lpc: {e}")))?;
 
     // DSP chain — built once, reused on every refill.
     let if_rate = session.negotiated_rate.sample_rate_hz as f32;
     let ratio = session.negotiated_rate.ratio;
     // Discriminator gain follows whatever max deviation the user
-    // selected (5 kHz NBFM standard, 2.5 kHz narrow NFM, etc.) — see
-    // `PlutoConfig::rx_max_deviation_hz`. Picking it below the actual
-    // on-air deviation would soft-clip; above would attenuate.
+    // selected (5 kHz NBFM standard, 2.5 kHz narrow NFM, etc.). Picking
+    // it below the actual on-air deviation soft-clips audio amplitude;
+    // above attenuates it.
     let mut demod = QuadratureDemod::new(if_rate, session.rx_max_deviation_hz);
-    // The decimator's input rate is the QuadratureDemod's output rate
-    // (= the IF rate, post-discriminator audio is at the IF rate). The
-    // taps are designed for an audio-band LPF at 24 kHz cutoff
-    // (= AUDIO_RATE / 2), with a 99-tap Hamming sinc. 99 is odd so the
-    // FIR stays linear-phase and centered.
+    // 99-tap Hamming-sinc LPF for ÷ratio decimation, cutoff at audio
+    // Nyquist. Linear-phase, ~52 dB stopband.
     let dec_taps = PolyphaseDecimator::hamming_sinc_taps(if_rate, AUDIO_RATE as f32 / 2.0, 99);
     let mut decim = PolyphaseDecimator::with_taps(dec_taps, ratio);
     let mut deemph = DeemphasisLpf::new(AUDIO_RATE as f32, DeemphasisLpf::DEFAULT_CORNER_HZ);
     let mut hpf = SubAudioHpf::new(AUDIO_RATE as f32, SubAudioHpf::DEFAULT_CORNER_HZ);
 
-    // Throttled-error state.
+    // Pre-allocated I/Q wire-format scratch — one buffer worth of
+    // bytes. iiod's `read_buffer_into` writes here; we reinterpret
+    // i16 LE pairs after the fill.
+    let buffer_bytes = RX_BUFFER_SAMPLES * BYTES_PER_SCAN;
+    let mut wire_buf = vec![0u8; buffer_bytes];
+
     let mut last_tick = std::time::Instant::now();
     let mut refill_errors: u64 = 0;
     let mut total_iq_samples: u64 = 0;
 
-    // Aggregation buffer between refills — one libiio refill produces
+    // Aggregation buffer between refills — one refill produces
     // ~RX_BUFFER_SAMPLES/ratio audio samples (~683 at 576 kHz ÷12),
     // smaller than [`TARGET_CHUNK_SAMPLES`]. We accumulate until we
-    // have a full chunk, then flush. Pre-allocated for a couple of
-    // chunks' worth so steady-state runs allocation-free.
+    // have a full chunk, then flush.
     let mut pending: Vec<f32> = Vec::with_capacity(TARGET_CHUNK_SAMPLES * 2);
 
     while !stop.load(Ordering::Relaxed) {
-        let n = match buf.refill() {
+        let n = match client.read_buffer_into(crate::device::iio_names::RX_BUFFER, &mut wire_buf) {
             Ok(n) => n,
             Err(e) => {
                 refill_errors += 1;
@@ -252,24 +248,19 @@ fn capture_loop(
             continue;
         }
 
-        // Demux i16 I and Q from the same buffer. industrial-io's
-        // `read::<i16>` does the demux + sign-extend (the AD9361 RX
-        // path is S12 in S16 LE).
-        let i_samples: Vec<i16> = i_chan
-            .read::<i16>(&buf)
-            .map_err(|e| PlutoError::Stream(format!("RX read I: {e}")))?;
-        let q_samples: Vec<i16> = q_chan
-            .read::<i16>(&buf)
-            .map_err(|e| PlutoError::Stream(format!("RX read Q: {e}")))?;
-        debug_assert_eq!(i_samples.len(), q_samples.len());
-        total_iq_samples += i_samples.len() as u64;
+        // Reinterpret the wire bytes as (I, Q) i16 LE pairs. Pluto's
+        // RX is S12 in S16 LE: sample bits in the low 12 with sign
+        // extension to 16, peak ±2047. We scale to unit-amplitude
+        // Complex32 by dividing by RX_S12_PEAK.
+        let n_pairs = n / BYTES_PER_SCAN;
+        total_iq_samples += n_pairs as u64;
 
-        // Pair into Complex<f32>, scaled to unit amplitude.
-        let iq: Vec<Complex32> = i_samples
-            .iter()
-            .zip(q_samples.iter())
-            .map(|(&i, &q)| Complex32::new(i as f32 / RX_S12_PEAK, q as f32 / RX_S12_PEAK))
-            .collect();
+        let mut iq: Vec<Complex32> = Vec::with_capacity(n_pairs);
+        for pair in wire_buf[..n].chunks_exact(BYTES_PER_SCAN) {
+            let i = i16::from_le_bytes([pair[0], pair[1]]) as f32 / RX_S12_PEAK;
+            let q = i16::from_le_bytes([pair[2], pair[3]]) as f32 / RX_S12_PEAK;
+            iq.push(Complex32::new(i, q));
+        }
 
         // Discriminate at IF rate, then decimate.
         let mut audio_if = vec![0.0f32; iq.len()];
@@ -284,11 +275,7 @@ fn capture_loop(
         hpf.process(&mut audio);
 
         // Accumulate into `pending`, flush full chunks of
-        // [`TARGET_CHUNK_SAMPLES`]. The remainder stays in `pending`
-        // for the next refill — no samples dropped, no reframing
-        // jitter visible to the worker. This drops the mpsc send
-        // rate from ~70/s (per-refill) to ~40/s (per-chunk) which
-        // matches cpal exactly.
+        // [`TARGET_CHUNK_SAMPLES`].
         pending.extend_from_slice(&audio);
         let mut hung_up = false;
         while pending.len() >= TARGET_CHUNK_SAMPLES {
@@ -309,5 +296,11 @@ fn capture_loop(
             last_tick = std::time::Instant::now();
         }
     }
+
+    // Best-effort cleanup. If CLOSE fails (server already gone, e.g.
+    // user yanked the USB) we don't care — the connection drops on
+    // the next `client` deref-Drop.
+    let _ = client.close_buffer(crate::device::iio_names::RX_BUFFER);
+    let _ = client.close();
     Ok(session.negotiated_rate)
 }
