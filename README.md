@@ -91,6 +91,79 @@ python study/nbfm_channel_sim.py input.wav output.wav \
     --thermal-ppm 5 --thermal-period 180
 ```
 
+### Périphériques d'entrée RX
+
+Le modem RX peut être alimenté par trois familles de sources, sélectionnables
+dans le menu déroulant *Carte son réception* (la liste regroupe tout) :
+
+1. **Carte son** (chemin par défaut) — `cpal` → ALSA / WASAPI / CoreAudio.
+   Branche la sortie ligne du transceiver sur l'entrée micro/ligne. Le
+   Squelch et le filtre dé-emphase tournent côté radio.
+2. **PlutoSDR** (ADALM-Pluto) — backend `pluto` via libiio. RX *et* TX sur
+   un seul USB. Voir [`rust/modem-pluto/README.md`](rust/modem-pluto/README.md).
+3. **SDRplay** — RX seul. Devices supportés (détection automatique du
+   modèle via le byte `hwVer` du daemon) :
+
+   | Device | Ports antenne | Bias-T | Notch FM/DAB | LNA states (VHF) |
+   |---|---|---|---|---|
+   | RSPduo | Hi-Z + 50 Ω (tuner A), 50 Ω (tuner B) | tuner B | oui | 10 |
+   | RSP1A / RSP1B | 1 SMA | oui | oui | 10 |
+   | RSP1 | 1 SMA | non | non | 4 |
+
+   RSP2 / RSPdx / RSPdx-R2 : reconnus mais pas encore programmés (le
+   backend rejette à `open()` avec un message clair).
+
+#### Installation de l'API SDRplay (Linux)
+
+L'API SDRplay 3.x est un binaire propriétaire non redistribuable. Procédure
+unique par machine :
+
+```bash
+# 1. Télécharger l'installeur depuis https://www.sdrplay.com/api/
+#    (compte gratuit requis). Choisir l'archi du PC :
+#       x86_64 → SDRplay_RSP_API-Linux-3.X.Y.run
+#       Pi 5 / ARM64 → SDRplay_RSP_API-Linux-ARM64-3.X.Y.run
+
+# 2. Lancer l'installeur en root, accepter l'EULA :
+chmod +x SDRplay_RSP_API-Linux-ARM64-3.15.2.run
+sudo ./SDRplay_RSP_API-Linux-ARM64-3.15.2.run
+
+# 3. Activer le service systemd (le daemon doit tourner quand le modem
+#    cherche des devices) :
+sudo systemctl enable --now sdrplay
+systemctl status sdrplay     # doit afficher "active (running)"
+
+# 4. Brancher le device et vérifier qu'il est visible :
+lsusb | grep -i sdrplay      # doit lister le RSPduo / RSP1A / etc.
+```
+
+Ce que l'installeur dépose :
+
+- `/usr/local/lib/libsdrplay_api.so.3.X` (+ liens symboliques) — la lib FFI
+- `/usr/local/include/sdrplay_api*.h` — les en-têtes que `bindgen` lit au build
+- `/opt/sdrplay_api/sdrplay_apiService` — le daemon
+- `/etc/udev/rules.d/66-sdrplay.rules` — permissions USB pour utilisateur non-root
+- Service systemd `sdrplay.service`
+
+**Pannes courantes :**
+
+| Symptôme | Cause / correctif |
+|---|---|
+| Device absent du dropdown GUI | `systemctl status sdrplay` → pas actif. `sudo systemctl start sdrplay` |
+| Daemon présent mais pas de device | `sudo udevadm control --reload && sudo udevadm trigger`, puis débrancher / rebrancher l'USB |
+| `Permission denied` sur `/dev/bus/usb` | L'utilisateur n'est pas dans le groupe `plugdev` (rare — l'installeur le configure normalement). `sudo usermod -aG plugdev $USER` puis relogin |
+| Build de `modem-sdrplay` échoue (`fatal: sdrplay_api.h not found`) | Headers absents : réinstaller l'API. Si dans un chemin atypique, `export SDRPLAY_API_INCLUDE_DIR=/path/to/include SDRPLAY_API_LIB_DIR=/path/to/lib` avant `cargo build` |
+| GUI démarre mais le device disparaît au lancement RX | API ouverte par un autre process (SDRuno, SoapySDRPlay3 daemon). Fermer l'autre client |
+
+L'API SDRplay est requise **à la fois au build et au runtime** : `build.rs`
+appelle `bindgen` sur `/usr/local/include/sdrplay_api*.h` et fait paniquer
+le compile si les headers manquent (avec un message qui pointe vers la
+page d'install). Si tu construis le `.deb` sur une machine, et qu'une
+autre l'installe, les deux ont besoin de l'API. Pour court-circuiter le
+support SDRplay au build (cas d'un installeur ARM-only sans accès aux
+headers), désactiver la feature : `cargo tauri build --no-default-features
+--features pluto`.
+
 ### ⚠ Carte son sous Windows — vérifier le format à 48 kHz
 
 **Symptôme** : votre carte son (typiquement **SignaLink USB**, ou tout autre
@@ -136,6 +209,11 @@ rapport_*.html          Rapports HTML avec graphiques
 ```
 
 ### Build — Linux (Debian 12 / Ubuntu 22.04+)
+
+> **Si tu veux le backend SDRplay** (RSPduo / RSP1A / RSP1B / RSP1) :
+> installe l'API SDRplay 3.x **avant** le build —
+> [procédure complète](#installation-de-lapi-sdrplay-linux). Sinon,
+> désactive la feature : `cargo tauri build --no-default-features --features pluto`.
 
 **Dépendances système :**
 
@@ -376,6 +454,79 @@ python study/nbfm_channel_sim.py input.wav output.wav \
     --thermal-ppm 5 --thermal-period 180
 ```
 
+### RX input devices
+
+The modem RX can be driven from three families of sources, all listed
+together in the *RX sound card* dropdown:
+
+1. **Sound card** (default path) — `cpal` → ALSA / WASAPI / CoreAudio.
+   Wire the transceiver's line-out into the host's mic/line-in. Squelch
+   and de-emphasis run on the radio side.
+2. **PlutoSDR** (ADALM-Pluto) — `pluto` backend via libiio. RX *and* TX
+   over one USB. See [`rust/modem-pluto/README.md`](rust/modem-pluto/README.md).
+3. **SDRplay** — RX-only. Supported devices (auto-detected from the
+   daemon's `hwVer` byte) :
+
+   | Device | Antenna ports | Bias-T | FM/DAB notch | LNA states (VHF) |
+   |---|---|---|---|---|
+   | RSPduo | Hi-Z + 50 Ω (tuner A), 50 Ω (tuner B) | tuner B | yes | 10 |
+   | RSP1A / RSP1B | 1 SMA | yes | yes | 10 |
+   | RSP1 | 1 SMA | no | no | 4 |
+
+   RSP2 / RSPdx / RSPdx-R2: detected but not yet programmed — the
+   backend rejects at `open()` with a clear error.
+
+#### SDRplay API install (Linux)
+
+The SDRplay API 3.x is a proprietary, non-redistributable binary blob.
+One-time install per machine:
+
+```bash
+# 1. Download the installer from https://www.sdrplay.com/api/
+#    (free account required). Pick the right arch:
+#       x86_64 → SDRplay_RSP_API-Linux-3.X.Y.run
+#       Pi 5 / ARM64 → SDRplay_RSP_API-Linux-ARM64-3.X.Y.run
+
+# 2. Run the installer as root, accept the EULA:
+chmod +x SDRplay_RSP_API-Linux-ARM64-3.15.2.run
+sudo ./SDRplay_RSP_API-Linux-ARM64-3.15.2.run
+
+# 3. Enable the systemd service (the daemon must be running for the
+#    modem to enumerate devices):
+sudo systemctl enable --now sdrplay
+systemctl status sdrplay     # must show "active (running)"
+
+# 4. Plug the device and verify it shows up:
+lsusb | grep -i sdrplay      # should list RSPduo / RSP1A / etc.
+```
+
+What the installer drops:
+
+- `/usr/local/lib/libsdrplay_api.so.3.X` (+ symlinks) — the FFI library
+- `/usr/local/include/sdrplay_api*.h` — headers that `bindgen` reads at build
+- `/opt/sdrplay_api/sdrplay_apiService` — the daemon
+- `/etc/udev/rules.d/66-sdrplay.rules` — USB permissions for non-root users
+- `sdrplay.service` systemd unit
+
+**Common pitfalls:**
+
+| Symptom | Cause / fix |
+|---|---|
+| Device missing from the GUI dropdown | `systemctl status sdrplay` → not active. `sudo systemctl start sdrplay` |
+| Daemon up but no device | `sudo udevadm control --reload && sudo udevadm trigger`, then unplug / replug |
+| `Permission denied` on `/dev/bus/usb` | User not in `plugdev` (rare — the installer sets this up). `sudo usermod -aG plugdev $USER` then re-login |
+| `modem-sdrplay` build fails (`fatal: sdrplay_api.h not found`) | Headers missing: reinstall the API. If in an atypical path, `export SDRPLAY_API_INCLUDE_DIR=/path/to/include SDRPLAY_API_LIB_DIR=/path/to/lib` before `cargo build` |
+| GUI starts but device disappears when RX starts | API already opened by another process (SDRuno, SoapySDRPlay3 daemon). Close the other client |
+
+The SDRplay API is needed **both at build time and runtime**: `build.rs`
+runs `bindgen` against `/usr/local/include/sdrplay_api*.h` and panics
+the compile with a clear message pointing at the install page if the
+headers are missing. If you build the `.deb` on one machine and install
+it on another, both need the API. To skip SDRplay support at build
+time (ARM-only setup with no access to the headers, for instance),
+disable the feature: `cargo tauri build --no-default-features
+--features pluto`.
+
 ### ⚠ Sound card on Windows — make sure the default format is 48 kHz
 
 **Symptom**: your sound card (typically a **SignaLink USB**, or any other
@@ -422,6 +573,11 @@ rapport_*.html          HTML reports with plots
 ```
 
 ### Build — Linux (Debian 12 / Ubuntu 22.04+)
+
+> **For the SDRplay backend** (RSPduo / RSP1A / RSP1B / RSP1):
+> install the SDRplay API 3.x **before** the build —
+> [full procedure](#sdrplay-api-install-linux). Otherwise disable
+> the feature: `cargo tauri build --no-default-features --features pluto`.
 
 **System dependencies:**
 
