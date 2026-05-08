@@ -102,6 +102,15 @@ impl IiodTransport {
         Ok(buf)
     }
 
+    /// Read `dest.len()` bytes straight into the caller's slice. Hot
+    /// path for `READBUF` — avoids the `Vec` allocation on every
+    /// chunk and lets the caller reuse one I/Q scratch buffer
+    /// across the whole streaming session.
+    pub fn recv_exact_into(&mut self, dest: &mut [u8]) -> Result<(), IiodError> {
+        self.reader.read_exact(dest)?;
+        Ok(())
+    }
+
     /// Drop a single trailing `\n` (libiio appends one after every
     /// payload — see the `write_all(buf, ret + 1)` convention in
     /// `iiod/ops.c`). On Pluto firmware this byte is sometimes

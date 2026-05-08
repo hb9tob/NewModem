@@ -259,6 +259,160 @@ impl IiodClient {
     }
 
     // -----------------------------------------------------------------
+    // Buffer-streaming commands
+    // -----------------------------------------------------------------
+    //
+    // OPEN allocates a kernel-side IIO buffer and enables the channels
+    // selected by `mask` on `device`. From that point on, READBUF
+    // (RX-side devices) or WRITEBUF (TX-side) move samples through.
+    // CLOSE tears the buffer down; the client connection survives and
+    // can re-OPEN against the same or a different device.
+    //
+    // For Pluto:
+    //   * RX device = `cf-ad9361-lpc`, channels voltage0 (real I) and
+    //     voltage1 (real Q). Mask = 0x3 (both enabled).
+    //   * TX device = `cf-ad9361-dds-core-lpc`, same channel layout,
+    //     same mask. The DDS gets bypassed when the buffer is fed from
+    //     userland.
+    //   * Sample format is `le:S16/16>>0` (TX) and `le:S12/16>>0` (RX:
+    //     12-bit value in the low bits of a sign-extended 16-bit slot).
+    //     Either way the wire byte layout is identical: I_lo, I_hi,
+    //     Q_lo, Q_hi, repeat. 4 bytes per scan cycle.
+
+    /// Open a streaming buffer on `device`.
+    ///
+    /// `samples_per_buffer` is the IIO buffer size in *scan cycles*
+    /// (i.e. one (I, Q) pair on Pluto). Pick a value that's large
+    /// enough to hide kernel-side jitter but small enough to keep
+    /// per-buffer latency manageable: 32768 = 64 kB at 4 B / sample,
+    /// fills in ~57 ms at 576 kSa/s — a good default.
+    ///
+    /// `mask` is the channel-enable bitmask. Channels are encoded
+    /// as 32-bit zero-padded hex on the wire (`%08x`); for Pluto
+    /// you almost always want `0x3`.
+    ///
+    /// `cyclic = true` makes the kernel replay the buffer endlessly
+    /// once filled — used by TX test tones. RX should always pass
+    /// `cyclic = false`.
+    pub fn open_buffer(
+        &mut self,
+        device: &str,
+        samples_per_buffer: usize,
+        mask: u32,
+        cyclic: bool,
+    ) -> Result<(), IiodError> {
+        let cyclic_token = if cyclic { " CYCLIC" } else { "" };
+        let cmd = format!(
+            "OPEN {device} {samples_per_buffer} {mask:08x}{cyclic_token}"
+        );
+        self.transport.send_line(&cmd)?;
+        let line = self.transport.recv_line()?;
+        let status = parse_status(&line, &cmd)?;
+        // Non-zero status from OPEN is always an error code (negative
+        // -errno). Zero means success — there's no payload size to
+        // interpret here, unlike READ.
+        if status < 0 {
+            return Err(IiodError::ServerErrno {
+                errno: (-status) as i32,
+                context: cmd,
+            });
+        }
+        Ok(())
+    }
+
+    /// Close a previously-opened streaming buffer.
+    pub fn close_buffer(&mut self, device: &str) -> Result<(), IiodError> {
+        let cmd = format!("CLOSE {device}");
+        self.transport.send_line(&cmd)?;
+        let line = self.transport.recv_line()?;
+        let status = parse_status(&line, &cmd)?;
+        if status < 0 {
+            return Err(IiodError::ServerErrno {
+                errno: (-status) as i32,
+                context: cmd,
+            });
+        }
+        Ok(())
+    }
+
+    /// Pull samples until `dest` is full or the server signals EOF.
+    ///
+    /// iiod's READBUF response is **chunked**: the server may answer
+    /// in several pieces if the requested byte count exceeds the
+    /// kernel buffer size. Each chunk carries:
+    ///
+    /// ```text
+    /// <chunk_bytes>\n        status line; positive = bytes follow,
+    ///                        negative = -errno, zero = end of buffer
+    /// <channel_mask_hex>\n   the mask we set at OPEN, echoed back
+    /// <chunk_bytes>          binary scan-cycle data
+    /// ```
+    ///
+    /// The mask line lets clients on multi-channel devices figure
+    /// out which scan elements are interleaved in the payload —
+    /// for Pluto we know the answer (mask = 0x3, 2 channels) so we
+    /// just consume it. Returns the number of bytes actually written
+    /// into `dest`. Short reads can happen on EOF; the caller
+    /// decides whether that's an error.
+    pub fn read_buffer_into(
+        &mut self,
+        device: &str,
+        dest: &mut [u8],
+    ) -> Result<usize, IiodError> {
+        let cmd = format!("READBUF {device} {}", dest.len());
+        self.transport.send_line(&cmd)?;
+
+        let mut filled = 0usize;
+        while filled < dest.len() {
+            let status_line = self.transport.recv_line()?;
+            let status = parse_status(&status_line, &cmd)?;
+            if status < 0 {
+                return Err(IiodError::ServerErrno {
+                    errno: (-status) as i32,
+                    context: format!("{cmd} (after {filled} B)"),
+                });
+            }
+            let chunk_bytes = status as usize;
+            if chunk_bytes == 0 {
+                // Server signals end of stream: no more data
+                // forthcoming for this READBUF call. Return what
+                // we got so far — caller treats short read.
+                break;
+            }
+            // Channel-mask echo line. Always present when status > 0
+            // per the iiod protocol contract; we don't validate it
+            // (OPEN already pinned the mask).
+            let _mask_line = self.transport.recv_line()?;
+
+            if filled + chunk_bytes > dest.len() {
+                return Err(IiodError::Protocol(format!(
+                    "{cmd}: server sent {chunk_bytes}-byte chunk but \
+                     only {} bytes remain in dest",
+                    dest.len() - filled
+                )));
+            }
+            self.transport
+                .recv_exact_into(&mut dest[filled..filled + chunk_bytes])?;
+            filled += chunk_bytes;
+        }
+        Ok(filled)
+    }
+
+    /// Push `src.len()` bytes into the device's TX buffer. Returns the
+    /// number of bytes the server accepted (may be less than asked
+    /// if the kernel buffer fills before the client buffer drains —
+    /// caller loops on the residue).
+    pub fn write_buffer(&mut self, device: &str, src: &[u8]) -> Result<usize, IiodError> {
+        let cmd = format!("WRITEBUF {device} {}", src.len());
+        self.transport.send_line(&cmd)?;
+        self.transport.send_bytes(src)?;
+        let line = self.transport.recv_line()?;
+        let status = parse_status(&line, &cmd)?;
+        let n = status_to_size(status, &cmd)?;
+        Ok(n)
+    }
+
+    // -----------------------------------------------------------------
     // private helpers
     // -----------------------------------------------------------------
 
