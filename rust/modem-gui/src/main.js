@@ -711,6 +711,76 @@ async function loadSdrBackends() {
   }
 }
 
+/// Per-device capability cache keyed by composite name (e.g.
+/// "sdrplay:1500R76GR1"). Backends with multiple hardware variants
+/// (SDRplay: RSPduo / RSP1A / RSP1B / RSP1) ship per-device caps via
+/// the Tauri `get_sdr_device_capabilities` command — the antenna
+/// selector / tuner radio / bias-T checkbox / LNA-state range follow
+/// the actual hardware instead of the family lowest-common-denominator.
+/// Backends without per-device variants (Pluto, RTL-SDR) return their
+/// family caps unchanged — same JSON shape, same render path.
+const deviceCapsCache = new Map();
+let pendingCapsFetch = new Map();   // composite_name → Promise
+
+/// Resolve the right `capabilities` payload for a composite device
+/// name, fetching + caching on first miss. `null` while in-flight; the
+/// caller should re-render once `await`-resolved. Errors fall back to
+/// the family caps so the panel still renders something useful.
+async function resolveDeviceCaps(compositeName, backendId) {
+  if (!compositeName) return null;
+  if (deviceCapsCache.has(compositeName)) return deviceCapsCache.get(compositeName);
+  if (pendingCapsFetch.has(compositeName)) return pendingCapsFetch.get(compositeName);
+  if (!window.__TAURI__ || !window.__TAURI__.core) return null;
+  const { invoke } = window.__TAURI__.core;
+  const promise = (async () => {
+    try {
+      const caps = await invoke("get_sdr_device_capabilities", { compositeName });
+      deviceCapsCache.set(compositeName, caps);
+      return caps;
+    } catch (err) {
+      console.error("get_sdr_device_capabilities:", err);
+      const family = sdrBackends.get(backendId);
+      const fallback = family ? family.capabilities : null;
+      if (fallback) deviceCapsCache.set(compositeName, fallback);
+      return fallback;
+    } finally {
+      pendingCapsFetch.delete(compositeName);
+    }
+  })();
+  pendingCapsFetch.set(compositeName, promise);
+  return promise;
+}
+
+/// Kick off a `resolveDeviceCaps` for the currently-selected SDR on
+/// `<direction>-device-select`. Awaitable so the change listener can
+/// re-render once the IPC reply comes back. No-op for cpal entries
+/// or when nothing is selected.
+async function prefetchCapsForSelected(selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel || !sel.options[sel.selectedIndex]) return;
+  const opt = sel.options[sel.selectedIndex];
+  const backendId = opt.dataset && opt.dataset.backend;
+  if (!backendId || backendId === "audio") return;
+  await resolveDeviceCaps(sel.value, backendId);
+}
+
+/// Read the cached per-device caps for the currently-selected SDR on
+/// `<direction>-device-select`, falling back to the backend's family
+/// caps if nothing is cached yet (first render). Synchronous — the
+/// `change` listener is the one that triggers the async refresh.
+function getCapsForSelected(selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel || !sel.options[sel.selectedIndex]) return null;
+  const opt = sel.options[sel.selectedIndex];
+  const backendId = opt.dataset && opt.dataset.backend;
+  if (!backendId || backendId === "audio") return null;
+  const composite = sel.value;
+  const cached = composite ? deviceCapsCache.get(composite) : null;
+  if (cached) return cached;
+  const family = sdrBackends.get(backendId);
+  return family ? family.capabilities : null;
+}
+
 /// Read the `data-backend` attribute of the currently-selected
 /// option on a device dropdown. Returns the backend ID for SDR
 /// entries or `null` for cpal soundcard entries (which carry
@@ -802,7 +872,10 @@ function renderSdrPanel(direction) {
     if (hintEl) hintEl.textContent = "";
     return;
   }
-  const caps = info.capabilities;
+  // Prefer per-device caps when the backend has shipped them
+  // (SDRplay RSP1A vs RSP1 vs RSPduo render very different panels);
+  // fall back to family caps before the first device pick.
+  const caps = getCapsForSelected(`${direction}-device-select`) || info.capabilities;
   const supported = direction === "rx" ? caps.rx_supported : caps.tx_supported;
   if (!supported) {
     panel.hidden = true;
@@ -832,7 +905,7 @@ function renderSdrPanel(direction) {
   if (direction === "tx") {
     rowsEl.appendChild(buildTxAttenuationRow(backendId, cfg));
   }
-  rowsEl.appendChild(buildBackendExtrasRow(direction, backendId, cfg));
+  rowsEl.appendChild(buildBackendExtrasRow(direction, backendId, caps, cfg));
   if (hintEl) hintEl.textContent = "";
 }
 
@@ -1179,28 +1252,39 @@ function buildTxAttenuationRow(backendId, cfg) {
   return row;
 }
 
-function buildBackendExtrasRow(direction, backendId, cfg) {
-  // The only place the frontend has per-backend knowledge:
-  // SDRplay tuner A/B (RX). All other backend_extras keys are
-  // managed under the hood (defaults from `makeDefaultSdrConfig`).
+function buildBackendExtrasRow(direction, backendId, caps, cfg) {
+  // The tuner radio is now driven by the backend's caps —
+  // multi-tuner devices (RSPduo) populate `tuner_options`;
+  // single-tuner ones (RSP1x, Pluto) leave it empty so the row
+  // disappears entirely. Other backend_extras keys
+  // (decimation, tx_attenuation_db, …) stay managed under the hood
+  // via `makeDefaultSdrConfig`.
   const row = makeRow();
-  if (backendId === "sdrplay" && direction === "rx") {
+  const tunerOptions = (caps && caps.tuner_options) || [];
+  if (direction === "rx" && tunerOptions.length > 0) {
     row.appendChild(makeFieldLabel("Tuner :"));
-    const cur = (cfg.backend_extras && cfg.backend_extras.tuner) || "B";
-    for (const v of ["A", "B"]) {
+    const persisted = cfg.backend_extras && cfg.backend_extras.tuner;
+    // Prefer the persisted value when it matches one of the offered
+    // IDs; otherwise default to the first option (the GUI used to
+    // hardcode "B" for RSPduo — same end result via the order in
+    // `BackendCapabilities::tuner_options`).
+    const cur = tunerOptions.some(o => o.id === persisted)
+      ? persisted
+      : tunerOptions[0].id;
+    for (const opt of tunerOptions) {
       const label = document.createElement("label");
       label.className = "pluto-field";
       const radio = document.createElement("input");
       radio.type = "radio";
       radio.name = `sdr-extras-tuner-${backendId}`;
-      radio.value = v;
-      radio.checked = (cur === v);
+      radio.value = opt.id;
+      radio.checked = (cur === opt.id);
       radio.dataset.sdrField = "backend_extras.tuner";
       radio.dataset.sdrTransform = "extras_string";
       radio.dataset.backend = backendId;
       radio.addEventListener("change", onSdrFieldChange);
       label.appendChild(radio);
-      label.appendChild(document.createTextNode(` ${v} (${v === "A" ? "Hi-Z + 50 Ω" : "50 Ω + bias-T"})`));
+      label.appendChild(document.createTextNode(` ${opt.label}`));
       row.appendChild(label);
     }
   }
@@ -1345,6 +1429,14 @@ async function loadDevices() {
       `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${backendTags.join("")}`;
     refreshRxDeviceLabel();
     refreshStartButtonFromRx();
+    // First render uses family caps (cache is empty); fetch the
+    // per-device caps for whatever the persisted RX/TX devices are
+    // and re-render once they land. Cheap when the selection is a
+    // cpal soundcard — `prefetchCapsForSelected` no-ops for those.
+    await Promise.all([
+      prefetchCapsForSelected("rx-device-select"),
+      prefetchCapsForSelected("tx-device-select"),
+    ]);
     refreshSdrPanels();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
@@ -1696,15 +1788,24 @@ function setupSettingsTab() {
     call.addEventListener("blur", onCallsignChange);
   }
   if (rxSel) {
-    rxSel.addEventListener("change", () => {
+    rxSel.addEventListener("change", async () => {
       refreshRxDeviceLabel();
       refreshStartButtonFromRx();
+      // Re-render once with the (possibly stale) cached caps so the
+      // panel updates immediately, then again once the per-device
+      // caps come back over IPC. Backends without device-aware caps
+      // get a single round-trip that returns family caps — same
+      // visual result, slightly more invokes (acceptable: tens of µs).
+      refreshSdrPanels();
+      await prefetchCapsForSelected("rx-device-select");
       refreshSdrPanels();
       persistSettings();
     });
   }
   if (txSel) {
-    txSel.addEventListener("change", () => {
+    txSel.addEventListener("change", async () => {
+      refreshSdrPanels();
+      await prefetchCapsForSelected("tx-device-select");
       refreshSdrPanels();
       persistSettings();
     });

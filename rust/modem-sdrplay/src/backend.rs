@@ -34,12 +34,12 @@ use std::sync::OnceLock;
 use modem_sdr::{
     AgcMode as SdrAgcModeDescriptor, AntennaChoice, BackendCapabilities, BackendFeatures,
     DeviceDescriptor, GainSetting, ManualGainShape, ManualGainValue, SampleRateStrategy,
-    SdrBackend, SdrCaptureHandle, SdrConfig, SdrDevice, SdrError,
+    SdrBackend, SdrCaptureHandle, SdrConfig, SdrDevice, SdrError, TunerOption,
 };
 
 use crate::device::{
-    self, AgcMode, AntennaPort, SdrplayConfig, SdrplaySession, Tuner, PREFERRED_DECIMATION,
-    PREFERRED_SAMPLE_RATE_HZ,
+    self, AgcMode, AntennaPort, SdrplayConfig, SdrplayHardware, SdrplaySession, Tuner,
+    PREFERRED_DECIMATION, PREFERRED_SAMPLE_RATE_HZ,
 };
 use crate::rx;
 
@@ -49,58 +49,107 @@ use crate::rx;
 pub const BACKEND_ID: &str = "sdrplay";
 const DISPLAY_NAME: &str = "SDRplay";
 
-static SDRPLAY_CAPS: OnceLock<BackendCapabilities> = OnceLock::new();
+// Per-hardware capability cells — populated lazily on first request.
+// `SDRPLAY_CAPS_FAMILY` is the conservative pre-selection set the
+// frontend uses before a device is picked (matches RSPduo because
+// that's the most-featured part — never under-promises).
+//
+// Once the user picks a device, `capabilities_for(&descriptor)` reads
+// the descriptor's `hardware_hint` and returns one of the per-device
+// cells. RSP1B reuses the RSP1A cell (identical surface).
+static SDRPLAY_CAPS_FAMILY: OnceLock<BackendCapabilities> = OnceLock::new();
+static SDRPLAY_CAPS_RSPDUO: OnceLock<BackendCapabilities> = OnceLock::new();
+static SDRPLAY_CAPS_RSP1A: OnceLock<BackendCapabilities> = OnceLock::new();
+static SDRPLAY_CAPS_RSP1: OnceLock<BackendCapabilities> = OnceLock::new();
 
+/// Wire string the SDRplay backend stamps in `descriptor.hardware_hint`
+/// for each variant. Kept as constants so the matching in
+/// [`capabilities_for_hint`] and the stamping in `list_devices` can't
+/// drift apart.
+pub const HINT_RSPDUO: &str = "rspduo";
+pub const HINT_RSP1A: &str = "rsp1a";
+pub const HINT_RSP1B: &str = "rsp1b";
+pub const HINT_RSP1: &str = "rsp1";
+
+/// Produce `descriptor.hardware_hint` from the daemon's `hwVer` byte.
+/// Single source of truth — every other lookup goes through here.
+fn hint_for_hardware(hw: SdrplayHardware) -> Option<&'static str> {
+    match hw {
+        SdrplayHardware::RspDuo => Some(HINT_RSPDUO),
+        SdrplayHardware::Rsp1a => Some(HINT_RSP1A),
+        SdrplayHardware::Rsp1b => Some(HINT_RSP1B),
+        SdrplayHardware::Rsp1 => Some(HINT_RSP1),
+        // RSP2 / RSPdx / RSPdxR2 / Unsupported(_) — list_devices still
+        // surfaces them so the user sees the device, but `open()`
+        // rejects with a clear error. No per-device caps cell yet.
+        _ => None,
+    }
+}
+
+/// AGC modes are identical across the SDRplay family — every part
+/// runs the same AD8334-class IF VGA loop. Factored out so the four
+/// per-device caps share one definition.
+fn shared_agc_modes() -> Vec<SdrAgcModeDescriptor> {
+    // SDRplay AGC only manages `gRdB` (IF gain reduction); the LNA
+    // state stays operator-controlled in every AGC mode (cf.
+    // `device::program_params` — `ctrl.agc.enable` does not touch
+    // `tuner_params.gain.LNAstate`). The `keeps_lna_manual` flag
+    // tells the GUI to leave the LNA-state `<input>` enabled while
+    // disabling IF gRdB.
+    vec![
+        SdrAgcModeDescriptor {
+            id: "disable".into(),
+            label: "Manuel (gain fixe)".into(),
+            manual: true,
+            keeps_lna_manual: false,
+        },
+        SdrAgcModeDescriptor {
+            id: "slow".into(),
+            label: "AGC lente (5 Hz)".into(),
+            manual: false,
+            keeps_lna_manual: true,
+        },
+        SdrAgcModeDescriptor {
+            id: "mid".into(),
+            label: "AGC moyenne (50 Hz, défaut SDRplay)".into(),
+            manual: false,
+            keeps_lna_manual: true,
+        },
+        SdrAgcModeDescriptor {
+            id: "fast".into(),
+            label: "AGC rapide (100 Hz)".into(),
+            manual: false,
+            keeps_lna_manual: true,
+        },
+    ]
+}
+
+fn shared_sample_rate_strategy() -> SampleRateStrategy {
+    SampleRateStrategy {
+        host_iq_rate_hz: PREFERRED_SAMPLE_RATE_HZ / PREFERRED_DECIMATION as u64,
+        audio_decim_ratio: 12,
+    }
+}
+
+/// Family-level capabilities — used pre-selection, also serves as the
+/// fallback for unknown hwVer bytes. Identical to RSPduo's caps so we
+/// never silently hide a knob the user might need.
 fn sdrplay_capabilities() -> &'static BackendCapabilities {
-    SDRPLAY_CAPS.get_or_init(|| BackendCapabilities {
+    SDRPLAY_CAPS_FAMILY.get_or_init(|| BackendCapabilities {
         rx_supported: true,
         tx_supported: false,
-        // RSPduo tuning range: 1 kHz lower bound on Tuner-A AM port,
-        // 2 GHz upper bound. The backend rejects out-of-port-range
-        // tunings at open() — the GUI just needs to know the family
-        // bound for the freq-input min/max attribute.
+        // 1 kHz lower bound on RSPduo Tuner-A AM port, 2 GHz upper
+        // bound. Other parts have similar ranges; the backend rejects
+        // out-of-band tunings at open() anyway.
         rx_freq_range_hz: Some((1_000, 2_000_000_000)),
         tx_freq_range_hz: None,
         independent_rx_tx_freq: false,
         manual_gain: ManualGainShape::LnaPlusIf {
-            // RSPduo VHF gain table has 10 LNA states (0 = least
-            // attenuation = most front-end gain).
             lna_states: 10,
             if_grdb_range: (20, 59),
             if_grdb_step: 1,
         },
-        agc_modes: vec![
-            // SDRplay AGC only manages `gRdB` (IF gain reduction);
-            // the LNA state stays operator-controlled in every AGC
-            // mode (cf. `device::program_params` — `ctrl.agc.enable`
-            // does not touch `tuner_params.gain.LNAstate`). The
-            // `keeps_lna_manual` flag tells the GUI to leave the
-            // LNA-state `<input>` enabled while disabling IF gRdB.
-            SdrAgcModeDescriptor {
-                id: "disable".into(),
-                label: "Manuel (gain fixe)".into(),
-                manual: true,
-                keeps_lna_manual: false,
-            },
-            SdrAgcModeDescriptor {
-                id: "slow".into(),
-                label: "AGC lente (5 Hz)".into(),
-                manual: false,
-                keeps_lna_manual: true,
-            },
-            SdrAgcModeDescriptor {
-                id: "mid".into(),
-                label: "AGC moyenne (50 Hz, défaut SDRplay)".into(),
-                manual: false,
-                keeps_lna_manual: true,
-            },
-            SdrAgcModeDescriptor {
-                id: "fast".into(),
-                label: "AGC rapide (100 Hz)".into(),
-                manual: false,
-                keeps_lna_manual: true,
-            },
-        ],
+        agc_modes: shared_agc_modes(),
         antennas: vec![
             AntennaChoice {
                 id: "hiz".into(),
@@ -111,20 +160,113 @@ fn sdrplay_capabilities() -> &'static BackendCapabilities {
                 label: "50 Ω (60 MHz – 2 GHz)".into(),
             },
         ],
+        tuner_options: vec![
+            TunerOption {
+                id: "A".into(),
+                label: "A (Hi-Z + 50 Ω)".into(),
+            },
+            TunerOption {
+                id: "B".into(),
+                label: "B (50 Ω + bias-T)".into(),
+            },
+        ],
         features: BackendFeatures {
             bias_t: true,
             fm_notch: true,
             dab_notch: true,
             ctcss_tx: false,
-            // Bandwidth is locked at 1.536 MHz on this RX-only setup
-            // (set inside `device::program_params`); no runtime knob.
             rf_bandwidth_range_hz: None,
         },
-        sample_rate_strategy: SampleRateStrategy {
-            host_iq_rate_hz: PREFERRED_SAMPLE_RATE_HZ / PREFERRED_DECIMATION as u64,
-            audio_decim_ratio: 12,
-        },
+        sample_rate_strategy: shared_sample_rate_strategy(),
     })
+}
+
+/// RSPduo — same as the family caps. Kept as a separate cell so
+/// future RSPduo-only tweaks (extRefOutput, dual-tuner mode) don't
+/// leak into the family pre-selection set.
+fn sdrplay_capabilities_rspduo() -> &'static BackendCapabilities {
+    SDRPLAY_CAPS_RSPDUO.get_or_init(|| sdrplay_capabilities().clone())
+}
+
+/// RSP1A and RSP1B share this cell — both use `rsp1aParams` /
+/// `rsp1aTunerParams` and ship identical knobs (bias-T on the single
+/// SMA, FM/DAB notch). Differences (LO performance, ADC noise) live
+/// at the silicon level, not in the API surface.
+fn sdrplay_capabilities_rsp1a() -> &'static BackendCapabilities {
+    SDRPLAY_CAPS_RSP1A.get_or_init(|| BackendCapabilities {
+        rx_supported: true,
+        tx_supported: false,
+        rx_freq_range_hz: Some((1_000, 2_000_000_000)),
+        tx_freq_range_hz: None,
+        independent_rx_tx_freq: false,
+        manual_gain: ManualGainShape::LnaPlusIf {
+            lna_states: 10,
+            if_grdb_range: (20, 59),
+            if_grdb_step: 1,
+        },
+        agc_modes: shared_agc_modes(),
+        // Single SMA — no antenna / tuner selectors. `[]` makes the
+        // GUI hide both rows entirely.
+        antennas: vec![],
+        tuner_options: vec![],
+        features: BackendFeatures {
+            bias_t: true,
+            fm_notch: true,
+            dab_notch: true,
+            ctcss_tx: false,
+            rf_bandwidth_range_hz: None,
+        },
+        sample_rate_strategy: shared_sample_rate_strategy(),
+    })
+}
+
+/// Original RSP1 — the slim one. No bias-T, no notch filters, single
+/// fixed SMA, and a much smaller VHF gain table (4 LNA states 0-3 vs
+/// 10 on RSP1A/B). Surfaces a stripped-down panel so toggles that
+/// won't actually do anything stay hidden.
+fn sdrplay_capabilities_rsp1() -> &'static BackendCapabilities {
+    SDRPLAY_CAPS_RSP1.get_or_init(|| BackendCapabilities {
+        rx_supported: true,
+        tx_supported: false,
+        rx_freq_range_hz: Some((1_000, 2_000_000_000)),
+        tx_freq_range_hz: None,
+        independent_rx_tx_freq: false,
+        manual_gain: ManualGainShape::LnaPlusIf {
+            // RSP1 VHF table — 4 states (0 = max gain, 3 = max
+            // attenuation). The backend silently clamps higher
+            // indices on open if the persisted config still has them.
+            lna_states: 4,
+            if_grdb_range: (20, 59),
+            if_grdb_step: 1,
+        },
+        agc_modes: shared_agc_modes(),
+        antennas: vec![],
+        tuner_options: vec![],
+        features: BackendFeatures {
+            // RSP1 has none of these on the chip.
+            bias_t: false,
+            fm_notch: false,
+            dab_notch: false,
+            ctcss_tx: false,
+            rf_bandwidth_range_hz: None,
+        },
+        sample_rate_strategy: shared_sample_rate_strategy(),
+    })
+}
+
+/// Map a `hardware_hint` string back to the right per-device caps
+/// cell. Used by the trait impl below — kept as a free function so
+/// tests can exercise the dispatch without going through `SdrBackend`.
+pub fn capabilities_for_hint(hint: Option<&str>) -> &'static BackendCapabilities {
+    match hint {
+        Some(HINT_RSPDUO) => sdrplay_capabilities_rspduo(),
+        Some(HINT_RSP1A) | Some(HINT_RSP1B) => sdrplay_capabilities_rsp1a(),
+        Some(HINT_RSP1) => sdrplay_capabilities_rsp1(),
+        // No hint, or a hint we don't recognise (RSP2 / RSPdx) —
+        // fall back to family caps. The `open()` path will reject
+        // unsupported hwVer bytes with a clear error.
+        _ => sdrplay_capabilities(),
+    }
 }
 
 /// Zero-sized backend handle. Registered statically by the GUI.
@@ -144,12 +286,23 @@ impl SdrBackend for SdrplayBackend {
         sdrplay_capabilities()
     }
 
+    fn capabilities_for(&self, descriptor: &DeviceDescriptor) -> &BackendCapabilities {
+        // Read the hardware hint we stamped at `list_devices()` time
+        // and route to the matching per-device caps cell. Anything
+        // unstamped (or stamped with a hint we don't have a cell for)
+        // falls back to the family caps — same as the trait default
+        // would do.
+        capabilities_for_hint(descriptor.hardware_hint.as_deref())
+    }
+
     fn list_devices(&self) -> Result<Vec<DeviceDescriptor>, SdrError> {
         // Daemon failures (not running, not installed, no device on
         // bus) are surfaced as an empty list — same UX as the libiio
         // path on Pluto. We want the friendly name to mention the
         // actual hardware (RSPduo / RSP1A / …) so the user can tell
-        // them apart in the dropdown without looking at the serial.
+        // them apart in the dropdown without looking at the serial,
+        // and the `hardware_hint` so `capabilities_for` can refresh
+        // the panel layout when the user picks a device.
         let metas = match device::list_devices_meta() {
             Ok(v) => v,
             Err(e) => {
@@ -161,7 +314,11 @@ impl SdrBackend for SdrplayBackend {
             .into_iter()
             .map(|(serial, hw)| {
                 let friendly = format!("SDRplay {} — {serial}", hw.short_name());
-                DeviceDescriptor::new(BACKEND_ID, serial, friendly)
+                let mut desc = DeviceDescriptor::new(BACKEND_ID, serial, friendly);
+                if let Some(hint) = hint_for_hardware(hw) {
+                    desc = desc.with_hardware_hint(hint);
+                }
+                desc
             })
             .collect())
     }
@@ -203,7 +360,10 @@ impl SdrDevice for SdrplayDevice {
     }
 
     fn capabilities(&self) -> &BackendCapabilities {
-        sdrplay_capabilities()
+        // Mirror what `SdrBackend::capabilities_for` returns for the
+        // descriptor we were opened with — once the user picks a
+        // device, every consumer should see the per-device caps.
+        capabilities_for_hint(self.descriptor.hardware_hint.as_deref())
     }
 
     fn start_rx(&mut self) -> Result<(SdrCaptureHandle, std::sync::mpsc::Receiver<Vec<f32>>), SdrError> {

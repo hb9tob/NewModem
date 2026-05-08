@@ -37,7 +37,7 @@ pub mod traits;
 
 pub use capabilities::{
     AgcMode, AntennaChoice, BackendCapabilities, BackendFeatures, ManualGainShape,
-    SampleRateStrategy,
+    SampleRateStrategy, TunerOption,
 };
 pub use config::{GainSetting, ManualGainValue, SdrConfig};
 pub use device::DeviceDescriptor;

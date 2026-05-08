@@ -31,6 +31,20 @@ pub struct DeviceDescriptor {
     /// `parse_composite_name` splits it back into (backend, id)
     /// without any prefix-matching code in main.rs.
     pub composite_name: String,
+
+    /// Backend-defined hardware family identifier. Stamped at
+    /// `list_devices()` time so the GUI can query device-aware
+    /// capabilities via [`crate::SdrBackend::capabilities_for`]
+    /// without having to open the device first. Examples:
+    ///
+    /// - SDRplay: `"rspduo" | "rsp1a" | "rsp1b" | "rsp1"`
+    /// - Pluto / RTL-SDR / single-flavour backends: `None`
+    ///
+    /// Backends are free to choose any string — the only consumer
+    /// is the same backend's `capabilities_for` lookup. Lowercase
+    /// snake-case is the convention for new backends.
+    #[serde(default)]
+    pub hardware_hint: Option<String>,
 }
 
 impl DeviceDescriptor {
@@ -46,6 +60,14 @@ impl DeviceDescriptor {
             id,
             friendly_name: friendly_name.into(),
             composite_name,
+            hardware_hint: None,
         }
+    }
+
+    /// Builder that stamps the hardware family hint. Only meaningful
+    /// for backends with multiple hardware variants (SDRplay today).
+    pub fn with_hardware_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hardware_hint = Some(hint.into());
+        self
     }
 }

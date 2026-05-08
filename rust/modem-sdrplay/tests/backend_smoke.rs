@@ -5,7 +5,10 @@
 use modem_sdr::{
     DeviceDescriptor, GainSetting, ManualGainShape, ManualGainValue, SdrBackend, SdrConfig,
 };
-use modem_sdrplay::backend::{build_sdrplay_config, SdrplayBackend, BACKEND_ID};
+use modem_sdrplay::backend::{
+    build_sdrplay_config, capabilities_for_hint, SdrplayBackend, BACKEND_ID, HINT_RSP1,
+    HINT_RSP1A, HINT_RSP1B, HINT_RSPDUO,
+};
 use modem_sdrplay::device::{AgcMode, AntennaPort, SdrplayHardware, Tuner};
 use serde_json::json;
 
@@ -227,6 +230,76 @@ fn programmable_hardware_count_matches_supported_branches() {
     // this number means you've added a new hardware branch and
     // should also have wired its per-device programming.
     assert_eq!(PROGRAMMABLE_HARDWARE.len(), 4);
+}
+
+#[test]
+fn capabilities_for_hint_returns_per_device_caps() {
+    // The whole point of `capabilities_for` is to give the GUI a
+    // device-specific panel. Verify each hint dispatches to caps
+    // whose surface matches the real hardware:
+    //   - RSPduo ⇒ tuner selector + 2 antennas + bias-T + notches
+    //   - RSP1A / RSP1B ⇒ no tuner, no antenna, bias-T + notches
+    //   - RSP1 ⇒ no tuner, no antenna, no bias-T, no notches, 4 LNA
+    //   - unknown / None ⇒ family fallback (matches RSPduo today)
+    let rspduo = capabilities_for_hint(Some(HINT_RSPDUO));
+    assert_eq!(rspduo.tuner_options.len(), 2);
+    assert_eq!(rspduo.antennas.len(), 2);
+    assert!(rspduo.features.bias_t);
+    assert!(rspduo.features.fm_notch);
+
+    let rsp1a = capabilities_for_hint(Some(HINT_RSP1A));
+    assert!(rsp1a.tuner_options.is_empty());
+    assert!(rsp1a.antennas.is_empty());
+    assert!(rsp1a.features.bias_t);
+    assert!(rsp1a.features.fm_notch);
+    assert!(rsp1a.features.dab_notch);
+    if let ManualGainShape::LnaPlusIf { lna_states, .. } = rsp1a.manual_gain {
+        assert_eq!(lna_states, 10, "RSP1A VHF has 10 LNA states");
+    } else {
+        panic!("RSP1A should ship LnaPlusIf shape");
+    }
+
+    // RSP1B reuses RSP1A's caps cell verbatim — same backing pointer.
+    let rsp1b = capabilities_for_hint(Some(HINT_RSP1B));
+    assert!(std::ptr::eq(rsp1a, rsp1b), "RSP1A and RSP1B share one caps cell");
+
+    let rsp1 = capabilities_for_hint(Some(HINT_RSP1));
+    assert!(rsp1.tuner_options.is_empty());
+    assert!(rsp1.antennas.is_empty());
+    assert!(!rsp1.features.bias_t, "RSP1 has no bias-T");
+    assert!(!rsp1.features.fm_notch, "RSP1 has no FM notch");
+    assert!(!rsp1.features.dab_notch, "RSP1 has no DAB notch");
+    if let ManualGainShape::LnaPlusIf { lna_states, .. } = rsp1.manual_gain {
+        assert_eq!(lna_states, 4, "RSP1 VHF has only 4 LNA states");
+    } else {
+        panic!("RSP1 should ship LnaPlusIf shape");
+    }
+
+    // Unknown hint ⇒ family caps. Family caps are RSPduo-flavoured
+    // (full feature set) so the GUI never under-promises.
+    let unknown = capabilities_for_hint(Some("rsp2"));
+    assert_eq!(unknown.tuner_options.len(), 2);
+    let none = capabilities_for_hint(None);
+    assert!(std::ptr::eq(unknown, none));
+}
+
+#[test]
+fn capabilities_for_descriptor_routes_through_hint() {
+    // End-to-end through the trait surface: a descriptor stamped
+    // with `hardware_hint = "rsp1"` should make
+    // `SdrBackend::capabilities_for` return the RSP1 cell, not the
+    // family one.
+    let backend = SdrplayBackend;
+    let desc_rsp1 = DeviceDescriptor::new("sdrplay", "x", "x").with_hardware_hint(HINT_RSP1);
+    let caps = backend.capabilities_for(&desc_rsp1);
+    assert!(!caps.features.bias_t);
+    assert!(!caps.features.fm_notch);
+
+    // No hint ⇒ default trait impl falls back to family caps; the
+    // SDRplay override mirrors that behaviour.
+    let desc_unhinted = DeviceDescriptor::new("sdrplay", "x", "x");
+    let fallback = backend.capabilities_for(&desc_unhinted);
+    assert!(std::ptr::eq(fallback, backend.capabilities()));
 }
 
 #[test]

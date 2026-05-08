@@ -157,6 +157,45 @@ fn list_sdr_devices(backend_id: String) -> Result<Vec<DeviceDescriptor>, String>
     backend.list_devices().map_err(|e| e.to_string())
 }
 
+/// Return per-device capabilities for the device identified by its
+/// composite name (`<backend>:<id>`). The frontend calls this each
+/// time the user picks a device in the dropdown so the panel layout
+/// (antenna selector, tuner radio buttons, bias-T checkbox, gain
+/// table size, …) tracks the actual hardware on the bus instead of
+/// the family-level lowest-common-denominator caps.
+///
+/// Backends without per-device variants fall back to family caps via
+/// `SdrBackend::capabilities_for`'s default impl, so this command
+/// works uniformly for Pluto / RTL-SDR / future single-flavour
+/// backends — same JSON shape, no special-case in the frontend.
+#[tauri::command]
+fn get_sdr_device_capabilities(
+    composite_name: String,
+) -> Result<modem_sdr::BackendCapabilities, String> {
+    let (backend, device_id) = sdr_registry::parse_composite_name(&composite_name)
+        .ok_or_else(|| format!("invalid composite name '{composite_name}'"))?;
+    // Re-list devices to find the descriptor with its `hardware_hint`
+    // — we only persist composite names in settings, not the full
+    // descriptor, so the hint has to come from a fresh enumeration.
+    // SDRplay's `list_devices` is a sub-millisecond daemon round-trip;
+    // calling it once per device-pick is fine.
+    let devices = backend.list_devices().map_err(|e| e.to_string())?;
+    let descriptor = devices
+        .into_iter()
+        .find(|d| d.id == device_id)
+        // If the device went away between the dropdown render and
+        // this call, fall back to a hint-less descriptor — caps_for
+        // returns family caps, which is the safe default.
+        .unwrap_or_else(|| {
+            DeviceDescriptor::new(
+                backend.id(),
+                device_id,
+                format!("{}:{device_id}", backend.id()),
+            )
+        });
+    Ok(backend.capabilities_for(&descriptor).clone())
+}
+
 #[tauri::command]
 fn list_modem_profiles() -> Vec<modem_core::traits::ProfileDescriptor> {
     use modem_core::traits::Modem;
@@ -1288,6 +1327,7 @@ fn main() {
             list_output_audio_devices,
             list_sdr_backends,
             list_sdr_devices,
+            get_sdr_device_capabilities,
             list_modem_profiles,
             list_serial_ports,
             ptt_status,

@@ -45,6 +45,19 @@ pub trait SdrBackend: Send + Sync {
     /// instance — no allocation per call.
     fn capabilities(&self) -> &BackendCapabilities;
 
+    /// Per-device capabilities. Default impl returns the family
+    /// caps from [`Self::capabilities`] — sufficient for backends
+    /// where every device behaves the same (Pluto, RTL-SDR).
+    /// Backends with multiple hardware variants under one ID
+    /// (SDRplay: RSPduo / RSP1A / RSP1B / RSP1) override this and
+    /// match `descriptor.hardware_hint` to return device-specific
+    /// caps (different antenna list, gain table, feature toggles).
+    /// The GUI calls this *after* the user picks a device in the
+    /// dropdown to refresh the panel layout.
+    fn capabilities_for(&self, _descriptor: &DeviceDescriptor) -> &BackendCapabilities {
+        self.capabilities()
+    }
+
     /// Live device enumeration. Empty `Vec` + `Ok(())` means
     /// "the backend works but no device is plugged in" — the GUI
     /// surfaces it as an empty group, not an error banner.

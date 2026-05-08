@@ -88,6 +88,8 @@ fn pluto_capabilities() -> &'static BackendCapabilities {
             },
         ],
         antennas: vec![],
+        // Pluto is a single-tuner part — no selector to render.
+        tuner_options: vec![],
         features: BackendFeatures {
             ctcss_tx: true,
             rf_bandwidth_range_hz: Some((200_000, 56_000_000)),

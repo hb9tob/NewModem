@@ -51,6 +51,13 @@ pub struct BackendCapabilities {
     /// enforced at `open()` time, not here.
     pub antennas: Vec<AntennaChoice>,
 
+    /// Tuner-half choices for multi-tuner devices (RSPduo). Empty
+    /// `[]` = single tuner, no selector rendered. The selected ID
+    /// is round-tripped through `SdrConfig::backend_extras["tuner"]`
+    /// — backends parse it themselves at `open()` time.
+    #[serde(default)]
+    pub tuner_options: Vec<TunerOption>,
+
     /// Boolean toggles surfaced as plain checkboxes.
     pub features: BackendFeatures,
 
@@ -105,6 +112,16 @@ pub struct AgcMode {
 #[derive(Clone, Debug, Serialize)]
 pub struct AntennaChoice {
     pub id: String,
+    pub label: String,
+}
+
+/// One entry of [`BackendCapabilities::tuner_options`].
+#[derive(Clone, Debug, Serialize)]
+pub struct TunerOption {
+    /// Wire string written into `backend_extras["tuner"]`. SDRplay
+    /// expects `"A"` or `"B"`.
+    pub id: String,
+    /// French UI label, e.g. `"A (Hi-Z + 50 Ω)"`, `"B (50 Ω + bias-T)"`.
     pub label: String,
 }
 

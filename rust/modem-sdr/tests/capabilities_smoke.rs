@@ -42,6 +42,7 @@ fn dummy_caps() -> BackendCapabilities {
             },
         ],
         antennas: vec![],
+        tuner_options: vec![],
         features: BackendFeatures {
             ctcss_tx: true,
             rf_bandwidth_range_hz: Some((200_000, 56_000_000)),
