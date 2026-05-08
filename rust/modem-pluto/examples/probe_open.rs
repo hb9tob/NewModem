@@ -1,6 +1,6 @@
 //! Live smoke test for `device::open` against a real Pluto.
 //!
-//! Plug a Pluto over USB and run:
+//! Plug a Pluto over USB (or reach it via Ethernet) and run:
 //!
 //! ```text
 //! cargo run -p modem-pluto --example probe_open
@@ -10,17 +10,18 @@
 //! `cargo run -p modem-pluto --example probe_open -- ip:pluto.local`.
 //!
 //! What we want to see: the FIR loads, `sampling_frequency` ends up at
-//! 576000 (or 2304000 fallback), and the LO + gain reads back what we
-//! programmed. This is the manual verification step for task #10.
+//! 576000 (or 2304000 fallback), and the LO + gain read back match
+//! what we programmed.
 
-use modem_pluto::device::{self, PlutoConfig};
+use modem_pluto::device::{self, iio_names, PlutoConfig};
+use modem_pluto::iiod::{ChanDir, IiodClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uri = std::env::args()
         .nth(1)
         .unwrap_or_else(|| modem_pluto::DEFAULT_URI.to_string());
     let config = PlutoConfig {
-        uri,
+        uri: uri.clone(),
         rx_freq_hz: 145_500_000,
         tx_freq_hz: 145_500_000,
         rx_gain_mode: modem_pluto::device::RxGainMode::Manual,
@@ -41,34 +42,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.negotiated_rate.sample_rate_hz, session.negotiated_rate.ratio
     );
 
-    // Read back what the chip thinks each attribute is. The channel
-    // helpers re-fetch the AD9361 control channels from the phy device
-    // — Channel is !Send (raw pointer) so PlutoSession deliberately
-    // doesn't cache them; find_channel is a cheap name lookup.
-    let rx = session.rx_baseband_chan()?;
-    let tx = session.tx_baseband_chan()?;
-    let actual_rx_rate: i64 = rx.attr_read_int("sampling_frequency")?;
-    let actual_tx_rate: i64 = tx.attr_read_int("sampling_frequency")?;
-    let actual_rx_gain: i64 = rx.attr_read_int("hardwaregain")?;
-    let actual_tx_gain: f64 = tx.attr_read_float("hardwaregain")?;
-    let actual_rf_bw_rx: i64 = rx.attr_read_int("rf_bandwidth")?;
-    let actual_rf_bw_tx: i64 = tx.attr_read_int("rf_bandwidth")?;
-    let actual_fir_rx: bool = rx.attr_read_bool("filter_fir_en")?;
-    let actual_fir_tx: bool = tx.attr_read_bool("filter_fir_en")?;
+    // Reopen a control connection to read everything back. `device::open`
+    // dropped its connection by design; the AD9361 retained the values
+    // we programmed kernel-side, so any fresh client sees them.
+    let mut client = IiodClient::connect(&uri)?;
 
-    let rx_freq: i64 = session.rx_lo_chan()?.attr_read_int("frequency")?;
-    let tx_freq: i64 = session.tx_lo_chan()?.attr_read_int("frequency")?;
+    let rx_rate = client.read_chn_attr(iio_names::PHY, ChanDir::Input, "voltage0", "sampling_frequency")?;
+    let tx_rate = client.read_chn_attr(iio_names::PHY, ChanDir::Output, "voltage0", "sampling_frequency")?;
+    let rx_fir = client.read_chn_attr(iio_names::PHY, ChanDir::Input, "voltage0", "filter_fir_en")?;
+    let tx_fir = client.read_chn_attr(iio_names::PHY, ChanDir::Output, "voltage0", "filter_fir_en")?;
+    let rx_gain = client.read_chn_attr(iio_names::PHY, ChanDir::Input, "voltage0", "hardwaregain")?;
+    let tx_gain = client.read_chn_attr(iio_names::PHY, ChanDir::Output, "voltage0", "hardwaregain")?;
+    let rx_bw = client.read_chn_attr(iio_names::PHY, ChanDir::Input, "voltage0", "rf_bandwidth")?;
+    let tx_bw = client.read_chn_attr(iio_names::PHY, ChanDir::Output, "voltage0", "rf_bandwidth")?;
+    let rx_freq = client.read_chn_attr(iio_names::PHY, ChanDir::Output, "altvoltage0", "frequency")?;
+    let tx_freq = client.read_chn_attr(iio_names::PHY, ChanDir::Output, "altvoltage1", "frequency")?;
 
-    println!("  RX sampling_frequency = {actual_rx_rate} Hz");
-    println!("  TX sampling_frequency = {actual_tx_rate} Hz");
-    println!("  RX filter_fir_en       = {actual_fir_rx}");
-    println!("  TX filter_fir_en       = {actual_fir_tx}");
-    println!("  RX hardwaregain        = {actual_rx_gain} dB");
-    println!("  TX hardwaregain        = {actual_tx_gain} dB");
-    println!("  RX rf_bandwidth        = {actual_rf_bw_rx} Hz");
-    println!("  TX rf_bandwidth        = {actual_rf_bw_tx} Hz");
+    println!("  RX sampling_frequency = {rx_rate} Hz");
+    println!("  TX sampling_frequency = {tx_rate} Hz");
+    println!("  RX filter_fir_en       = {rx_fir}");
+    println!("  TX filter_fir_en       = {tx_fir}");
+    println!("  RX hardwaregain        = {rx_gain}");
+    println!("  TX hardwaregain        = {tx_gain}");
+    println!("  RX rf_bandwidth        = {rx_bw} Hz");
+    println!("  TX rf_bandwidth        = {tx_bw} Hz");
     println!("  RX_LO frequency        = {rx_freq} Hz");
     println!("  TX_LO frequency        = {tx_freq} Hz");
 
+    client.close()?;
     Ok(())
 }

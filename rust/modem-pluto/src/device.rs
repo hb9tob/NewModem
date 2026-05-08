@@ -1,29 +1,32 @@
-//! Pluto device discovery + AD9361/AD9363 control.
+//! Pluto device discovery + AD9361/AD9363 control via iiod over TCP.
 //!
-//! Opens a libiio context, finds the three IIO devices the AD9363 ASoC
-//! driver exposes, loads a 4× decimating/interpolating FIR into
-//! `filter_fir_config`, and programs the requested sample rate, LO,
-//! RX gain, TX attenuation, and RF bandwidth.
+//! Opens a short-lived [`IiodClient`] (control plane), programs every
+//! AD9361 knob (gain, freq, bandwidth, FIR, sample rate) via WRITE
+//! attr commands, then drops the control connection. The chip retains
+//! its kernel-side state after the connection closes — RX and TX
+//! threads open their own independent iiod connections for streaming.
 //!
-//! The 4× FIR is the gating piece. Stock Pluto firmware exposes a
-//! BBPLL minimum of 2.083 MS/s without a custom FIR loaded, which is
-//! why `sampling_frequency_available` reads `[2083333 1 61440000]` on
-//! a fresh context. Loading a 4× decimating FIR effectively divides
-//! that floor by 4, so the chip then accepts 576 kSa/s
-//! ([`crate::PREFERRED_SAMPLE_RATE_HZ`], chosen so the ÷N to 48 kHz
-//! audio is the small-prime composite 12 = 2²·3 — see project memory
-//! `sdr-rate-convention.md`).
+//! ## Why a stateless session
 //!
-//! The AD9361 driver expects the FIR config in a small ASCII blob
-//! ([`format_fir_blob`]) written into the device-attribute
-//! `filter_fir_config` on `ad9361-phy`. The taps are computed at
-//! startup with [`design_decim4_lpf`] — a 128-tap Hamming-windowed
-//! sinc — so the crate stays runtime-only and ships no opaque tap
-//! files. See the constants in that helper for the design choices.
-
-use industrial_io::{Channel, Context, Device, Direction};
+//! With libiio FFI we kept a live `Context` around because cloning was
+//! cheap (Arc-wrapped) and channel handles came from the device. With
+//! iiod-TCP we want one connection per active stream, no shared state
+//! across threads — so the session becomes a *snapshot of the
+//! configuration that's been programmed into the chip* plus the
+//! negotiated rate. Cloning is trivial; the loopback test path is
+//! happy; multi-thread streaming opens fresh connections per direction
+//! without any locking.
+//!
+//! The 4× FIR is the gating piece for sub-2.083 MS/s rates. Stock
+//! Pluto firmware exposes a BBPLL minimum of 2.083 MS/s without a
+//! custom FIR loaded, which is why `sampling_frequency_available`
+//! reads `[2083333 1 61440000]` on a fresh context. Loading a 4×
+//! decimating FIR effectively divides that floor by 4, so the chip
+//! then accepts 576 kSa/s (the project's preferred small-prime
+//! composite of 48 kHz audio).
 
 use crate::error::PlutoError;
+use crate::iiod::{ChanDir, IiodClient};
 
 /// Names of the three IIO devices the Pluto exposes that we drive.
 ///
@@ -46,7 +49,11 @@ pub mod iio_names {
 /// TX 145.025 MHz on a 2 m repeater with a -600 kHz shift).
 #[derive(Clone, Debug)]
 pub struct PlutoConfig {
-    /// libiio URI, e.g. `"usb:1.6.5"` or `"ip:pluto.local"`.
+    /// iiod target — anything `parse_pluto_target` accepts. Typical
+    /// forms:
+    ///   * `"ip:192.168.2.1"`  Pluto over USB-NCM (default)
+    ///   * `"ip:pluto.local"`  mDNS hostname
+    ///   * `"192.168.10.50:31000"`  remote Pluto on a different LAN
     pub uri: String,
     /// RX_LO frequency in Hz.
     pub rx_freq_hz: u64,
@@ -93,10 +100,7 @@ pub struct PlutoConfig {
     /// audio to open repeater squelches. `0.0` = disabled (no tone
     /// added). Otherwise one of the 39 EIA standard values
     /// (67.0 Hz – 254.1 Hz, see
-    /// [`modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`]). The tone is
-    /// added in front of the polyphase interpolator so it goes
-    /// through the PhaseMod just like the voice — the receiver's
-    /// `SubAudioHpf` rejects it post-demodulation. Default 0.0.
+    /// [`modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`]).
     pub ctcss_freq_hz: f32,
     /// Linear amplitude of the CTCSS tone vs the unit-amplitude
     /// voice signal. `0.1` (= -20 dB) gives ±500 Hz deviation on
@@ -189,185 +193,66 @@ impl NegotiatedRate {
     };
 }
 
-/// Live, fully-configured Pluto session.
+/// Snapshot of a fully-configured Pluto.
 ///
-/// Owns the libiio `Context` plus the three device handles. **Channels
-/// are intentionally not stored** because `industrial_io::Channel`
-/// holds a raw pointer and is therefore `!Send`, which would prevent
-/// moving the session into a worker thread (the natural place to run
-/// the libiio buffer pump). Channel handles are cheap to re-fetch via
-/// the helpers on this type — `find_channel` is just a name lookup
-/// against the parent device.
-///
-/// `Context` is `Send + Sync` (cloning bumps an internal `Arc`) and
-/// `Device` is manually-marked `Send`, so cloning a session is safe
-/// and used by the loopback test to drive RX and TX simultaneously
-/// from one open Pluto context.
-#[derive(Clone)]
+/// Doesn't own any iiod connection: configuration has been programmed
+/// into the AD9361's kernel-side state via a transient control
+/// connection, and is retained until something else writes new values.
+/// Streaming threads open their own connections; cloning the session
+/// is just a memcpy.
+#[derive(Clone, Debug)]
 pub struct PlutoSession {
-    pub ctx: Context,
-    pub phy: Device,
-    pub rx_buffer_dev: Device,
-    pub tx_buffer_dev: Device,
+    /// The config that was programmed. `uri` points at the same Pluto
+    /// the streaming threads will reconnect to.
+    pub config: PlutoConfig,
+    /// Whichever sample rate actually locked.
     pub negotiated_rate: NegotiatedRate,
     /// RX FM max deviation copied from the [`PlutoConfig`] used to
     /// open this session. Read by `rx::capture_loop` to size the
-    /// `QuadratureDemod` discriminator gain. Carried on the session
-    /// rather than passed as an extra capture-loop argument so the
-    /// existing `start_on` / `capture_loop` signatures stay compatible
-    /// with the loopback test path.
+    /// `QuadratureDemod` discriminator gain.
     pub rx_max_deviation_hz: f32,
     /// TX FM deviation copied from the [`PlutoConfig`]. Read by
     /// `tx::run_tx` to scale the `PhaseMod`'s `k_p` from its 5 kHz
-    /// calibration. Same rationale as `rx_max_deviation_hz`.
+    /// calibration.
     pub tx_deviation_hz: f32,
-    /// CTCSS sub-audible tone frequency, copied from the
-    /// [`PlutoConfig`]. `0.0` disables CTCSS. Read by `tx::run_tx`
-    /// to construct the [`modem_sdr_dsp::ctcss_gen::CtcssToneGen`]
-    /// once at session start.
+    /// CTCSS sub-audible tone frequency. `0.0` disables CTCSS.
     pub ctcss_freq_hz: f32,
-    /// Linear CTCSS amplitude (default 0.1 = -20 dB). Same rationale
-    /// as `ctcss_freq_hz`.
+    /// Linear CTCSS amplitude (default 0.1 = -20 dB).
     pub ctcss_level: f32,
 }
 
-impl std::fmt::Debug for PlutoSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `industrial_io::Device` doesn't impl Debug in a useful way,
-        // so summarize what the user actually wants to see.
-        f.debug_struct("PlutoSession")
-            .field("rate_hz", &self.negotiated_rate.sample_rate_hz)
-            .field("ratio", &self.negotiated_rate.ratio)
-            .finish()
-    }
-}
-
-impl PlutoSession {
-    /// RX baseband control channel on `ad9361-phy` (`voltage0` input).
-    /// This is where `hardwaregain`, `gain_control_mode`,
-    /// `rf_bandwidth`, `filter_fir_en`, `sampling_frequency` live.
-    pub fn rx_baseband_chan(&self) -> Result<Channel, PlutoError> {
-        self.phy
-            .find_channel("voltage0", Direction::Input)
-            .ok_or(PlutoError::Attribute {
-                device: iio_names::PHY,
-                attr: "voltage0 (input)",
-                detail: "RX baseband channel not present".into(),
-            })
-    }
-
-    /// TX baseband control channel on `ad9361-phy` (`voltage0` output).
-    pub fn tx_baseband_chan(&self) -> Result<Channel, PlutoError> {
-        self.phy
-            .find_channel("voltage0", Direction::Output)
-            .ok_or(PlutoError::Attribute {
-                device: iio_names::PHY,
-                attr: "voltage0 (output)",
-                detail: "TX baseband channel not present".into(),
-            })
-    }
-
-    /// RX_LO frequency channel on `ad9361-phy` (`altvoltage0` output).
-    pub fn rx_lo_chan(&self) -> Result<Channel, PlutoError> {
-        self.phy
-            .find_channel("altvoltage0", Direction::Output)
-            .ok_or(PlutoError::Attribute {
-                device: iio_names::PHY,
-                attr: "altvoltage0",
-                detail: "RX_LO channel not present".into(),
-            })
-    }
-
-    /// TX_LO frequency channel on `ad9361-phy` (`altvoltage1` output).
-    pub fn tx_lo_chan(&self) -> Result<Channel, PlutoError> {
-        self.phy
-            .find_channel("altvoltage1", Direction::Output)
-            .ok_or(PlutoError::Attribute {
-                device: iio_names::PHY,
-                attr: "altvoltage1",
-                detail: "TX_LO channel not present".into(),
-            })
-    }
-}
-
-/// Open a libiio context and apply the static parts of `config`.
+/// Open a control connection to the Pluto, apply `config`, and drop
+/// the connection. Returns a [`PlutoSession`] snapshot.
 ///
 /// Sequence (matches the `pyadi-iio` / `gr-iio` recipe):
 ///
-/// 1. Open context at `config.uri`.
-/// 2. Locate `ad9361-phy`, `cf-ad9361-lpc`, `cf-ad9361-dds-core-lpc`.
-/// 3. Set RX gain control mode = `manual`, RX hardwaregain, TX
-///    attenuation, RX/TX RF bandwidth (all on the phy device).
-/// 4. Set RX_LO and TX_LO frequencies (altvoltage0 / altvoltage1).
-/// 5. Generate a 4× decimating FIR + format the .ftr blob, write to
-///    the device-attr `filter_fir_config`.
-/// 6. Enable per-channel `filter_fir_en = 1` on the RX/TX baseband
+/// 1. TCP-connect to `config.uri` and run the VERSION handshake.
+/// 2. Program RX gain mode + manual gain (if mode = Manual).
+/// 3. Program TX attenuation.
+/// 4. Program RX/TX RF bandwidths.
+/// 5. Program RX_LO and TX_LO frequencies.
+/// 6. Generate a 4× decimating FIR + format the .ftr blob, write to
+///    the device-attribute `filter_fir_config`.
+/// 7. Enable per-channel `filter_fir_en = 1` on the RX/TX baseband
 ///    channels.
-/// 7. Try `sampling_frequency = 576000` on both directions; if either
+/// 8. Try `sampling_frequency = 576000` on both directions; if either
 ///    rejects with `EINVAL`, retry at `2304000`.
-///
-/// The session that comes back is "armed" — buffer devices are ready
-/// for the rx / tx modules to call `create_buffer` against them.
+/// 9. Drop the connection — the chip retains its programmed state.
 pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
-    let ctx = Context::from_uri(&config.uri).map_err(|e| PlutoError::OpenContext {
-        uri: config.uri.clone(),
-        source: e,
-    })?;
+    let mut client = IiodClient::connect(&config.uri)?;
 
-    let phy = ctx
-        .find_device(iio_names::PHY)
-        .ok_or(PlutoError::DeviceNotFound {
-            name: iio_names::PHY,
-        })?;
-    let rx_buffer_dev =
-        ctx.find_device(iio_names::RX_BUFFER)
-            .ok_or(PlutoError::DeviceNotFound {
-                name: iio_names::RX_BUFFER,
-            })?;
-    let tx_buffer_dev =
-        ctx.find_device(iio_names::TX_BUFFER)
-            .ok_or(PlutoError::DeviceNotFound {
-                name: iio_names::TX_BUFFER,
-            })?;
-
-    // Per-channel handles. The AD9361 driver puts gain control + FIR
-    // enable + bandwidth on the per-direction baseband voltage0
-    // channels rather than on the device, so we keep these around.
-    let rx_chan = phy
-        .find_channel("voltage0", Direction::Input)
-        .ok_or(PlutoError::Attribute {
-            device: iio_names::PHY,
-            attr: "voltage0 (input)",
-            detail: "RX baseband channel not present".into(),
-        })?;
-    let tx_chan = phy
-        .find_channel("voltage0", Direction::Output)
-        .ok_or(PlutoError::Attribute {
-            device: iio_names::PHY,
-            attr: "voltage0 (output)",
-            detail: "TX baseband channel not present".into(),
-        })?;
-    let rx_lo = phy
-        .find_channel("altvoltage0", Direction::Output)
-        .ok_or(PlutoError::Attribute {
-            device: iio_names::PHY,
-            attr: "altvoltage0",
-            detail: "RX_LO channel not present".into(),
-        })?;
-    let tx_lo = phy
-        .find_channel("altvoltage1", Direction::Output)
-        .ok_or(PlutoError::Attribute {
-            device: iio_names::PHY,
-            attr: "altvoltage1",
-            detail: "TX_LO channel not present".into(),
-        })?;
-
-    // --- RX gain: program the chosen AGC mode, then in `manual` mode
+    // RX gain: program the chosen AGC mode, then in `manual` mode
     // also push the explicit gain. In any AGC mode we leave the chip
     // to do its thing — writing `hardwaregain` in non-manual modes
     // would be ignored by the driver anyway.
-    rx_chan
-        .attr_write_str("gain_control_mode", config.rx_gain_mode.as_iio_str())
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Input,
+            "voltage0",
+            "gain_control_mode",
+            config.rx_gain_mode.as_iio_str(),
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/gain_control_mode",
@@ -377,8 +262,14 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
             ),
         })?;
     if config.rx_gain_mode == RxGainMode::Manual {
-        rx_chan
-            .attr_write_int("hardwaregain", config.rx_gain_db as i64)
+        client
+            .write_chn_attr(
+                iio_names::PHY,
+                ChanDir::Input,
+                "voltage0",
+                "hardwaregain",
+                &config.rx_gain_db.to_string(),
+            )
             .map_err(|e| PlutoError::Attribute {
                 device: iio_names::PHY,
                 attr: "voltage0/hardwaregain (RX)",
@@ -386,57 +277,89 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
             })?;
     }
 
-    // --- TX attenuation: AD9361 driver expects a negative value in dB.
+    // TX attenuation: AD9361 driver expects a negative dB value
+    // (gain semantics — more negative = more attenuation).
     let tx_hw_gain = -config.tx_attenuation_db.abs();
-    tx_chan
-        .attr_write_float("hardwaregain", tx_hw_gain)
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Output,
+            "voltage0",
+            "hardwaregain",
+            &format!("{tx_hw_gain}"),
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/hardwaregain (TX)",
             detail: format!("tx_attenuation_db = {} rejected: {e}", config.tx_attenuation_db),
         })?;
 
-    // --- RF bandwidths.
-    rx_chan
-        .attr_write_int("rf_bandwidth", config.rf_bandwidth_hz as i64)
+    // RF bandwidths.
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Input,
+            "voltage0",
+            "rf_bandwidth",
+            &config.rf_bandwidth_hz.to_string(),
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/rf_bandwidth (RX)",
             detail: format!("{} rejected: {e}", config.rf_bandwidth_hz),
         })?;
-    tx_chan
-        .attr_write_int("rf_bandwidth", config.rf_bandwidth_hz as i64)
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Output,
+            "voltage0",
+            "rf_bandwidth",
+            &config.rf_bandwidth_hz.to_string(),
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/rf_bandwidth (TX)",
             detail: format!("{} rejected: {e}", config.rf_bandwidth_hz),
         })?;
 
-    // --- LO frequencies.
-    rx_lo
-        .attr_write_int("frequency", config.rx_freq_hz as i64)
+    // LO frequencies. RX_LO = altvoltage0, TX_LO = altvoltage1.
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Output,
+            "altvoltage0",
+            "frequency",
+            &config.rx_freq_hz.to_string(),
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "altvoltage0/frequency (RX_LO)",
             detail: format!("{} Hz rejected: {e}", config.rx_freq_hz),
         })?;
-    tx_lo
-        .attr_write_int("frequency", config.tx_freq_hz as i64)
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Output,
+            "altvoltage1",
+            "frequency",
+            &config.tx_freq_hz.to_string(),
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "altvoltage1/frequency (TX_LO)",
             detail: format!("{} Hz rejected: {e}", config.tx_freq_hz),
         })?;
 
-    // --- FIR: load taps, enable per-direction, then negotiate rate.
-    load_decim4_fir(&phy, &rx_chan, &tx_chan)?;
-    let negotiated_rate = negotiate_sample_rate(&rx_chan, &tx_chan, config.prefer_low_rate)?;
+    // FIR: load taps + enable per-direction, then negotiate rate.
+    load_decim4_fir(&mut client)?;
+    let negotiated_rate = negotiate_sample_rate(&mut client, config.prefer_low_rate)?;
+
+    // Tear the control connection down — chip state is retained
+    // server-side.
+    client.close()?;
 
     Ok(PlutoSession {
-        ctx,
-        phy,
-        rx_buffer_dev,
-        tx_buffer_dev,
+        config: config.clone(),
         negotiated_rate,
         rx_max_deviation_hz: config.rx_max_deviation_hz,
         tx_deviation_hz: config.tx_deviation_hz,
@@ -451,25 +374,38 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
 /// count or gain combo doesn't match the BBPLL state), we surface the
 /// error rather than silently fall back — the caller can choose to
 /// rebuild with a different rate.
-fn load_decim4_fir(phy: &Device, rx_chan: &Channel, tx_chan: &Channel) -> Result<(), PlutoError> {
+fn load_decim4_fir(client: &mut IiodClient) -> Result<(), PlutoError> {
     let taps = design_decim4_lpf();
     let blob = format_fir_blob(&taps, &taps);
 
-    phy.attr_write_str("filter_fir_config", &blob)
+    client
+        .write_dev_attr(iio_names::PHY, "filter_fir_config", &blob)
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "filter_fir_config",
             detail: format!("FIR config rejected: {e}"),
         })?;
-    rx_chan
-        .attr_write_bool("filter_fir_en", true)
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Input,
+            "voltage0",
+            "filter_fir_en",
+            "1",
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/filter_fir_en (RX)",
             detail: e.to_string(),
         })?;
-    tx_chan
-        .attr_write_bool("filter_fir_en", true)
+    client
+        .write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Output,
+            "voltage0",
+            "filter_fir_en",
+            "1",
+        )
         .map_err(|e| PlutoError::Attribute {
             device: iio_names::PHY,
             attr: "voltage0/filter_fir_en (TX)",
@@ -484,8 +420,7 @@ fn load_decim4_fir(phy: &Device, rx_chan: &Channel, tx_chan: &Channel) -> Result
 /// AD9361 are clocked together — writing one effectively writes both,
 /// but we set both explicitly for robustness against driver versions.
 fn negotiate_sample_rate(
-    rx_chan: &Channel,
-    tx_chan: &Channel,
+    client: &mut IiodClient,
     prefer_low_rate: bool,
 ) -> Result<NegotiatedRate, PlutoError> {
     let candidates: &[NegotiatedRate] = if prefer_low_rate {
@@ -496,8 +431,21 @@ fn negotiate_sample_rate(
 
     let mut last_err: Option<String> = None;
     for cand in candidates {
-        let rx_res = rx_chan.attr_write_int("sampling_frequency", cand.sample_rate_hz as i64);
-        let tx_res = tx_chan.attr_write_int("sampling_frequency", cand.sample_rate_hz as i64);
+        let rate_str = cand.sample_rate_hz.to_string();
+        let rx_res = client.write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Input,
+            "voltage0",
+            "sampling_frequency",
+            &rate_str,
+        );
+        let tx_res = client.write_chn_attr(
+            iio_names::PHY,
+            ChanDir::Output,
+            "voltage0",
+            "sampling_frequency",
+            &rate_str,
+        );
         match (rx_res, tx_res) {
             (Ok(()), Ok(())) => return Ok(*cand),
             (Err(e), _) | (_, Err(e)) => {
@@ -515,7 +463,9 @@ fn negotiate_sample_rate(
 }
 
 // ---------------------------------------------------------------------
-// FIR design (pure-Rust, runtime-computed)
+// FIR design (pure-Rust, runtime-computed) — unchanged from the
+// libiio-FFI version. Lives here because it's tightly bound to the
+// AD9361's expected blob format.
 // ---------------------------------------------------------------------
 
 /// Number of taps in the AD9361 RFIR/TFIR when running 4× dec/int.

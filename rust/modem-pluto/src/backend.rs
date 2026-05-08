@@ -3,21 +3,34 @@
 //! [`PlutoBackend`] is a zero-sized type that registers in
 //! `modem-gui/src-tauri/src/sdr_registry.rs` behind the `pluto`
 //! cargo feature. It exposes the Pluto family's static
-//! [`BackendCapabilities`], scans libiio USB contexts in
+//! [`BackendCapabilities`], discovers reachable Plutos in
 //! [`PlutoBackend::list_devices`], and opens a [`PlutoDevice`] in
 //! [`PlutoBackend::open`].
 //!
-//! [`PlutoDevice`] is the [`SdrDevice`] wrapper around a not-yet-
-//! streaming Pluto. It owns the [`PlutoConfig`] derived from the
-//! GUI's [`SdrConfig`] (via [`build_pluto_config`]) and dispatches
-//! `start_rx` / `tx_sink` to the existing Pluto code paths
-//! (`crate::rx::start`, `crate::tx::PlutoSink`).
+//! ## Discovery
+//!
+//! With the iiod-TCP transport, "discovery" means: try to handshake
+//! with the well-known endpoints and report whichever respond. We
+//! probe two by default:
+//!
+//! * `192.168.2.1:30431` — Pluto over USB-NCM. The AD USB driver on
+//!   Windows / Linux's cdc-ncm kernel module assigns this address by
+//!   default. **No driver install needed on Windows** — USB-NCM is a
+//!   standard class.
+//! * `pluto.local:30431` — mDNS hostname Pluto advertises on the
+//!   network it's on. Useful for Pluto+ on real Ethernet, or any LAN
+//!   reachable Pluto regardless of its USB-NCM IP.
+//!
+//! For everything else (custom IP, remote LAN, multiple Plutos), the
+//! GUI / CLI passes the URI directly via `SdrConfig.device_uri` —
+//! that gets stored in `DeviceDescriptor.id` and reaches `device::open`
+//! intact. See `crate::iiod::target::parse_pluto_target` for the full
+//! list of accepted spellings.
 //!
 //! ## Pluto-specific keys recognized in [`SdrConfig::backend_extras`]
 //!
 //! - `tx_attenuation_db: f64` — AD9361 TX hardware-gain attenuation.
-//!   Range `[0.0, 89.75]` dB step 0.25. Default `10.0` (matches
-//!   today's `PlutoConfig::default()`).
+//!   Range `[0.0, 89.75]` dB step 0.25. Default `10.0`.
 //! - `prefer_low_rate: bool` — try 576 kS/s first (true) vs go
 //!   directly to 2304 kS/s (false). Default `true`.
 //!
@@ -25,6 +38,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use modem_sdr::{
     AgcMode, AntennaChoice, BackendCapabilities, BackendFeatures, DeviceDescriptor, GainSetting,
@@ -33,6 +47,7 @@ use modem_sdr::{
 };
 
 use crate::device::{PlutoConfig, RxGainMode};
+use crate::iiod::target::IIOD_DEFAULT_PORT;
 use crate::rx;
 use crate::tx::PlutoSink;
 
@@ -41,6 +56,18 @@ use crate::tx::PlutoSink;
 /// composite names.
 pub const BACKEND_ID: &str = "pluto";
 const DISPLAY_NAME: &str = "PlutoSDR (ADALM-PLUTO)";
+
+/// Hosts probed when listing devices. First match wins; the user can
+/// always type a custom URI to bypass.
+const DISCOVERY_HOSTS: &[(&str, &str)] = &[
+    // (host, friendly suffix)
+    ("192.168.2.1", "USB-NCM"),
+    ("pluto.local", "mDNS"),
+];
+
+/// How long to wait for each TCP probe. 250 ms is plenty for a LAN
+/// hop; we don't want a slow probe to stall the GUI device dropdown.
+const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 static PLUTO_CAPS: OnceLock<BackendCapabilities> = OnceLock::new();
 
@@ -120,31 +147,18 @@ impl SdrBackend for PlutoBackend {
     }
 
     fn list_devices(&self) -> Result<Vec<DeviceDescriptor>, SdrError> {
-        // Scan libiio USB contexts. We deliberately do NOT surface
-        // libiio failures as errors — the GUI just shows an empty
-        // group when no Pluto is plugged in (or when the libiio USB
-        // backend isn't compiled in on this platform).
-        let scan = match industrial_io::ScanContext::new_usb() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[pluto] USB scan unavailable: {e}");
-                return Ok(Vec::new());
-            }
-        };
+        // Probe each well-known endpoint with a short TCP-connect
+        // timeout. Any host that opens the iiod port fast enough
+        // gets an entry in the dropdown. We deliberately do NOT
+        // surface failures as errors — the GUI just shows an empty
+        // group when no Pluto is plugged in or reachable.
         let mut out = Vec::new();
-        for (uri, descr) in scan.iter() {
-            // libiio can list other AD9361-class boards alongside
-            // genuine Plutos — match on the description so we don't
-            // try to drive a dev kit through the Pluto code paths.
-            let is_pluto = descr.contains("PlutoSDR")
-                || descr.contains("ADALM-PLUTO")
-                || descr.contains("AD9363")
-                || descr.contains("AD9361");
-            if !is_pluto {
-                continue;
+        for &(host, suffix) in DISCOVERY_HOSTS {
+            if probe_iiod(host) {
+                let uri = format!("ip:{host}");
+                let friendly = format!("Pluto SDR — {host} ({suffix})");
+                out.push(DeviceDescriptor::new(BACKEND_ID, uri, friendly));
             }
-            let friendly = format!("Pluto SDR — {uri}");
-            out.push(DeviceDescriptor::new(BACKEND_ID, uri, friendly));
         }
         Ok(out)
     }
@@ -155,12 +169,12 @@ impl SdrBackend for PlutoBackend {
         config: &SdrConfig,
     ) -> Result<Box<dyn SdrDevice>, SdrError> {
         let pluto_config = build_pluto_config(descriptor, config)?;
-        // Don't actually open the libiio context here — keep the
+        // Don't actually open the iiod connection here — keep the
         // existing semantics where opening happens lazily inside
-        // `rx::start` (RX path) or `PlutoSink::play_buffer` (TX path).
-        // Eager-opening would burn USB cycles and serialise the two
-        // directions through one Context that we don't actually need
-        // to share at the SdrDevice level.
+        // `rx::start` / `PlutoSink::play_buffer`. Eager-opening would
+        // burn a TCP handshake and serialise the two directions
+        // through one connection that we don't actually want shared
+        // (RX and TX each get their own).
         let device = PlutoDevice {
             descriptor: descriptor.clone(),
             config: config.clone(),
@@ -168,6 +182,24 @@ impl SdrBackend for PlutoBackend {
         };
         Ok(Box::new(device))
     }
+}
+
+/// TCP-probe an iiod endpoint to decide whether to surface it in the
+/// device list. Returns `true` iff the connect succeeds inside
+/// [`DISCOVERY_PROBE_TIMEOUT`]. We don't bother with the VERSION
+/// handshake: anything listening on port 30431 is iiod by convention,
+/// and the full handshake happens later in `device::open`.
+fn probe_iiod(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{host}:{IIOD_DEFAULT_PORT}");
+    let mut addrs = match addr_str.to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&addr, DISCOVERY_PROBE_TIMEOUT).is_ok()
 }
 
 /// Open Pluto — owns its [`PlutoConfig`] until dropped.
@@ -219,8 +251,8 @@ impl SdrDevice for PlutoDevice {
 /// Validation is deliberate but light — out-of-range frequencies and
 /// gain shapes that don't match this backend's capabilities are
 /// rejected with [`SdrError::InvalidConfig`]; everything else is
-/// passed through and let the libiio attribute write fail loudly if
-/// the chip doesn't like it.
+/// passed through and let the iiod attribute write fail loudly if the
+/// chip doesn't like it.
 pub fn build_pluto_config(
     descriptor: &DeviceDescriptor,
     cfg: &SdrConfig,
@@ -250,8 +282,8 @@ pub fn build_pluto_config(
         }
     };
 
-    // backend_extras — read with sane defaults that match today's
-    // PlutoConfig::default() so the GUI behaves identically post-refactor.
+    // backend_extras — read with sane defaults that match
+    // PlutoConfig::default() so the GUI behaves identically.
     let tx_attenuation_db = cfg
         .backend_extras
         .get("tx_attenuation_db")
