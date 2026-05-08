@@ -210,6 +210,25 @@ fn build_sdrplay_config_honours_lna_state_under_agc() {
     assert_eq!(scfg.agc_mode, AgcMode::Mid);
 }
 
+/// `SdrplayHardware` is wired into `program_params` for every variant
+/// listed here — the test exists so adding a new arm to the enum
+/// without touching the match in `device::program_params` becomes a
+/// loud failure instead of a silent "Unsupported" path.
+const PROGRAMMABLE_HARDWARE: &[SdrplayHardware] = &[
+    SdrplayHardware::RspDuo,
+    SdrplayHardware::Rsp1a,
+    SdrplayHardware::Rsp1b,
+    SdrplayHardware::Rsp1,
+];
+
+#[test]
+fn programmable_hardware_count_matches_supported_branches() {
+    // 4 device branches today: RSPduo, RSP1A, RSP1B, RSP1. Bumping
+    // this number means you've added a new hardware branch and
+    // should also have wired its per-device programming.
+    assert_eq!(PROGRAMMABLE_HARDWARE.len(), 4);
+}
+
 #[test]
 fn sdrplay_hardware_maps_hw_ver_bytes() {
     // The hwVer bytes come straight from sdrplay_api.h —

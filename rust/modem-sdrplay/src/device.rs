@@ -10,10 +10,14 @@
 //! byte we map to [`SdrplayHardware`]. [`open`] branches on it so:
 //!  * **RSPduo** uses `rspDuoMode = Single_Tuner`, `rspDuoTunerParams`
 //!    for bias-T / antenna port / FM/DAB notches.
-//!  * **RSP1A** ignores `rspDuoMode`, always picks `Tuner::A`, uses
-//!    `rsp1aTunerParams.biasTEnable` and `devParams.rsp1aParams` for
-//!    the FM / DAB notches; antenna port is fixed at 50 Ω SMA.
-//! Other variants (RSP1, RSP2, RSPdx, RSP1B) surface as
+//!  * **RSP1A** and **RSP1B** ignore `rspDuoMode`, always pick
+//!    `Tuner::A`, use `rsp1aTunerParams.biasTEnable` and
+//!    `devParams.rsp1aParams` for the FM / DAB notches; antenna
+//!    port is fixed at 50 Ω SMA. RSP1B is wired to the same struct
+//!    contract — it's an electrical refresh, not a new API surface.
+//!  * **RSP1** (the original) has no bias-T / notches / antenna
+//!    selector — only the common rxChannel programming runs.
+//! Other variants (RSP2, RSPdx, RSPdxR2) surface as
 //! [`SdrplayError::Api`] until they grow their own branch.
 
 use std::os::raw::c_uint;
@@ -401,7 +405,8 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
             call: "GetDevices",
             code: -1,
             api_message: format!(
-                "unsupported SDRplay hardware (hwVer={v}); RSPduo and RSP1A are wired"
+                "unsupported SDRplay hardware (hwVer={v}); \
+                 RSPduo / RSP1A / RSP1B / RSP1 are wired"
             ),
         });
     }
@@ -518,10 +523,16 @@ fn program_params(
         (*dev_params).fsFreq.fsHz = config.sample_rate_hz;
 
         // FM / DAB notch lives on the device-level sub-struct for
-        // RSP1A (`rsp1aParams`); on RSPduo the same notches live on
-        // the rxChannel sub-struct (handled below). Programmed here
-        // so we touch `dev_params` exactly once.
-        if matches!(hardware, SdrplayHardware::Rsp1a) {
+        // RSP1A and RSP1B (both share `rsp1aParams` — the RSP1B is
+        // an electrical refresh of the RSP1A and reuses its API
+        // contract). On RSPduo the same notches live on the
+        // rxChannel sub-struct (handled below). RSP1 has no notch
+        // hardware so there's nothing to write. Programmed here so
+        // we touch `dev_params` exactly once.
+        if matches!(
+            hardware,
+            SdrplayHardware::Rsp1a | SdrplayHardware::Rsp1b
+        ) {
             let rsp1a = &mut (*dev_params).rsp1aParams;
             rsp1a.rfNotchEnable = if config.fm_notch { 1 } else { 0 };
             rsp1a.rfDabNotchEnable = if config.dab_notch { 1 } else { 0 };
@@ -584,19 +595,30 @@ fn program_params(
                 // tuner1AmNotchEnable left at 0 — only affects the AM
                 // (Hi-Z) port we don't use for VHF.
             }
-            SdrplayHardware::Rsp1a => {
+            SdrplayHardware::Rsp1a | SdrplayHardware::Rsp1b => {
                 // cf. sdrplay_api_rsp1a.h. Notches sat on `dev_params`
                 // (above); only bias-T lives on the rxChannel struct.
-                // Antenna port has no GUI counterpart on RSP1A — the
-                // single SMA is hard-wired.
+                // RSP1B reuses the RSP1A struct contract, so the same
+                // write covers both.
+                // Antenna port has no GUI counterpart on either part —
+                // the single SMA is hard-wired.
                 let rsp1a = &mut (*rx_chan_ptr).rsp1aTunerParams;
                 rsp1a.biasTEnable = if config.bias_t { 1 } else { 0 };
             }
+            SdrplayHardware::Rsp1 => {
+                // RSP1 (the original, hwVer=1) has no bias-T, no notch
+                // filters, and a single fixed SMA antenna. The common
+                // rxChannel programming above is enough — there is no
+                // `rsp1Params` / `rsp1TunerParams` in the API, by
+                // design. The GUI's bias-T / FM-notch / DAB-notch
+                // toggles are silently ignored; addressing that needs
+                // device-aware capabilities (follow-up).
+            }
             other => {
                 // `open()` already filters `Unsupported(_)` out, but
-                // RSP1 / RSP2 / RSPdx / RSPdxR2 / RSP1B don't have
-                // their per-device branches yet. Surface as a clear
-                // error rather than silently skip the bias-T write.
+                // RSP2 / RSPdx / RSPdxR2 don't have their per-device
+                // branches yet. Surface as a clear error rather than
+                // silently skip the per-device writes.
                 return Err(SdrplayError::Api {
                     call: "program_params",
                     code: -1,
