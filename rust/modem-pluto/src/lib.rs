@@ -52,13 +52,30 @@
 //!   loopback test): pending — `rx::start` and the TX submit path
 //!   still return `PlutoError::NotImplemented`.
 
-pub mod backend;
-pub mod device;
+// Cross-platform pieces — these compile everywhere and are the
+// long-term home for the Pluto backend. The iiod module is the
+// pure-Rust replacement for the libiio C library: TCP transport,
+// no FFI, identical wire-protocol on Windows / Linux / Pi.
 pub mod error;
+pub mod iiod;
+
+// Legacy `industrial-io`-backed modules, gated behind `legacy-iio`
+// (default ON on unix, force-OFF on Windows because the upstream FFI
+// crate is `#[cfg(unix)]`-only). The migration plan is to port each
+// of these to the iiod transport in turn — as that work lands, the
+// `cfg` blocks shrink, then the feature goes away.
+#[cfg(feature = "legacy-iio")]
+pub mod backend;
+#[cfg(feature = "legacy-iio")]
+pub mod device;
+#[cfg(feature = "legacy-iio")]
 pub mod rx;
+#[cfg(feature = "legacy-iio")]
 pub mod sample_sink_adapter;
+#[cfg(feature = "legacy-iio")]
 pub mod tx;
 
+#[cfg(feature = "legacy-iio")]
 pub use backend::{PlutoBackend, PlutoDevice};
 pub use error::PlutoError;
 
