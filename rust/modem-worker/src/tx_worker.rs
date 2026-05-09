@@ -21,6 +21,7 @@
 //!   - tx_complete  { duration_s, wav_path, stopped_early }
 //!   - tx_error     { message }
 
+use hound::{SampleFormat, WavSpec, WavWriter};
 use modem_core::{
     profile::{self, ModemConfig, ProfileIndex},
     traits::{EncodeRequest, Modem},
@@ -32,7 +33,8 @@ use modem_framing::{
     payload_envelope::PayloadEnvelope,
     raptorq_codec::k_from_payload,
 };
-use modem_io::{CpalSink, SampleSink};
+use modem_io::SampleSink;
+use modem_sdr_dsp::emphasis::preemphasis_nbfm_48k;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,8 +231,14 @@ pub fn spawn_more(
     count: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
+    tx_sink: Arc<dyn SampleSink>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
+    // Where to dump the synthesised WAV (mono, 48 kHz, int16) before
+    // playback. `None` = legacy behaviour (no on-disk copy). The path
+    // is built as `<save_wav_dir>/tx_history/tx-{ts}-{filename}.wav`
+    // so it sits next to the source archived by `archive_payload`.
+    save_wav_dir: Option<PathBuf>,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -263,14 +271,19 @@ pub fn spawn_more(
                 filename: filename.clone(),
             },
         );
+        let wav_path = save_wav_dir
+            .as_deref()
+            .map(|d| build_tx_wav_path(d, &filename, esi_start))
+            .unwrap_or_default();
         run_playback(
             &device_name,
             samples,
             total_blocks,
             duration_s,
-            String::new(),
+            wav_path,
             attenuation_db,
             preemphasis_enabled,
+            tx_sink,
             stop_thread,
             ptt,
             sink,
@@ -295,8 +308,12 @@ pub fn spawn(
     repair_pct: u32,
     attenuation_db: f32,
     preemphasis_enabled: bool,
+    tx_sink: Arc<dyn SampleSink>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
+    // See `spawn_more::save_wav_dir`. Same semantics for the initial
+    // burst.
+    save_wav_dir: Option<PathBuf>,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -346,13 +363,17 @@ pub fn spawn(
         let envelope_overhead = 2 + filename.len() + 1 + callsign.len() + 1;
         let wire_bytes = (payload_bytes + envelope_overhead) as u32;
 
+        let wav_path = save_wav_dir
+            .as_deref()
+            .map(|d| build_tx_wav_path(d, &filename, 0))
+            .unwrap_or_default();
         sink.emit(
             "tx_plan",
             TxPlanEvent {
                 duration_s,
                 total_blocks,
                 wire_bytes,
-                wav_path: String::new(),
+                wav_path: wav_path.clone(),
                 mode: mode.clone(),
                 callsign: callsign.clone(),
                 filename: filename.clone(),
@@ -364,9 +385,10 @@ pub fn spawn(
             samples,
             total_blocks,
             duration_s,
-            String::new(),
+            wav_path,
             attenuation_db,
             preemphasis_enabled,
+            tx_sink,
             stop_thread,
             ptt,
             sink,
@@ -375,6 +397,61 @@ pub fn spawn(
     TxHandle {
         stop,
         thread: Some(thread),
+    }
+}
+
+/// Build the path the TX worker writes the synthesised WAV to when the
+/// user enables the `tx_save_wav` toggle. Lives under `tx_history/` so
+/// it sits next to the archived source file produced by
+/// `archive_payload`. Includes a UNIX timestamp prefix to disambiguate
+/// repeat TX of the same file, plus an `-r{esi}` tag for "More" bursts
+/// so they don't overwrite the initial burst's WAV.
+fn build_tx_wav_path(save_dir: &Path, filename: &str, esi_start: u32) -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let history_dir = save_dir.join("tx_history");
+    let _ = std::fs::create_dir_all(&history_dir);
+    let safe = sanitize_filename(filename);
+    let suffix = if esi_start == 0 {
+        String::new()
+    } else {
+        format!("-r{esi_start}")
+    };
+    history_dir
+        .join(format!("tx-{ts}-{safe}{suffix}.wav"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Write a mono int16 48 kHz WAV at `path` from a slice of f32 samples
+/// in [-1.0, 1.0] (the same format the legacy `nbfm-modem tx` produced).
+/// Errors are logged via stderr but never propagated — saving the WAV
+/// is a best-effort side-channel, never a reason to abort the TX.
+fn write_tx_wav(path: &str, samples: &[f32]) {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: AUDIO_RATE,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut writer = match WavWriter::create(path, spec) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[tx_save_wav] create {path}: {e}");
+            return;
+        }
+    };
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        if let Err(e) = writer.write_sample(v) {
+            eprintln!("[tx_save_wav] write {path}: {e}");
+            return;
+        }
+    }
+    if let Err(e) = writer.finalize() {
+        eprintln!("[tx_save_wav] finalize {path}: {e}");
     }
 }
 
@@ -424,41 +501,6 @@ fn encode_in_process(
         .map_err(|e| format!("encode: {e}"))
 }
 
-/// Digital +6 dB/octave NBFM pre-emphasis: first-order shelf
-/// H(s) = (1+s*tau1)/(1+s*tau2), tau1 = 750 us (zero at f1 ~= 212 Hz),
-/// tau2 = 75 us (pole at f2 ~= 2.12 kHz, capping the HF gain at
-/// tau1/tau2 = 20 dB). Bilinear transform at 48 kHz, coefficients
-/// normalized for DC = 1.
-///
-/// Digital response:
-///   - DC      : 0 dB
-///   - 1 kHz   : ~+13 dB
-///   - 2.7 kHz : ~+18 dB
-///   - Nyquist : +20 dB (shelf plateau)
-///
-/// Heavy boost across the full useful audio band (NBFM starts pre-
-/// emphasizing as low as 200 Hz, not 2 kHz like broadcast FM). The
-/// caller MUST peak-normalize the signal after filtering, otherwise
-/// the sound card clips.
-fn preemphasis_nbfm_48k(samples: &mut [f32]) {
-    // Bilinear sans prewarp : 2τ₁/T = 72.0, 2τ₂/T = 7.2.
-    // Num brut : 73 - 71 z⁻¹  ;  Den brut : 8.2 - 6.2 z⁻¹.
-    // Normalisation par a0 = 8.2 → b0 = 8.9024, b1 = -8.6585, a1 = -0.7561.
-    // Pole at z = 0.7561, stable.
-    const B0: f32 = 8.9024;
-    const B1: f32 = -8.6585;
-    const A1: f32 = -0.7561;
-    let mut x_prev = 0.0f32;
-    let mut y_prev = 0.0f32;
-    for s in samples.iter_mut() {
-        let x = *s;
-        let y = B0 * x + B1 * x_prev - A1 * y_prev;
-        x_prev = x;
-        y_prev = y;
-        *s = y;
-    }
-}
-
 /// Switch the PTT to TX polarity. Best-effort: if writing to the port
 /// fails (cable unplugged mid-session, ...) we log and keep going - the
 /// worker is not in the business of aborting a transmission for that.
@@ -497,6 +539,7 @@ fn run_playback(
     wav_path: String,
     attenuation_db: f32,
     preemphasis_enabled: bool,
+    tx_sink: Arc<dyn SampleSink>,
     stop: Arc<AtomicBool>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
@@ -530,6 +573,13 @@ fn run_playback(
             *s *= gain;
         }
     }
+    // Optional WAV dump (settings: tx_save_wav). We write the
+    // *post-processing* signal — what actually goes to the sound card
+    // / Pluto — so reopening the file in Audacity reproduces the on-air
+    // audio exactly. Best-effort: errors get logged, never abort the TX.
+    if !wav_path.is_empty() {
+        write_tx_wav(&wav_path, &samples);
+    }
     let total_samples = samples.len();
 
     // PTT: switch to TX BEFORE opening the audio stream, then wait
@@ -542,7 +592,15 @@ fn run_playback(
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
     }
 
-    let handle = match CpalSink.play_buffer(device_name, AUDIO_RATE, samples) {
+    // The Tauri layer resolved `tx_sink` upfront (Pluto SampleSink for a
+    // composite SDR device name, or CpalSink for a plain cpal name). Both
+    // implementations return `modem_io::PlaybackHandle`, so the polling
+    // loop below is uniform — one trait dispatch on `play_buffer`, then
+    // direct method calls on the handle. The `device_name` arg is
+    // ignored by the Pluto adapter (it already knows its libiio URI from
+    // the SdrConfig that built the sink) but kept for the cpal sink
+    // which still needs it for device lookup.
+    let handle = match tx_sink.play_buffer(device_name, AUDIO_RATE, samples) {
         Ok(h) => h,
         Err(e) => {
             if ptt_engaged {

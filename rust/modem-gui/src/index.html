@@ -37,7 +37,9 @@
         <button id="btn-start" disabled>Démarrer</button>
         <button id="btn-stop" disabled>Arrêter</button>
         <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
-        <span id="rx-device-label" class="rx-device-label" title="Carte son sélectionnée dans les Paramètres">—</span>
+        <button id="btn-play-wav" class="btn-raw" title="Lire un fichier WAV 48 kHz mono à la place du flux audio">▶ Lire WAV</button>
+        <input type="file" id="rx-wav-input" accept=".wav,audio/wav,audio/x-wav" hidden>
+        <span id="rx-device-label" class="rx-device-label" title="Périphérique sélectionné dans les Paramètres">—</span>
       </div>
       <div class="rx-force-bar" id="rx-force-bar" hidden>
         <label>
@@ -277,7 +279,7 @@
       <div class="settings-form">
         <div id="settings-rx-warn" class="settings-warn" hidden>
           <span class="settings-warn-text">
-            ⚠ Le RX est en cours. Pour modifier la carte son RX ou
+            ⚠ Le RX est en cours. Pour modifier le périphérique RX ou
             la désemphase, il faut d'abord arrêter la réception.
           </span>
           <button type="button" id="settings-stop-rx-btn">Arrêter le RX</button>
@@ -288,7 +290,7 @@
           <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
         <fieldset>
-          <legend>Carte son réception (RX)</legend>
+          <legend>Périphérique réception (RX)</legend>
           <select id="rx-device-select">
             <option>Chargement…</option>
           </select>
@@ -303,9 +305,18 @@
             filtré. À activer si le récepteur radio n'applique pas (ou
             insuffisamment) la désemphase.
           </p>
+          <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
+               in main.js fills this from `BackendCapabilities` of the
+               currently-selected SDR backend. Adding a new backend is
+               an `impl SdrBackend` + a cfg-feature line in
+               `sdr_registry.rs` — no HTML changes here. -->
+          <fieldset id="sdr-rx-panel" class="pluto-subgroup" hidden>
+            <div class="sdr-panel-rows" id="sdr-rx-rows"></div>
+            <p class="tx-hint" id="sdr-rx-hint" style="margin: 0.4rem 0 0;"></p>
+          </fieldset>
         </fieldset>
         <fieldset>
-          <legend>Carte son émission (TX)</legend>
+          <legend>Périphérique émission (TX)</legend>
           <select id="tx-device-select">
             <option>Chargement…</option>
           </select>
@@ -316,9 +327,26 @@
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
             Boost des aigus dès ~212 Hz (~+13 dB à 1 kHz, ~+18 dB à 2.7 kHz,
             plateau +20 dB). Le signal est re-normalisé après filtrage pour
-            ne pas écrêter la carte son. À activer si la chaîne audio TX
+            ne pas écrêter la sortie TX. À activer si la chaîne audio TX
             n'effectue pas elle-même la pré-emphase.
           </p>
+          <label class="ptt-row" style="margin-top: 0.5rem;">
+            <input type="checkbox" id="tx-save-wav-enabled">
+            Sauver le WAV émis dans tx_history/
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Écrit l'audio synthétisé (mono 48 kHz int16, post pré-emphase
+            et atténuation) à côté du fichier source archivé. Désactivé
+            par défaut.
+          </p>
+          <!-- Generic SDR TX panel — filled by `renderSdrPanel("tx")`.
+               Hidden when the selected TX device is RX-only or a cpal
+               soundcard; populated with freq / attenuation / deviation /
+               CTCSS rows when the backend's capabilities advertise them. -->
+          <fieldset id="sdr-tx-panel" class="pluto-subgroup" hidden>
+            <div class="sdr-panel-rows" id="sdr-tx-rows"></div>
+            <p class="tx-hint" id="sdr-tx-hint" style="margin: 0.4rem 0 0;"></p>
+          </fieldset>
         </fieldset>
         <fieldset>
           <legend>PTT (RTS/DTR sur port série)</legend>
@@ -451,7 +479,7 @@
           <fieldset>
             <legend>Atténuation appliquée à ma TX</legend>
             <p class="tx-hint">
-              Réduit le niveau du WAV transmis avant la carte son. Gain
+              Réduit le niveau du WAV transmis avant la sortie TX. Gain
               appliqué : <span id="att-gain-info">×1.000 (0 dB)</span>.
             </p>
             <div class="channel-att-row">
@@ -527,6 +555,51 @@
   <div id="image-lightbox" class="image-lightbox" tabindex="-1" hidden>
     <div class="image-lightbox-hint">a/q ou +/− ou molette : zoom (jusqu'à 8×) · 0 : ajuster · flèches ou drag : pan · Échap : fermer</div>
     <img id="image-lightbox-img" alt="" />
+  </div>
+  <!--
+    Native virtual keyboard for kiosk-mode text/number entry. Auto-opens
+    on focus when body has `.kiosk-mode`. The keypad rows are emitted
+    dynamically by `setupVirtKeyboard()` so the same DOM serves the
+    QWERTY alpha layout, the symbols layout (?123), and the numeric pad
+    that frequency / gain inputs use. Trigger logic + key handlers live
+    in main.js (search "virtKeyboard").
+  -->
+  <!--
+    Touch-friendly select picker for kiosk mode. The native WebKitGTK
+    `<select>` popup tops out at ~5-6 visible rows on the 480 px Pi
+    DSI screen, hiding the experimental profiles at the bottom of
+    `tx-mode` / `rx-forced-profile` (cf. setupSelectPicker in main.js).
+    On kiosk we intercept the open and present this fullscreen list
+    instead — same options, big tap targets, scrollable.
+  -->
+  <div id="select-picker-modal" class="select-picker-modal" hidden>
+    <div class="select-picker-panel">
+      <div class="select-picker-header">
+        <span class="select-picker-label" id="select-picker-label">—</span>
+        <span class="select-picker-close" id="select-picker-cancel" title="Annuler">✕</span>
+      </div>
+      <div class="select-picker-list" id="select-picker-list">
+        <!-- Rows injected by openSelectPicker(). -->
+      </div>
+    </div>
+  </div>
+  <div id="virt-keyboard-modal" class="virt-keyboard-modal" hidden>
+    <div class="virt-kb-panel">
+      <div class="virt-kb-header">
+        <span class="virt-kb-label" id="virt-kb-label">—</span>
+        <span class="virt-kb-close" id="virt-kb-cancel" title="Annuler">✕</span>
+      </div>
+      <div class="virt-kb-display">
+        <span id="virt-kb-value">&nbsp;</span><span class="virt-kb-caret">|</span>
+      </div>
+      <div class="virt-kb-rows" id="virt-kb-rows">
+        <!-- Rows injected by setupVirtKeyboard(). -->
+      </div>
+      <div class="virt-kb-actions">
+        <button type="button" id="virt-kb-cancel-btn">Annuler</button>
+        <button type="button" id="virt-kb-ok">Valider</button>
+      </div>
+    </div>
   </div>
   <script type="module" src="main.js"></script>
 </body>

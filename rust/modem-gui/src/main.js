@@ -247,12 +247,24 @@ function showCurrentFile(payload) {
   const info = document.getElementById("current-info");
   const wrap = document.getElementById("current-image-wrap");
   const mime = MIME_TYPES[payload.mime_type] || "application/octet-stream";
+  // σ² shown in the file panel is the running mean over every decode
+  // tick that contributed to the session (data-symbol residuals only,
+  // pilots/preamble excluded). We label it as such and surface the
+  // implied SNR in dB. Falls back to the legacy single-window σ² if
+  // the worker isn't emitting the new field yet.
+  const sigAvg = Number.isFinite(payload.sigma2_data_avg)
+    ? payload.sigma2_data_avg
+    : payload.sigma2;
+  const sigStr = Number.isFinite(sigAvg) ? sigAvg.toFixed(4) : "—";
+  const snrStr = Number.isFinite(sigAvg) && sigAvg > 0
+    ? `${(-10 * Math.log10(sigAvg)).toFixed(1)} dB`
+    : "— dB";
   info.innerHTML =
     `<strong>De :</strong> ${payload.callsign || "?"} · ` +
     `<strong>Nom :</strong> ${payload.filename} · ` +
     `<strong>Taille :</strong> ${payload.size} o · ` +
     `<strong>MIME :</strong> ${mime} · ` +
-    `<strong>σ² :</strong> ${payload.sigma2.toFixed(4)} · ` +
+    `<strong>σ² moyen :</strong> ${sigStr} (${snrStr}) · ` +
     `<code>${payload.saved_path}</code>`;
   wrap.innerHTML = "";
   if (isImageMime(payload.mime_type)) {
@@ -538,6 +550,7 @@ let currentSettings = {
   ptt_dtr_tx_high: true,
   tx_attenuation_db: 0,
   tx_preemphasis_enabled: false,
+  tx_save_wav: false,
   rx_deemphasis_enabled: false,
   collector_url: "",
   tx_quality: 10,
@@ -590,19 +603,34 @@ function ensureOverlaySlots() {
   }
 }
 
-function populateDeviceSelect(selectId, devices, savedName) {
+/// Populate a device dropdown with cpal soundcards followed by every
+/// SDR backend's live devices. SDR entries are filtered by direction
+/// — backends with `tx_supported=false` don't appear on the TX list.
+/// Each `<option>` carries `data-backend="<id>"` (or `"audio"` for
+/// cpal); `renderSdrPanel` reads that attribute to know which
+/// capabilities to render.
+///
+/// `backendDevices` is a `Map<backend_id, DeviceDescriptor[]>`
+/// produced by parallel `list_sdr_devices` calls in `loadDevices`.
+function populateDeviceSelect(selectId, devices, savedName, backendDevices, direction) {
   const select = document.getElementById(selectId);
   if (!select) return null;
   select.innerHTML = "";
-  if (!devices || devices.length === 0) {
+  const audio = devices || [];
+  const sdrCount = (() => {
+    let n = 0;
+    for (const [, devs] of backendDevices || []) n += (devs || []).length;
+    return n;
+  })();
+  if (audio.length === 0 && sdrCount === 0) {
     const opt = document.createElement("option");
-    opt.textContent = "aucune carte détectée";
+    opt.textContent = "aucun périphérique détecté";
     opt.value = "";
     select.appendChild(opt);
     return null;
   }
   let preferred = null;
-  for (const dev of devices) {
+  for (const dev of audio) {
     const opt = document.createElement("option");
     opt.value = dev.name;
     const range = dev.max_sample_rate > 0
@@ -613,17 +641,730 @@ function populateDeviceSelect(selectId, devices, savedName) {
     const tagErr = dev.error ? ` [${dev.error}]` : "";
     opt.textContent = `${dev.friendly_name} — ${range}${tag48}${tagDef}${tagErr}`;
     opt.dataset.supports48k = dev.supports_48k ? "1" : "0";
+    opt.dataset.backend = "audio";
     select.appendChild(opt);
     if (preferred === null && dev.supports_48k) preferred = dev;
     if (dev.is_default && dev.supports_48k) preferred = dev;
   }
-  // Priority: saved value if still available, otherwise the preferred one.
-  if (savedName && devices.some(d => d.name === savedName)) {
+  for (const [backendId, devs] of backendDevices || []) {
+    const info = sdrBackends.get(backendId);
+    if (!info) continue;
+    const supported = direction === "rx" ? info.capabilities.rx_supported : info.capabilities.tx_supported;
+    if (!supported) continue;
+    for (const dev of devs) {
+      const opt = document.createElement("option");
+      opt.value = dev.composite_name;
+      opt.textContent = `${dev.friendly_name} ✓48k [SDR]`;
+      opt.dataset.supports48k = "1";
+      opt.dataset.backend = backendId;
+      select.appendChild(opt);
+    }
+  }
+  // Priority: saved value if still in the list, otherwise the preferred cpal entry.
+  let savedFound = false;
+  if (savedName) {
+    for (let i = 0; i < select.options.length; i++) {
+      if (select.options[i].value === savedName) { savedFound = true; break; }
+    }
+  }
+  if (savedFound) {
     select.value = savedName;
   } else if (preferred) {
     select.value = preferred.name;
   }
   return select.value || null;
+}
+
+// ─── SDR-agnostic panel rendering ────────────────────────────────
+//
+// Every per-backend control (frequency input min/max, AGC dropdown
+// options, antenna selector, gain row layout, feature checkboxes,
+// CTCSS tone picker, …) is built from `BackendCapabilities`
+// returned by the Tauri command `list_sdr_backends`. The frontend
+// has zero hardcoded knowledge of "Pluto" or "SDRplay" except for
+// the small whitelist in `buildBackendExtrasRow`.
+
+/// Cache of every compiled-in backend's static descriptor. Keyed by
+/// `id`; values are `{id, display_name, capabilities}` shipped from
+/// `sdr_registry::registered_backends`. Loaded once at startup.
+let sdrBackends = new Map();
+
+/// EIA standard CTCSS tones (39 values, in Hz). Mirror of
+/// `modem_sdr_dsp::ctcss_gen::EIA_CTCSS_TONES_HZ`. Used by every
+/// backend whose `capabilities.features.ctcss_tx === true`.
+const EIA_CTCSS_TONES_HZ = [
+  67.0, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8,
+  97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8,
+  136.5, 141.3, 146.2, 151.4, 156.7, 162.2, 167.9, 173.8, 179.9, 186.2,
+  192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3, 254.1,
+];
+
+async function loadSdrBackends() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    const backends = await invoke("list_sdr_backends");
+    sdrBackends = new Map(backends.map(b => [b.id, b]));
+  } catch (err) {
+    console.error("list_sdr_backends:", err);
+    sdrBackends = new Map();
+  }
+}
+
+/// Per-device capability cache keyed by composite name (e.g.
+/// "sdrplay:1500R76GR1"). Backends with multiple hardware variants
+/// (SDRplay: RSPduo / RSP1A / RSP1B / RSP1) ship per-device caps via
+/// the Tauri `get_sdr_device_capabilities` command — the antenna
+/// selector / tuner radio / bias-T checkbox / LNA-state range follow
+/// the actual hardware instead of the family lowest-common-denominator.
+/// Backends without per-device variants (Pluto, RTL-SDR) return their
+/// family caps unchanged — same JSON shape, same render path.
+const deviceCapsCache = new Map();
+let pendingCapsFetch = new Map();   // composite_name → Promise
+
+/// Resolve the right `capabilities` payload for a composite device
+/// name, fetching + caching on first miss. `null` while in-flight; the
+/// caller should re-render once `await`-resolved. Errors fall back to
+/// the family caps so the panel still renders something useful.
+async function resolveDeviceCaps(compositeName, backendId) {
+  if (!compositeName) return null;
+  if (deviceCapsCache.has(compositeName)) return deviceCapsCache.get(compositeName);
+  if (pendingCapsFetch.has(compositeName)) return pendingCapsFetch.get(compositeName);
+  if (!window.__TAURI__ || !window.__TAURI__.core) return null;
+  const { invoke } = window.__TAURI__.core;
+  const promise = (async () => {
+    try {
+      const caps = await invoke("get_sdr_device_capabilities", { compositeName });
+      deviceCapsCache.set(compositeName, caps);
+      return caps;
+    } catch (err) {
+      console.error("get_sdr_device_capabilities:", err);
+      const family = sdrBackends.get(backendId);
+      const fallback = family ? family.capabilities : null;
+      if (fallback) deviceCapsCache.set(compositeName, fallback);
+      return fallback;
+    } finally {
+      pendingCapsFetch.delete(compositeName);
+    }
+  })();
+  pendingCapsFetch.set(compositeName, promise);
+  return promise;
+}
+
+/// Kick off a `resolveDeviceCaps` for the currently-selected SDR on
+/// `<direction>-device-select`. Awaitable so the change listener can
+/// re-render once the IPC reply comes back. No-op for cpal entries
+/// or when nothing is selected.
+async function prefetchCapsForSelected(selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel || !sel.options[sel.selectedIndex]) return;
+  const opt = sel.options[sel.selectedIndex];
+  const backendId = opt.dataset && opt.dataset.backend;
+  if (!backendId || backendId === "audio") return;
+  await resolveDeviceCaps(sel.value, backendId);
+}
+
+/// Read the cached per-device caps for the currently-selected SDR on
+/// `<direction>-device-select`, falling back to the backend's family
+/// caps if nothing is cached yet (first render). Synchronous — the
+/// `change` listener is the one that triggers the async refresh.
+function getCapsForSelected(selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel || !sel.options[sel.selectedIndex]) return null;
+  const opt = sel.options[sel.selectedIndex];
+  const backendId = opt.dataset && opt.dataset.backend;
+  if (!backendId || backendId === "audio") return null;
+  const composite = sel.value;
+  const cached = composite ? deviceCapsCache.get(composite) : null;
+  if (cached) return cached;
+  const family = sdrBackends.get(backendId);
+  return family ? family.capabilities : null;
+}
+
+/// Read the `data-backend` attribute of the currently-selected
+/// option on a device dropdown. Returns the backend ID for SDR
+/// entries or `null` for cpal soundcard entries (which carry
+/// `data-backend = "audio"`).
+function getSelectedBackendId(selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel) return null;
+  const opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.dataset) return null;
+  const b = opt.dataset.backend;
+  return (b && b !== "audio") ? b : null;
+}
+
+/// Ensure `currentSettings.sdr_settings.backends[backendId]` exists,
+/// seeding from the per-backend defaults table (mirror of
+/// `default_sdr_config_for` in `settings.rs`) on first selection.
+function ensureBackendConfig(backendId) {
+  if (!currentSettings.sdr_settings) currentSettings.sdr_settings = { backends: {} };
+  if (!currentSettings.sdr_settings.backends) currentSettings.sdr_settings.backends = {};
+  let entry = currentSettings.sdr_settings.backends[backendId];
+  if (!entry) {
+    entry = { config: makeDefaultSdrConfig(backendId), freq_favorites: [] };
+    currentSettings.sdr_settings.backends[backendId] = entry;
+  }
+  if (!entry.config) entry.config = makeDefaultSdrConfig(backendId);
+  if (!entry.freq_favorites) entry.freq_favorites = [];
+  return entry.config;
+}
+
+function ensureBackendEntry(backendId) {
+  ensureBackendConfig(backendId);
+  return currentSettings.sdr_settings.backends[backendId];
+}
+
+function makeDefaultSdrConfig(backendId) {
+  if (backendId === "pluto") {
+    return {
+      backend_id: "pluto", device_id: "",
+      rx_freq_hz: 145_500_000, tx_freq_hz: 145_500_000,
+      gain: { kind: "agc_mode", id: "slow_attack" },
+      max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+      antenna: "",
+      bias_t: false, fm_notch: false, dab_notch: false,
+      ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+      rf_bandwidth_hz: 200_000,
+      backend_extras: { tx_attenuation_db: 30.0, prefer_low_rate: true },
+    };
+  }
+  if (backendId === "sdrplay") {
+    return {
+      backend_id: "sdrplay", device_id: "",
+      rx_freq_hz: 145_500_000, tx_freq_hz: 145_500_000,
+      gain: { kind: "manual", shape: "lna_plus_if", lna_state: 4, if_grdb: 40 },
+      max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+      antenna: "fifty",
+      bias_t: false, fm_notch: false, dab_notch: false,
+      ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+      rf_bandwidth_hz: null,
+      backend_extras: { tuner: "B", decimation: 4 },
+    };
+  }
+  return {
+    backend_id: backendId, device_id: "",
+    rx_freq_hz: 0, tx_freq_hz: 0,
+    gain: { kind: "manual", shape: "db", db: 0 },
+    max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+    antenna: "",
+    bias_t: false, fm_notch: false, dab_notch: false,
+    ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+    rf_bandwidth_hz: null,
+    backend_extras: {},
+  };
+}
+
+/// Build the SDR panel rows for a direction ("rx" or "tx") from the
+/// currently-selected device's backend capabilities. Hidden when
+/// the selection is a cpal card or an RX-only backend on the TX
+/// panel.
+function renderSdrPanel(direction) {
+  const panel = document.getElementById(`sdr-${direction}-panel`);
+  const rowsEl = document.getElementById(`sdr-${direction}-rows`);
+  const hintEl = document.getElementById(`sdr-${direction}-hint`);
+  if (!panel || !rowsEl) return;
+  const backendId = getSelectedBackendId(`${direction}-device-select`);
+  const info = backendId ? sdrBackends.get(backendId) : null;
+  if (!info) {
+    panel.hidden = true;
+    rowsEl.innerHTML = "";
+    if (hintEl) hintEl.textContent = "";
+    return;
+  }
+  // Prefer per-device caps when the backend has shipped them
+  // (SDRplay RSP1A vs RSP1 vs RSPduo render very different panels);
+  // fall back to family caps before the first device pick.
+  const caps = getCapsForSelected(`${direction}-device-select`) || info.capabilities;
+  const supported = direction === "rx" ? caps.rx_supported : caps.tx_supported;
+  if (!supported) {
+    panel.hidden = true;
+    rowsEl.innerHTML = "";
+    if (hintEl) hintEl.textContent = "";
+    return;
+  }
+  panel.hidden = false;
+  panel.dataset.backend = backendId;
+  const cfg = ensureBackendConfig(backendId);
+  rowsEl.innerHTML = "";
+  rowsEl.appendChild(buildFreqRow(direction, backendId, caps, cfg));
+  if (caps.agc_modes && caps.agc_modes.length > 0) {
+    rowsEl.appendChild(buildAgcRow(direction, backendId, caps, cfg));
+  }
+  rowsEl.appendChild(buildGainRow(direction, backendId, caps, cfg));
+  if (direction === "rx" && caps.antennas && caps.antennas.length > 0) {
+    rowsEl.appendChild(buildAntennaRow(backendId, caps, cfg));
+  }
+  if (hasFeatureToggles(caps)) {
+    rowsEl.appendChild(buildFeatureRow(direction, backendId, caps, cfg));
+  }
+  rowsEl.appendChild(buildDeviationRow(direction, backendId, cfg));
+  if (direction === "tx" && caps.features.ctcss_tx) {
+    rowsEl.appendChild(buildCtcssRow(backendId, cfg));
+  }
+  if (direction === "tx") {
+    rowsEl.appendChild(buildTxAttenuationRow(backendId, cfg));
+  }
+  rowsEl.appendChild(buildBackendExtrasRow(direction, backendId, caps, cfg));
+  if (hintEl) hintEl.textContent = "";
+}
+
+function refreshSdrPanels() {
+  renderSdrPanel("rx");
+  renderSdrPanel("tx");
+}
+
+function hasFeatureToggles(caps) {
+  const f = caps.features;
+  return !!(f && (f.bias_t || f.fm_notch || f.dab_notch));
+}
+
+function makeRow() {
+  const r = document.createElement("div");
+  r.className = "pluto-row";
+  return r;
+}
+function makeFieldLabel(text) {
+  const s = document.createElement("span");
+  s.className = "pluto-field-label";
+  s.textContent = text;
+  return s;
+}
+
+function buildFreqRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  const range = direction === "rx" ? caps.rx_freq_range_hz : caps.tx_freq_range_hz;
+  const minMhz = range ? (range[0] / 1e6) : 0.001;
+  const maxMhz = range ? (range[1] / 1e6) : 6000;
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  label.textContent = direction === "rx" ? "Fréquence RX (MHz) : " : "Fréquence TX (MHz) : ";
+  const input = document.createElement("input");
+  input.type = "number";
+  input.id = `sdr-${direction}-freq-${backendId}`;
+  input.step = "0.001";
+  input.min = String(minMhz);
+  input.max = String(maxMhz);
+  const fieldHz = direction === "rx" ? "rx_freq_hz" : "tx_freq_hz";
+  if (Number.isFinite(cfg[fieldHz]) && cfg[fieldHz] > 0) {
+    input.value = (cfg[fieldHz] / 1e6).toFixed(3);
+  }
+  input.dataset.sdrField = fieldHz;
+  input.dataset.sdrTransform = "mhz_to_hz";
+  input.dataset.backend = backendId;
+  input.addEventListener("change", onSdrFieldChange);
+  label.appendChild(input);
+  row.appendChild(label);
+  return row;
+}
+
+function buildAgcRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  label.textContent = "AGC : ";
+  const sel = document.createElement("select");
+  sel.id = `sdr-${direction}-agc-${backendId}`;
+  sel.dataset.backend = backendId;
+  for (const mode of caps.agc_modes) {
+    const opt = document.createElement("option");
+    opt.value = mode.id;
+    opt.textContent = mode.label;
+    opt.dataset.manual = mode.manual ? "1" : "0";
+    // Per-mode "AGC keeps LNA manual" hint — SDRplay's AGC loop
+    // only manages IF gRdB. Stashed on the option so buildGainRow
+    // can read it back without re-walking caps.
+    opt.dataset.keepsLna = mode.keeps_lna_manual ? "1" : "0";
+    sel.appendChild(opt);
+  }
+  const gain = cfg.gain || {};
+  if (gain.kind === "agc_mode" && gain.id) {
+    sel.value = gain.id;
+  } else if (gain.kind === "manual") {
+    const m = caps.agc_modes.find(x => x.manual);
+    if (m) sel.value = m.id;
+  }
+  sel.addEventListener("change", () => {
+    const opt = sel.options[sel.selectedIndex];
+    const isManual = opt && opt.dataset.manual === "1";
+    if (isManual) {
+      cfg.gain = manualGainFromShape(caps.manual_gain, cfg.gain);
+    } else {
+      // Carry the LNA state across the manual→AGC transition so
+      // SDRplay backends that keep the LNA operator-controlled
+      // (`keeps_lna_manual`) reuse the user's setpoint instead of
+      // snapping back to the mid-band default. Pluto / DbContinuous
+      // backends ignore the field anyway.
+      const lna = readLnaStateFromGain(cfg.gain);
+      cfg.gain = lna != null
+        ? { kind: "agc_mode", id: sel.value, lna_state: lna }
+        : { kind: "agc_mode", id: sel.value };
+    }
+    persistSettings();
+    refreshSdrPanels();   // re-render so the gain row's enable/disable matches.
+  });
+  label.appendChild(sel);
+  row.appendChild(label);
+  return row;
+}
+
+/// Pull the LNA state out of either gain shape — the manual
+/// `lna_plus_if` payload, or the AGC variant's `lna_state` overlay.
+/// Returns `null` when the current gain has no LNA dimension (e.g.
+/// continuous-dB Pluto config).
+function readLnaStateFromGain(gain) {
+  if (!gain) return null;
+  if (gain.kind === "manual" && gain.shape === "lna_plus_if" && Number.isFinite(gain.lna_state)) {
+    return gain.lna_state;
+  }
+  if (gain.kind === "agc_mode" && Number.isFinite(gain.lna_state)) {
+    return gain.lna_state;
+  }
+  return null;
+}
+
+/// True when the active AGC mode advertises `keeps_lna_manual`.
+/// Used by `buildGainRow` to decide whether the LNA `<input>`
+/// should stay enabled while AGC is on.
+function agcModeKeepsLnaManual(caps, cfg) {
+  if (!cfg.gain || cfg.gain.kind !== "agc_mode") return false;
+  const mode = (caps.agc_modes || []).find(m => m.id === cfg.gain.id);
+  return !!(mode && mode.keeps_lna_manual);
+}
+
+function manualGainFromShape(shape, current) {
+  if (current && current.kind === "manual") {
+    if (shape && shape.DbContinuous && current.shape === "db") return current;
+    if (shape && shape.LnaPlusIf && current.shape === "lna_plus_if") return current;
+    if (shape && shape.DbDiscrete && current.shape === "discrete") return current;
+  }
+  if (shape && shape.DbContinuous) return { kind: "manual", shape: "db", db: 0 };
+  if (shape && shape.LnaPlusIf) {
+    // Carry the LNA state across the AGC→manual transition: SDRplay's
+    // AGC mode keeps `lna_state` operator-controlled, so flipping back
+    // to "Manuel (gain fixe)" should preserve it instead of snapping to
+    // the mid-band default. IF gRdB starts back at 40 either way (the
+    // daemon was managing it under AGC, we don't have a "last value").
+    const lna = readLnaStateFromGain(current);
+    return {
+      kind: "manual",
+      shape: "lna_plus_if",
+      lna_state: lna != null ? lna : 4,
+      if_grdb: 40,
+    };
+  }
+  if (shape && shape.DbDiscrete) return { kind: "manual", shape: "discrete", step_idx: 0 };
+  return { kind: "manual", shape: "db", db: 0 };
+}
+
+function buildGainRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  const shape = caps.manual_gain;
+  const isAgc = !!(cfg.gain && cfg.gain.kind === "agc_mode");
+  // For the LnaPlusIf shape (SDRplay), the LNA-state input stays
+  // editable under AGC iff the active AGC mode advertises
+  // `keeps_lna_manual`. The IF gRdB input is always daemon-managed
+  // under AGC (only `disable` re-enables it via `manual: true`).
+  const lnaStaysManual = isAgc && agcModeKeepsLnaManual(caps, cfg);
+  if (shape && shape.DbContinuous) {
+    const r = shape.DbContinuous;
+    const label = document.createElement("label");
+    label.className = "pluto-field";
+    label.textContent = direction === "rx" ? "Gain RX (dB) : " : "Gain TX (dB) : ";
+    const input = document.createElement("input");
+    input.type = "number";
+    input.id = `sdr-${direction}-gain-db-${backendId}`;
+    input.min = String(r.min_db); input.max = String(r.max_db); input.step = String(r.step_db);
+    input.disabled = isAgc;
+    if (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "db") input.value = String(cfg.gain.db);
+    input.dataset.sdrField = "gain.db";
+    input.dataset.sdrTransform = "manual_db";
+    input.dataset.backend = backendId;
+    input.addEventListener("change", onSdrFieldChange);
+    label.appendChild(input);
+    row.appendChild(label);
+  } else if (shape && shape.LnaPlusIf) {
+    const r = shape.LnaPlusIf;
+    const lnaLabel = document.createElement("label");
+    lnaLabel.className = "pluto-field";
+    lnaLabel.textContent = "LNA state : ";
+    const lnaInput = document.createElement("input");
+    lnaInput.type = "number";
+    lnaInput.id = `sdr-${direction}-gain-lna-${backendId}`;
+    lnaInput.min = "0"; lnaInput.max = String(r.lna_states - 1); lnaInput.step = "1";
+    lnaInput.disabled = isAgc && !lnaStaysManual;
+    // Populate from manual.lna_state OR agc_mode.lna_state — both
+    // shapes carry the operator's setpoint (cf. `readLnaStateFromGain`).
+    const lnaCurrent = readLnaStateFromGain(cfg.gain);
+    if (lnaCurrent != null) lnaInput.value = String(lnaCurrent);
+    lnaInput.dataset.sdrField = "gain.lna_state";
+    lnaInput.dataset.sdrTransform = "manual_lna";
+    lnaInput.dataset.backend = backendId;
+    lnaInput.addEventListener("change", onSdrFieldChange);
+    lnaLabel.appendChild(lnaInput);
+    row.appendChild(lnaLabel);
+
+    const ifLabel = document.createElement("label");
+    ifLabel.className = "pluto-field";
+    ifLabel.textContent = "IF gRdB : ";
+    const ifInput = document.createElement("input");
+    ifInput.type = "number";
+    ifInput.id = `sdr-${direction}-gain-if-${backendId}`;
+    ifInput.min = String(r.if_grdb_range[0]); ifInput.max = String(r.if_grdb_range[1]); ifInput.step = String(r.if_grdb_step);
+    ifInput.disabled = isAgc;
+    if (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if") ifInput.value = String(cfg.gain.if_grdb);
+    ifInput.dataset.sdrField = "gain.if_grdb";
+    ifInput.dataset.sdrTransform = "manual_if";
+    ifInput.dataset.backend = backendId;
+    ifInput.addEventListener("change", onSdrFieldChange);
+    ifLabel.appendChild(ifInput);
+    row.appendChild(ifLabel);
+  }
+  return row;
+}
+
+function buildAntennaRow(backendId, caps, cfg) {
+  const row = makeRow();
+  row.appendChild(makeFieldLabel("Port antenne :"));
+  const sel = document.createElement("select");
+  sel.id = `sdr-rx-antenna-${backendId}`;
+  sel.dataset.sdrField = "antenna";
+  sel.dataset.sdrTransform = "string";
+  sel.dataset.backend = backendId;
+  for (const a of caps.antennas) {
+    const opt = document.createElement("option");
+    opt.value = a.id;
+    opt.textContent = a.label;
+    sel.appendChild(opt);
+  }
+  if (cfg.antenna) sel.value = cfg.antenna;
+  sel.addEventListener("change", onSdrFieldChange);
+  row.appendChild(sel);
+  return row;
+}
+
+function buildFeatureRow(direction, backendId, caps, cfg) {
+  const row = makeRow();
+  if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", "Bias-T (+5 V vers préampli)", !!cfg.bias_t));
+  if (caps.features.fm_notch) row.appendChild(makeCheckbox(backendId, "fm_notch", "Filtre rejet FM (88-108 MHz)", !!cfg.fm_notch));
+  if (caps.features.dab_notch) row.appendChild(makeCheckbox(backendId, "dab_notch", "Filtre rejet DAB (174-240 MHz)", !!cfg.dab_notch));
+  return row;
+}
+
+function makeCheckbox(backendId, fieldName, labelText, checked) {
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  const cb = document.createElement("input");
+  cb.type = "checkbox"; cb.checked = checked;
+  cb.dataset.sdrField = fieldName;
+  cb.dataset.sdrTransform = "bool";
+  cb.dataset.backend = backendId;
+  cb.addEventListener("change", onSdrFieldChange);
+  label.appendChild(cb);
+  label.appendChild(document.createTextNode(" " + labelText));
+  return label;
+}
+
+function buildDeviationRow(direction, backendId, cfg) {
+  const row = makeRow();
+  row.appendChild(makeFieldLabel(direction === "rx" ? "Déviation RX :" : "Déviation TX :"));
+  const fieldHz = direction === "rx" ? "max_deviation_hz" : "tx_deviation_hz";
+  const cur = cfg[fieldHz] != null ? cfg[fieldHz] : 5000;
+  for (const v of [5000, 2500]) {
+    const label = document.createElement("label");
+    label.className = "pluto-field";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = `sdr-${direction}-dev-${backendId}`;
+    radio.value = String(v);
+    radio.checked = (Math.round(cur) === v);
+    radio.dataset.sdrField = fieldHz;
+    radio.dataset.sdrTransform = "float";
+    radio.dataset.backend = backendId;
+    radio.addEventListener("change", onSdrFieldChange);
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(v === 5000 ? " 5 kHz" : " 2.5 kHz"));
+    row.appendChild(label);
+  }
+  return row;
+}
+
+function buildCtcssRow(backendId, cfg) {
+  const row = makeRow();
+  const cbLabel = document.createElement("label");
+  cbLabel.className = "pluto-field";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = (cfg.ctcss_freq_hz > 0);
+  cb.dataset.backend = backendId;
+  cbLabel.appendChild(cb);
+  cbLabel.appendChild(document.createTextNode(" CTCSS (squelch relais)"));
+  row.appendChild(cbLabel);
+  const toneLabel = document.createElement("label");
+  toneLabel.className = "pluto-field";
+  toneLabel.textContent = "Tonalité : ";
+  const sel = document.createElement("select");
+  sel.id = `sdr-tx-ctcss-tone-${backendId}`;
+  for (const f of EIA_CTCSS_TONES_HZ) {
+    const opt = document.createElement("option");
+    opt.value = String(f);
+    opt.textContent = `${f.toFixed(1)} Hz`;
+    sel.appendChild(opt);
+  }
+  const cur = cfg.ctcss_freq_hz > 0 ? cfg.ctcss_freq_hz : 88.5;
+  const closest = EIA_CTCSS_TONES_HZ.reduce(
+    (best, t) => (Math.abs(t - cur) < Math.abs(best - cur) ? t : best),
+    EIA_CTCSS_TONES_HZ[0]);
+  sel.value = String(closest);
+  sel.addEventListener("change", () => {
+    if (cb.checked) {
+      cfg.ctcss_freq_hz = parseFloat(sel.value);
+      persistSettings();
+    }
+  });
+  cb.addEventListener("change", () => {
+    cfg.ctcss_freq_hz = cb.checked ? parseFloat(sel.value) : 0.0;
+    persistSettings();
+  });
+  toneLabel.appendChild(sel);
+  row.appendChild(toneLabel);
+  return row;
+}
+
+function buildTxAttenuationRow(backendId, cfg) {
+  const row = makeRow();
+  const label = document.createElement("label");
+  label.className = "pluto-field";
+  label.textContent = "Atténuation TX (dB) : ";
+  const input = document.createElement("input");
+  input.type = "number";
+  input.id = `sdr-tx-att-${backendId}`;
+  input.min = "0"; input.max = "89.75"; input.step = "0.25";
+  const cur = (cfg.backend_extras && cfg.backend_extras.tx_attenuation_db != null)
+    ? cfg.backend_extras.tx_attenuation_db : 30.0;
+  input.value = String(cur);
+  input.dataset.sdrField = "backend_extras.tx_attenuation_db";
+  input.dataset.sdrTransform = "extras_float";
+  input.dataset.backend = backendId;
+  input.addEventListener("change", onSdrFieldChange);
+  label.appendChild(input);
+  row.appendChild(label);
+  return row;
+}
+
+function buildBackendExtrasRow(direction, backendId, caps, cfg) {
+  // The tuner radio is now driven by the backend's caps —
+  // multi-tuner devices (RSPduo) populate `tuner_options`;
+  // single-tuner ones (RSP1x, Pluto) leave it empty so the row
+  // disappears entirely. Other backend_extras keys
+  // (decimation, tx_attenuation_db, …) stay managed under the hood
+  // via `makeDefaultSdrConfig`.
+  const row = makeRow();
+  const tunerOptions = (caps && caps.tuner_options) || [];
+  if (direction === "rx" && tunerOptions.length > 0) {
+    row.appendChild(makeFieldLabel("Tuner :"));
+    const persisted = cfg.backend_extras && cfg.backend_extras.tuner;
+    // Prefer the persisted value when it matches one of the offered
+    // IDs; otherwise default to the first option (the GUI used to
+    // hardcode "B" for RSPduo — same end result via the order in
+    // `BackendCapabilities::tuner_options`).
+    const cur = tunerOptions.some(o => o.id === persisted)
+      ? persisted
+      : tunerOptions[0].id;
+    for (const opt of tunerOptions) {
+      const label = document.createElement("label");
+      label.className = "pluto-field";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = `sdr-extras-tuner-${backendId}`;
+      radio.value = opt.id;
+      radio.checked = (cur === opt.id);
+      radio.dataset.sdrField = "backend_extras.tuner";
+      radio.dataset.sdrTransform = "extras_string";
+      radio.dataset.backend = backendId;
+      radio.addEventListener("change", onSdrFieldChange);
+      label.appendChild(radio);
+      label.appendChild(document.createTextNode(` ${opt.label}`));
+      row.appendChild(label);
+    }
+  }
+  return row;
+}
+
+/// Generic change handler: read `data-sdr-field` + `-transform`,
+/// write the parsed value back into the per-backend config and
+/// persist immediately.
+function onSdrFieldChange(evt) {
+  const el = evt.currentTarget;
+  const backendId = el.dataset.backend;
+  if (!backendId) return;
+  const cfg = ensureBackendConfig(backendId);
+  applySdrFieldUpdate(cfg, el.dataset.sdrField, el.dataset.sdrTransform, el);
+  persistSettings();
+}
+
+function applySdrFieldUpdate(cfg, field, transform, el) {
+  switch (transform) {
+    case "mhz_to_hz": {
+      const m = parseFloat(el.value);
+      if (Number.isFinite(m) && m > 0) cfg[field] = Math.round(m * 1e6);
+      break;
+    }
+    case "string": cfg[field] = el.value; break;
+    case "bool":   cfg[field] = !!el.checked; break;
+    case "float": {
+      const v = parseFloat(el.value);
+      if (Number.isFinite(v)) cfg[field] = v;
+      break;
+    }
+    case "manual_db": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) cfg.gain = { kind: "manual", shape: "db", db: v };
+      break;
+    }
+    case "manual_lna": {
+      const v = parseInt(el.value, 10);
+      if (!Number.isFinite(v)) break;
+      // When AGC is engaged AND the mode keeps LNA operator-controlled
+      // (SDRplay AGC), update the agc_mode variant's lna_state overlay
+      // in place — don't switch back to a `manual` payload, that would
+      // disengage the AGC. Otherwise the user is in pure manual mode
+      // and we just patch the LnaPlusIf payload like before.
+      if (cfg.gain && cfg.gain.kind === "agc_mode") {
+        cfg.gain = { ...cfg.gain, lna_state: v };
+      } else {
+        const cur = (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if")
+          ? cfg.gain : { kind: "manual", shape: "lna_plus_if", lna_state: 0, if_grdb: 40 };
+        cfg.gain = { ...cur, lna_state: v };
+      }
+      break;
+    }
+    case "manual_if": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) {
+        const cur = (cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "lna_plus_if")
+          ? cfg.gain : { kind: "manual", shape: "lna_plus_if", lna_state: 4, if_grdb: 40 };
+        cfg.gain = { ...cur, if_grdb: v };
+      }
+      break;
+    }
+    case "extras_float": {
+      const v = parseFloat(el.value);
+      const key = field.split(".")[1];
+      if (Number.isFinite(v)) {
+        if (!cfg.backend_extras) cfg.backend_extras = {};
+        cfg.backend_extras[key] = v;
+      }
+      break;
+    }
+    case "extras_string": {
+      const key = field.split(".")[1];
+      if (!cfg.backend_extras) cfg.backend_extras = {};
+      cfg.backend_extras[key] = el.value;
+      break;
+    }
+    default: break;
+  }
 }
 
 function refreshRxDeviceLabel() {
@@ -654,16 +1395,49 @@ async function loadDevices() {
   }
   const { invoke } = window.__TAURI__.core;
   try {
+    // cpal soundcard lists in parallel; per-backend SDR device lists
+    // come next (one Tauri call per registered backend, fanned out).
     const [rxDevices, txDevices] = await Promise.all([
       invoke("list_audio_devices"),
       invoke("list_output_audio_devices"),
     ]);
-    populateDeviceSelect("rx-device-select", rxDevices, currentSettings.rx_device);
-    populateDeviceSelect("tx-device-select", txDevices, currentSettings.tx_device);
+    const backendDevices = new Map();
+    const backendTags = [];
+    await Promise.all(
+      Array.from(sdrBackends.keys()).map(async (id) => {
+        try {
+          const list = await invoke("list_sdr_devices", { backendId: id });
+          backendDevices.set(id, list);
+          if (list.length > 0) {
+            const info = sdrBackends.get(id);
+            backendTags.push(` · ${list.length} ${info ? info.display_name : id}`);
+          }
+        } catch (err) {
+          console.warn(`list_sdr_devices(${id}):`, err);
+          backendDevices.set(id, []);
+        }
+      })
+    );
+    populateDeviceSelect(
+      "rx-device-select", rxDevices, currentSettings.rx_device, backendDevices, "rx",
+    );
+    populateDeviceSelect(
+      "tx-device-select", txDevices, currentSettings.tx_device, backendDevices, "tx",
+    );
     const n48 = rxDevices.filter(d => d.supports_48k).length;
-    status.textContent = `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX`;
+    status.textContent =
+      `${rxDevices.length} RX (${n48} @48k) · ${txDevices.length} TX${backendTags.join("")}`;
     refreshRxDeviceLabel();
     refreshStartButtonFromRx();
+    // First render uses family caps (cache is empty); fetch the
+    // per-device caps for whatever the persisted RX/TX devices are
+    // and re-render once they land. Cheap when the selection is a
+    // cpal soundcard — `prefetchCapsForSelected` no-ops for those.
+    await Promise.all([
+      prefetchCapsForSelected("rx-device-select"),
+      prefetchCapsForSelected("tx-device-select"),
+    ]);
+    refreshSdrPanels();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
@@ -682,7 +1456,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, rx_deemphasis_enabled: false, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -706,8 +1480,16 @@ async function loadSettings() {
   if (histMax) histMax.value = String(currentSettings.tx_history_max ?? 100);
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.checked = !!currentSettings.tx_preemphasis_enabled;
+  const saveWav = document.getElementById("tx-save-wav-enabled");
+  if (saveWav) saveWav.checked = !!currentSettings.tx_save_wav;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
+
+  // SDR controls are built on demand by `renderSdrPanel` (called
+  // from `loadDevices` once the dropdown selection is known). The
+  // per-backend config is kept in `currentSettings.sdr_settings.backends[id]`
+  // and surfaced through `data-sdr-field` inputs — no per-backend
+  // load block here.
   applyTxSettingsToUI();
 }
 
@@ -975,8 +1757,15 @@ async function persistSettings() {
   }
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) currentSettings.tx_preemphasis_enabled = !!preemph.checked;
+  const saveWav = document.getElementById("tx-save-wav-enabled");
+  if (saveWav) currentSettings.tx_save_wav = !!saveWav.checked;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
+
+  // SDR-specific config is mutated directly on
+  // `currentSettings.sdr_settings.backends[id].config` by the
+  // `data-sdr-field` listeners (`onSdrFieldChange`) before
+  // `persistSettings` runs — no per-backend reading block here.
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
@@ -999,17 +1788,36 @@ function setupSettingsTab() {
     call.addEventListener("blur", onCallsignChange);
   }
   if (rxSel) {
-    rxSel.addEventListener("change", () => {
+    rxSel.addEventListener("change", async () => {
       refreshRxDeviceLabel();
       refreshStartButtonFromRx();
+      // Re-render once with the (possibly stale) cached caps so the
+      // panel updates immediately, then again once the per-device
+      // caps come back over IPC. Backends without device-aware caps
+      // get a single round-trip that returns family caps — same
+      // visual result, slightly more invokes (acceptable: tens of µs).
+      refreshSdrPanels();
+      await prefetchCapsForSelected("rx-device-select");
+      refreshSdrPanels();
       persistSettings();
     });
   }
   if (txSel) {
-    txSel.addEventListener("change", persistSettings);
+    txSel.addEventListener("change", async () => {
+      refreshSdrPanels();
+      await prefetchCapsForSelected("tx-device-select");
+      refreshSdrPanels();
+      persistSettings();
+    });
   }
+  // SDR-specific inputs are wired up at row-build time inside
+  // `renderSdrPanel` (each `data-sdr-field` input gets an
+  // `onSdrFieldChange` listener that mutates the per-backend config
+  // and calls `persistSettings`). Nothing to register here.
   const preemph = document.getElementById("tx-preemphasis-enabled");
   if (preemph) preemph.addEventListener("change", persistSettings);
+  const saveWav = document.getElementById("tx-save-wav-enabled");
+  if (saveWav) saveWav.addEventListener("change", persistSettings);
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.addEventListener("change", persistSettings);
   const stopRxBtn = document.getElementById("settings-stop-rx-btn");
@@ -1136,6 +1944,77 @@ async function tryAutoStartCapture() {
   if (txStopBtn && !txStopBtn.disabled) return;
   if (startBtn.disabled) return;
   await startCapture();
+}
+
+// ─── WAV-file replay (offline RX from a recorded capture) ─────────
+//
+// The Rust side exposes `start_capture_from_wav` which spins up a
+// paced sender thread (500 ms batches at 48 kHz) feeding the same
+// `Receiver<Vec<f32>>` the rx_worker reads from cpal/Pluto. The UI
+// flow mirrors `startCapture` so the user gets the same
+// state-chip / progress / level-meter behaviour with a WAV source.
+function setupWavPlayback() {
+  const btn = document.getElementById("btn-play-wav");
+  const input = document.getElementById("rx-wav-input");
+  if (!btn || !input) return;
+  btn.addEventListener("click", () => {
+    // Reset value so re-picking the same file still fires `change`.
+    input.value = "";
+    input.click();
+  });
+  input.addEventListener("change", () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (file) startCaptureFromWav(file);
+  });
+  // Frontend echo of the pacer-finished event — flip the buttons back
+  // so the user knows the file finished playing without having to
+  // manually press Stop. The backend leaves the worker running for a
+  // few seconds so any in-flight decode finalises naturally.
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("wav_playback_done", () => {
+      logEvent("wav_playback_done", null);
+    });
+  }
+}
+
+async function startCaptureFromWav(file) {
+  const { invoke } = window.__TAURI__.core;
+  const status = document.getElementById("status");
+  // Refuse to start a WAV replay when a live RX is already in flight —
+  // the backend rejects it anyway, but this surfaces a clearer message
+  // and avoids spending seconds reading the file for nothing.
+  const stopBtn = document.getElementById("btn-stop");
+  if (stopBtn && !stopBtn.disabled) {
+    status.textContent = "arrêter d'abord la capture en cours";
+    status.style.color = "#ef5350";
+    return;
+  }
+  status.textContent = `chargement ${file.name}…`;
+  status.style.color = "#90caf9";
+  try {
+    const buf = await file.arrayBuffer();
+    // JSON-array IPC (same pattern as set_tx_source) — Tauri 2 doesn't
+    // wire raw-binary arguments by default in this codebase. For long
+    // captures (tens of MB) the transfer is the bottleneck; the user
+    // sees a "chargement" status while it happens.
+    const bytes = Array.from(new Uint8Array(buf));
+    const forced = !!currentSettings.rx_force_mode;
+    const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
+    await invoke("start_capture_from_wav", { args: { bytes, profile, forced } });
+    status.textContent = `lecture WAV : ${file.name}`;
+    status.style.color = "#ffb74d";
+    document.getElementById("btn-start").disabled = true;
+    document.getElementById("btn-stop").disabled = false;
+    const rxSel = document.getElementById("rx-device-select");
+    if (rxSel) rxSel.disabled = true;
+    refreshSettingsRxWarn();
+    logEvent("wav_playback_start", { file: file.name, profile, forced });
+  } catch (err) {
+    status.textContent = `erreur lecture WAV : ${err}`;
+    status.style.color = "#ef5350";
+    logEvent("wav_playback_error", { message: String(err) });
+  }
 }
 
 async function stopCapture() {
@@ -1580,6 +2459,11 @@ function updateV2Marker(payload) {
 }
 
 // ─────────────────────────────── Per-block progress + constellation state
+// `sigma2` here means the per-window data-symbol σ² (frame-only,
+// hard-decision residuals — what `result.sigma2_data` carries on the
+// Rust side). The pilot-residual σ² stays internal to the demod (LLR
+// scale) and is not surfaced to the operator. Field is kept named
+// `sigma2` because every consumer of `lastProgress` already expects it.
 let lastProgress = {
   bitmap: null,
   expected: 0,
@@ -1655,11 +2539,17 @@ function updateV2Progress(payload) {
   const bitmap = bm
     ? new Uint8Array(bm)
     : new Uint8Array(Math.ceil((payload.blocks_expected || 0) / 8));
+  // Prefer `sigma2_data` (frame-only, hard-decision residuals) when the
+  // worker provides it. Fall back to `sigma2` (pilot-residual) for
+  // older payloads so a partial rebuild doesn't blank the indicator.
+  const sigmaInst = Number.isFinite(payload.sigma2_data)
+    ? payload.sigma2_data
+    : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null);
   lastProgress = {
     bitmap,
     expected: payload.blocks_expected || 0,
     converged: payload.blocks_converged || 0,
-    sigma2: Number.isFinite(payload.sigma2) ? payload.sigma2 : null,
+    sigma2: sigmaInst,
   };
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
@@ -2254,6 +3144,14 @@ function refreshTxButtons() {
     btnTx.title = "";
   }
   btnTx.classList.toggle("tx-btn-warn", warn && !txState.txActive);
+  // Kiosk: WebKitGTK on the Pi 7" touchscreen turns the native
+  // title-based tooltip into a sticky bubble that doesn't auto-hide
+  // on tap-release. We suppress it here and show a JS-controlled
+  // toast (showKioskInfoToast) on TX press instead. Desktop hover
+  // tooltips are unaffected.
+  if (document.body.classList.contains("kiosk-mode")) {
+    btnTx.removeAttribute("title");
+  }
 }
 
 function txFormatBytes(n) {
@@ -2264,12 +3162,15 @@ function txFormatBytes(n) {
 }
 
 // TX button tooltip: duration, N emitted, K required, K threshold.
+// `dur` is `est.duration_s` (raw float seconds); we always format it
+// through fmtSeconds so the bubble shows M:SS (rounded to whole
+// seconds) instead of "18.453123…".
 function txButtonTitle(est, dur, longTx) {
   if (!est) return "";
   const base = longTx ? `transmission longue (> 2 min) — durée ` : `durée `;
   const k = est.k_source;
   const n = est.n_initial ?? est.total_blocks;
-  const parts = [`${base}${dur}, ${n} blocs émis`];
+  const parts = [`${base}${fmtSeconds(dur)}, ${n} blocs émis`];
   if (k != null && k !== n) {
     parts.push(`K=${k} nécessaires au décodage`);
   }
@@ -3028,12 +3929,50 @@ function setupTxTab() {
 }
 
 // ────────────────────────────────────────────── TX orchestration (RX↔TX)
+// Kiosk info toast — JS-controlled replacement for the native
+// title-based tooltip on the TX button. WebKitGTK on the Pi 7"
+// touchscreen keeps the native tooltip sticky on tap-release; we
+// own the timing here and auto-hide after `durationMs`. No-op
+// outside kiosk mode (desktop keeps the native hover tooltip).
+let kioskInfoToastTimer = null;
+function showKioskInfoToast(text, durationMs = 5000) {
+  if (!document.body.classList.contains("kiosk-mode")) return;
+  if (!text) return;
+  let el = document.getElementById("kiosk-info-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "kiosk-info-toast";
+    el.className = "kiosk-info-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  // Force reflow so the fade-in transition runs again on rapid
+  // re-show (e.g. user taps TX twice in a row).
+  void el.offsetWidth;
+  el.classList.add("show");
+  if (kioskInfoToastTimer) clearTimeout(kioskInfoToastTimer);
+  kioskInfoToastTimer = setTimeout(() => {
+    el.classList.remove("show");
+    kioskInfoToastTimer = null;
+  }, durationMs);
+}
+
 async function txStart() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   if (txState.txActive) return;
   if (!txState.estimate) {
     logEvent("tx_start_skipped", { reason: "pas d'estimation (compresse d'abord)" });
     return;
+  }
+  // Kiosk: show a transient info bubble (auto-hides after 5 s) with
+  // the same content the desktop hover tooltip carries. The "long
+  // transmission" wording uses the same threshold as refreshTxButtons
+  // (file vs image mode have distinct warn/hard limits).
+  {
+    const est = txState.estimate;
+    const dur = est.duration_s;
+    const warnSeconds = txState.fileMode ? TX_FILE_WARN_SECONDS : TX_WARN_SECONDS;
+    showKioskInfoToast(txButtonTitle(est, dur, dur > warnSeconds));
   }
   const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
@@ -3631,6 +4570,8 @@ function setupKioskMode() {
 
 async function init() {
   setupKioskMode();
+  setupSelectPicker();
+  setupVirtKeyboard();
   setupTabs();
   setupLightbox();
   setupTxTab();
@@ -3639,6 +4580,7 @@ async function init() {
   setupCaptureSubmitPanel();
   setupHistoryTab();
   await loadSettings();
+  await loadSdrBackends();
   applyOverlaysToUI();
   setupChannelTab();
   await loadDevices();
@@ -3655,6 +4597,7 @@ async function init() {
   document.getElementById("btn-start").addEventListener("click", startCapture);
   document.getElementById("btn-stop").addEventListener("click", stopCapture);
   document.getElementById("btn-raw").addEventListener("click", toggleRawRecording);
+  setupWavPlayback();
   window.addEventListener("resize", redrawAll);
   document
     .getElementById("btn-sessions-refresh")
@@ -3667,6 +4610,560 @@ async function init() {
   setInterval(refreshOverdriveChip, 200);
   // Auto-start RX capture if a device is configured.
   await tryAutoStartCapture();
+}
+
+// ─── Touch-friendly <select> picker (kiosk) ───────────────────────
+//
+// WebKitGTK on Wayland renders `<select>` as a native popup whose
+// height is capped to ~5-6 rows on the 800x480 Pi DSI panel. With
+// 10 entries in `tx-mode` / `rx-forced-profile` the bottom of the
+// list (where the experimental profiles live) is unreachable on a
+// touchscreen — the popup is scrollable in theory but the affordance
+// is invisible, so the user thinks the experimentals are gone.
+//
+// Fix: in kiosk mode we capture `mousedown` on every `<select>`
+// before the engine opens its popup, and present a fullscreen modal
+// instead — same options, ≥48 px tap targets, scroll obvious. Off
+// kiosk this stays dormant, so the desktop UX is untouched.
+//
+// Opt-out: `data-select-picker-skip="1"` on the `<select>`.
+
+const selectPicker = {
+  modal: null,
+  labelEl: null,
+  listEl: null,
+  closeEl: null,
+  target: null,
+};
+
+function setupSelectPicker() {
+  selectPicker.modal = document.getElementById("select-picker-modal");
+  selectPicker.labelEl = document.getElementById("select-picker-label");
+  selectPicker.listEl = document.getElementById("select-picker-list");
+  selectPicker.closeEl = document.getElementById("select-picker-cancel");
+  if (!selectPicker.modal) return;
+
+  // Capture phase — must run before WebKitGTK opens its native popup.
+  // Mousedown is the right hook: click is fired AFTER the native
+  // popup has already opened (and consumed the gesture on touch).
+  document.addEventListener("mousedown", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    let el = e.target;
+    if (el instanceof HTMLOptionElement) el = el.parentElement;
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled) return;
+    if (el.dataset.selectPickerSkip === "1") return;
+    if (selectPicker.modal.contains(el)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.blur();
+    openSelectPicker(el);
+  }, /*capture=*/true);
+
+  // Same hook on `keydown` Space/Enter, in case the select is
+  // reached by Tab (the kiosk has no keyboard, but the desktop devs
+  // can still keyboard-navigate).
+  document.addEventListener("keydown", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    if (e.key !== " " && e.key !== "Enter" && e.key !== "ArrowDown") return;
+    const el = e.target;
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled || el.dataset.selectPickerSkip === "1") return;
+    e.preventDefault();
+    openSelectPicker(el);
+  }, /*capture=*/true);
+
+  selectPicker.closeEl.addEventListener("click", closeSelectPicker);
+  selectPicker.modal.addEventListener("click", (e) => {
+    if (e.target === selectPicker.modal) closeSelectPicker();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (selectPicker.modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeSelectPicker();
+    }
+  });
+}
+
+function selectLabel(sel) {
+  // Surrounding <label>'s text minus the <select>'s current option text,
+  // falls back to <legend>, then to the id. Matches the virtKb pattern.
+  const lab = sel.closest("label");
+  if (lab) {
+    const txt = (lab.textContent || "")
+      .replace(sel.options[sel.selectedIndex]?.textContent || "", "")
+      .trim();
+    if (txt) return txt.replace(/\s+/g, " ").slice(0, 80);
+  }
+  const fs = sel.closest("fieldset");
+  const lg = fs && fs.querySelector("legend");
+  if (lg && lg.textContent) return lg.textContent.trim().slice(0, 80);
+  return sel.id || "Choisir";
+}
+
+function openSelectPicker(sel) {
+  selectPicker.target = sel;
+  selectPicker.labelEl.textContent = selectLabel(sel);
+  const list = selectPicker.listEl;
+  list.innerHTML = "";
+  for (const opt of sel.options) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "select-picker-row";
+    if (opt.classList.contains("experimental-option")) {
+      row.classList.add("select-picker-experimental");
+    }
+    if (opt.value === sel.value) {
+      row.classList.add("select-picker-current");
+    }
+    if (opt.disabled) row.classList.add("select-picker-disabled");
+    row.dataset.value = opt.value;
+    row.textContent = opt.textContent;
+    if (opt.disabled) row.disabled = true;
+    row.addEventListener("click", () => {
+      const target = selectPicker.target;
+      if (target && target.value !== opt.value) {
+        target.value = opt.value;
+        // Notify the rest of the app exactly as the native popup does.
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      closeSelectPicker();
+    });
+    list.appendChild(row);
+  }
+  selectPicker.modal.hidden = false;
+  // Scroll the current selection into view so opening on a long list
+  // (10 modem profiles, 39 CTCSS tones) doesn't always start from top.
+  const cur = list.querySelector(".select-picker-current");
+  if (cur) cur.scrollIntoView({ block: "center" });
+}
+
+function closeSelectPicker() {
+  if (!selectPicker.modal || selectPicker.modal.hidden) return;
+  selectPicker.modal.hidden = true;
+  selectPicker.target = null;
+  selectPicker.listEl.innerHTML = "";
+}
+
+// ─── Native virtual keyboard (kiosk text/number entry) ────────────
+//
+// In kiosk mode (no physical keyboard on the 7" Pi panel) text/number
+// inputs become impossible to fill: the user can't enter their callsign,
+// a filename, a Pluto frequency offset, etc. This component is a pure
+// in-app touch keyboard — no system dependency (no squeekboard / wvkbd /
+// onboard) — that auto-opens when an `<input>` is focused while
+// `body.kiosk-mode` is set. Outside kiosk it stays dormant: a physical
+// keyboard typing into the input works like before.
+//
+// Layouts:
+//   * `alpha`   QWERTY uppercase + lower toggle, with shift, space,
+//               and a `?123` key to switch to symbols/numerics.
+//   * `symbols` digits, common punctuation, `ABC` to come back.
+//   * `numeric` 0-9 + decimal point + sign for `<input type="number">`.
+//
+// Special-cased by input id:
+//   * `callsign-input` opens caps-locked, ASCII letters + digits only.
+//
+// On Valider: write `virtKb.draft` to `target.value`, dispatch `input`
+// + `change`, close. On Annuler / outside-tap / Esc: close, no save.
+const VIRT_KB_QWERTY_ROWS = [
+  ["q","w","e","r","t","y","u","i","o","p"],
+  ["a","s","d","f","g","h","j","k","l"],
+  ["z","x","c","v","b","n","m"],
+];
+const VIRT_KB_SYMBOLS_ROWS = [
+  ["1","2","3","4","5","6","7","8","9","0"],
+  ["@","#","_","-",".",",","/",":","="],
+  ["+","*","(",")","'","\"","?","!","%"],
+];
+const VIRT_KB_NUMERIC_ROWS = [
+  ["1","2","3"],
+  ["4","5","6"],
+  ["7","8","9"],
+  ["-",".","0"],
+];
+
+const virtKb = {
+  modal: null,
+  rowsEl: null,
+  displayEl: null,
+  labelEl: null,
+  okBtn: null,
+  cancelBtn: null,
+  closeBtn: null,
+  // Live state — reset on every open():
+  target: null,        // the original <input> element
+  draft: "",           // editable string buffer
+  layout: "alpha",     // "alpha" | "symbols" | "numeric"
+  shift: false,        // true = uppercase letters in alpha mode
+  capsLock: false,     // sticky shift (callsign field auto-engages)
+};
+
+function setupVirtKeyboard() {
+  virtKb.modal = document.getElementById("virt-keyboard-modal");
+  virtKb.rowsEl = document.getElementById("virt-kb-rows");
+  virtKb.displayEl = document.getElementById("virt-kb-value");
+  virtKb.labelEl = document.getElementById("virt-kb-label");
+  virtKb.okBtn = document.getElementById("virt-kb-ok");
+  virtKb.cancelBtn = document.getElementById("virt-kb-cancel-btn");
+  virtKb.closeBtn = document.getElementById("virt-kb-cancel");
+  if (!virtKb.modal) return;
+
+  // Single delegated focusin handler (cheap, no re-attach when DOM
+  // changes). Filters by input.type so checkboxes / radios / file pickers
+  // don't trigger the keyboard. Hidden inputs in modals (e.g. file
+  // picker) are skipped via `:not([hidden])`.
+  document.addEventListener("focusin", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement)) return;
+    if (t.dataset.virtKbSkip === "1") return;
+    const type = (t.type || "text").toLowerCase();
+    if (type !== "text" && type !== "number" && type !== "search" && type !== "tel" && type !== "url") return;
+    // Already inside the keyboard? avoid recursion (the display is a
+    // <span>, not an input, but defensive).
+    if (virtKb.modal.contains(t)) return;
+    // Unfocus the input so the OS soft-keyboard (if any) doesn't try to
+    // appear underneath. We keep a reference for the commit.
+    t.blur();
+    openVirtKeyboard(t);
+  });
+
+  // OK / Cancel / outside-tap / Esc.
+  virtKb.okBtn.addEventListener("click", () => closeVirtKeyboard(true));
+  virtKb.cancelBtn.addEventListener("click", () => closeVirtKeyboard(false));
+  virtKb.closeBtn.addEventListener("click", () => closeVirtKeyboard(false));
+  virtKb.modal.addEventListener("click", (e) => {
+    if (e.target === virtKb.modal) closeVirtKeyboard(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (virtKb.modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeVirtKeyboard(false);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      closeVirtKeyboard(true);
+    }
+  });
+}
+
+function openVirtKeyboard(input) {
+  virtKb.target = input;
+  virtKb.draft = input.value || "";
+  // Pick layout from input.type and id.
+  const type = (input.type || "text").toLowerCase();
+  if (type === "number") {
+    virtKb.layout = "numeric";
+    virtKb.shift = false;
+    virtKb.capsLock = false;
+  } else {
+    virtKb.layout = "alpha";
+    // Callsign field — uppercase locked, ASCII alphanum only. Same
+    // pragmatic behaviour as a real radio's callsign editor.
+    virtKb.capsLock = (input.id === "callsign-input");
+    virtKb.shift = virtKb.capsLock;
+  }
+  virtKb.labelEl.textContent = inputLabel(input);
+  virtKb.modal.hidden = false;
+  renderVirtKeyboardLayout();
+  refreshVirtKbDisplay();
+}
+
+function closeVirtKeyboard(commit) {
+  if (!virtKb.modal || virtKb.modal.hidden) return;
+  const target = virtKb.target;
+  if (commit && target) {
+    const max = parseInt(target.getAttribute("maxlength") || "0", 10);
+    let out = virtKb.draft;
+    if (max > 0) out = out.slice(0, max);
+    target.value = out;
+    // Notify any change listener wired by the rest of the app
+    // (persistSettings, refreshTxEstimate, …).
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    // Frequency inputs : add the validated value to the MRU
+    // favorites so the next keypad open offers it as a quick-pick.
+    if (isFreqInputId(target.id)) {
+      const mhz = parseFloat(out);
+      if (Number.isFinite(mhz) && mhz > 0) {
+        // fire-and-forget — own save flush, doesn't block close.
+        pushFreqMru(mhz, target);
+      }
+    }
+  }
+  virtKb.modal.hidden = true;
+  virtKb.target = null;
+  virtKb.draft = "";
+}
+
+function inputLabel(input) {
+  // Prefer the surrounding <label>'s direct text node, fall back to
+  // placeholder, then to the id.
+  const lab = input.closest("label");
+  if (lab) {
+    const txt = (lab.textContent || "").replace(input.value || "", "").trim();
+    if (txt) return txt.replace(/\s+/g, " ").slice(0, 60);
+  }
+  if (input.placeholder) return input.placeholder;
+  return input.id || "Saisie";
+}
+
+function renderVirtKeyboardLayout() {
+  const rows = virtKb.rowsEl;
+  rows.innerHTML = "";
+  if (virtKb.layout === "numeric") {
+    // Extra rows for frequency inputs: MRU favorites + step buttons.
+    // Detected by input id; falls back to a plain numeric pad for any
+    // other `<input type="number">` (gain dB, attenuation, etc).
+    if (isFreqInputId(virtKb.target?.id)) {
+      renderVirtKbFavoritesRow();
+      renderVirtKbStepRow();
+    }
+    for (const row of VIRT_KB_NUMERIC_ROWS) {
+      const r = document.createElement("div");
+      r.className = "virt-kb-row";
+      for (const k of row) r.appendChild(makeKbKey(k));
+      rows.appendChild(r);
+    }
+    const trailer = document.createElement("div");
+    trailer.className = "virt-kb-row";
+    trailer.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+    rows.appendChild(trailer);
+    return;
+  }
+  const rowsData = virtKb.layout === "symbols" ? VIRT_KB_SYMBOLS_ROWS : VIRT_KB_QWERTY_ROWS;
+  for (const row of rowsData) {
+    const r = document.createElement("div");
+    r.className = "virt-kb-row";
+    for (const k of row) {
+      const display = (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock))
+        ? k.toUpperCase()
+        : k;
+      r.appendChild(makeKbKey(display, k));
+    }
+    rows.appendChild(r);
+  }
+  // Last row : layout-specific specials.
+  const last = document.createElement("div");
+  last.className = "virt-kb-row";
+  if (virtKb.layout === "alpha") {
+    const shiftLabel = virtKb.capsLock ? "⇪" : "⇧";
+    last.appendChild(makeKbKey(shiftLabel, "shift", "wide-2 special"));
+    last.appendChild(makeKbKey("?123", "to-symbols", "wide-2 special"));
+    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
+    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+  } else {
+    last.appendChild(makeKbKey("ABC", "to-alpha", "wide-2 special"));
+    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
+    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+  }
+  rows.appendChild(last);
+}
+
+function makeKbKey(label, action, extraClass) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "virt-kb-key" + (extraClass ? " " + extraClass : "");
+  b.textContent = label;
+  b.dataset.action = action || label;
+  b.addEventListener("click", () => onVirtKbKey(b.dataset.action));
+  return b;
+}
+
+function onVirtKbKey(action) {
+  switch (action) {
+    case "back":
+      virtKb.draft = virtKb.draft.slice(0, -1);
+      break;
+    case "space":
+      appendVirtKbChar(" ");
+      break;
+    case "shift":
+      if (virtKb.shift && !virtKb.capsLock) {
+        // 1st tap : shift on. 2nd consecutive tap : caps-lock.
+        virtKb.capsLock = true;
+      } else if (virtKb.capsLock) {
+        // Tap while capsLock : turn everything off.
+        virtKb.capsLock = false;
+        virtKb.shift = false;
+      } else {
+        virtKb.shift = true;
+      }
+      renderVirtKeyboardLayout();
+      return;
+    case "to-symbols":
+      virtKb.layout = "symbols";
+      renderVirtKeyboardLayout();
+      return;
+    case "to-alpha":
+      virtKb.layout = "alpha";
+      renderVirtKeyboardLayout();
+      return;
+    default:
+      // Single-character key: respect shift / capsLock for letters.
+      let c = action;
+      if (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock) && c.length === 1) {
+        c = c.toUpperCase();
+      }
+      appendVirtKbChar(c);
+      // Auto-release a one-shot shift (capsLock keeps it on).
+      if (virtKb.shift && !virtKb.capsLock) {
+        virtKb.shift = false;
+        renderVirtKeyboardLayout();
+      }
+      break;
+  }
+  refreshVirtKbDisplay();
+}
+
+function appendVirtKbChar(c) {
+  if (virtKb.target) {
+    const max = parseInt(virtKb.target.getAttribute("maxlength") || "0", 10);
+    if (max > 0 && virtKb.draft.length >= max) return;
+  }
+  virtKb.draft += c;
+}
+
+function refreshVirtKbDisplay() {
+  // Replace ` ` to keep an empty draft visible (otherwise the
+  // height collapses).
+  virtKb.displayEl.textContent = virtKb.draft.length ? virtKb.draft : " ";
+}
+
+// ─── Frequency-keypad enrichments (MRU favorites + step buttons) ──
+//
+// Active when the focused input is an SDR frequency field. The new
+// dynamic-render scheme produces IDs like `sdr-rx-freq-<backend>`
+// or `sdr-tx-freq-<backend>` — one prefix matches every registered
+// backend. The MRU bucket is per-backend, picked off the input's
+// `data-backend` attribute (set when the row was built); step
+// buttons (5 / 6.25 / 12.5 / 25 kHz) work uniformly across all
+// backends. The pick survives keypad close/re-open via
+// `virtKb.stepKHz`.
+const FREQ_INPUT_ID_PREFIX = ["sdr-rx-freq-", "sdr-tx-freq-"];
+const STEP_OPTIONS_KHZ = [5.0, 6.25, 12.5, 25.0];
+virtKb.stepKHz = 6.25;
+
+function isFreqInputId(id) {
+  if (!id) return false;
+  return FREQ_INPUT_ID_PREFIX.some(p => id.startsWith(p));
+}
+
+/// Pick the per-backend MRU list. Reads the `data-backend`
+/// attribute on the input — set by the row builders to the backend
+/// ID. Returns the live array (mutable) so callers can splice.
+function backendIdForFreqInput(targetEl) {
+  if (!targetEl) return null;
+  return targetEl.dataset && targetEl.dataset.backend
+    ? targetEl.dataset.backend : null;
+}
+
+function freqFavoritesArray(backendId) {
+  if (!backendId) return [];
+  ensureBackendEntry(backendId);
+  const entry = currentSettings.sdr_settings.backends[backendId];
+  if (!Array.isArray(entry.freq_favorites)) entry.freq_favorites = [];
+  return entry.freq_favorites;
+}
+
+function renderVirtKbFavoritesRow() {
+  const target = virtKb.target;
+  const backendId = backendIdForFreqInput(target);
+  const favs = backendId ? freqFavoritesArray(backendId) : [];
+  if (favs.length === 0) return;
+  const row = document.createElement("div");
+  row.className = "virt-kb-row virt-kb-favs";
+  for (const hz of favs) {
+    const mhz = (hz / 1e6).toFixed(3);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "virt-kb-key special";
+    b.textContent = mhz;
+    b.title = `Charger ${mhz} MHz`;
+    b.addEventListener("click", () => {
+      // Strip trailing zeros so "145.500" displays compact, but
+      // keep the decimal point so the user knows it's fractional.
+      virtKb.draft = mhz.replace(/0+$/, "").replace(/\.$/, "");
+      refreshVirtKbDisplay();
+    });
+    row.appendChild(b);
+  }
+  virtKb.rowsEl.appendChild(row);
+}
+
+function renderVirtKbStepRow() {
+  const row = document.createElement("div");
+  row.className = "virt-kb-row virt-kb-step-row";
+  // Step selector — taps cycle through STEP_OPTIONS_KHZ.
+  const stepBtn = document.createElement("button");
+  stepBtn.type = "button";
+  stepBtn.className = "virt-kb-key special wide-2";
+  stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
+  stepBtn.title = "Cycle 5 / 6.25 / 12.5 / 25 kHz";
+  stepBtn.addEventListener("click", () => {
+    const idx = STEP_OPTIONS_KHZ.indexOf(virtKb.stepKHz);
+    virtKb.stepKHz = STEP_OPTIONS_KHZ[(idx + 1) % STEP_OPTIONS_KHZ.length];
+    stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
+  });
+  row.appendChild(stepBtn);
+
+  const minusBtn = document.createElement("button");
+  minusBtn.type = "button";
+  minusBtn.className = "virt-kb-key";
+  minusBtn.textContent = "−";
+  minusBtn.addEventListener("click", () => stepDraft(-1));
+  row.appendChild(minusBtn);
+
+  const plusBtn = document.createElement("button");
+  plusBtn.type = "button";
+  plusBtn.className = "virt-kb-key";
+  plusBtn.textContent = "+";
+  plusBtn.addEventListener("click", () => stepDraft(+1));
+  row.appendChild(plusBtn);
+
+  virtKb.rowsEl.appendChild(row);
+}
+
+function stepDraft(direction) {
+  // Parse the current draft as MHz (accept partials like "145." or
+  // ""). Empty / unparseable → start from 0.
+  const cur = parseFloat(virtKb.draft);
+  const start = Number.isFinite(cur) ? cur : 0;
+  const deltaMHz = (virtKb.stepKHz / 1000.0) * direction;
+  const next = start + deltaMHz;
+  // 5 decimals = 10 Hz precision, more than enough for amateur
+  // channel rasters. Trim trailing zeros for compact display.
+  let fixed = next.toFixed(5).replace(/0+$/, "").replace(/\.$/, "");
+  if (fixed === "" || fixed === "-") fixed = "0";
+  virtKb.draft = fixed;
+  refreshVirtKbDisplay();
+}
+
+/// Push a freshly-validated frequency (MHz) onto the per-backend
+/// MRU list. Dedup on Hz equality, prepend, cap at 6. Persists via
+/// `save_settings` so the next keypad open already shows it. The
+/// MRU bucket is the live array under
+/// `currentSettings.sdr_settings.backends[backendId].freq_favorites`.
+async function pushFreqMru(mhz, targetEl) {
+  if (!Number.isFinite(mhz) || mhz <= 0) return;
+  const backendId = backendIdForFreqInput(targetEl);
+  if (!backendId) return;
+  const hz = Math.round(mhz * 1e6);
+  const list = freqFavoritesArray(backendId);
+  const idx = list.indexOf(hz);
+  if (idx !== -1) list.splice(idx, 1);
+  list.unshift(hz);
+  while (list.length > 6) list.pop();
+  if (window.__TAURI__ && window.__TAURI__.core) {
+    try {
+      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
+    } catch (err) {
+      console.warn("save favorites:", err);
+    }
+  }
 }
 
 if (document.readyState === "loading") {

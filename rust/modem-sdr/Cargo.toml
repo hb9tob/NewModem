@@ -1,0 +1,15 @@
+[package]
+name = "modem-sdr"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-agnostic SDR trait surface for the NBFM modem (SdrBackend, SdrDevice, BackendCapabilities, SdrConfig). Implementations live in modem-pluto / modem-sdrplay / future modem-rtlsdr — each `impl SdrBackend` plus a cfg-feature in modem-gui's registry is enough to add a new SDR with no GUI changes."
+publish = false
+
+[dependencies]
+modem-io = { path = "../modem-io" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

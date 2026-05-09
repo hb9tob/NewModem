@@ -3,6 +3,7 @@
 mod collector_client;
 mod overlay;
 mod ptt;
+mod sdr_registry;
 mod settings;
 mod tx_encode;
 
@@ -11,6 +12,8 @@ use modem_worker::{rx_worker, tx_worker, EventSink};
 
 use modem_io::cpal_capture::{self, CaptureHandle};
 use modem_io::devices::{list_input_devices, list_output_devices, DeviceInfo};
+use modem_io::{CpalSink, SampleSink};
+use modem_sdr::{DeviceDescriptor, SdrCaptureHandle, SdrDevice};
 use ptt::SharedPtt;
 use settings::Settings;
 use modem_worker::tx_worker::TxHandle;
@@ -21,8 +24,53 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+/// Active RX backend. Dropping the variant releases the underlying
+/// hardware: capture thread Drop cascades through `SdrCaptureHandle`
+/// for SDRs; cpal Stream / WAV pacer Drop for the other paths.
+enum CaptureKind {
+    /// cpal soundcard input. Used when the device name doesn't parse
+    /// as a `<backend_id>:<device_id>` composite.
+    Cpal(CaptureHandle),
+    /// Any registered SDR backend (Pluto, SDRplay, …). The boxed
+    /// device keeps the hardware handle alive while RX is running;
+    /// `SdrCaptureHandle` owns the capture thread and stops it on
+    /// drop. The worker downstream sees the same 48 kHz mono
+    /// `Vec<f32>` stream as the cpal path.
+    Sdr(Box<dyn SdrDevice>, SdrCaptureHandle),
+    /// Synthetic capture: a paced thread streams f32 samples loaded
+    /// from a WAV file through the same `mpsc::Receiver<Vec<f32>>`
+    /// interface the worker expects from cpal / SDR backends. Used
+    /// to replay captured audio (offline debug, regression testing).
+    WavFile {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
+impl CaptureKind {
+    fn stop(self) {
+        match self {
+            CaptureKind::Cpal(h) => h.stop(),
+            CaptureKind::Sdr(dev, cap) => {
+                // Stop the capture stream first (its Drop joins the
+                // capture thread / calls Uninit), then release the
+                // device handle. Explicit drops keep the order
+                // unambiguous.
+                drop(cap);
+                drop(dev);
+            }
+            CaptureKind::WavFile { stop, thread } => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(t) = thread {
+                    let _ = t.join();
+                }
+            }
+        }
+    }
+}
+
 struct CaptureSession {
-    capture: CaptureHandle,
+    capture: CaptureKind,
     worker: WorkerHandle,
     device_name: String,
 }
@@ -66,6 +114,86 @@ fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
 #[tauri::command]
 fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_output_devices().map_err(|e| e.to_string())
+}
+
+/// Per-backend descriptor shipped to the GUI frontend at startup.
+/// Each compiled-in `SdrBackend` produces one entry; the frontend
+/// caches the list keyed by `id` and reads `capabilities` to
+/// dynamically build the per-backend RX/TX panels (frequency input
+/// min/max, AGC `<select>`, antenna selector, feature toggles, …).
+/// Replaces the legacy per-backend `list_pluto_devices` /
+/// `list_sdrplay_devices` commands.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SdrBackendInfo {
+    id: String,
+    display_name: String,
+    capabilities: modem_sdr::BackendCapabilities,
+}
+
+/// Enumerate every SDR backend compiled into this binary, with its
+/// static capabilities. The frontend constructs the device dropdown
+/// `<optgroup>` headers and the per-backend control panels from the
+/// returned list — no hardcoded knowledge of "Pluto" or "SDRplay" in
+/// the frontend.
+#[tauri::command]
+fn list_sdr_backends() -> Vec<SdrBackendInfo> {
+    sdr_registry::registered_backends()
+        .iter()
+        .map(|b| SdrBackendInfo {
+            id: b.id().to_string(),
+            display_name: b.display_name().to_string(),
+            capabilities: b.capabilities().clone(),
+        })
+        .collect()
+}
+
+/// List the live devices visible to one specific SDR backend.
+/// Returns an empty `Vec` (not an error) when the backend itself is
+/// reachable but no hardware is plugged in — the GUI surfaces this
+/// as an empty group, not a red banner.
+#[tauri::command]
+fn list_sdr_devices(backend_id: String) -> Result<Vec<DeviceDescriptor>, String> {
+    let backend = sdr_registry::backend_by_id(&backend_id).map_err(|e| e.to_string())?;
+    backend.list_devices().map_err(|e| e.to_string())
+}
+
+/// Return per-device capabilities for the device identified by its
+/// composite name (`<backend>:<id>`). The frontend calls this each
+/// time the user picks a device in the dropdown so the panel layout
+/// (antenna selector, tuner radio buttons, bias-T checkbox, gain
+/// table size, …) tracks the actual hardware on the bus instead of
+/// the family-level lowest-common-denominator caps.
+///
+/// Backends without per-device variants fall back to family caps via
+/// `SdrBackend::capabilities_for`'s default impl, so this command
+/// works uniformly for Pluto / RTL-SDR / future single-flavour
+/// backends — same JSON shape, no special-case in the frontend.
+#[tauri::command]
+fn get_sdr_device_capabilities(
+    composite_name: String,
+) -> Result<modem_sdr::BackendCapabilities, String> {
+    let (backend, device_id) = sdr_registry::parse_composite_name(&composite_name)
+        .ok_or_else(|| format!("invalid composite name '{composite_name}'"))?;
+    // Re-list devices to find the descriptor with its `hardware_hint`
+    // — we only persist composite names in settings, not the full
+    // descriptor, so the hint has to come from a fresh enumeration.
+    // SDRplay's `list_devices` is a sub-millisecond daemon round-trip;
+    // calling it once per device-pick is fine.
+    let devices = backend.list_devices().map_err(|e| e.to_string())?;
+    let descriptor = devices
+        .into_iter()
+        .find(|d| d.id == device_id)
+        // If the device went away between the dropdown render and
+        // this call, fall back to a hint-less descriptor — caps_for
+        // returns family caps, which is the safe default.
+        .unwrap_or_else(|| {
+            DeviceDescriptor::new(
+                backend.id(),
+                device_id,
+                format!("{}:{device_id}", backend.id()),
+            )
+        });
+    Ok(backend.capabilities_for(&descriptor).clone())
 }
 
 #[tauri::command]
@@ -167,6 +295,34 @@ fn ptt_status(state: State<'_, AppState>) -> PttStatusEvent {
     }
 }
 
+/// Resolve `device_name` to a `SampleSink` for TX. Composite SDR
+/// names (`<backend>:<device_id>` produced by the registry) open
+/// the device through `SdrBackend::open` and ask for `tx_sink()`;
+/// plain cpal device names (the legacy soundcard path) fall back
+/// to [`CpalSink`].
+///
+/// Backends that are RX-only return `None` from `tx_sink()` — we
+/// surface that to the GUI as a clean error so the operator knows
+/// to pick a different TX device.
+fn resolve_tx_sink(device_name: &str, cfg: &Settings) -> Result<Arc<dyn SampleSink>, String> {
+    if let Some((backend, device_id)) = sdr_registry::parse_composite_name(device_name) {
+        let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
+        let descriptor = DeviceDescriptor::new(
+            backend.id(),
+            device_id,
+            format!("{}:{device_id}", backend.id()),
+        );
+        let device = backend
+            .open(&descriptor, &sdr_cfg)
+            .map_err(|e| format!("{}: {e}", backend.id()))?;
+        device
+            .tx_sink()
+            .ok_or_else(|| format!("{} est RX uniquement", backend.id()))
+    } else {
+        Ok(Arc::new(CpalSink))
+    }
+}
+
 #[tauri::command]
 fn start_capture(
     device_name: String,
@@ -179,30 +335,37 @@ fn start_capture(
     if guard.is_some() {
         return Err("capture already running".into());
     }
-    let profile_idx = match profile.as_deref().unwrap_or("HIGH").to_uppercase().as_str() {
-        "MEGA" => modem_core::profile::ProfileIndex::Mega,
-        "HIGH" => modem_core::profile::ProfileIndex::High,
-        "NORMAL" => modem_core::profile::ProfileIndex::Normal,
-        "ROBUST" => modem_core::profile::ProfileIndex::Robust,
-        "ULTRA" => modem_core::profile::ProfileIndex::Ultra,
-        // EXPERIMENTAL : seulement utilisable si forced=true.
-        "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
-        "FAST" => modem_core::profile::ProfileIndex::Fast,
-        "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
-        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix,
-        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix,
-        other => return Err(format!("unknown profile '{other}'")),
-    };
     let forced = forced.unwrap_or(false);
-    if profile_idx.is_experimental() && !forced {
-        return Err(format!(
-            "profil '{}' est expérimental, requiert forced=true",
-            profile_idx.name()
-        ));
-    }
-    let (capture, samples) = cpal_capture::start(&device_name)?;
-    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
+    let profile_idx = resolve_profile(profile.as_deref().unwrap_or("HIGH"), forced)?;
     let cfg = settings::load();
+    // Route on the composite device name. SDR devices arrive as
+    // `<backend_id>:<device_id>` (produced by `SdrBackend::list_devices`
+    // via `DeviceDescriptor::composite_name`); the registry parses it
+    // back into (backend, device_id). Plain strings (cpal device
+    // names like "USB Audio (hw:1,0)") fall through to the soundcard
+    // path. Every branch emits the same shape:
+    // `mpsc::Receiver<Vec<f32>>` at 48 kHz mono — the rx_worker
+    // doesn't know which backend produced the samples.
+    let (capture, samples) =
+        if let Some((backend, device_id)) = sdr_registry::parse_composite_name(&device_name) {
+            let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
+            let descriptor = DeviceDescriptor::new(
+                backend.id(),
+                device_id,
+                format!("{}:{device_id}", backend.id()),
+            );
+            let mut device = backend
+                .open(&descriptor, &sdr_cfg)
+                .map_err(|e| format!("{}: {e}", backend.id()))?;
+            let (cap_handle, rx) = device
+                .start_rx()
+                .map_err(|e| format!("{}: {e}", backend.id()))?;
+            (CaptureKind::Sdr(device, cap_handle), rx)
+        } else {
+            let (h, rx) = cpal_capture::start(&device_name)?;
+            (CaptureKind::Cpal(h), rx)
+        };
+    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
         samples,
         sink,
@@ -220,13 +383,171 @@ fn start_capture(
     Ok(())
 }
 
+/// Resolve a profile name (case-insensitive, accepts both
+/// `HIGH+`/`HIGHPLUS` style aliases) and reject experimental profiles
+/// when `forced=false`. Shared by `start_capture` and
+/// `start_capture_from_wav` so the WAV replay path mirrors the live
+/// capture path's gating exactly.
+fn resolve_profile(name: &str, forced: bool) -> Result<modem_core::profile::ProfileIndex, String> {
+    let p = match name.to_uppercase().as_str() {
+        "MEGA" => modem_core::profile::ProfileIndex::Mega,
+        "HIGH" => modem_core::profile::ProfileIndex::High,
+        "NORMAL" => modem_core::profile::ProfileIndex::Normal,
+        "ROBUST" => modem_core::profile::ProfileIndex::Robust,
+        "ULTRA" => modem_core::profile::ProfileIndex::Ultra,
+        "HIGH+" | "HIGHPLUS" => modem_core::profile::ProfileIndex::HighPlus,
+        "FAST" => modem_core::profile::ProfileIndex::Fast,
+        "HIGH++" | "HIGHPLUSPLUS" => modem_core::profile::ProfileIndex::HighPlusPlus,
+        "HIGH56" | "HIGH-56" => modem_core::profile::ProfileIndex::HighFiveSix,
+        "HIGH+56" | "HIGHPLUS56" => modem_core::profile::ProfileIndex::HighPlusFiveSix,
+        other => return Err(format!("unknown profile '{other}'")),
+    };
+    if p.is_experimental() && !forced {
+        return Err(format!(
+            "profil '{}' est expérimental, requiert forced=true",
+            p.name()
+        ));
+    }
+    Ok(p)
+}
+
+#[derive(serde::Deserialize)]
+struct StartCaptureFromWavArgs {
+    /// WAV file content as raw bytes (read by the frontend via
+    /// `file.arrayBuffer()`). Must be mono, 48 kHz, int8/int16/int24
+    /// or float32 — the modem chain only handles 48 kHz audio.
+    bytes: Vec<u8>,
+    profile: Option<String>,
+    forced: Option<bool>,
+}
+
+/// Replay a WAV file as if it were live audio: the bytes are decoded
+/// into f32 samples and a paced helper thread pushes 500 ms batches
+/// through an `mpsc::channel` to the rx_worker. Real-time pacing is
+/// important — the worker's silence detection and 1 s scan interval
+/// are wall-clock based, so dumping the whole buffer at once would
+/// produce one giant scan instead of incremental decodes.
+#[tauri::command]
+fn start_capture_from_wav(
+    args: StartCaptureFromWavArgs,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    if guard.is_some() {
+        return Err("capture already running".into());
+    }
+    let forced = args.forced.unwrap_or(false);
+    let profile_idx = resolve_profile(args.profile.as_deref().unwrap_or("HIGH"), forced)?;
+
+    // Parse the WAV from in-memory bytes. hound::WavReader::new takes
+    // any `Read`, so a `Cursor<Vec<u8>>` works without writing a temp
+    // file.
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(args.bytes))
+        .map_err(|e| format!("WAV parse: {e}"))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 48_000 {
+        return Err(format!(
+            "WAV doit être à 48 kHz (vu : {} Hz)",
+            spec.sample_rate
+        ));
+    }
+    if spec.channels != 1 {
+        return Err(format!(
+            "WAV doit être mono (vu : {} canaux)",
+            spec.channels
+        ));
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            // Same convention as modem-cli's read_wav: scale by
+            // 2^(bps-1) so a max-amplitude sample lands on ±1.0.
+            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.unwrap_or(0) as f32 / max_val)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|s| s.unwrap_or(0.0))
+            .collect(),
+    };
+    if samples.is_empty() {
+        return Err("WAV vide".into());
+    }
+
+    // Build the channel + paced sender. Pacing constants chosen to
+    // match what cpal_capture / Pluto produce on a live channel.
+    let (tx_chan, rx_chan) = std::sync::mpsc::channel::<Vec<f32>>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let app_for_done = app.clone();
+    let pacer = std::thread::spawn(move || {
+        // ~500 ms at 48 kHz → matches rx_worker's BATCH_TARGET_SAMPLES
+        // so each delivered batch triggers (at most) one scan.
+        const BATCH: usize = 24_000;
+        const PERIOD: std::time::Duration = std::time::Duration::from_millis(500);
+        let start = std::time::Instant::now();
+        let mut batch_idx: u32 = 0;
+        let mut i = 0usize;
+        while i < samples.len()
+            && !stop_thread.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let end = (i + BATCH).min(samples.len());
+            // tx_chan.send fails when the worker has dropped the
+            // receiver (stop_capture scenario) — exit cleanly.
+            if tx_chan.send(samples[i..end].to_vec()).is_err() {
+                break;
+            }
+            i = end;
+            batch_idx += 1;
+            // Pace to next "real-time" tick so the worker's wall-clock
+            // gates (silence threshold, scan interval) behave like a
+            // live capture.
+            let target = start + PERIOD * batch_idx;
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+        }
+        // Drop the sender: the worker's recv() will return Err and
+        // the worker thread exits naturally.
+        drop(tx_chan);
+        // Tell the frontend the playback finished — it can flip the
+        // toolbar buttons back without waiting for `stop_capture`.
+        let _ = tauri::Emitter::emit(&app_for_done, "wav_playback_done", ());
+    });
+
+    let cfg = settings::load();
+    let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
+    let worker = rx_worker::spawn(
+        rx_chan,
+        sink,
+        state.save_dir.clone(),
+        state.wav_sink.clone(),
+        profile_idx,
+        forced,
+        cfg.rx_deemphasis_enabled,
+    );
+    *guard = Some(CaptureSession {
+        capture: CaptureKind::WavFile {
+            stop,
+            thread: Some(pacer),
+        },
+        worker,
+        device_name: "wav-file".to_string(),
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn stop_capture(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     if let Some(session) = guard.take() {
-        // Drop the capture first : that closes the stream and disconnects
-        // the mpsc channel, so the worker's recv() returns and the thread
-        // exits naturally.
+        // Drop the capture first : that closes the stream / cancels
+        // the libiio buffer pump and disconnects the mpsc channel, so
+        // the worker's recv() returns and the thread exits naturally.
         session.capture.stop();
         session.worker.stop();
     }
@@ -397,13 +718,19 @@ fn tx_start(
         return Err("indicatif vide (Paramètres → Indicatif)".into());
     }
     if args.tx_device.trim().is_empty() {
-        return Err("carte son TX non sélectionnée (Paramètres)".into());
+        return Err("périphérique TX non sélectionné (Paramètres)".into());
     }
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let history_max = cfg.tx_history_max;
+    let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
     let repair_pct = args.repair_pct.unwrap_or(30);
+    // Resolve the SampleSink upfront on the Tauri thread. The worker
+    // thread only sees an `Arc<dyn SampleSink>` — no per-backend
+    // branching inside `tx_worker::run_playback`, no `Option<PlutoConfig>`
+    // sneaking through the call chain.
+    let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let archive_sink = TauriEventSink(app.clone());
     tx_worker::archive_payload(
         &save_dir,
@@ -414,7 +741,7 @@ fn tx_start(
         history_max,
         &archive_sink,
     );
-    let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
+    let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn(
         payload_path,
         args.mode,
@@ -425,8 +752,10 @@ fn tx_start(
         repair_pct,
         attenuation_db,
         preemphasis_enabled,
+        audio_sink,
         state.ptt.clone(),
-        tx_sink,
+        event_sink,
+        save_wav_dir,
     );
     *tx_guard = Some(handle);
     Ok(())
@@ -472,7 +801,7 @@ fn tx_more(
         return Err("indicatif vide (Paramètres → Indicatif)".into());
     }
     if args.tx_device.trim().is_empty() {
-        return Err("carte son TX non sélectionnée (Paramètres)".into());
+        return Err("périphérique TX non sélectionné (Paramètres)".into());
     }
     if args.count == 0 {
         return Err("choisir un nombre de blocs > 0".into());
@@ -480,7 +809,9 @@ fn tx_more(
     let cfg = settings::load();
     let attenuation_db = cfg.tx_attenuation_db;
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
-    let tx_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
+    let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
+    let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
+    let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn_more(
         payload_path,
         args.mode,
@@ -492,8 +823,10 @@ fn tx_more(
         args.count,
         attenuation_db,
         preemphasis_enabled,
+        audio_sink,
         state.ptt.clone(),
-        tx_sink,
+        event_sink,
+        save_wav_dir,
     );
     *tx_guard = Some(handle);
     Ok(())
@@ -992,12 +1325,16 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
+            list_sdr_backends,
+            list_sdr_devices,
+            get_sdr_device_capabilities,
             list_modem_profiles,
             list_serial_ports,
             ptt_status,
             get_settings,
             save_settings,
             start_capture,
+            start_capture_from_wav,
             stop_capture,
             get_save_dir,
             set_save_dir,

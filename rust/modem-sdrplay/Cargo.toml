@@ -1,0 +1,28 @@
+[package]
+name = "modem-sdrplay"
+version = "0.1.0"
+edition = "2021"
+description = "SDRplay RSPduo (closed binary API 3.x) backend for the NBFM modem. RX-only — opens libsdrplay_api, configures one tuner of the RSPduo, runs the radio-faithful demod chain from modem-sdr-dsp, and exposes the same `mpsc::Receiver<Vec<f32>>` shape as the cpal soundcard backend so rx_worker is agnostic to which radio fed it."
+publish = false
+
+[dependencies]
+modem-sdr-dsp = { path = "../modem-sdr-dsp" }
+modem-sdr = { path = "../modem-sdr" }
+modem-io = { path = "../modem-io" }
+num-complex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+# bindgen runs on the SDRplay C headers (typically under /usr/local/include
+# after the user installs SDRplay's API 3.x package — see crate README).
+bindgen = "0.69"
+
+# We do raw FFI on libsdrplay_api (callbacks, void* contexts, raw
+# struct pointers). Unlike modem-pluto (which wraps libiio in the
+# safe `industrial-io` crate), there's no safe-Rust SDRplay binding
+# upstream, so unsafe is unavoidable. Every unsafe block carries a
+# SAFETY: comment explaining why the contract is honoured. No
+# crate-level lint override needed — Rust's default permits unsafe.

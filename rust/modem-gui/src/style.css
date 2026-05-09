@@ -92,6 +92,11 @@ body {
   min-width: 130px;
   display: inline-block;
   text-align: left;
+  /* Preserve the leading spaces produced by padStart() so the digits
+     stay right-aligned to a fixed column. Without this, HTML collapses
+     the spaces and the "-" shifts the whole string by one character
+     when db crosses 0 dB, which reads as flicker on screen. */
+  white-space: pre;
 }
 .level-bar {
   display: inline-block;
@@ -1066,6 +1071,52 @@ main {
 .ptt-refresh:hover {
   background: #383838;
 }
+
+/* PlutoSDR settings fieldset — RX/TX freq pair, AGC mode, gain knobs.
+   Two flex rows so freqs sit side-by-side, gain mode + values wrap as
+   the column shrinks. Styling mirrors .ptt-config / .ptt-line spacing
+   so the panel slots naturally between the cpal-RX and cpal-TX
+   blocks. */
+.pluto-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.3rem;
+  font-size: 0.85rem;
+}
+.pluto-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.pluto-field input[type="number"] {
+  width: 7em;
+  text-align: right;
+}
+.pluto-field-label {
+  font-size: 0.85rem;
+  color: #c0c0c0;
+}
+.pluto-field-value {
+  font-size: 0.85rem;
+  color: #9ccc65;
+  font-variant-numeric: tabular-nums;
+  min-width: 4em;
+}
+/* Sub-fieldset shown inside the RX/TX device fieldsets when the
+   currently-selected device is a Pluto. Visually nested via a
+   left-border accent + indent. Hidden by `[hidden]` when not Pluto. */
+.pluto-subgroup {
+  margin-top: 0.7rem;
+  padding: 0.5rem 0.7rem;
+  border-left: 2px solid #4a90c8;
+  background: rgba(74, 144, 200, 0.06);
+  border-radius: 0 4px 4px 0;
+}
+.pluto-subgroup .pluto-row:first-child {
+  margin-top: 0;
+}
 .ptt-status {
   font-size: 0.8rem;
   margin-top: 0.4rem;
@@ -1435,6 +1486,233 @@ main {
   pointer-events: none;
 }
 
+/* ─── Touch-friendly <select> picker (kiosk) ─── */
+/*
+   Replaces the native WebKitGTK popup which caps at ~5-6 visible rows
+   on 480 px and hides the bottom of long lists (10 modem profiles, 39
+   CTCSS tones). Same layout pattern as `.virt-keyboard-modal` — fixed
+   overlay, centered panel, scrollable list, ≥48 px touch rows.
+*/
+.select-picker-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 260;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  touch-action: manipulation;
+}
+.select-picker-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.6rem;
+  width: 100%;
+  max-width: 600px;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.select-picker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: #9ccc65;
+}
+.select-picker-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.select-picker-close {
+  font-size: 1.4rem;
+  color: #ef5350;
+  cursor: pointer;
+  padding: 0.1rem 0.5rem;
+  user-select: none;
+}
+.select-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  /* Scrollbar visible at finger-grabbable size — same as the kiosk
+     media-query rule. */
+  scrollbar-width: thin;
+}
+.select-picker-list::-webkit-scrollbar { width: 12px; }
+.select-picker-list::-webkit-scrollbar-thumb { background: #555; border-radius: 6px; }
+.select-picker-list::-webkit-scrollbar-thumb:hover { background: #777; }
+.select-picker-row {
+  min-height: 48px;
+  padding: 0.55rem 0.8rem;
+  background: #2a3845;
+  color: #e0e0e0;
+  border: 1px solid #4a5868;
+  border-radius: 4px;
+  text-align: left;
+  font-family: ui-monospace, monospace;
+  font-size: 0.95rem;
+  cursor: pointer;
+  user-select: none;
+}
+.select-picker-row:hover { background: #34495a; }
+.select-picker-row:active { background: #4a90c8; color: #fff; }
+.select-picker-row.select-picker-current {
+  outline: 2px solid #9ccc65;
+  outline-offset: -2px;
+}
+.select-picker-row.select-picker-experimental {
+  color: #ff6b4a;
+  background: #2a1a14;
+  border-color: #6a3030;
+  font-weight: bold;
+}
+.select-picker-row.select-picker-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ─── Native virtual keyboard (kiosk text/number entry) ─── */
+/*
+   Modal overlay that auto-opens when an input is focused while body
+   has `.kiosk-mode`. Layout follows the `.image-lightbox` pattern:
+   `position: fixed; inset: 0` covers the viewport. Touch keys use
+   the same min-height as `#kiosk-exit` (44 px is the ergonomic
+   minimum on a 7" 800x480 panel — keys here go a bit larger at
+   ~52 px for a 4-row layout that still fits below 480 px).
+*/
+.virt-keyboard-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 250;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  /* Native iOS Safari prevents pinch-zoom inside modal — keeps the
+     keyboard scale stable when the user accidentally pinches. */
+  touch-action: manipulation;
+}
+.virt-kb-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.6rem;
+  width: 100%;
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.virt-kb-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: #9ccc65;
+}
+.virt-kb-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.virt-kb-close {
+  font-size: 1.4rem;
+  color: #ef5350;
+  cursor: pointer;
+  padding: 0.1rem 0.5rem;
+  user-select: none;
+}
+.virt-kb-display {
+  background: #000;
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  font-size: 1.4rem;
+  font-family: ui-monospace, monospace;
+  color: #d0d0d0;
+  min-height: 2rem;
+  word-break: break-all;
+  letter-spacing: 0.04em;
+}
+.virt-kb-caret {
+  display: inline-block;
+  margin-left: 1px;
+  color: #9ccc65;
+  animation: virt-kb-blink 1s steps(2, end) infinite;
+}
+@keyframes virt-kb-blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+.virt-kb-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.virt-kb-row {
+  display: flex;
+  gap: 0.3rem;
+  justify-content: center;
+}
+.virt-kb-key {
+  flex: 1;
+  min-width: 0;
+  min-height: 52px;
+  padding: 0.4rem 0;
+  font-size: 1.1rem;
+  background: #2a3845;
+  color: #e0e0e0;
+  border: 1px solid #4a5868;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-family: inherit;
+}
+.virt-kb-key:hover {
+  background: #34495a;
+}
+.virt-kb-key:active,
+.virt-kb-key.held {
+  background: #4a90c8;
+  color: #fff;
+  border-color: #5aa0d8;
+}
+.virt-kb-key.wide-2 { flex: 2; }
+.virt-kb-key.wide-3 { flex: 3; }
+.virt-kb-key.special {
+  background: #34465a;
+  font-size: 0.85rem;
+}
+/* Frequency keypad enrichments: distinct visual cue so the user
+   sees the favorites + step rows aren't part of the digit grid. */
+.virt-kb-favs .virt-kb-key {
+  background: #2d4256;
+  border-color: #5e8aaf;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.95rem;
+}
+.virt-kb-step-row .virt-kb-key {
+  background: #2d4256;
+  border-color: #5e8aaf;
+  font-size: 1rem;
+}
+.virt-kb-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.3rem;
+}
+.virt-kb-actions button {
+  flex: 1;
+  min-height: 50px;
+  font-size: 1.05rem;
+  border-radius: 4px;
+  border: 1px solid #4a5868;
+  cursor: pointer;
+}
+#virt-kb-cancel-btn { background: #34465a; color: #ddd; }
+#virt-kb-ok { background: #4a90c8; color: #fff; border-color: #5aa0d8; }
+
 /* ─── Sessions tab ─── */
 .sessions-layout {
   padding: 12px 16px;
@@ -1802,6 +2080,32 @@ select option.experimental-option {
    ============================================================ */
 .kiosk-only { display: none; }
 body.kiosk-mode .kiosk-only { display: inline-flex; }
+
+/* Kiosk info toast — JS-driven (showKioskInfoToast in main.js)
+   replacement for the native title-based tooltip on the TX button.
+   The native WebKitGTK tooltip is sticky on touchscreens; this one
+   auto-fades after 5 s under our control. */
+.kiosk-info-toast {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(20, 20, 20, 0.94);
+  color: #f0f0f0;
+  border: 1px solid #555;
+  border-radius: 6px;
+  padding: 10px 16px;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  max-width: 80vw;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease-out;
+  z-index: 10000;
+}
+.kiosk-info-toast.show { opacity: 1; }
 
 /* ============================================================
    Small-screen layout — Raspberry Pi 7" 800x480 and similar.

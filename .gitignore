@@ -12,6 +12,7 @@ rust/modem-gui/src-tauri/secret.txt
 .claude/
 *.swp
 *~
+*.log
 .DS_Store
 Thumbs.db
 

@@ -39,7 +39,20 @@ pub struct RxV2Result {
     pub total_blocks: usize,
     pub segments_decoded: usize,
     pub segments_lost: usize,
+    /// Pilot-residual σ². Computed from the LS-fit residuals on KNOWN
+    /// pilot symbols (statistically optimal noise-variance estimator,
+    /// used as the LLR scale by the soft demod). Includes pilots from
+    /// every segment in the window, including meta.
     pub sigma2: f64,
+    /// Data-symbol σ², computed from hard-decision residuals on the
+    /// post-equalisation DATA symbols of non-meta segments only. This
+    /// is the value the GUI surfaces as "frame noise" — it excludes
+    /// pilot/preamble overhead so the operator sees what the actual
+    /// payload symbols look like to the demod. Slightly biased low at
+    /// low SNR (wrong decisions reduce the residual artificially) but
+    /// good enough for a live indicator. Falls back to `sigma2` when
+    /// no data segments were processed.
+    pub sigma2_data: f64,
     /// Unique DATA ESIs recovered (excludes meta-segment blocks, which are
     /// framing overhead rather than payload content). This is the metric
     /// the GUI should display as real decode progress.
@@ -65,15 +78,18 @@ pub struct RxV2Result {
     /// concatenates these into a phase-vs-position plot to diagnose drift
     /// or phase noise that the linear pilot interpolation can't track.
     pub pilot_phase_segments: Vec<Vec<f32>>,
-    /// Offset (in samples, relative to the input slice) of the last preamble
-    /// whose window was fully closed and decoded by `rx_v3` in this call.
-    /// Callers that maintain a sliding capture buffer can persist this
-    /// position (translated to absolute samples) and skip re-decoding the
-    /// same closed windows on subsequent ticks.
-    /// `None` for `rx_v2_single` results (single window, no concept of
-    /// "closed vs open"), or for `rx_v3` calls where fewer than 2 preambles
-    /// were found (no closed window to mark done).
-    pub last_closed_preamble_offset: Option<usize>,
+    /// Offset (in samples, relative to the input slice) of the LAST preamble
+    /// found by `rx_v3` in this call — closed or open. Callers maintaining a
+    /// rolling capture buffer can drain everything before
+    /// `last_preamble_offset - margin` after a successful scan: closed
+    /// windows are already routed to the store, and the open one is rebuilt
+    /// from the preserved P_last (+ MF pre-roll margin) on the next tick when
+    /// the next preamble lands. The buffer becomes a self-purging queue that
+    /// tracks the live preamble cadence — no more guess-the-period
+    /// scan-window heuristic.
+    /// `None` for `rx_v2_single` (single-window, no preamble walking) or
+    /// `rx_v3_after` calls where no preamble was found at all.
+    pub last_preamble_offset: Option<usize>,
 }
 
 /// Cheap preamble presence probe — intended for the RX worker's Idle gate.
@@ -592,6 +608,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let mut segments_lost: usize = 0;
     let mut sigma2_sum: f64 = 0.0;
     let mut sigma2_count: usize = 0;
+    // Hard-decision data-symbol σ² accumulators. Populated alongside
+    // the pilot σ² but only on non-meta segments and only over actual
+    // data symbols (post-equalisation). Surfaced separately to the GUI.
+    let mut sigma2_data_sum: f64 = 0.0;
+    let mut sigma2_data_count: usize = 0;
     const MAX_CONSTELLATION_POINTS: usize = 500;
     let mut constellation_sample: Vec<[f32; 2]> = Vec::new();
     // Pilot LS smoothed phases per data segment, in temporal order. Meta
@@ -706,6 +727,20 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             pilot_phase_segments.push(seg_pilot_phases);
         }
 
+        // Data-symbol σ² (frame-only, hard-decision residuals). Skip meta
+        // segments — the GUI metric is meant to track payload-symbol
+        // quality, and meta is framing overhead. Use the n_cw*syms_per_cw
+        // prefix only (track_segment may have over-allocated on the last
+        // pilot group).
+        if !marker_payload.is_meta() {
+            let n_data_syms = (n_cw * syms_per_cw).min(seg_data_syms.len());
+            for &y in &seg_data_syms[..n_data_syms] {
+                let d = constellation.hard_decision(y);
+                sigma2_data_sum += (y - d).norm_sqr();
+                sigma2_data_count += 1;
+            }
+        }
+
         // Sample post-equalised DATA symbols for the constellation scatter
         // plot. Meta segments are excluded (their content is the AppHeader
         // replicated, would bias the cloud toward a subset of constellation
@@ -804,6 +839,13 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     } else {
         1.0
     };
+    // Falls back to the pilot σ² when no data segments contributed —
+    // the GUI then has at least a sane number to display.
+    let sigma2_data = if sigma2_data_count > 0 {
+        (sigma2_data_sum / sigma2_data_count as f64).max(1e-6)
+    } else {
+        sigma2
+    };
 
     let data_blocks_recovered = cw_bytes.len();
     let eot_seen = decoded_header.flags & header::FLAG_EOT != 0;
@@ -816,12 +858,13 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         segments_decoded,
         segments_lost,
         sigma2,
+        sigma2_data,
         data_blocks_recovered,
         cw_bytes_map: cw_bytes,
         eot_seen,
         constellation_sample,
         pilot_phase_segments,
-        last_closed_preamble_offset: None,
+        last_preamble_offset: None,
     })
 }
 
@@ -897,6 +940,8 @@ pub fn rx_v3_after(
     let mut segs_lost = 0usize;
     let mut sigma2_sum = 0.0f64;
     let mut sigma2_count = 0usize;
+    let mut sigma2_data_sum = 0.0f64;
+    let mut sigma2_data_count = 0usize;
     let mut eot_seen = false;
     let mut last_constellation: Vec<[f32; 2]> = Vec::new();
     let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
@@ -961,6 +1006,8 @@ pub fn rx_v3_after(
         segs_lost += r.segments_lost;
         sigma2_sum += r.sigma2;
         sigma2_count += 1;
+        sigma2_data_sum += r.sigma2_data;
+        sigma2_data_count += 1;
         if r.eot_seen {
             eot_seen = true;
         }
@@ -1013,16 +1060,19 @@ pub fn rx_v3_after(
     } else {
         1.0
     };
+    let sigma2_data = if sigma2_data_count > 0 {
+        sigma2_data_sum / sigma2_data_count as f64
+    } else {
+        sigma2
+    };
     let data_blocks_recovered = merged.len();
 
-    // Closed window watermark : positions kept after `skip_until` filter,
-    // all but the last one were treated as closed (had a P_{i+1} after).
-    // The last closed = positions[len-2] when len ≥ 2.
-    let last_closed_preamble_offset = if positions.len() >= 2 {
-        Some(positions[positions.len() - 2])
-    } else {
-        None
-    };
+    // Position of the last preamble seen in this scan. Always set when
+    // we got here (early-return guarantees `positions` is non-empty after
+    // the skip_until filter, so `.last()` is Some). The caller (rx_worker)
+    // uses this to truncate its rolling capture buffer right behind P_last,
+    // turning the buffer into a self-purging queue.
+    let last_preamble_offset = positions.last().copied();
 
     Some(RxV2Result {
         data: assembled,
@@ -1033,12 +1083,13 @@ pub fn rx_v3_after(
         segments_decoded: segs_decoded,
         segments_lost: segs_lost,
         sigma2,
+        sigma2_data,
         data_blocks_recovered,
         cw_bytes_map: merged,
         eot_seen,
         constellation_sample: last_constellation,
         pilot_phase_segments: last_pilot_phases,
-        last_closed_preamble_offset,
+        last_preamble_offset,
     })
 }
 

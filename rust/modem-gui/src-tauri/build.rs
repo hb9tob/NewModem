@@ -5,6 +5,26 @@ fn main() {
     let profile = std::env::var("PROFILE").expect("PROFILE not set");
     println!("cargo:rustc-env=TARGET_TRIPLE={target}");
 
+    // Windows-only: delay-load sdrplay_api.dll so nbfm-modem-gui.exe
+    // launches even when the SDRplay SDK isn't installed (users
+    // without an RSP still get the GUI for Pluto / sound-card
+    // backends). modem_sdrplay::runtime_guard::ensure_dll_loadable()
+    // is called before the first API entry-point (LoadLibraryW
+    // pre-check) and surfaces SdrplayError::DllMissing if absent —
+    // backend.rs swallows it into an empty device list. delayimp.lib
+    // ships with the Windows SDK so the linker resolves the
+    // __delayLoadHelper2 thunks without an explicit search path.
+    // Only emit the directives when both conditions hold:
+    //   * we're targeting Windows MSVC, AND
+    //   * the `sdrplay` cargo feature is on (otherwise the linker
+    //     warns about an unknown DLL name).
+    let is_windows_msvc = target.contains("windows-msvc");
+    let sdrplay_feature_on = std::env::var_os("CARGO_FEATURE_SDRPLAY").is_some();
+    if is_windows_msvc && sdrplay_feature_on {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:sdrplay_api.dll");
+        println!("cargo:rustc-link-lib=delayimp");
+    }
+
     let is_windows = target.contains("windows");
     let ext = if is_windows { ".exe" } else { "" };
 

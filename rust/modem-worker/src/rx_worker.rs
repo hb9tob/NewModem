@@ -28,6 +28,7 @@ use modem_core::header::Header;
 use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_core::profile::{ModemConfig, ProfileIndex};
 use modem_core::rx_v2;
+use modem_sdr_dsp::emphasis::DeemphasisFilter;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -139,7 +140,13 @@ struct V2ProgressPayload {
     blocks_converged: usize,
     blocks_total: usize,
     blocks_expected: usize,
+    /// Pilot-residual σ² (kept for backward compat / debug). The GUI
+    /// surfaces `sigma2_data` instead, which excludes pilot+preamble
+    /// overhead. See RxV2Result for the full definition.
     sigma2: f64,
+    /// Hard-decision data-symbol σ² for the current window (frame-only,
+    /// instantaneous). What the top bar and phase-error overlay display.
+    sigma2_data: f64,
     converged_bitmap: Vec<u8>,
     constellation_sample: Vec<[f32; 2]>,
     /// Pilot LS smoothed phases per data segment (radians) for the most
@@ -153,7 +160,11 @@ struct FileCompletePayload {
     callsign: String,
     mime_type: u8,
     saved_path: String,
+    /// Pilot-residual σ² of the last contributing window (legacy).
     sigma2: f64,
+    /// Mean data-symbol σ² across every decode tick that contributed
+    /// to this session. Surfaced in the GUI file panel as "moyenne".
+    sigma2_data_avg: f64,
     size: usize,
 }
 
@@ -259,57 +270,6 @@ pub fn spawn(
     }
 }
 
-/// First-order IIR de-emphasis filter, mathematical inverse of the TX
-/// pre-emphasis defined in `tx_worker::preemphasis_nbfm_48k`. Same
-/// bilinear transform at 48 kHz with tau1 = 750 us and tau2 = 75 us,
-/// roles of the time constants swapped:
-///   H(s) = (1 + s*tau2) / (1 + s*tau1)
-/// → -20 dB plateau above ~2 kHz, flat at DC, breakpoints near 212 Hz
-/// and 2.12 kHz. Cascaded with the matching pre-emphasis the response
-/// is flat to within discretization noise. Stateful: the worker keeps
-/// one instance across batches to avoid boundary clicks.
-pub struct DeemphasisFilter {
-    x_prev: f32,
-    y_prev: f32,
-}
-
-impl DeemphasisFilter {
-    // Bilinear coefficients without pre-warp, fs = 48 kHz, tau1/tau2
-    // swapped relative to preemphasis_nbfm_48k:
-    //   2*tau2/T = 7.2, 2*tau1/T = 72.0
-    //   Numerator   : 8.2 - 6.2 z^-1
-    //   Denominator : 73  - 71  z^-1
-    //   Normalized by a0 = 73 →
-    const B0: f32 = 0.112_328_77; // 8.2 / 73
-    const B1: f32 = -0.084_931_51; // -6.2 / 73
-    const A1: f32 = -0.972_602_75; // -71 / 73
-
-    pub fn new() -> Self {
-        Self {
-            x_prev: 0.0,
-            y_prev: 0.0,
-        }
-    }
-
-    /// Apply the filter in place. Designed to be called batch-by-batch;
-    /// internal state carries across calls.
-    pub fn process(&mut self, samples: &mut [f32]) {
-        for s in samples.iter_mut() {
-            let x = *s;
-            let y = Self::B0 * x + Self::B1 * self.x_prev - Self::A1 * self.y_prev;
-            self.x_prev = x;
-            self.y_prev = y;
-            *s = y;
-        }
-    }
-}
-
-impl Default for DeemphasisFilter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
@@ -335,11 +295,43 @@ const MAX_SESSION_SECONDS: u64 = 25 * 60;
 /// preamble already partially landing in this tick to still be detected.
 const PREROLL_SECONDS: usize = 2;
 
-/// While capturing, keep only this many seconds of trailing audio. Must
-/// cover at least 2 × V3 preamble period on the slowest profile (ULTRA
-/// emits one cycle every ~4.6 s). 15 s leaves comfortable margin for
-/// late-entry / marker jitter without letting rx_v3 grow unbounded.
-const CAPTURE_WINDOW_SECONDS: usize = 15;
+// History (kept terse) :
+//   - `CAPTURE_WINDOW_SECONDS = 15` rolling trim (data-loss cascade
+//     on long HIGH+ when a slow rx_v3 tick + trim dropped pending
+//     audio). Replaced by an unbounded buffer + per-tick scan
+//     bounding.
+//   - `SCAN_WINDOW_FAST/ULTRA_SECONDS` (per-tick fixed scan window,
+//     4 s for fast / 12 s for ULTRA). Failed because the V3 preamble
+//     period is ~4 s for *every* profile (`V3_PREAMBLE_PERIOD_S`),
+//     so a 4 s scan window hit the boundary case where 1 of every
+//     ~4 ticks just barely missed having two preambles
+//     simultaneously visible — that period's superframe never got a
+//     full-grid `rx_v2` decode and lost the codewords that needed
+//     drift compensation. Symptom: ~25 % block loss at low CPU.
+//   - **Now** : the scan walks the *entire* `session_buffer`, and
+//     after every successful tick the worker drains everything before
+//     `last_preamble_offset - TRUNCATE_MARGIN` (the position of the
+//     last preamble found by `find_all_preambles`, returned by
+//     `rx_v3_after`). The buffer becomes a self-purging queue that
+//     tracks the live preamble cadence — no period guess, no fixed
+//     scan window. P_last itself is preserved so the next tick can
+//     re-decode `[P_last, P_last+1]` as a closed window with the
+//     full drift grid once the next preamble lands.
+
+/// Pre-roll preserved before `last_preamble_offset` when truncating the
+/// session buffer after a scan. Covers `rx_v3_after`'s matched-filter
+/// pre-roll context (`(RRC_SPAN_SYM + 4) * pitch` ≤ 1536 samples = 32 ms
+/// for the slowest profile, ULTRA at sps=96), with margin. 100 ms is
+/// plenty for any V3 profile and costs ~4800 f32 = 19 KB of RAM.
+const TRUNCATE_MARGIN_MS: usize = 100;
+
+/// Hard cap on the in-memory audio buffer during a session. Defends
+/// against pathological cases where the truncation loop never advances
+/// (no preamble ever found, profile-detect loop, etc.). Five minutes at
+/// 48 kHz f32 mono = ~57 MB; below the practical RAM budget on any
+/// target. Bursts longer than this are unsupported by the V3 modem
+/// anyway (`MAX_SESSION_SECONDS`).
+const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 
 /// Fall back to Idle if no preamble has been seen for this long while
 /// Capturing — covers the case where the sender disappears mid-burst without
@@ -358,7 +350,7 @@ struct WorkerState {
     /// post-decode header refine. Required for HIGH+/FAST.
     forced: bool,
     /// Accumulated audio for the current capture. Rolled to PREROLL_SECONDS
-    /// while Idle (cheap noise buffer) ; bounded to CAPTURE_WINDOW_SECONDS
+    /// while Idle (cheap noise buffer) ; bounded to SESSION_HARD_CAP_SECONDS
     /// while Capturing so rx_v3 stays fast even on long salves.
     session_buffer: Vec<f32>,
     /// Disk-persistent store of decoded codewords, per session_id.
@@ -367,6 +359,11 @@ struct WorkerState {
     announced_sessions: HashSet<u32>,
     /// Last `received` count emitted per session, for progress rate-limiting.
     last_progress: std::collections::HashMap<u32, u32>,
+    /// Running mean of `result.sigma2_data` per session (sum + count).
+    /// Accumulated on every successful decode tick that touches the
+    /// session, drained on `file_complete` so the GUI receives the
+    /// across-the-burst average rather than the last window's value.
+    sigma2_data_running: std::collections::HashMap<u32, (f64, u32)>,
     /// First decoded protocol header, for legacy `header` event emission.
     header: Option<Header>,
     last_scan_at: Instant,
@@ -379,13 +376,6 @@ struct WorkerState {
     /// disappears mid-burst without sending EOT.
     last_preamble_seen_at: Instant,
     total_samples: u64,
-    /// Absolute offset (in capture samples since worker start) of the
-    /// most recent CLOSED preamble window already decoded. The next scan
-    /// passes `skip_until = last_closed_abs - buffer_start_abs` to
-    /// `rx_v3_after`, so closed windows aren't re-decoded each tick. Reset
-    /// on profile switch / soft buffer reset / preroll trim. None = no
-    /// closed window decoded yet (start, or after reset).
-    last_closed_preamble_abs: Option<u64>,
     /// Optional NBFM de-emphasis filter applied to the path going to the
     /// modem demodulator (after the raw WAV tee + level meter). `None`
     /// when the user has not enabled the toggle in Settings.
@@ -408,6 +398,7 @@ impl WorkerState {
             store,
             announced_sessions: HashSet::new(),
             last_progress: std::collections::HashMap::new(),
+            sigma2_data_running: std::collections::HashMap::new(),
             header: None,
             last_scan_at: now,
             last_audio_above_silence_at: now,
@@ -415,7 +406,6 @@ impl WorkerState {
             session_started_at: now,
             last_preamble_seen_at: now,
             total_samples: 0,
-            last_closed_preamble_abs: None,
             deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
         }
     }
@@ -425,7 +415,6 @@ impl WorkerState {
         self.header = None;
         self.session_active = false;
         self.announced_sessions.clear();
-        self.last_closed_preamble_abs = None;
     }
 
     /// Keep only the last `PREROLL_SECONDS` of audio in the in-memory buffer.
@@ -442,7 +431,6 @@ impl WorkerState {
         self.header = None;
         self.session_active = false;
         self.announced_sessions.clear();
-        self.last_closed_preamble_abs = None;
     }
 }
 
@@ -478,6 +466,16 @@ fn run_worker(
     };
     let mut state = WorkerState::new(profile, forced, store, deemphasis_enabled);
 
+    // Telemetry to surface "worker falling behind realtime" — the
+    // signature of CPU-limited HIGH+ on the Pi 5 SDR path. We compare
+    // wall-clock time to audio time (= samples processed / 48 kHz);
+    // on a healthy system the two stay locked. A growing gap is the
+    // smoking gun that the decoder can't keep up with the capture.
+    let started = Instant::now();
+    let mut last_telemetry_tick = Instant::now();
+    let mut last_batch_processing_ms: f64 = 0.0;
+    let mut max_batch_processing_ms: f64 = 0.0;
+
     while !stop.load(Ordering::Relaxed) {
         let first = match samples.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
@@ -488,6 +486,7 @@ fn run_worker(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        let batch_start = Instant::now();
         let mut batch = first;
         batch.reserve(BATCH_TARGET_SAMPLES);
         while batch.len() < BATCH_TARGET_SAMPLES {
@@ -533,22 +532,66 @@ fn run_worker(
             filter.process(&mut batch);
         }
 
-        // Append + rolling trim. Idle = PREROLL_SECONDS (just enough for a
-        // preamble landing across batch boundaries). Capturing =
-        // CAPTURE_WINDOW_SECONDS (≥ 2 × V3 preamble period, bounds rx_v3 CPU).
+        // Append. Trim policy:
+        //   - Idle  : PREROLL_SECONDS rolling window — just enough for a
+        //             preamble landing across batch boundaries.
+        //   - Active: NO rolling trim from the ingest path. Truncation
+        //             happens in `scan_and_route` after each successful
+        //             rx_v3 tick, draining everything before
+        //             `last_preamble_offset - TRUNCATE_MARGIN`. The
+        //             buffer therefore tracks the live preamble cadence
+        //             rather than a fixed-size window — closed windows
+        //             are always intact, no in-flight audio is ever
+        //             dropped under the decoder.
+        //   - Both  : SESSION_HARD_CAP_SECONDS catches pathological
+        //             "session never closes / no preamble ever found"
+        //             cases (sender vanished, profile-detect loop, ...).
         state.session_buffer.extend_from_slice(&batch);
-        let keep_secs = if state.session_active {
-            CAPTURE_WINDOW_SECONDS
+        let cap_secs = if state.session_active {
+            SESSION_HARD_CAP_SECONDS
         } else {
             PREROLL_SECONDS
         };
-        let keep = AUDIO_RATE as usize * keep_secs;
+        let cap = AUDIO_RATE as usize * cap_secs;
         let len = state.session_buffer.len();
-        if len > keep {
-            state.session_buffer.drain(..len - keep);
+        if len > cap {
+            state.session_buffer.drain(..len - cap);
         }
 
         maintenance_tick(&*sink, &save_dir, &mut state);
+
+        // Per-batch wall time, tracked so the 2 s telemetry tick can
+        // surface peak processing cost. A batch ≈ 500 ms of audio,
+        // so anything over ~500 ms here is "falling behind realtime".
+        last_batch_processing_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+        if last_batch_processing_ms > max_batch_processing_ms {
+            max_batch_processing_ms = last_batch_processing_ms;
+        }
+
+        // 2 s realtime-margin tick.
+        //   wall_s : seconds of wall clock since worker started
+        //   audio_s: seconds of audio that have actually been
+        //            consumed by this loop (= total_samples / 48 kHz)
+        //   lag_ms : (wall_s - audio_s) * 1000. Ideally near 0. A
+        //            positive growing value means the decoder can't
+        //            keep up with the capture and the session_buffer
+        //            trim is silently dropping audio under us.
+        if last_telemetry_tick.elapsed() >= Duration::from_secs(2) {
+            let wall_s = started.elapsed().as_secs_f64();
+            let audio_s = state.total_samples as f64 / AUDIO_RATE as f64;
+            let lag_ms = (wall_s - audio_s) * 1000.0;
+            let session_buf_ms =
+                state.session_buffer.len() as f64 * 1000.0 / AUDIO_RATE as f64;
+            worker_log(&format!(
+                "[worker] tick: audio={audio_s:.1}s wall={wall_s:.1}s \
+                 lag={lag_ms:+.0}ms last_batch={last_batch_processing_ms:.0}ms \
+                 max_batch={max_batch_processing_ms:.0}ms \
+                 session_buf={session_buf_ms:.0}ms session_active={}",
+                state.session_active
+            ));
+            last_telemetry_tick = Instant::now();
+            max_batch_processing_ms = 0.0;
+        }
     }
 
     worker_log("[worker] stop");
@@ -698,28 +741,22 @@ fn scan_and_route(
 
     let config = state.config.clone();
 
-    // Compute the relative skip offset : closed windows already decoded in
-    // earlier ticks are at absolute offsets ≤ `last_closed_preamble_abs`.
-    // Translate to a buffer-relative position so `rx_v3_after` can drop
-    // those preambles without re-running the (expensive) per-window decode.
-    let buf_start_abs = state
-        .total_samples
-        .saturating_sub(state.session_buffer.len() as u64);
-    let skip_rel = match state.last_closed_preamble_abs {
-        Some(abs) if abs > buf_start_abs => {
-            // +1 to exclude the watermark itself (we've already decoded it).
-            (abs - buf_start_abs + 1) as usize
-        }
-        _ => 0,
-    };
-
+    // Scan the entire `session_buffer` — no fixed-size scan window, no
+    // skip_until watermark. The buffer is kept small by the post-scan
+    // truncation below : after every successful tick we drain
+    // everything before `last_preamble_offset - TRUNCATE_MARGIN`, so by
+    // construction the buffer holds at most ~one preamble period of
+    // already-walked audio (≤ TRUNCATE_MARGIN_MS) plus whatever has
+    // arrived since the previous tick. `rx_v3_after`'s linear
+    // downmix/MF cost therefore stays bounded by the live preamble
+    // cadence, not by burst length.
     let t_rx_v3_start = Instant::now();
-    let rx_v3_opt = rx_v2::rx_v3_after(&state.session_buffer, &config, skip_rel);
+    let rx_v3_opt = rx_v2::rx_v3(&state.session_buffer, &config);
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
-            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} skip_rel={} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
-            state.session_active, buf_secs, state.profile, skip_rel, rms_sqr, t_probe_us, probe_label, probe_ratio, t_detect_us, t_rx_v3_us
+            "[scan] active={} buf={:.1}s rx_v3=None profile={:?} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
+            state.session_active, buf_secs, state.profile, rms_sqr, t_probe_us, probe_label, probe_ratio, t_detect_us, t_rx_v3_us
         ));
         return;
     };
@@ -748,11 +785,6 @@ fn scan_and_route(
                     state.config = hdr_profile.to_config();
                     state.header = None;
                     state.announced_sessions.clear();
-                    // The closed-window watermark was computed under the
-                    // wrong profile (different Rs/pitch can shift detected
-                    // positions). Drop it so the re-decode below scans
-                    // everything fresh.
-                    state.last_closed_preamble_abs = None;
                     sink.emit(
                         "profile_auto_detected",
                         serde_json::json!({ "profile": profile_name(state.profile) }),
@@ -795,16 +827,6 @@ fn scan_and_route(
             }
         }
     }
-    // Advance the closed-window watermark so the next tick passes
-    // `skip_until = last_closed_abs + 1` to rx_v3_after and avoids
-    // re-decoding the same closed windows. Only update when rx_v3 actually
-    // saw a closed window in this scan ; if positions.len() < 2 here, the
-    // value is None and we leave the watermark untouched (next scan will
-    // see the same 1 preamble plus any new one and treat the older one
-    // as closed).
-    if let Some(rel) = result.last_closed_preamble_offset {
-        state.last_closed_preamble_abs = Some(buf_start_abs + rel as u64);
-    }
     let eot_seen = result.eot_seen;
     worker_log(&format!(
         "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
@@ -833,8 +855,9 @@ fn scan_and_route(
     // buffer is trimmed to 2 s, which is too short to decode the meta CW
     // (needs ~0.7 s post-preamble including pilots). Golay(24,12) with 3
     // correctable bits per block is reliable enough to trust as a preamble
-    // confirmation ; once active, the buffer grows to CAPTURE_WINDOW_SECONDS
-    // and subsequent ticks will populate the meta.
+    // confirmation ; once active, the buffer grows freely (capped only
+    // by SESSION_HARD_CAP_SECONDS, ~5 min) and subsequent ticks will
+    // populate the meta.
     let header_ok = result
         .header
         .as_ref()
@@ -926,8 +949,23 @@ fn scan_and_route(
             },
         );
         if let Some(df) = state.store.peek_decoded(ah, state.profile) {
-            emit_decoded_file(sink, save_dir, &df, result.sigma2);
+            // Re-announce of an already-decoded session : we don't have
+            // a running mean (this is a peek, not a fresh decode), so
+            // pass the current window's sigma2_data as a best-effort.
+            emit_decoded_file(sink, save_dir, &df, result.sigma2, result.sigma2_data);
         }
+    }
+
+    // Accumulate the running mean of sigma2_data for this session : every
+    // tick that produced an AppHeader (and therefore a valid `result`)
+    // contributes one sample. Drained when the file completes (below).
+    {
+        let entry = state
+            .sigma2_data_running
+            .entry(ah.session_id)
+            .or_insert((0.0, 0));
+        entry.0 += result.sigma2_data;
+        entry.1 += 1;
     }
 
     // Route the packets to the disk store.
@@ -954,6 +992,7 @@ fn scan_and_route(
         // store (not the sliding rx_v3 window, which would only show the
         // last few seconds of ESIs and appear to "scroll").
         let sigma2 = result.sigma2;
+        let sigma2_data = result.sigma2_data;
         let expected = outcome.needed as usize;
         sink.emit(
             "v2_progress",
@@ -962,6 +1001,7 @@ fn scan_and_route(
                 blocks_total: result.total_blocks,
                 blocks_expected: expected,
                 sigma2,
+                sigma2_data,
                 converged_bitmap: outcome.seen_bitmap.clone(),
                 constellation_sample: result.constellation_sample.clone(),
                 pilot_phase_segments: result.pilot_phase_segments.clone(),
@@ -971,21 +1011,48 @@ fn scan_and_route(
 
     // A freshly-decoded file : emit session_decoded, copy to save_dir root
     // under the envelope filename, and emit the legacy file_complete event.
+    // The `sigma2_data` attached to file_complete is the running mean over
+    // every tick that contributed to this session.
     if let Some(df) = outcome.decoded {
-        emit_decoded_file(sink, save_dir, &df, result.sigma2);
+        let avg_sigma2_data = state
+            .sigma2_data_running
+            .get(&df.session_id)
+            .map(|&(sum, n)| if n > 0 { sum / n as f64 } else { result.sigma2_data })
+            .unwrap_or(result.sigma2_data);
+        emit_decoded_file(sink, save_dir, &df, result.sigma2, avg_sigma2_data);
     }
 
     // Free the in-memory audio buffer only once the TX explicitly signalled
-    // EOT. The older `just_decoded` trigger pre-dates the EOT frame : at the
-    // time, early trim was the cheapest way to keep rx_v3 fast after a
-    // decode. With EOT in place it becomes harmful — on a repair-padded
-    // burst (pct > 0), convergence fires at K while the tail repair packets
-    // are still on the wire, and the 2-s preroll usually strips the last
-    // periodic preamble so those tail ESIs never get latched in the next
-    // scan. CAPTURE_WINDOW_SECONDS (15 s) is already the hard cap, so
-    // dropping the early trim costs at most one slightly-slower scan.
+    // EOT. The older `just_decoded` trigger pre-dates the EOT frame : at
+    // the time, early trim was the cheapest way to keep rx_v3 fast after
+    // a decode. With EOT in place it becomes harmful — on a repair-padded
+    // burst (pct > 0), convergence fires at K while the tail repair
+    // packets are still on the wire, and the 2-s preroll usually strips
+    // the last periodic preamble so those tail ESIs never get latched in
+    // the next scan. The post-tick truncation below keeps the buffer
+    // small without dropping in-flight repair packets.
     if eot_seen {
         state.trim_buffer_to_preroll();
+        let _ = session_store::BLOB_WARN_RATIO;
+        return;
+    }
+
+    // Self-purging queue : drain everything before the LAST preamble
+    // found in this scan, minus a small MF pre-roll margin. P_last
+    // itself is preserved so that the next tick sees it again — once
+    // the next preamble (P_last+1) lands, the closed window
+    // [P_last, P_last+1] gets a full-grid `rx_v2` decode. Without
+    // this, the buffer would either grow without bound (memory) or
+    // need a fixed-size scan window (which fails when scan_window
+    // ≈ V3_PREAMBLE_PERIOD_S, see history note above the constants).
+    if let Some(p_last) = result.last_preamble_offset {
+        let margin = AUDIO_RATE as usize * TRUNCATE_MARGIN_MS / 1000;
+        let drain_end = p_last
+            .saturating_sub(margin)
+            .min(state.session_buffer.len());
+        if drain_end > 0 {
+            state.session_buffer.drain(..drain_end);
+        }
     }
 
     let _ = session_store::BLOB_WARN_RATIO; // keep the import visible for future UI use
@@ -1001,6 +1068,7 @@ fn emit_decoded_file(
     save_dir: &Arc<Mutex<PathBuf>>,
     df: &session_store::DecodedFile,
     sigma2: f64,
+    sigma2_data_avg: f64,
 ) {
     if let Some(fname) = df.meta.filename.clone() {
         sink.emit(
@@ -1063,6 +1131,7 @@ fn emit_decoded_file(
                     mime_type: final_mime,
                     saved_path: path.to_string_lossy().into_owned(),
                     sigma2,
+                    sigma2_data_avg,
                     size: final_content.len(),
                 },
             );
