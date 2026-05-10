@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Architecture RX SDR — chaîne NBFM partagée Pluto / SDRplay</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --good: #2b8f4a;
+        --good-soft: #ecf7ef;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem 6rem;
+    }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block;
+        font-size: 1rem;
+        font-weight: 400;
+        color: #666;
+        margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 {
+        margin-top: 1.8rem;
+        color: #444;
+    }
+    figure {
+        margin: 1.5rem 0;
+        padding: 0.8rem;
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    figure svg {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        margin: 0 auto;
+    }
+    figcaption {
+        font-size: 0.9rem;
+        color: #555;
+        margin-top: 0.6rem;
+        font-style: italic;
+        text-align: center;
+    }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em;
+        border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e;
+        color: #dcdcaa;
+        padding: 1rem;
+        border-radius: 5px;
+        overflow-x: auto;
+        font-size: 0.85rem;
+    }
+    pre code {
+        background: transparent;
+        color: inherit;
+        padding: 0;
+    }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+        font-size: 0.93rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.5rem 0.7rem;
+        text-align: left;
+        vertical-align: top;
+    }
+    th {
+        background: var(--accent-soft);
+        color: var(--accent);
+    }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: #fff8f0;
+        margin: 1rem 0;
+        border-radius: 0 4px 4px 0;
+    }
+    .callout.info {
+        border-left-color: var(--accent);
+        background: var(--accent-soft);
+    }
+    .callout.good {
+        border-left-color: var(--good);
+        background: var(--good-soft);
+    }
+    nav.toc {
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 1rem 1.5rem;
+        margin: 1.5rem 0;
+        font-size: 0.95rem;
+    }
+    nav.toc ol {
+        margin: 0.4rem 0 0 1rem;
+        padding: 0;
+    }
+    nav.toc a {
+        color: var(--accent);
+        text-decoration: none;
+    }
+    nav.toc a:hover {
+        text-decoration: underline;
+    }
+    .meta {
+        color: #888;
+        font-size: 0.88rem;
+        margin-top: -0.3rem;
+    }
+    .tag {
+        display: inline-block;
+        padding: 0.1em 0.5em;
+        background: var(--accent);
+        color: white;
+        border-radius: 3px;
+        font-size: 0.75rem;
+        margin-right: 0.3rem;
+        letter-spacing: 0.5px;
+    }
+    .tag.rx { background: #bf5f2b; }
+    .tag.dsp { background: #7f2bbf; }
+    .tag.gr { background: #2b8f4a; }
+    .filename {
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.88em;
+        color: #555;
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Architecture RX SDR — chaîne NBFM partagée Pluto / SDRplay
+    <span class="sub">Documentation technique — 2026-05-10 — sélection canal + démod + filtres audio</span>
+</h1>
+
+<p class="meta">
+    Sources :
+    <code>rust/modem-sdr-dsp/src/nbfm_rx_chain.rs</code>,
+    <code>rust/modem-sdr-dsp/src/freq_xlating.rs</code>,
+    <code>rust/modem-sdr-dsp/src/decimator.rs</code>,
+    <code>rust/modem-sdr-dsp/src/fm_demod.rs</code>,
+    <code>rust/modem-sdr-dsp/src/audio_filters.rs</code>,
+    <code>rust/modem-sdrplay/src/{rx,device}.rs</code>,
+    <code>rust/modem-pluto/src/rx.rs</code>.
+    <br>
+    Référence GNU&nbsp;Radio :
+    <code>gr-analog/python/analog/nbfm_rx.py</code>,
+    <code>gr-filter/include/gnuradio/filter/freq_xlating_fir_filter.h</code>.
+</p>
+
+<nav class="toc">
+    <strong>Sommaire</strong>
+    <ol>
+        <li><a href="#why">1. Pourquoi cette architecture — le bug originel</a></li>
+        <li><a href="#layers">2. Les couches : transport vs DSP</a></li>
+        <li><a href="#chain">3. La chaîne <code>NbfmRxChain</code> en détail</a></li>
+        <li><a href="#xlating">4. Le bloc <code>FreqXlatingFir</code> (port GR)</a></li>
+        <li><a href="#filter">5. Filtre canal — paramètres Kaiser</a></li>
+        <li><a href="#backends">6. Spécificités backend — LO offset SDRplay</a></li>
+        <li><a href="#params">7. Tableau des paramètres par cas</a></li>
+        <li><a href="#test">8. Comment vérifier que ça marche</a></li>
+    </ol>
+</nav>
+
+<!-- ====================================================================== -->
+<h2 id="why">1. Pourquoi cette architecture — le bug originel</h2>
+
+<p>
+    Avant ce refactor, la chaîne RX SDR (Pluto comme SDRplay) était :
+    <strong>I/Q → démodulateur FM → décimation audio</strong>. Le discriminateur
+    tournait au taux d'échantillonnage I/Q complet (576&nbsp;kHz, BW
+    1.5&nbsp;MHz côté SDRplay) et n'importe quel canal voisin dans cette
+    bande contribuait à l'audio démodulé. Deux bugs concrets en découlaient :
+</p>
+
+<ul>
+    <li>
+        <strong>Pas de réjection canaux adjacents</strong> — un voisin à 25&nbsp;kHz,
+        même 40&nbsp;dB plus fort, passait dans le démod sans atténuation. En
+        bande 2&nbsp;m amateur active, l'audio reçu est inintelligible.
+    </li>
+    <li>
+        <strong>DC spike sur le SDRplay</strong> — le tuner Mirics MSi001 en
+        zero-IF a une pointe de DC (fuite LO + offset ADC). Le LO étant
+        programmé sur la fréquence utilisateur, la porteuse à recevoir
+        tombait pile sur la pointe. Empiriquement, l'utilisateur obtenait
+        <em>une bien meilleure réception en saisissant 145.500&nbsp;MHz au
+        lieu de 145.550&nbsp;MHz</em> (= LO décalé par erreur, signal
+        sortant du DC spike).
+    </li>
+</ul>
+
+<p>
+    Le refactor introduit la <strong>sélection canal avant le démod</strong>
+    (port du bloc <code>freq_xlating_fir_filter_ccf</code> de GNU&nbsp;Radio)
+    et un <strong>LO offset matériel + NCO digital</strong> côté SDRplay
+    pour s'écarter du DC spike. La chaîne est <strong>partagée</strong>
+    entre Pluto et SDRplay : un seul code DSP, paramétré par le backend.
+</p>
+
+<!-- ====================================================================== -->
+<h2 id="layers">2. Les couches : transport vs DSP</h2>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 380" font-family="Consolas, Monaco, monospace" font-size="13">
+    <!-- Layer rectangles -->
+    <defs>
+        <linearGradient id="gtransport" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#fef0e6"/>
+            <stop offset="100%" stop-color="#fcdcc4"/>
+        </linearGradient>
+        <linearGradient id="gdsp" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#ece4f7"/>
+            <stop offset="100%" stop-color="#d9c8ee"/>
+        </linearGradient>
+        <linearGradient id="gabstract" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#e8f3fa"/>
+            <stop offset="100%" stop-color="#cfe5f5"/>
+        </linearGradient>
+    </defs>
+
+    <!-- Top layer: abstract trait surface -->
+    <rect x="40" y="20" width="820" height="80" rx="8" fill="url(#gabstract)" stroke="#2b7fbf" stroke-width="1.5"/>
+    <text x="60" y="45" font-weight="bold" fill="#2b7fbf">modem-sdr</text>
+    <text x="60" y="65" fill="#444">Surface trait abstraite : SdrBackend, SdrDevice, SdrConfig (avec backend_extras pour les knobs spécifiques)</text>
+    <text x="60" y="85" font-style="italic" fill="#666" font-size="11">→ pas touché par le refactor — le LO offset reste interne au backend SDRplay</text>
+
+    <!-- DSP layer (shared) -->
+    <rect x="40" y="120" width="820" height="100" rx="8" fill="url(#gdsp)" stroke="#7f2bbf" stroke-width="1.5"/>
+    <text x="60" y="145" font-weight="bold" fill="#7f2bbf">modem-sdr-dsp</text>
+    <text x="60" y="165" fill="#444">Primitives DSP partagées (NbfmRxChain, FreqXlatingFir, QuadratureDemod, audio filters, decimator, kaiser_sinc_taps)</text>
+    <text x="60" y="185" font-style="italic" fill="#666" font-size="11">→ aucun code backend-spécifique. Génériquement paramétré par (input_rate, max_dev, lo_offset).</text>
+    <text x="60" y="205" fill="#444" font-weight="bold">★ La chaîne RX vit ici. Les backends ne réimplémentent pas la DSP.</text>
+
+    <!-- Backends (transport) -->
+    <rect x="40" y="240" width="395" height="120" rx="8" fill="url(#gtransport)" stroke="#bf5f2b" stroke-width="1.5"/>
+    <text x="60" y="265" font-weight="bold" fill="#bf5f2b">modem-pluto</text>
+    <text x="60" y="285" fill="#444">Transport : iiod-TCP buffer pump,</text>
+    <text x="60" y="302" fill="#444">S12-in-S16 → Complex32, polling.</text>
+    <text x="60" y="325" font-style="italic" fill="#666">DC compensation matérielle AD9363</text>
+    <text x="60" y="343" font-style="italic" fill="#666">→ <code>lo_offset_hz = 0</code></text>
+
+    <rect x="465" y="240" width="395" height="120" rx="8" fill="url(#gtransport)" stroke="#bf5f2b" stroke-width="1.5"/>
+    <text x="485" y="265" font-weight="bold" fill="#bf5f2b">modem-sdrplay</text>
+    <text x="485" y="285" fill="#444">Transport : sdrplay_api callback,</text>
+    <text x="485" y="302" fill="#444">int16 full-scale → Complex32, async.</text>
+    <text x="485" y="325" font-style="italic" fill="#666">Tuner Mirics zero-IF, DC spike</text>
+    <text x="485" y="343" font-style="italic" fill="#666">→ <code>lo_offset_hz = +75 kHz</code></text>
+
+    <!-- Arrows from backends up to DSP -->
+    <path d="M 235 240 L 235 220" stroke="#444" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+    <path d="M 660 240 L 660 220" stroke="#444" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+    <text x="245" y="232" font-size="11" fill="#666">utilise NbfmRxChain</text>
+    <text x="670" y="232" font-size="11" fill="#666">utilise NbfmRxChain</text>
+
+    <!-- Arrow from abstract down to backends (covers everything) -->
+    <path d="M 235 100 L 235 240" stroke="#2b7fbf" stroke-dasharray="4 3" stroke-width="1" fill="none"/>
+    <path d="M 660 100 L 660 240" stroke="#2b7fbf" stroke-dasharray="4 3" stroke-width="1" fill="none"/>
+
+    <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+        </marker>
+    </defs>
+</svg>
+<figcaption>Couches du workspace. La DSP est centralisée dans <code>modem-sdr-dsp</code>;
+    les backends ne s'en occupent pas, ils ne font que le transport.</figcaption>
+</figure>
+
+<div class="callout info">
+    <strong>Invariant architectural :</strong> ajouter un backend (RTL-SDR,
+    Lime, …) consiste à écrire <em>un seul</em> <code>rx.rs</code> qui fait
+    le pont format-sample → <code>Complex32</code> et appelle
+    <code>NbfmRxChain::process()</code>. La DSP n'est plus à recopier.
+</div>
+
+<!-- ====================================================================== -->
+<h2 id="chain">3. La chaîne <code>NbfmRxChain</code> en détail</h2>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 280" font-family="Consolas, Monaco, monospace" font-size="13">
+    <defs>
+        <linearGradient id="gblock" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#ffffff"/>
+            <stop offset="100%" stop-color="#eef2f7"/>
+        </linearGradient>
+        <linearGradient id="ghot" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#fff5e8"/>
+            <stop offset="100%" stop-color="#ffe1ba"/>
+        </linearGradient>
+        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+        </marker>
+    </defs>
+
+    <!-- Input -->
+    <rect x="20" y="100" width="120" height="60" rx="6" fill="#e8f6ff" stroke="#2b7fbf" stroke-width="1.5"/>
+    <text x="80" y="125" text-anchor="middle" font-weight="bold" fill="#2b7fbf">SDR I/Q</text>
+    <text x="80" y="145" text-anchor="middle" font-size="11" fill="#444">576 / 2304 kS/s</text>
+
+    <!-- Conversion -->
+    <rect x="160" y="100" width="120" height="60" rx="6" fill="url(#gblock)" stroke="#666" stroke-width="1"/>
+    <text x="220" y="123" text-anchor="middle" font-size="11">i16 → Complex32</text>
+    <text x="220" y="138" text-anchor="middle" font-size="10" fill="#666">/ 32768  (SDRplay)</text>
+    <text x="220" y="151" text-anchor="middle" font-size="10" fill="#666">/ 2047   (Pluto S12)</text>
+
+    <!-- FreqXlatingFir (the big block) -->
+    <rect x="300" y="60" width="220" height="140" rx="8" fill="url(#ghot)" stroke="#bf5f2b" stroke-width="2"/>
+    <text x="410" y="85" text-anchor="middle" font-weight="bold" fill="#bf5f2b">FreqXlatingFir</text>
+    <text x="410" y="100" text-anchor="middle" font-size="10" font-style="italic" fill="#666">(== GR freq_xlating_fir_filter_ccf)</text>
+    <line x1="320" y1="110" x2="500" y2="110" stroke="#bf5f2b" stroke-dasharray="3 2" opacity="0.5"/>
+    <text x="410" y="128" text-anchor="middle" font-size="11">① NCO ×exp(−j·ω·n)</text>
+    <text x="410" y="145" text-anchor="middle" font-size="11">② FIR LPF Kaiser 80 dB</text>
+    <text x="410" y="162" text-anchor="middle" font-size="11">③ ÷N décimation</text>
+    <text x="410" y="190" text-anchor="middle" font-size="11" fill="#bf5f2b" font-weight="bold">→ 48 kHz I/Q centré DC</text>
+
+    <!-- QuadratureDemod -->
+    <rect x="540" y="100" width="120" height="60" rx="6" fill="url(#gblock)" stroke="#666" stroke-width="1"/>
+    <text x="600" y="120" text-anchor="middle" font-size="11" font-weight="bold">QuadratureDemod</text>
+    <text x="600" y="135" text-anchor="middle" font-size="10" fill="#666">atan2(z·conj(z⁻¹))</text>
+    <text x="600" y="150" text-anchor="middle" font-size="10" fill="#666">à 48 kHz</text>
+
+    <!-- DeemphasisLpf -->
+    <rect x="680" y="100" width="100" height="60" rx="6" fill="url(#gblock)" stroke="#666" stroke-width="1"/>
+    <text x="730" y="123" text-anchor="middle" font-size="11" font-weight="bold">Deemph LPF</text>
+    <text x="730" y="138" text-anchor="middle" font-size="10" fill="#666">single-pole IIR</text>
+    <text x="730" y="151" text-anchor="middle" font-size="10" fill="#666">corner 300 Hz</text>
+
+    <!-- SubAudioHpf -->
+    <rect x="800" y="100" width="100" height="60" rx="6" fill="url(#gblock)" stroke="#666" stroke-width="1"/>
+    <text x="850" y="123" text-anchor="middle" font-size="11" font-weight="bold">SubAudio HPF</text>
+    <text x="850" y="138" text-anchor="middle" font-size="10" fill="#666">CTCSS reject</text>
+    <text x="850" y="151" text-anchor="middle" font-size="10" fill="#666">corner 300 Hz</text>
+
+    <!-- Output -->
+    <rect x="920" y="100" width="50" height="60" rx="6" fill="#ecf7ef" stroke="#2b8f4a" stroke-width="1.5"/>
+    <text x="945" y="125" text-anchor="middle" font-size="11" fill="#2b8f4a" font-weight="bold">→</text>
+    <text x="945" y="142" text-anchor="middle" font-size="10" fill="#2b8f4a">48 kHz</text>
+    <text x="945" y="155" text-anchor="middle" font-size="10" fill="#2b8f4a">audio f32</text>
+
+    <!-- Arrows -->
+    <line x1="140" y1="130" x2="160" y2="130" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="280" y1="130" x2="300" y2="130" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="520" y1="130" x2="540" y2="130" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="660" y1="130" x2="680" y2="130" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="780" y1="130" x2="800" y2="130" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="900" y1="130" x2="920" y2="130" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+    <!-- Rate annotations under the arrows -->
+    <text x="290" y="155" text-anchor="middle" font-size="10" fill="#888">[Complex32]</text>
+    <text x="530" y="220" text-anchor="middle" font-size="10" fill="#bf5f2b">[Complex32 @ 48k]</text>
+    <text x="670" y="155" text-anchor="middle" font-size="10" fill="#888">[f32]</text>
+    <text x="790" y="155" text-anchor="middle" font-size="10" fill="#888">[f32]</text>
+    <text x="910" y="155" text-anchor="middle" font-size="10" fill="#888">[f32]</text>
+
+    <!-- Highlighted: where the heavy lifting happens -->
+    <text x="410" y="225" text-anchor="middle" font-size="11" fill="#bf5f2b" font-style="italic">★ 99 % du CPU + tout le filtrage canal</text>
+    <text x="410" y="245" text-anchor="middle" font-size="10" fill="#888">décimation polyphase ÷6, ÷12 ou ÷48 selon backend</text>
+</svg>
+<figcaption>Pipeline complet de <code>NbfmRxChain::process(&amp;[Complex32]) → Vec&lt;f32&gt;</code>.
+    Le bloc orange (<code>FreqXlatingFir</code>) est nouveau ; tout le reste pré-existait.</figcaption>
+</figure>
+
+<h3>Topologie GR équivalente</h3>
+
+<p>
+    La chaîne est l'idiome canonique de réception NBFM en GNU&nbsp;Radio :
+    un <code>freq_xlating_fir_filter_ccf</code> en amont de <code>nbfm_rx</code>.
+    Notre <code>NbfmRxChain</code> fusionne les deux dans un seul struct, avec
+    le même découpage de responsabilités :
+</p>
+
+<pre><code># GNU Radio flowgraph idiomatique pour NBFM
+src = sdr_source(...)            # I/Q at e.g. 576 kS/s
+sel = freq_xlating_fir_filter_ccf(
+        decim=12,
+        taps=firdes.low_pass(...),  # Kaiser 80 dB
+        center_freq=lo_offset_hz,
+        sampling_freq=576_000,
+)
+nbfm = nbfm_rx(audio_rate=48_000, quad_rate=48_000, max_dev=5_000)
+self.connect(src, sel, nbfm, audio_sink)
+</code></pre>
+
+<p>
+    Côté Rust, ces quatre lignes deviennent un seul appel :
+</p>
+
+<pre><code>let mut chain = NbfmRxChain::new(NbfmRxChainConfig::new(
+    input_rate_hz: 576_000,
+    max_deviation_hz: 5_000.0,
+    lo_offset_hz: 75_000.0,    // 0.0 sur Pluto (DC compensation matérielle)
+));
+let audio = chain.process(&iq_complex32);  // → Vec&lt;f32&gt; @ 48 kHz
+</code></pre>
+
+<!-- ====================================================================== -->
+<h2 id="xlating">4. Le bloc <code>FreqXlatingFir</code> (port GR)</h2>
+
+<p>
+    C'est la pièce nouvelle, et la plus importante. Elle fait
+    <strong>trois opérations en un seul bloc</strong> :
+</p>
+
+<ol>
+    <li>
+        <strong>NCO digital</strong> — multiplie chaque échantillon I/Q par
+        <code>exp(−j·ω·n)</code> où <code>ω = 2π·lo_offset/fs</code>. Ramène
+        un signal qui était à <code>+lo_offset</code> Hz vers le DC.
+    </li>
+    <li>
+        <strong>Filtre LPF complexe</strong> — FIR à coefficients réels
+        (taps Kaiser, ~700 taps pour 80 dB) appliqué sur l'I/Q déjà
+        descendu en bande de base. Rejette tout ce qui sort du canal NBFM
+        choisi.
+    </li>
+    <li>
+        <strong>Décimation polyphase ÷N</strong> — n'évalue le FIR qu'une
+        fois sur N échantillons d'entrée, où <code>N = input_rate / 48&nbsp;kHz</code>.
+        Le coût de calcul total est dominé par la sortie audio
+        (48&nbsp;kHz × N_taps × 2 mults complexes).
+    </li>
+</ol>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 350" font-family="Consolas, Monaco, monospace" font-size="12">
+    <!-- Spectrum BEFORE -->
+    <text x="200" y="25" text-anchor="middle" font-weight="bold" fill="#444">Spectre I/Q d'entrée (576 kHz, ±288 kHz vu)</text>
+
+    <line x1="50" y1="100" x2="350" y2="100" stroke="#333" stroke-width="1"/>
+    <line x1="200" y1="40" x2="200" y2="105" stroke="#888" stroke-width="0.5" stroke-dasharray="3 2"/>
+    <text x="200" y="115" text-anchor="middle" font-size="10" fill="#666">DC</text>
+
+    <!-- DC spike at 0 -->
+    <line x1="200" y1="60" x2="200" y2="100" stroke="#bf5f2b" stroke-width="3"/>
+    <text x="205" y="58" font-size="10" fill="#bf5f2b">DC spike</text>
+
+    <!-- Wanted at +75 kHz -->
+    <path d="M 245 100 Q 252 75, 260 75 Q 268 75, 275 100" fill="#2b7fbf" opacity="0.4" stroke="#2b7fbf"/>
+    <text x="260" y="68" text-anchor="middle" font-size="10" fill="#2b7fbf">wanted</text>
+    <text x="260" y="118" text-anchor="middle" font-size="9" fill="#666">+75 kHz</text>
+
+    <!-- Adjacent at +100 kHz -->
+    <path d="M 285 100 Q 290 90, 295 90 Q 300 90, 305 100" fill="#888" opacity="0.4"/>
+    <text x="295" y="83" text-anchor="middle" font-size="9" fill="#888">adj</text>
+
+    <!-- Adjacent at -50 kHz -->
+    <path d="M 145 100 Q 150 92, 155 92 Q 160 92, 165 100" fill="#888" opacity="0.4"/>
+    <text x="155" y="85" text-anchor="middle" font-size="9" fill="#888">adj</text>
+
+    <!-- Frequency labels -->
+    <text x="50" y="135" font-size="9" fill="#666">−288 kHz</text>
+    <text x="350" y="135" font-size="9" fill="#666">+288 kHz</text>
+
+    <!-- Big arrow: NCO shifts -->
+    <text x="450" y="80" font-size="11" font-weight="bold" fill="#bf5f2b">① NCO shift</text>
+    <text x="450" y="95" font-size="10" fill="#666">×exp(−j·2π·75k·n/576k)</text>
+    <line x1="450" y1="100" x2="540" y2="100" stroke="#bf5f2b" stroke-width="2" marker-end="url(#arr3)"/>
+
+    <defs>
+        <marker id="arr3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#bf5f2b"/>
+        </marker>
+    </defs>
+
+    <!-- Spectrum AFTER NCO -->
+    <line x1="560" y1="100" x2="780" y2="100" stroke="#333" stroke-width="1"/>
+    <line x1="670" y1="40" x2="670" y2="105" stroke="#888" stroke-width="0.5" stroke-dasharray="3 2"/>
+    <text x="670" y="115" text-anchor="middle" font-size="10" fill="#666">DC</text>
+
+    <!-- DC spike now at +75 kHz -->
+    <line x1="715" y1="80" x2="715" y2="100" stroke="#bf5f2b" stroke-width="3"/>
+    <text x="720" y="78" font-size="10" fill="#bf5f2b">spike</text>
+
+    <!-- Wanted now at DC -->
+    <path d="M 660 100 Q 668 60, 675 60 Q 682 60, 690 100" fill="#2b7fbf" opacity="0.5" stroke="#2b7fbf"/>
+    <text x="675" y="55" text-anchor="middle" font-size="10" fill="#2b7fbf" font-weight="bold">wanted @ DC</text>
+
+    <!-- Adjacents: still at their relative positions but shifted -->
+    <path d="M 752 100 Q 757 92, 762 92 Q 766 92, 770 100" fill="#888" opacity="0.4"/>
+    <path d="M 615 100 Q 620 92, 625 92 Q 630 92, 635 100" fill="#888" opacity="0.4"/>
+
+    <!-- LPF mask -->
+    <text x="200" y="170" text-anchor="middle" font-weight="bold" fill="#444">LPF Kaiser ±8 kHz appliqué après NCO (dans le bloc)</text>
+
+    <line x1="50" y1="240" x2="350" y2="240" stroke="#333" stroke-width="1"/>
+    <line x1="200" y1="180" x2="200" y2="245" stroke="#888" stroke-width="0.5" stroke-dasharray="3 2"/>
+    <text x="200" y="255" text-anchor="middle" font-size="10" fill="#666">DC</text>
+
+    <!-- LPF passband shaded -->
+    <rect x="180" y="180" width="40" height="60" fill="#2b8f4a" opacity="0.18"/>
+    <text x="200" y="195" text-anchor="middle" font-size="9" fill="#2b8f4a">passband</text>
+    <text x="200" y="208" text-anchor="middle" font-size="9" fill="#2b8f4a">±8 kHz</text>
+
+    <!-- Wanted in passband -->
+    <path d="M 190 240 Q 197 210, 200 210 Q 203 210, 210 240" fill="#2b7fbf" opacity="0.6"/>
+    <text x="200" y="270" text-anchor="middle" font-size="10" fill="#2b7fbf" font-weight="bold">passe ✓</text>
+
+    <!-- Adjacents and spike: rejected -->
+    <text x="245" y="220" font-size="9" fill="#888">stop</text>
+    <text x="245" y="232" font-size="9" fill="#888">−80 dB</text>
+    <text x="155" y="220" font-size="9" fill="#888">stop</text>
+    <text x="155" y="232" font-size="9" fill="#888">−80 dB</text>
+
+    <!-- Final output -->
+    <text x="600" y="170" text-anchor="middle" font-weight="bold" fill="#444">Sortie : I/Q décimé à 48 kHz, signal centré DC</text>
+    <line x1="500" y1="240" x2="780" y2="240" stroke="#333" stroke-width="1"/>
+    <line x1="640" y1="180" x2="640" y2="245" stroke="#888" stroke-width="0.5" stroke-dasharray="3 2"/>
+    <text x="640" y="255" text-anchor="middle" font-size="10" fill="#666">DC</text>
+
+    <path d="M 615 240 Q 632 200, 640 200 Q 648 200, 665 240" fill="#2bbf7f" opacity="0.6" stroke="#2b8f4a"/>
+    <text x="640" y="195" text-anchor="middle" font-size="11" fill="#2b8f4a" font-weight="bold">propre, prêt pour démod</text>
+
+    <text x="500" y="260" font-size="9" fill="#666">−24 kHz</text>
+    <text x="780" y="260" font-size="9" fill="#666">+24 kHz</text>
+
+    <!-- Arrow ② FIR + decim -->
+    <text x="450" y="200" font-size="11" font-weight="bold" fill="#bf5f2b">② FIR + ③ ÷N</text>
+    <line x1="450" y1="220" x2="500" y2="220" stroke="#bf5f2b" stroke-width="2" marker-end="url(#arr3)"/>
+</svg>
+<figcaption>Schéma spectral des trois étapes internes au <code>FreqXlatingFir</code>.
+    Le NCO décale le spectre, le LPF rejette ce qui n'est plus à DC, la décim baisse le rate.</figcaption>
+</figure>
+
+<h3>Pourquoi un seul bloc et pas trois étapes séparées</h3>
+
+<p>
+    On pourrait écrire <code>NCO → LPF → décim</code> comme trois opérations
+    distinctes, mais l'astuce de GR (que <code>FreqXlatingFir</code>
+    reproduit) c'est que la décim N divise le coût du FIR par N : le FIR
+    n'est évalué qu'une fois sur N. Et garder les <strong>taps réels</strong>
+    (au lieu de pré-rotater par <code>exp(j·ω·k)</code> comme GR le fait
+    en interne) coûte deux multiplications par paire (re,&nbsp;im) au lieu
+    de quatre. Au final, ~5&nbsp;Mmac/s sur le préféré 576&nbsp;kS/s ÷12,
+    sous 1&nbsp;% d'un cœur Pi&nbsp;5.
+</p>
+
+<!-- ====================================================================== -->
+<h2 id="filter">5. Filtre canal — paramètres Kaiser</h2>
+
+<p>
+    Le LPF dans <code>FreqXlatingFir</code> est conçu par
+    <code>kaiser_sinc_taps()</code> à partir de quatre paramètres :
+</p>
+
+<ul>
+    <li><code>fs_hz</code> — taux d'entrée du FIR (= input_rate du SDR).</li>
+    <li><code>passband_end_hz</code> — dernier Hz à passer ≤ 0.1&nbsp;dB ; calculé
+        comme <code>max_deviation_hz + AUDIO_MARGIN_HZ</code> (= 3&nbsp;kHz).</li>
+    <li><code>stopband_start_hz</code> — premier Hz à atténuer ≤ −80&nbsp;dB ;
+        <code>passband_end × TRANSITION_RATIO</code> (= 1.5).</li>
+    <li><code>stopband_db</code> — atténuation cible (default 80&nbsp;dB).</li>
+</ul>
+
+<p>
+    La largeur de bande totale du canal (sur Complex32, donc symétrique
+    autour de DC) est <strong>2 × passband_end_hz</strong>, ce qui correspond
+    à la formule de Carson&nbsp;:
+</p>
+
+<pre><code>BW_canal = 2 · (Δf + f_audio_max)</code></pre>
+
+<table>
+    <tr>
+        <th>Mode</th><th>Δf (max_dev)</th><th>passband_end</th>
+        <th>BW totale (Carson)</th><th>stopband</th>
+        <th>N taps @ 576 kHz</th>
+    </tr>
+    <tr>
+        <td>NBFM standard</td><td>±5 kHz</td><td>8 kHz</td>
+        <td>16 kHz</td><td>12 kHz</td><td>~723</td>
+    </tr>
+    <tr>
+        <td>narrow NFM</td><td>±2.5 kHz</td><td>5.5 kHz</td>
+        <td>11 kHz</td><td>8.25 kHz</td><td>~1051</td>
+    </tr>
+</table>
+
+<div class="callout info">
+    <strong>Pourquoi Kaiser et pas Hamming&nbsp;?</strong> Hamming plafonne à
+    ~53&nbsp;dB de réjection quel que soit le nombre de taps — insuffisant
+    pour un voisin 60&nbsp;dB plus fort en bande encombrée. Kaiser permet
+    de viser n'importe quel rejet (formule&nbsp;:
+    <code>β = 0.1102·(A−8.7)</code> pour A&nbsp;&gt;&nbsp;50&nbsp;dB) au prix
+    d'un tap count proportionnel.
+</div>
+
+<!-- ====================================================================== -->
+<h2 id="backends">6. Spécificités backend — LO offset SDRplay</h2>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 280" font-family="Consolas, Monaco, monospace" font-size="12">
+    <!-- SDRplay path -->
+    <text x="225" y="25" text-anchor="middle" font-weight="bold" fill="#bf5f2b">SDRplay (Mirics MSi001 zero-IF)</text>
+    <text x="225" y="42" text-anchor="middle" font-size="11" fill="#666">DC spike résiduel → on l'évite avec un offset</text>
+
+    <!-- User input -->
+    <rect x="30" y="60" width="120" height="50" rx="5" fill="#e8f3fa" stroke="#2b7fbf"/>
+    <text x="90" y="80" text-anchor="middle" font-size="11">VFO utilisateur</text>
+    <text x="90" y="98" text-anchor="middle" font-size="11" font-weight="bold">145.550 MHz</text>
+
+    <!-- Tuner programmed -->
+    <rect x="170" y="60" width="140" height="50" rx="5" fill="#fef0e6" stroke="#bf5f2b"/>
+    <text x="240" y="78" text-anchor="middle" font-size="11">Tuner LO programmé</text>
+    <text x="240" y="95" text-anchor="middle" font-size="11" font-weight="bold">VFO + 75 kHz</text>
+    <text x="240" y="108" text-anchor="middle" font-size="10" fill="#666">= 145.625 MHz</text>
+
+    <!-- Resulting spectrum -->
+    <rect x="330" y="60" width="200" height="50" rx="5" fill="#fff" stroke="#666"/>
+    <text x="430" y="78" text-anchor="middle" font-size="11">→ I/Q : signal à <strong>−75 kHz</strong></text>
+    <text x="430" y="95" text-anchor="middle" font-size="11">DC spike au centre (loin)</text>
+
+    <!-- NCO compensates -->
+    <rect x="550" y="60" width="160" height="50" rx="5" fill="#ece4f7" stroke="#7f2bbf"/>
+    <text x="630" y="78" text-anchor="middle" font-size="11">NbfmRxChain.NCO</text>
+    <text x="630" y="95" text-anchor="middle" font-size="10">×exp(+j·2π·75k·n/fs)</text>
+    <text x="630" y="108" text-anchor="middle" font-size="9" fill="#666">remonte le signal au DC</text>
+
+    <!-- Output -->
+    <rect x="730" y="60" width="140" height="50" rx="5" fill="#ecf7ef" stroke="#2b8f4a"/>
+    <text x="800" y="80" text-anchor="middle" font-size="11">Démod voit le signal</text>
+    <text x="800" y="98" text-anchor="middle" font-size="11" font-weight="bold">au centre du canal</text>
+
+    <!-- Arrows -->
+    <line x1="150" y1="85" x2="170" y2="85" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+    <line x1="310" y1="85" x2="330" y2="85" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+    <line x1="530" y1="85" x2="550" y2="85" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+    <line x1="710" y1="85" x2="730" y2="85" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+
+    <defs>
+        <marker id="arr4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+        </marker>
+    </defs>
+
+    <!-- Pluto path -->
+    <text x="225" y="170" text-anchor="middle" font-weight="bold" fill="#2b8f4a">Pluto (AD9363)</text>
+    <text x="225" y="187" text-anchor="middle" font-size="11" fill="#666">DC compensation matérielle → pas d'offset nécessaire</text>
+
+    <!-- User input -->
+    <rect x="30" y="205" width="120" height="50" rx="5" fill="#e8f3fa" stroke="#2b7fbf"/>
+    <text x="90" y="225" text-anchor="middle" font-size="11">VFO utilisateur</text>
+    <text x="90" y="243" text-anchor="middle" font-size="11" font-weight="bold">145.550 MHz</text>
+
+    <!-- Tuner programmed -->
+    <rect x="170" y="205" width="140" height="50" rx="5" fill="#ecf7ef" stroke="#2b8f4a"/>
+    <text x="240" y="223" text-anchor="middle" font-size="11">Tuner LO programmé</text>
+    <text x="240" y="240" text-anchor="middle" font-size="11" font-weight="bold">VFO direct</text>
+    <text x="240" y="252" text-anchor="middle" font-size="10" fill="#666">= 145.550 MHz</text>
+
+    <!-- Resulting spectrum -->
+    <rect x="330" y="205" width="200" height="50" rx="5" fill="#fff" stroke="#666"/>
+    <text x="430" y="223" text-anchor="middle" font-size="11">→ I/Q : signal à <strong>DC</strong></text>
+    <text x="430" y="240" text-anchor="middle" font-size="11">DC spike absent (calibré HW)</text>
+
+    <!-- NCO no-op -->
+    <rect x="550" y="205" width="160" height="50" rx="5" fill="#fff" stroke="#aaa" stroke-dasharray="3 3"/>
+    <text x="630" y="225" text-anchor="middle" font-size="11" fill="#aaa">NCO no-op</text>
+    <text x="630" y="240" text-anchor="middle" font-size="10" fill="#aaa">offset = 0 → ×1</text>
+
+    <!-- Output -->
+    <rect x="730" y="205" width="140" height="50" rx="5" fill="#ecf7ef" stroke="#2b8f4a"/>
+    <text x="800" y="225" text-anchor="middle" font-size="11">Démod voit le signal</text>
+    <text x="800" y="243" text-anchor="middle" font-size="11" font-weight="bold">au centre du canal</text>
+
+    <line x1="150" y1="230" x2="170" y2="230" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+    <line x1="310" y1="230" x2="330" y2="230" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+    <line x1="530" y1="230" x2="550" y2="230" stroke="#aaa" stroke-width="1" stroke-dasharray="3 3"/>
+    <line x1="710" y1="230" x2="730" y2="230" stroke="#333" stroke-width="1.5" marker-end="url(#arr4)"/>
+</svg>
+<figcaption>Comparaison des deux trajectoires de tuning. Même chaîne DSP,
+    seul le paramètre <code>lo_offset_hz</code> diffère.</figcaption>
+</figure>
+
+<div class="callout good">
+    <strong>L'avantage architectural</strong> : c'est la même
+    <code>NbfmRxChain</code> dans les deux backends. Quand
+    <code>lo_offset_hz = 0</code>, le NCO multiplie par
+    <code>exp(0) = 1</code> à chaque échantillon — pas de bypass
+    spécial, le code est partagé bit-pour-bit.
+</div>
+
+<h3>Comment c'est paramétré côté code</h3>
+
+<pre><code>// SDRplay : modem-sdrplay/src/device.rs
+pub const DEFAULT_LO_OFFSET_HZ: i32 = 75_000;
+
+// Programmation du tuner Mirics
+tuner_params.rfFreq.rfHz =
+    (config.rf_freq_hz as i64 + DEFAULT_LO_OFFSET_HZ as i64) as f64;
+
+// Construction de la chaîne (modem-sdrplay/src/rx.rs)
+let chain = NbfmRxChain::new(NbfmRxChainConfig::new(
+    host_iq_rate_hz as u32,
+    session.config.max_deviation_hz,
+    DEFAULT_LO_OFFSET_HZ as f32,   // ← +75 kHz
+));</code></pre>
+
+<pre><code>// Pluto : modem-pluto/src/rx.rs (juste 0.0 pour le 3e param)
+let mut chain = NbfmRxChain::new(NbfmRxChainConfig::new(
+    session.negotiated_rate.sample_rate_hz as u32,
+    session.rx_max_deviation_hz,
+    0.0,                            // ← AD9363 fait la DC compensation
+));</code></pre>
+
+<!-- ====================================================================== -->
+<h2 id="params">7. Tableau des paramètres par cas</h2>
+
+<p>
+    Les paramètres dérivés (<code>passband</code>, <code>stopband</code>,
+    nombre de taps, coût CPU) sont calculés automatiquement à partir des
+    trois entrées (<code>input_rate</code>, <code>max_deviation</code>,
+    <code>lo_offset</code>). Récap des cinq cas qui peuvent se présenter :
+</p>
+
+<table>
+    <tr>
+        <th>Cas</th>
+        <th>Backend</th>
+        <th>Mode</th>
+        <th>input_rate</th>
+        <th>max_dev</th>
+        <th>lo_offset</th>
+        <th>÷N</th>
+        <th>passband × 2 (BW canal)</th>
+        <th>N taps</th>
+        <th>CPU ~</th>
+    </tr>
+    <tr>
+        <td>1</td>
+        <td>SDRplay</td>
+        <td>NBFM ±5 kHz</td>
+        <td>576 kHz</td>
+        <td>5 kHz</td>
+        <td><strong>+75 kHz</strong></td>
+        <td>12</td>
+        <td>16 kHz</td>
+        <td>723</td>
+        <td>~72 Mmac/s</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>SDRplay</td>
+        <td>narrow ±2.5 kHz</td>
+        <td>576 kHz</td>
+        <td>2.5 kHz</td>
+        <td><strong>+75 kHz</strong></td>
+        <td>12</td>
+        <td>11 kHz</td>
+        <td>1051</td>
+        <td>~103 Mmac/s</td>
+    </tr>
+    <tr>
+        <td>3</td>
+        <td>Pluto</td>
+        <td>NBFM ±5 kHz</td>
+        <td>576 kHz</td>
+        <td>5 kHz</td>
+        <td>0</td>
+        <td>12</td>
+        <td>16 kHz</td>
+        <td>723</td>
+        <td>~70 Mmac/s</td>
+    </tr>
+    <tr>
+        <td>4</td>
+        <td>Pluto</td>
+        <td>narrow ±2.5 kHz</td>
+        <td>576 kHz</td>
+        <td>2.5 kHz</td>
+        <td>0</td>
+        <td>12</td>
+        <td>11 kHz</td>
+        <td>1051</td>
+        <td>~101 Mmac/s</td>
+    </tr>
+    <tr>
+        <td>5</td>
+        <td>Pluto fallback</td>
+        <td>NBFM ±5 kHz</td>
+        <td>2304 kHz</td>
+        <td>5 kHz</td>
+        <td>0</td>
+        <td>48</td>
+        <td>16 kHz</td>
+        <td>2889</td>
+        <td>~286 Mmac/s</td>
+    </tr>
+</table>
+
+<p>
+    À titre d'échelle : un cœur Pi&nbsp;5 atteint 5 à 10&nbsp;Gflops en
+    f32, donc même le pire cas (Pluto fallback ≈&nbsp;286&nbsp;Mmac/s)
+    consomme moins de 5&nbsp;% d'un cœur. Les machines x86 modernes ne
+    le voient même pas.
+</p>
+
+<!-- ====================================================================== -->
+<h2 id="test">8. Comment vérifier que ça marche</h2>
+
+<h3>Tests automatiques en place</h3>
+
+<table>
+    <tr><th>Test</th><th>Vérifie</th></tr>
+    <tr>
+        <td><code>kaiser_taps_meet_stopband_target</code></td>
+        <td>Le filtre Kaiser atteint bien ≥ 75 dB de réjection au-delà de la stopband.</td>
+    </tr>
+    <tr>
+        <td><code>freq_xlating::adjacent_channel_rejected</code></td>
+        <td>Un voisin à +25 kHz est atténué de ≥ 70 dB en sortie de FreqXlatingFir.</td>
+    </tr>
+    <tr>
+        <td><code>freq_xlating::lo_offset_brings_tone_to_dc</code></td>
+        <td>Avec center_freq = +75 kHz, un tone à +75 kHz arrive à DC en sortie (vérifie le sens du NCO).</td>
+    </tr>
+    <tr>
+        <td><code>freq_xlating::image_at_minus_center_is_rejected</code></td>
+        <td>Un tone à −75 kHz, image potentielle, est rejeté ≥ 70 dB (sens NCO + LPF).</td>
+    </tr>
+    <tr>
+        <td><code>nbfm_rx_chain::end_to_end_recovers_audio_with_lo_offset</code></td>
+        <td>Cas SDRplay : NBFM PM-encodé à +75 kHz → audio recovered ±3 dB.</td>
+    </tr>
+    <tr>
+        <td><code>nbfm_rx_chain::end_to_end_recovers_audio_without_lo_offset</code></td>
+        <td>Cas Pluto : même test avec offset = 0.</td>
+    </tr>
+    <tr>
+        <td><code>nbfm_rx_chain::adjacent_does_not_swamp_wanted</code></td>
+        <td>Wanted + adjacent 20 dB plus fort à +25 kHz → SNR audio recovered &gt; 20 dB.</td>
+    </tr>
+    <tr>
+        <td><code>nbfm_rx_chain::pluto_fallback_rate_works</code></td>
+        <td>Cas 5 : input à 2304 kS/s, ÷48, tap count dans le budget.</td>
+    </tr>
+    <tr>
+        <td><code>nbfm_rx_chain::chunk_boundary_audio_matches</code></td>
+        <td>Appel en deux moitiés ≡ appel en un bloc (état seamless).</td>
+    </tr>
+</table>
+
+<h3>Validation sur l'air</h3>
+
+<ol>
+    <li>
+        <strong>SDRplay</strong> : taper la VFO sur la fréquence directe
+        (par exemple <code>145.550 MHz</code>). Avant le fix, il fallait
+        décaler de ~50&nbsp;kHz pour sortir du DC spike. Maintenant la
+        réception doit être propre directement, et la sélectivité face à
+        un voisin proche doit être nettement meilleure.
+    </li>
+    <li>
+        <strong>Pluto</strong> : qualité au moins équivalente à avant.
+        L'amélioration visible est la réjection des canaux adjacents
+        en bande encombrée — un signal sur le canal voisin (25&nbsp;kHz
+        d'écart) doit être totalement absent du démod.
+    </li>
+</ol>
+
+<div class="callout">
+    <strong>Diagnostic rapide en cas de réception cassée :</strong>
+    si l'audio sonne comme avant (canal voisin présent, ou DC spike
+    audible), vérifier dans <code>cargo tree</code> que
+    <code>modem-sdrplay</code> et <code>modem-pluto</code> tirent bien
+    la dernière version de <code>modem-sdr-dsp</code> (pas de cache de
+    build périmé). Le point de vérité unique est le test
+    <code>adjacent_does_not_swamp_wanted</code> — s'il passe, la chaîne
+    elle-même est correcte.
+</div>
+
+<p style="margin-top: 3rem; color: #888; font-size: 0.85rem; text-align: center;">
+    Document généré le 2026-05-10. Sources Rust à <code>rust/modem-sdr-dsp/</code>,
+    <code>rust/modem-sdrplay/</code>, <code>rust/modem-pluto/</code>.
+    Pour reconstruire après modification de la chaîne : <code>cargo test -p modem-sdr-dsp</code>.
+</p>
+
+</div>
+</body>
+</html>

@@ -9,16 +9,23 @@
 //! buffer pump, and forwards 48 kHz mono `Vec<f32>` batches over an
 //! mpsc.
 //!
-//! Chain (matches `modem_sdr_dsp`'s integration test layout):
+//! Chain — delegates the DSP entirely to
+//! [`modem_sdr_dsp::NbfmRxChain`]; this module owns transport (iiod
+//! buffer pump, S12-in-S16 sample format, AD9363 rate negotiation)
+//! and the shared crate owns the math. SDRplay uses the same chain
+//! with a non-zero `lo_offset_hz` to compensate the LO-offset tuning
+//! its tuner needs; Pluto's AD9363 has hardware DC compensation so
+//! the LO sits straight on the user's frequency and `lo_offset_hz`
+//! is 0.
 //!
 //! ```text
 //! cf-ad9361-lpc → I[i16], Q[i16]                            (576 kHz IF)
 //!   → Complex32 = (I + jQ) / 2048                           (S12-aligned)
-//!   → QuadratureDemod                                       → real f32
-//!   → PolyphaseDecimator (÷12 to 48 kHz)
-//!   → DeemphasisLpf  (single-pole IIR, 300 Hz corner)
-//!   → SubAudioHpf    (CTCSS-reject mirror)
-//!   → mpsc::Sender<Vec<f32>>
+//!   → NbfmRxChain.process()
+//!         ↪ FreqXlatingFir (LPF + decim → 48 kHz I/Q at DC)
+//!         ↪ QuadratureDemod (at 48 kHz)
+//!         ↪ DeemphasisLpf, SubAudioHpf
+//!   → mpsc::Sender<Vec<f32>> (48 kHz mono audio)
 //! ```
 //!
 //! The thread starts by re-running [`device::open`] inside itself,
@@ -34,9 +41,7 @@ use std::time::Duration;
 
 use num_complex::Complex32;
 
-use modem_sdr_dsp::audio_filters::{DeemphasisLpf, SubAudioHpf};
-use modem_sdr_dsp::decimator::PolyphaseDecimator;
-use modem_sdr_dsp::fm_demod::QuadratureDemod;
+use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
 
 use crate::device::{self, NegotiatedRate, PlutoConfig, PlutoSession};
 use crate::error::PlutoError;
@@ -198,20 +203,18 @@ fn capture_loop(
         )
         .map_err(|e| PlutoError::Stream(format!("OPEN cf-ad9361-lpc: {e}")))?;
 
-    // DSP chain — built once, reused on every refill.
-    let if_rate = session.negotiated_rate.sample_rate_hz as f32;
-    let ratio = session.negotiated_rate.ratio;
-    // Discriminator gain follows whatever max deviation the user
-    // selected (5 kHz NBFM standard, 2.5 kHz narrow NFM, etc.). Picking
-    // it below the actual on-air deviation soft-clips audio amplitude;
-    // above attenuates it.
-    let mut demod = QuadratureDemod::new(if_rate, session.rx_max_deviation_hz);
-    // 99-tap Hamming-sinc LPF for ÷ratio decimation, cutoff at audio
-    // Nyquist. Linear-phase, ~52 dB stopband.
-    let dec_taps = PolyphaseDecimator::hamming_sinc_taps(if_rate, AUDIO_RATE as f32 / 2.0, 99);
-    let mut decim = PolyphaseDecimator::with_taps(dec_taps, ratio);
-    let mut deemph = DeemphasisLpf::new(AUDIO_RATE as f32, DeemphasisLpf::DEFAULT_CORNER_HZ);
-    let mut hpf = SubAudioHpf::new(AUDIO_RATE as f32, SubAudioHpf::DEFAULT_CORNER_HZ);
+    // DSP chain — built once, reused on every refill. The chain
+    // takes the host I/Q rate (576 kS/s preferred, 2304 kS/s on
+    // BBPLL-fallback) plus the operator-selected max deviation, runs
+    // the channel-select FreqXlatingFir + discriminator + audio
+    // filters, and outputs 48 kHz mono. lo_offset_hz = 0 because
+    // the AD9363 has hardware DC compensation — no LO-leakage spike
+    // to dodge.
+    let mut chain = NbfmRxChain::new(NbfmRxChainConfig::new(
+        session.negotiated_rate.sample_rate_hz as u32,
+        session.rx_max_deviation_hz,
+        0.0,
+    ));
 
     // Pre-allocated I/Q wire-format scratch — one buffer worth of
     // bytes. iiod's `read_buffer_into` writes here; we reinterpret
@@ -262,17 +265,13 @@ fn capture_loop(
             iq.push(Complex32::new(i, q));
         }
 
-        // Discriminate at IF rate, then decimate.
-        let mut audio_if = vec![0.0f32; iq.len()];
-        demod.process(&iq, &mut audio_if);
-        let mut audio = decim.process(&audio_if);
+        // Channel select + demod + audio filters in one call. The
+        // chain handles every rate transition; we get 48 kHz mono
+        // back.
+        let audio = chain.process(&iq);
         if audio.is_empty() {
             continue;
         }
-
-        // Radio-faithful audio post-processing.
-        deemph.process(&mut audio);
-        hpf.process(&mut audio);
 
         // Accumulate into `pending`, flush full chunks of
         // [`TARGET_CHUNK_SAMPLES`].

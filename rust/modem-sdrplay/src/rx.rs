@@ -10,17 +10,22 @@
 //! DSP chain there and ship the resulting 48 kHz audio over an
 //! mpsc.
 //!
-//! Chain (matches `modem_sdr_dsp`'s integration test layout, same as
-//! Pluto):
+//! Chain — delegates the DSP entirely to
+//! [`modem_sdr_dsp::NbfmRxChain`], so this module owns transport
+//! (callback plumbing, sample format, FFI lifetime) and the shared
+//! crate owns the math. Pluto uses the same chain with
+//! `lo_offset_hz = 0`; SDRplay passes
+//! [`crate::device::DEFAULT_LO_OFFSET_HZ`] so the channel-select
+//! NCO compensates the LO offset programmed at the tuner.
 //!
 //! ```text
 //! sdrplay_api StreamCallback → I[i16], Q[i16]                (host I/Q rate)
 //!   → Complex32 = (I + jQ) / 32768
-//!   → QuadratureDemod                                          → real f32
-//!   → PolyphaseDecimator (host_rate ÷ AUDIO_RATIO → 48 kHz)
-//!   → DeemphasisLpf                                           (NBFM 75 µs)
-//!   → SubAudioHpf                                             (CTCSS reject)
-//!   → mpsc::Sender<Vec<f32>>
+//!   → NbfmRxChain.process()
+//!         ↪ FreqXlatingFir (NCO + Kaiser LPF + decim → 48 kHz I/Q at DC)
+//!         ↪ QuadratureDemod (at 48 kHz)
+//!         ↪ DeemphasisLpf, SubAudioHpf
+//!   → mpsc::Sender<Vec<f32>> (48 kHz mono audio)
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,15 +36,13 @@ use std::time::Duration;
 
 use num_complex::Complex32;
 
-use modem_sdr_dsp::audio_filters::{DeemphasisLpf, SubAudioHpf};
-use modem_sdr_dsp::decimator::PolyphaseDecimator;
-use modem_sdr_dsp::fm_demod::QuadratureDemod;
+use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
 
 use crate::api::{
     self, sdrplay_api_CallbackFnsT, sdrplay_api_EventParamsT, sdrplay_api_EventT,
     sdrplay_api_Init, sdrplay_api_StreamCbParamsT, sdrplay_api_TunerSelectT, sdrplay_api_Uninit,
 };
-use crate::device::{self, SdrplayConfig, SdrplaySession, PREFERRED_AUDIO_RATIO};
+use crate::device::{self, SdrplayConfig, SdrplaySession, DEFAULT_LO_OFFSET_HZ};
 use crate::error::SdrplayError;
 
 
@@ -102,10 +105,10 @@ impl Drop for CaptureHandle {
 /// `Arc<Mutex<>>` so the C callback can borrow it briefly via the
 /// `cbContext` void pointer the API hands back to us.
 struct CallbackState {
-    demod: QuadratureDemod,
-    decim: PolyphaseDecimator,
-    deemph: DeemphasisLpf,
-    hpf: SubAudioHpf,
+    /// The whole NBFM RX DSP, in one struct. Same chain construction
+    /// as `modem_pluto::rx`; backends differ only in the
+    /// `lo_offset_hz` they pass at construction.
+    chain: NbfmRxChain,
     pending: Vec<f32>,
     sample_tx: Sender<Vec<f32>>,
     /// Heartbeat counter — bumped every callback. Used by the
@@ -139,20 +142,19 @@ pub fn start_on(
 
     // Build the DSP chain on the user's thread, hand it to the API
     // thread inside `CallbackState`. The host I/Q rate is whatever
-    // came out of (sample_rate / decimation).
+    // came out of (sample_rate / decimation) — typically 576 kS/s on
+    // the preferred path. NbfmRxChain takes care of decimating that
+    // down to 48 kHz, NCO-shifting the LO offset out, and running
+    // the demod + audio filters.
     let host_iq_rate_hz =
         (session.config.sample_rate_hz / session.config.decimation as f64).round() as u64;
-    let if_rate = host_iq_rate_hz as f32;
-    let demod = QuadratureDemod::new(if_rate, session.config.max_deviation_hz);
-    let dec_taps = PolyphaseDecimator::hamming_sinc_taps(if_rate, AUDIO_RATE as f32 / 2.0, 99);
-    let decim = PolyphaseDecimator::with_taps(dec_taps, PREFERRED_AUDIO_RATIO);
-    let deemph = DeemphasisLpf::new(AUDIO_RATE as f32, DeemphasisLpf::DEFAULT_CORNER_HZ);
-    let hpf = SubAudioHpf::new(AUDIO_RATE as f32, SubAudioHpf::DEFAULT_CORNER_HZ);
+    let chain = NbfmRxChain::new(NbfmRxChainConfig::new(
+        host_iq_rate_hz as u32,
+        session.config.max_deviation_hz,
+        DEFAULT_LO_OFFSET_HZ as f32,
+    ));
     let cb_state = Arc::new(Mutex::new(CallbackState {
-        demod,
-        decim,
-        deemph,
-        hpf,
+        chain,
         pending: Vec::with_capacity(TARGET_CHUNK_SAMPLES * 2),
         sample_tx,
         total_iq_samples: 0,
@@ -308,8 +310,9 @@ unsafe extern "C" fn stream_a_callback(
     let i_slice = unsafe { std::slice::from_raw_parts(xi, n) };
     let q_slice = unsafe { std::slice::from_raw_parts(xq, n) };
 
-    // I/Q → Complex32 → discriminate → decimate → audio filters →
-    // mpsc. Same chain shape as `modem_pluto::rx::capture_loop`.
+    // I/Q (i16, full-scale on 32768) → Complex32 → NbfmRxChain. The
+    // chain runs the channel-select + demod + audio filters and
+    // returns 48 kHz mono audio.
     let iq: Vec<Complex32> = i_slice
         .iter()
         .zip(q_slice.iter())
@@ -318,15 +321,11 @@ unsafe extern "C" fn stream_a_callback(
         })
         .collect();
 
-    let mut audio_if = vec![0.0f32; iq.len()];
-    g.demod.process(&iq, &mut audio_if);
-    let mut audio = g.decim.process(&audio_if);
     g.total_iq_samples = g.total_iq_samples.saturating_add(n as u64);
+    let audio = g.chain.process(&iq);
     if audio.is_empty() {
         return;
     }
-    g.deemph.process(&mut audio);
-    g.hpf.process(&mut audio);
 
     // Accumulate, flush full TARGET_CHUNK_SAMPLES chunks. Same
     // policy as the Pluto path — pins worker mpsc rate to ~40/s.

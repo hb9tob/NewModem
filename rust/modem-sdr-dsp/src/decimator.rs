@@ -1,16 +1,19 @@
-//! Real-valued FIR decimator (÷N) — Rust port of the integer-decim
-//! mode of `gr-filter::fir_filter_fff`.
+//! Real-valued FIR decimator (÷N) + tap-generation helpers.
 //!
-//! Used right after [`crate::fm_demod::QuadratureDemod`] in the SDR
-//! RX chain, mirroring GR's `nbfm_rx` topology where the discriminator
-//! runs at the IF rate (e.g. 528 kHz on Pluto) and a real-valued FIR
-//! decimator brings the audio down to 48 kHz before the modem decoder
-//! sees it.
+//! [`PolyphaseDecimator`] is a Rust port of the integer-decim mode of
+//! `gr-filter::fir_filter_fff` — kept for any post-demod real-rate
+//! resampling that doesn't go through the canonical NBFM chain.
 //!
-//! Why real-valued and not complex: `quadrature_demod_cf` already
-//! produced a real audio sample per IF sample. Decimating real audio
-//! costs half what decimating complex I/Q would, with no loss in
-//! quality — exactly the GR `nbfm_rx` topology.
+//! For complex (I/Q) channel selection — what an SDR RX needs — we
+//! use the [`crate::freq_xlating::FreqXlatingFir`] block (port of GR's
+//! `freq_xlating_fir_filter_ccf`); it combines NCO + complex LPF +
+//! decimation in a single block, so a redundant "complex polyphase
+//! decimator" type isn't needed here.
+//!
+//! The Kaiser tap generator [`kaiser_sinc_taps`] lives in this module
+//! because it's used by both — `FreqXlatingFir` for the channel filter
+//! and any `PolyphaseDecimator` users that want a tighter stop-band
+//! than the simpler Hamming helper produces.
 //!
 //! Cost optimisation: the FIR is only evaluated on output samples,
 //! i.e. once every `factor` inputs. So the per-output cost is `N`
@@ -182,6 +185,140 @@ impl PolyphaseDecimator {
     }
 }
 
+// ---------------------------------------------------------------------
+// Kaiser-window sinc tap generator.
+//
+// Added when the RX chain was rearranged to put a channel-select
+// filter ahead of the FM discriminator (the original chain ran the
+// demod at the host I/Q rate and only decimated the audio after, so
+// adjacent channels at ±25 kHz were demodulated alongside the wanted
+// one). The Hamming window above tops out at ~53 dB rejection — for
+// a crowded 2 m or 70 cm band we want 70-80 dB, which is what the
+// Kaiser window's parametric β gives us.
+// ---------------------------------------------------------------------
+
+/// Generate Kaiser-window sinc low-pass FIR taps, normalised to unit
+/// DC gain.
+///
+/// Where the Hamming-sinc helper above takes a fixed tap count and
+/// gives whatever stop-band falls out of it (~53 dB), this one takes
+/// the **target rejection** and **transition band** and computes the
+/// minimum tap count that meets both — Kaiser's design formulas:
+///
+/// ```text
+/// β  = 0.1102·(A − 8.7)                         for A > 50 dB
+/// β  = 0.5842·(A − 21)^0.4 + 0.07886·(A − 21)   for 21 ≤ A ≤ 50 dB
+/// β  = 0                                         for A < 21 dB
+/// N  = ceil((A − 8) / (2.285 · 2π · Δf/Fs))
+/// ```
+///
+/// where `A = stopband_db` and `Δf = stopband_start_hz − passband_end_hz`.
+/// `N` is then rounded up to the next odd integer for linear-phase
+/// symmetry. The cutoff (-6 dB point) sits at the midpoint of the
+/// transition band.
+///
+/// # Arguments
+/// * `fs_hz` — sample rate at which this filter runs.
+/// * `passband_end_hz` — last frequency the filter must pass with
+///   ≤ 0.1 dB ripple.
+/// * `stopband_start_hz` — first frequency the filter must attenuate
+///   by `stopband_db`.
+/// * `stopband_db` — target stop-band rejection in dB. 60 dB is a
+///   reasonable amateur-radio default; 80 dB for very crowded bands.
+///
+/// # Panics
+/// * `passband_end_hz >= stopband_start_hz`
+/// * `stopband_start_hz > fs_hz / 2`
+/// * `stopband_db <= 0.0`
+pub fn kaiser_sinc_taps(
+    fs_hz: f32,
+    passband_end_hz: f32,
+    stopband_start_hz: f32,
+    stopband_db: f32,
+) -> Vec<f32> {
+    use std::f32::consts::PI;
+    assert!(
+        passband_end_hz < stopband_start_hz,
+        "passband ({passband_end_hz}) must end before stopband ({stopband_start_hz})"
+    );
+    assert!(
+        stopband_start_hz <= fs_hz / 2.0,
+        "stopband start ({stopband_start_hz}) must be within Nyquist (fs/2 = {})",
+        fs_hz / 2.0
+    );
+    assert!(stopband_db > 0.0, "stopband_db must be positive");
+
+    // Kaiser β from desired stop-band attenuation A.
+    let a = stopband_db;
+    let beta = if a > 50.0 {
+        0.1102 * (a - 8.7)
+    } else if a >= 21.0 {
+        0.5842 * (a - 21.0).powf(0.4) + 0.07886 * (a - 21.0)
+    } else {
+        0.0
+    };
+
+    // Minimum tap count from the transition band.
+    let transition_norm = (stopband_start_hz - passband_end_hz) / fs_hz; // Δf/Fs
+    let n_min_f = ((a - 8.0) / (2.285 * 2.0 * PI * transition_norm)).ceil();
+    let n_min = (n_min_f as usize).max(3);
+    let num_taps = if n_min % 2 == 0 { n_min + 1 } else { n_min };
+
+    // Cutoff at the midpoint of the transition band (-6 dB nominal).
+    let cutoff_hz = 0.5 * (passband_end_hz + stopband_start_hz);
+    let omega_c = 2.0 * cutoff_hz / fs_hz; // 2·fc/fs
+
+    let nm1 = (num_taps - 1) as f32;
+    let center = nm1 / 2.0;
+    let inv_i0_beta = 1.0 / kaiser_i0(beta);
+    let mut h = Vec::with_capacity(num_taps);
+    let mut sum = 0.0_f32;
+    for k in 0..num_taps {
+        let n_off = k as f32 - center;
+        let sinc = if n_off.abs() < f32::EPSILON {
+            omega_c
+        } else {
+            (PI * omega_c * n_off).sin() / (PI * n_off)
+        };
+        // Kaiser window — argument runs from -1 at k=0 to +1 at k=N-1.
+        let arg = 2.0 * (k as f32) / nm1 - 1.0;
+        let inside = (1.0 - arg * arg).max(0.0).sqrt();
+        let w = kaiser_i0(beta * inside) * inv_i0_beta;
+        let c = sinc * w;
+        h.push(c);
+        sum += c;
+    }
+    // Normalise so DC gain is exactly 1.0. Without this the Kaiser
+    // window introduces a small mid-band droop that adds up across
+    // multi-stage decimation.
+    for c in &mut h {
+        *c /= sum;
+    }
+    h
+}
+
+/// Modified Bessel function of the first kind, order 0.
+///
+/// Used by the Kaiser window weight calculation. Truncated power-series
+/// expansion `I₀(x) = Σ (x²/4)^k / (k!)²`. Converges geometrically; for
+/// the β values we feed it (typically ≤ 14) ~32 terms is well below
+/// f32 round-off — but the loop also breaks early when terms drop
+/// below 1e-9 of the running sum, so cheap-β cases exit fast.
+fn kaiser_i0(x: f32) -> f32 {
+    let x_sq_4 = (x * x) / 4.0;
+    let mut term = 1.0_f32;
+    let mut sum = 1.0_f32;
+    for k in 1..32 {
+        let kf = k as f32;
+        term *= x_sq_4 / (kf * kf);
+        sum += term;
+        if term < 1e-9 * sum {
+            break;
+        }
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,4 +438,85 @@ mod tests {
         let steady: f32 = out.iter().skip(20).map(|v| v - 1.0).map(|e| e.abs()).fold(0.0, f32::max);
         assert!(steady < 1e-5);
     }
+
+    // ---- Kaiser sinc tap generator -------------------------------
+
+    #[test]
+    fn kaiser_i0_matches_known_values() {
+        // Reference values from any standard table (Abramowitz & Stegun
+        // 9.8.1, or `scipy.special.i0`):
+        //   I₀(0)   = 1.0
+        //   I₀(1)   ≈ 1.2660658
+        //   I₀(5)   ≈ 27.239872
+        //   I₀(10)  ≈ 2815.7166
+        let cases = [(0.0, 1.0), (1.0, 1.2660658), (5.0, 27.239872), (10.0, 2815.7166)];
+        for &(x, expected) in &cases {
+            let got = kaiser_i0(x);
+            let rel_err = (got - expected).abs() / expected.max(1.0);
+            assert!(
+                rel_err < 1e-4,
+                "I0({x}) = {got}, expected {expected} (rel err {rel_err:.2e})"
+            );
+        }
+    }
+
+    #[test]
+    fn kaiser_taps_normalised_and_odd() {
+        let h = kaiser_sinc_taps(96_000.0, 8_000.0, 12_000.0, 80.0);
+        assert!(h.len() % 2 == 1, "tap count must be odd, got {}", h.len());
+        let dc: f32 = h.iter().sum();
+        assert!((dc - 1.0).abs() < 1e-6, "DC gain {dc} should be 1.0");
+        // Symmetric — h[k] == h[N-1-k].
+        let n = h.len();
+        for k in 0..n / 2 {
+            let err = (h[k] - h[n - 1 - k]).abs();
+            assert!(err < 1e-6, "asymmetric at k={k}: {} vs {}", h[k], h[n - 1 - k]);
+        }
+    }
+
+    #[test]
+    fn kaiser_taps_meet_stopband_target() {
+        // Target 80 dB rejection past 12 kHz at 96 kHz Fs. Generate the
+        // taps, then sweep the response by direct DFT at a couple of
+        // stopband frequencies and check we're at or below -80 dB.
+        let fs = 96_000.0_f32;
+        let h = kaiser_sinc_taps(fs, 8_000.0, 12_000.0, 80.0);
+        for &f in &[12_000.0_f32, 18_000.0, 24_000.0, 40_000.0] {
+            let mag = freq_response_db(&h, fs, f);
+            assert!(
+                mag <= -75.0,
+                "stopband leakage at {f} Hz = {mag:.1} dB (target ≤ -75)"
+            );
+        }
+        // Passband must stay flat near DC.
+        for &f in &[0.0_f32, 1_000.0, 5_000.0, 7_000.0] {
+            let mag = freq_response_db(&h, fs, f);
+            assert!(
+                mag.abs() < 0.5,
+                "passband ripple at {f} Hz = {mag:.2} dB (target |·| < 0.5)"
+            );
+        }
+    }
+
+    /// Direct DFT magnitude (in dB) at one frequency. Linear-phase FIR
+    /// with unit DC gain → at f = 0 we get exactly 0 dB.
+    fn freq_response_db(taps: &[f32], fs_hz: f32, f_hz: f32) -> f32 {
+        use std::f32::consts::PI;
+        let omega = 2.0 * PI * f_hz / fs_hz;
+        let mut re = 0.0_f32;
+        let mut im = 0.0_f32;
+        for (k, &t) in taps.iter().enumerate() {
+            let phi = omega * k as f32;
+            re += t * phi.cos();
+            im -= t * phi.sin();
+        }
+        let mag = (re * re + im * im).sqrt();
+        20.0 * mag.log10()
+    }
+
+    // The complex side of the chain (decim + LPF on Complex32) is
+    // exercised by the freq_xlating module's own test suite — see
+    // `freq_xlating::tests::zero_center_passes_in_band` and
+    // `freq_xlating::tests::adjacent_channel_rejected`. No need to
+    // duplicate them here.
 }

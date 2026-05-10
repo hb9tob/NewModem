@@ -252,6 +252,22 @@ pub const PREFERRED_DECIMATION: u32 = 4;
 /// samples at 576 kSa/s.
 pub const PREFERRED_AUDIO_RATIO: usize = 12;
 
+/// LO-offset compensation, in Hz. The hardware tuner is programmed to
+/// `rf_user_hz + DEFAULT_LO_OFFSET_HZ`; the channel-select chain's NCO
+/// then mixes the wanted signal back to DC. Why this matters: an SDRplay
+/// (Mirics MSi001) tuned in zero-IF mode (`IF_Zero`, what we use) has a
+/// noticeable DC spike on its I/Q stream — LO leakage onto the same ADC
+/// plus residual DC offset of the tuner. If `rf_user_hz` lands the
+/// wanted carrier exactly at the LO, the carrier sits on the spike and
+/// the discriminator integrates it as audio garbage. Pulling the LO
+/// `+75 kHz` away keeps the carrier in clean spectrum well inside the
+/// 1.536 MHz front-end bandwidth.
+///
+/// Compatible backends with hardware DC compensation (Pluto's AD9363)
+/// don't need this — `modem-pluto` programs the LO straight on the user
+/// frequency and passes `lo_offset_hz = 0` into the chain.
+pub const DEFAULT_LO_OFFSET_HZ: i32 = 75_000;
+
 
 /// Live device handle — owns the daemon-side selection. Dropping
 /// this releases the device through `sdrplay_api_ReleaseDevice` and
@@ -564,8 +580,14 @@ fn program_params(
         }
 
         // Tuner-side params: RF LO, IF gain reduction, LNA state, BW.
+        // The LO is offset by DEFAULT_LO_OFFSET_HZ from the user's
+        // requested frequency to dodge the zero-IF DC spike (LO leakage
+        // + ADC DC); the matching down-conversion happens digitally in
+        // `NbfmRxChain` via its `lo_offset_hz` parameter, so the
+        // wanted channel still ends up at DC for the discriminator.
         let tuner_params = &mut (*rx_chan_ptr).tunerParams;
-        tuner_params.rfFreq.rfHz = config.rf_freq_hz as f64;
+        tuner_params.rfFreq.rfHz =
+            (config.rf_freq_hz as i64 + DEFAULT_LO_OFFSET_HZ as i64) as f64;
         tuner_params.gain.gRdB = config.if_gain_reduction_db;
         tuner_params.gain.LNAstate = config.lna_state;
         tuner_params.bwType = sdrplay_api_Bw_MHzT::sdrplay_api_BW_1_536;

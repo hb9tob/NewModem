@@ -3,34 +3,39 @@
 //! This crate is the staging ground for the DSP needed to bolt SDR
 //! receivers / transceivers onto a modem core that is hard-locked to
 //! 48 kHz mono f32 audio. The chain mirrors GNU Radio's `nbfm_rx` /
-//! `nbfm_tx` hierarchical blocks, ported to Rust without the GR
-//! framework dependency:
+//! `nbfm_tx` hierarchical blocks preceded by a
+//! `freq_xlating_fir_filter_ccf` channel selector, ported to Rust
+//! without the GR framework dependency:
 //!
 //! ```text
 //! TX:  48 kHz audio
-//!        → emphasis::preemphasis_nbfm_48k     (== analog::fm_preemph)
-//!        → fir::AudioLPF                      (== filter::fir_filter_fff)
+//!        → pm_mod::PhaseMod                   (== analog::phase_modulator_fc,
+//!                                                gives the natural +6 dB/oct)
 //!        → interpolator::PolyphaseInterpolator
 //!                                             (== filter::interp_fir_filter_fff)
-//!        → fm_mod::FrequencyMod               (== analog::frequency_modulator_fc)
-//!        → I/Q at 528 / 960 kSa/s to the SDR
+//!        → I/Q at 576 / 2304 kSa/s to the SDR
 //!
-//! RX:  I/Q at 528 / 960 kSa/s from the SDR
-//!        → decimator::PolyphaseDecimator      (== filter::fir_filter_ccc)
-//!        → fm_demod::QuadratureDemod          (== analog::quadrature_demod_cf)
-//!        → fir::AudioLPF
-//!        → emphasis::DeemphasisFilter         (== analog::fm_deemph)
+//! RX:  I/Q at 576 / 2304 kSa/s from the SDR
+//!        → freq_xlating::FreqXlatingFir       (== filter::freq_xlating_fir_filter_ccf,
+//!                                                NCO + Kaiser LPF + decim)
+//!        → fm_demod::QuadratureDemod          (== analog::quadrature_demod_cf,
+//!                                                at 48 kHz, post-decim)
+//!        → audio_filters::DeemphasisLpf       (== analog::fm_deemph)
+//!        → audio_filters::SubAudioHpf          (CTCSS reject)
 //!        → 48 kHz audio
 //! ```
 //!
-//! Why a dedicated crate: the `modem-pluto` / `modem-rtlsdr` /
-//! `modem-sdrplay` backends will all consume the same chain. Keeping
-//! the math here avoids duplicating it once per driver, and lets the
-//! GR-port unit tests live in one place.
+//! The full RX chain is bundled as [`NbfmRxChain`] — every SDR
+//! backend just instantiates it with `(input_rate, max_deviation,
+//! lo_offset)` and feeds it `Complex32`. Backends differ only in
+//! transport (sample format, callback vs poll) and in the
+//! `lo_offset_hz` they pass: 0 for backends with hardware DC
+//! compensation (Pluto's AD9363), positive for zero-IF SDRs that
+//! need an explicit LO offset to dodge the DC spike (SDRplay).
 //!
 //! Sample rates are locked to integer ratios against the modem's
 //! 48 kHz audio rate so no rational resampler / Farrow interpolator
-//! is needed — a single polyphase FIR per direction is enough.
+//! is needed — a single Kaiser-window polyphase FIR is enough.
 
 pub mod traits;
 
@@ -41,8 +46,12 @@ pub mod emphasis;
 pub mod fir;
 pub mod fm_demod;
 pub mod fm_mod;
+pub mod freq_xlating;
 pub mod interpolator;
+pub mod nbfm_rx_chain;
 pub mod pm_mod;
+
+pub use nbfm_rx_chain::{NbfmRxChain, NbfmRxChainConfig};
 
 /// Audio sample rate the modem core expects, in Hz. Mirrors
 /// `modem_core::types::AUDIO_RATE`. Re-exported so SDR backends can
