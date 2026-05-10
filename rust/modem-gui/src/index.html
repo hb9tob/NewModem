@@ -421,6 +421,22 @@
             sur la même version de l'appli en mode forcé.
           </p>
         </fieldset>
+        <fieldset>
+          <legend>Full-duplex</legend>
+          <label class="ptt-row">
+            <input type="checkbox" id="full-duplex-enabled">
+            Autoriser émission et réception simultanées
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Par défaut, l'émission interrompt la réception (puis la
+            relance après TX). Si activé : les deux tournent en parallèle
+            (utile avec un device RX distinct du device TX, ex. SDRplay
+            en RX + carte son en TX). Une seconde barre de progression
+            (violet → bleu) apparaît au-dessus de la barre RX pendant
+            l'émission. À éviter si RX et TX partagent la même chaîne
+            audio half-duplex.
+          </p>
+        </fieldset>
         <div class="settings-status" id="settings-status">—</div>
       </div>
     </section>
@@ -550,6 +566,16 @@
   <!-- Global progress bar at the bottom of the window, a few pixels tall. -->
   <div id="rx-progress-bar" class="rx-progress-bar">
     <canvas id="progress-blocks"></canvas>
+  </div>
+  <!--
+    Full-duplex TX progress bar — visible only when both RX and TX run
+    concurrently. Stacked 5 px above .rx-progress-bar so the two bars
+    share the bottom of the window: RX below, TX above. The fill colour
+    interpolates from violet (#5E35B1) at 0 % to logo blue (#29B6F6)
+    at 100 %, leaving the bottom canvas free to keep showing RX blocks.
+  -->
+  <div id="tx-duplex-bar" class="tx-duplex-bar" hidden>
+    <div id="tx-duplex-fill" class="tx-duplex-fill"></div>
   </div>
   <!-- Image lightbox: fullscreen + zoom up to 1:1. -->
   <div id="image-lightbox" class="image-lightbox" tabindex="-1" hidden>

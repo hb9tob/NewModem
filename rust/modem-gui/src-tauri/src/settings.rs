@@ -98,6 +98,15 @@ pub struct Settings {
     pub rx_forced_profile: String,
     #[serde(default)]
     pub experimental_modes_enabled: bool,
+    /// If true, TX no longer stops RX before transmitting and the GUI
+    /// surfaces a dedicated TX progress bar above the RX one when both
+    /// are active. Off by default — the modem is half-duplex unless the
+    /// user opts in (e.g. RX SDRplay + TX cpal on a separate device, or
+    /// future Pluto monodevice). Worker layer is already FDX-ready;
+    /// this flag only controls the GUI policy that has been forcing
+    /// half-duplex via `txStart` → `stop_capture` → `maybeRestartRx`.
+    #[serde(default)]
+    pub full_duplex_enabled: bool,
     #[serde(default = "default_overlay_slots")]
     pub overlays: Vec<Overlay>,
     #[serde(default)]
@@ -276,6 +285,7 @@ impl Default for Settings {
             rx_force_mode: false,
             rx_forced_profile: default_rx_forced_profile(),
             experimental_modes_enabled: false,
+            full_duplex_enabled: false,
             overlays: default_overlay_slots(),
             active_overlay: 0,
             overlay_default_seeded: false,

@@ -572,6 +572,12 @@ let currentSettings = {
   /// ROBUST / NORMAL / HIGH / HIGH56 / HIGH+) and the rx-force-bar is
   /// hidden.
   experimental_modes_enabled: false,
+  /// If true, TX no longer stops RX before transmitting and a dedicated
+  /// TX progress bar (violet → logo blue) appears above the RX bar
+  /// while both run concurrently. Default false: keep the historical
+  /// half-duplex behaviour (txStart stops RX, maybeRestartRx restarts it
+  /// after tx_complete). Mirror of the Rust-side `full_duplex_enabled`.
+  full_duplex_enabled: false,
   overlays: [],
   active_overlay: 0,
 };
@@ -1484,6 +1490,8 @@ async function loadSettings() {
   if (saveWav) saveWav.checked = !!currentSettings.tx_save_wav;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
+  const fdx = document.getElementById("full-duplex-enabled");
+  if (fdx) fdx.checked = !!currentSettings.full_duplex_enabled;
 
   // SDR controls are built on demand by `renderSdrPanel` (called
   // from `loadDevices` once the dropdown selection is known). The
@@ -1887,6 +1895,17 @@ function setupSettingsTab() {
       persistSettings();
     });
   }
+  const fdxEnabled = document.getElementById("full-duplex-enabled");
+  if (fdxEnabled) {
+    fdxEnabled.addEventListener("change", () => {
+      currentSettings.full_duplex_enabled = fdxEnabled.checked;
+      // Re-evaluate the duplex bar visibility right away: turning the
+      // toggle off mid-TX should hide the bar even before the next
+      // tx_progress event arrives.
+      refreshDuplexTxBar();
+      persistSettings();
+    });
+  }
 }
 
 async function loadSaveDir() {
@@ -1924,6 +1943,9 @@ async function startCapture() {
     document.getElementById("btn-stop").disabled = false;
     if (select) select.disabled = true;
     refreshSettingsRxWarn();
+    // RX just came up: if TX is also running and FDX is on, surface the
+    // dedicated TX bar with whatever progress we already had buffered.
+    refreshDuplexTxBar();
     logEvent("start", { device: deviceName, profile, forced });
   } catch (err) {
     status.textContent = `erreur start : ${err}`;
@@ -2009,6 +2031,8 @@ async function startCaptureFromWav(file) {
     const rxSel = document.getElementById("rx-device-select");
     if (rxSel) rxSel.disabled = true;
     refreshSettingsRxWarn();
+    // Same as live RX start: refresh the duplex bar in case TX is running.
+    refreshDuplexTxBar();
     logEvent("wav_playback_start", { file: file.name, profile, forced });
   } catch (err) {
     status.textContent = `erreur lecture WAV : ${err}`;
@@ -2029,6 +2053,9 @@ async function stopCapture() {
     if (rxSel) rxSel.disabled = false;
     refreshStartButtonFromRx();
     refreshSettingsRxWarn();
+    // RX just stopped: if TX is still running, hide the duplex bar — the
+    // next tx_progress event will fall back to the bottom canvas.
+    refreshDuplexTxBar();
     await refreshRawRecordingState();
     logEvent("stop", null);
   } catch (err) {
@@ -3977,14 +4004,18 @@ async function txStart() {
   const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
   const rxWasActive = rxStopBtn && !rxStopBtn.disabled;
-  if (rxWasActive) {
+  // Half-duplex (default): stop RX before TX, then maybeRestartRx() picks
+  // it up after tx_complete. Full-duplex (opt-in): leave RX running and
+  // never set restartRxAfter so the post-TX path is a no-op.
+  const fdx = !!currentSettings.full_duplex_enabled;
+  if (rxWasActive && !fdx) {
     try {
       await invoke("stop_capture");
     } catch (err) {
       logEvent("tx_pre_stop_error", { message: String(err) });
     }
   }
-  txState.restartRxAfter = rxWasActive;
+  txState.restartRxAfter = rxWasActive && !fdx;
   txState.txActive = true;
   txState.progress = null;
   updateTxProgressText();
@@ -4060,14 +4091,17 @@ async function txMore() {
   const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
   const rxWasActive = rxStopBtn && !rxStopBtn.disabled;
-  if (rxWasActive) {
+  // Same FDX gate as in txStart: keep RX running when full_duplex_enabled
+  // is on, otherwise preserve the historical stop-then-restart dance.
+  const fdx = !!currentSettings.full_duplex_enabled;
+  if (rxWasActive && !fdx) {
     try {
       await invoke("stop_capture");
     } catch (err) {
       logEvent("tx_pre_stop_error", { message: String(err) });
     }
   }
-  txState.restartRxAfter = rxWasActive;
+  txState.restartRxAfter = rxWasActive && !fdx;
   txState.txActive = true;
   txState.progress = null;
   // Remember where we'll land after this burst (count packets starting at esiStart).
@@ -4141,10 +4175,67 @@ function updateTxProgressText() {
     `TX ${p.blocks_sent} / ${p.total_blocks} blocs${kTail} · ${fmtSeconds(p.elapsed_s)} / ${fmtSeconds(p.duration_s)}`;
 }
 
+// ──────────────────────────── Full-duplex TX progress bar
+//
+// In full-duplex mode the bottom canvas keeps showing RX blocks and we
+// push TX progress to a dedicated bar stacked just above it. Colour is
+// linearly interpolated between violet (0 %) and logo blue (100 %) so
+// the user can read the burst progress at a glance from any tab.
+
+const TX_DUPLEX_VIOLET = { r: 0x5e, g: 0x35, b: 0xb1 }; // #5E35B1 start
+const TX_DUPLEX_BLUE   = { r: 0x29, g: 0xb6, b: 0xf6 }; // #29B6F6 end (logo)
+
+function lerpDuplexColor(frac) {
+  const t = Math.max(0, Math.min(1, frac));
+  const r = Math.round(TX_DUPLEX_VIOLET.r + (TX_DUPLEX_BLUE.r - TX_DUPLEX_VIOLET.r) * t);
+  const g = Math.round(TX_DUPLEX_VIOLET.g + (TX_DUPLEX_BLUE.g - TX_DUPLEX_VIOLET.g) * t);
+  const b = Math.round(TX_DUPLEX_VIOLET.b + (TX_DUPLEX_BLUE.b - TX_DUPLEX_VIOLET.b) * t);
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function rxIsRunning() {
+  const stopBtn = document.getElementById("btn-stop");
+  return !!(stopBtn && !stopBtn.disabled);
+}
+
+function isDuplexActive() {
+  return !!currentSettings.full_duplex_enabled
+    && rxIsRunning()
+    && !!(txState && txState.txActive);
+}
+
+// Update / show / hide the dedicated TX bar based on the current state.
+// Called from onTxProgress, onTxComplete, onTxError, and from every site
+// that toggles RX running state (start_capture / stop_capture / WAV
+// playback start) so the bar appears as soon as both are active and
+// disappears immediately when one stops.
+function refreshDuplexTxBar() {
+  const bar = document.getElementById("tx-duplex-bar");
+  const fill = document.getElementById("tx-duplex-fill");
+  if (!bar || !fill) return;
+  if (!isDuplexActive() || !txState.progress) {
+    bar.hidden = true;
+    return;
+  }
+  const p = txState.progress;
+  const total = p.total_blocks || 0;
+  const sent = p.blocks_sent || 0;
+  const frac = total > 0 ? Math.min(1, sent / total) : 0;
+  fill.style.width = `${(frac * 100).toFixed(2)}%`;
+  fill.style.backgroundColor = lerpDuplexColor(frac);
+  bar.hidden = false;
+}
+
 function onTxProgress(payload) {
   txState.progress = payload;
   updateTxProgressText();
-  // Reuse the bottom progress bar (blocks) in TX mode.
+  if (isDuplexActive()) {
+    // FDX: leave the bottom canvas to RX, paint TX in the dedicated bar.
+    refreshDuplexTxBar();
+    return;
+  }
+  // Half-duplex (or RX not running): reuse the bottom progress bar in TX
+  // mode, same behaviour as before.
   const bitmap = new Uint8Array(Math.ceil((payload.total_blocks || 0) / 8));
   for (let i = 0; i < payload.blocks_sent; i++) {
     bitmap[i >> 3] |= 1 << (i & 7);
@@ -4164,6 +4255,7 @@ async function onTxComplete(payload) {
   txState.progress = null;
   updateTxProgressText();
   refreshTxButtons();
+  refreshDuplexTxBar();
   try {
     const { invoke } = window.__TAURI__.core;
     await invoke("tx_reset");
@@ -4179,6 +4271,7 @@ async function onTxError(payload) {
   txState.progress = null;
   updateTxProgressText();
   refreshTxButtons();
+  refreshDuplexTxBar();
   try {
     const { invoke } = window.__TAURI__.core;
     await invoke("tx_reset");
