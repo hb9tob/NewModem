@@ -2056,6 +2056,10 @@ async function stopCapture() {
     // RX just stopped: if TX is still running, hide the duplex bar — the
     // next tx_progress event will fall back to the bottom canvas.
     refreshDuplexTxBar();
+    // The worker stopped emitting rx_realtime — drop the chip back to
+    // its inactive state. Without this it would freeze on the last
+    // received colour even though no measurement is being produced.
+    noteRxRealtimeReset();
     await refreshRawRecordingState();
     logEvent("stop", null);
   } catch (err) {
@@ -2462,6 +2466,81 @@ function noteAudioOverdrive(overdrive, crestDb) {
   if (Number.isFinite(crestDb)) lastCrestDb = crestDb;
   if (overdrive) lastOverdriveMs = Date.now();
   refreshOverdriveChip();
+}
+
+// ────────────────────────────────────────── RX realtime margin chip
+//
+// `rx_realtime` is emitted by `rx_worker` every ~2 s (see RxRealtimePayload
+// in modem-worker/src/rx_worker.rs). We classify into three states so the
+// chip in the top bar gives a colour-coded health pulse:
+//
+//   ok   : healthy — lag < 100 ms, last_batch < 500 ms, no fresh drops
+//   warn : transient pressure — lag 100–300 ms OR last_batch 500–800 ms,
+//          still no drops. The session_buffer absorbs the spike, samples
+//          are intact.
+//   err  : sustained overload — lag > 300 ms OR samples were dropped
+//          since the previous tick. On a soundcard input this means the
+//          bounded cpal mpsc was Full and the OS audio thread had to
+//          discard chunks (see CHANNEL_CAPACITY_CHUNKS in cpal_capture.rs).
+//          The user's CPU can't keep up with the chosen profile.
+//
+// The chip auto-clears to `off` when capture stops (see noteRxRealtimeReset).
+// Tooltip carries the raw numbers.
+const RX_RT_DROP_HOLD_MS = 6000;
+let lastRxRealtime = null;       // last RxRealtimePayload received
+let lastDropTimestamp = 0;       // wall-clock ms of last fresh drop
+let lastSeenDroppedSamples = 0;  // monotonic counter from previous tick
+let rxRealtimeActive = false;    // false until first event after a fresh start
+
+function refreshRxRealtimeChip() {
+  const chip = document.getElementById("rt-chip");
+  if (!chip) return;
+  if (!rxRealtimeActive || !lastRxRealtime) {
+    chip.classList.remove("rt-ok", "rt-warn", "rt-err");
+    chip.classList.add("rt-off");
+    chip.title = "Marge temps-réel RX — capture inactive";
+    return;
+  }
+  const p = lastRxRealtime;
+  const recentDrop = (Date.now() - lastDropTimestamp) < RX_RT_DROP_HOLD_MS;
+  let state;
+  if (recentDrop || p.lag_ms > 300) {
+    state = "err";
+  } else if (p.lag_ms > 100 || p.last_batch_ms > 500) {
+    state = "warn";
+  } else {
+    state = "ok";
+  }
+  chip.classList.remove("rt-off", "rt-ok", "rt-warn", "rt-err");
+  chip.classList.add(`rt-${state}`);
+  const lines = [
+    `Marge temps-réel RX (${state.toUpperCase()})`,
+    `lag wall-clock : ${p.lag_ms.toFixed(0)} ms`,
+    `dernier batch  : ${p.last_batch_ms.toFixed(0)} ms (cible < 500)`,
+    `pic 2 s        : ${p.max_batch_ms.toFixed(0)} ms`,
+    `session_buffer : ${p.session_buf_ms.toFixed(0)} ms`,
+    `samples perdus : ${p.dropped_samples}` + (recentDrop ? " ⚠ récents" : ""),
+  ];
+  chip.title = lines.join("\n");
+}
+
+function noteRxRealtime(payload) {
+  if (!payload) return;
+  if (payload.dropped_samples > lastSeenDroppedSamples) {
+    lastDropTimestamp = Date.now();
+  }
+  lastSeenDroppedSamples = payload.dropped_samples | 0;
+  lastRxRealtime = payload;
+  rxRealtimeActive = true;
+  refreshRxRealtimeChip();
+}
+
+function noteRxRealtimeReset() {
+  rxRealtimeActive = false;
+  lastRxRealtime = null;
+  lastSeenDroppedSamples = 0;
+  lastDropTimestamp = 0;
+  refreshRxRealtimeChip();
 }
 
 function noteProfileFromHeader(_profileStr) {}
@@ -2906,6 +2985,9 @@ function wireEvents() {
     const p = event.payload;
     updateLevel(p.rms, p.peak, p.total_samples);
     noteAudioOverdrive(!!p.overdrive, p.crest_db);
+  });
+  listen("rx_realtime", (event) => {
+    noteRxRealtime(event.payload);
   });
 
   listen("tx_plan", (ev) => {
@@ -3402,8 +3484,15 @@ async function _runTxCompressImpl() {
         passthrough: !!txState.avifPassthrough,
       });
       // An active overlay must be baked into the pixels, which requires
-      // a real decode/re-encode — so force passthrough off whenever an
-      // overlay is present, even on AVIF sources.
+      // a real decode/re-encode. We'd love to do that on AVIF sources too,
+      // but the `image` crate isn't built with the `avif` feature (no
+      // libdav1d dependency), so decoding AVIF bytes Rust-side returns an
+      // error — the compression then fails silently and `compressedBytes`
+      // stays null, leaving the TX button disabled (regression after the
+      // default-overlay seeding). Workaround: keep passthrough ON for AVIF
+      // sources even when an overlay is active. The overlay is silently
+      // dropped for AVIF inputs (no worse than pre-overlay behaviour);
+      // non-AVIF sources still get the overlay baked in normally.
       const ov = getActiveOverlayPayload();
       const result = await invoke("compress_image", {
         opts: {
@@ -3411,8 +3500,8 @@ async function _runTxCompressImpl() {
           target_h: dims.h,
           quality: txState.quality,
           speed: txState.speed,
-          passthrough: !!txState.avifPassthrough && !ov,
-          overlay: ov,
+          passthrough: !!txState.avifPassthrough,
+          overlay: txState.avifPassthrough ? null : ov,
         },
       });
       if (seq !== txState.compressSeq) return; // stale

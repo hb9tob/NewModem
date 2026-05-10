@@ -148,6 +148,41 @@ body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.55; }
 }
+/* RT chip: real-time margin of the RX worker. Three states driven by
+   `rx_realtime` events (see noteRxRealtime in main.js).
+     off  : RX not running → muted grey, like .ovd-off
+     ok   : RX healthy (lag < 100 ms, no drops) → green tint
+     warn : transient lag 100–300 ms or batch > 500 ms, no drops yet
+     err  : sustained lag > 300 ms OR samples dropped recently */
+.rt-chip {
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 3px;
+  border: 1px solid;
+  letter-spacing: 0.02em;
+}
+.rt-off {
+  background: #2a2a2a;
+  border-color: #444;
+  color: #555;
+}
+.rt-ok {
+  background: #0d2a18;
+  border-color: #2e7d32;
+  color: #a5d6a7;
+}
+.rt-warn {
+  background: #3a2a00;
+  border-color: #f9a825;
+  color: #ffe082;
+}
+.rt-err {
+  background: #5a0000;
+  border-color: #ef5350;
+  color: #ffe0e0;
+  animation: ovd-pulse 0.8s ease-in-out infinite;
+}
 .state-chip.state-idle {
   background: #2a2a2a;
   border-color: #555;

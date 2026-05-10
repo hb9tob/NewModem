@@ -346,7 +346,12 @@ fn start_capture(
     // path. Every branch emits the same shape:
     // `mpsc::Receiver<Vec<f32>>` at 48 kHz mono — the rx_worker
     // doesn't know which backend produced the samples.
-    let (capture, samples) =
+    // Drop counter: only cpal capture exposes one (its bounded mpsc
+    // increments on `Full`). SDR backends pre-buffer in-thread so they
+    // don't need it — we still pass an Arc to keep `rx_worker::spawn`'s
+    // signature uniform; the SDR-side counter just stays at zero and
+    // the GUI chip never lights up for that reason.
+    let (capture, samples, dropped_samples) =
         if let Some((backend, device_id)) = sdr_registry::parse_composite_name(&device_name) {
             let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
             let descriptor = DeviceDescriptor::new(
@@ -360,10 +365,15 @@ fn start_capture(
             let (cap_handle, rx) = device
                 .start_rx()
                 .map_err(|e| format!("{}: {e}", backend.id()))?;
-            (CaptureKind::Sdr(device, cap_handle), rx)
+            (
+                CaptureKind::Sdr(device, cap_handle),
+                rx,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
         } else {
             let (h, rx) = cpal_capture::start(&device_name)?;
-            (CaptureKind::Cpal(h), rx)
+            let dropped = h.dropped_samples.clone();
+            (CaptureKind::Cpal(h), rx, dropped)
         };
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
@@ -374,6 +384,7 @@ fn start_capture(
         profile_idx,
         forced,
         cfg.rx_deemphasis_enabled,
+        dropped_samples,
     );
     *guard = Some(CaptureSession {
         capture,
@@ -521,6 +532,10 @@ fn start_capture_from_wav(
 
     let cfg = settings::load();
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
+    // WAV replay is a deterministic file-pacer; the in-process channel
+    // can't drop samples (the pacer paces wall-clock). Pass an
+    // always-zero counter; the rx_realtime event will report
+    // `dropped_samples = 0` throughout.
     let worker = rx_worker::spawn(
         rx_chan,
         sink,
@@ -529,6 +544,7 @@ fn start_capture_from_wav(
         profile_idx,
         forced,
         cfg.rx_deemphasis_enabled,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     *guard = Some(CaptureSession {
         capture: CaptureKind::WavFile {

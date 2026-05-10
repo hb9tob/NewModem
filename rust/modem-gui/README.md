@@ -133,6 +133,29 @@ usage normal.
 
 ---
 
+## TX — sources AVIF et overlay
+
+Les **Paramètres → Overlay** permettent d'incruster un logo + texte
+dans le coin de chaque image émise (le défaut est *NBFM Modem* en haut
+à gauche, 10 % de hauteur). L'overlay est appliqué côté Rust dans
+`compress_avif` après le resize, sur les sources PNG / JPEG / WebP /
+BMP / GIF — qui sont décodées, redimensionnées, taguées avec l'overlay,
+puis ré-encodées en AVIF avant émission.
+
+**Exception : sources `.avif`.** Quand on dépose un AVIF (drag-drop,
+file picker, ou rappel depuis l'historique), le pipeline reste en mode
+**passthrough** — les bytes sont émis tels quels, sans décodage ni
+ré-encodage. C'est le but premier de l'AVIF en entrée : zéro perte de
+qualité, zéro cycle CPU, et la durée OTA est purement celle du fichier
+source. **L'overlay n'est donc pas incrusté sur les sources AVIF.** La
+crate Rust `image` est compilée sans la feature `avif` / libdav1d, et
+même si on l'ajoutait il faudrait décoder + ré-encoder, ce qui ferait
+perdre l'avantage du passthrough. Pour qu'un logo apparaisse sur l'image
+émise, partir d'une source PNG/JPEG/WebP — l'overlay est alors baked-in
+et le résultat encodé en AVIF avant émission.
+
+---
+
 ## Onglet Canal — phase A (cascade ATT)
 
 Outil de réglage du niveau d'émission basé sur les rapports oraux des

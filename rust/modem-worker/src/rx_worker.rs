@@ -216,6 +216,38 @@ struct AudioLevelPayload {
     crest_db: f32,
 }
 
+/// Real-time margin telemetry. Emitted every ~2 s so the GUI can show a
+/// "RX surcharge CPU" badge when the worker can't keep up with the
+/// capture (= classic Pi4 / old-PC sound-card symptom). Healthy systems
+/// stay near `lag_ms = 0`, `last_batch_ms` ≪ 500, `dropped_samples = 0`.
+///
+/// `dropped_samples` is the cumulative count of f32 samples that the
+/// bounded `cpal_capture` mpsc dropped at the source because the worker
+/// couldn't drain fast enough (`SyncSender::try_send` returned `Full`).
+/// SDR backends pre-buffer in-thread before sending and never trip this
+/// counter, so on Pluto/SDRplay this stays 0 even on overloaded CPUs.
+#[derive(Debug, Clone, Serialize)]
+struct RxRealtimePayload {
+    /// `(wall_clock - audio_consumed) * 1000`. Positive growing = falling
+    /// behind. < 100 ms is healthy; > 100 ms surfaces a warning chip.
+    lag_ms: f64,
+    /// Wall time spent in the last batch (ingest + scan + decode). Batch
+    /// is ~500 ms of audio, so any value > 500 means "this batch alone
+    /// fell behind realtime".
+    last_batch_ms: f64,
+    /// Worst batch wall time over the last 2 s window. Resets on each
+    /// emit so the chart shows local peaks.
+    max_batch_ms: f64,
+    /// Current `session_buffer.len() / 48 kHz` in ms. Bounded by
+    /// `SESSION_HARD_CAP_SECONDS` while active, by `PREROLL_SECONDS`
+    /// otherwise.
+    session_buf_ms: f64,
+    /// Cumulative samples dropped by the cpal capture mpsc since the
+    /// worker started. Monotonic. The frontend computes the delta to
+    /// flag fresh drops.
+    dropped_samples: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Worker handle / spawn
 // ---------------------------------------------------------------------------
@@ -241,6 +273,12 @@ impl WorkerHandle {
 /// - the post-decode header refine is bypassed as well.
 /// This is mandatory to decode EXPERIMENTAL profiles (HIGH+, FAST) which
 /// are absent from `PROBE_TEMPLATES` and therefore not auto-detected.
+/// Spawn the V3 RX worker. `dropped_samples` is the cumulative count of
+/// f32 samples that the cpal-capture bounded mpsc has dropped because
+/// the worker couldn't drain fast enough; SDR backends pass a fresh
+/// always-zero counter (their producers pre-buffer in-thread). Read
+/// every 2 s by the realtime tick and surfaced as
+/// `rx_realtime.dropped_samples` to the GUI.
 pub fn spawn(
     samples: Receiver<Vec<f32>>,
     sink: Arc<dyn EventSink>,
@@ -249,6 +287,7 @@ pub fn spawn(
     profile: ProfileIndex,
     forced: bool,
     deemphasis_enabled: bool,
+    dropped_samples: Arc<std::sync::atomic::AtomicU64>,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -261,6 +300,7 @@ pub fn spawn(
             profile,
             forced,
             deemphasis_enabled,
+            dropped_samples,
             stop_thread,
         );
     });
@@ -446,6 +486,7 @@ fn run_worker(
     profile: ProfileIndex,
     forced: bool,
     deemphasis_enabled: bool,
+    dropped_samples: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = std::fs::remove_file(log_path());
@@ -582,13 +623,29 @@ fn run_worker(
             let lag_ms = (wall_s - audio_s) * 1000.0;
             let session_buf_ms =
                 state.session_buffer.len() as f64 * 1000.0 / AUDIO_RATE as f64;
+            let dropped = dropped_samples.load(Ordering::Relaxed);
             worker_log(&format!(
                 "[worker] tick: audio={audio_s:.1}s wall={wall_s:.1}s \
                  lag={lag_ms:+.0}ms last_batch={last_batch_processing_ms:.0}ms \
                  max_batch={max_batch_processing_ms:.0}ms \
-                 session_buf={session_buf_ms:.0}ms session_active={}",
+                 session_buf={session_buf_ms:.0}ms dropped={dropped} \
+                 session_active={}",
                 state.session_active
             ));
+            // Surface the metric to the GUI so a chip can flag CPU
+            // overload in real time. Always emitted (every ~2 s) so the
+            // frontend has fresh state to drive its own thresholding /
+            // hysteresis (see `noteRxRealtime` in main.js).
+            sink.emit(
+                "rx_realtime",
+                RxRealtimePayload {
+                    lag_ms,
+                    last_batch_ms: last_batch_processing_ms,
+                    max_batch_ms: max_batch_processing_ms,
+                    session_buf_ms,
+                    dropped_samples: dropped,
+                },
+            );
             last_telemetry_tick = Instant::now();
             max_batch_processing_ms = 0.0;
         }
