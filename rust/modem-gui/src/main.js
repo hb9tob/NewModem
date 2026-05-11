@@ -2480,9 +2480,12 @@ function noteAudioOverdrive(overdrive, crestDb) {
 //          are intact.
 //   err  : sustained overload — lag > 300 ms OR samples were dropped
 //          since the previous tick. On a soundcard input this means the
-//          bounded cpal mpsc was Full and the OS audio thread had to
-//          discard chunks (see CHANNEL_CAPACITY_CHUNKS in cpal_capture.rs).
-//          The user's CPU can't keep up with the chosen profile.
+//          30 s SPSC ring in cpal_capture overflowed (= the reader thread
+//          was starved long enough that even 30 seconds of slack ran out)
+//          AND/OR the worker hit the 5 min session_buffer brickwall.
+//          Either way the worker has flushed and returned to idle —
+//          the chip is informing the user that the previous capture
+//          was lost. CPU can't keep up with the chosen profile.
 //
 // The chip auto-clears to `off` when capture stops (see noteRxRealtimeReset).
 // Tooltip carries the raw numbers.
@@ -2519,7 +2522,8 @@ function refreshRxRealtimeChip() {
     `dernier batch  : ${p.last_batch_ms.toFixed(0)} ms (cible < 500)`,
     `pic 2 s        : ${p.max_batch_ms.toFixed(0)} ms`,
     `session_buffer : ${p.session_buf_ms.toFixed(0)} ms`,
-    `samples perdus : ${p.dropped_samples}` + (recentDrop ? " ⚠ récents" : ""),
+    `samples perdus capture (ring 30 s overflow) : ${p.dropped_samples}`
+      + (recentDrop ? " ⚠ brickwall récent → flush+idle" : ""),
   ];
   chip.title = lines.join("\n");
 }
@@ -2578,11 +2582,16 @@ let lastProgress = {
 };
 let lastConstellation = [];
 let lastPilotPhases = [];
+// Parallel to lastPilotPhases : true for META segments (header replicated),
+// false for DATA segments. drawPilotPhase paints META in a distinct colour
+// so the operator can see the full frame layout at a glance.
+let lastPilotPhaseIsMeta = [];
 
 function resetRxVisuals() {
   lastProgress = { bitmap: null, expected: 0, converged: 0, sigma2: null };
   lastConstellation = [];
   lastPilotPhases = [];
+  lastPilotPhaseIsMeta = [];
   const text = document.getElementById("v2-progress-text");
   if (text) text.textContent = "—";
   hideFountainStatus();
@@ -2662,6 +2671,9 @@ function updateV2Progress(payload) {
     : [];
   lastPilotPhases = Array.isArray(payload.pilot_phase_segments)
     ? payload.pilot_phase_segments
+    : [];
+  lastPilotPhaseIsMeta = Array.isArray(payload.pilot_phase_is_meta)
+    ? payload.pilot_phase_is_meta
     : [];
 
   const sigmaStr = lastProgress.sigma2 != null
@@ -2903,15 +2915,28 @@ function drawPilotPhase() {
     ctx.stroke();
   }
 
-  // Walk each segment as a polyline. Alternate stroke colour per segment
-  // so the user can count them and see where pilot interp restarts.
-  const colours = ["rgba(129, 212, 250, 0.95)", "rgba(255, 183, 77, 0.95)"];
+  // Walk each segment as a polyline. DATA segments alternate blue/orange
+  // so the operator can count them and spot where pilot interp restarts;
+  // META segments (header replicated, marked by the worker via
+  // pilot_phase_is_meta) get a distinct magenta stroke so they're
+  // immediately identifiable in the trace — they have a different pilot
+  // density / payload structure than DATA segments and would otherwise
+  // be invisible after the rework that removed the meta-filter.
+  const dataColours = ["rgba(129, 212, 250, 0.95)", "rgba(255, 183, 77, 0.95)"];
+  const metaColour = "rgba(236, 64, 122, 0.95)"; // magenta-pink
   let xCursor = 0;
+  let dataIdx = 0;
   const pxPerSample = total > 1 ? plotW / (total - 1) : 0;
   for (let s = 0; s < anchored.length; s++) {
     const seg = anchored[s];
     if (seg.length === 0) continue;
-    ctx.strokeStyle = colours[s % colours.length];
+    const isMeta = !!(lastPilotPhaseIsMeta && lastPilotPhaseIsMeta[s]);
+    if (isMeta) {
+      ctx.strokeStyle = metaColour;
+    } else {
+      ctx.strokeStyle = dataColours[dataIdx % dataColours.length];
+      dataIdx += 1;
+    }
     ctx.lineWidth = 2 * dpr;
     ctx.beginPath();
     for (let i = 0; i < seg.length; i++) {

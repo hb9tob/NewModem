@@ -7,3 +7,15 @@ description = "Audio I/O backends for the NBFM modem (cpal devices + capture, fu
 [dependencies]
 cpal = "0.15"
 serde = { version = "1", features = ["derive"] }
+# SPSC lock-free ring buffer designed for audio callbacks — keeps the
+# OS audio thread allocation-free and wait-free. ~200 LOC, zero
+# transitive deps. Used by `cpal_capture` to drop raw native-format
+# bytes straight into a 30 s ring; a dedicated reader thread drains it,
+# converts to f32 mono, and forwards to the rx_worker.
+rtrb = "0.3"
+
+# `sched_setscheduler(SCHED_FIFO, …)` best-effort RT-priority lift for
+# the reader thread on Linux. We never panic if it fails (typical
+# unprivileged user) — just log once and continue at normal priority.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

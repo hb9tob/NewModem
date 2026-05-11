@@ -149,9 +149,17 @@ struct V2ProgressPayload {
     sigma2_data: f64,
     converged_bitmap: Vec<u8>,
     constellation_sample: Vec<[f32; 2]>,
-    /// Pilot LS smoothed phases per data segment (radians) for the most
+    /// Pilot LS smoothed phases per segment (radians) for the most
     /// recent decoded window. Empty if no segment was decoded yet.
+    /// Includes both META and DATA segments; use [`pilot_phase_is_meta`]
+    /// to tell them apart.
     pilot_phase_segments: Vec<Vec<f32>>,
+    /// Parallel to [`pilot_phase_segments`]: `true` if the same-index
+    /// entry is a META segment (header replicated), `false` for a
+    /// regular DATA segment. The frontend uses this to colour META
+    /// distinctly so the operator sees the full frame layout rather
+    /// than only data segments.
+    pilot_phase_is_meta: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -516,6 +524,10 @@ fn run_worker(
     let mut last_telemetry_tick = Instant::now();
     let mut last_batch_processing_ms: f64 = 0.0;
     let mut max_batch_processing_ms: f64 = 0.0;
+    // Cumulative `dropped_samples` reading observed last loop iteration.
+    // Any positive delta means the capture-side ring overflowed since
+    // we last looked — see brickwall handler below.
+    let mut last_dropped: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let first = match samples.recv_timeout(Duration::from_millis(200)) {
@@ -538,6 +550,45 @@ fn run_worker(
         }
 
         state.total_samples += batch.len() as u64;
+
+        // Capture-side brickwall: did the OS-audio 30 s ring overflow
+        // since the last iteration? If yes and we're mid-session, the
+        // session_buffer now contains a hole (the dropped samples are
+        // gone; the audio downstream of the gap doesn't line up with
+        // what came before for the matched filter / drift estimator).
+        // Discard the in-flight session and return to idle so the next
+        // preamble is treated as a clean start, mirroring what the user
+        // wants: "Si un des brickwall est atteint on flush tout et on
+        // repart un idle pour attendre la prochaine superframe."
+        //
+        // While idle, an overflow is informational — we drop the current
+        // batch (would be discarded by the preroll trim anyway) and
+        // continue without flushing.
+        let cur_dropped = dropped_samples.load(Ordering::Relaxed);
+        if cur_dropped > last_dropped {
+            let delta = cur_dropped - last_dropped;
+            last_dropped = cur_dropped;
+            if state.session_active {
+                worker_log(&format!(
+                    "[worker] BRICKWALL capture: +{delta} mono-samples dropped \
+                     during active session → flush + idle"
+                ));
+                state.soft_reset_buffer();
+                let flushed = drain_mpsc(&samples, &mut state.total_samples);
+                if flushed > 0 {
+                    worker_log(&format!(
+                        "[worker] flushed {flushed} mpsc samples on brickwall"
+                    ));
+                }
+                // Skip the rest of this iteration — the batch we just
+                // pulled is itself part of the corrupted stream.
+                continue;
+            } else {
+                worker_log(&format!(
+                    "[worker] ring overflow +{delta} mono-samples while idle (no flush)"
+                ));
+            }
+        }
 
         // Raw capture (if armed)
         if let Ok(mut guard) = wav_sink.lock() {
@@ -588,15 +639,42 @@ fn run_worker(
         //             "session never closes / no preamble ever found"
         //             cases (sender vanished, profile-detect loop, ...).
         state.session_buffer.extend_from_slice(&batch);
-        let cap_secs = if state.session_active {
-            SESSION_HARD_CAP_SECONDS
-        } else {
-            PREROLL_SECONDS
-        };
-        let cap = AUDIO_RATE as usize * cap_secs;
         let len = state.session_buffer.len();
-        if len > cap {
-            state.session_buffer.drain(..len - cap);
+        if state.session_active {
+            // Worker-side brickwall. SESSION_HARD_CAP_SECONDS (5 min) is
+            // the proxy for "the worker has accumulated 5 minutes of
+            // audio without scan_and_route ever managing to truncate
+            // it" — either no preamble ever found, profile-detect loop,
+            // or the worker is so far behind realtime that the buffer
+            // builds up faster than it can be drained. In all these
+            // cases the in-flight decode state is unrecoverable;
+            // flush + idle so the next preamble lands on a clean buffer.
+            // Same drain_mpsc semantic as the capture brickwall.
+            let cap = AUDIO_RATE as usize * SESSION_HARD_CAP_SECONDS;
+            if len > cap {
+                worker_log(&format!(
+                    "[worker] BRICKWALL worker: session_buffer reached {:.0}s without \
+                     scan_and_route truncation → flush + idle",
+                    len as f64 / AUDIO_RATE as f64,
+                ));
+                state.soft_reset_buffer();
+                let flushed = drain_mpsc(&samples, &mut state.total_samples);
+                if flushed > 0 {
+                    worker_log(&format!(
+                        "[worker] flushed {flushed} mpsc samples on brickwall"
+                    ));
+                }
+                continue;
+            }
+        } else {
+            // Idle: keep a rolling PREROLL_SECONDS noise buffer so a
+            // preamble landing across batch boundaries is still
+            // detectable. Drop-from-the-front is harmless here — no
+            // decode is in flight.
+            let cap = AUDIO_RATE as usize * PREROLL_SECONDS;
+            if len > cap {
+                state.session_buffer.drain(..len - cap);
+            }
         }
 
         maintenance_tick(&*sink, &save_dir, &mut state);
@@ -652,6 +730,24 @@ fn run_worker(
     }
 
     worker_log("[worker] stop");
+}
+
+/// Drain whatever the cpal-reader thread has queued in the mpsc and
+/// account for it in `total_samples` so the post-flush `lag_ms` metric
+/// is honest (those samples WERE observed by the worker, we just chose
+/// not to decode them). Returns the number of f32 samples discarded —
+/// purely for the log line.
+///
+/// Called on both brickwall paths (capture ring overflow and worker
+/// 5 min cap) so we don't restart the next session on top of a stale
+/// backlog.
+fn drain_mpsc(samples: &Receiver<Vec<f32>>, total_samples: &mut u64) -> usize {
+    let mut n = 0;
+    while let Ok(chunk) = samples.try_recv() {
+        *total_samples += chunk.len() as u64;
+        n += chunk.len();
+    }
+    n
 }
 
 fn compute_audio_stats(batch: &[f32]) -> (f32, f32, f32) {
@@ -885,8 +981,17 @@ fn scan_and_route(
         }
     }
     let eot_seen = result.eot_seen;
+    // `sigma2`      : pilot residual variance, includes meta segments
+    //                 (header pilots count toward the average).
+    // `sigma2_data` : data-symbol hard-decision residual variance,
+    //                 EXCLUDES meta — closer to what the actual payload
+    //                 constellation looks like.
+    // Logging both so we can tell whether a high `sigma2` is real data
+    // degradation (`sigma2_data` also high) vs a meta-pilot statistical
+    // artifact (`sigma2_data` low). The 2026-05-11 sound-card investigation
+    // hinges on this distinction.
     worker_log(&format!(
-        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
+        "[scan] active={} buf={:.1}s rx_v3=Some hdr={} v{} flags=0x{:02X} ah={} cw_map={} conv={}/{} segs={}/{} sigma2={:.4} sigma2_data={:.4} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
         state.session_active,
         buf_secs,
         result.header.is_some(),
@@ -899,6 +1004,7 @@ fn scan_and_route(
         result.segments_decoded,
         result.segments_lost,
         result.sigma2,
+        result.sigma2_data,
         rms_sqr,
         t_probe_us,
         probe_label,
@@ -906,6 +1012,30 @@ fn scan_and_route(
         t_detect_us,
         t_rx_v3_us,
     ));
+
+    // Per-segment pilot sigma² breakdown. Surfaces whether the aggregate
+    // `sigma2` is uniformly distributed across segments or concentrated
+    // on a subset (= confirms or refutes the "odd segments alternate to
+    // sigma2=0.5" observation reported on HighPlus sound-card capture).
+    // Format: `M:` for meta, `D:` for data, in temporal order. Skipped
+    // when no per-segment data exists (e.g. rx_v3=None path).
+    if !result.pilot_sigma2_per_segment.is_empty() {
+        let mut parts = String::with_capacity(
+            result.pilot_sigma2_per_segment.len() * 12,
+        );
+        for (i, &s) in result.pilot_sigma2_per_segment.iter().enumerate() {
+            let tag = if *result.pilot_phase_is_meta.get(i).unwrap_or(&false) {
+                "M"
+            } else {
+                "D"
+            };
+            if i > 0 {
+                parts.push(' ');
+            }
+            parts.push_str(&format!("{tag}:{s:.4}"));
+        }
+        worker_log(&format!("[scan-segs] {parts}"));
+    }
 
     // Transition to Capturing as soon as a V3 protocol header is Golay-
     // decoded. Requiring app_header (meta LDPC) would deadlock : the Idle
@@ -1062,6 +1192,7 @@ fn scan_and_route(
                 converged_bitmap: outcome.seen_bitmap.clone(),
                 constellation_sample: result.constellation_sample.clone(),
                 pilot_phase_segments: result.pilot_phase_segments.clone(),
+                pilot_phase_is_meta: result.pilot_phase_is_meta.clone(),
             },
         );
     }

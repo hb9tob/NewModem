@@ -73,11 +73,24 @@ pub struct RxV2Result {
     /// scatter). Capped at ~500 points — the GUI displays them as a
     /// scatter plot.
     pub constellation_sample: Vec<[f32; 2]>,
-    /// Pilot LS smoothed phases (radians) per decoded data segment in
-    /// this window, in temporal order. Meta segments are excluded. The GUI
-    /// concatenates these into a phase-vs-position plot to diagnose drift
-    /// or phase noise that the linear pilot interpolation can't track.
+    /// Pilot LS smoothed phases (radians) per decoded segment in this
+    /// window, in temporal order. Both META and DATA segments are
+    /// included so the GUI can show the full picture of the frame.
+    /// Companion [`pilot_phase_is_meta`] flags which entries are META.
     pub pilot_phase_segments: Vec<Vec<f32>>,
+    /// Parallel to `pilot_phase_segments`: `true` if the segment at the
+    /// same index is a META segment (header replicated), `false` for
+    /// a regular DATA segment. Lets the GUI render META in a distinct
+    /// colour so the operator sees the full frame layout rather than
+    /// data-only segments.
+    pub pilot_phase_is_meta: Vec<bool>,
+    /// Parallel to `pilot_phase_segments`: per-segment pilot-residual
+    /// sigma² (= mean squared residual of `received_pilot - g_hat *
+    /// expected_pilot` over the segment's pilot symbols). Lets us
+    /// confirm whether a high aggregate sigma² is uniformly distributed
+    /// across segments or concentrated on a few. NaN if a segment had
+    /// no pilots accumulated.
+    pub pilot_sigma2_per_segment: Vec<f64>,
     /// Offset (in samples, relative to the input slice) of the LAST preamble
     /// found by `rx_v3` in this call — closed or open. Callers maintaining a
     /// rolling capture buffer can drain everything before
@@ -619,6 +632,14 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // segments are excluded — their phase trace would alias onto the data
     // plot at a different cadence (1 CW vs 2 CW per segment).
     let mut pilot_phase_segments: Vec<Vec<f32>> = Vec::new();
+    // Parallel to `pilot_phase_segments`: true when the same-index entry
+    // is a META segment. Lets the GUI distinguish META from DATA in the
+    // bottom phase plot.
+    let mut pilot_phase_is_meta: Vec<bool> = Vec::new();
+    // Parallel to `pilot_phase_segments`: per-segment pilot sigma².
+    // Surfaced for diagnostic logging — confirms whether sigma² is
+    // distributed evenly across segments or spikes on a subset.
+    let mut pilot_sigma2_per_segment: Vec<f64> = Vec::new();
 
     // Session: first valid marker we see locks session_id_low; later markers
     // with a different session_id_low indicate a session change → we stop
@@ -707,6 +728,12 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         }
         let seg_syms_raw = &data_region[cursor..cursor + seg_sym_len];
 
+        // Snapshot sigma2 accumulator before/after the track_segment call
+        // so we can derive this segment's own sigma2 contribution (used
+        // for the per-segment diagnostic log surfaced via
+        // pilot_sigma2_per_segment).
+        let s2_sum_before = sigma2_sum;
+        let s2_count_before = sigma2_count;
         let (seg_data_syms, seg_pilot_phases) = track_segment(
             seg_syms_raw,
             &config.pilot_pattern,
@@ -715,6 +742,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             &mut sigma2_sum,
             &mut sigma2_count,
         );
+        let seg_sigma2 = if sigma2_count > s2_count_before {
+            (sigma2_sum - s2_sum_before) / (sigma2_count - s2_count_before) as f64
+        } else {
+            f64::NAN
+        };
         cursor += seg_sym_len;
 
         if seg_data_syms.len() < n_cw * syms_per_cw {
@@ -722,9 +754,15 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             continue;
         }
 
-        // Pilot phase trace per DATA segment for the GUI drift diagnostic.
-        if !marker_payload.is_meta() && !seg_pilot_phases.is_empty() {
+        // Pilot phase trace per segment for the GUI drift diagnostic.
+        // META and DATA are both included; `pilot_phase_is_meta` tags
+        // which is which so the GUI can colour them distinctly. The
+        // parallel `pilot_sigma2_per_segment` carries the segment's own
+        // pilot-residual variance for the per-segment diagnostic log.
+        if !seg_pilot_phases.is_empty() {
             pilot_phase_segments.push(seg_pilot_phases);
+            pilot_phase_is_meta.push(marker_payload.is_meta());
+            pilot_sigma2_per_segment.push(seg_sigma2);
         }
 
         // Data-symbol σ² (frame-only, hard-decision residuals). Skip meta
@@ -864,6 +902,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         eot_seen,
         constellation_sample,
         pilot_phase_segments,
+        pilot_phase_is_meta,
+        pilot_sigma2_per_segment,
         last_preamble_offset: None,
     })
 }
@@ -945,6 +985,8 @@ pub fn rx_v3_after(
     let mut eot_seen = false;
     let mut last_constellation: Vec<[f32; 2]> = Vec::new();
     let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
+    let mut last_pilot_phase_is_meta: Vec<bool> = Vec::new();
+    let mut last_pilot_sigma2_per_segment: Vec<f64> = Vec::new();
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -1021,6 +1063,8 @@ pub fn rx_v3_after(
         // recent window so the operator can watch drift evolve tick by tick.
         if !r.pilot_phase_segments.is_empty() {
             last_pilot_phases = r.pilot_phase_segments;
+            last_pilot_phase_is_meta = r.pilot_phase_is_meta;
+            last_pilot_sigma2_per_segment = r.pilot_sigma2_per_segment;
         }
     }
 
@@ -1089,6 +1133,8 @@ pub fn rx_v3_after(
         eot_seen,
         constellation_sample: last_constellation,
         pilot_phase_segments: last_pilot_phases,
+        pilot_phase_is_meta: last_pilot_phase_is_meta,
+        pilot_sigma2_per_segment: last_pilot_sigma2_per_segment,
         last_preamble_offset,
     })
 }
@@ -1232,6 +1278,17 @@ fn track_segment(
     // tracks the intra-segment residual (small-angle, fast convergence). On
     // 8-PSK / 16-APSK we skip this pass — the decision noise on those
     // constellations would amplify more than the PLL removes.
+    //
+    // Note (2026-05-11) : tested a narrow-band variant (α=0.005, BW≈1 Hz)
+    // for APSK profiles on sound-card capture, hoping to track residual
+    // phase drift between pilot groups. Got the opposite result: sigma²
+    // on narrow-window scans rose ~50% (0.03→0.05), conv ratios unchanged.
+    // Conclusion: the sound-card degradation isn't phase-tracking but a
+    // preamble→data transient (radio AGC + AF chain settling). The first
+    // codeword after the preamble gets sacrificed, the rest decodes clean.
+    // Track that under "investigate preamble→data transient" — needs an
+    // RX-only fix (skip first M symbols / downweight initial LLR) or a
+    // TX-side guard period, not a phase loop.
     if constellation.bits_per_sym == 2 {
         pll.reset();
         for y in data_syms.iter_mut() {
