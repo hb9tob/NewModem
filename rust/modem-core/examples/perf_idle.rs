@@ -109,7 +109,7 @@ fn main() {
         let _ = rx_v2::detect_best_profile(&buf, ProfileIndex::Normal);
     }
     for _ in 0..3 {
-        let _ = rx_v2::rx_v3_after(&buf, &ProfileIndex::Normal.to_config(), 0);
+        let _ = rx_v2::rx_v3_after(&buf, &ProfileIndex::Normal.to_config(), 0, false);
     }
 
     // 1) detect_best_profile (5 profiles internally).
@@ -133,7 +133,7 @@ fn main() {
         let mut t_rx = Vec::with_capacity(N_ITERS);
         for _ in 0..N_ITERS {
             let t0 = Instant::now();
-            let _ = rx_v2::rx_v3_after(&buf, &cfg, 0);
+            let _ = rx_v2::rx_v3_after(&buf, &cfg, 0, false);
             t_rx.push(t0.elapsed().as_micros());
         }
         report(&format!("rx_v3_after[{:?}]", profile), t_rx);
@@ -146,7 +146,7 @@ fn main() {
     for _ in 0..N_ITERS {
         let t0 = Instant::now();
         let _ = rx_v2::detect_best_profile(&buf, ProfileIndex::Normal);
-        let _ = rx_v2::rx_v3_after(&buf, &cfg, 0);
+        let _ = rx_v2::rx_v3_after(&buf, &cfg, 0, false);
         t_combo.push(t0.elapsed().as_micros());
     }
     report("legacy idle tick", t_combo);
@@ -184,7 +184,7 @@ fn main() {
             // Would fall through to detect + rx_v3 here ; on noise it
             // never triggers, so the cost stays at the probe alone.
             let _ = rx_v2::detect_best_profile(&buf, ProfileIndex::Normal);
-            let _ = rx_v2::rx_v3_after(&buf, &cfg, 0);
+            let _ = rx_v2::rx_v3_after(&buf, &cfg, 0, false);
         }
         t_new_tick.push(t0.elapsed().as_micros());
     }

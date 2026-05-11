@@ -904,7 +904,16 @@ fn scan_and_route(
     // downmix/MF cost therefore stays bounded by the live preamble
     // cadence, not by burst length.
     let t_rx_v3_start = Instant::now();
-    let rx_v3_opt = rx_v2::rx_v3(&state.session_buffer, &config);
+    // IDLE pre-activation → `finalize=true` (decode the trailing OPEN
+    // window so its header can trigger session activation); once
+    // ACTIVE → `finalize=false` (skip OPEN, wait for the next preamble
+    // to close it on a subsequent tick — avoids the segment-by-segment
+    // drift accumulation that pilot-only tracking suffers on an
+    // unclosed window). `rx_v3_after` auto-escalates back to a decode
+    // if a CLOSED window of this same buffer carries an EOT marker,
+    // so end-of-burst recovery doesn't need a second scan.
+    let finalize = !state.session_active;
+    let rx_v3_opt = rx_v2::rx_v3_after(&state.session_buffer, &config, 0, finalize);
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
@@ -943,7 +952,15 @@ fn scan_and_route(
                         serde_json::json!({ "profile": profile_name(state.profile) }),
                     );
                     let new_config = state.config.clone();
-                    match rx_v2::rx_v3(&state.session_buffer, &new_config) {
+                    // Auto-profile re-decode: same `finalize` policy as
+                    // the main tick. We got here BECAUSE the first
+                    // decode produced a header (so a CLOSED window did
+                    // decode) — `session_active` may still be false at
+                    // this point and gets flipped further down based on
+                    // the refreshed result. `!session_active` correctly
+                    // forces the OPEN decode for the activation path.
+                    let finalize = !state.session_active;
+                    match rx_v2::rx_v3_after(&state.session_buffer, &new_config, 0, finalize) {
                         Some(refresh) => {
                             // Defensive : if the fresh header still claims a
                             // different profile, give up rather than loop.

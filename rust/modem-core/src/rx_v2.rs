@@ -103,6 +103,17 @@ pub struct RxV2Result {
     /// `None` for `rx_v2_single` (single-window, no preamble walking) or
     /// `rx_v3_after` calls where no preamble was found at all.
     pub last_preamble_offset: Option<usize>,
+    /// Per-window drift compensation (ppm, positive = RX clock faster than
+    /// TX) applied to produce this decode. Populated by `rx_v2`'s grid
+    /// search (= `best_ppm`); 0.0 when the first-pass `rx_v2_single`
+    /// already converged or when produced by `rx_v2_single` /
+    /// `rx_v3_after` directly. `rx_v3_after` carries this value forward
+    /// from the latest CLOSED window to the OPEN one (via `rx_v2_with_hint`),
+    /// because TX/RX sound-card clocks drift slowly enough that the
+    /// previous superframe's ppm is a near-perfect prior — much more
+    /// reliable than a blind grid search on a loosely-constrained OPEN
+    /// window.
+    pub drift_ppm: f64,
 }
 
 /// Cheap preamble presence probe — intended for the RX worker's Idle gate.
@@ -344,7 +355,44 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         }
         eprintln!("[rx_v2] drift-compensated at {best_ppm:+.0} ppm");
     }
+    // Expose the chosen drift so `rx_v3_after` can carry it forward as a
+    // hint to neighbouring windows. Left at 0.0 if the first-pass decode
+    // was already clean (no grid search ran).
+    if let Some(ref mut r) = best {
+        r.drift_ppm = best_ppm;
+    }
     best
+}
+
+/// Decode `samples` after pre-resampling by `hint_ppm`. Single-pass: no
+/// grid search, no refine. Order-of-magnitude cheaper than [`rx_v2`] and
+/// only safe when the caller has a tight prior on the actual TX/RX clock
+/// drift — typically the [`RxV2Result::drift_ppm`] returned by a recent
+/// [`rx_v2`] decode of a neighbouring window in the same session.
+///
+/// Used by [`rx_v3_after`] to decode the OPEN (trailing, no-closing-
+/// preamble) window with the drift estimate of the latest CLOSED window
+/// instead of either (a) skipping it — would lose the last superframe of
+/// a burst — or (b) re-running the blind grid search on a loosely-
+/// constrained window — expensive and unreliable, the segments past the
+/// last pilot drift unboundedly without an anchoring preamble.
+///
+/// Pass `hint_ppm = 0.0` to short-circuit straight to [`rx_v2_single`] —
+/// the resample is a no-op at zero ppm and we avoid the allocation.
+pub fn rx_v2_with_hint(
+    samples: &[f32],
+    config: &ModemConfig,
+    hint_ppm: f64,
+) -> Option<RxV2Result> {
+    // Snap sub-grid-step hints to zero; cheaper than resampling and the
+    // residual ppm gets absorbed by the per-segment pilot tracker anyway.
+    if hint_ppm.abs() < 0.5 {
+        return rx_v2_single(samples, config);
+    }
+    let corrected = resample_audio(samples, hint_ppm);
+    let mut r = rx_v2_single(&corrected, config)?;
+    r.drift_ppm = hint_ppm;
+    Some(r)
 }
 
 /// Score a decode result for comparing drift candidates. Higher is better.
@@ -796,8 +844,28 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             }
         }
 
-        // Use a per-segment sigma² estimate if available, else a reasonable default
-        let sigma2_for_llr = if sigma2_count > 0 {
+        // LLR scale: use THIS segment's own pilot-residual σ² so the
+        // soft demod sees the noise variance that actually applies to
+        // these data symbols. The previous implementation used the
+        // running mean σ² across all segments processed so far in this
+        // superframe — a sound aggregate metric for diagnostics, but a
+        // poor LLR scale when channel quality varies segment by segment
+        // (drift accumulation on sound-card paths, brief fades, ALSA
+        // glitches mid-burst). With an aggregate σ², a noisy segment's
+        // high variance was diluted by the surrounding clean ones, so
+        // its symbols were soft-demodulated as if clean → LLR magnitudes
+        // were over-confident → LDPC converged on the noise → wrong
+        // bits → wrong hard decisions on the (otherwise clean) data
+        // symbols → outlier points scattered across the constellation
+        // scatter (the "constellation aux fraises" symptom observed
+        // 2026-05-11 OTA on HighPlus). Per-segment σ² fixes the LLR
+        // scale at the source.
+        //
+        // Fallback to the running aggregate, then to a generic 0.1, in
+        // the (rare) case where this segment had no pilot contribution.
+        let sigma2_for_llr = if seg_sigma2.is_finite() {
+            seg_sigma2.max(1e-6)
+        } else if sigma2_count > 0 {
             (sigma2_sum / sigma2_count as f64).max(1e-6)
         } else {
             0.1
@@ -905,6 +973,10 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         pilot_phase_is_meta,
         pilot_sigma2_per_segment,
         last_preamble_offset: None,
+        // Single-pass path never resamples; the caller (`rx_v2` /
+        // `rx_v2_with_hint`) overwrites this when the decode was driven
+        // by a non-zero hint.
+        drift_ppm: 0.0,
     })
 }
 
@@ -927,7 +999,12 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
 ///
 /// Returns `None` only if no preamble is found at all.
 pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
-    rx_v3_after(samples, config, 0)
+    // One-shot semantics: `samples` is assumed to hold the complete
+    // transmission (CLI WAV decode, unit tests), so we must finalize and
+    // decode the trailing OPEN window — there is no "next tick" to wait
+    // for a closing preamble. The live worker uses `rx_v3_after` directly
+    // with `finalize=false` for normal ticks.
+    rx_v3_after(samples, config, 0, true)
 }
 
 /// Same as `rx_v3` but skip every preamble whose detected offset is strictly
@@ -937,11 +1014,33 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
 /// profiles like ULTRA where each `rx_v2` pass costs several hundred ms
 /// and the buffer can hold 2-3 closed windows at any time.
 ///
-/// When `skip_until = 0`, behaves exactly like `rx_v3`.
+/// When `skip_until = 0` and `finalize = true`, behaves exactly like the
+/// public [`rx_v3`] wrapper (one-shot full decode).
+///
+/// The OPEN window (trailing preamble with no closing preamble in this
+/// buffer) is ALWAYS decoded — its header is the only path for an idle
+/// worker to recognize that a burst has started. When a CLOSED window
+/// earlier in the same buffer produced a drift estimate, that estimate
+/// is inherited as a hint via [`rx_v2_with_hint`], giving the OPEN
+/// window the same drift compensation as if it were CLOSED itself
+/// (sound-card clocks drift slowly enough that the previous superframe's
+/// ppm is a near-perfect prior).
+///
+/// `finalize` controls only the no-hint fallback strategy:
+/// - `false` (live worker, normal tick) — fall back to [`rx_v2_single`]
+///   (1 pass, no drift grid). Fast, matches pre-refactor behaviour.
+///   Once a CLOSED window decodes successfully later in the session,
+///   subsequent OPEN decodes inherit its drift hint.
+/// - `true` (one-shot decode = CLI WAV file, unit tests) — fall back
+///   to a full [`rx_v2`] grid search. Used when the OPEN window IS
+///   the entire payload (no future tick to wait for a closing preamble)
+///   so we must give it the best possible chance to decode, including
+///   large drift / misparameterized profile cases.
 pub fn rx_v3_after(
     samples: &[f32],
     config: &ModemConfig,
     skip_until: usize,
+    finalize: bool,
 ) -> Option<RxV2Result> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
@@ -987,6 +1086,11 @@ pub fn rx_v3_after(
     let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
     let mut last_pilot_phase_is_meta: Vec<bool> = Vec::new();
     let mut last_pilot_sigma2_per_segment: Vec<f64> = Vec::new();
+    // Running drift estimate. Updated by every CLOSED window decode that
+    // exits `rx_v2` with a successful grid hit; used as a hint when we
+    // (later in this same call) decide to decode an OPEN window.
+    let mut chosen_ppm: f64 = 0.0;
+    let mut have_hint: bool = false;
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -1004,26 +1108,53 @@ pub fn rx_v3_after(
             continue;
         }
         let window = &samples[start..end];
-        // Drift grid search (rx_v2 wrapper) costs up to 13 extra rx_v2_single
-        // passes when the decode isn't clean. On the OPEN window (last in
-        // this scan, no following preamble yet), the decode is by construction
-        // incomplete — not because of drift but because the burst is still
-        // in flight, so segments past the buffer end are missing and `clean`
-        // never trips. Running the full grid there wastes O(13) decodes per
-        // tick, which is the dominant cost on slow profiles (ULTRA at 500 Bd
-        // can spend several seconds per tick re-running the same drift sweep).
-        // Skip the grid for the open window — drift would only matter if the
-        // closed-window decodes had to compensate, and they still get the
-        // full search. By the next scan tick this window will be closed
-        // (a new preamble appeared) and gets the full treatment.
         let r_opt = if is_closed {
+            // CLOSED window: bounded on both sides by a preamble. The full
+            // `rx_v2` grid search is safe here — the matched filter has an
+            // absolute timing anchor at both ends, so the drift estimate
+            // is reliable. The fast-path inside `rx_v2` skips the grid
+            // when the first-pass `rx_v2_single` is already clean.
             rx_v2(window, config)
         } else {
-            rx_v2_single(window, config)
+            // OPEN window: trailing, no closing preamble.
+            //
+            // `finalize` toggles two semantics:
+            // - `true` (one-shot CLI/tests, OR live worker IDLE pre-
+            //   activation tick where the OPEN header is the only
+            //   signal that a burst has started) — DECODE the window.
+            //   Use the drift hint from the latest CLOSED window if
+            //   available (`rx_v2_with_hint`), else fall back to a
+            //   full `rx_v2` grid search so misparameterized profiles
+            //   or large drifts still decode.
+            // - `false` (live worker ACTIVE normal tick) — SKIP the
+            //   window. Its audio stays in the caller's buffer (via
+            //   `last_preamble_offset = positions.last()`) and gets
+            //   decoded as a CLOSED window on the next tick once a
+            //   new preamble lands. Avoids the segment-by-segment
+            //   timing-drift accumulation that pilot-only tracking
+            //   suffers on an unclosed window (observed 2026-05-11
+            //   on sound-card paths in `[scan-segs]`).
+            //
+            // Auto-escalates to a decode if any CLOSED window of this
+            // same buffer carried an EOT marker — the TX explicitly
+            // flagged end-of-burst, so no closing preamble will ever
+            // arrive and the OPEN audio is the last word of the burst.
+            if !(finalize || eot_seen) {
+                continue;
+            }
+            if have_hint {
+                rx_v2_with_hint(window, config, chosen_ppm)
+            } else {
+                rx_v2(window, config)
+            }
         };
         let Some(r) = r_opt else {
             continue;
         };
+        if is_closed {
+            chosen_ppm = r.drift_ppm;
+            have_hint = true;
+        }
         for (esi, bytes) in r.cw_bytes_map.into_iter() {
             merged.entry(esi).or_insert(bytes);
         }
@@ -1136,6 +1267,12 @@ pub fn rx_v3_after(
         pilot_phase_is_meta: last_pilot_phase_is_meta,
         pilot_sigma2_per_segment: last_pilot_sigma2_per_segment,
         last_preamble_offset,
+        // Aggregate value across multiple windows isn't meaningful at
+        // this level — the per-window estimates were already carried as
+        // hints to neighbouring windows inside the loop. Set to 0.0 so
+        // top-level callers (CLI, GUI worker) don't accidentally inherit
+        // a stale per-window value.
+        drift_ppm: 0.0,
     })
 }
 
