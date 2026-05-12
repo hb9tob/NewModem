@@ -211,6 +211,57 @@ struct ErrorPayload {
     message: String,
 }
 
+/// One LDPC-codeword-bearing segment in a decoded scan tick. The order
+/// in `SfDetailPayload::blocks` is temporal (preamble-first), so each
+/// `kind == "M"` entry marks the start of a fresh superframe (the meta
+/// CW is always the leading segment after a preamble+header), and the
+/// `kind == "D"` entries that follow are its data segments. The
+/// frontend renders this in the Info tab via the generic `logEvent`
+/// path.
+#[derive(Debug, Clone, Serialize)]
+struct SfBlockEntry {
+    /// Position within `blocks` (= temporal index across all segments
+    /// decoded by this scan, not seg_id from the marker payload — that
+    /// value resets per SF and would be ambiguous in a multi-SF tick).
+    idx: usize,
+    /// `"M"` (meta, first segment of an SF) or `"D"` (data segment).
+    kind: &'static str,
+    /// Pilot-residual σ² for this segment's pilot groups. Lower = cleaner
+    /// channel for this CW.
+    sigma2: f64,
+}
+
+/// Per-scan-tick decode detail. Lists every segment of every superframe
+/// processed in this tick along with the shared drift correction. The
+/// Info tab displays one log line per `sf_detail`; "tail -f" of the
+/// captured event log gives a flight-recorder view of every CW the
+/// modem touched.
+#[derive(Debug, Clone, Serialize)]
+struct SfDetailPayload {
+    /// Profile name the decode actually ran with (e.g. `"HIGH+"`),
+    /// which may differ from the user's pre-selected one after an
+    /// auto-profile refinement from the Golay header.
+    profile: String,
+    /// Drift correction (ppm, positive = RX clock faster) the scan
+    /// applied to land on a clean decode. Single value per tick: every
+    /// CW in `blocks` was demodulated with this ppm (rx_v3 inherits
+    /// the latest CLOSED window's drift to the OPEN one via the same
+    /// resample path, so the value is uniform across the tick).
+    ppm: f64,
+    /// Aggregate `converged_blocks / total_blocks` for the whole tick.
+    /// Mirrors the existing `progress` event's fields; duplicated here
+    /// so the Info-tab entry is self-contained.
+    converged_blocks: usize,
+    total_blocks: usize,
+    /// `true` if any window in this tick carried `FLAG_EOT`. Helps the
+    /// operator correlate "decode ended cleanly" with the surrounding
+    /// SF detail.
+    eot: bool,
+    /// Per-segment details, temporally ordered (preamble → header →
+    /// meta → data → ... → meta of next SF → data → ...).
+    blocks: Vec<SfBlockEntry>,
+}
+
 // TX-overdrive detection : see previous worker version for calibration.
 const OVERDRIVE_RMS_GATE_LINEAR: f32 = 0.056;
 const OVERDRIVE_CREST_GATE_DB: f32 = 8.5;
@@ -1052,6 +1103,41 @@ fn scan_and_route(
             parts.push_str(&format!("{tag}:{s:.4}"));
         }
         worker_log(&format!("[scan-segs] {parts}"));
+    }
+
+    // Info-tab feed: emit a structured per-tick `sf_detail` event with
+    // the same per-segment σ² breakdown, the drift_ppm that was applied,
+    // and the aggregate converged/total counts. The frontend logs every
+    // event under #event-log so the operator sees one row per SF batch
+    // with full DSP context (debug + OTA observation).
+    //
+    // Skipped on ticks with no per-segment data (= `[scan-segs]` was
+    // also skipped above) to avoid spamming the Info tab while idle.
+    if !result.pilot_sigma2_per_segment.is_empty() {
+        let blocks: Vec<SfBlockEntry> = result
+            .pilot_sigma2_per_segment
+            .iter()
+            .enumerate()
+            .map(|(idx, &s)| {
+                let is_meta = *result.pilot_phase_is_meta.get(idx).unwrap_or(&false);
+                SfBlockEntry {
+                    idx,
+                    kind: if is_meta { "M" } else { "D" },
+                    sigma2: s,
+                }
+            })
+            .collect();
+        sink.emit(
+            "sf_detail",
+            SfDetailPayload {
+                profile: profile_name(state.profile).to_string(),
+                ppm: result.drift_ppm,
+                converged_blocks: result.converged_blocks,
+                total_blocks: result.total_blocks,
+                eot: eot_seen,
+                blocks,
+            },
+        );
     }
 
     // Transition to Capturing as soon as a V3 protocol header is Golay-

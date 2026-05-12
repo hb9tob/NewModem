@@ -2988,6 +2988,10 @@ function wireEvents() {
     "file_complete",
     "session_end",
     "error",
+    // Per-scan DSP breakdown: profile + ppm + per-segment sigma². One
+    // entry per tick with decoded segments. Logged in the Info tab via
+    // the generic logEvent path (JSON dump under the event name).
+    "sf_detail",
   ];
   for (const name of names) {
     listen(name, (event) => {
