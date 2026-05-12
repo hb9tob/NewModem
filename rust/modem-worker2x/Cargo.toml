@@ -1,0 +1,21 @@
+[package]
+name = "modem-worker2x"
+version = "0.1.0"
+edition = "2021"
+description = "GUI-agnostic TX/RX orchestration for the 2x family (V4 wire format). Sibling of modem-worker; reuses ptt + EventSink from there. Separate crate so the legacy V3 worker stays bit-for-bit unchanged."
+
+[dependencies]
+modem-core-base = { path = "../modem-core-base" }
+modem-core2x = { path = "../modem-core2x" }
+modem-framing = { path = "../modem-framing" }
+modem-io = { path = "../modem-io" }
+# `modem-worker` is brought in solely to re-export `ptt` and `EventSink`
+# so the 2x worker doesn't duplicate the GPIO / serial logic. No V3
+# DSP types from `modem-core` cross the boundary.
+modem-worker = { path = "../modem-worker" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -310,20 +310,19 @@ pub fn rx_v4_symbols_after(
 
         // DATA-CWs of this cycle. The encoder wrote `cw_per_cycle` (or
         // fewer at the very end of a burst); we read until either we
-        // hit `cw_per_cycle`, the next SOF, or run out of symbols.
+        // hit `cw_per_cycle` or run out of symbols.
+        //
+        // Earlier versions also tried to stop early if a fresh SOF
+        // candidate lit up inside the current CW slot, but the SOF
+        // correlation threshold (0.5·64 = 32) is low enough that random
+        // data symbols cross it spuriously — we lost real data CWs to
+        // false positives, especially on short ULTRA cycles. The outer
+        // `find_next_sof(scan)` re-anchors on the next real SOF anyway,
+        // so a CW slice that's actually past EOT just LDPC-fails and
+        // is dropped from `cw_bytes` (no harm).
         for k in 0..cw_per_cycle {
             let chunk_end = wire_cursor + cw_with_pilots;
             if chunk_end > symbols.len() {
-                break;
-            }
-            // Stop early if a fresh SOF lands inside this CW slot — the
-            // burst ended this cycle short.
-            let next_sof_in_chunk = find_next_sof(
-                &symbols[wire_cursor..chunk_end],
-                0,
-                cfg.family,
-            );
-            if next_sof_in_chunk.is_some() {
                 break;
             }
 

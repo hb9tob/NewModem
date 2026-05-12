@@ -3060,6 +3060,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "modem-worker2x"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "modem-core-base",
+ "modem-core2x",
+ "modem-framing",
+ "modem-io",
+ "modem-worker",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

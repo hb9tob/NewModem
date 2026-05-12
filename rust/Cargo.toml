@@ -1,5 +1,5 @@
 [workspace]
-members = ["modem-core", "modem-core-base", "modem-core2x", "modem-cli", "modem-framing", "modem-gui/src-tauri", "modem-io", "modem-pluto", "modem-sdr", "modem-sdr-dsp", "modem-sdrplay", "modem-worker", "newmodem-collector"]
+members = ["modem-core", "modem-core-base", "modem-core2x", "modem-cli", "modem-framing", "modem-gui/src-tauri", "modem-io", "modem-pluto", "modem-sdr", "modem-sdr-dsp", "modem-sdrplay", "modem-worker", "modem-worker2x", "newmodem-collector"]
 resolver = "2"
 
 [workspace.dependencies]
