@@ -102,11 +102,15 @@ pub fn make_preamble_for(family: PreambleFamily) -> Vec<Complex64> {
 
 /// Build the family preamble scaled by `config.training_amplitude()`.
 ///
-/// For QPSK/16APSK profiles the amplitude is 1.0 -> strictly equivalent
-/// to `make_preamble_for(family)`. For the two APSK profiles the
-/// unit-circle QPSK is multiplied so the 4 preamble points coincide
-/// with a strict subset of the data constellation:
+/// The preamble is emitted at the radius of the data constellation's
+/// outer ring, making the 4 QPSK preamble points (angles +/-pi/4,
+/// +/-3pi/4) coincide with a strict subset of the data constellation:
 ///
+/// - QPSK / 8PSK profiles (Normal/High/Robust/Ultra/Fast/Mega):
+///   amplitude 1.0 -- the constellation is already on the unit circle.
+///   Strictly equivalent to `make_preamble_for(family)`.
+/// - Apsk16 (HIGH56): multiply by R2 -> indices 0..3 of `apsk16_dvbs2`
+///   (R2 at +/-pi/4, +/-3pi/4).
 /// - Apsk32 (HIGH+):  multiply by R3 -> indices 25, 12, 10, 31 of
 ///   Figure 12 of EN 302 307-1 (R3 at +/-pi/4, +/-3pi/4).
 /// - Apsk64 (HIGH++): multiply by R4 -> indices 0, 1, 2, 3 of Table 13e
@@ -125,23 +129,23 @@ pub fn make_preamble_for_config(config: &crate::profile::ModemConfig) -> Vec<Com
     base.into_iter().map(|s| s * amp).collect()
 }
 
-/// "LMS guard interval" sequence inserted between the QPSK preamble and
-/// the header so that the FFE can adapt to mu_train on the data
-/// constellation before switching to DD.
+/// "LMS guard interval" sequence inserted between the preamble and the
+/// header so that the FFE can adapt to mu_train on the data constellation
+/// before switching to DD.
 ///
-/// - QPSK/16APSK profiles: empty Vec (the QPSK preamble and the
-///   DD-on-data-constellation transition were enough -- this is the
-///   historical behaviour).
-/// - Apsk32 (HIGH+): 32 symbols sweeping **each point of the 4+12+16
-///   constellation exactly once** in canonical Figure 12 order.
-/// - Apsk64 (HIGH++): 64 symbols sweeping **each point of the
-///   4+12+20+28 constellation exactly once** in canonical Table 13e
-///   order.
+/// **Uniform 32 syms across every profile** (cf. `lms_warmup_syms`).
+/// One wire layout for the whole catalogue : preamble[256] + warmup[32]
+/// + header[96] + ... The cycle through the constellation depends on
+/// the profile's bit count :
+/// - QPSK : 4 points x 8 cycles -> dense on every QPSK angle.
+/// - 8PSK : 8 points x 4 cycles.
+/// - 16-APSK : 16 points x 2 cycles -> every ring R1, R2 sampled twice.
+/// - 32-APSK : 32 points x 1 cycle -> exactly one sweep of 4+12+16
+///   (canonical Figure 12 order).
+/// - 64-APSK : first 32 of 64 points -> half-coverage of the 28-pt
+///   outer ring; pilot-dense tracking carries the slack on HIGH++.
 ///
-/// In both APSK cases LMS sees every amplitude (R1..Rk) and every angle
-/// before the first data CW, so the meta CW arrives on a FFE already
-/// adapted to the density. The sequence is deterministic and
-/// reconstructed identically on TX/RX.
+/// The sequence is deterministic and reconstructed identically on TX/RX.
 pub fn make_lms_warmup_for_config(config: &crate::profile::ModemConfig) -> Vec<Complex64> {
     let n = config.lms_warmup_syms();
     if n == 0 {

@@ -496,7 +496,10 @@ mod tests {
         for (i, (&actual, &expected)) in symbols.iter().zip(preamble.iter()).enumerate() {
             assert!((actual - expected).norm() < 1e-10, "preamble mismatch at {i}");
         }
-        let header_syms = &symbols[256..256 + 96];
+        // After 0.10.16 every profile carries a 32-sym LMS warmup between
+        // preamble and header (see `ModemConfig::lms_warmup_syms`).
+        let hdr_start = 256 + config.lms_warmup_syms();
+        let header_syms = &symbols[hdr_start..hdr_start + 96];
         let hdr = header::decode_header_symbols(header_syms).expect("header should decode");
         assert_eq!(hdr.version, HEADER_VERSION_V3);
         assert_eq!(hdr.payload_length, 200);
@@ -506,7 +509,8 @@ mod tests {
     fn eot_frame_carries_eot_flag_in_header() {
         let config = profile_normal();
         let symbols = build_eot_frame(&config, 0xDEAD_BEEF);
-        let header_syms = &symbols[256..256 + 96];
+        let hdr_start = 256 + config.lms_warmup_syms();
+        let header_syms = &symbols[hdr_start..hdr_start + 96];
         let hdr = header::decode_header_symbols(header_syms).expect("header decodes");
         assert_eq!(hdr.version, HEADER_VERSION_V3);
         assert!(
@@ -591,7 +595,8 @@ mod tests {
         let symbols =
             build_superframe_v3(&data, &config, 0xDEAD_BEEF, mime::BINARY, 0);
         let sync = crate::marker::make_sync_pattern();
-        let cursor = 256 + 96;
+        // preamble[256] + warmup[lms_warmup_syms] + header[96] = marker base.
+        let cursor = 256 + config.lms_warmup_syms() + 96;
         let marker_syms = &symbols[cursor..cursor + crate::marker::MARKER_SYNC_LEN];
         for (i, (&a, &b)) in marker_syms.iter().zip(sync.iter()).enumerate() {
             assert!((a - b).norm() < 1e-10, "marker sync mismatch at index {i}");

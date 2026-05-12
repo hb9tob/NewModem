@@ -396,27 +396,39 @@ impl ModemConfig {
 }
 
 impl ModemConfig {
-    /// Multiplier applied to the (otherwise unit-circle) QPSK preamble
-    /// before TX modulation, and to the matching RX reference (FFE
-    /// training). TDM pilots are NOT affected -- they stay on the unit
-    /// circle (see `pilot::pilot_symbol`).
+    /// Amplitude at which the family preamble is emitted -- the radius
+    /// of the OUTER RING of the data constellation. Applied to the QPSK
+    /// preamble before TX modulation, and to the matching RX reference
+    /// (FFE training, gain LS). TDM pilots are NOT affected -- they
+    /// stay on the unit circle (see `pilot::pilot_symbol`).
     ///
-    /// QPSK preambles use angles +/-pi/4, +/-3pi/4. The two APSK
-    /// constellations have a ring with exactly those 4 angles, so
-    /// scaling the preamble to a ring's radius makes the 4 preamble
-    /// points coincide with a strict subset of the data constellation.
-    /// The FFE/LMS then adapts on a continuous preamble->data amplitude,
-    /// without the scale "jump" that inflated residuals at the DD
-    /// switch.
+    /// QPSK preambles live at angles +/-pi/4, +/-3pi/4. Every supported
+    /// constellation has its outer ring at exactly those 4 angles, so
+    /// scaling the preamble to that radius makes the 4 preamble points
+    /// coincide with a strict subset of the data constellation. The
+    /// FFE/LMS then adapts on a continuous preamble->warmup->data
+    /// amplitude, without the scale "jump" that inflated residuals at
+    /// the DD switch.
     ///
-    /// - Apsk64 (HIGH++): align to R4 (outer, 28 pts). Indices 0..3 of
-    ///   Table 13e are R4 at the QPSK angles.
-    /// - Apsk32 (HIGH+): align to R3 (outer, 16 pts). Indices 25, 12,
-    ///   10, 31 of Figure 12 are R3 at the QPSK angles.
-    /// - QPSK/16APSK profiles: 1.0 (the QPSK preamble already lives
-    ///   inside the data constellation).
+    /// Uniform principle across the whole catalogue (single wire-format
+    /// layout in family A pitch=32, so the gate's anchor=Normal path can
+    /// header-refine into any sibling profile):
+    /// - QPSK / 8PSK profiles: 1.0 (constellation already on unit circle).
+    /// - Apsk16: R2 = sqrt(4 / (1/gamma^2 + 3)). Indices 0..3 of
+    ///   `apsk16_dvbs2` are R2 at the QPSK angles.
+    /// - Apsk32: R3 = gamma2 * r0 where r0 = sqrt(8 / (1+3*g1^2+4*g2^2)).
+    ///   Indices 25, 12, 10, 31 of Figure 12 (EN 302 307-1) are R3 at the
+    ///   QPSK angles.
+    /// - Apsk64: R4 = gamma3 * r0 where r0 = sqrt(16/(1+3g1^2+5g2^2+7g3^2)).
+    ///   Indices 0..3 of Table 13e (EN 302 307-2) are R4 at the QPSK angles.
     pub fn training_amplitude(&self) -> f64 {
         match self.constellation {
+            ConstellationType::Apsk16 => {
+                // R2 normalised: Es=1 on 4+12 -> r0^2 = 4/(1/g^2 + 3),
+                // R2 = r0 (r2_raw = 1 in `apsk16_dvbs2`).
+                let g = self.apsk_gamma;
+                (4.0 / (1.0 / (g * g) + 3.0)).sqrt()
+            }
             ConstellationType::Apsk32 => {
                 let g1 = self.apsk_gamma;
                 let g2 = self.apsk_gamma2;
@@ -443,28 +455,30 @@ impl ModemConfig {
         }
     }
 
-    /// Number of LMS training symbols injected between the QPSK
-    /// preamble and the header -- an "FFE guard interval" that covers
-    /// every ring of an APSK constellation so LMS adapts at the
-    /// `mu_train` step before switching to DD.
+    /// Number of LMS training symbols ("FFE guard interval") injected
+    /// between the preamble and the header.
     ///
-    /// - QPSK/16APSK profiles: 0 (QPSK preamble alone is enough; the
-    ///   data constellation decodes at the DD switch).
-    /// - Apsk32 (HIGH+): 32 (= 4+12+16 = a full sweep of the 32-APSK
-    ///   constellation, each point exactly once, in canonical Figure 12
-    ///   order).
-    /// - Apsk64 (HIGH++): 64 (= 4+12+20+28 = a full sweep of the
-    ///   64-APSK constellation, each point exactly once, in canonical
-    ///   Table 13e order).
+    /// **Uniform 32 across the whole catalogue** (= one wire layout for
+    /// every profile : preamble[256] + warmup[32] + header[96] + ...).
     ///
-    /// Symbols known on both TX and RX side, provided by
-    /// `preamble::make_lms_warmup_for_config`.
+    /// This uniformity is what makes the gate's anchor=Normal path work
+    /// for the family A pitch=32 cluster (Normal/High/HighPlus/HighFiveSix
+    /// + the two experimentals HighPlusPlus/HighPlusFiveSix). With a
+    /// fixed warmup length, the header lands at a deterministic
+    /// preamble-relative offset regardless of the underlying profile, so
+    /// the worker can decode the header with `state.profile = Normal`
+    /// and let the `profile_index` byte refine it to the actual one --
+    /// the auto-detect path that 0.10.13 broke for HighPlus.
+    ///
+    /// The training sequence cycles through the data constellation
+    /// (`make_lms_warmup_for_config`). 32 syms covers the inner rings
+    /// densely (QPSK : 8x, 8PSK : 4x, 16-APSK : 2x, 32-APSK : 1x) so
+    /// the FFE adapts to every amplitude before the first data CW.
+    /// Apsk64 (HIGH++) sweeps the first 32 of 64 points -- half-coverage
+    /// of the 28-pt outer ring, but pilot-dense (16/2) tracking on this
+    /// profile carries the slack between LMS warmup and CW decode.
     pub fn lms_warmup_syms(&self) -> usize {
-        match self.constellation {
-            ConstellationType::Apsk32 => 32,
-            ConstellationType::Apsk64 => 64,
-            _ => 0,
-        }
+        32
     }
 
     /// Net data rate in bits/s (after LDPC + pilot overhead).
