@@ -1216,6 +1216,13 @@ pub fn rx_v3_after(
     // (later in this same call) decide to decode an OPEN window.
     let mut chosen_ppm: f64 = 0.0;
     let mut have_hint: bool = false;
+    // Latest successfully-decoded window's drift_ppm (CLOSED or OPEN),
+    // surfaced in the returned `RxV2Result.drift_ppm`. This is what the
+    // worker reports to the Info tab so the operator sees the actual
+    // ppm correction the modem just landed on -- distinct from
+    // `chosen_ppm`, which is gated to CLOSED windows because it feeds
+    // the OPEN-window hint path.
+    let mut reported_ppm: f64 = 0.0;
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -1280,6 +1287,9 @@ pub fn rx_v3_after(
             chosen_ppm = r.drift_ppm;
             have_hint = true;
         }
+        // Capture every successful window's drift for reporting -- the
+        // last one wins, which is the most recent state of the channel.
+        reported_ppm = r.drift_ppm;
         for (esi, bytes) in r.cw_bytes_map.into_iter() {
             merged.entry(esi).or_insert(bytes);
         }
@@ -1392,12 +1402,14 @@ pub fn rx_v3_after(
         pilot_phase_is_meta: last_pilot_phase_is_meta,
         pilot_sigma2_per_segment: last_pilot_sigma2_per_segment,
         last_preamble_offset,
-        // Aggregate value across multiple windows isn't meaningful at
-        // this level — the per-window estimates were already carried as
-        // hints to neighbouring windows inside the loop. Set to 0.0 so
-        // top-level callers (CLI, GUI worker) don't accidentally inherit
-        // a stale per-window value.
-        drift_ppm: 0.0,
+        // Drift correction of the LAST successfully decoded window in
+        // this scan (CLOSED or OPEN). The per-window estimates are also
+        // carried forward as hints to neighbouring windows inside the
+        // loop (see `chosen_ppm`); this field is the telemetry view.
+        // Falls back to 0.0 only when no window decoded -- in which
+        // case the caller short-circuits on the assembled-data check
+        // anyway.
+        drift_ppm: reported_ppm,
     })
 }
 
