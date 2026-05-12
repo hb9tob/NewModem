@@ -499,20 +499,30 @@ struct WorkerState {
     /// when the user has not enabled the toggle in Settings.
     deemphasis: Option<DeemphasisFilter>,
     /// Session-wide drift estimate (ppm, positive = RX clock faster).
-    /// `None` until the first CLOSED SF of the session decodes cleanly:
-    /// at that point we force a one-shot `estimate_drift_gardner` on
-    /// the buffer and store the result. Subsequent ticks pass this
-    /// value as the `session_hint_ppm` to `rx_v3_after`, which lets
-    /// every CLOSED+OPEN window skip its per-window grid search and
-    /// decode straight with the session estimate -- amortised cost
-    /// ≈ N_sf rx_v2_with_hint vs 1× Gardner + N_sf rx_v2 grids.
+    /// `None` on cold start; locked by one of three paths:
     ///
-    /// Re-estimation trigger: after each decode we compare the
-    /// per-tick FFE-tap centroid shift (`final - initial`, in
-    /// FSE-input samples) against `FFE_CENTROID_REESTIMATE_SAMPLES`.
-    /// A shift > threshold means LMS had to migrate the peak that far
-    /// to track the residual drift uncorrected by the current
-    /// estimate -- we re-run Gardner and refresh the value.
+    /// 1. **PRE-DECODE Gardner** (`scan_and_route` cold-start block,
+    ///    runs before `rx_v3_after`). When the gate passes and we
+    ///    have no estimate yet, we call `estimate_drift_gardner` on
+    ///    the current buffer. If Gardner finds ≥3 markers, this is
+    ///    the fastest path -- we feed the ppm directly as
+    ///    `session_hint_ppm` to `rx_v3_after`, which then routes
+    ///    CLOSED windows through `rx_v2_with_hint` and saves the
+    ///    wasted 0-ppm `rx_v2_single` attempt that the legacy
+    ///    `rx_v2()` grid does on cold-start drift.
+    ///
+    /// 2. **POST-DECODE safety net** (Phase A, runs after
+    ///    `rx_v3_after`). Fires only when pre-decode returned None
+    ///    (typical idle pre-activation with <3 markers) AND the
+    ///    legacy `rx_v2()` path inside `rx_v3_after` somehow
+    ///    succeeded via its own internal Gardner+grid. Captures
+    ///    the drift from the post-decode buffer so the next tick
+    ///    has the hint.
+    ///
+    /// 3. **POST-DECODE re-estimation** (Phase C, runs after
+    ///    `rx_v3_after`). Compares the per-tick FFE-tap centroid
+    ///    shift converted to ppm against `REESTIMATE_RESIDUAL_PPM`;
+    ///    on overshoot we re-run Gardner and refresh the value.
     session_drift_ppm: Option<f64>,
 }
 
@@ -1002,6 +1012,38 @@ fn scan_and_route(
 
     let config = state.config.clone();
 
+    // Pre-decode drift estimation
+    // ---------------------------
+    // If we don't have a session-level estimate yet (cold start, or
+    // post-brickwall reset), try to lock one BEFORE rx_v3_after runs.
+    // Gardner re-uses the production MF + LS-FFE + LMS + marker-scan
+    // pipeline; if it finds ≥3 markers it returns a sub-ppm OLS slope
+    // estimate. We feed that as `session_hint_ppm` to `rx_v3_after`,
+    // which then routes CLOSED windows straight through
+    // `rx_v2_with_hint` -- one resample + one rx_v2_single decode
+    // -- instead of `rx_v2()`'s legacy 0 ppm attempt + internal
+    // Gardner + ±15 ppm grid search. Saves a wasted LDPC pass on
+    // the very first SF of a drifted session.
+    //
+    // If Gardner returns None (insufficient markers, typical idle
+    // pre-activation OPEN with <3 segments): we leave session_drift_ppm
+    // unset and `rx_v3_after` falls back to the legacy `rx_v2()` path,
+    // whose internal Gardner+grid is the safety net. The post-decode
+    // Phase A then captures whatever drift the legacy path landed on.
+    if state.session_drift_ppm.is_none() && !state.session_buffer.is_empty() {
+        let t0 = Instant::now();
+        if let Some(est_ppm) =
+            rx_v2::estimate_drift_gardner(&state.session_buffer, &config)
+        {
+            state.session_drift_ppm = Some(est_ppm);
+            worker_log(&format!(
+                "[drift] pre-decode init ppm={:+.2} (took {} ms) -- propagating to rx_v3_after",
+                est_ppm,
+                t0.elapsed().as_millis(),
+            ));
+        }
+    }
+
     // Scan the entire `session_buffer` — no fixed-size scan window, no
     // skip_until watermark. The buffer is kept small by the post-scan
     // truncation below : after every successful tick we drain
@@ -1174,21 +1216,24 @@ fn scan_and_route(
         worker_log(&format!("[scan-segs] {parts}"));
     }
 
-    // Session-level drift estimator (runs BEFORE the sf_detail emit so
-    // the operator sees the just-(re-)estimated value on the same tick).
+    // Session-level drift management (post-decode) -- runs BEFORE the
+    // sf_detail emit so the operator sees the just-(re-)estimated
+    // value on the same tick.
     //
-    // Phase A (init) -- first successful decode of the session, no
-    // estimate yet: force one Gardner pass on the buffer regardless of
-    // whether the fast-path converged. Gardner needs ≥3 markers, which
-    // ANY decoded CLOSED SF will produce; if it returns None (idle
-    // pre-activation OPEN with <3 markers, etc.), we keep
-    // session_drift_ppm = None and retry on the next decode.
+    // Phase A (safety-net init) -- fires only if pre-decode Gardner
+    // (cold-start block above) failed to lock but the legacy
+    // `rx_v2()` path inside `rx_v3_after` still managed to produce a
+    // result (typical: idle pre-activation OPEN with 2 markers,
+    // pre-decode Gardner gates at <3, but rx_v2_single found enough
+    // post-preamble symbols to decode a header). In that case we
+    // re-run Gardner on the now-decoded buffer.
     //
-    // Phase C (verify) -- estimate already locked: look at the FFE-tap
-    // centroid shift (`final - initial`) from this tick, converted to
-    // ppm via the profile-dependent FSE rate. A residual drift estimate
-    // above REESTIMATE_RESIDUAL_PPM means the LMS had to track that
-    // much un-corrected drift across an SF and we re-run Gardner.
+    // Phase C (verify / re-estimate) -- estimate already locked from
+    // a previous tick (or pre-decode): convert the per-tick FFE-tap
+    // centroid shift to ppm via the profile-dependent FSE rate. A
+    // residual drift estimate above REESTIMATE_RESIDUAL_PPM means
+    // the LMS had to track that much un-corrected drift across an SF
+    // and we re-run Gardner to refresh `session_drift_ppm`.
     //
     // Both phases are gated on a non-empty pilot_sigma2_per_segment
     // (same guard as the [scan-segs] / sf_detail emits) so idle ticks
@@ -1222,7 +1267,7 @@ fn scan_and_route(
                     state.session_drift_ppm = Some(est_ppm);
                     worker_log(&format!(
                         "[drift] {} ppm={:+.2} (prev={:?}, residual_ppm={:+.2}, centroid_shift={:+.3} samples, took {} ms)",
-                        if prev.is_none() { "init" } else { "refresh" },
+                        if prev.is_none() { "safety-net-init" } else { "refresh" },
                         est_ppm,
                         prev,
                         residual_ppm_estimate,
