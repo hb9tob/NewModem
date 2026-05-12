@@ -60,3 +60,9 @@ pub mod plheader;
 // Phase C-2 — `ProfileIndex2x` enum (8 profiles, HighPlusPlus2x
 // promoted) and `ModemConfig2x` struct used by the encoder/decoder.
 pub mod profile2x;
+
+// Phase C-3 — V4 superframe builder. Wires PLHEADER + LMS warmup +
+// META-CW + (pilot_block + DATA-CW)* into the wire stream of complex
+// symbols. Mutually exclusive with V3 frame layout (no markers, no
+// TDM intra-CW pilots, no runout).
+pub mod frame2x;

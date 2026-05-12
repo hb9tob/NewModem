@@ -44,13 +44,17 @@ pub fn pilot_block() -> &'static [Complex64; PILOT_BLOCK_LEN] {
 
 /// Interleave data symbols with pilot blocks.
 ///
-/// `data` is sliced into `blocks_per_cw` chunks of equal size; each chunk
-/// is followed by one pilot block. The caller passes one codeword's worth
-/// of data symbols at a time. For `blocks_per_cw == 1` the layout is
-/// `[CW][pilot_block]`; for `blocks_per_cw == 2`,
-/// `[CW_first_half][pilot_block][CW_second_half][pilot_block]`.
+/// `data` is sliced into `blocks_per_cw` chunks; each chunk is followed
+/// by one pilot block. When `data.len()` divides cleanly the chunks are
+/// equal; otherwise the first `blocks_per_cw - 1` chunks have size
+/// `floor(data.len() / blocks_per_cw)` and the last chunk picks up the
+/// remainder (e.g. Apsk32 has 461 data sym/CW → 230 + 231 with 2 pilot
+/// blocks). The deterministic split keeps TX/RX in sync without an extra
+/// length field.
 ///
-/// `data.len()` must be divisible by `blocks_per_cw`.
+/// For `blocks_per_cw == 1` the layout is `[CW][pilot_block]`; for
+/// `blocks_per_cw == 2`,
+/// `[CW_first_half][pilot_block][CW_second_half][pilot_block]`.
 ///
 /// Returns `(interleaved, positions)` where `positions[k] = (start, end)`
 /// is the half-open range of the k-th pilot block in `interleaved`.
@@ -59,18 +63,20 @@ pub fn interleave_pilot_blocks(
     blocks_per_cw: usize,
 ) -> (Vec<Complex64>, Vec<(usize, usize)>) {
     assert!(blocks_per_cw >= 1, "blocks_per_cw must be ≥ 1");
-    assert_eq!(
-        data.len() % blocks_per_cw,
-        0,
-        "data.len()={} not divisible by blocks_per_cw={}",
-        data.len(),
-        blocks_per_cw
-    );
-    let chunk_sz = data.len() / blocks_per_cw;
+    let base_chunk = data.len() / blocks_per_cw;
     let mut out = Vec::with_capacity(data.len() + blocks_per_cw * PILOT_BLOCK_LEN);
     let mut positions = Vec::with_capacity(blocks_per_cw);
+    let mut cursor = 0usize;
     for k in 0..blocks_per_cw {
-        out.extend_from_slice(&data[k * chunk_sz..(k + 1) * chunk_sz]);
+        // Last chunk eats the remainder so total data syms emitted equals
+        // data.len() exactly.
+        let take = if k + 1 == blocks_per_cw {
+            data.len() - cursor
+        } else {
+            base_chunk
+        };
+        out.extend_from_slice(&data[cursor..cursor + take]);
+        cursor += take;
         let start = out.len();
         out.extend_from_slice(&PILOT_BLOCK);
         positions.push((start, start + PILOT_BLOCK_LEN));
@@ -79,7 +85,10 @@ pub fn interleave_pilot_blocks(
 }
 
 /// Reverse of [`interleave_pilot_blocks`]: extract the data symbols
-/// only, given the interleaved stream and the same `blocks_per_cw`.
+/// only, given the interleaved stream, `blocks_per_cw`, and the original
+/// `data_len` (the deterministic split below depends on it because the
+/// last chunk may be larger than the others — see the `interleave_pilot_blocks`
+/// docstring).
 ///
 /// This is the simple deterministic deinterleaver used by `rx_v4` when
 /// it already knows where the pilot blocks are (from frame-builder
@@ -88,27 +97,30 @@ pub fn interleave_pilot_blocks(
 pub fn deinterleave_pilot_blocks(
     interleaved: &[Complex64],
     blocks_per_cw: usize,
+    data_len: usize,
 ) -> Vec<Complex64> {
     assert!(blocks_per_cw >= 1, "blocks_per_cw must be ≥ 1");
-    let block_with_pilot = (interleaved.len() / blocks_per_cw)
-        .saturating_sub(0);
-    // Each (data_chunk + pilot_block) is block_with_pilot symbols.
+    let expected = data_len + blocks_per_cw * PILOT_BLOCK_LEN;
     assert_eq!(
-        interleaved.len() % blocks_per_cw,
-        0,
-        "interleaved.len()={} not divisible by blocks_per_cw={}",
         interleaved.len(),
-        blocks_per_cw
+        expected,
+        "interleaved.len()={} expected {expected} (data_len={data_len}, \
+         blocks_per_cw={blocks_per_cw})",
+        interleaved.len()
     );
-    assert!(
-        block_with_pilot >= PILOT_BLOCK_LEN,
-        "each interleaved chunk must contain at least one pilot block"
-    );
-    let chunk_sz = block_with_pilot - PILOT_BLOCK_LEN;
-    let mut out = Vec::with_capacity(chunk_sz * blocks_per_cw);
+    let base_chunk = data_len / blocks_per_cw;
+    let mut out = Vec::with_capacity(data_len);
+    let mut data_cursor = 0usize;
+    let mut wire_cursor = 0usize;
     for k in 0..blocks_per_cw {
-        let base = k * block_with_pilot;
-        out.extend_from_slice(&interleaved[base..base + chunk_sz]);
+        let take = if k + 1 == blocks_per_cw {
+            data_len - data_cursor
+        } else {
+            base_chunk
+        };
+        out.extend_from_slice(&interleaved[wire_cursor..wire_cursor + take]);
+        wire_cursor += take + PILOT_BLOCK_LEN; // skip the pilot block
+        data_cursor += take;
     }
     out
 }
@@ -180,7 +192,7 @@ mod tests {
             .map(|k| Complex64::new(k as f64, -(k as f64) * 0.1))
             .collect();
         let (out, _pos) = interleave_pilot_blocks(&data, 1);
-        let recovered = deinterleave_pilot_blocks(&out, 1);
+        let recovered = deinterleave_pilot_blocks(&out, 1, data.len());
         assert_eq!(recovered, data);
     }
 
@@ -190,7 +202,28 @@ mod tests {
             .map(|k| Complex64::new(k as f64, -(k as f64) * 0.3))
             .collect();
         let (out, _pos) = interleave_pilot_blocks(&data, 2);
-        let recovered = deinterleave_pilot_blocks(&out, 2);
+        let recovered = deinterleave_pilot_blocks(&out, 2, data.len());
+        assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn interleave_two_blocks_apsk32_uneven_split() {
+        // 461 sym (Apsk32 padded CW) with 2 pilot blocks: 230 + 231 split.
+        let data: Vec<Complex64> = (0..461)
+            .map(|k| Complex64::new(k as f64, 0.0))
+            .collect();
+        let (out, positions) = interleave_pilot_blocks(&data, 2);
+        assert_eq!(out.len(), 461 + 2 * PILOT_BLOCK_LEN);
+        assert_eq!(positions[0], (230, 230 + PILOT_BLOCK_LEN));
+        assert_eq!(
+            positions[1],
+            (
+                230 + PILOT_BLOCK_LEN + 231,
+                230 + PILOT_BLOCK_LEN + 231 + PILOT_BLOCK_LEN,
+            )
+        );
+        // Roundtrip.
+        let recovered = deinterleave_pilot_blocks(&out, 2, data.len());
         assert_eq!(recovered, data);
     }
 
@@ -211,12 +244,5 @@ mod tests {
     fn zero_blocks_panics() {
         let data = vec![Complex64::new(0.0, 0.0); 100];
         let _ = interleave_pilot_blocks(&data, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "not divisible")]
-    fn non_divisible_data_panics() {
-        let data = vec![Complex64::new(0.0, 0.0); 101];
-        let _ = interleave_pilot_blocks(&data, 2);
     }
 }
