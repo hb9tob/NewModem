@@ -3069,6 +3069,9 @@ version = "0.1.0"
 dependencies = [
  "hound",
  "modem-core-base",
+ "modem-framing",
+ "modem-io",
+ "modem-sdr-dsp",
  "serde",
  "serde_json",
  "serialport",
