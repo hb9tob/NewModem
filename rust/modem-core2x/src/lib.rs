@@ -51,4 +51,8 @@
 //! - `gate2x` + `detect2x` — FFT-gate + auto-detect 2x.
 //! - `modem2x` — `V4Modem` impl of the `Modem` trait.
 
-// Modules will be added by Phase C-1 onward.
+// Phase C-1 — PLHEADER (192 sym SOF+PLS) and pilot blocks (36 sym
+// (1+j)/√2 each). Both are isolated frame primitives: no profile or
+// frame-builder dependency.
+pub mod pilot_block;
+pub mod plheader;
