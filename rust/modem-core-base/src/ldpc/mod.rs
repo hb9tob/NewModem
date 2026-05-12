@@ -8,6 +8,6 @@ pub mod wimax;
 pub mod encoder;
 pub mod decoder;
 
-pub use crate::profile::LdpcRate;
+pub use crate::profile_types::LdpcRate;
 pub use encoder::LdpcEncoder;
 pub use decoder::LdpcDecoder;

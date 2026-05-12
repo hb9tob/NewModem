@@ -4,7 +4,7 @@
 //! to precompute an encoding matrix. At encode time, a simple
 //! matrix-vector multiply in GF(2) produces the parity bits.
 
-use crate::profile::LdpcRate;
+use crate::profile_types::LdpcRate;
 use super::wimax::{self, SparseH};
 
 pub struct LdpcEncoder {

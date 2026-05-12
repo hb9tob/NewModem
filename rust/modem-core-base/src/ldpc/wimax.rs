@@ -10,7 +10,7 @@
 //! Entry -1 means zero z×z block. Entry s (0..z-1) means
 //! z×z identity matrix cyclically shifted right by s positions.
 
-use crate::profile::LdpcRate;
+use crate::profile_types::LdpcRate;
 
 /// A base matrix entry: -1 = zero block, 0..95 = cyclic shift of I_z.
 pub type BaseEntry = i16;

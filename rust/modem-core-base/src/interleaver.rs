@@ -16,7 +16,7 @@
 //! For 8PSK (m=3): π = [2, 1, 0] (swap MSB/LSB)
 //! For 16-APSK (m=4): π = [3, 1, 2, 0] (DVB-S2 standard)
 
-use crate::profile::ConstellationType;
+use crate::profile_types::ConstellationType;
 
 /// Bit count after padding to the next multiple of `bits_per_sym`.
 ///

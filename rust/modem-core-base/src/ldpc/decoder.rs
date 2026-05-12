@@ -5,7 +5,7 @@
 //! Normalization factor alpha = 0.75 (standard for WiMAX codes).
 //! ~0.2 dB loss vs full BP, acceptable for our SNR margins.
 
-use crate::profile::LdpcRate;
+use crate::profile_types::LdpcRate;
 use super::wimax::{self, SparseH};
 
 /// LNMS normalization factor.

@@ -1,14 +1,12 @@
 [package]
-name = "modem-core"
+name = "modem-core-base"
 version = "0.1.0"
 edition = "2021"
-description = "NBFM audio modem library — APSK/PSK/QPSK + LDPC WiMAX"
+description = "Shared DSP primitives for NewModem modems — constellations, LDPC, RRC, FFE, PLL, Golay, demodulator (V3 and 2x both depend on this)"
 
 [dependencies]
 num-complex = { workspace = true }
 thiserror = { workspace = true }
-modem-core-base = { path = "../modem-core-base" }
-modem-framing = { path = "../modem-framing" }
 realfft = "3"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

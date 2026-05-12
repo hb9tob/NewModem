@@ -2916,7 +2916,19 @@ dependencies = [
 name = "modem-core"
 version = "0.1.0"
 dependencies = [
+ "modem-core-base",
  "modem-framing",
+ "num-complex",
+ "realfft",
+ "rustfft",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "modem-core-base"
+version = "0.1.0"
+dependencies = [
  "num-complex",
  "realfft",
  "rustfft",
