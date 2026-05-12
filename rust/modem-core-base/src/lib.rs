@@ -20,3 +20,9 @@ pub mod equalizer;
 pub mod pll;
 pub mod soft_demod;
 pub mod traits;
+
+// Phase A — Farrow cubic-Lagrange interpolator (DVB-S2X-style continuous
+// timing recovery building block). Isolated module, no integration into
+// V3 yet; consumed by the upcoming Phase B closed-loop Gardner and by
+// the 2x RX pipeline.
+pub mod farrow;
