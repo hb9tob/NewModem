@@ -26,3 +26,8 @@ pub mod traits;
 // V3 yet; consumed by the upcoming Phase B closed-loop Gardner and by
 // the 2x RX pipeline.
 pub mod farrow;
+
+// Phase B — closed-loop Gardner TED + PI loop filter. Pairs with
+// `farrow` to drive a continuous timing-recovery strobe. Standard
+// Gardner for PSK + AbsGardner for APSK constellations.
+pub mod timing_loop;
