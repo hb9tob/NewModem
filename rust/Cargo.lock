@@ -2909,7 +2909,10 @@ dependencies = [
  "clap",
  "hound",
  "modem-core",
+ "modem-core-base",
+ "modem-core2x",
  "modem-framing",
+ "modem-worker2x",
 ]
 
 [[package]]

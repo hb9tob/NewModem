@@ -4,18 +4,47 @@ use modem_core::profile::{
     self, ConstellationType, LdpcRate, ModemConfig,
 };
 use modem_core::types::AUDIO_RATE;
+use modem_core_base::traits::EncodeRequest;
+use modem_core2x::profile2x::ProfileIndex2x;
+use modem_worker2x::{rx_worker2x, tx_worker2x};
 use std::path::PathBuf;
 
+/// AppHeader.mode_code byte that the V4 encoder embeds (see
+/// `modem_core2x::frame2x`). The CLI uses the same constant when computing
+/// session_id so the value is reproducible between Tx and TxMore.
+const V4_MODE_CODE: u8 = 0xA5;
+
 #[derive(Parser)]
-#[command(name = "nbfm-modem", about = "NBFM audio modem — WAV file TX/RX (V3 only)")]
+#[command(
+    name = "nbfm-modem",
+    about = "NBFM audio modem — WAV file TX/RX (V3 legacy + V4 2x families)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+/// Wire-format family selector for the `--family` CLI flag.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Family {
+    Legacy,
+    TwoX,
+}
+
+fn parse_family(s: &str) -> Family {
+    match s.to_lowercase().as_str() {
+        "legacy" | "v3" | "1x" => Family::Legacy,
+        "2x" | "v4" => Family::TwoX,
+        _ => {
+            eprintln!("Unknown --family '{s}'. Expected: legacy | 2x");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Encode a file to a WAV audio signal (V3 frame format).
+    /// Encode a file to a WAV audio signal.
     Tx {
         /// Input file to transmit
         #[arg(short, long)]
@@ -25,7 +54,13 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Predefined profile: MEGA, HIGH, NORMAL, ROBUST, ULTRA
+        /// Wire-format family: `legacy` (V3) or `2x` (V4).
+        #[arg(long, default_value = "legacy")]
+        family: String,
+
+        /// Predefined profile. Legacy: MEGA, HIGH, NORMAL, ROBUST, ULTRA
+        /// (and HIGH+, HIGH56, HIGH+56). 2x: NORMAL2X, HIGH2X, ROBUST2X,
+        /// ULTRA2X, HIGH+2X, HIGH++2X, HIGH56_2X, HIGH+56_2X.
         #[arg(short, long, default_value = "NORMAL")]
         profile: String,
 
@@ -86,6 +121,10 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
+        /// Wire-format family (must match the initial burst): `legacy` or `2x`.
+        #[arg(long, default_value = "legacy")]
+        family: String,
+
         /// Profile (must match initial burst)
         #[arg(short, long, default_value = "NORMAL")]
         profile: String,
@@ -135,7 +174,7 @@ enum Commands {
         callsign: Option<String>,
     },
 
-    /// Decode a WAV audio signal to a file (V3 frame format).
+    /// Decode a WAV audio signal to a file.
     Rx {
         /// Input WAV file
         #[arg(short, long)]
@@ -145,7 +184,11 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Profile (must match TX): MEGA, HIGH, NORMAL, ROBUST, ULTRA
+        /// Wire-format family (must match TX): `legacy` (V3) or `2x` (V4).
+        #[arg(long, default_value = "legacy")]
+        family: String,
+
+        /// Profile (must match TX). See `tx --help` for the per-family list.
         #[arg(short, long, default_value = "NORMAL")]
         profile: String,
 
@@ -177,6 +220,7 @@ fn main() {
         Commands::Tx {
             input,
             output,
+            family,
             profile,
             constellation,
             ldpc_rate,
@@ -189,6 +233,20 @@ fn main() {
             callsign,
             repair_pct,
         } => {
+            if parse_family(&family) == Family::TwoX {
+                reject_legacy_overrides_2x(&constellation, &ldpc_rate, &rs, &beta, &fc);
+                run_tx_2x(
+                    &input,
+                    &output,
+                    &profile,
+                    vox,
+                    session_id.as_deref(),
+                    filename.as_deref(),
+                    callsign.as_deref(),
+                    repair_pct,
+                );
+                return;
+            }
             let mut config = parse_profile(&profile);
 
             if let Some(c) = constellation {
@@ -334,6 +392,7 @@ fn main() {
         Commands::TxMore {
             input,
             output,
+            family,
             profile,
             constellation,
             ldpc_rate,
@@ -348,6 +407,22 @@ fn main() {
             filename,
             callsign,
         } => {
+            if parse_family(&family) == Family::TwoX {
+                reject_legacy_overrides_2x(&constellation, &ldpc_rate, &rs, &beta, &fc);
+                run_tx_more_2x(
+                    &input,
+                    &output,
+                    &profile,
+                    vox,
+                    session_id.as_deref(),
+                    filename.as_deref(),
+                    callsign.as_deref(),
+                    esi_start,
+                    pct,
+                    count,
+                );
+                return;
+            }
             let mut config = parse_profile(&profile);
             if let Some(c) = constellation {
                 config.constellation = parse_constellation(&c);
@@ -481,11 +556,17 @@ fn main() {
         Commands::Rx {
             input,
             output,
+            family,
             profile,
             ldpc_rate,
             rs,
             fc,
         } => {
+            if parse_family(&family) == Family::TwoX {
+                reject_legacy_overrides_2x(&None, &ldpc_rate, &rs, &None, &fc);
+                run_rx_2x(&input, &output, &profile);
+                return;
+            }
             let mut config = parse_profile(&profile);
             if let Some(r) = ldpc_rate {
                 config.ldpc_rate = parse_ldpc_rate(&r);
@@ -668,6 +749,282 @@ fn parse_profile(name: &str) -> ModemConfig {
         std::process::exit(1);
     })
 }
+
+// --- 2x (V4) helpers -------------------------------------------------------
+
+fn reject_legacy_overrides_2x(
+    constellation: &Option<String>,
+    ldpc_rate: &Option<String>,
+    rs: &Option<f64>,
+    beta: &Option<f64>,
+    fc: &Option<f64>,
+) {
+    let mut bad: Vec<&'static str> = Vec::new();
+    if constellation.is_some() { bad.push("--constellation"); }
+    if ldpc_rate.is_some() { bad.push("--ldpc-rate"); }
+    if rs.is_some() { bad.push("--rs"); }
+    if beta.is_some() { bad.push("--beta"); }
+    if fc.is_some() { bad.push("--fc"); }
+    if !bad.is_empty() {
+        eprintln!(
+            "--family 2x is incompatible with DSP overrides ({}). 2x profiles \
+             are fixed — pick a different --profile instead.",
+            bad.join(", ")
+        );
+        std::process::exit(1);
+    }
+}
+
+fn parse_profile_2x(name: &str) -> ProfileIndex2x {
+    ProfileIndex2x::from_name(name).unwrap_or_else(|| {
+        eprintln!(
+            "Unknown 2x profile '{}'. Available: ULTRA2X, ROBUST2X, NORMAL2X, \
+             HIGH2X, HIGH+2X, HIGH++2X, HIGH56_2X, HIGH+56_2X.",
+            name
+        );
+        std::process::exit(1);
+    })
+}
+
+/// Encode TX inputs that are family-agnostic (envelope, callsign, file,
+/// session_id, hash, mime). Used by both `run_tx_2x` and `run_tx_more_2x`
+/// so the request-construction logic stays identical.
+struct Tx2xPrep {
+    wire_payload: Vec<u8>,
+    session_id: u32,
+    mime: u8,
+    hash: u16,
+}
+
+fn prepare_tx_2x(
+    input: &PathBuf,
+    profile_index: ProfileIndex2x,
+    explicit_session_id: Option<&str>,
+    filename: Option<&str>,
+    callsign: Option<&str>,
+) -> Tx2xPrep {
+    let data = std::fs::read(input).unwrap_or_else(|e| {
+        eprintln!("Error reading {}: {e}", input.display());
+        std::process::exit(1);
+    });
+    let fname = filename
+        .map(str::to_string)
+        .unwrap_or_else(|| infer_filename(input));
+    let qrz = callsign.map(str::to_string).unwrap_or_else(|| {
+        eprintln!("TX error: --callsign is required (e.g. HB9TOB)");
+        std::process::exit(1);
+    });
+    let envelope = modem_framing::payload_envelope::PayloadEnvelope::new(
+        &fname, &qrz, data.clone(),
+    )
+    .unwrap_or_else(|| {
+        eprintln!(
+            "TX error: filename (len {}) / callsign (len {}) exceed size limits or contain NUL",
+            fname.len(),
+            qrz.len()
+        );
+        std::process::exit(1);
+    });
+    let wire_payload = envelope.encode();
+    let sid = explicit_session_id
+        .map(parse_explicit_session_id)
+        .unwrap_or_else(|| {
+            modem_framing::app_header::compute_session_id(
+                &wire_payload,
+                V4_MODE_CODE,
+                profile_index.as_u8(),
+            )
+        });
+    let hash = content_hash_short(&wire_payload);
+    let mime = infer_mime(input);
+    eprintln!(
+        "TX 2x: session_id=0x{:08X}, callsign={}, filename={}, mime=0x{:02X}, hash=0x{:04X}",
+        sid, qrz, fname, mime, hash
+    );
+    Tx2xPrep { wire_payload, session_id: sid, mime, hash }
+}
+
+fn run_tx_2x(
+    input: &PathBuf,
+    output: &PathBuf,
+    profile: &str,
+    vox: f64,
+    explicit_session_id: Option<&str>,
+    filename: Option<&str>,
+    callsign: Option<&str>,
+    repair_pct: u32,
+) {
+    let pi = parse_profile_2x(profile);
+    let cfg = pi.to_config();
+    let prep = prepare_tx_2x(input, pi, explicit_session_id, filename, callsign);
+
+    // K = source-symbol count derived from the wire payload + the
+    // profile's LDPC `k`. n_total = K + repair. V4 supports partial
+    // cycles natively (`build_superframe_v4_range`), so we don't need
+    // V3's `effective_packet_count` rounding here.
+    let k_bytes = modem_core_base::profile_types::LdpcRate::k(cfg.base.ldpc_rate) / 8;
+    let k_src =
+        modem_framing::raptorq_codec::k_from_payload(prep.wire_payload.len(), k_bytes) as u32;
+    let n_total = (k_src + (k_src * repair_pct) / 100).max(1);
+    eprintln!(
+        "TX 2x: profile={} ({}), K={k_src}, repair_pct={repair_pct}, n_total={n_total} packets",
+        pi.name(),
+        pi.as_u8()
+    );
+
+    let req = EncodeRequest {
+        profile: pi.name(),
+        wire_payload: &prep.wire_payload,
+        session_id: prep.session_id,
+        mime_type: prep.mime,
+        hash_short: prep.hash,
+        esi_start: 0,
+        n_packets: n_total,
+        vox_seconds: vox,
+    };
+    let n_samples = tx_worker2x::encode_to_wav(&req, output).unwrap_or_else(|e| {
+        eprintln!("TX 2x error: {e}");
+        std::process::exit(1);
+    });
+    let duration_s = n_samples as f64 / AUDIO_RATE as f64;
+    eprintln!(
+        "Generated {} samples ({:.2}s), written to {}",
+        n_samples,
+        duration_s,
+        output.display()
+    );
+}
+
+fn run_tx_more_2x(
+    input: &PathBuf,
+    output: &PathBuf,
+    profile: &str,
+    vox: f64,
+    explicit_session_id: Option<&str>,
+    filename: Option<&str>,
+    callsign: Option<&str>,
+    esi_start: u32,
+    pct: u32,
+    count: Option<u32>,
+) {
+    let pi = parse_profile_2x(profile);
+    let cfg = pi.to_config();
+    let prep = prepare_tx_2x(input, pi, explicit_session_id, filename, callsign);
+
+    let k_bytes = modem_core_base::profile_types::LdpcRate::k(cfg.base.ldpc_rate) / 8;
+    let k =
+        modem_framing::raptorq_codec::k_from_payload(prep.wire_payload.len(), k_bytes) as u32;
+    let n_packets = match count {
+        Some(c) => c,
+        None => (k * pct) / 100,
+    };
+    if n_packets == 0 {
+        eprintln!("tx-more 2x: empty burst (K={k}, pct={pct}%, count={count:?})");
+        std::process::exit(1);
+    }
+    eprintln!(
+        "tx-more 2x: profile={}, K={k}, esi_start={esi_start}, count={n_packets}",
+        pi.name()
+    );
+
+    let req = EncodeRequest {
+        profile: pi.name(),
+        wire_payload: &prep.wire_payload,
+        session_id: prep.session_id,
+        mime_type: prep.mime,
+        hash_short: prep.hash,
+        esi_start,
+        n_packets,
+        vox_seconds: vox,
+    };
+    let n_samples = tx_worker2x::encode_to_wav(&req, output).unwrap_or_else(|e| {
+        eprintln!("tx-more 2x error: {e}");
+        std::process::exit(1);
+    });
+    eprintln!(
+        "Generated {} samples ({:.2}s), written to {}",
+        n_samples,
+        n_samples as f64 / AUDIO_RATE as f64,
+        output.display()
+    );
+}
+
+fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
+    let pi = parse_profile_2x(profile);
+    let cfg = pi.to_config();
+    let samples = read_wav(input);
+    let duration_s = samples.len() as f64 / AUDIO_RATE as f64;
+    eprintln!(
+        "RX 2x: {} samples ({:.2}s) from {}, profile={} ({})",
+        samples.len(),
+        duration_s,
+        input.display(),
+        pi.name(),
+        pi.as_u8()
+    );
+
+    let result = rx_worker2x::rx_v4_audio(&samples, &cfg).unwrap_or_else(|e| {
+        eprintln!("RX 2x error: {e}");
+        std::process::exit(1);
+    });
+    let Some(result) = result else {
+        eprintln!("RX 2x failed: no PLHEADER found or signal too short");
+        std::process::exit(1);
+    };
+
+    eprintln!(
+        "Decoded: {} bytes, {}/{} CWs converged, {} PLHEADER cycles, σ²={:.4}, EOT_seen={}",
+        result.data.len(),
+        result.converged_cws,
+        result.total_cws,
+        result.cycles,
+        result.sigma2_data,
+        result.eot_seen,
+    );
+    if let Some(ref ah) = result.app_header {
+        eprintln!(
+            "App header: session_id=0x{:08X}, file_size={}, K={}, T={}, mime=0x{:02X}, hash=0x{:04X}",
+            ah.session_id, ah.file_size, ah.k_symbols, ah.t_bytes,
+            ah.mime_type, ah.hash_short
+        );
+    }
+    if let Some(ref pls) = result.first_pls {
+        let profile_name = ProfileIndex2x::from_u8(pls.profile_index)
+            .map(|p| p.name())
+            .unwrap_or("UNKNOWN");
+        eprintln!(
+            "First PLS: profile={} ({}), base_esi={}, session_id_low=0x{:02X}",
+            profile_name, pls.profile_index, pls.base_esi, pls.session_id_low,
+        );
+    }
+
+    let envelope =
+        modem_framing::payload_envelope::PayloadEnvelope::decode_or_fallback(&result.data);
+    if envelope.version == 0 {
+        eprintln!("Payload envelope: none (writing raw content)");
+    } else {
+        eprintln!(
+            "Payload envelope: v{}, from={}, filename={}, content_size={} B",
+            envelope.version,
+            envelope.callsign,
+            envelope.filename,
+            envelope.content.len()
+        );
+    }
+
+    let to_write = if envelope.version == 0 {
+        &result.data
+    } else {
+        &envelope.content
+    };
+    std::fs::write(output, to_write).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {e}", output.display());
+        std::process::exit(1);
+    });
+    eprintln!("Written {} bytes to {}", to_write.len(), output.display());
+}
+
+// --- Legacy (V3) helpers ---------------------------------------------------
 
 fn parse_constellation(s: &str) -> ConstellationType {
     match s.to_lowercase().as_str() {
