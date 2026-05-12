@@ -72,3 +72,8 @@ pub mod frame2x;
 // (Phase C-7); rx_v4 here decodes a stream of complex symbols already
 // sampled at the symbol rate.
 pub mod rx_v4;
+
+// Phase C-6 — `V4Modem` impl of the `Modem` trait from
+// modem-core-base::traits. Stateless wrapper that maps a profile name
+// to its config, calls frame2x + modulator, returns audio samples.
+pub mod modem2x;
