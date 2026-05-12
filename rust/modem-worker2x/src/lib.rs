@@ -23,13 +23,17 @@
 //!
 //! [`AppHeader`]: modem_framing::app_header::AppHeader
 //!
-//! `ptt` and `EventSink` are re-exported from [`modem_worker`] verbatim
-//! so the 2x worker doesn't duplicate the GPIO / serial layer or the
-//! event abstraction.
+//! `ptt`, `EventSink`, `WorkerHandle` and `WavSink` are re-exported from
+//! [`modem_worker_base`] so the 2x worker doesn't duplicate the GPIO /
+//! serial layer or the event abstraction. The V3 worker
+//! (`modem-worker`) and the V4 worker (here) both sit on top of the
+//! same shared infrastructure.
 
 pub mod rx_worker2x;
 pub mod session_store2x;
 pub mod tx_worker2x;
 
-pub use modem_worker::ptt;
-pub use modem_worker::{EventSink, EventSinkExt, NoopSink, RecordingSink};
+pub use modem_worker_base::ptt;
+pub use modem_worker_base::{
+    EventSink, EventSinkExt, NoopSink, RecordingSink, SharedWavSink, WavSink, WorkerHandle,
+};

@@ -23,7 +23,6 @@
 //! to `spawn()` when the capture starts. Changing profile requires a
 //! stop/start of the worker.
 
-use hound::{SampleFormat, WavSpec, WavWriter};
 use modem_core::header::Header;
 use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_core::profile::{ModemConfig, ProfileIndex};
@@ -33,65 +32,21 @@ use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::event_sink::{EventSink, EventSinkExt};
 use crate::session_store::{self, SessionStore};
 
-type WavFileWriter = WavWriter<BufWriter<std::fs::File>>;
-
-/// Open WAV file + running sample counter. The worker writes into this while
-/// `SharedWavSink` holds a `Some`; the Tauri start/stop commands create and
-/// finalize it.
-pub struct WavSink {
-    writer: WavFileWriter,
-    pub path: PathBuf,
-    pub samples_written: u64,
-}
-
-impl WavSink {
-    /// Create a new 48 kHz mono 16-bit WAV at `path`.
-    pub fn create(path: &Path) -> Result<Self, hound::Error> {
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate: AUDIO_RATE,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-        let writer = WavWriter::create(path, spec)?;
-        Ok(Self {
-            writer,
-            path: path.to_path_buf(),
-            samples_written: 0,
-        })
-    }
-
-    fn write_chunk(&mut self, samples: &[f32]) {
-        for &s in samples {
-            let val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-            let _ = self.writer.write_sample(val);
-        }
-        self.samples_written += samples.len() as u64;
-    }
-
-    /// Flush + write header size. Consumes self.
-    pub fn finalize(self) -> Result<(PathBuf, u64), hound::Error> {
-        let samples = self.samples_written;
-        let path = self.path.clone();
-        self.writer.finalize()?;
-        Ok((path, samples))
-    }
-}
-
-/// Shared raw-capture sink. None = not recording ; Some = worker is teeing
-/// every ingested batch into the WAV.
-pub type SharedWavSink = Arc<Mutex<Option<WavSink>>>;
+// WavSink + SharedWavSink + WorkerHandle live in modem-worker-base now;
+// re-exported here so existing `use modem_worker::rx_worker::WavSink` and
+// friends keep working.
+pub use modem_worker_base::{SharedWavSink, WavSink, WorkerHandle};
 
 fn log_path() -> std::path::PathBuf {
     std::env::temp_dir().join("nbfm-worker.log")
@@ -257,22 +212,8 @@ struct RxRealtimePayload {
 }
 
 // ---------------------------------------------------------------------------
-// Worker handle / spawn
+// Worker spawn (WorkerHandle re-exported from modem-worker-base)
 // ---------------------------------------------------------------------------
-
-pub struct WorkerHandle {
-    pub stop: Arc<AtomicBool>,
-    pub thread: Option<JoinHandle<()>>,
-}
-
-impl WorkerHandle {
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.thread.take() {
-            let _ = h.join();
-        }
-    }
-}
 
 /// Spawn an RX worker.
 ///

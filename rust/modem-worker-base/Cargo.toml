@@ -1,0 +1,12 @@
+[package]
+name = "modem-worker-base"
+version = "0.1.0"
+edition = "2021"
+description = "Shared worker infrastructure (EventSink, PTT, WorkerHandle, WavSink) used by both modem-worker (V3) and modem-worker2x (V4). Types only; the V3 and V4 state machines live in their respective sibling crates."
+
+[dependencies]
+modem-core-base = { path = "../modem-core-base" }
+hound = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4"
