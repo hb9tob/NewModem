@@ -359,7 +359,19 @@ fn start_capture(
         return Err("capture already running".into());
     }
     let forced = forced.unwrap_or(false);
-    let profile_idx = resolve_profile(profile.as_deref().unwrap_or("HIGH"), forced)?;
+    let profile_str = profile.as_deref().unwrap_or("HIGH").to_string();
+    // Family dispatch identical to start_capture_from_wav: 2x profile
+    // names route to the streaming worker2x spawn (Farrow + Gardner
+    // closed-loop), V3 names continue through resolve_profile + the
+    // legacy sliding-window worker. Same audio mpsc channel feeds both
+    // — every backend (cpal, Pluto, SDRplay, WAV pacer) produces the
+    // same `mpsc::Receiver<Vec<f32>>` shape.
+    let family_is_2x = is_2x_profile(&profile_str);
+    let profile_idx_v3 = if family_is_2x {
+        None
+    } else {
+        Some(resolve_profile(&profile_str, forced)?)
+    };
     let cfg = settings::load();
     // Route on the composite device name. SDR devices arrive as
     // `<backend_id>:<device_id>` (produced by `SdrBackend::list_devices`
@@ -399,16 +411,28 @@ fn start_capture(
             (CaptureKind::Cpal(h), rx, dropped)
         };
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
-    let worker = rx_worker::spawn(
-        samples,
-        sink,
-        state.save_dir.clone(),
-        state.wav_sink.clone(),
-        profile_idx,
-        forced,
-        cfg.rx_deemphasis_enabled,
-        dropped_samples,
-    );
+    let worker = if family_is_2x {
+        modem_worker2x::rx_worker2x::spawn(
+            samples,
+            sink,
+            state.save_dir.clone(),
+            state.wav_sink.clone(),
+            profile_str.clone(),
+            cfg.rx_deemphasis_enabled,
+            dropped_samples,
+        )
+    } else {
+        rx_worker::spawn(
+            samples,
+            sink,
+            state.save_dir.clone(),
+            state.wav_sink.clone(),
+            profile_idx_v3.expect("V3 profile resolved above"),
+            forced,
+            cfg.rx_deemphasis_enabled,
+            dropped_samples,
+        )
+    };
     *guard = Some(CaptureSession {
         capture,
         worker,

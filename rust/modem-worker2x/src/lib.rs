@@ -31,6 +31,7 @@
 
 pub mod rx_worker2x;
 pub mod session_store2x;
+pub mod streaming_frontend;
 pub mod tx_worker2x;
 
 pub use modem_worker_base::ptt;

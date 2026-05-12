@@ -206,32 +206,58 @@ struct ErrorPayload {
 }
 
 // ---------------------------------------------------------------------------
-// One-shot WAV-decode worker (Phase D-1b)
+// Streaming RX worker (Phase D-1c) — no sliding-window
 // ---------------------------------------------------------------------------
 
-/// Spawn a minimal one-shot V4 RX worker for the WAV-replay path.
+/// Spawn a streaming V4 RX worker.
 ///
-/// Reads `f32` audio batches from `samples` until the channel closes
-/// (= WAV pacer exhausted the file), accumulates them, optionally tees
-/// every batch into `wav_sink` if a raw recording is armed, and then
-/// runs a single [`rx_v4_audio`] pass on the full buffer. On success
-/// (a non-empty `RxResult2x.data` plus a recovered `AppHeader`), the
-/// recovered file is written under `<save_dir>/sessions/<sid>/decoded.<ext>`
-/// and the GUI is notified through the V3-compatible event sequence
-/// (`session_armed` → `session_decoded` → `envelope` → `file_complete`).
+/// Architecture (replaces the D-1b one-shot version):
 ///
-/// This is intentionally NOT a sliding-window worker — the V3 path's
-/// live-decode-while-still-receiving behaviour comes back in Phase D-1c
-/// once `gate2x` + sliding-window state machine land. For now the
-/// channel is a finite WAV, so one-shot at EOF is enough.
+/// ```text
+///   audio chunk (f32, 48 kHz)
+///      │  ↳ tee to wav_sink if armed
+///      ▼
+///   StreamingFrontend.process_chunk(chunk)
+///      │  ↳ NCO downmix · RRC matched filter · Farrow interpolation
+///      │     at fractional strobes · Gardner TED + PI loop
+///      ▼
+///   newly-produced symbols (Vec<Complex64>)
+///      │
+///      ▼
+///   symbol_buffer.extend(symbols)
+///      │
+///      ▼
+///   rx_v4_symbols(symbol_buffer)   // idempotent on a growing buffer;
+///      │                            // Farrow+Gardner make per-chunk
+///      │                            // re-decodes lossless (no sliding
+///      │                            // window needed).
+///      ▼
+///   dedup-aware event emission (session_armed once per session_id,
+///   session_progress per tick, session_decoded once per session_id,
+///   file_complete once per session_id) → finalize on EOT.
+/// ```
+///
+/// No sliding window: with closed-loop Gardner driving the strobe,
+/// every symbol is produced once at the correct timing. The periodic
+/// `rx_v4_symbols` call on the growing symbol buffer is the cheap
+/// "advance the decode" step — it's not re-doing timing recovery,
+/// it's just re-running SOF correlation + LDPC on a slightly larger
+/// input each tick. The symbol buffer is ~32× smaller than the
+/// equivalent audio buffer V3 carried around.
+///
+/// On channel close (WAV pacer done OR live capture stopped): one
+/// final `rx_v4_symbols` pass with any remaining symbols. If the EOT
+/// flag was seen at any point during streaming, the session is already
+/// finalised; otherwise we finalise here on a best-effort basis (a
+/// partial decode still produces session_decoded if enough CWs
+/// converged).
 ///
 /// `dropped_samples` and `deemphasis_enabled` are accepted purely for
 /// signature symmetry with [`modem-worker::rx_worker::spawn`] so the
 /// GUI's dispatch site is a clean `if 2x { v4_spawn } else { v3_spawn }`
 /// branch. Today the dropped-sample counter is observed only for the
-/// final tally on `wav_playback_done`, and deemphasis is a no-op
-/// (V4 hasn't wired the optional NBFM deemphasis filter into its RX
-/// chain yet — tracked separately).
+/// final tally and deemphasis is a no-op (V4 hasn't wired the optional
+/// NBFM deemphasis filter into its RX chain yet — tracked separately).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     samples: Receiver<Vec<f32>>,
@@ -257,45 +283,126 @@ pub fn spawn(
                 return;
             }
         };
-        let mut accumulated: Vec<f32> = Vec::with_capacity(48_000 * 60);
+        let mut frontend = crate::streaming_frontend::StreamingFrontend::new(cfg.clone());
+        let mut symbol_buffer: Vec<Complex64> = Vec::with_capacity(8192);
+        // Dedup state: once we emit `session_armed` / `session_decoded`
+        // / `file_complete` for a given session_id, we don't re-emit
+        // them on a later tick that still sees the same session. The
+        // app_header is captured the first time it converges; the
+        // payload is finalised either on EOT or at channel close.
+        let mut emitted_session_id: Option<u32> = None;
+        let mut last_progress_converged: usize = 0;
+        let mut finalised = false;
         loop {
-            match samples.recv() {
-                Ok(chunk) => {
-                    // Tee into the raw-recording WAV sink if one is armed.
-                    // Matches V3 behaviour byte-for-byte so the "save raw"
-                    // toggle works for both families.
-                    if let Ok(mut g) = wav_sink.lock() {
-                        if let Some(ws) = g.as_mut() {
-                            ws.write_chunk(&chunk);
+            let chunk = match samples.recv() {
+                Ok(c) => c,
+                Err(_) => break, // sender dropped → exit and run a final tick.
+            };
+            if let Ok(mut g) = wav_sink.lock() {
+                if let Some(ws) = g.as_mut() {
+                    ws.write_chunk(&chunk);
+                }
+            }
+            // Closed-loop streaming front-end: returns timing-recovered
+            // symbols for the chunk. Cheap (~O(chunk_len)).
+            let new_syms = frontend.process_chunk(&chunk);
+            symbol_buffer.extend_from_slice(&new_syms);
+
+            // Try to advance the symbol-domain decode. Skip if we have
+            // too few symbols (rx_v4 needs at least one PLHEADER cycle's
+            // worth ≈ 192 syms before SOF can be located).
+            if !finalised && symbol_buffer.len() >= 192 {
+                if let Some(res) = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg) {
+                    if let Some(ah) = res.app_header.as_ref() {
+                        // First-time AppHeader → arm the session.
+                        if emitted_session_id.is_none() {
+                            let dir = save_dir
+                                .lock()
+                                .ok()
+                                .map(|p| p.clone())
+                                .unwrap_or_default();
+                            let session_dir = dir
+                                .join("sessions")
+                                .join(format!("{:08x}.session", ah.session_id));
+                            let _ = std::fs::create_dir_all(&session_dir);
+                            sink.emit(
+                                "session_armed",
+                                SessionArmedPayload {
+                                    session_id: ah.session_id,
+                                    k: 0,
+                                    t: 0,
+                                    file_size: ah.file_size,
+                                    mime_type: ah.mime_type,
+                                    profile: profile_name.clone(),
+                                    session_dir: session_dir.to_string_lossy().into_owned(),
+                                },
+                            );
+                            emitted_session_id = Some(ah.session_id);
+                            last_progress_converged = 0;
+                        }
+                        // Progress: only emit when the converged count
+                        // changed since the last tick (avoid spamming
+                        // listeners when a slow chunk produces no new
+                        // CWs).
+                        if res.converged_cws != last_progress_converged {
+                            sink.emit(
+                                "v2_progress",
+                                serde_json::json!({
+                                    "blocks_converged": res.converged_cws,
+                                    "blocks_total": res.total_cws,
+                                    "blocks_expected": res.total_cws,
+                                    "sigma2": res.sigma2_data,
+                                    "sigma2_data": res.sigma2_data,
+                                }),
+                            );
+                            last_progress_converged = res.converged_cws;
+                        }
+                        // EOT seen on at least one cycle → finalise
+                        // immediately, no need to wait for channel
+                        // close.
+                        if res.eot_seen && !res.data.is_empty() {
+                            let dir = save_dir
+                                .lock()
+                                .ok()
+                                .map(|p| p.clone())
+                                .unwrap_or_default();
+                            finalize_session(
+                                &sink,
+                                &dir,
+                                &profile_name,
+                                ah,
+                                &res.data,
+                                res.sigma2_data,
+                            );
+                            finalised = true;
                         }
                     }
-                    accumulated.extend_from_slice(&chunk);
-                    if stop_thread.load(Ordering::Relaxed) {
-                        break;
-                    }
                 }
-                Err(_) => break, // pacer dropped the sender → finalise.
+            }
+            if stop_thread.load(Ordering::Relaxed) {
+                break;
             }
         }
-        // Final one-shot decode. A stopped worker (user pressed Stop)
-        // still attempts to decode whatever we accumulated, mirroring V3
-        // which keeps its in-memory session_buffer after Stop. The
-        // operator can still recover the file if enough audio came
-        // through.
-        let result = match rx_v4_audio(&accumulated, &cfg) {
-            Ok(r) => r,
-            Err(e) => {
-                sink.emit("error", ErrorPayload { message: e });
-                return;
-            }
-        };
+
+        // Channel-close or stop: one final pass to catch a burst that
+        // ended without an EOT (truncated WAV, stop button mid-frame,
+        // ...). If we already emitted via the EOT path above, skip.
+        if finalised {
+            return;
+        }
+        let result = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg);
         let Some(rx_result) = result else {
-            sink.emit(
-                "error",
-                ErrorPayload {
-                    message: "RX V4 : aucun burst détecté".to_string(),
-                },
-            );
+            // Only complain if we never saw a SOF. Otherwise emitted_id
+            // is Some and the GUI's session pane already shows progress
+            // — silence is the better UX than a bogus error.
+            if emitted_session_id.is_none() {
+                sink.emit(
+                    "error",
+                    ErrorPayload {
+                        message: "RX V4 : aucun burst détecté".to_string(),
+                    },
+                );
+            }
             return;
         };
         let Some(app_header) = rx_result.app_header else {
@@ -310,6 +417,18 @@ pub fn spawn(
             );
             return;
         };
+        if rx_result.data.is_empty() {
+            sink.emit(
+                "error",
+                ErrorPayload {
+                    message: format!(
+                        "RX V4 : payload vide (cycles={}, CW {}/{})",
+                        rx_result.cycles, rx_result.converged_cws, rx_result.total_cws
+                    ),
+                },
+            );
+            return;
+        }
         let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
         finalize_session(
             &sink,
