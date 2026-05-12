@@ -56,3 +56,7 @@
 // frame-builder dependency.
 pub mod pilot_block;
 pub mod plheader;
+
+// Phase C-2 — `ProfileIndex2x` enum (8 profiles, HighPlusPlus2x
+// promoted) and `ModemConfig2x` struct used by the encoder/decoder.
+pub mod profile2x;
