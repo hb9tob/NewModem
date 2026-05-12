@@ -198,8 +198,31 @@ fn get_sdr_device_capabilities(
 
 #[tauri::command]
 fn list_modem_profiles() -> Vec<modem_core::traits::ProfileDescriptor> {
+    // `modem_core::traits` is re-exported from `modem_core_base::traits`,
+    // so the V3 and V4 `Modem` impls satisfy the same trait — one merged
+    // descriptor list, two encoders.
     use modem_core::traits::Modem;
-    modem_core::v3_modem::V3Modem.list_profiles()
+    // Merge V3 and V4 (2x) profiles into a single combo list. Each
+    // descriptor carries its `family` ("NBFM-V3" or "NBFM-2x") so the
+    // frontend could group / colour them, and the family suffix in the
+    // profile name (`*2X`) makes the dispatch in tx_start /
+    // start_capture unambiguous without a separate field on the
+    // request. The 2x branch is appended after V3 so the default-pick
+    // (`HIGH`, first item) stays on the legacy family until the user
+    // explicitly chooses a 2x profile.
+    let mut v3 = modem_core::v3_modem::V3Modem.list_profiles();
+    let v4 = modem_core2x::modem2x::V4Modem.list_profiles();
+    v3.extend(v4);
+    v3
+}
+
+/// Returns true if `name` matches a 2x family profile (NBFM-2x). Used to
+/// dispatch TX / RX commands between the legacy V3 worker and the
+/// modem-worker2x sibling. Falls back to the V3 path on any unknown
+/// name so the existing error reporting in `resolve_profile` keeps
+/// catching typos at the V3 boundary.
+fn is_2x_profile(name: &str) -> bool {
+    modem_core2x::profile2x::ProfileIndex2x::from_name(name).is_some()
 }
 
 #[tauri::command]
@@ -678,13 +701,23 @@ fn tx_estimate(
     filename: String,
     repair_pct: Option<u32>,
 ) -> Result<TxEstimate, String> {
-    let plan = tx_worker::tx_plan(
-        payload_bytes,
-        &mode,
-        callsign.len(),
-        filename.len(),
-        repair_pct.unwrap_or(30),
-    )?;
+    let plan = if is_2x_profile(&mode) {
+        modem_worker2x::tx_worker2x::tx_plan(
+            payload_bytes,
+            &mode,
+            callsign.len(),
+            filename.len(),
+            repair_pct.unwrap_or(30),
+        )?
+    } else {
+        tx_worker::tx_plan(
+            payload_bytes,
+            &mode,
+            callsign.len(),
+            filename.len(),
+            repair_pct.unwrap_or(30),
+        )?
+    };
     Ok(TxEstimate {
         duration_s: plan.duration_s_initial,
         total_blocks: plan.n_initial,
@@ -758,21 +791,39 @@ fn tx_start(
         &archive_sink,
     );
     let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
-    let handle = tx_worker::spawn(
-        payload_path,
-        args.mode,
-        args.callsign.trim().to_uppercase(),
-        args.filename,
-        args.tx_device,
-        save_dir,
-        repair_pct,
-        attenuation_db,
-        preemphasis_enabled,
-        audio_sink,
-        state.ptt.clone(),
-        event_sink,
-        save_wav_dir,
-    );
+    let handle = if is_2x_profile(&args.mode) {
+        modem_worker2x::tx_worker2x::spawn(
+            payload_path,
+            args.mode,
+            args.callsign.trim().to_uppercase(),
+            args.filename,
+            args.tx_device,
+            save_dir,
+            repair_pct,
+            attenuation_db,
+            preemphasis_enabled,
+            audio_sink,
+            state.ptt.clone(),
+            event_sink,
+            save_wav_dir,
+        )
+    } else {
+        tx_worker::spawn(
+            payload_path,
+            args.mode,
+            args.callsign.trim().to_uppercase(),
+            args.filename,
+            args.tx_device,
+            save_dir,
+            repair_pct,
+            attenuation_db,
+            preemphasis_enabled,
+            audio_sink,
+            state.ptt.clone(),
+            event_sink,
+            save_wav_dir,
+        )
+    };
     *tx_guard = Some(handle);
     Ok(())
 }
@@ -828,22 +879,41 @@ fn tx_more(
     let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
     let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
-    let handle = tx_worker::spawn_more(
-        payload_path,
-        args.mode,
-        args.callsign.trim().to_uppercase(),
-        args.filename,
-        args.tx_device,
-        save_dir,
-        args.esi_start,
-        args.count,
-        attenuation_db,
-        preemphasis_enabled,
-        audio_sink,
-        state.ptt.clone(),
-        event_sink,
-        save_wav_dir,
-    );
+    let handle = if is_2x_profile(&args.mode) {
+        modem_worker2x::tx_worker2x::spawn_more(
+            payload_path,
+            args.mode,
+            args.callsign.trim().to_uppercase(),
+            args.filename,
+            args.tx_device,
+            save_dir,
+            args.esi_start,
+            args.count,
+            attenuation_db,
+            preemphasis_enabled,
+            audio_sink,
+            state.ptt.clone(),
+            event_sink,
+            save_wav_dir,
+        )
+    } else {
+        tx_worker::spawn_more(
+            payload_path,
+            args.mode,
+            args.callsign.trim().to_uppercase(),
+            args.filename,
+            args.tx_device,
+            save_dir,
+            args.esi_start,
+            args.count,
+            attenuation_db,
+            preemphasis_enabled,
+            audio_sink,
+            state.ptt.clone(),
+            event_sink,
+            save_wav_dir,
+        )
+    };
     *tx_guard = Some(handle);
     Ok(())
 }

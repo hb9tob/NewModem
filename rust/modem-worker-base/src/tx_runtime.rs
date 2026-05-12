@@ -84,6 +84,32 @@ pub struct TxErrorEvent {
     pub message: String,
 }
 
+/// Per-profile transmission plan, derived purely from arithmetic (no
+/// symbol synthesis). Computed by both V3 (`modem-worker::tx_worker::tx_plan`)
+/// and V4 (`modem-worker2x::tx_worker2x::tx_plan`) ahead of any TX so
+/// the GUI can pre-populate the duration / block-count widgets and
+/// expose the RaptorQ fountain math to the operator. The struct is
+/// family-independent; only the routine that *computes* it knows about
+/// frame layout.
+pub struct TxPlan {
+    /// Number of LDPC codewords required at RX to reconstruct the payload
+    /// (the RaptorQ "K" source-symbol count). The RX must accumulate at
+    /// least this many unique ESIs before `try_decode` succeeds.
+    pub k_source: u32,
+    /// Number of codewords the initial TX burst actually emits (K + default
+    /// repair ≈ 30 %). The progress bar counts up to here.
+    pub n_initial: u32,
+    /// Seconds of audio needed to transmit `n_initial` codewords at this
+    /// profile's net bitrate. Includes pilot + LDPC overhead.
+    pub duration_s_initial: f64,
+    /// Seconds of audio needed just for `k_source` codewords — the minimum
+    /// theoretical time before RX could decode if no packet was ever lost.
+    pub duration_s_k: f64,
+    /// Seconds per one additional codeword at this profile — used by the UI
+    /// to convert "+N% More" to a duration estimate.
+    pub seconds_per_cw: f64,
+}
+
 /// Per-TX cancellation token + join handle. Identical shape to
 /// [`WorkerHandle`](crate::worker_handle::WorkerHandle) but distinct so
 /// callers can hold an RX worker and a TX worker simultaneously without

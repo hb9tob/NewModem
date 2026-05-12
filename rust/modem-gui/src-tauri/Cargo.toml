@@ -23,12 +23,14 @@ windows-min = ["pluto"]
 
 [dependencies]
 modem-core = { path = "../../modem-core" }
+modem-core2x = { path = "../../modem-core2x" }
 modem-framing = { path = "../../modem-framing" }
 modem-io = { path = "../../modem-io" }
 modem-sdr = { path = "../../modem-sdr" }
 modem-pluto = { path = "../../modem-pluto", optional = true }
 modem-sdrplay = { path = "../../modem-sdrplay", optional = true }
 modem-worker = { path = "../../modem-worker" }
+modem-worker2x = { path = "../../modem-worker2x" }
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 zstd = "0.13"

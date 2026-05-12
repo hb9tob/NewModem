@@ -21,8 +21,8 @@ pub mod worker_handle;
 
 pub use event_sink::{EventSink, EventSinkExt, NoopSink, RecordingSink};
 pub use tx_runtime::{
-    archive_payload, build_tx_wav_path, run_playback, sanitize_filename, write_tx_wav, TxCompleteEvent,
-    TxErrorEvent, TxHandle, TxPlanEvent, TxProgressEvent, TX_VOX_SECONDS,
+    archive_payload, build_tx_wav_path, run_playback, sanitize_filename, write_tx_wav,
+    TxCompleteEvent, TxErrorEvent, TxHandle, TxPlan, TxPlanEvent, TxProgressEvent, TX_VOX_SECONDS,
 };
 pub use wav_sink::{SharedWavSink, WavSink};
 pub use worker_handle::WorkerHandle;

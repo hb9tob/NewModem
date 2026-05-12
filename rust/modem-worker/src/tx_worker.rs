@@ -48,7 +48,7 @@ use crate::event_sink::{EventSink, EventSinkExt};
 // thin.
 pub use modem_worker_base::tx_runtime::{
     archive_payload, build_tx_wav_path, run_playback, TxCompleteEvent, TxErrorEvent, TxHandle,
-    TxPlanEvent, TxProgressEvent, TX_VOX_SECONDS,
+    TxPlan, TxPlanEvent, TxProgressEvent, TX_VOX_SECONDS,
 };
 
 use crate::ptt::SharedPtt;
@@ -57,27 +57,9 @@ pub fn parse_profile(name: &str) -> Result<ModemConfig, String> {
     profile::config_by_name(name).ok_or_else(|| format!("unknown profile '{name}'"))
 }
 
-/// Per-profile transmission plan, derived purely from arithmetic (no symbol
-/// synthesis). Computed before any TX to pre-populate the UI buttons and
-/// progress bars, and to surface the RaptorQ fountain math to the user.
-pub struct TxPlan {
-    /// Number of LDPC codewords required at RX to reconstruct the payload
-    /// (the RaptorQ "K" source-symbol count). The RX must accumulate at
-    /// least this many unique ESIs before `try_decode` succeeds.
-    pub k_source: u32,
-    /// Number of codewords the initial TX burst actually emits (K + default
-    /// repair ≈ 30 %). The progress bar counts up to here.
-    pub n_initial: u32,
-    /// Seconds of audio needed to transmit `n_initial` codewords at this
-    /// profile's net bitrate. Includes pilot + LDPC overhead.
-    pub duration_s_initial: f64,
-    /// Seconds of audio needed just for `k_source` codewords — the minimum
-    /// theoretical time before RX could decode if no packet was ever lost.
-    pub duration_s_k: f64,
-    /// Seconds per one additional codeword at this profile — used by the UI
-    /// to convert "+N% More" to a duration estimate.
-    pub seconds_per_cw: f64,
-}
+// `TxPlan` lives in modem-worker-base::tx_runtime so the V4 sibling
+// (`modem-worker2x::tx_worker2x::tx_plan`) returns the same struct
+// without re-deriving it. Re-exported above.
 
 /// Compute the transmission plan for a given payload + profile + chosen
 /// RaptorQ repair percentage. Includes every frame overhead (preamble,
