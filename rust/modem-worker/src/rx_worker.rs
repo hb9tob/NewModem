@@ -24,10 +24,13 @@
 //! stop/start of the worker.
 
 use hound::{SampleFormat, WavSpec, WavWriter};
+use modem_core::frame::V3_PREAMBLE_PERIOD_S;
 use modem_core::header::Header;
 use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_core::profile::{ModemConfig, ProfileIndex};
+use modem_core::rrc;
 use modem_core::rx_v2;
+use modem_core::sync as rx_sync;
 use modem_sdr_dsp::emphasis::DeemphasisFilter;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
@@ -253,12 +256,17 @@ struct SfDetailPayload {
     /// Gardner has had a chance to lock.
     ppm: f64,
     /// FFE-tap centroid shift on this tick (`final - initial`, in
-    /// FSE-input samples). Diagnostic for the re-estimation trigger:
-    /// |shift| > `FFE_CENTROID_REESTIMATE_SAMPLES` (= 0.5) means LMS
-    /// had to migrate the peak that far to track residual drift, and
-    /// the worker just re-ran Gardner -- the freshly-updated `ppm`
-    /// field reflects that.
+    /// FSE-input samples). Raw diagnostic. Higher = LMS had to work
+    /// harder; profile-dependent meaning (a 0.1-sample shift on Normal
+    /// reflects a different residual drift than 0.1 on MEGA -- see
+    /// `residual_ppm` for the profile-normalised view).
     ffe_shift: f64,
+    /// Residual drift estimate from the FFE centroid shift, converted
+    /// to ppm via the profile's FSE rate. The worker compares
+    /// `|residual_ppm| > REESTIMATE_RESIDUAL_PPM` (= 2 ppm) to decide
+    /// whether to re-run Gardner. Profile-uniform: same 2 ppm trigger
+    /// on Normal/HighPlus/Robust/Ultra/MEGA/...
+    residual_ppm: f64,
     /// Aggregate `converged_blocks / total_blocks` for the whole tick.
     /// Mirrors the existing `progress` event's fields; duplicated here
     /// so the Info-tab entry is self-contained.
@@ -508,14 +516,22 @@ struct WorkerState {
     session_drift_ppm: Option<f64>,
 }
 
-/// Magnitude (in FSE-input samples) of the FFE-tap centroid drift we
-/// tolerate before triggering a Gardner re-estimation. The LMS adapter
-/// migrates the peak by ~`residual_ppm × window_duration × pitch_fse_per_s`
-/// samples; at 48 kHz audio rate and a typical SF ~4 s, 1 sample shift
-/// corresponds to ~5 ppm of uncorrected residual drift. Threshold 0.5
-/// catches a ~2.5 ppm departure while staying comfortably above LMS
-/// noise (the random tap-walk on a clean channel sits under 0.1 sample).
-const FFE_CENTROID_REESTIMATE_SAMPLES: f64 = 0.5;
+/// Residual drift (ppm) above which we re-run the Gardner estimator on
+/// the running session_drift_ppm. Uniform across profiles -- the per-tick
+/// FFE centroid shift is converted to ppm via the profile-dependent FSE
+/// rate before comparison:
+///
+/// ```text
+/// residual_ppm = centroid_shift × d_fse × 1e6 / (V3_PREAMBLE_PERIOD_S × AUDIO_RATE)
+/// ```
+///
+/// With 2 ppm threshold the worker re-estimates whenever the LMS adapter
+/// is tracking >2 ppm of uncorrected residual drift across an SF -- well
+/// above the pilot tracker's natural floor (<0.5 ppm on a clean channel)
+/// but tight enough to catch thermal crystal walk and DRO retuning on
+/// SDR backends. Gardner amortises easily: re-fires only on actual drift
+/// events, not on every tick.
+const REESTIMATE_RESIDUAL_PPM: f64 = 2.0;
 
 impl WorkerState {
     fn new(
@@ -1169,19 +1185,34 @@ fn scan_and_route(
     // session_drift_ppm = None and retry on the next decode.
     //
     // Phase C (verify) -- estimate already locked: look at the FFE-tap
-    // centroid shift (`final - initial`) from this tick. The LMS
-    // adapter migrates the peak proportionally to residual drift, so a
-    // shift > FFE_CENTROID_REESTIMATE_SAMPLES means the running
-    // estimate no longer matches the channel and we re-run Gardner.
+    // centroid shift (`final - initial`) from this tick, converted to
+    // ppm via the profile-dependent FSE rate. A residual drift estimate
+    // above REESTIMATE_RESIDUAL_PPM means the LMS had to track that
+    // much un-corrected drift across an SF and we re-run Gardner.
     //
     // Both phases are gated on a non-empty pilot_sigma2_per_segment
     // (same guard as the [scan-segs] / sf_detail emits) so idle ticks
     // don't spin Gardner on noise.
     let centroid_shift = result.ffe_centroid_final - result.ffe_centroid_initial;
+    // Convert centroid_shift (in FSE-input samples accumulated over one
+    // SF) to ppm. `fse_decim_factor` depends only on (sps, pitch) of
+    // the current profile; falls back to 1.0 ppm/sample (= d_fse=2,
+    // worst case, smaller trigger window) if rrc constraints fail.
+    let residual_ppm_estimate = match rrc::check_integer_constraints(
+        AUDIO_RATE,
+        state.config.symbol_rate,
+        state.config.tau,
+    ) {
+        Ok((sps, pitch)) => {
+            let d_fse = rx_sync::fse_decim_factor(sps, pitch) as f64;
+            centroid_shift * d_fse * 1e6 / (V3_PREAMBLE_PERIOD_S * AUDIO_RATE as f64)
+        }
+        Err(_) => centroid_shift * 2.0, // safe default, never executes in practice
+    };
     if !result.pilot_sigma2_per_segment.is_empty() {
         let need_estimate = match state.session_drift_ppm {
             None => true,
-            Some(_) => centroid_shift.abs() > FFE_CENTROID_REESTIMATE_SAMPLES,
+            Some(_) => residual_ppm_estimate.abs() > REESTIMATE_RESIDUAL_PPM,
         };
         if need_estimate {
             let t0 = Instant::now();
@@ -1190,10 +1221,11 @@ fn scan_and_route(
                     let prev = state.session_drift_ppm;
                     state.session_drift_ppm = Some(est_ppm);
                     worker_log(&format!(
-                        "[drift] {} ppm={:+.2} (prev={:?}, centroid_shift={:+.3} samples, took {} ms)",
+                        "[drift] {} ppm={:+.2} (prev={:?}, residual_ppm={:+.2}, centroid_shift={:+.3} samples, took {} ms)",
                         if prev.is_none() { "init" } else { "refresh" },
                         est_ppm,
                         prev,
+                        residual_ppm_estimate,
                         centroid_shift,
                         t0.elapsed().as_millis(),
                     ));
@@ -1203,7 +1235,8 @@ fn scan_and_route(
                     // Stay on the previous estimate (or None on cold
                     // start) and try again next tick.
                     worker_log(&format!(
-                        "[drift] estimator returned None (centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
+                        "[drift] estimator returned None (residual_ppm={:+.2}, centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
+                        residual_ppm_estimate,
                         centroid_shift,
                         t0.elapsed().as_millis(),
                         state.session_drift_ppm,
@@ -1246,6 +1279,7 @@ fn scan_and_route(
                 profile: profile_name(state.profile).to_string(),
                 ppm: reported_ppm,
                 ffe_shift: centroid_shift,
+                residual_ppm: residual_ppm_estimate,
                 converged_blocks: result.converged_blocks,
                 total_blocks: result.total_blocks,
                 eot: eot_seen,
