@@ -114,6 +114,21 @@ pub struct RxV2Result {
     /// reliable than a blind grid search on a loosely-constrained OPEN
     /// window.
     pub drift_ppm: f64,
+    /// FFE tap centroid right after LS-training on the preamble
+    /// (= "where the equalizer thinks the symbol peak lives" at the
+    /// start of the window). Expressed in FSE-input samples, so
+    /// the natural center is `(n_ff - 1) / 2` and a shift of
+    /// `ffe_centroid_final - ffe_centroid_initial` reflects how much
+    /// the LMS adapter had to move the peak over the window's
+    /// duration. Used by the worker to detect uncorrected
+    /// sample-rate drift accumulating across an SF -- a non-zero
+    /// shift means residual ppm error not absorbed by the running
+    /// session-level estimate.
+    pub ffe_centroid_initial: f64,
+    /// FFE tap centroid at the end of the window's LMS adaptation.
+    /// Same units as `ffe_centroid_initial`; their difference is the
+    /// drift diagnostic surfaced for re-estimation triggering.
+    pub ffe_centroid_final: f64,
 }
 
 /// Cheap preamble presence probe — intended for the RX worker's Idle gate.
@@ -272,6 +287,30 @@ pub fn detect_best_profile(
         return None;
     }
     Some(best)
+}
+
+/// Energy-weighted index of an FFE tap vector, in FSE-input samples.
+///
+/// `centroid = sum_k k * |tap[k]|^2 / sum_k |tap[k]|^2`. For an LS-trained
+/// FFE on a clean preamble the centroid sits at the geometric center
+/// `(n_ff - 1) / 2`. After LMS adapts across a window with residual
+/// sample-rate drift, the centroid migrates by ~`drift_ppm × window_s
+/// × sample_rate / pitch_fse` samples. The worker observes the shift
+/// (`final - initial`) to decide whether the running session_drift_ppm
+/// needs a Gardner re-estimation.
+fn ffe_tap_centroid(taps: &[Complex64]) -> f64 {
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for (k, t) in taps.iter().enumerate() {
+        let p = t.norm_sqr();
+        num += (k as f64) * p;
+        den += p;
+    }
+    if den > 1e-12 {
+        num / den
+    } else {
+        (taps.len() as f64 - 1.0) / 2.0
+    }
 }
 
 /// Linear-interpolation resample of a float audio stream to compensate a
@@ -459,7 +498,7 @@ fn score_result(r: &RxV2Result) -> f64 {
 /// structure), so the estimator is data-aided — robust across
 /// constellations, β values, and noise levels without per-profile
 /// calibration.
-fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f64> {
+pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f64> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
@@ -697,6 +736,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         .map(|k| fse_start + k * pitch_fse)
         .collect();
     let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
+    let ffe_centroid_initial = ffe_tap_centroid(&ffe_initial);
 
     let half = n_ff / 2;
     let max_syms = if fse_input.len() > fse_start + half {
@@ -727,7 +767,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     }
     let mu_train = 0.10;
     let mu_dd = 0.02;
-    let (all_rx_syms, _final_taps) = ffe::apply_ffe_lms_with_training(
+    let (all_rx_syms, final_taps) = ffe::apply_ffe_lms_with_training(
         &fse_input,
         &ffe_initial,
         fse_start,
@@ -738,6 +778,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         mu_train,
         mu_dd,
     );
+    let ffe_centroid_final = ffe_tap_centroid(&final_taps);
     if all_rx_syms.len() < N_PREAMBLE + warmup_len + header_sym_count {
         return None;
     }
@@ -1102,6 +1143,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         // `rx_v2_with_hint`) overwrites this when the decode was driven
         // by a non-zero hint.
         drift_ppm: 0.0,
+        ffe_centroid_initial,
+        ffe_centroid_final,
     })
 }
 
@@ -1129,7 +1172,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     // decode the trailing OPEN window — there is no "next tick" to wait
     // for a closing preamble. The live worker uses `rx_v3_after` directly
     // with `finalize=false` for normal ticks.
-    rx_v3_after(samples, config, 0, true)
+    rx_v3_after(samples, config, 0, true, None)
 }
 
 /// Same as `rx_v3` but skip every preamble whose detected offset is strictly
@@ -1161,11 +1204,23 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
 ///   the entire payload (no future tick to wait for a closing preamble)
 ///   so we must give it the best possible chance to decode, including
 ///   large drift / misparameterized profile cases.
+/// `session_hint_ppm` lets the worker carry a session-wide drift
+/// estimate forward to every window. When `Some(p)`, CLOSED windows
+/// skip the per-window `rx_v2` grid search and decode directly via
+/// `rx_v2_with_hint(window, config, p)` -- saves ~14× the grid-search
+/// cost on a clean signal and keeps the drift correction stable
+/// across SFs. `None` falls back to the legacy behaviour (CLOSED
+/// runs the full `rx_v2` grid, hint cascades CLOSED→OPEN inside the
+/// loop). Either way the OPEN window inherits the latest CLOSED's
+/// `r.drift_ppm` as before (which IS the session hint when one was
+/// provided, since `rx_v2_with_hint` echoes the hint back into
+/// `drift_ppm`).
 pub fn rx_v3_after(
     samples: &[f32],
     config: &ModemConfig,
     skip_until: usize,
     finalize: bool,
+    session_hint_ppm: Option<f64>,
 ) -> Option<RxV2Result> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
@@ -1211,6 +1266,12 @@ pub fn rx_v3_after(
     let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
     let mut last_pilot_phase_is_meta: Vec<bool> = Vec::new();
     let mut last_pilot_sigma2_per_segment: Vec<f64> = Vec::new();
+    // FFE-tap centroid pair of the most recent successful window.
+    // Surfaced to the worker so it can compute `final - initial` and
+    // trigger a Gardner re-estimate when the LMS adapter had to migrate
+    // the peak across an SF -- proxy for uncorrected residual ppm.
+    let mut last_ffe_centroid_initial: f64 = 0.0;
+    let mut last_ffe_centroid_final: f64 = 0.0;
     // Running drift estimate. Updated by every CLOSED window decode that
     // exits `rx_v2` with a successful grid hit; used as a hint when we
     // (later in this same call) decide to decode an OPEN window.
@@ -1246,7 +1307,17 @@ pub fn rx_v3_after(
             // absolute timing anchor at both ends, so the drift estimate
             // is reliable. The fast-path inside `rx_v2` skips the grid
             // when the first-pass `rx_v2_single` is already clean.
-            rx_v2(window, config)
+            //
+            // When a session-wide hint is provided (worker already
+            // locked onto the drift on the 1st CLOSED of the session),
+            // use it directly instead of re-running the grid -- saves
+            // the per-window cost and keeps the correction consistent
+            // across the whole session.
+            if let Some(hint) = session_hint_ppm {
+                rx_v2_with_hint(window, config, hint)
+            } else {
+                rx_v2(window, config)
+            }
         } else {
             // OPEN window: trailing, no closing preamble.
             //
@@ -1274,8 +1345,13 @@ pub fn rx_v3_after(
             if !(finalize || eot_seen) {
                 continue;
             }
+            // Hint priority for the OPEN: latest CLOSED of this scan
+            // (most local) > session-wide hint (still valid prior) >
+            // fall back to a full `rx_v2` grid (cold start).
             if have_hint {
                 rx_v2_with_hint(window, config, chosen_ppm)
+            } else if let Some(hint) = session_hint_ppm {
+                rx_v2_with_hint(window, config, hint)
             } else {
                 rx_v2(window, config)
             }
@@ -1332,6 +1408,8 @@ pub fn rx_v3_after(
             last_pilot_phase_is_meta = r.pilot_phase_is_meta;
             last_pilot_sigma2_per_segment = r.pilot_sigma2_per_segment;
         }
+        last_ffe_centroid_initial = r.ffe_centroid_initial;
+        last_ffe_centroid_final = r.ffe_centroid_final;
     }
 
     // Assembly — same policy as rx_v2_single: RaptorQ fountain decode from
@@ -1410,6 +1488,8 @@ pub fn rx_v3_after(
         // case the caller short-circuits on the assembled-data check
         // anyway.
         drift_ppm: reported_ppm,
+        ffe_centroid_initial: last_ffe_centroid_initial,
+        ffe_centroid_final: last_ffe_centroid_final,
     })
 }
 

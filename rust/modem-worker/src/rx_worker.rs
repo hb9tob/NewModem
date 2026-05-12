@@ -242,12 +242,23 @@ struct SfDetailPayload {
     /// which may differ from the user's pre-selected one after an
     /// auto-profile refinement from the Golay header.
     profile: String,
-    /// Drift correction (ppm, positive = RX clock faster) the scan
-    /// applied to land on a clean decode. Single value per tick: every
-    /// CW in `blocks` was demodulated with this ppm (rx_v3 inherits
-    /// the latest CLOSED window's drift to the OPEN one via the same
-    /// resample path, so the value is uniform across the tick).
+    /// Current session-level drift estimate (ppm, positive = RX clock
+    /// faster) the modem is locked on. The worker maintains this as
+    /// `WorkerState.session_drift_ppm`, initialised by a forced Gardner
+    /// run on the first decoded SF and refreshed when the FFE centroid
+    /// shift exceeds `FFE_CENTROID_REESTIMATE_SAMPLES`. Uniform across
+    /// the tick (every CW in `blocks` was demodulated with the same
+    /// resample correction). Falls back to the per-window
+    /// `result.drift_ppm` only on the very first decoded tick before
+    /// Gardner has had a chance to lock.
     ppm: f64,
+    /// FFE-tap centroid shift on this tick (`final - initial`, in
+    /// FSE-input samples). Diagnostic for the re-estimation trigger:
+    /// |shift| > `FFE_CENTROID_REESTIMATE_SAMPLES` (= 0.5) means LMS
+    /// had to migrate the peak that far to track residual drift, and
+    /// the worker just re-ran Gardner -- the freshly-updated `ppm`
+    /// field reflects that.
+    ffe_shift: f64,
     /// Aggregate `converged_blocks / total_blocks` for the whole tick.
     /// Mirrors the existing `progress` event's fields; duplicated here
     /// so the Info-tab entry is self-contained.
@@ -479,7 +490,32 @@ struct WorkerState {
     /// modem demodulator (after the raw WAV tee + level meter). `None`
     /// when the user has not enabled the toggle in Settings.
     deemphasis: Option<DeemphasisFilter>,
+    /// Session-wide drift estimate (ppm, positive = RX clock faster).
+    /// `None` until the first CLOSED SF of the session decodes cleanly:
+    /// at that point we force a one-shot `estimate_drift_gardner` on
+    /// the buffer and store the result. Subsequent ticks pass this
+    /// value as the `session_hint_ppm` to `rx_v3_after`, which lets
+    /// every CLOSED+OPEN window skip its per-window grid search and
+    /// decode straight with the session estimate -- amortised cost
+    /// ≈ N_sf rx_v2_with_hint vs 1× Gardner + N_sf rx_v2 grids.
+    ///
+    /// Re-estimation trigger: after each decode we compare the
+    /// per-tick FFE-tap centroid shift (`final - initial`, in
+    /// FSE-input samples) against `FFE_CENTROID_REESTIMATE_SAMPLES`.
+    /// A shift > threshold means LMS had to migrate the peak that far
+    /// to track the residual drift uncorrected by the current
+    /// estimate -- we re-run Gardner and refresh the value.
+    session_drift_ppm: Option<f64>,
 }
+
+/// Magnitude (in FSE-input samples) of the FFE-tap centroid drift we
+/// tolerate before triggering a Gardner re-estimation. The LMS adapter
+/// migrates the peak by ~`residual_ppm × window_duration × pitch_fse_per_s`
+/// samples; at 48 kHz audio rate and a typical SF ~4 s, 1 sample shift
+/// corresponds to ~5 ppm of uncorrected residual drift. Threshold 0.5
+/// catches a ~2.5 ppm departure while staying comfortably above LMS
+/// noise (the random tap-walk on a clean channel sits under 0.1 sample).
+const FFE_CENTROID_REESTIMATE_SAMPLES: f64 = 0.5;
 
 impl WorkerState {
     fn new(
@@ -506,6 +542,7 @@ impl WorkerState {
             last_preamble_seen_at: now,
             total_samples: 0,
             deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
+            session_drift_ppm: None,
         }
     }
 
@@ -514,6 +551,10 @@ impl WorkerState {
         self.header = None;
         self.session_active = false;
         self.announced_sessions.clear();
+        // A brickwall flush ends the current session: any drift estimate
+        // we'd locked onto is tied to the audio just dropped, so the
+        // next preamble triggers a fresh Gardner on a clean buffer.
+        self.session_drift_ppm = None;
     }
 
     /// Keep only the last `PREROLL_SECONDS` of audio in the in-memory buffer.
@@ -964,7 +1005,13 @@ fn scan_and_route(
     // if a CLOSED window of this same buffer carries an EOT marker,
     // so end-of-burst recovery doesn't need a second scan.
     let finalize = !state.session_active;
-    let rx_v3_opt = rx_v2::rx_v3_after(&state.session_buffer, &config, 0, finalize);
+    let rx_v3_opt = rx_v2::rx_v3_after(
+        &state.session_buffer,
+        &config,
+        0,
+        finalize,
+        state.session_drift_ppm,
+    );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
@@ -1011,7 +1058,13 @@ fn scan_and_route(
                     // the refreshed result. `!session_active` correctly
                     // forces the OPEN decode for the activation path.
                     let finalize = !state.session_active;
-                    match rx_v2::rx_v3_after(&state.session_buffer, &new_config, 0, finalize) {
+                    match rx_v2::rx_v3_after(
+                        &state.session_buffer,
+                        &new_config,
+                        0,
+                        finalize,
+                        state.session_drift_ppm,
+                    ) {
                         Some(refresh) => {
                             // Defensive : if the fresh header still claims a
                             // different profile, give up rather than loop.
@@ -1105,6 +1158,61 @@ fn scan_and_route(
         worker_log(&format!("[scan-segs] {parts}"));
     }
 
+    // Session-level drift estimator (runs BEFORE the sf_detail emit so
+    // the operator sees the just-(re-)estimated value on the same tick).
+    //
+    // Phase A (init) -- first successful decode of the session, no
+    // estimate yet: force one Gardner pass on the buffer regardless of
+    // whether the fast-path converged. Gardner needs ≥3 markers, which
+    // ANY decoded CLOSED SF will produce; if it returns None (idle
+    // pre-activation OPEN with <3 markers, etc.), we keep
+    // session_drift_ppm = None and retry on the next decode.
+    //
+    // Phase C (verify) -- estimate already locked: look at the FFE-tap
+    // centroid shift (`final - initial`) from this tick. The LMS
+    // adapter migrates the peak proportionally to residual drift, so a
+    // shift > FFE_CENTROID_REESTIMATE_SAMPLES means the running
+    // estimate no longer matches the channel and we re-run Gardner.
+    //
+    // Both phases are gated on a non-empty pilot_sigma2_per_segment
+    // (same guard as the [scan-segs] / sf_detail emits) so idle ticks
+    // don't spin Gardner on noise.
+    let centroid_shift = result.ffe_centroid_final - result.ffe_centroid_initial;
+    if !result.pilot_sigma2_per_segment.is_empty() {
+        let need_estimate = match state.session_drift_ppm {
+            None => true,
+            Some(_) => centroid_shift.abs() > FFE_CENTROID_REESTIMATE_SAMPLES,
+        };
+        if need_estimate {
+            let t0 = Instant::now();
+            match rx_v2::estimate_drift_gardner(&state.session_buffer, &state.config) {
+                Some(est_ppm) => {
+                    let prev = state.session_drift_ppm;
+                    state.session_drift_ppm = Some(est_ppm);
+                    worker_log(&format!(
+                        "[drift] {} ppm={:+.2} (prev={:?}, centroid_shift={:+.3} samples, took {} ms)",
+                        if prev.is_none() { "init" } else { "refresh" },
+                        est_ppm,
+                        prev,
+                        centroid_shift,
+                        t0.elapsed().as_millis(),
+                    ));
+                }
+                None => {
+                    // Insufficient markers (<3) or RMS gate failed.
+                    // Stay on the previous estimate (or None on cold
+                    // start) and try again next tick.
+                    worker_log(&format!(
+                        "[drift] estimator returned None (centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
+                        centroid_shift,
+                        t0.elapsed().as_millis(),
+                        state.session_drift_ppm,
+                    ));
+                }
+            }
+        }
+    }
+
     // Info-tab feed: emit a structured per-tick `sf_detail` event with
     // the same per-segment σ² breakdown, the drift_ppm that was applied,
     // and the aggregate converged/total counts. The frontend logs every
@@ -1127,11 +1235,17 @@ fn scan_and_route(
                 }
             })
             .collect();
+        // Prefer the fresh session estimate over `result.drift_ppm`:
+        // the latter is what was APPLIED (= the hint we passed in,
+        // possibly 0.0 if it was the cold-start tick); the former is
+        // what the modem now believes the channel actually has.
+        let reported_ppm = state.session_drift_ppm.unwrap_or(result.drift_ppm);
         sink.emit(
             "sf_detail",
             SfDetailPayload {
                 profile: profile_name(state.profile).to_string(),
-                ppm: result.drift_ppm,
+                ppm: reported_ppm,
+                ffe_shift: centroid_shift,
                 converged_blocks: result.converged_blocks,
                 total_blocks: result.total_blocks,
                 eot: eot_seen,
