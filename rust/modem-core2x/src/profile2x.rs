@@ -530,6 +530,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn training_amplitude_apsk32_matches_outer_ring_R3() {
         // 32-APSK γ1=2.84 γ2=5.27, Es=1:
         //   r0² = 8/(1+3γ1²+4γ2²) = 8/136.29 → r0 ≈ 0.2423,
@@ -543,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn training_amplitude_apsk64_matches_outer_ring_R4() {
         // 64-APSK γ1=2.4 γ2=4.3 γ3=7.0, Es=1:
         //   r0² = 16/(1+3γ1²+5γ2²+7γ3²) = 16/453.73 → r0 ≈ 0.1878,

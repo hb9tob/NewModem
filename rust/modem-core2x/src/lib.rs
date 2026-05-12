@@ -66,3 +66,9 @@ pub mod profile2x;
 // symbols. Mutually exclusive with V3 frame layout (no markers, no
 // TDM intra-CW pilots, no runout).
 pub mod frame2x;
+
+// Phase C-4 — V4 receive pipeline (symbol domain). The audio-domain
+// matched filter + Farrow + TimingLoop wrapper lives in the worker
+// (Phase C-7); rx_v4 here decodes a stream of complex symbols already
+// sampled at the symbol rate.
+pub mod rx_v4;
