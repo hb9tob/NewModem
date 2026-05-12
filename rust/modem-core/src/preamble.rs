@@ -100,16 +100,22 @@ pub fn make_preamble_for(family: PreambleFamily) -> Vec<Complex64> {
     }
 }
 
-/// Build the family preamble scaled by `config.preamble_amplitude()`.
+/// Build the family preamble scaled by `config.training_amplitude()`.
 ///
-/// For most profiles the amplitude is 1.0 -> strictly equivalent to
-/// `make_preamble_for(family)`. For Apsk64 (HIGH++) the unit-circle QPSK
-/// is multiplied by R4 so the preamble lands on the 4 outer-ring points
-/// of the constellation (indices 0/1/2/3 of Table 13e of EN 302 307-2),
-/// ensuring FFE/LMS scale continuity from preamble to data.
+/// For QPSK/16APSK profiles the amplitude is 1.0 -> strictly equivalent
+/// to `make_preamble_for(family)`. For the two APSK profiles the
+/// unit-circle QPSK is multiplied so the 4 preamble points coincide
+/// with a strict subset of the data constellation:
 ///
-/// Both TX and RX call this function -> the scale stays consistent
-/// without renegotiation.
+/// - Apsk32 (HIGH+):  multiply by R3 -> indices 25, 12, 10, 31 of
+///   Figure 12 of EN 302 307-1 (R3 at +/-pi/4, +/-3pi/4).
+/// - Apsk64 (HIGH++): multiply by R4 -> indices 0, 1, 2, 3 of Table 13e
+///   of EN 302 307-2 (R4 at +/-pi/4, +/-3pi/4).
+///
+/// FFE/LMS therefore see no scale "jump" between preamble and data, and
+/// the DD switch lands on a tracker already adapted to the data
+/// amplitude. Both TX and RX call this function -> the scale stays
+/// consistent without renegotiation.
 pub fn make_preamble_for_config(config: &crate::profile::ModemConfig) -> Vec<Complex64> {
     let base = make_preamble_for(config.preamble_family());
     let amp = config.training_amplitude();
@@ -123,17 +129,19 @@ pub fn make_preamble_for_config(config: &crate::profile::ModemConfig) -> Vec<Com
 /// the header so that the FFE can adapt to mu_train on the data
 /// constellation before switching to DD.
 ///
-/// For non-Apsk64 profiles: empty Vec (the QPSK preamble and the
-/// DD-on-data-constellation transition were enough -- this is the
-/// historical behaviour).
+/// - QPSK/16APSK profiles: empty Vec (the QPSK preamble and the
+///   DD-on-data-constellation transition were enough -- this is the
+///   historical behaviour).
+/// - Apsk32 (HIGH+): 32 symbols sweeping **each point of the 4+12+16
+///   constellation exactly once** in canonical Figure 12 order.
+/// - Apsk64 (HIGH++): 64 symbols sweeping **each point of the
+///   4+12+20+28 constellation exactly once** in canonical Table 13e
+///   order.
 ///
-/// For Apsk64 (HIGH++): 64 symbols sweeping **each point of the
-/// 4+12+20+28 constellation exactly once** (indices 0..63 in the
-/// canonical Table 13e order). LMS sees every amplitude (R1..R4) and
-/// every angle before the first data CW, so the meta CW arrives on a
-/// FFE already adapted to the density.
-///
-/// The sequence is deterministic and reconstructed identically on TX/RX.
+/// In both APSK cases LMS sees every amplitude (R1..Rk) and every angle
+/// before the first data CW, so the meta CW arrives on a FFE already
+/// adapted to the density. The sequence is deterministic and
+/// reconstructed identically on TX/RX.
 pub fn make_lms_warmup_for_config(config: &crate::profile::ModemConfig) -> Vec<Complex64> {
     let n = config.lms_warmup_syms();
     if n == 0 {

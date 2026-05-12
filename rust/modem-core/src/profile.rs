@@ -396,24 +396,35 @@ impl ModemConfig {
 }
 
 impl ModemConfig {
-    /// Multiplier applied to the (otherwise unit-circle) QPSK training
-    /// signals -- preamble **and** TDM pilots -- before TX modulation,
-    /// and to the matching RX reference (FFE training, pilot residual
-    /// computation for sigma^2).
+    /// Multiplier applied to the (otherwise unit-circle) QPSK preamble
+    /// before TX modulation, and to the matching RX reference (FFE
+    /// training). TDM pilots are NOT affected -- they stay on the unit
+    /// circle (see `pilot::pilot_symbol`).
     ///
-    /// For nearly every profile this is 1.0; for Apsk64 (HIGH++) we map
-    /// the training signals onto the constellation's outer ring R4.
-    /// Reason: multiplying the unit QPSK (angles +/-pi/4, +/-3pi/4) by
-    /// R4 produces the 4 points that **exactly** match Table 13e
-    /// indices 0, 1, 2, 3 (R4 at the same angles). The preamble and
-    /// pilots therefore stay a strict subset of the 64-APSK
-    /// constellation, and the FFE/LMS adapts on a continuous
-    /// preamble<->data<->pilot amplitude -- without the scale "jump"
-    /// that prevented the meta CW from decoding and that kept sigma^2
-    /// high through inflated pilot residuals (each TDM group =
-    /// 2 pilots * 1*R4 mismatch).
+    /// QPSK preambles use angles +/-pi/4, +/-3pi/4. The two APSK
+    /// constellations have a ring with exactly those 4 angles, so
+    /// scaling the preamble to a ring's radius makes the 4 preamble
+    /// points coincide with a strict subset of the data constellation.
+    /// The FFE/LMS then adapts on a continuous preamble->data amplitude,
+    /// without the scale "jump" that inflated residuals at the DD
+    /// switch.
+    ///
+    /// - Apsk64 (HIGH++): align to R4 (outer, 28 pts). Indices 0..3 of
+    ///   Table 13e are R4 at the QPSK angles.
+    /// - Apsk32 (HIGH+): align to R3 (outer, 16 pts). Indices 25, 12,
+    ///   10, 31 of Figure 12 are R3 at the QPSK angles.
+    /// - QPSK/16APSK profiles: 1.0 (the QPSK preamble already lives
+    ///   inside the data constellation).
     pub fn training_amplitude(&self) -> f64 {
         match self.constellation {
+            ConstellationType::Apsk32 => {
+                let g1 = self.apsk_gamma;
+                let g2 = self.apsk_gamma2;
+                // R3 normalised: Es=1 on 4+12+16 -> r0^2 = 8/(1+3*g1^2+4*g2^2),
+                // R3 = g2 * r0.
+                let r0 = (8.0 / (1.0 + 3.0 * g1 * g1 + 4.0 * g2 * g2)).sqrt();
+                g2 * r0
+            }
             ConstellationType::Apsk64 => {
                 let g1 = self.apsk_gamma;
                 let g2 = self.apsk_gamma2;
@@ -434,16 +445,23 @@ impl ModemConfig {
 
     /// Number of LMS training symbols injected between the QPSK
     /// preamble and the header -- an "FFE guard interval" that covers
-    /// the 4 rings of the 64-APSK constellation so LMS adapts at the
+    /// every ring of an APSK constellation so LMS adapts at the
     /// `mu_train` step before switching to DD.
     ///
-    /// For standard profiles: 0 (QPSK preamble alone is enough, the
-    /// data constellation decodes at the DD switch). For Apsk64
-    /// (HIGH++): 64 (= 4+12+20+28 = a full sweep of the constellation,
-    /// each point exactly once). Symbols known on both TX and RX side,
-    /// provided by `preamble::make_lms_warmup_for_config`.
+    /// - QPSK/16APSK profiles: 0 (QPSK preamble alone is enough; the
+    ///   data constellation decodes at the DD switch).
+    /// - Apsk32 (HIGH+): 32 (= 4+12+16 = a full sweep of the 32-APSK
+    ///   constellation, each point exactly once, in canonical Figure 12
+    ///   order).
+    /// - Apsk64 (HIGH++): 64 (= 4+12+20+28 = a full sweep of the
+    ///   64-APSK constellation, each point exactly once, in canonical
+    ///   Table 13e order).
+    ///
+    /// Symbols known on both TX and RX side, provided by
+    /// `preamble::make_lms_warmup_for_config`.
     pub fn lms_warmup_syms(&self) -> usize {
         match self.constellation {
+            ConstellationType::Apsk32 => 32,
             ConstellationType::Apsk64 => 64,
             _ => 0,
         }
