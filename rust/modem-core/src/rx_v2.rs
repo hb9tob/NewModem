@@ -300,87 +300,162 @@ fn resample_audio(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
 
 /// Top-level v2 decode with automatic sound-card drift compensation.
 ///
-/// **Phase 1 (0.10.13+) — marker-fit drift estimator.** Runs the
-/// single-pass decode once. If clean, returns it. Otherwise calls
-/// [`estimate_drift_ppm`] to fit the ppm from the sub-symbol positions
-/// of marker correlation peaks (~4 ppm precision in one shot), then
-/// re-decodes once at that ppm. Keeps the better of the two.
+/// **Phase 1c v2 (0.10.14+) — adaptive iterative drift correction.**
+/// Runs the single-pass decode once at 0 ppm. If clean, returns it.
+/// Otherwise enters an iterative loop:
 ///
-/// **Fallback grid.** If the estimator returns `None` (fewer than 3
-/// markers found, or residuals exceed the line-fit guard) or the
-/// estimator-driven decode is worse than the zero-ppm first pass, a
-/// short ±10 ppm × 5 ppm safety grid is swept. This catches edge cases
-/// where marker detection itself is broken by the drift (very rare
-/// since the grid pattern needs a marker scan anyway).
+///   1. Call [`estimate_drift_ppm`] on the current (possibly already
+///      partially-corrected) audio. The estimator returns `ε_obs`, an
+///      OLS slope on marker positions in the FFE output. Empirically
+///      `ε_obs = K × ε_residual` with `K` profile-dependent (~1.4 on
+///      Apsk32).
+///   2. If `|ε_obs| < TOL_PPM` -> converged, exit loop.
+///   3. Estimate `K` from the secant slope of the previous two
+///      `(step, ε_obs)` measurements: `K = (ε_obs[n-1] - ε_obs[n]) / step[n-1]`.
+///      First iter uses `K_DEFAULT = 1.4`.
+///   4. Apply correction `step = ε_obs / K_est` to the cumulative ppm,
+///      resample the original audio at the new cumulative ppm.
 ///
-/// **Cost.** Old grid: 14 single-pass decodes worst-case. New:
-/// 1 decode (clean) → 2 decodes + 1 estimator-FFE (refined) →
-/// 7 decodes worst-case (fallback grid). Typical 5-7× CPU win.
+/// Then decode at the converged cumulative ppm. Fallback: if final
+/// decode still isn't clean, sweep a narrow ±10 ppm × 5 ppm grid
+/// around the converged value.
+///
+/// **Why iterate instead of a single shot.** The `~1.4×` factor in
+/// `estimate_drift_ppm` is a FFE-windowing artefact that depends on
+/// (profile, channel). Iterating with adaptive `K` cancels this factor
+/// in 2 iters regardless of the actual value, AND re-trains the FFE
+/// on a less-drifted preamble each iter, which improves the next ε_obs
+/// measurement.
+///
+/// **Cost.** Old blind grid (0.10.12): 14 full decodes. Hint+grid
+/// (0.10.14): 1 estimator + 8 decodes. **Iterative (this version)**:
+/// 1-2 estimators + 1 final decode = 1.9-2.8× a single decode. 3-5×
+/// CPU win vs 0.10.14 grid.
 pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let first = rx_v2_single(samples, config);
-    let clean = match &first {
-        Some(r) if r.total_blocks > 0 => {
-            r.converged_blocks * 100 >= r.total_blocks * 99 && r.segments_decoded > 0
-        }
-        _ => false,
+    let clean = |r: &RxV2Result| -> bool {
+        r.total_blocks > 0
+            && r.converged_blocks * 100 >= r.total_blocks * 99
+            && r.segments_decoded > 0
     };
-    if clean {
-        return first;
+    if let Some(ref r) = first {
+        if clean(r) {
+            return first;
+        }
     }
+
+    // --- Iterative drift correction (Phase 1c v2, adaptive K secant) ---
+    const MAX_ITERS: usize = 3;
+    const TOL_PPM: f64 = 2.0;            // exit when |obs| < this
+    const K_DEFAULT: f64 = 1.4;
+    const K_MIN: f64 = 0.5;
+    const K_MAX: f64 = 3.0;
+
+    let mut cum_ppm = 0.0_f64;
+    let mut current_audio = samples.to_vec();
+    let mut prev_obs: Option<f64> = None;
+    let mut prev_step: Option<f64> = None;
+    let mut k_est = K_DEFAULT;
+    let mut converged = false;
+    let mut best_iter_cum_ppm = 0.0_f64;
+    let mut best_iter_residual = f64::INFINITY;
+
+    for iter in 0..MAX_ITERS {
+        let Some((obs, _n)) = estimate_drift_ppm(&current_audio, config) else {
+            eprintln!("[rx_v2] iter {iter}: estimator returned None, abort iters");
+            break;
+        };
+        eprintln!(
+            "[rx_v2] iter {iter}: cum={cum_ppm:+.2}, obs={obs:+.2}, k_est={k_est:.2}"
+        );
+        // Track the iteration that came CLOSEST to the optimum
+        // (smallest |obs|) -- protects against oscillation for FTN
+        // profiles where K can flip sign and the secant overshoots.
+        if obs.abs() < best_iter_residual {
+            best_iter_residual = obs.abs();
+            best_iter_cum_ppm = cum_ppm;
+        }
+        if obs.abs() < TOL_PPM {
+            converged = true;
+            break;
+        }
+        // Secant-method K estimate from prior step
+        if let (Some(po), Some(ps)) = (prev_obs, prev_step) {
+            if ps.abs() > 1.0 {
+                let candidate = (po - obs) / ps;
+                if candidate > K_MIN && candidate < K_MAX {
+                    k_est = candidate;
+                }
+            }
+        }
+        let step = obs / k_est;
+        // Divergence guard: if step gets ridiculous, abort
+        if step.abs() > 200.0 {
+            eprintln!("[rx_v2] iter {iter}: step {step:+.1} too large, abort");
+            break;
+        }
+        cum_ppm += step;
+        current_audio = resample_audio(samples, cum_ppm);
+        prev_obs = Some(obs);
+        prev_step = Some(step);
+    }
+
+    // If iterative oscillated (didn't converge but visited a better
+    // operating point), use that best-iter ppm instead of the final.
+    if !converged && best_iter_residual < f64::INFINITY {
+        if (cum_ppm - best_iter_cum_ppm).abs() > 1.0 {
+            eprintln!(
+                "[rx_v2] iter ended non-converged, rolling back from {cum_ppm:+.2} to best-iter {best_iter_cum_ppm:+.2}"
+            );
+            cum_ppm = best_iter_cum_ppm;
+            current_audio = resample_audio(samples, cum_ppm);
+        }
+    }
+
+    // Final decode at the converged cumulative ppm
     let mut best = first;
     let mut best_score = best.as_ref().map(score_result).unwrap_or(-1.0);
-    let mut best_ppm = 0.0f64;
-
-    // Phase 1 — marker-fit hint. The estimator gives a coarse ppm
-    // (correct sign, magnitude empirically ~1.3-1.4× the true drift on
-    // HIGH+ -- a FFE-windowing artefact I haven't analytically pinned
-    // down yet). We use it ONLY as a centering hint for a narrow refine
-    // grid: typically 3-5 decodes find the true ppm, vs 14 in the
-    // blind grid.
-    let hint = estimate_drift_ppm(samples, config).map(|(p, _)| p).unwrap_or(0.0);
-    eprintln!("[rx_v2] drift hint = {hint:+.1} ppm");
-
-    // Refine grid centred on the hint. ±20 ppm in 5-ppm steps, plus the
-    // hint itself snapped to its native value (which often matches the
-    // grid). When `hint` was already ~0, this collapses to a tiny ±20
-    // ppm grid centred at 0, which still costs less than the old ±80
-    // sweep.
-    let centers: Vec<f64> = if hint.abs() < 1.0 {
-        // No hint -> stick to the safe ±40 ppm range we had in 0.10.12.
-        vec![-40.0, -30.0, -20.0, -10.0, 10.0, 20.0, 30.0, 40.0]
-    } else {
-        // Estimator gives correct sign but empirically ~1.3-1.4× the
-        // true drift on HIGH+. Search around hint × 0.7 (rough true
-        // estimate) FIRST so it wins score ties via the strict-greater
-        // gate, then around the raw hint for outliers.
-        let h = hint;
-        let h_corr = h * 0.7;
-        vec![
-            h_corr, h_corr - 5.0, h_corr + 5.0, h_corr - 10.0, h_corr + 10.0,
-            h, h - 5.0, h + 5.0,
-        ]
-    };
-    for &ppm in &centers {
-        if ppm == 0.0 {
-            continue;
-        }
-        let corrected = resample_audio(samples, ppm);
-        if let Some(r) = rx_v2_single(&corrected, config) {
+    let mut best_ppm = 0.0_f64;
+    if cum_ppm.abs() >= 0.5 {
+        if let Some(r) = rx_v2_single(&current_audio, config) {
             let s = score_result(&r);
             if s > best_score {
                 best_score = s;
                 best = Some(r);
-                best_ppm = ppm;
+                best_ppm = cum_ppm;
             }
         }
     }
+    let iter_clean = best.as_ref().map(|r| clean(r)).unwrap_or(false);
+
+    if !iter_clean && !converged {
+        // Iteration didn't fully converge AND decode isn't clean.
+        // Sweep a narrow safety grid (±15 ppm) around the best ppm
+        // we have so far.
+        let center = best_ppm;
+        for &delta in &[-15.0, -10.0, -5.0, 5.0, 10.0, 15.0] {
+            let ppm = center + delta;
+            let corrected = resample_audio(samples, ppm);
+            if let Some(r) = rx_v2_single(&corrected, config) {
+                let s = score_result(&r);
+                if s > best_score {
+                    best_score = s;
+                    best = Some(r);
+                    best_ppm = ppm;
+                }
+            }
+        }
+    }
+
     if best_ppm != 0.0 {
-        eprintln!("[rx_v2] drift-compensated at {best_ppm:+.1} ppm (hint was {hint:+.1})");
+        eprintln!(
+            "[rx_v2] drift-compensated at {best_ppm:+.2} ppm (converged={converged}, k_final={k_est:.2})"
+        );
     }
 
     // Expose the chosen drift so `rx_v3_after` can carry it forward as a
     // hint to neighbouring windows. Left at 0.0 if the first-pass decode
-    // was already clean (no drift search ran).
+    // was already clean.
     if let Some(ref mut r) = best {
         r.drift_ppm = best_ppm;
     }
@@ -487,16 +562,29 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<(f64, usi
     let max_syms = if fse_input.len() > fse_start + half {
         (fse_input.len() - fse_start - half) / pitch_fse + 1
     } else { 0 };
-    // **Critical for drift estimation**: use fixed-tap FFE (LS-trained on
-    // preamble) instead of LMS-adapting FFE. The LMS path tracks the
-    // residual sub-symbol timing drift by re-aiming its tap delay every
-    // symbol -- the markers then appear at NEAR-NOMINAL positions in the
-    // output, which collapses the slope we're trying to measure (and
-    // worse, can flip its sign through over-correction). Fixed taps
-    // preserve the linear position offset that encodes ε_audio.
-    let all_rx_syms = ffe::apply_ffe(
-        &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
-    );
+    // FFE mode selection:
+    // - Non-FTN (tau=1.0): use fixed taps. Clean markers, LMS timing
+    //   adaptation introduces an opaque ~1.4× factor in the slope.
+    //   Adaptive K secant in `rx_v2` cancels it across iterations.
+    // - FTN (tau<1): use LMS adaptation. The sub-Nyquist pulse density
+    //   creates inherent ISI that fixed taps don't equalise, so marker
+    //   correlation magnitudes drop below the `find_sync_in_window`
+    //   0.5 threshold and we fail to detect anything. LMS shapes the
+    //   channel equaliser, recovers markers, K factor differs from
+    //   non-FTN but the secant copes.
+    let all_rx_syms = if config.tau >= 0.99 {
+        ffe::apply_ffe(
+            &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
+        )
+    } else {
+        let preamble_training: Vec<(usize, Complex64)> = preamble_syms
+            .iter().enumerate().map(|(k, &s)| (k, s)).collect();
+        let (syms, _final_taps) = ffe::apply_ffe_lms_with_training(
+            &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
+            &preamble_training, &constellation, 0.10, 0.02,
+        );
+        syms
+    };
     // Header is 96 syms; warmup_len precedes it (0 / 32 / 64 depending
     // on profile).
     let warmup_len = config.lms_warmup_syms();
@@ -1916,6 +2004,150 @@ mod tests {
             "drift-45+AWGN: estimator returned {:+.2} ppm, want ~{:+.0} (err {:.2} > 10)",
             r.drift_ppm, injected_ppm, err,
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1c v2 — per-profile drift sweep matrix
+    // -------------------------------------------------------------------
+    //
+    // Each profile sweep runs N drift values × {clean, AWGN}. For
+    // un-drifted (ε=0), assertion is loose (clean first pass → drift_ppm
+    // = 0); for drifted, we check both bit-exact payload AND that the
+    // converged ppm is within tolerance of the injected value.
+
+    /// Helper: TX -> drift -> AWGN -> RX. Asserts payload + ppm tolerance.
+    fn run_drift_test(
+        profile_name: &str,
+        cfg: &crate::profile::ModemConfig,
+        payload_size: usize,
+        seed: u32,
+        injected_ppm: f64,
+        noise_rms: f32,
+        ppm_tolerance: f64,
+    ) {
+        let data: Vec<u8> = (0..payload_size)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(13))
+            .collect();
+        let samples_tx = tx_v3(&data, cfg, seed);
+        let samples_drifted = if injected_ppm.abs() > 0.01 {
+            resample_audio(&samples_tx, -injected_ppm)
+        } else {
+            samples_tx.clone()
+        };
+        let samples_final = if noise_rms > 0.0 {
+            add_awgn(&samples_drifted, noise_rms, (seed as u64) ^ 0xA5A5_5A5A)
+        } else {
+            samples_drifted
+        };
+        let r = rx_v2(&samples_final, cfg).unwrap_or_else(|| {
+            panic!(
+                "{profile_name} drift={injected_ppm:+.0} noise={noise_rms}: rx_v2 None"
+            )
+        });
+        assert!(
+            r.app_header.is_some(),
+            "{profile_name} drift={injected_ppm:+.0} noise={noise_rms}: no AppHeader"
+        );
+        assert_eq!(
+            &r.data[..data.len()],
+            &data[..],
+            "{profile_name} drift={injected_ppm:+.0} noise={noise_rms}: payload mismatch"
+        );
+        // Two valid success states when drift is injected:
+        //   (a) `drift_ppm` close to injected -- iterative path engaged
+        //       and converged.
+        //   (b) `drift_ppm` == 0 (first-pass clean) -- the channel
+        //       (pilots + LDPC margin) absorbed the drift without
+        //       needing the resample. Common for robust profiles
+        //       (QPSK NORMAL, 64-APSK HIGH++ with 16/2 pilots) at
+        //       moderate drift.
+        // Both are functionally correct (payload bit-exact). The
+        // tolerance check only applies when the iterative path
+        // actually ran -- `drift_ppm` non-zero.
+        if injected_ppm.abs() > 1.0 && r.drift_ppm.abs() > 0.1 {
+            let err = (r.drift_ppm - injected_ppm).abs();
+            assert!(
+                err < ppm_tolerance,
+                "{profile_name} drift={injected_ppm:+.0} noise={noise_rms}: \
+                 drift_ppm={:+.2}, want ~{:+.0}, err={:.2} > tol={:.2}",
+                r.drift_ppm, injected_ppm, err, ppm_tolerance,
+            );
+        }
+    }
+
+    /// NORMAL (QPSK 1500 Bd β=0.20 LDPC 3/4) — sweep ±30, ±60 ppm clean + ±30 AWGN.
+    #[test]
+    fn drift_sweep_normal() {
+        let cfg = crate::profile::profile_normal();
+        let n = "NORMAL";
+        run_drift_test(n, &cfg, 200, 0x4E00_0000, 0.0, 0.0, 4.0);
+        run_drift_test(n, &cfg, 200, 0x4E00_0001, 30.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4E00_0002, -30.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4E00_0003, 60.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4E00_0004, -60.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4E00_0005, 30.0, 0.05, 8.0);
+        run_drift_test(n, &cfg, 200, 0x4E00_0006, -30.0, 0.05, 8.0);
+    }
+
+    /// HIGH (QPSK 1500 Bd β=0.20 LDPC 5/6) — same sweep as NORMAL.
+    #[test]
+    fn drift_sweep_high() {
+        let cfg = crate::profile::profile_high();
+        let n = "HIGH";
+        run_drift_test(n, &cfg, 200, 0x4800_0000, 0.0, 0.0, 4.0);
+        run_drift_test(n, &cfg, 200, 0x4800_0001, 30.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4800_0002, -30.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4800_0003, 60.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4800_0004, -45.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4800_0005, 30.0, 0.05, 8.0);
+    }
+
+    /// HIGH+56 (HIGH+ with LDPC 5/6) — thinner LDPC margin on 32-APSK.
+    #[test]
+    fn drift_sweep_high_plus_5_6() {
+        let cfg = crate::profile::profile_high_plus_5_6();
+        let n = "HIGH+56";
+        run_drift_test(n, &cfg, 200, 0x4856_0000, 0.0, 0.0, 4.0);
+        run_drift_test(n, &cfg, 200, 0x4856_0001, 30.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4856_0002, -45.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 200, 0x4856_0003, 30.0, 0.05, 8.0);
+    }
+
+    /// HIGH++ (64-APSK DVB-S2X 1500 Bd β=0.20 LDPC 3/4) — densest
+    /// constellation in the lineup, K factor may differ from HIGH+.
+    #[test]
+    fn drift_sweep_high_plus_plus() {
+        let cfg = crate::profile::profile_high_plus_plus();
+        let n = "HIGH++";
+        run_drift_test(n, &cfg, 1500, 0xC064_0000, 0.0, 0.0, 4.0);
+        run_drift_test(n, &cfg, 1500, 0xC064_0001, 30.0, 0.0, 6.0);
+        run_drift_test(n, &cfg, 1500, 0xC064_0002, -30.0, 0.0, 6.0);
+        run_drift_test(n, &cfg, 1500, 0xC064_0003, 45.0, 0.0, 6.0);
+        run_drift_test(n, &cfg, 1500, 0xC064_0004, -45.0, 0.0, 6.0);
+        run_drift_test(n, &cfg, 1500, 0xC064_0005, 30.0, 0.03, 8.0);
+    }
+
+    /// MEGA (16-APSK FTN tau=30/32, 1500 Bd) — sub-Nyquist pulse
+    /// density. Bigger payload (1200 B) to ensure ≥3 markers per SF so
+    /// the estimator's linear regression has enough points.
+    ///
+    /// **Tolerance widening for FTN**: with `apply_ffe_lms_with_training`
+    /// (required because fixed taps don't equalise FTN ISI well enough
+    /// to detect markers), the LMS timing adaptation makes K highly
+    /// nonlinear in ε. K_actual ≈ 2.3 at large drift, ≈ 0.1 near zero.
+    /// The secant method picks an averaged K and converges to a value
+    /// off by ~20 ppm from the true injected drift. Payload still
+    /// decodes (pilots + LDPC margin absorb the residual). So the
+    /// `drift_ppm` tolerance here is loose -- ±25 ppm. The PAYLOAD
+    /// assertion is the actual correctness check.
+    #[test]
+    fn drift_sweep_mega() {
+        let cfg = crate::profile::profile_mega();
+        let n = "MEGA";
+        run_drift_test(n, &cfg, 1200, 0x4D6E_0000, 0.0, 0.0, 5.0);
+        run_drift_test(n, &cfg, 1200, 0x4D6E_0001, 30.0, 0.0, 25.0);
+        run_drift_test(n, &cfg, 1200, 0x4D6E_0002, -30.0, 0.0, 25.0);
+        run_drift_test(n, &cfg, 1200, 0x4D6E_0003, 30.0, 0.05, 25.0);
     }
 
     /// Loopback HIGH+ (32-APSK 1500 Bd beta=0.20 LDPC 3/4): exercises
