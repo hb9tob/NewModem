@@ -441,7 +441,19 @@ fn decode_one_cw(
         let bytes = info_bytes[..k_bytes].to_vec();
         if is_meta {
             if let Some(h) = app_header::decode_meta_payload(&bytes) {
-                result.app_header = Some(h);
+                // The EOT cycle's META-CW carries a sentinel AppHeader
+                // with `file_size = 0` (see `build_eot_frame_v4`). It must
+                // not clobber a real AppHeader recovered from an earlier
+                // data cycle — otherwise the RaptorQ reassembly step
+                // computes `n_source_cw = 0` and `result.data` ends up
+                // empty even though every data CW converged.
+                let keep_existing = matches!(
+                    result.app_header,
+                    Some(ref cur) if cur.file_size > 0 && h.file_size == 0,
+                );
+                if !keep_existing {
+                    result.app_header = Some(h);
+                }
             }
         } else {
             cw_bytes.insert(esi, bytes);
@@ -561,6 +573,29 @@ mod tests {
         assert!(result.eot_seen, "EOT flag must be reported");
         assert!(result.app_header.is_some(), "EOT carries an AppHeader");
         assert_eq!(result.app_header.unwrap().session_id, 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn data_then_eot_preserves_real_app_header() {
+        // Regression: an EOT cycle following a data superframe used to
+        // clobber `result.app_header` with the EOT's zero-file_size
+        // sentinel, leaving `result.data` empty even though every data CW
+        // converged. We pin the test to ULTRA2X (cw_per_cycle = 1, so
+        // every cycle is "full" and the data-CW inner loop never reads
+        // past the actual data into the EOT PLHEADER — a separate edge
+        // case that only bites profiles with cw_per_cycle > 1 and a
+        // partial last cycle). This is the exact shape that the CLI
+        // `nbfm-modem tx --family 2x -p ULTRA2X … && rx …` produces.
+        let cfg = profile_ultra_2x();
+        let payload = rng_bytes(150, 0xEEE0);
+        let mut symbols = build_superframe_v4(&payload, &cfg, 0x12345678, mime::BINARY, 0xCC);
+        symbols.extend(build_eot_frame_v4(&cfg, 0x12345678));
+
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        assert!(result.eot_seen, "EOT must be detected");
+        let h = result.app_header.expect("data AppHeader survives EOT");
+        assert_eq!(h.file_size as usize, payload.len());
+        assert_eq!(result.data, payload);
     }
 
     #[test]
