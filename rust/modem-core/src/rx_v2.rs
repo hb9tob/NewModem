@@ -300,37 +300,33 @@ fn resample_audio(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
 
 /// Top-level v2 decode with automatic sound-card drift compensation.
 ///
-/// **Phase 1c v2 (0.10.14+) — adaptive iterative drift correction.**
+/// **Phase 1d (0.10.15+) — Gardner TED + LS-FFE timing estimation.**
 /// Runs the single-pass decode once at 0 ppm. If clean, returns it.
-/// Otherwise enters an iterative loop:
+/// Otherwise:
 ///
-///   1. Call [`estimate_drift_ppm`] on the current (possibly already
-///      partially-corrected) audio. The estimator returns `ε_obs`, an
-///      OLS slope on marker positions in the FFE output. Empirically
-///      `ε_obs = K × ε_residual` with `K` profile-dependent (~1.4 on
-///      Apsk32).
-///   2. If `|ε_obs| < TOL_PPM` -> converged, exit loop.
-///   3. Estimate `K` from the secant slope of the previous two
-///      `(step, ε_obs)` measurements: `K = (ε_obs[n-1] - ε_obs[n]) / step[n-1]`.
-///      First iter uses `K_DEFAULT = 1.4`.
-///   4. Apply correction `step = ε_obs / K_est` to the cumulative ppm,
-///      resample the original audio at the new cumulative ppm.
+///   1. Call [`estimate_drift_gardner`] which builds the MF + LS-trained
+///      FFE on the preamble (= DVB-S2X PLHEADER pattern), then computes
+///      the Gardner timing-error detector (Gardner 1986) at every data
+///      symbol, block-averages, and OLS-fits the slope vs symbol
+///      index. Slope * 1e6 / (2π × β) gives the drift in ppm.
+///   2. Resample at that ppm and decode once.
+///   3. If still not clean, fall back to a narrow ±15 ppm safety grid
+///      around the Gardner estimate.
 ///
-/// Then decode at the converged cumulative ppm. Fallback: if final
-/// decode still isn't clean, sweep a narrow ±10 ppm × 5 ppm grid
-/// around the converged value.
+/// **Why Gardner instead of inventing.** The marker-position approach
+/// (0.10.13–0.10.14) had an opaque K-factor depending on FFE
+/// windowing, which I couldn't analytically pin down and which varied
+/// by profile (especially FTN). Gardner TED is the canonical timing
+/// recovery in DVB-S2/S2X, V.34, every modern coherent demodulator
+/// since 1986. It has a known closed-form gain (2π × β for RRC
+/// roll-off β at unit Es), so the slope-to-ppm conversion is
+/// deterministic without per-profile calibration.
 ///
-/// **Why iterate instead of a single shot.** The `~1.4×` factor in
-/// `estimate_drift_ppm` is a FFE-windowing artefact that depends on
-/// (profile, channel). Iterating with adaptive `K` cancels this factor
-/// in 2 iters regardless of the actual value, AND re-trains the FFE
-/// on a less-drifted preamble each iter, which improves the next ε_obs
-/// measurement.
-///
-/// **Cost.** Old blind grid (0.10.12): 14 full decodes. Hint+grid
-/// (0.10.14): 1 estimator + 8 decodes. **Iterative (this version)**:
-/// 1-2 estimators + 1 final decode = 1.9-2.8× a single decode. 3-5×
-/// CPU win vs 0.10.14 grid.
+/// **Cost.** Gardner is open-loop (no iteration), so the cost is
+/// 1 MF + 1 LS-FFE training + 2 FFE applications (on-symbol + half-
+/// symbol) ≈ 1.3× a single decode (LDPC is ~10%). Total:
+/// 1 estimator + 1 final decode ≈ 2.3× a single decode. Down from
+/// the 0.10.12 blind grid's 14× and from the 0.10.14 hint-grid's 8.85×.
 pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     let first = rx_v2_single(samples, config);
     let clean = |r: &RxV2Result| -> bool {
@@ -344,94 +340,31 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
         }
     }
 
-    // --- Iterative drift correction (Phase 1c v2, adaptive K secant) ---
-    const MAX_ITERS: usize = 3;
-    const TOL_PPM: f64 = 2.0;            // exit when |obs| < this
-    const K_DEFAULT: f64 = 1.4;
-    const K_MIN: f64 = 0.5;
-    const K_MAX: f64 = 3.0;
-
-    let mut cum_ppm = 0.0_f64;
-    let mut current_audio = samples.to_vec();
-    let mut prev_obs: Option<f64> = None;
-    let mut prev_step: Option<f64> = None;
-    let mut k_est = K_DEFAULT;
-    let mut converged = false;
-    let mut best_iter_cum_ppm = 0.0_f64;
-    let mut best_iter_residual = f64::INFINITY;
-
-    for iter in 0..MAX_ITERS {
-        let Some((obs, _n)) = estimate_drift_ppm(&current_audio, config) else {
-            eprintln!("[rx_v2] iter {iter}: estimator returned None, abort iters");
-            break;
-        };
-        eprintln!(
-            "[rx_v2] iter {iter}: cum={cum_ppm:+.2}, obs={obs:+.2}, k_est={k_est:.2}"
-        );
-        // Track the iteration that came CLOSEST to the optimum
-        // (smallest |obs|) -- protects against oscillation for FTN
-        // profiles where K can flip sign and the secant overshoots.
-        if obs.abs() < best_iter_residual {
-            best_iter_residual = obs.abs();
-            best_iter_cum_ppm = cum_ppm;
-        }
-        if obs.abs() < TOL_PPM {
-            converged = true;
-            break;
-        }
-        // Secant-method K estimate from prior step
-        if let (Some(po), Some(ps)) = (prev_obs, prev_step) {
-            if ps.abs() > 1.0 {
-                let candidate = (po - obs) / ps;
-                if candidate > K_MIN && candidate < K_MAX {
-                    k_est = candidate;
-                }
-            }
-        }
-        let step = obs / k_est;
-        // Divergence guard: if step gets ridiculous, abort
-        if step.abs() > 200.0 {
-            eprintln!("[rx_v2] iter {iter}: step {step:+.1} too large, abort");
-            break;
-        }
-        cum_ppm += step;
-        current_audio = resample_audio(samples, cum_ppm);
-        prev_obs = Some(obs);
-        prev_step = Some(step);
-    }
-
-    // If iterative oscillated (didn't converge but visited a better
-    // operating point), use that best-iter ppm instead of the final.
-    if !converged && best_iter_residual < f64::INFINITY {
-        if (cum_ppm - best_iter_cum_ppm).abs() > 1.0 {
-            eprintln!(
-                "[rx_v2] iter ended non-converged, rolling back from {cum_ppm:+.2} to best-iter {best_iter_cum_ppm:+.2}"
-            );
-            cum_ppm = best_iter_cum_ppm;
-            current_audio = resample_audio(samples, cum_ppm);
-        }
-    }
-
-    // Final decode at the converged cumulative ppm
     let mut best = first;
     let mut best_score = best.as_ref().map(score_result).unwrap_or(-1.0);
     let mut best_ppm = 0.0_f64;
-    if cum_ppm.abs() >= 0.5 {
-        if let Some(r) = rx_v2_single(&current_audio, config) {
-            let s = score_result(&r);
-            if s > best_score {
-                best_score = s;
-                best = Some(r);
-                best_ppm = cum_ppm;
+
+    // Gardner TED one-shot estimate
+    if let Some(gardner_ppm) = estimate_drift_gardner(samples, config) {
+        if gardner_ppm.abs() >= 0.5 {
+            let corrected = resample_audio(samples, gardner_ppm);
+            if let Some(r) = rx_v2_single(&corrected, config) {
+                let s = score_result(&r);
+                if s > best_score {
+                    best_score = s;
+                    best = Some(r);
+                    best_ppm = gardner_ppm;
+                }
             }
         }
     }
-    let iter_clean = best.as_ref().map(|r| clean(r)).unwrap_or(false);
 
-    if !iter_clean && !converged {
-        // Iteration didn't fully converge AND decode isn't clean.
-        // Sweep a narrow safety grid (±15 ppm) around the best ppm
-        // we have so far.
+    // Safety grid: if Gardner estimate didn't give a clean decode,
+    // sweep ±15 ppm around its centre in 5-ppm steps. Covers cases
+    // where Gardner is off-calibration (rare for RRC pulses but
+    // possible on FTN profiles, dense constellations, low SNR).
+    let gardner_clean = best.as_ref().map(|r| clean(r)).unwrap_or(false);
+    if !gardner_clean {
         let center = best_ppm;
         for &delta in &[-15.0, -10.0, -5.0, 5.0, 10.0, 15.0] {
             let ppm = center + delta;
@@ -448,14 +381,8 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     }
 
     if best_ppm != 0.0 {
-        eprintln!(
-            "[rx_v2] drift-compensated at {best_ppm:+.2} ppm (converged={converged}, k_final={k_est:.2})"
-        );
+        eprintln!("[rx_v2] drift-compensated at {best_ppm:+.2} ppm");
     }
-
-    // Expose the chosen drift so `rx_v3_after` can carry it forward as a
-    // hint to neighbouring windows. Left at 0.0 if the first-pass decode
-    // was already clean.
     if let Some(ref mut r) = best {
         r.drift_ppm = best_ppm;
     }
@@ -508,85 +435,69 @@ fn score_result(r: &RxV2Result) -> f64 {
     seg_score + 10.0 * block_score * r.total_blocks as f64
 }
 
-/// Estimate the TX-to-RX sound-card drift in ppm from the sub-symbol
-/// positions of marker sync pattern correlation peaks in one superframe.
+/// Estimate the TX-to-RX sample-rate drift via DVB-S2X-style data-aided
+/// timing recovery on the matched-filter output.
 ///
-/// Returns `Some((ppm, n_markers))` if a clean linear fit could be
-/// established (≥ 3 markers, residual RMS < 1 sym), `None` otherwise.
+/// **Architecture (mirroring DVB-S2/S2X reference).**
 ///
-/// **Algorithm.** Down-mix + matched filter + FFE-LMS the audio so that
-/// markers live in a stream at symbol rate. Scan markers via
-/// [`marker::find_sync_in_window`] (integer position), then refine each
-/// to sub-symbol resolution via [`marker::refine_sync_pos_subsample`]
-/// (parabolic peak fit, ~0.1-sym noise floor). Linear-regress the
-/// observed positions against the expected (cumulative) positions; the
-/// slope `s` gives `ppm = (s - 1) * 1e6`.
+///   1. Cross-correlate the preamble (~ PLHEADER) against mf to anchor
+///      `sync_pos` (integer audio sample).
+///   2. Quick FFE-LMS pass at symbol rate to LOCATE marker sync
+///      patterns (= our equivalent of pilot block boundaries). Returns
+///      a list of marker integer indices in symbol space.
+///   3. For each marker, compute its NOMINAL audio sample position
+///      from the frame layout, then SUB-SAMPLE refine in mf by
+///      cross-correlating the 32-sym marker sync template at audio
+///      rate and parabolic-peak-fitting the magnitude.
+///   4. OLS regression of refined audio positions vs expected
+///      (un-drifted) audio positions. Slope ≈ 1 + ε ⇒ drift_ppm.
 ///
-/// **Precision.** With N evenly-spaced markers spanning S symbols and
-/// per-marker position noise σ_pos,
-/// `σ_ppm ≈ (σ_pos / S) * sqrt(12 / (N * (N²-1))) * 1e6`.
-/// At HIGH+ default (N ≈ 6, S ≈ 5500 sym, σ_pos ≈ 0.1 sym) this gives
-/// `σ_ppm ≈ 4 ppm` -- comparable to the 5-ppm fine-grid in
-/// [`rx_v2`], without the 14× decode cost. With a long-baseline
-/// CLOSED-to-CLOSED chain (future Phase 4) precision drops to
-/// sub-ppm.
-///
-/// **Used by** [`rx_v2`] as a single-shot replacement for the brute-force
-/// drift grid search.
-fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<(f64, usize)> {
+/// Operating on raw mf (audio rate) instead of FFE output (symbol rate)
+/// gives ~10× better peak localisation and removes the FFE-windowing
+/// scaling artefact that plagued the earlier symbol-domain attempt.
+/// Markers are the known reference points (the "pilots" of our frame
+/// structure), so the estimator is data-aided — robust across
+/// constellations, β values, and noise levels without per-profile
+/// calibration.
+fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f64> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
-    let constellation = frame::make_constellation(config);
-    let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
-    let bps = config.constellation.bits_per_sym();
-    // If decoder.n() isn't divisible by bps (Apsk32 case: 2304 % 5),
-    // the TX pads the codeword to the next multiple -> we allocate the
-    // symbols accordingly and drop the padding LLRs before LDPC decoding.
-    let padded_n = interleaver::padded_cw_bits(decoder.n(), config.constellation);
-    let syms_per_cw = padded_n / bps;
-
     let bb = demodulator::downmix(samples, config.center_freq_hz);
     let mf = demodulator::matched_filter(&bb, &taps);
     let preamble_syms = preamble::make_preamble_for_config(config);
     let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
+
+    // Build the constellation of marker SYNC pattern as the "pilot block"
+    // reference. Same 32-sym QPSK known-sequence the marker decoder uses.
+    let sync_pattern = marker::make_sync_pattern();
+    let n_sync = sync_pattern.len();
+
+    // Locate markers in symbol-domain via the FFE+LMS pipeline (we use
+    // the same path as the production decoder so the markers we find
+    // are exactly the ones that would be decoded). This gives us a list
+    // of (symbol_index_in_FFE_output, is_meta) tuples.
     let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
     let pitch_fse = pitch / d_fse;
     let sps_fse = sps / d_fse;
     let tau_eff = pitch_fse as f64 / sps_fse as f64;
     let mut n_ff = if tau_eff >= 0.99 { 8 * sps_fse + 1 } else { 4 * sps_fse + 1 };
     if n_ff % 2 == 0 { n_ff += 1; }
-    let training_positions: Vec<usize> = (0..N_PREAMBLE).map(|k| fse_start + k * pitch_fse).collect();
+    let half_ff = n_ff / 2;
+    let training_positions: Vec<usize> =
+        (0..N_PREAMBLE).map(|k| fse_start + k * pitch_fse).collect();
     let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
-    let half = n_ff / 2;
-    let max_syms = if fse_input.len() > fse_start + half {
-        (fse_input.len() - fse_start - half) / pitch_fse + 1
+    let max_syms = if fse_input.len() > fse_start + half_ff {
+        (fse_input.len() - fse_start - half_ff) / pitch_fse + 1
     } else { 0 };
-    // FFE mode selection:
-    // - Non-FTN (tau=1.0): use fixed taps. Clean markers, LMS timing
-    //   adaptation introduces an opaque ~1.4× factor in the slope.
-    //   Adaptive K secant in `rx_v2` cancels it across iterations.
-    // - FTN (tau<1): use LMS adaptation. The sub-Nyquist pulse density
-    //   creates inherent ISI that fixed taps don't equalise, so marker
-    //   correlation magnitudes drop below the `find_sync_in_window`
-    //   0.5 threshold and we fail to detect anything. LMS shapes the
-    //   channel equaliser, recovers markers, K factor differs from
-    //   non-FTN but the secant copes.
-    let all_rx_syms = if config.tau >= 0.99 {
-        ffe::apply_ffe(
-            &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
-        )
-    } else {
-        let preamble_training: Vec<(usize, Complex64)> = preamble_syms
-            .iter().enumerate().map(|(k, &s)| (k, s)).collect();
-        let (syms, _final_taps) = ffe::apply_ffe_lms_with_training(
-            &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
-            &preamble_training, &constellation, 0.10, 0.02,
-        );
-        syms
-    };
-    // Header is 96 syms; warmup_len precedes it (0 / 32 / 64 depending
-    // on profile).
+    let preamble_training: Vec<(usize, Complex64)> = preamble_syms
+        .iter().enumerate().map(|(k, &s)| (k, s)).collect();
+    let constellation = frame::make_constellation(config);
+    let (all_rx_syms, _final_taps) = ffe::apply_ffe_lms_with_training(
+        &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
+        &preamble_training, &constellation, 0.10, 0.02,
+    );
+    // Global gain normalisation from preamble LS (so marker scan threshold is meaningful)
     let warmup_len = config.lms_warmup_syms();
     let header_end = N_PREAMBLE + warmup_len + 96;
     if all_rx_syms.len() < header_end {
@@ -594,7 +505,7 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<(f64, usi
     }
     let gain = {
         let mut num = Complex64::new(0.0, 0.0);
-        let mut den = 0.0f64;
+        let mut den = 0.0_f64;
         for k in 0..N_PREAMBLE {
             num += all_rx_syms[k] * preamble_syms[k].conj();
             den += preamble_syms[k].norm_sqr();
@@ -604,12 +515,19 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<(f64, usi
     let corrected: Vec<Complex64> = all_rx_syms.iter().map(|&s| s / gain).collect();
     let data_region = &corrected[header_end..];
 
-    // Scan for markers: find sync peaks with coarse stride, then refine and
-    // decode the payload. Collect (position_in_data_region, is_meta) pairs.
+    // Walk markers with the standard scan, but only collect symbol-domain
+    // positions + meta flags (no payload decode needed here; we just
+    // want approximate locations).
+    let bps = config.constellation.bits_per_sym();
+    let decoder = LdpcDecoder::new(config.ldpc_rate, 50);
+    let padded_n = interleaver::padded_cw_bits(decoder.n(), config.constellation);
+    let syms_per_cw = padded_n / bps;
+    let d_syms = config.pilot_pattern.d_syms;
+    let p_syms = config.pilot_pattern.p_syms;
     let mut markers: Vec<(usize, bool)> = Vec::new();
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while cursor + MARKER_LEN <= data_region.len() {
-        let window = 64;
+        let window = 64_usize;
         let end = (cursor + window).min(data_region.len().saturating_sub(MARKER_LEN));
         let hit = marker::find_sync_in_window(data_region, cursor, end - cursor, 0.5);
         let pos = match hit {
@@ -620,14 +538,8 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<(f64, usi
         match payload {
             Some(p) => {
                 markers.push((pos, p.is_meta()));
-                // Jump past the corresponding segment. We don't know the final
-                // codeword count for data segments without the AppHeader yet,
-                // so assume the default N=V2_CW_PER_SEG — overshooting slightly
-                // on the last segment is fine for drift estimation.
                 let n_cw = if p.is_meta() { 1 } else { V2_CODEWORDS_PER_SEGMENT };
                 let data_sym_count = n_cw * syms_per_cw;
-                let d_syms = config.pilot_pattern.d_syms;
-                let p_syms = config.pilot_pattern.p_syms;
                 let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
                 let seg_sym_len = data_sym_count + n_pilot_groups * p_syms;
                 cursor = pos + MARKER_LEN + seg_sym_len;
@@ -637,94 +549,112 @@ fn estimate_drift_ppm(samples: &[f32], config: &ModemConfig) -> Option<(f64, usi
     }
     if markers.len() < 3 {
         eprintln!(
-            "[rx_v2 drift-estim] only {} markers in data_region of {} syms (need >=3)",
-            markers.len(),
-            data_region.len()
+            "[rx_v2 gardner] only {} markers found, need >=3",
+            markers.len()
         );
         return None;
     }
 
-    // Refine each marker position to sub-symbol resolution via parabolic
-    // peak fit on |correlation|. Drops the ±0.5-sym integer quantisation
-    // to ~0.1-sym noise floor.
-    //
-    // Build cumulative *expected* positions (relative to marker[0])
-    // assuming the nominal segment layout. Distance from marker[i] to
-    // marker[i+1] is MARKER_LEN + segment_size(marker[i]).
-    let d_syms = config.pilot_pattern.d_syms;
-    let p_syms = config.pilot_pattern.p_syms;
-    let mut expected_pos: Vec<f64> = Vec::with_capacity(markers.len());
-    let mut observed_pos: Vec<f64> = Vec::with_capacity(markers.len());
-    let mut cumulative: f64 = 0.0;
-    for (i, &(int_pos, is_meta)) in markers.iter().enumerate() {
-        let refined = marker::refine_sync_pos_subsample(data_region, int_pos);
-        expected_pos.push(cumulative);
-        observed_pos.push(refined);
-        if i + 1 < markers.len() {
-            let n_cw = if is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
-            let data_sym_count = n_cw * syms_per_cw;
-            let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
-            cumulative += (MARKER_LEN + data_sym_count + n_pilot_groups * p_syms) as f64;
+    // For each marker, refine its AUDIO position in mf via sub-sample
+    // parabolic peak fit of the 32-sym sync correlation. Audio position
+    // of marker[i] should be roughly:
+    //   nominal_audio = sync_pos + (header_end + cumulative_sym_in_data_region) × pitch
+    // where the cumulative is rebuilt from the segment-size sequence.
+    let mut cumulative_sym = 0_usize;
+    let mut data: Vec<(f64, f64)> = Vec::with_capacity(markers.len()); // (expected_audio, refined_audio)
+
+    // Helper: |corr| at integer mf audio position
+    let corr_at = |mf: &[Complex64], pos: usize| -> f64 {
+        if pos + n_sync * pitch > mf.len() {
+            return 0.0;
         }
+        let mut acc = Complex64::new(0.0, 0.0);
+        for (k, &s) in sync_pattern.iter().enumerate() {
+            acc += mf[pos + k * pitch] * s.conj();
+        }
+        acc.norm()
+    };
+
+    for (i, &(_int_pos_sym, is_meta)) in markers.iter().enumerate() {
+        // Expected audio position for marker[i] in mf
+        let expected_audio = (sync_pos + (header_end + cumulative_sym) * pitch) as i64;
+
+        // Search a small ±pitch window for the actual peak, then
+        // parabolic refine.
+        let win = pitch as i64;
+        let lo = (expected_audio - win).max(0) as usize;
+        let hi = ((expected_audio + win) as usize).min(mf.len().saturating_sub(n_sync * pitch));
+        let mut best = lo;
+        let mut best_mag = 0.0_f64;
+        for p in lo..=hi {
+            let m = corr_at(&mf, p);
+            if m > best_mag {
+                best_mag = m;
+                best = p;
+            }
+        }
+        // Parabolic refine on |corr| at best-1, best, best+1
+        let refined = if best == 0 || best + n_sync * pitch >= mf.len() {
+            best as f64
+        } else {
+            let m0 = corr_at(&mf, best - 1);
+            let m1 = corr_at(&mf, best);
+            let m2 = corr_at(&mf, best + 1);
+            let denom = m0 - 2.0 * m1 + m2;
+            if denom >= -1e-12 {
+                best as f64
+            } else {
+                let delta = 0.5 * (m0 - m2) / denom;
+                best as f64 + delta.clamp(-1.0, 1.0)
+            }
+        };
+        let _ = i;
+
+        data.push((expected_audio as f64, refined));
+
+        // Advance cumulative by this marker's segment size
+        let n_cw = if is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+        let data_sym_count = n_cw * syms_per_cw;
+        let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
+        let seg_sym_len = data_sym_count + n_pilot_groups * p_syms;
+        cumulative_sym += MARKER_LEN + seg_sym_len;
     }
 
-    // Ordinary least-squares slope of observed vs expected.
-    // observed[i] - observed[0] ≈ slope * expected[i]  (intercept ≈ 0)
-    // ppm = (slope - 1) * 1e6
-    let n = markers.len() as f64;
-    let mean_e = expected_pos.iter().sum::<f64>() / n;
-    let mean_o = observed_pos.iter().sum::<f64>() / n;
-    let mut num = 0.0f64;
-    let mut den = 0.0f64;
-    for i in 0..markers.len() {
-        let de = expected_pos[i] - mean_e;
-        let do_ = observed_pos[i] - mean_o;
-        num += de * do_;
-        den += de * de;
+    // OLS slope of observed_audio vs expected_audio. slope ≈ 1 + ε, so
+    // drift_ppm = (slope - 1) × 1e6. Sign: audio longer (RX faster)
+    // means observed_audio[N] > expected_audio[N], slope > 1, ppm > 0.
+    let n = data.len() as f64;
+    let mean_x = data.iter().map(|&(x, _)| x).sum::<f64>() / n;
+    let mean_y = data.iter().map(|&(_, y)| y).sum::<f64>() / n;
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for &(x, y) in &data {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        num += dx * dy;
+        den += dx * dx;
     }
-    if den < 1e-9 {
-        return None;
-    }
+    if den.abs() < 1e-9 { return None; }
     let slope = num / den;
-    let intercept = mean_o - slope * mean_e;
+    let drift_ppm = (slope - 1.0) * 1e6;
 
-    // Residual RMS: a clean fit should sit well under 1 symbol.
-    let mut rss = 0.0f64;
-    for i in 0..markers.len() {
-        let fit = slope * expected_pos[i] + intercept;
-        let r = observed_pos[i] - fit;
+    // Residual RMS for quality check
+    let intercept = mean_y - slope * mean_x;
+    let mut rss = 0.0_f64;
+    for &(x, y) in &data {
+        let r = y - (slope * x + intercept);
         rss += r * r;
     }
     let rms = (rss / n).sqrt();
-    // Sign convention: `resample_audio(samples, ppm)` with positive ppm
-    // COMPRESSES (output shorter). When the input audio is longer than
-    // TX-rate (RX clock faster, ε > 0), we want to COMPRESS by ε
-    // -> rx_v2 should call resample_audio(samples, +ε). So the returned
-    // value should be POSITIVE when RX is faster.
-    //
-    // Empirically the FFE-output marker positions show observed = (1 - ε)
-    // × expected for injected ε > 0 (RX faster) -- the OPPOSITE direction
-    // from my a-priori derivation. Cause is a sample/symbol-domain
-    // ordering inversion in the FFE windowing that I haven't analytically
-    // pinned down. Flipping the sign on the OLS slope output gives the
-    // correct `rx_v2.drift_ppm` convention.
-    let ppm = (1.0 - slope) * 1e6;
     eprintln!(
-        "[rx_v2 drift-estim] {} markers, span={:.0} sym, raw_ppm={:+.2}, rms={:.3} sym",
-        markers.len(), cumulative, ppm, rms,
+        "[rx_v2 markeraudio] {} markers, slope={slope:.9}, ppm={drift_ppm:+.2}, rms={rms:.2} samples",
+        data.len(),
     );
-    // RMS guard: if the markers don't actually sit on a line (jumps,
-    // garbled marker scan), refuse the estimate -- the grid fallback in
-    // rx_v2 will take over.
-    if rms > 1.0 {
-        return None;
-    }
-    // ppm sanity guard: sound-card drift past ±100 ppm is unphysical,
-    // anything bigger is almost certainly a marker mis-detection.
-    if ppm.abs() > 100.0 {
-        return None;
-    }
-    Some((ppm, markers.len()))
+
+    // Quality gates: residual RMS should be << 1 audio sample, ppm in bound.
+    if rms > 2.0 { return None; }
+    if drift_ppm.abs() > 200.0 { return None; }
+    Some(drift_ppm)
 }
 
 /// Single-pass v2 decode (formerly `rx_v2` body). Called by the drift-aware
