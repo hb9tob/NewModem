@@ -1,0 +1,54 @@
+//! NBFM audio modem — **2x PHY** (DVB-S2X-inspired wire format V4).
+//!
+//! Parallel to [`modem_core`] (V3). Both crates depend on
+//! [`modem_core_base`] for the shared DSP primitives (constellations,
+//! LDPC, RRC, Golay, FFE, PLL, soft demodulation, Farrow interpolator,
+//! Gardner closed-loop timing recovery). 2x adds a fresh frame layout
+//! and RX pipeline on top, NOT a re-implementation of the lower layers.
+//!
+//! # What changes vs V3
+//!
+//! - **PLHEADER** (192 sym) replaces preamble + LMS warmup + header
+//!   + per-segment marker triplet.
+//! - **Sparse pilot blocks** (36 sym, value `P = (1+j)/√2`, one block
+//!   after every LDPC codeword; densified to 2 blocks/CW for the
+//!   APSK-32 and APSK-64 profiles only) replace the V3 TDM pilots
+//!   interleaved inside each segment.
+//! - **Closed-loop timing recovery** via
+//!   `modem_core_base::timing_loop::TimingLoop` + Farrow interpolation
+//!   replaces the V3 open-loop Phase 1d marker-correlation drift
+//!   estimator + bulk `resample_audio`.
+//!
+//! # What stays
+//!
+//! - LDPC WiMAX 802.16e N=2304, 4 rates — unchanged.
+//! - DVB-S2/S2X constellations (QPSK, 8PSK, 16/32/64-APSK) — unchanged.
+//! - RaptorQ fountain code (in `modem_framing::raptorq_codec`) —
+//!   unchanged. ESI tracking moves from marker control payload to PLS
+//!   payload but the codec API is identical.
+//! - `AppHeader` meta codeword carrying session_id, file_size, K, T,
+//!   mime, hash — emitted right after each PLHEADER, replicated 4×
+//!   inside one LDPC codeword like in V3.
+//! - `Modem` trait + `EncodeRequest` / `ProfileDescriptor` interfaces
+//!   from `modem_core_base::traits` — `V4Modem` implements them.
+//!
+//! # Mutual exclusion with V3
+//!
+//! At runtime, the worker is either in **legacy (V3)** mode using
+//! `modem_worker` + `modem_core::v3_modem::V3Modem`, **or** in **2x
+//! (V4)** mode using `modem_worker2x` + `modem_core2x::V4Modem`. Never
+//! both at once. The choice is a CLI flag / GUI top-level selector and
+//! is fixed for the session — see the plan in
+//! `~/.claude/plans/je-voudrsis-edudier-la-precious-treasure.md`.
+//!
+//! # Module roadmap (filled in by Phase C-1 onward)
+//!
+//! - `plheader` — Start-of-Frame + PLS encoding/decoding.
+//! - `pilot_block` — 36-sym `(1+j)/√2` blocks + interleaver.
+//! - `profile2x` — 8 profiles `*2x` incl. `HighPlusPlus2x`.
+//! - `frame2x` — `build_superframe_v4`.
+//! - `rx_v4` — full RX pipeline, integrates Farrow + TimingLoop.
+//! - `gate2x` + `detect2x` — FFT-gate + auto-detect 2x.
+//! - `modem2x` — `V4Modem` impl of the `Modem` trait.
+
+// Modules will be added by Phase C-1 onward.
