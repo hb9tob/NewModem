@@ -27,8 +27,17 @@ use modem_core_base::demodulator;
 use modem_core_base::rrc::{self, rrc_taps};
 use modem_core_base::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
 use modem_core2x::plheader::{sof_for_family, SOF_LEN_SYM};
-use modem_core2x::profile2x::ModemConfig2x;
+use modem_core2x::profile2x::{config_by_name_2x, ModemConfig2x};
 use modem_core2x::rx_v4::{self, RxResult2x};
+use modem_framing::app_header::AppHeader;
+use modem_framing::payload_envelope::PayloadEnvelope;
+use modem_worker_base::{EventSink, EventSinkExt, SharedWavSink, WorkerHandle};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// Convert an audio-domain `f32` buffer into a stream of complex symbols
 /// ready for [`rx_v4_symbols`](modem_core2x::rx_v4::rx_v4_symbols).
@@ -146,6 +155,334 @@ pub fn rx_v4_audio(
 ) -> Result<Option<RxResult2x>, String> {
     let symbols = audio_to_symbols(samples, cfg)?;
     Ok(rx_v4::rx_v4_symbols(&symbols, cfg))
+}
+
+// ---------------------------------------------------------------------------
+// Event payloads — shaped to match the V3 worker's wire format so the
+// frontend listeners don't care which family decoded the burst.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionArmedPayload {
+    session_id: u32,
+    k: u32,
+    t: u8,
+    file_size: u32,
+    mime_type: u8,
+    profile: String,
+    session_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDecodedPayload {
+    session_id: u32,
+    session_dir: String,
+    decoded_path: String,
+    size: u32,
+    filename: Option<String>,
+    callsign: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FileCompletePayload {
+    filename: String,
+    callsign: String,
+    mime_type: u8,
+    saved_path: String,
+    sigma2: f64,
+    sigma2_data_avg: f64,
+    size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EnvelopePayload {
+    filename: String,
+    callsign: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ErrorPayload {
+    message: String,
+}
+
+// ---------------------------------------------------------------------------
+// One-shot WAV-decode worker (Phase D-1b)
+// ---------------------------------------------------------------------------
+
+/// Spawn a minimal one-shot V4 RX worker for the WAV-replay path.
+///
+/// Reads `f32` audio batches from `samples` until the channel closes
+/// (= WAV pacer exhausted the file), accumulates them, optionally tees
+/// every batch into `wav_sink` if a raw recording is armed, and then
+/// runs a single [`rx_v4_audio`] pass on the full buffer. On success
+/// (a non-empty `RxResult2x.data` plus a recovered `AppHeader`), the
+/// recovered file is written under `<save_dir>/sessions/<sid>/decoded.<ext>`
+/// and the GUI is notified through the V3-compatible event sequence
+/// (`session_armed` → `session_decoded` → `envelope` → `file_complete`).
+///
+/// This is intentionally NOT a sliding-window worker — the V3 path's
+/// live-decode-while-still-receiving behaviour comes back in Phase D-1c
+/// once `gate2x` + sliding-window state machine land. For now the
+/// channel is a finite WAV, so one-shot at EOF is enough.
+///
+/// `dropped_samples` and `deemphasis_enabled` are accepted purely for
+/// signature symmetry with [`modem-worker::rx_worker::spawn`] so the
+/// GUI's dispatch site is a clean `if 2x { v4_spawn } else { v3_spawn }`
+/// branch. Today the dropped-sample counter is observed only for the
+/// final tally on `wav_playback_done`, and deemphasis is a no-op
+/// (V4 hasn't wired the optional NBFM deemphasis filter into its RX
+/// chain yet — tracked separately).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn(
+    samples: Receiver<Vec<f32>>,
+    sink: Arc<dyn EventSink>,
+    save_dir: Arc<Mutex<PathBuf>>,
+    wav_sink: SharedWavSink,
+    profile_name: String,
+    _deemphasis_enabled: bool,
+    _dropped_samples: Arc<AtomicU64>,
+) -> WorkerHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let thread = thread::spawn(move || {
+        let cfg = match config_by_name_2x(&profile_name) {
+            Some(c) => c,
+            None => {
+                sink.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!("unknown 2x profile '{profile_name}'"),
+                    },
+                );
+                return;
+            }
+        };
+        let mut accumulated: Vec<f32> = Vec::with_capacity(48_000 * 60);
+        loop {
+            match samples.recv() {
+                Ok(chunk) => {
+                    // Tee into the raw-recording WAV sink if one is armed.
+                    // Matches V3 behaviour byte-for-byte so the "save raw"
+                    // toggle works for both families.
+                    if let Ok(mut g) = wav_sink.lock() {
+                        if let Some(ws) = g.as_mut() {
+                            ws.write_chunk(&chunk);
+                        }
+                    }
+                    accumulated.extend_from_slice(&chunk);
+                    if stop_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(_) => break, // pacer dropped the sender → finalise.
+            }
+        }
+        // Final one-shot decode. A stopped worker (user pressed Stop)
+        // still attempts to decode whatever we accumulated, mirroring V3
+        // which keeps its in-memory session_buffer after Stop. The
+        // operator can still recover the file if enough audio came
+        // through.
+        let result = match rx_v4_audio(&accumulated, &cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                sink.emit("error", ErrorPayload { message: e });
+                return;
+            }
+        };
+        let Some(rx_result) = result else {
+            sink.emit(
+                "error",
+                ErrorPayload {
+                    message: "RX V4 : aucun burst détecté".to_string(),
+                },
+            );
+            return;
+        };
+        let Some(app_header) = rx_result.app_header else {
+            sink.emit(
+                "error",
+                ErrorPayload {
+                    message: format!(
+                        "RX V4 : décodage incomplet ({}/{} CW)",
+                        rx_result.converged_cws, rx_result.total_cws
+                    ),
+                },
+            );
+            return;
+        };
+        let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
+        finalize_session(
+            &sink,
+            &dir,
+            &profile_name,
+            &app_header,
+            &rx_result.data,
+            rx_result.sigma2_data,
+        );
+    });
+    WorkerHandle {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// Build the on-disk path the decoded payload lands at, emit the V3-
+/// shaped events, decode the envelope and (if zstd-wrapped) decompress
+/// the content, then drop the final user file alongside the session
+/// metadata.
+fn finalize_session(
+    sink: &Arc<dyn EventSink>,
+    save_dir: &Path,
+    profile_name: &str,
+    app_header: &AppHeader,
+    payload: &[u8],
+    sigma2_data: f64,
+) {
+    // Mirror the V3 layout: `<save_dir>/sessions/<sid:08x>/`. Lets the
+    // existing "list sessions" Tauri command pick V4 sessions up too
+    // without any backend change.
+    let session_dir = save_dir
+        .join("sessions")
+        .join(format!("{:08x}.session", app_header.session_id));
+    if let Err(e) = std::fs::create_dir_all(&session_dir) {
+        sink.emit(
+            "error",
+            ErrorPayload {
+                message: format!("mkdir {}: {e}", session_dir.display()),
+            },
+        );
+        return;
+    }
+    sink.emit(
+        "session_armed",
+        SessionArmedPayload {
+            session_id: app_header.session_id,
+            k: 0,
+            t: 0,
+            file_size: app_header.file_size,
+            mime_type: app_header.mime_type,
+            profile: profile_name.to_string(),
+            session_dir: session_dir.to_string_lossy().into_owned(),
+        },
+    );
+
+    // Honour app_header.file_size: rx_v4 already truncates `data` to
+    // file_size but we keep the assertion explicit so a future change
+    // upstream doesn't silently break this contract.
+    let payload = if payload.len() > app_header.file_size as usize {
+        &payload[..app_header.file_size as usize]
+    } else {
+        payload
+    };
+
+    let env = PayloadEnvelope::decode_or_fallback(payload);
+    let (filename, callsign, content) = if env.version != 0 {
+        (env.filename.clone(), env.callsign.clone(), env.content.clone())
+    } else {
+        (
+            format!("decoded_{:08x}.bin", app_header.session_id),
+            String::new(),
+            payload.to_vec(),
+        )
+    };
+
+    // zstd unwrap for non-image payloads, matching the V3 worker.
+    let (final_content, final_mime) =
+        if app_header.mime_type == modem_framing::app_header::mime::ZSTD {
+            match zstd::stream::decode_all(content.as_slice()) {
+                Ok(decoded) => (decoded, modem_framing::app_header::mime::BINARY),
+                Err(e) => {
+                    sink.emit(
+                        "error",
+                        ErrorPayload {
+                            message: format!("zstd decode: {e}"),
+                        },
+                    );
+                    return;
+                }
+            }
+        } else {
+            (content, app_header.mime_type)
+        };
+
+    // Session-level "decoded.<ext>" copy for archival, plus the user-
+    // facing copy at the save_dir root. Same dual-write pattern as V3
+    // (see `rx_worker::finalize_session`): the session dir tracks the
+    // raw decode for forensics, the root copy is what the operator
+    // double-clicks.
+    let ext = extension_for_mime(final_mime);
+    let session_copy = session_dir.join(format!("decoded.{ext}"));
+    if let Err(e) = std::fs::write(&session_copy, &final_content) {
+        sink.emit(
+            "error",
+            ErrorPayload {
+                message: format!("write {}: {e}", session_copy.display()),
+            },
+        );
+        return;
+    }
+    let user_copy = save_dir.join(&filename);
+    if let Err(e) = std::fs::create_dir_all(save_dir) {
+        sink.emit(
+            "error",
+            ErrorPayload {
+                message: format!("mkdir {}: {e}", save_dir.display()),
+            },
+        );
+        return;
+    }
+    if let Err(e) = std::fs::write(&user_copy, &final_content) {
+        sink.emit(
+            "error",
+            ErrorPayload {
+                message: format!("write {}: {e}", user_copy.display()),
+            },
+        );
+        return;
+    }
+
+    sink.emit(
+        "session_decoded",
+        SessionDecodedPayload {
+            session_id: app_header.session_id,
+            session_dir: session_dir.to_string_lossy().into_owned(),
+            decoded_path: session_copy.to_string_lossy().into_owned(),
+            size: final_content.len() as u32,
+            filename: Some(filename.clone()),
+            callsign: Some(callsign.clone()),
+        },
+    );
+    sink.emit(
+        "envelope",
+        EnvelopePayload {
+            filename: filename.clone(),
+            callsign: callsign.clone(),
+        },
+    );
+    sink.emit(
+        "file_complete",
+        FileCompletePayload {
+            filename,
+            callsign,
+            mime_type: final_mime,
+            saved_path: user_copy.to_string_lossy().into_owned(),
+            sigma2: sigma2_data, // V4 has no separate pilot σ²; reuse data σ²
+            sigma2_data_avg: sigma2_data,
+            size: final_content.len(),
+        },
+    );
+}
+
+fn extension_for_mime(mime_type: u8) -> &'static str {
+    use modem_framing::app_header::mime;
+    match mime_type {
+        mime::IMAGE_AVIF => "avif",
+        mime::IMAGE_JPEG => "jpg",
+        mime::IMAGE_PNG => "png",
+        mime::TEXT => "txt",
+        mime::ZSTD => "zst",
+        _ => "bin",
+    }
 }
 
 /// Placeholder for the Phase B closed-loop timing-recovery integration.
@@ -322,6 +659,112 @@ mod tests {
                 .unwrap_or_else(|| panic!("{p:?} decode None"));
             assert_eq!(result.data, payload, "{p:?}");
         }
+    }
+
+    #[test]
+    fn spawn_one_shot_decodes_wav_path_and_emits_events() {
+        // End-to-end mirror of the GUI's start_capture_from_wav path:
+        // 1. Encode a payload to V4 audio (with envelope, so the worker
+        //    can write a user-named file).
+        // 2. Push the audio in 500ms chunks through an mpsc channel.
+        // 3. Close the channel — spawn should run its one-shot decode.
+        // 4. Verify the RecordingSink saw `session_decoded` + the
+        //    decoded file landed on disk.
+        use modem_framing::payload_envelope::PayloadEnvelope;
+        use modem_worker_base::RecordingSink;
+        use std::sync::mpsc;
+
+        let content = rng_bytes(300, 0x99);
+        let envelope =
+            PayloadEnvelope::new("rx_spawn_test.bin", "HB9TOB", content.clone()).expect("env");
+        let wire = envelope.encode();
+        let cfg = profile_high_2x();
+        let k_bytes = cfg.base.ldpc_rate.k() / 8;
+        let k_source = modem_framing::raptorq_codec::k_from_payload(wire.len(), k_bytes) as u32;
+        let n_packets =
+            k_source + modem_framing::raptorq_codec::n_repair_default(k_source);
+        let req = EncodeRequest {
+            profile: "HIGH2X",
+            wire_payload: &wire,
+            session_id: 0xCAFE_FACE,
+            mime_type: mime::BINARY,
+            hash_short: 0x1234,
+            esi_start: 0,
+            n_packets,
+            vox_seconds: 0.0,
+        };
+        let audio = V4Modem.encode_to_samples(&req).expect("encode");
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
+        let wav_sink: SharedWavSink = Arc::new(Mutex::new(None));
+        // Two Arc handles to the same RecordingSink: one as the dyn
+        // EventSink the worker emits through, one typed so we can call
+        // `.events()` for assertions afterwards. Mutex inside
+        // RecordingSink makes the cross-thread share sound.
+        let recording: Arc<RecordingSink> = Arc::new(RecordingSink::new());
+        let sink: Arc<dyn EventSink> = recording.clone();
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let mut handle = spawn(
+            rx,
+            sink,
+            save_dir,
+            wav_sink,
+            "HIGH2X".to_string(),
+            false,
+            Arc::new(AtomicU64::new(0)),
+        );
+        // Push the audio in 500ms-equivalent chunks (24_000 @ 48 kHz).
+        // No wall-clock pacing — the spawn is one-shot so it doesn't
+        // care about real-time alignment.
+        const BATCH: usize = 24_000;
+        for i in (0..audio.len()).step_by(BATCH) {
+            let end = (i + BATCH).min(audio.len());
+            tx.send(audio[i..end].to_vec()).expect("send");
+        }
+        drop(tx);
+        // Join WITHOUT setting the stop flag: the worker must observe
+        // the channel close, drain the in-flight chunks, then run its
+        // one-shot decode. handle.stop() would race the recv loop and
+        // bail out with a partial buffer.
+        handle
+            .thread
+            .take()
+            .expect("worker thread present")
+            .join()
+            .expect("worker join");
+
+        let events = recording.events();
+        let names: Vec<_> = events.iter().map(|(n, _)| n.as_str()).collect();
+        let err_msg = events
+            .iter()
+            .find(|(n, _)| n == "error")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        assert!(
+            names.contains(&"session_armed"),
+            "missing session_armed: events={names:?} error={err_msg}"
+        );
+        assert!(
+            names.contains(&"session_decoded"),
+            "missing session_decoded: {names:?}"
+        );
+        assert!(
+            names.contains(&"file_complete"),
+            "missing file_complete: {names:?}"
+        );
+
+        // file_complete.saved_path should exist with the original bytes.
+        let file_complete = events
+            .iter()
+            .find(|(n, _)| n == "file_complete")
+            .map(|(_, v)| v.clone())
+            .expect("file_complete event");
+        let saved_path = file_complete["saved_path"]
+            .as_str()
+            .expect("saved_path string");
+        let written = std::fs::read(saved_path).expect("read saved");
+        assert_eq!(written, content, "decoded file != original content");
     }
 
     #[test]

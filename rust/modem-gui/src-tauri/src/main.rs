@@ -472,7 +472,16 @@ fn start_capture_from_wav(
         return Err("capture already running".into());
     }
     let forced = args.forced.unwrap_or(false);
-    let profile_idx = resolve_profile(args.profile.as_deref().unwrap_or("HIGH"), forced)?;
+    let profile_str = args.profile.as_deref().unwrap_or("HIGH").to_string();
+    // Validate the profile against the family it belongs to BEFORE we
+    // parse the WAV — fail fast on a typo regardless of whether the V3
+    // resolver or the V4 lookup is the right one.
+    let family_is_2x = is_2x_profile(&profile_str);
+    let profile_idx_v3 = if family_is_2x {
+        None
+    } else {
+        Some(resolve_profile(&profile_str, forced)?)
+    };
 
     // Parse the WAV from in-memory bytes. hound::WavReader::new takes
     // any `Read`, so a `Cursor<Vec<u8>>` works without writing a temp
@@ -559,16 +568,29 @@ fn start_capture_from_wav(
     // can't drop samples (the pacer paces wall-clock). Pass an
     // always-zero counter; the rx_realtime event will report
     // `dropped_samples = 0` throughout.
-    let worker = rx_worker::spawn(
-        rx_chan,
-        sink,
-        state.save_dir.clone(),
-        state.wav_sink.clone(),
-        profile_idx,
-        forced,
-        cfg.rx_deemphasis_enabled,
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let worker = if family_is_2x {
+        modem_worker2x::rx_worker2x::spawn(
+            rx_chan,
+            sink,
+            state.save_dir.clone(),
+            state.wav_sink.clone(),
+            profile_str.clone(),
+            cfg.rx_deemphasis_enabled,
+            dropped,
+        )
+    } else {
+        rx_worker::spawn(
+            rx_chan,
+            sink,
+            state.save_dir.clone(),
+            state.wav_sink.clone(),
+            profile_idx_v3.expect("V3 profile resolved above"),
+            forced,
+            cfg.rx_deemphasis_enabled,
+            dropped,
+        )
+    };
     *guard = Some(CaptureSession {
         capture: CaptureKind::WavFile {
             stop,
