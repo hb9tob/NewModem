@@ -367,6 +367,24 @@ fn resample_audio(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
 /// 1 estimator + 1 final decode ≈ 2.3× a single decode. Down from
 /// the 0.10.12 blind grid's 14× and from the 0.10.14 hint-grid's 8.85×.
 pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
+    rx_v2_with_options(samples, config, true)
+}
+
+/// Same as [`rx_v2`] but lets the caller skip the post-Gardner ±15 ppm
+/// safety grid. The grid is the most CPU-heavy fallback (6 extra
+/// `rx_v2_single` passes on resampled buffers) ; on weak hosts (Pi-class)
+/// it's pure waste when the channel is noise-limited (LDPC fails at every
+/// trial point anyway, but we still pay the resample + MF + FFE + LMS
+/// + LDPC cost per point). Set `allow_legacy_grid = false` to bypass it.
+///
+/// The fast-path (`rx_v2_single` @ 0 ppm) and the Gardner-one-shot
+/// (`estimate_drift_gardner` + `rx_v2_with_hint`) always run -- they're
+/// cheap and cover the common cases.
+pub fn rx_v2_with_options(
+    samples: &[f32],
+    config: &ModemConfig,
+    allow_legacy_grid: bool,
+) -> Option<RxV2Result> {
     let first = rx_v2_single(samples, config);
     let clean = |r: &RxV2Result| -> bool {
         r.total_blocks > 0
@@ -402,8 +420,12 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     // sweep ±15 ppm around its centre in 5-ppm steps. Covers cases
     // where Gardner is off-calibration (rare for RRC pulses but
     // possible on FTN profiles, dense constellations, low SNR).
+    //
+    // Skipped when `allow_legacy_grid = false` (Pi-class hosts). The
+    // fast-path + Gardner+rx_v2_with_hint above still ran, so we
+    // return whatever they produced -- nothing more is attempted.
     let gardner_clean = best.as_ref().map(|r| clean(r)).unwrap_or(false);
-    if !gardner_clean {
+    if allow_legacy_grid && !gardner_clean {
         let center = best_ppm;
         for &delta in &[-15.0, -10.0, -5.0, 5.0, 10.0, 15.0] {
             let ppm = center + delta;
@@ -1172,7 +1194,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     // decode the trailing OPEN window — there is no "next tick" to wait
     // for a closing preamble. The live worker uses `rx_v3_after` directly
     // with `finalize=false` for normal ticks.
-    rx_v3_after(samples, config, 0, true, None)
+    rx_v3_after(samples, config, 0, true, None, true)
 }
 
 /// Same as `rx_v3` but skip every preamble whose detected offset is strictly
@@ -1215,12 +1237,21 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
 /// `r.drift_ppm` as before (which IS the session hint when one was
 /// provided, since `rx_v2_with_hint` echoes the hint back into
 /// `drift_ppm`).
+///
+/// `allow_legacy_grid` controls whether `rx_v2` (when called for a
+/// CLOSED window with no `session_hint_ppm`) runs its post-Gardner
+/// ±15 ppm safety grid. On weak hosts (Pi-class) the grid is mostly
+/// wasted CPU when the channel is noise-limited; the operator can
+/// disable it from the GUI Settings tab. Has no effect on the
+/// `session_hint_ppm = Some(_)` path since that already bypasses
+/// the grid.
 pub fn rx_v3_after(
     samples: &[f32],
     config: &ModemConfig,
     skip_until: usize,
     finalize: bool,
     session_hint_ppm: Option<f64>,
+    allow_legacy_grid: bool,
 ) -> Option<RxV2Result> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
@@ -1316,7 +1347,7 @@ pub fn rx_v3_after(
             if let Some(hint) = session_hint_ppm {
                 rx_v2_with_hint(window, config, hint)
             } else {
-                rx_v2(window, config)
+                rx_v2_with_options(window, config, allow_legacy_grid)
             }
         } else {
             // OPEN window: trailing, no closing preamble.
@@ -1353,7 +1384,7 @@ pub fn rx_v3_after(
             } else if let Some(hint) = session_hint_ppm {
                 rx_v2_with_hint(window, config, hint)
             } else {
-                rx_v2(window, config)
+                rx_v2_with_options(window, config, allow_legacy_grid)
             }
         };
         let Some(r) = r_opt else {

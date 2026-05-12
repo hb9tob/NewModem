@@ -552,6 +552,7 @@ let currentSettings = {
   tx_preemphasis_enabled: false,
   tx_save_wav: false,
   rx_deemphasis_enabled: false,
+  rx_allow_legacy_grid: true,
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
@@ -1462,7 +1463,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -1490,6 +1491,8 @@ async function loadSettings() {
   if (saveWav) saveWav.checked = !!currentSettings.tx_save_wav;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
+  const grid = document.getElementById("rx-allow-legacy-grid");
+  if (grid) grid.checked = !!currentSettings.rx_allow_legacy_grid;
   const fdx = document.getElementById("full-duplex-enabled");
   if (fdx) fdx.checked = !!currentSettings.full_duplex_enabled;
 
@@ -1769,6 +1772,8 @@ async function persistSettings() {
   if (saveWav) currentSettings.tx_save_wav = !!saveWav.checked;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
+  const grid = document.getElementById("rx-allow-legacy-grid");
+  if (grid) currentSettings.rx_allow_legacy_grid = !!grid.checked;
 
   // SDR-specific config is mutated directly on
   // `currentSettings.sdr_settings.backends[id].config` by the

@@ -65,6 +65,17 @@ pub struct Settings {
     /// Worker-level — see `rx_worker::spawn`.
     #[serde(default)]
     pub rx_deemphasis_enabled: bool,
+    /// When true, allow the legacy `rx_v2()` ±15 ppm safety grid on
+    /// cold-start CLOSED decodes that didn't get a session-level
+    /// Gardner hint. The grid is ~480 ms of CPU per failed tick
+    /// (6× rx_v2_single on resampled buffers) -- trivial on a
+    /// modern desktop, painful on a Pi where the worker can fall
+    /// behind realtime. Defaults to `true` everywhere except
+    /// aarch64 (= Pi / Apple Silicon), where it defaults to `false`
+    /// so a fresh Pi install runs in low-CPU mode out of the box.
+    /// The operator can always override from the Settings tab.
+    #[serde(default = "default_rx_allow_legacy_grid")]
+    pub rx_allow_legacy_grid: bool,
 
     /// Base URL of the Phase-D collector. If empty, the post-raw-capture
     /// prompt does not appear and submission is disabled for the session.
@@ -227,6 +238,14 @@ pub fn default_sdr_config_for(backend_id: &str) -> SdrConfig {
 fn default_tx_quality() -> u32 {
     10
 }
+/// Per-platform default for `rx_allow_legacy_grid`. aarch64 (Pi /
+/// Apple Silicon) lands on `false` -- the safety grid is ~480 ms of
+/// CPU per failed tick which can push a Pi worker into realtime lag.
+/// All other targets (x86_64 desktops/laptops) default to `true`
+/// because the cost is negligible.
+fn default_rx_allow_legacy_grid() -> bool {
+    !cfg!(target_arch = "aarch64")
+}
 fn default_tx_repair_pct() -> u32 {
     5
 }
@@ -271,6 +290,7 @@ impl Default for Settings {
             tx_attenuation_db: 0.0,
             tx_preemphasis_enabled: false,
             rx_deemphasis_enabled: false,
+            rx_allow_legacy_grid: default_rx_allow_legacy_grid(),
             collector_url: String::new(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),

@@ -365,6 +365,7 @@ pub fn spawn(
     profile: ProfileIndex,
     forced: bool,
     deemphasis_enabled: bool,
+    allow_legacy_grid: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -378,6 +379,7 @@ pub fn spawn(
             profile,
             forced,
             deemphasis_enabled,
+            allow_legacy_grid,
             dropped_samples,
             stop_thread,
         );
@@ -498,6 +500,13 @@ struct WorkerState {
     /// modem demodulator (after the raw WAV tee + level meter). `None`
     /// when the user has not enabled the toggle in Settings.
     deemphasis: Option<DeemphasisFilter>,
+    /// Operator-controlled flag (Settings tab) : when `true`, the
+    /// legacy `rx_v2()` ±15 ppm safety grid is allowed on cold-start
+    /// CLOSED decodes that didn't get a session-level Gardner hint.
+    /// When `false`, only the fast-path + Gardner-one-shot run --
+    /// avoids ~480 ms of wasted CPU per failed tick on Pi-class hosts
+    /// when the channel is noise-limited.
+    allow_legacy_grid: bool,
     /// Session-wide drift estimate (ppm, positive = RX clock faster).
     /// `None` on cold start; locked by one of three paths:
     ///
@@ -549,6 +558,7 @@ impl WorkerState {
         forced: bool,
         store: SessionStore,
         deemphasis_enabled: bool,
+        allow_legacy_grid: bool,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -568,6 +578,7 @@ impl WorkerState {
             last_preamble_seen_at: now,
             total_samples: 0,
             deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
+            allow_legacy_grid,
             session_drift_ppm: None,
         }
     }
@@ -612,6 +623,7 @@ fn run_worker(
     profile: ProfileIndex,
     forced: bool,
     deemphasis_enabled: bool,
+    allow_legacy_grid: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
@@ -631,7 +643,7 @@ fn run_worker(
             return;
         }
     };
-    let mut state = WorkerState::new(profile, forced, store, deemphasis_enabled);
+    let mut state = WorkerState::new(profile, forced, store, deemphasis_enabled, allow_legacy_grid);
 
     // Telemetry to surface "worker falling behind realtime" — the
     // signature of CPU-limited HIGH+ on the Pi 5 SDR path. We compare
@@ -1069,6 +1081,7 @@ fn scan_and_route(
         0,
         finalize,
         state.session_drift_ppm,
+        state.allow_legacy_grid,
     );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     let Some(mut result) = rx_v3_opt else {
@@ -1122,6 +1135,7 @@ fn scan_and_route(
                         0,
                         finalize,
                         state.session_drift_ppm,
+                        state.allow_legacy_grid,
                     ) {
                         Some(refresh) => {
                             // Defensive : if the fresh header still claims a

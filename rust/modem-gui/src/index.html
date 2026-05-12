@@ -306,6 +306,18 @@
             filtré. À activer si le récepteur radio n'applique pas (ou
             insuffisamment) la désemphase.
           </p>
+          <label class="ptt-row" style="margin-top: 0.7rem;">
+            <input type="checkbox" id="rx-allow-legacy-grid">
+            Grille de drift ±15 ppm (cold start)
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Filet de sécurité utilisé sur le 1er SF d'une session lorsque
+            l'estimateur Gardner échoue : 6 tentatives supplémentaires à
+            ±15 ppm autour de zéro. Coût ~480 ms de CPU par tick raté.
+            Recommandé sur PC moderne (négligeable). Décocher sur Pi
+            ou vieux PC où le worker peut prendre du retard temps-réel.
+            <em>Désactivé par défaut sur Raspberry Pi.</em>
+          </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
                in main.js fills this from `BackendCapabilities` of the
                currently-selected SDR backend. Adding a new backend is
