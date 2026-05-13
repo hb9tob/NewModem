@@ -34,7 +34,6 @@ use modem_framing::app_header::AppHeader;
 use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_worker_base::{EventSink, EventSinkExt, SharedWavSink, WorkerHandle};
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -292,7 +291,7 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(1000);
 /// entirely).
 const PROBE_HOT_HOLD: Duration = Duration::from_secs(4);
 
-/// Minimum samples in `idle_audio_buf` before the probe is willing to
+/// Minimum samples in the audio buffer before the probe is willing to
 /// run. The FFT zero-pads short buffers, so a partial fill still
 /// produces a meaningful peak² / mean² ratio — the floor exists only
 /// to keep us from probing a single dust mote of audio on every chunk.
@@ -301,10 +300,16 @@ const PROBE_HOT_HOLD: Duration = Duration::from_secs(4);
 /// (sps=32, full PLHEADER ≈ 0.13 s). Even a multi-burst capture with
 /// 1.5 s of inter-burst silence has the next burst's PLHEADER landing
 /// inside this much audio by the time the gate fires, so we don't lock
-/// onto the EOT cycle by mistake. Previous floor of `BUF_SAMPLES / 2`
-/// (1 s) was too patient — it would miss the second burst's PLHEADER #1
-/// and grab PLHEADER #2 (the EOT sentinel) instead.
+/// onto the EOT cycle by mistake.
 const PROBE_MIN_BUF_SAMPLES: usize = 24_000;
+
+/// Audio samples accumulated between two `audio_to_symbols` +
+/// `rx_v4_symbols` invocations while the gate is hot. Audio-budget
+/// instead of wall-clock so test paths that push chunks back-to-back
+/// (no real-time pacing) get the same decode cadence as live captures.
+/// 24 000 samples @ 48 kHz = 0.5 s — one chunk's worth at typical
+/// cpal / SDR delivery cadence, ≈ V3's per-batch scan rhythm.
+const SCAN_AUDIO_DELTA: usize = 24_000;
 
 // ---------------------------------------------------------------------------
 // Streaming RX worker (Phase D-1c) — no sliding-window
@@ -386,6 +391,14 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
+        // One-line stderr ping so the operator can verify (via terminal
+        // launch) that the worker is actually running V4 and not the
+        // V3 path under a forced-profile typo. Mirrors V3's
+        // `[worker] start V3 profile=…` log without touching the
+        // worker_log file.
+        eprintln!(
+            "[worker] start NBFM-2x profile={profile_name}"
+        );
         let cfg = match config_by_name_2x(&profile_name) {
             Some(c) => c,
             None => {
@@ -398,8 +411,19 @@ pub fn spawn(
                 return;
             }
         };
-        let mut frontend = crate::streaming_frontend::StreamingFrontend::new(cfg.clone());
-        let mut symbol_buffer: Vec<Complex64> = Vec::with_capacity(8192);
+        // Rolling audio buffer. Stays small (IDLE_PROBE_BUF_SAMPLES)
+        // while no burst is detected; grows to cover the full burst once
+        // the gate fires hot, then drops back on EOT finalise. We feed
+        // it through `audio_to_symbols` + `rx_v4_symbols` instead of the
+        // closed-loop `StreamingFrontend` (Farrow + Gardner) because the
+        // open-loop, SOF-anchored phase pick is the only one robust
+        // enough to acquire on real OTA captures today — the streaming
+        // front-end's Gardner TED drifts on the band-noise prefix
+        // before a burst and never re-acquires. Same pattern V3's
+        // `rx_worker::WorkerState::session_buffer` uses, audio-domain
+        // sliding window.
+        let mut audio_buffer: Vec<f32> = Vec::with_capacity(48_000 * 8);
+        let mut last_scan_audio_len: usize = 0;
         // V3-parity telemetry. `total_samples` is the cumulative count
         // of f32 audio samples the worker has observed (drives the GUI
         // VU meter's frame counter). `last_telemetry_tick` paces the
@@ -420,19 +444,11 @@ pub fn spawn(
         // tight loop add measurable latency on Pi 5.
         let log_gate = std::env::var_os("RX_V4_LOG_GATE").is_some();
         // `RX_V4_NO_GATE=1` bypasses the FFT probe entirely — every
-        // chunk goes straight into `rx_v4_symbols` (= pre-C-5
-        // behaviour). Useful when bringing up OTA on a new radio and
-        // unsure whether the gate or the decoder is the blocker.
+        // tick (still throttled to SCAN_INTERVAL_MS) runs `audio_to_symbols`
+        // and `rx_v4_symbols`. Useful when bringing up OTA on a new
+        // radio and unsure whether the gate or the decoder is the
+        // blocker.
         let no_gate = std::env::var_os("RX_V4_NO_GATE").is_some();
-        // Absolute index (in the front-end's `symbols_emitted` space) of
-        // `symbol_buffer[0]`. Bumped when the buffer is reset between
-        // bursts so the `first_sof_at` returned by `rx_v4_symbols`
-        // (relative to the slice we hand it) can be translated back to
-        // the absolute axis that `StreamingFrontend::align_to_sof`
-        // expects. Always equals `frontend.symbols_emitted() -
-        // symbol_buffer.len()` just before the buffer is appended to
-        // each tick.
-        let mut symbol_buffer_base: u64 = 0;
         // Dedup state: once we emit `session_armed` / `session_decoded`
         // / `file_complete` for a given session_id, we don't re-emit
         // them on a later tick that still sees the same session. The
@@ -454,13 +470,7 @@ pub fn spawn(
         // one already landed is silence, not failure.
         let mut any_session_finalised = false;
 
-        // Idle-gate state (Phase C-5). The audio buffer is only
-        // populated while the worker hasn't yet locked an SOF — once
-        // the StreamingFrontend's `sof_anchor` flips to Some or the
-        // worker has emitted a `session_armed`, we drop into the
-        // always-decode path and the buffer is freed.
-        let mut idle_audio_buf: VecDeque<f32> =
-            VecDeque::with_capacity(IDLE_PROBE_BUF_SAMPLES);
+        // Idle-gate state (Phase C-5).
         let mut last_probe_at: Option<Instant> = None;
         let mut probe_hot_until: Option<Instant> = None;
         loop {
@@ -493,147 +503,115 @@ pub fn spawn(
                     crest_db,
                 },
             );
-            // Closed-loop streaming front-end: returns timing-recovered
-            // symbols for the chunk. Cheap (~O(chunk_len)). MUST run
-            // every chunk regardless of the gate so the Farrow + Gardner
-            // closed-loop state stays continuous across the idle / active
-            // transition (interrupting it would force re-acquisition on
-            // the first decoded burst).
-            let new_syms = frontend.process_chunk(&chunk);
-            symbol_buffer.extend_from_slice(&new_syms);
+            // Accumulate into the rolling audio buffer. Trim to
+            // IDLE_PROBE_BUF_SAMPLES while we're cold (no recent probe
+            // pass AND no active session) so memory stays bounded
+            // during long quiet captures. Once a burst is in flight
+            // (`emitted_session_id.is_some()` OR within
+            // `PROBE_HOT_HOLD` of a probe pass) the buffer grows freely
+            // to cover the whole burst — `audio_to_symbols` needs the
+            // full PLHEADER..EOT span to land an SOF correlation peak.
+            audio_buffer.extend_from_slice(&chunk);
+            let now = Instant::now();
+            let in_hot_window = probe_hot_until.map_or(false, |t| now < t);
+            let is_active = emitted_session_id.is_some();
+            let warm = in_hot_window || is_active;
+            if !warm && audio_buffer.len() > IDLE_PROBE_BUF_SAMPLES {
+                let drop_n = audio_buffer.len() - IDLE_PROBE_BUF_SAMPLES;
+                audio_buffer.drain(..drop_n);
+            }
 
-            // Decide whether `rx_v4_symbols` (the expensive part — SOF
-            // correlation + LDPC + EM smoothers) is worth running this
-            // tick. Three cases:
-            //
-            //   1. Already-active session (`emitted_session_id` set or
-            //      `frontend.sof_anchor()` locked). Run every chunk.
-            //   2. Idle, within a `PROBE_HOT_HOLD` window after a
-            //      positive probe. Run every chunk (let rx_v4 catch
-            //      the SOF and graduate us to case 1).
-            //   3. Idle, outside the hot window. Append to
-            //      `idle_audio_buf`, throttle to `PROBE_INTERVAL`, run
-            //      the FFT probe. On pass → start a new hot window.
-            //      Otherwise skip.
-            let is_active =
-                emitted_session_id.is_some() || frontend.sof_anchor().is_some();
-            let should_decode = if !finalised && symbol_buffer.len() >= 192 {
-                if no_gate {
-                    // RX_V4_NO_GATE=1 → bypass the probe. Always decode
-                    // once we have enough symbols. Idle buffer stays
-                    // empty so it can't compete for memory.
-                    if !idle_audio_buf.is_empty() {
-                        idle_audio_buf.clear();
-                        idle_audio_buf.shrink_to_fit();
-                    }
-                    true
-                } else if is_active {
-                    // Active session — free the idle buffer; we won't
-                    // use it again for this session.
-                    if !idle_audio_buf.is_empty() {
-                        idle_audio_buf.clear();
-                        idle_audio_buf.shrink_to_fit();
-                    }
-                    true
-                } else {
-                    // Append the new chunk to the rolling idle buffer,
-                    // trim front. VecDeque pop_front is O(1).
-                    for &s in &chunk {
-                        idle_audio_buf.push_back(s);
-                    }
-                    while idle_audio_buf.len() > IDLE_PROBE_BUF_SAMPLES {
-                        idle_audio_buf.pop_front();
-                    }
-                    let now = Instant::now();
-                    let in_hot_window =
-                        probe_hot_until.map_or(false, |t| now < t);
-                    if in_hot_window {
-                        true
-                    } else if last_probe_at
-                        .map_or(true, |t| now.duration_since(t) >= PROBE_INTERVAL)
-                        && idle_audio_buf.len() >= PROBE_MIN_BUF_SAMPLES
-                    {
-                        last_probe_at = Some(now);
-                        // VecDeque → contiguous Vec for the FFT input.
-                        // make_contiguous returns a &[T] in O(buf.len);
-                        // we copy because the probe wants `&[f32]` and
-                        // VecDeque borrow rules make this cleaner.
-                        let buf: Vec<f32> =
-                            idle_audio_buf.iter().copied().collect();
-                        let probe =
-                            PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
-                        let r = probe.check(&buf);
-                        let passes = r.passes(PROBE_THRESHOLD_2X);
-                        if log_gate {
-                            eprintln!(
-                                "[gate] buf={}s rms={:.4} ratio={:.0} \
-                                 thr={:.0} anchor={:?} per_template={:?} \
-                                 → {}",
-                                idle_audio_buf.len() as f64
-                                    / AUDIO_RATE as f64,
-                                rms,
-                                r.max_ratio,
-                                PROBE_THRESHOLD_2X,
-                                r.best_anchor,
-                                r.per_template_ratio
-                                    .iter()
-                                    .map(|x| format!("{x:.0}"))
-                                    .collect::<Vec<_>>(),
-                                if passes { "PASS" } else { "FAIL" },
-                            );
-                        }
-                        if passes {
-                            probe_hot_until = Some(now + PROBE_HOT_HOLD);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
+            // Run the FFT probe per-chunk while idle — bypassed under
+            // `RX_V4_NO_GATE`. The probe itself costs ~25 ms (cheap
+            // relative to the rx_v4 pipeline it's gating), and chunks
+            // arrive at ~500 ms cpal cadence, so the wall-clock probe
+            // rate stays in the 2 Hz range during live captures. We
+            // skip the wall-clock throttle so paced test paths (which
+            // push chunks back-to-back with no real-time delay) still
+            // probe every chunk of audio rather than once.
+            let _ = last_probe_at;
+            if !no_gate
+                && !warm
+                && !finalised
+                && audio_buffer.len() >= PROBE_MIN_BUF_SAMPLES
+            {
+                last_probe_at = Some(now);
+                // Use the most recent IDLE_PROBE_BUF_SAMPLES samples so
+                // the FFT window matches the probe's calibrated buf_len.
+                let tail_start = audio_buffer
+                    .len()
+                    .saturating_sub(IDLE_PROBE_BUF_SAMPLES);
+                let probe =
+                    PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
+                let r = probe.check(&audio_buffer[tail_start..]);
+                let passes = r.passes(PROBE_THRESHOLD_2X);
+                if log_gate {
+                    eprintln!(
+                        "[gate] buf={:.1}s rms={:.4} ratio={:.0} thr={:.0} \
+                         anchor={:?} → {}",
+                        audio_buffer.len() as f64 / AUDIO_RATE as f64,
+                        rms,
+                        r.max_ratio,
+                        PROBE_THRESHOLD_2X,
+                        r.best_anchor,
+                        if passes { "PASS" } else { "FAIL" },
+                    );
                 }
-            } else {
-                false
-            };
+                if passes {
+                    probe_hot_until = Some(now + PROBE_HOT_HOLD);
+                }
+            }
+
+            // Decide whether to run `audio_to_symbols` + `rx_v4_symbols`
+            // this tick. Throttled to SCAN_INTERVAL_MS so a 5 ms chunk
+            // doesn't force a 200 ms re-decode pass. The audio_to_symbols
+            // SOF-anchored phase search scales linearly with buffer length
+            // (≈ 0.3 s for 30 s sps=32 on Pi 5), fine at this cadence.
+            let in_hot_window_now =
+                probe_hot_until.map_or(false, |t| now < t);
+            let should_decode = !finalised
+                && (no_gate || in_hot_window_now || is_active)
+                && audio_buffer.len() >= AUDIO_RATE as usize / 2
+                && audio_buffer.len() - last_scan_audio_len >= SCAN_AUDIO_DELTA;
 
             if should_decode {
-                let res_opt = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg);
+                last_scan_audio_len = audio_buffer.len();
+                let symbols_opt = audio_to_symbols(&audio_buffer, &cfg);
+                let symbols = match symbols_opt {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if log_gate {
+                            eprintln!("[rxv4] audio_to_symbols error: {e}");
+                        }
+                        Vec::new()
+                    }
+                };
+                let res_opt = if symbols.len() >= 192 {
+                    modem_core2x::rx_v4::rx_v4_symbols(&symbols, &cfg)
+                } else {
+                    None
+                };
                 if log_gate {
                     match &res_opt {
                         Some(r) => eprintln!(
-                            "[rxv4] syms={} cycles={} cws={}/{} \
+                            "[rxv4] audio={:.1}s syms={} cycles={} \
                              data_cws={}/{} sof@={:?} eot={}",
-                            symbol_buffer.len(),
+                            audio_buffer.len() as f64 / AUDIO_RATE as f64,
+                            symbols.len(),
                             r.cycles,
-                            r.converged_cws,
-                            r.total_cws,
                             r.data_cws_converged,
                             r.data_cws_total,
                             r.first_sof_at,
                             r.eot_seen,
                         ),
                         None => eprintln!(
-                            "[rxv4] syms={} → no SOF",
-                            symbol_buffer.len(),
+                            "[rxv4] audio={:.1}s syms={} → no SOF",
+                            audio_buffer.len() as f64 / AUDIO_RATE as f64,
+                            symbols.len(),
                         ),
                     }
                 }
                 if let Some(res) = res_opt {
-                    // D-1c-ii: once rx_v4 has located the SOF, forward
-                    // its absolute symbol-stream position to the
-                    // StreamingFrontend so its closed-loop TED switches
-                    // to AbsGardner-on-pilot-interior (DVB-S2X §9.3.2
-                    // recipe). `first_sof_at` is relative to
-                    // `symbol_buffer`'s current contents; add
-                    // `symbol_buffer_base` to convert back to the
-                    // absolute axis the front-end keeps. Within a single
-                    // burst the base stays at 0; it advances only after
-                    // an EOT-driven buffer reset (multi-burst capture).
-                    if frontend.sof_anchor().is_none() {
-                        if let Some(sof) = res.first_sof_at {
-                            frontend.align_to_sof(symbol_buffer_base + sof as u64);
-                        }
-                    }
                     if let Some(ah) = res.app_header.as_ref() {
                         // First-time AppHeader → arm the session.
                         if emitted_session_id.is_none() {
@@ -727,34 +705,18 @@ pub fn spawn(
                                 res.sigma2_data,
                             );
                             any_session_finalised = true;
-                            // Multi-burst reset: rewind everything for
-                            // a fresh burst-acquisition cycle. We
-                            // rebuild `frontend` rather than just
-                            // clearing its SOF anchor because the
-                            // Gardner timing loop has been integrating
-                            // through the inter-burst silence (TED ≈ 0
-                            // on zeros, but NCO phase still drifts vs
-                            // the next burst's actual symbol grid).
-                            // Without this rebuild the second burst's
-                            // PLHEADER #1 lands on misaligned strobes
-                            // and the SOF correlator picks up
-                            // PLHEADER #2 (the EOT sentinel) by
-                            // mistake — see regression test
-                            // `spawn_decodes_two_consecutive_bursts_…`.
-                            // The cost is one PLHEADER's worth of
-                            // re-acquisition per burst (~0.13 s at
-                            // sps=32), same as V3's per-burst
-                            // `WorkerState::soft_reset_buffer`.
+                            // Multi-burst reset: drop the audio buffer
+                            // and the gate state so the next burst
+                            // looks like a fresh capture. No timing
+                            // loop to rewind here — the audio-domain
+                            // SOF-anchored phase pick is stateless per
+                            // call.
                             emitted_session_id = None;
                             last_progress_converged = 0;
                             finalised = false;
-                            symbol_buffer.clear();
-                            symbol_buffer_base = 0;
-                            frontend = crate::streaming_frontend::
-                                StreamingFrontend::new(cfg.clone());
-                            // Idle-gate state: probe re-fires on the
-                            // next burst's PLHEADER.
-                            idle_audio_buf.clear();
+                            audio_buffer.clear();
+                            audio_buffer.shrink_to_fit();
+                            last_scan_audio_len = 0;
                             last_probe_at = None;
                             probe_hot_until = None;
                         }
@@ -774,8 +736,8 @@ pub fn spawn(
                 let wall_s = started.elapsed().as_secs_f64();
                 let audio_s = total_samples as f64 / AUDIO_RATE as f64;
                 let lag_ms = (wall_s - audio_s) * 1000.0;
-                let session_buf_ms = symbol_buffer.len() as f64 * 1000.0
-                    / cfg.base.symbol_rate;
+                let session_buf_ms =
+                    audio_buffer.len() as f64 * 1000.0 / AUDIO_RATE as f64;
                 let dropped = dropped_samples.load(Ordering::Relaxed);
                 sink.emit(
                     "rx_realtime",
@@ -807,7 +769,12 @@ pub fn spawn(
         if finalised {
             return;
         }
-        let result = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg);
+        let symbols = audio_to_symbols(&audio_buffer, &cfg).unwrap_or_default();
+        let result = if symbols.len() >= 192 {
+            modem_core2x::rx_v4::rx_v4_symbols(&symbols, &cfg)
+        } else {
+            None
+        };
         let Some(rx_result) = result else {
             // Only complain if we never saw a SOF AND never finalised a
             // prior burst. Otherwise emitted_id is Some (active session
