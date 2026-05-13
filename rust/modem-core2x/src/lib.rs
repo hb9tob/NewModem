@@ -73,6 +73,13 @@ pub mod frame2x;
 // sampled at the symbol rate.
 pub mod rx_v4;
 
+// Phase C-5 — FFT-based SOF presence probe. Cheap idle gate that lets
+// the worker skip the symbol-domain SOF correlation when the audio
+// buffer holds nothing but band noise. Three templates by (sps, β)
+// bucket cover the 8 ProfileIndex2x entries; PLS payload of the
+// matching cycle refines the anchor profile downstream.
+pub mod gate2x;
+
 // Phase C-6 — `V4Modem` impl of the `Modem` trait from
 // modem-core-base::traits. Stateless wrapper that maps a profile name
 // to its config, calls frame2x + modulator, returns audio samples.

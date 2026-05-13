@@ -9,4 +9,5 @@ num-complex = { workspace = true }
 thiserror = { workspace = true }
 modem-core-base = { path = "../modem-core-base" }
 modem-framing = { path = "../modem-framing" }
+realfft = "3"
 serde = { version = "1", features = ["derive"] }

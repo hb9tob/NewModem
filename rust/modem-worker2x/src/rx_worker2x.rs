@@ -26,6 +26,7 @@
 use modem_core_base::demodulator;
 use modem_core_base::rrc::{self, rrc_taps};
 use modem_core_base::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
+use modem_core2x::gate2x::{PreambleProbe2x, IDLE_PROBE_BUF_SAMPLES, PROBE_THRESHOLD_2X};
 use modem_core2x::plheader::{sof_for_family, SOF_LEN_SYM};
 use modem_core2x::profile2x::{config_by_name_2x, ModemConfig2x};
 use modem_core2x::rx_v4::{self, RxResult2x};
@@ -33,11 +34,13 @@ use modem_framing::app_header::AppHeader;
 use modem_framing::payload_envelope::PayloadEnvelope;
 use modem_worker_base::{EventSink, EventSinkExt, SharedWavSink, WorkerHandle};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Convert an audio-domain `f32` buffer into a stream of complex symbols
 /// ready for [`rx_v4_symbols`](modem_core2x::rx_v4::rx_v4_symbols).
@@ -206,6 +209,22 @@ struct ErrorPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Idle-gate tuning (Phase C-5)
+// ---------------------------------------------------------------------------
+
+/// Minimum wall-clock interval between two FFT probe calls while idle.
+/// Matches the V3 worker's `SCAN_INTERVAL_MS` so latency-to-first-decode
+/// is comparable between families.
+const PROBE_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// After a positive probe, keep running `rx_v4_symbols` every chunk for
+/// this long without re-probing. One PLHEADER period is plenty — the
+/// SOF correlator inside `rx_v4_symbols` typically locks within the
+/// first cycle and then [`is_active`] becomes true (gate bypassed
+/// entirely).
+const PROBE_HOT_HOLD: Duration = Duration::from_secs(4);
+
+// ---------------------------------------------------------------------------
 // Streaming RX worker (Phase D-1c) — no sliding-window
 // ---------------------------------------------------------------------------
 
@@ -258,6 +277,20 @@ struct ErrorPayload {
 /// branch. Today the dropped-sample counter is observed only for the
 /// final tally and deemphasis is a no-op (V4 hasn't wired the optional
 /// NBFM deemphasis filter into its RX chain yet — tracked separately).
+///
+/// # Idle gate (Phase C-5)
+///
+/// While no SOF has been locked yet, the symbol-domain
+/// [`rx_v4_symbols`](modem_core2x::rx_v4::rx_v4_symbols) pipeline is
+/// throttled by a cheap FFT presence probe
+/// ([`PreambleProbe2x`](modem_core2x::gate2x::PreambleProbe2x)). The
+/// probe runs at most every [`PROBE_INTERVAL`] on a rolling 2 s audio
+/// window; a positive result opens a [`PROBE_HOT_HOLD`] window during
+/// which `rx_v4_symbols` is called every chunk (one PLHEADER cycle —
+/// long enough for the SOF correlator inside `rx_v4_symbols` to lock
+/// and switch the worker to the always-decode path). The `frontend`
+/// (Farrow + Gardner timing recovery) still runs every chunk so the
+/// closed-loop state stays continuous; only LDPC is gated.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     samples: Receiver<Vec<f32>>,
@@ -293,6 +326,16 @@ pub fn spawn(
         let mut emitted_session_id: Option<u32> = None;
         let mut last_progress_converged: usize = 0;
         let mut finalised = false;
+
+        // Idle-gate state (Phase C-5). The audio buffer is only
+        // populated while the worker hasn't yet locked an SOF — once
+        // the StreamingFrontend's `sof_anchor` flips to Some or the
+        // worker has emitted a `session_armed`, we drop into the
+        // always-decode path and the buffer is freed.
+        let mut idle_audio_buf: VecDeque<f32> =
+            VecDeque::with_capacity(IDLE_PROBE_BUF_SAMPLES);
+        let mut last_probe_at: Option<Instant> = None;
+        let mut probe_hot_until: Option<Instant> = None;
         loop {
             let chunk = match samples.recv() {
                 Ok(c) => c,
@@ -304,14 +347,81 @@ pub fn spawn(
                 }
             }
             // Closed-loop streaming front-end: returns timing-recovered
-            // symbols for the chunk. Cheap (~O(chunk_len)).
+            // symbols for the chunk. Cheap (~O(chunk_len)). MUST run
+            // every chunk regardless of the gate so the Farrow + Gardner
+            // closed-loop state stays continuous across the idle / active
+            // transition (interrupting it would force re-acquisition on
+            // the first decoded burst).
             let new_syms = frontend.process_chunk(&chunk);
             symbol_buffer.extend_from_slice(&new_syms);
 
-            // Try to advance the symbol-domain decode. Skip if we have
-            // too few symbols (rx_v4 needs at least one PLHEADER cycle's
-            // worth ≈ 192 syms before SOF can be located).
-            if !finalised && symbol_buffer.len() >= 192 {
+            // Decide whether `rx_v4_symbols` (the expensive part — SOF
+            // correlation + LDPC + EM smoothers) is worth running this
+            // tick. Three cases:
+            //
+            //   1. Already-active session (`emitted_session_id` set or
+            //      `frontend.sof_anchor()` locked). Run every chunk.
+            //   2. Idle, within a `PROBE_HOT_HOLD` window after a
+            //      positive probe. Run every chunk (let rx_v4 catch
+            //      the SOF and graduate us to case 1).
+            //   3. Idle, outside the hot window. Append to
+            //      `idle_audio_buf`, throttle to `PROBE_INTERVAL`, run
+            //      the FFT probe. On pass → start a new hot window.
+            //      Otherwise skip.
+            let is_active =
+                emitted_session_id.is_some() || frontend.sof_anchor().is_some();
+            let should_decode = if !finalised && symbol_buffer.len() >= 192 {
+                if is_active {
+                    // Active session — free the idle buffer; we won't
+                    // use it again for this session.
+                    if !idle_audio_buf.is_empty() {
+                        idle_audio_buf.clear();
+                        idle_audio_buf.shrink_to_fit();
+                    }
+                    true
+                } else {
+                    // Append the new chunk to the rolling idle buffer,
+                    // trim front. VecDeque pop_front is O(1).
+                    for &s in &chunk {
+                        idle_audio_buf.push_back(s);
+                    }
+                    while idle_audio_buf.len() > IDLE_PROBE_BUF_SAMPLES {
+                        idle_audio_buf.pop_front();
+                    }
+                    let now = Instant::now();
+                    let in_hot_window =
+                        probe_hot_until.map_or(false, |t| now < t);
+                    if in_hot_window {
+                        true
+                    } else if last_probe_at
+                        .map_or(true, |t| now.duration_since(t) >= PROBE_INTERVAL)
+                        && idle_audio_buf.len() >= IDLE_PROBE_BUF_SAMPLES / 2
+                    {
+                        last_probe_at = Some(now);
+                        // VecDeque → contiguous Vec for the FFT input.
+                        // make_contiguous returns a &[T] in O(buf.len);
+                        // we copy because the probe wants `&[f32]` and
+                        // VecDeque borrow rules make this cleaner.
+                        let buf: Vec<f32> =
+                            idle_audio_buf.iter().copied().collect();
+                        let probe =
+                            PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
+                        let r = probe.check(&buf);
+                        if r.passes(PROBE_THRESHOLD_2X) {
+                            probe_hot_until = Some(now + PROBE_HOT_HOLD);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if should_decode {
                 if let Some(res) = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg) {
                     // D-1c-ii: once rx_v4 has located the SOF, forward
                     // its absolute symbol-stream position to the

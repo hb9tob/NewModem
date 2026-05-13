@@ -2946,6 +2946,7 @@ dependencies = [
  "modem-core-base",
  "modem-framing",
  "num-complex",
+ "realfft",
  "serde",
  "thiserror 2.0.18",
 ]
