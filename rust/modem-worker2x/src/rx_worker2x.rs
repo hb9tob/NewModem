@@ -467,6 +467,19 @@ pub fn spawn(
                         // listeners when a slow chunk produces no new
                         // CWs).
                         if res.converged_cws != last_progress_converged {
+                            // Wrap each per-CW pilot phase into a single-
+                            // element Vec to match V3's Vec<Vec<f32>>
+                            // shape (V3 "segment" carried multiple pilot
+                            // groups; V4 "CW" carries 1 or 2 pilot blocks
+                            // collapsed to a single LS phase). The
+                            // frontend renders one polyline point per
+                            // outer-Vec entry, which is exactly what we
+                            // want for per-CW drift over a burst.
+                            let pilot_phase_segments: Vec<Vec<f32>> = res
+                                .pilot_phase_per_cw
+                                .iter()
+                                .map(|&p| vec![p as f32])
+                                .collect();
                             sink.emit(
                                 "v2_progress",
                                 serde_json::json!({
@@ -475,6 +488,12 @@ pub fn spawn(
                                     "blocks_expected": res.total_cws,
                                     "sigma2": res.sigma2_data,
                                     "sigma2_data": res.sigma2_data,
+                                    "constellation_sample":
+                                        res.constellation_sample.clone(),
+                                    "pilot_phase_segments":
+                                        pilot_phase_segments,
+                                    "pilot_phase_is_meta":
+                                        res.pilot_phase_is_meta.clone(),
                                 }),
                             );
                             last_progress_converged = res.converged_cws;

@@ -109,7 +109,31 @@ pub struct RxResult2x {
     ///
     /// [`StreamingFrontend`]: `modem_worker2x::streaming_frontend::StreamingFrontend`
     pub first_sof_at: Option<usize>,
+    /// Scatter sample of post-correction DATA symbols (META excluded).
+    /// Capped at [`MAX_CONSTELLATION_POINTS`]; the worker forwards this
+    /// verbatim through the `v2_progress` event so the GUI's
+    /// constellation panel renders the live cloud.
+    pub constellation_sample: Vec<[f32; 2]>,
+    /// Per-CW pilot-LS phase (`arg(gain)` in radians, wrapped to
+    /// `[-π, π]`). One entry per decoded CW in the order they were
+    /// processed (META included, in line with the parallel
+    /// [`pilot_phase_is_meta`](Self::pilot_phase_is_meta) flags). The
+    /// V3 GUI's pilot-phase canvas plots this as a polyline; the V4
+    /// analogue of "per-segment pilot phase" is one phase per CW (each
+    /// CW carries 1 or 2 pilot blocks per the wire format).
+    pub pilot_phase_per_cw: Vec<f64>,
+    /// Parallel to [`pilot_phase_per_cw`](Self::pilot_phase_per_cw):
+    /// `true` for META CWs (header replicated), `false` for DATA. Drives
+    /// the GUI's META-vs-DATA colour coding on the phase canvas — same
+    /// contract as V3's
+    /// `RxV2Result::pilot_phase_is_meta`.
+    pub pilot_phase_is_meta: Vec<bool>,
 }
+
+/// Cap on the scatter cloud we forward to the GUI per `rx_v4_symbols`
+/// call. Matches the V3 `rx_v2::MAX_CONSTELLATION_POINTS` so the
+/// frontend renders a comparable density across families.
+pub const MAX_CONSTELLATION_POINTS: usize = 500;
 
 impl RxResult2x {
     fn empty() -> Self {
@@ -125,6 +149,9 @@ impl RxResult2x {
             sigma2_radial: SIGMA2_FLOOR / 2.0,
             sigma2_tangential: SIGMA2_FLOOR / 2.0,
             first_sof_at: None,
+            constellation_sample: Vec::new(),
+            pilot_phase_per_cw: Vec::new(),
+            pilot_phase_is_meta: Vec::new(),
         }
     }
 }
@@ -140,6 +167,23 @@ impl RxResult2x {
 /// Linear (not normalised) is enough because the SOF is constant-magnitude
 /// and the gain estimate inside `decode_plheader_at` will absorb any
 /// channel scaling later.
+/// Circular mean of a phase trajectory in radians (output in `[-π, π]`).
+/// Pushed into `RxResult2x.pilot_phase_per_cw` so the GUI's pilot-phase
+/// canvas plots one point per CW summarising the Pass 2 RTS-smoothed
+/// trend, rather than the noisy first-sample value.
+fn mean_phase(phis: &[f64]) -> f64 {
+    if phis.is_empty() {
+        return 0.0;
+    }
+    let mut sx = 0.0_f64;
+    let mut sy = 0.0_f64;
+    for &p in phis {
+        sx += p.cos();
+        sy += p.sin();
+    }
+    sy.atan2(sx)
+}
+
 fn find_next_sof(
     symbols: &[Complex64],
     cursor: usize,
@@ -1272,6 +1316,37 @@ fn decode_one_cw(
             }
         }
 
+        // GUI diagnostic snapshot — recorded AFTER Pass 2 phase + gain
+        // correction so the constellation panel shows the modem's best
+        // estimate, not the raw Pass 1 cloud. Likewise the pilot phase
+        // entry pushed here is the mean of the RTS-smoothed phase
+        // trajectory `phi_smooth` (not `gain.arg()` from Pass 1) so the
+        // operator sees the trend Pass 2 actually fits, including the
+        // intra-CW slope a 1-state gain estimator would miss.
+        result
+            .pilot_phase_per_cw
+            .push(mean_phase(&phi_smooth));
+        result.pilot_phase_is_meta.push(is_meta);
+        if !is_meta
+            && result.constellation_sample.len() < MAX_CONSTELLATION_POINTS
+        {
+            let remaining = MAX_CONSTELLATION_POINTS
+                - result.constellation_sample.len();
+            let step = (data_p2.len() / remaining.max(1)).max(1);
+            for (i, sym) in data_p2.iter().enumerate() {
+                if i % step == 0 {
+                    result
+                        .constellation_sample
+                        .push([sym.re as f32, sym.im as f32]);
+                    if result.constellation_sample.len()
+                        >= MAX_CONSTELLATION_POINTS
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
         // Step 5. EM per-ring σ²_r(k) on the now phase + gain corrected
         // data. Uses the *unit* g_r expected after correction (so we
         // pass identity gains for σ² estimation — residuals e = y − μ).
@@ -1628,6 +1703,61 @@ mod tests {
         for s in &mut symbols { *s = *s * g; }
         let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
         assert_eq!(result.data, payload);
+    }
+
+    #[test]
+    fn gui_diagnostic_fields_populated() {
+        // The v2_progress event surfaced to the GUI needs three per-CW
+        // diagnostic streams: a constellation scatter cloud (post-Pass 2
+        // correction, DATA-CWs only), per-CW pilot phase, and the META
+        // vs DATA flag for each CW. This regression test pins the contract
+        // so a future refactor can't silently blank one of them.
+        let cfg = profile_high_2x();
+        let payload = rng_bytes(2_000, 0xC0DE);
+        let symbols = build_superframe_v4(
+            &payload, &cfg, 0x123, mime::BINARY, 0);
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+
+        // pilot_phase_per_cw and pilot_phase_is_meta are parallel and
+        // span every CW the decoder visited (META included).
+        assert_eq!(
+            result.pilot_phase_per_cw.len(),
+            result.pilot_phase_is_meta.len(),
+            "phase / is_meta arrays must stay aligned",
+        );
+        assert_eq!(
+            result.pilot_phase_per_cw.len(),
+            result.total_cws,
+            "one phase entry per CW the decoder walked",
+        );
+        // META cycles are emitted once per cycle, DATA cycles ≥ once,
+        // so at least one of each must appear in a multi-cycle burst.
+        assert!(result.cycles >= 1);
+        assert!(
+            result.pilot_phase_is_meta.iter().any(|&m| m),
+            "expected at least one META CW flag",
+        );
+        assert!(
+            result.pilot_phase_is_meta.iter().any(|&m| !m),
+            "expected at least one DATA CW flag",
+        );
+        // Every phase is wrapped to [-π, π] by `mean_phase`.
+        for &p in &result.pilot_phase_per_cw {
+            assert!(p.abs() <= std::f64::consts::PI + 1e-9, "phase out of range");
+        }
+
+        // Constellation: DATA-only, capped at MAX_CONSTELLATION_POINTS.
+        // On a noise-free roundtrip every sample lands close to a
+        // constellation point — outside any reasonable [-2, 2] box would
+        // signal a misfire upstream.
+        assert!(!result.constellation_sample.is_empty(),
+            "constellation_sample populated on any successful decode");
+        assert!(result.constellation_sample.len() <= MAX_CONSTELLATION_POINTS);
+        for &[re, im] in &result.constellation_sample {
+            assert!(re.is_finite() && im.is_finite());
+            assert!(re.abs() < 2.0 && im.abs() < 2.0,
+                "post-correction symbol unexpectedly large: ({re}, {im})");
+        }
     }
 
     #[test]
