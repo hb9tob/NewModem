@@ -960,18 +960,73 @@ pub fn rx_v4_symbols_after(
         // fewer at the very end of a burst); we read until either we
         // hit `cw_per_cycle` or run out of symbols.
         //
-        // Earlier versions also tried to stop early if a fresh SOF
-        // candidate lit up inside the current CW slot, but the SOF
-        // correlation threshold (0.5·64 = 32) is low enough that random
-        // data symbols cross it spuriously — we lost real data CWs to
-        // false positives, especially on short ULTRA cycles. The outer
-        // `find_next_sof(scan)` re-anchors on the next real SOF anyway,
-        // so a CW slice that's actually past EOT just LDPC-fails and
-        // is dropped from `cw_bytes` (no harm).
+        // On the **last cycle** of a burst (`FLAG2X_LAST` set in PLS),
+        // the encoder may have emitted fewer than `cw_per_cycle` data
+        // CWs (when `n_source_cw + repair` doesn't divide evenly by
+        // `cw_per_cycle`). The decoder doesn't know `cw_take`
+        // explicitly — it sees only the PLS flag — but the EOT
+        // cycle's PLHEADER sits **right after** the legitimate data
+        // CWs, so we can detect it by correlating the start of each
+        // CW slot with the SOF Chu sequence. A tighter threshold
+        // (0.7·SOF_LEN_SYM = 45) discriminates from random data
+        // (peak ≈ √64 = 8) without false-positive risk.
+        //
+        // Limit the check to `FLAG2X_LAST` cycles so non-final cycles
+        // — which always have `cw_take = cw_per_cycle` by construction
+        // — pay no detection cost and have no false-positive exposure.
+        // Discovered via 5-seed diagnostic on HIGH++2X 0.45 where
+        // ESI 60-62 (the final 2-3 over-read slots) failed
+        // systematically; with this gate they're skipped, freeing
+        // 2-3 CWs of RaptorQ margin per burst.
+        let last_cycle = pls.flags & FLAG2X_LAST != 0;
+        let eot_sof_threshold =
+            0.7_f64 * crate::plheader::SOF_LEN_SYM as f64;
+        let sof_pattern = crate::plheader::sof_for_family(cfg.family);
         for k in 0..cw_per_cycle {
             let chunk_end = wire_cursor + cw_with_pilots;
             if chunk_end > symbols.len() {
                 break;
+            }
+
+            // On the last cycle, sniff this slot's start for either
+            // (a) the EOT PLHEADER's SOF (when TX layout puts EOT
+            // right after the last data CW) or (b) silence (the
+            // realistic case: `modem2x::encode_to_samples` inserts a
+            // 200 ms `INTER_FRAME_SILENCE_S` between data and EOT,
+            // so the over-read into slots beyond the last `cw_take`
+            // CW consumes zeros). Either signal means the data
+            // portion of the cycle is exhausted — abandon this slot
+            // and let the outer SOF scan re-anchor on the genuine
+            // next PLHEADER. Limited to `FLAG2X_LAST` cycles to keep
+            // non-final cycles (always full by construction) at zero
+            // false-positive risk.
+            //
+            // Discovered via 5-seed diagnostic on HIGH++2X 0.45 where
+            // ESIs 61-62 (the 2 over-read slots beyond
+            // `cw_take = 7` of `cw_per_cycle = 9` in the last cycle
+            // for k=47 + 14 repair) failed every burst — the silence
+            // detection skips them and frees up 2 CWs of RaptorQ
+            // margin.
+            if last_cycle {
+                // Energy gate first: silence is the common case
+                // because of the 200 ms inter-frame silence.
+                let mean_e2: f64 = symbols[wire_cursor..wire_cursor + SOF_LEN_SYM]
+                    .iter()
+                    .map(|&s| s.norm_sqr())
+                    .sum::<f64>()
+                    / SOF_LEN_SYM as f64;
+                if mean_e2 < 0.05 {
+                    break;
+                }
+                // SOF correlation: defensive fall-through when the TX
+                // doesn't insert silence (e.g. continuous-stream OTA).
+                let mut acc = Complex64::new(0.0, 0.0);
+                for n in 0..SOF_LEN_SYM {
+                    acc += symbols[wire_cursor + n] * sof_pattern[n].conj();
+                }
+                if acc.norm() >= eot_sof_threshold {
+                    break;
+                }
             }
 
             let chunk: Vec<Complex64> = symbols[wire_cursor..chunk_end]
@@ -1254,6 +1309,21 @@ fn decode_one_cw(
     };
 
     result.total_cws += 1;
+    // Diagnostic: stable log line, one per CW, for analysing the
+    // pattern of failures (random vs clustered) on borderline SNRs.
+    // Enable via `RX_V4_LOG_CW=1`. The format is grep-friendly:
+    // `[cw-status]` prefix + key=val pairs.
+    if std::env::var_os("RX_V4_LOG_CW").is_some() {
+        eprintln!(
+            "[cw-status] is_meta={} esi={} converged={} σ²={:.4e} σ²_R={:.4e} σ²_T={:.4e}",
+            is_meta as u8,
+            esi,
+            converged as u8,
+            split.total,
+            split.radial,
+            split.tangential,
+        );
+    }
     if converged {
         result.converged_cws += 1;
         let bytes = info_bytes[..k_bytes].to_vec();
