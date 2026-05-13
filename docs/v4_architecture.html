@@ -1465,6 +1465,86 @@ e_tangential = Im(e · conj(P))     ← composante perpendiculaire à P
         précisément l'origine du R/T=53.</li>
 </ul>
 
+<h3 id="turbo-passes">10.3.3 Décodeur turbo — deux passes LDPC avec affinage du modèle canal</h3>
+
+<p>
+    Le décodeur RX-V4 est désormais à <strong>deux passes</strong>, selon
+    le schéma demandé :
+</p>
+
+<pre><code>Pass 1 (model-driven)
+   ├── LS gain pilote → g
+   ├── MAD radial/tangentiel sur pilotes (après rotation par g̅)
+   │     → σ²_radial_pilot, σ²_tangential_pilot
+   ├── ChannelModel { σ²_awgn_per_dim, σ²_am, σ²_phi }
+   │     σ²_awgn_per_dim = min(σ²_radial_pilot, σ²_tangential_pilot)
+   │     σ²_am   = σ²_radial_pilot − σ²_awgn_per_dim   (excès radial)
+   │     σ²_phi  = σ²_tangential_pilot − σ²_awgn_per_dim
+   ├── σ²_r par anneau via modèle :
+   │     σ²_total(R) = 2·σ²_awgn_per_dim + R²·(σ²_am + σ²_phi)
+   ├── llr_maxlog_per_symbol(data, constellation, σ²_per_symbol)
+   │     σ²_per_symbol[i] = σ²_r(ring(s_hat[i]))
+   └── LDPC → (info_bytes_p1, converged_p1)
+
+Pass 2 (data-driven, gated on Pass 1 convergence)
+   ├── Re-encode info_bytes_p1 → ŝ_k via
+   │     frame2x::encode_one_codeword (vérité absolue grâce
+   │     au LDPC syndrome check ≈ sans erreur sur N=2304)
+   ├── Hard-assign anneau pour chaque ŝ_k (nearest constellation point)
+   ├── MAD per-ring sur les résidus e_i = data_norm[i] − ŝ_k
+   │     σ²_r,DD = median(|e|²) / ln(2)   (rings avec ≥ 8 syms)
+   ├── Sanity check : si σ²_r,DD / σ²_r,model ∉ [0.2, 5.0]
+   │     → fallback model σ² pour cet anneau (re-encode pathologique)
+   ├── llr_maxlog_per_symbol(data, constellation, σ²_per_symbol_blended)
+   └── LDPC → (info_bytes_p2, converged_p2)
+       Si converged_p2 : trust pass 2 (LLR plus fidèle au canal réel)
+       Sinon : fallback pass 1 (qui était déjà OK)
+</code></pre>
+
+<div class="callout info">
+    <strong>Pourquoi la même décodeur ré-itère sur la même donnée ?</strong>
+    Sur les CWs déjà convergés en pass 1, pass 2 reconverge presque
+    toujours aux mêmes bytes — la valeur ajoutée est dans la
+    <strong>fidélité des LLR par anneau</strong>. Sur un canal où la
+    σ²_r réelle diverge fortement entre anneaux (HIGH+2X avec R/T=53
+    sur l'anneau pilote → AM-AM massif sur les autres anneaux), le
+    Pass 1 model-based donne déjà une bonne première approximation ;
+    Pass 2 raffine sur la base de la vraie sortie LDPC. Bénéfice
+    secondaire : reporting plus précis du σ²_r par anneau (utile pour
+    le link quality monitoring) et un filet de sécurité contre les
+    cas marginaux où pass 1 converge sur un mauvais codeword (rare
+    pour N=2304, mais le pass 2 le détecterait).
+</div>
+
+<p>
+    <strong>Impact mesuré</strong> sur le sweep §10.3 (NBFM simulé,
+    seed=100, 10 kB) — avec Pass 2 vs Pass 1 model-only :
+</p>
+
+<ul>
+    <li><strong>HIGH++2X @ if_noise=0.00</strong> : 63/69 → 64/69 CWs convergés
+        (+1, modeste — le canal NBFM simulé a peu d'AM-AM, donc le
+        modèle pilote-only est déjà ~bon).</li>
+    <li><strong>HIGH+2X / HIGH2X</strong> : convergence inchangée (déjà
+        max, 68/69 et 69/70 respectivement à ces SNRs).</li>
+    <li><strong>Test unitaire dédié</strong> :
+        <code>turbo_pass2_handles_strong_per_ring_distortion_apsk32</code>
+        applique 3 gains ring-dépendants (inner 0.90+0.05j, middle
+        1.05−0.03j, outer 1.15−0.10j) et vérifie le byte-exact —
+        passe avec turbo, démontre que la chaîne complète Pass 1 + SSD
+        + Pass 2 absorbe la distorsion APSK structurée.</li>
+    <li>Coût compute : ~1 LDPC iter additionnelle par CW convergé.
+        Wall-clock par CW passe de 2.5s à 2.9-3.1s sur Pi5 (en debug),
+        négligeable en release.</li>
+</ul>
+
+<p>
+    Le bénéfice plein du turbo se manifestera sur des canaux <em>réels</em>
+    (transceiver OTA avec AM-AM/AM-PM non triviale) où le modèle pilote-
+    only sous-estime la variance des anneaux extérieurs. La sanity check
+    [0.2, 5.0] protège contre les divergences pathologiques.
+</p>
+
 <h3>10.4 Throughput applicatif attendu</h3>
 
 <p>

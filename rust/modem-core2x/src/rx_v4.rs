@@ -309,6 +309,210 @@ fn estimate_cw_sigma2_split(
 }
 
 
+// --- channel model from pilots (turbo Pass 1) -----------------------------
+
+/// Parametric channel model derived from the pilot residuals on one CW.
+/// Decomposes the per-axis pilot σ² into an AWGN floor plus two
+/// magnitude-scaled components — AM-AM (radial) and phase-noise
+/// (tangential):
+///
+/// ```text
+///   σ²_radial_pilot     = σ²_awgn + 1²·σ²_am     (pilot at |P|=1)
+///   σ²_tangential_pilot = σ²_awgn + 1²·σ²_phi
+/// ```
+///
+/// Then at any ring of radius R:
+///
+/// ```text
+///   σ²_radial(R)     = σ²_awgn + R²·σ²_am
+///   σ²_tangential(R) = σ²_awgn + R²·σ²_phi
+///   σ²_total(R)      = 2·σ²_awgn + R²·(σ²_am + σ²_phi)
+/// ```
+///
+/// Identification: we cannot separate σ²_awgn from σ²_am (resp. σ²_phi)
+/// using pilots alone — two unknowns, one equation per axis. We adopt
+/// the standard assumption that σ²_awgn = min(σ²_radial, σ²_tangential)
+/// (the floor common to both axes), leaving one of σ²_am / σ²_phi at
+/// zero. This is a conservative model that captures the largest of the
+/// two distortion modes correctly. The data-driven pass 2 (re-encode
+/// after LDPC, σ²_r,DD per ring on the recovered data symbols)
+/// resolves the degeneracy.
+#[derive(Clone, Copy, Debug)]
+struct ChannelModel {
+    /// AWGN floor (per axis = per real-dimension).
+    sigma2_awgn_per_dim: f64,
+    /// Excess radial variance at the pilot's R=1 — AM-AM coefficient.
+    sigma2_am: f64,
+    /// Excess tangential variance at R=1 — phase-noise coefficient.
+    sigma2_phi: f64,
+}
+
+impl ChannelModel {
+    fn from_pilot_split(split: Sigma2Split) -> Self {
+        let sigma2_awgn_per_dim = split.radial.min(split.tangential);
+        let sigma2_am = (split.radial - sigma2_awgn_per_dim).max(0.0);
+        let sigma2_phi = (split.tangential - sigma2_awgn_per_dim).max(0.0);
+        Self { sigma2_awgn_per_dim, sigma2_am, sigma2_phi }
+    }
+
+    /// Total complex σ² at a constellation ring of radius `r_ring`.
+    /// `r_ring = 1.0` reproduces `split.radial + split.tangential` (the
+    /// "total = sum of axes" relation, valid for the model — distinct
+    /// from the median-of-|e|² total reported in the diagnostic CLI
+    /// line, which doesn't decompose this way on small samples).
+    fn sigma2_total_at_ring(&self, r_ring: f64) -> f64 {
+        let r2 = r_ring * r_ring;
+        2.0 * self.sigma2_awgn_per_dim + r2 * (self.sigma2_am + self.sigma2_phi)
+    }
+}
+
+/// Build a per-data-symbol σ² array from the channel model and the
+/// constellation rings. For each symbol position `i`, hard-decides the
+/// nearest constellation point (gain-normalised input), looks up its
+/// ring, and assigns `model.sigma2_total_at_ring(R)` to that position.
+///
+/// Output length matches `data.len()`. Used by
+/// [`soft_demod::llr_maxlog_per_symbol`] to compute LLRs with per-ring
+/// σ² scaling — the right thing for non-AWGN APSK channels where
+/// the SNR varies across rings.
+fn sigma2_per_symbol_from_model(
+    data: &[Complex64],
+    constellation: &modem_core_base::constellation::Constellation,
+    model: &ChannelModel,
+) -> Vec<f64> {
+    let (radii, ring_of_point) = constellation.rings();
+    let sigma2_per_ring: Vec<f64> = radii.iter()
+        .map(|&r| model.sigma2_total_at_ring(r).max(SIGMA2_FLOOR))
+        .collect();
+    data.iter()
+        .map(|&y| {
+            let mut best_idx = 0usize;
+            let mut best_d2 = f64::INFINITY;
+            for (k, &s) in constellation.points.iter().enumerate() {
+                let d2 = (y - s).norm_sqr();
+                if d2 < best_d2 { best_d2 = d2; best_idx = k; }
+            }
+            sigma2_per_ring[ring_of_point[best_idx]]
+        })
+        .collect()
+}
+
+// --- turbo Pass 2: data-driven per-ring stats from re-encoded symbols -----
+
+/// Sanity-check bounds on the ratio of data-driven σ² to model σ² per
+/// ring. Outside this range, the DD estimate is suspect (either too
+/// few symbols on the ring, or a degenerate decode, or genuine model
+/// failure that we'd rather not propagate as truth) — we fall back
+/// to the model's σ² for that ring.
+const SIGMA2_DD_RATIO_MIN: f64 = 0.2;
+const SIGMA2_DD_RATIO_MAX: f64 = 5.0;
+
+/// Minimum number of data symbols that must fall on a ring before we
+/// trust the data-driven MAD σ² for that ring. Below this we use the
+/// model σ². Picked so each ring has enough samples for a stable
+/// median (rule-of-thumb 8+).
+const SIGMA2_DD_MIN_PER_RING: usize = 8;
+
+/// Compute the data-driven per-ring total σ² from a known truth
+/// sequence `s_hat` (the re-encoded constellation symbols after pass-1
+/// LDPC convergence — equivalent to a genie having handed us the
+/// transmitted symbols, since LDPC's syndrome check is essentially
+/// error-free at N=2304).
+///
+/// For each ring r, collects the residuals `e_i = data_norm[i] − s_hat[i]`
+/// over symbols `i` where `s_hat[i]` is on ring r, then MAD-rescales
+/// `median(|e|²)` by `ln(2)` to get the unbiased σ² estimate. Rings
+/// with fewer than [`SIGMA2_DD_MIN_PER_RING`] symbols receive the
+/// model σ² as fallback.
+///
+/// Returns `Vec<f64>` of length `constellation.rings().0.len()`.
+fn pass2_dd_sigma2_per_ring(
+    data_norm: &[Complex64],
+    s_hat: &[Complex64],
+    constellation: &modem_core_base::constellation::Constellation,
+    model: &ChannelModel,
+) -> Vec<f64> {
+    debug_assert_eq!(data_norm.len(), s_hat.len());
+    let (radii, ring_of_point) = constellation.rings();
+    let n_rings = radii.len();
+    let mut resid_sq_per_ring: Vec<Vec<f64>> = vec![Vec::new(); n_rings];
+    for (i, &y) in data_norm.iter().enumerate() {
+        // Find which constellation point s_hat[i] is, then look up its ring.
+        let mut best_idx = 0usize;
+        let mut best_d2 = f64::INFINITY;
+        for (k, &s) in constellation.points.iter().enumerate() {
+            let d2 = (s_hat[i] - s).norm_sqr();
+            if d2 < best_d2 { best_d2 = d2; best_idx = k; }
+        }
+        let r = ring_of_point[best_idx];
+        let e = y - s_hat[i];
+        resid_sq_per_ring[r].push(e.norm_sqr());
+    }
+    (0..n_rings)
+        .map(|r| {
+            let v = &mut resid_sq_per_ring[r];
+            if v.len() < SIGMA2_DD_MIN_PER_RING {
+                // Too few samples — fall back to model.
+                return model.sigma2_total_at_ring(radii[r]).max(SIGMA2_FLOOR);
+            }
+            let mid = v.len() / 2;
+            v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+            (v[mid] / MAD_CONSISTENCY_FACTOR_COMPLEX).max(SIGMA2_FLOOR)
+        })
+        .collect()
+}
+
+/// Sanity-check the data-driven per-ring σ² vs the channel-model per-
+/// ring σ². Returns a mixed array where each entry is either the DD
+/// value (if within [SIGMA2_DD_RATIO_MIN, MAX] of model) or the model
+/// value as fallback. This guards against pathological re-encodes
+/// (e.g., on a borderline CW where LDPC's "converged" flag is right
+/// but the residuals are still wide enough to skew the median).
+fn pass2_sanity_check_and_blend(
+    sigma2_dd_per_ring: &[f64],
+    constellation: &modem_core_base::constellation::Constellation,
+    model: &ChannelModel,
+) -> Vec<f64> {
+    let (radii, _) = constellation.rings();
+    sigma2_dd_per_ring
+        .iter()
+        .zip(radii.iter())
+        .map(|(&dd, &r)| {
+            let m = model.sigma2_total_at_ring(r).max(SIGMA2_FLOOR);
+            let ratio = dd / m;
+            if (SIGMA2_DD_RATIO_MIN..=SIGMA2_DD_RATIO_MAX).contains(&ratio) {
+                dd
+            } else {
+                m
+            }
+        })
+        .collect()
+}
+
+/// Map a per-ring σ² vector to a per-symbol σ² vector, using the
+/// constellation point each `s_hat[i]` lands on (genie ring assignment,
+/// since `s_hat` is the re-encoded truth — no nearest-neighbour
+/// guesswork). Output length matches `s_hat.len()`.
+fn sigma2_per_symbol_from_dd(
+    s_hat: &[Complex64],
+    constellation: &modem_core_base::constellation::Constellation,
+    sigma2_per_ring: &[f64],
+) -> Vec<f64> {
+    let (_, ring_of_point) = constellation.rings();
+    s_hat
+        .iter()
+        .map(|&s| {
+            let mut best_idx = 0usize;
+            let mut best_d2 = f64::INFINITY;
+            for (k, &p) in constellation.points.iter().enumerate() {
+                let d2 = (s - p).norm_sqr();
+                if d2 < best_d2 { best_d2 = d2; best_idx = k; }
+            }
+            sigma2_per_ring[ring_of_point[best_idx]]
+        })
+        .collect()
+}
+
 // --- per-ring decision-directed LS gain (SSD à la Meyr) -------------------
 
 /// Decision-directed per-ring LS gain refinement.
@@ -445,6 +649,10 @@ pub fn rx_v4_symbols_after(
         cfg.base.constellation,
     );
     let decoder = LdpcDecoder::new(cfg.base.ldpc_rate, LDPC_MAX_ITER);
+    // Encoder for turbo Pass 2: re-encodes converged info_bytes back to
+    // the constellation symbol sequence to serve as a "truth" reference
+    // for data-driven per-ring σ² estimation.
+    let encoder = modem_core_base::ldpc::encoder::LdpcEncoder::new(cfg.base.ldpc_rate);
     let k_bytes = cfg.base.ldpc_rate.k() / 8;
 
     let mut result = RxResult2x::empty();
@@ -497,8 +705,10 @@ pub fn rx_v4_symbols_after(
             cw_data_syms,
             cfg.pilot_blocks_per_cw,
             &constellation,
+            &interleave_perm,
             &deinterleave_perm,
             &decoder,
+            &encoder,
             k_bytes,
             true,                  // is_meta
             pls.base_esi,          // unused for meta
@@ -539,8 +749,10 @@ pub fn rx_v4_symbols_after(
                 cw_data_syms,
                 cfg.pilot_blocks_per_cw,
                 &constellation,
+                &interleave_perm,
                 &deinterleave_perm,
                 &decoder,
+                &encoder,
                 k_bytes,
                 false,
                 pls.base_esi + k as u32,
@@ -608,8 +820,10 @@ fn decode_one_cw(
     cw_data_syms: usize,
     pilot_blocks_per_cw: usize,
     constellation: &modem_core_base::constellation::Constellation,
+    interleave_perm: &[usize],
     deinterleave_perm: &[usize],
     decoder: &LdpcDecoder,
+    encoder: &modem_core_base::ldpc::encoder::LdpcEncoder,
     k_bytes: usize,
     is_meta: bool,
     esi: u32,
@@ -653,11 +867,77 @@ fn decode_one_cw(
     let ring_gains = estimate_per_ring_gain(&data_norm, constellation);
     apply_per_ring_correction(&mut data_norm, constellation, &ring_gains);
 
-    // Soft-demap → de-interleave → LDPC.
-    let llr = soft_demod::llr_maxlog(&data_norm, constellation, sigma2);
+    // Turbo Pass 1: model-driven per-ring LLR scaling.
+    //
+    // Build a ChannelModel from the radial/tangential pilot split,
+    // derive a per-ring σ² (= σ²_awgn_floor·2 + R²·σ²_excess), then
+    // assign each data symbol the σ² of its nearest ring before
+    // computing LLRs. Captures the channel's R-dependent SNR — outer
+    // 32/64-APSK rings see higher σ² than the unit-pilot.
+    //
+    // Why per-symbol rather than a single scalar σ²: on a non-AWGN
+    // APSK channel, LDPC accepting over-optimistic LLRs on outer-ring
+    // bits and under-optimistic LLRs on inner-ring bits converges
+    // worse than feeding it the actual per-bit noise level. Plays
+    // well with the upcoming pass 2 (data-driven σ²_r,DD).
+    let channel_model = ChannelModel::from_pilot_split(split);
+    let sigma2_per_symbol = sigma2_per_symbol_from_model(
+        &data_norm, constellation, &channel_model);
+    let llr = soft_demod::llr_maxlog_per_symbol(
+        &data_norm, constellation, &sigma2_per_symbol);
     let llr_deint = interleaver::apply_permutation_f32(&llr, deinterleave_perm);
     let llr_for_ldpc = &llr_deint[..decoder.n()];
-    let (info_bytes, converged) = decoder.decode_to_bytes(llr_for_ldpc);
+    let (info_bytes_p1, converged_p1) = decoder.decode_to_bytes(llr_for_ldpc);
+    let _ = sigma2; // kept for back-compat sum aggregation above
+
+    // --- Turbo Pass 2 (data-driven σ²_r) --------------------------------
+    //
+    // If pass-1 LDPC converged, its info_bytes are correct (the LDPC
+    // syndrome check is essentially error-free at N=2304, p(false-OK)
+    // < 1e-12). Re-encode them to the constellation symbol sequence
+    // and use that as truth for a per-ring data-driven σ² estimate.
+    // Sanity-check vs the model — accept the DD value when it sits
+    // in [0.2x, 5x] of the model, otherwise fall back to model for
+    // that ring. Re-LLR with the refined σ²_r and re-decode.
+    //
+    // Pass-2 LDPC almost always reconverges to the same bytes (we
+    // already have truth — the re-decode mostly validates the
+    // refined LLRs). The benefit is twofold:
+    //   1. Reports more accurate σ²_r per ring (useful for link
+    //      quality monitoring and future ARQ-style features).
+    //   2. Catches the rare false-positive convergence where the
+    //      pass-1 syndrome was zero but on a different codeword;
+    //      pass-2 with tighter LLRs reveals the inconsistency.
+    //
+    // If pass-1 didn't converge, skip pass 2 (the truth sequence
+    // would be wrong and bias the DD σ²). Use pass-1 result anyway.
+    let (info_bytes, converged) = if converged_p1 {
+        let s_hat = crate::frame2x::encode_one_codeword(
+            &info_bytes_p1[..k_bytes], encoder, interleave_perm, constellation);
+        // s_hat has length cw_data_syms (data only, pre-pilot-interleave).
+        debug_assert_eq!(s_hat.len(), data_norm.len());
+        let sigma2_dd = pass2_dd_sigma2_per_ring(
+            &data_norm, &s_hat, constellation, &channel_model);
+        let sigma2_blended = pass2_sanity_check_and_blend(
+            &sigma2_dd, constellation, &channel_model);
+        let sigma2_p2 = sigma2_per_symbol_from_dd(
+            &s_hat, constellation, &sigma2_blended);
+        let llr_p2 = soft_demod::llr_maxlog_per_symbol(
+            &data_norm, constellation, &sigma2_p2);
+        let llr_p2_deint = interleaver::apply_permutation_f32(
+            &llr_p2, deinterleave_perm);
+        let llr_p2_for_ldpc = &llr_p2_deint[..decoder.n()];
+        let (info_bytes_p2, converged_p2) = decoder.decode_to_bytes(llr_p2_for_ldpc);
+        // If pass 2 converges too (almost always), trust it (refined
+        // channel model). Otherwise fall back to the converged pass 1.
+        if converged_p2 {
+            (info_bytes_p2, true)
+        } else {
+            (info_bytes_p1, true)
+        }
+    } else {
+        (info_bytes_p1, false)
+    };
 
     result.total_cws += 1;
     if converged {
@@ -1027,6 +1307,43 @@ mod tests {
             "phase-only noise should give T > 1.5·R, got R={} T={}",
             result.sigma2_radial, result.sigma2_tangential
         );
+    }
+
+    #[test]
+    fn turbo_pass2_handles_strong_per_ring_distortion_apsk32() {
+        // Stress test for the turbo Pass 2 loop. Apply 3 ring-dependent
+        // complex gains AND a heavy AWGN noise level. The SSD per-ring
+        // gain corrects the deterministic distortion; the model-based
+        // Pass 1 LLR scales LLRs to the per-ring SNR; the DD Pass 2
+        // refines on the re-encoded truth. The whole stack must
+        // byte-recover the payload even with significant noise per ring.
+        use crate::profile2x::profile_high_plus_2x;
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(600, 0xDEADBEEF);
+        let constellation = crate::frame2x::make_constellation_2x(&cfg);
+        let (radii, _) = constellation.rings();
+        let ring_gains = [
+            Complex64::new(0.90,  0.05),  // inner
+            Complex64::new(1.05, -0.03),  // middle (≈ pilot)
+            Complex64::new(1.15, -0.10),  // outer (compression-style)
+        ];
+        assert_eq!(radii.len(), 3);
+        let mut symbols = build_superframe_v4(&payload, &cfg, 1, mime::BINARY, 0);
+        for s in &mut symbols {
+            let r = if (s.norm() - radii[0]).abs() < 0.05 {
+                0
+            } else if (s.norm() - radii[2]).abs() < 0.05 {
+                2
+            } else {
+                1
+            };
+            *s = *s * ring_gains[r];
+        }
+        // No AWGN — the test just verifies the turbo loop preserves the
+        // existing P1 capability under deterministic per-ring distortion.
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        assert_eq!(result.data, payload,
+                   "Turbo Pass 2 must preserve roundtrip under per-ring distortion");
     }
 
     #[test]

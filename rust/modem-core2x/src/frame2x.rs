@@ -97,7 +97,12 @@ pub fn make_lms_warmup_2x(cfg: &ModemConfig2x) -> Vec<Complex64> {
 
 // --- Codeword encode helper (mirrors V3 `encode_one_codeword`) ------------
 
-fn encode_one_codeword(
+/// Encode `info_bytes` into a slice of complex constellation symbols
+/// (the data portion of one CW, before pilot interleaving). Public
+/// because the [`crate::rx_v4`] turbo loop re-encodes the converged
+/// LDPC output to recover the "truth" symbol sequence for pass 2
+/// channel estimation (data-driven per-ring σ² and gain).
+pub fn encode_one_codeword(
     info_bytes: &[u8],
     encoder: &LdpcEncoder,
     interleave_perm: &[usize],

@@ -52,6 +52,48 @@ pub fn llr_maxlog(
     llr
 }
 
+/// Per-ring (or more generally per-symbol) max-log LLR.
+///
+/// Same convention as [`llr_maxlog`] (positive = bit 0 more likely) but
+/// each received symbol carries its own σ² via `sigma2_per_symbol`:
+/// the caller assigns a σ² to each `y_i` (typically via a hard
+/// nearest-ring decision on |y_i| → ring → σ²_ring lookup) before
+/// calling. This lets the demapper weight bits differently across rings
+/// on a non-AWGN channel where one ring sees more amplitude/phase
+/// distortion than another.
+///
+/// Length contract: `sigma2_per_symbol.len() == symbols.len()`. Each
+/// σ² must be > 0.
+pub fn llr_maxlog_per_symbol(
+    symbols: &[Complex64],
+    constellation: &Constellation,
+    sigma2_per_symbol: &[f64],
+) -> Vec<f32> {
+    assert_eq!(symbols.len(), sigma2_per_symbol.len(),
+               "sigma2_per_symbol must match symbols length");
+    let bps = constellation.bits_per_sym;
+    let mut llr = Vec::with_capacity(symbols.len() * bps);
+    for (yi, &y) in symbols.iter().enumerate() {
+        let sigma2 = sigma2_per_symbol[yi];
+        assert!(sigma2 > 0.0, "sigma2 must be > 0 at symbol {yi}");
+        let d2: Vec<f64> = constellation.points.iter()
+            .map(|&s| (y - s).norm_sqr()).collect();
+        for k in 0..bps {
+            let mut min_d2_0 = f64::INFINITY;
+            let mut min_d2_1 = f64::INFINITY;
+            for (idx, &dist) in d2.iter().enumerate() {
+                if constellation.bit_map[idx][k] == 0 {
+                    if dist < min_d2_0 { min_d2_0 = dist; }
+                } else {
+                    if dist < min_d2_1 { min_d2_1 = dist; }
+                }
+            }
+            llr.push(((min_d2_1 - min_d2_0) / sigma2) as f32);
+        }
+    }
+    llr
+}
+
 /// Estimate sigma^2 from FSE residuals (outputs - decisions).
 pub fn sigma2_from_residuals(outputs: &[Complex64], decisions: &[Complex64]) -> f64 {
     if outputs.is_empty() {
