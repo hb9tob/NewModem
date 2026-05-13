@@ -1074,10 +1074,12 @@ fn decode_one_cw(
 
     // --- Turbo Pass 2 EM (forward-backward Kalman + RTS) ----------------
     //
-    // Pass 1 LDPC produced bit posteriors. Convert them to **soft
-    // constellation symbols** (E[s_k | LLR_post] and ring-conditional
-    // means), then run three Kalman + RTS smoothers in succession to
-    // refine the channel model with the full LDPC information:
+    // Pass 1 LDPC produced bit posteriors (saturated when Pass 1
+    // converged, intermediate-magnitude when it ran out of iterations
+    // on a near-miss). Convert them to **soft constellation symbols**
+    // (E[s_k | LLR_post] and ring-conditional means), then run three
+    // Kalman + RTS smoothers to refine the channel model with the
+    // full LDPC information:
     //
     //   1. Phase φ_k        — 2-state {phase, drift} smoother
     //                         (`phase_smoother::rts_phase_smooth`).
@@ -1088,15 +1090,21 @@ fn decode_one_cw(
     //                         drift, with χ²₂-derived bias correction).
     //
     // The three smoothers feed `llr_maxlog_per_sym_per_ring` for the
-    // Pass 2 re-LLR. Sanity gate: if Pass 2 LDPC fails to converge,
-    // we fall back to the Pass 1 info_bytes (the EM trajectory may
-    // have diverged on a borderline CW).
+    // Pass 2 re-LLR.
     //
-    // We only run Pass 2 if Pass 1 converged — soft symbols built from
-    // an unconverged posterior carry the LDPC's wrong-codeword bias
-    // and the EM would lock onto that. Pre-convergence Pass 1 LLRs
-    // remain the best estimate in that case.
-    let (info_bytes, converged) = if converged_p1 {
+    // **Run unconditionally** — even when Pass 1 didn't converge.
+    // The posterior LLRs at LDPC max_iter are imperfect (the decoder
+    // got stuck in some local minimum) but still informative: bit
+    // signs carry the decoder's best guess, magnitudes carry how
+    // confident it was. The soft symbols built from them are noisier
+    // than the converged case but still strongly biased toward the
+    // truth on most positions. The EM channel refinement then gives
+    // LDPC a second shot with better-scaled LLRs, which on the SNR
+    // cliff (where a few dB of LLR-scale error is the difference
+    // between hitting max_iter and converging) rescues a meaningful
+    // fraction of CWs. Trust Pass 2 byte output whenever Pass 2 LDPC
+    // converges, regardless of Pass 1's status.
+    let (info_bytes, converged) = {
         // Step 1. Re-interleave posterior LLR (n bits) back to the
         // symbol-major space (cw_data_syms × bps bits). The padding bit
         // (when present, e.g. Apsk32 R=1/2 pads 2304 → 2305) sits at
@@ -1162,44 +1170,20 @@ fn decode_one_cw(
             &llr_p2, deinterleave_perm);
         let llr_p2_for_ldpc = &llr_p2_deint[..decoder.n()];
         let (info_bytes_p2, converged_p2) = decoder.decode_to_bytes(llr_p2_for_ldpc);
-        // Likelihood-based tie-break when P1 and P2 disagree.
-        //
-        // The LDPC code's false-positive convergence rate at N=2304 is
-        // very small in absolute terms but non-zero — on 32/64-APSK
-        // under deterministic distortion, Pass 1's syndrome can be
-        // zero while the info bytes are off (a near-miss codeword).
-        // EM Pass 2 may converge to the *true* codeword in that case,
-        // but the converse also happens: on HIGH++2X 64-APSK in the
-        // noise-free channel, Pass 1 is already the truth and EM
-        // Pass 2 drifts onto a near-miss because of small numerical
-        // edge effects on the tight outer rings.
-        //
-        // Discriminator: re-encode both bytes back to symbol sequences
-        // and compute the per-symbol-distance sum-of-squares against
-        // `data_norm` (the pilot+SSD-corrected received symbols).
-        // Whichever codeword is **physically closer** to what came out
-        // of the channel wins. No σ² weighting — at the "P1 vs P2
-        // close codeword" decision boundary, all symbols are near-on-
-        // the-grid, so a flat SSE is the cleanest measure (σ²-weighted
-        // NLL biased toward P2 in practice; the σ² estimate is itself
-        // EM-influenced and tends to favour the codeword the EM ran
-        // for).
-        // Trust Pass 2's bytes when it converges; otherwise keep
-        // Pass 1's. Pre-bytes-bug fix this path silently corrupted
-        // P1-fallback CWs because `info_bytes_p1` was packed wrongly
-        // (decode_with_posterior returned bits, not bytes — see commit
-        // history). With the bytes-bug fixed, always-P2 matches or
-        // beats strict-P1-truth on the §10.3 sweep, and the EM
-        // smoother chain (phase, g_r, σ²_r) actually contributes when
-        // the refined LLR helps LDPC converge to truth on borderline
-        // CWs (~+1 CW on HIGH++2X 64-APSK noise-free).
+
+        // Combine the two passes. `converged_p2 = true` always wins:
+        // Pass 2 LDPC syndrome is zero, so its bytes are LDPC-valid
+        // even if Pass 1 disagreed. When Pass 2 didn't converge but
+        // Pass 1 did, fall back to Pass 1's bytes. When neither
+        // converged, take Pass 1's bytes and report `converged = false`
+        // — the CW won't contribute to RaptorQ assembly downstream.
         if converged_p2 {
             (info_bytes_p2, true)
-        } else {
+        } else if converged_p1 {
             (info_bytes_p1, true)
+        } else {
+            (info_bytes_p1, false)
         }
-    } else {
-        (info_bytes_p1, false)
     };
 
     result.total_cws += 1;

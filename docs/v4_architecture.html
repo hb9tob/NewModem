@@ -1133,7 +1133,7 @@ for chaque symbole pilote p_recu dans la CW {
             <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
             <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
             <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">61/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">22/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
             <td class="num">0.111</td><td class="num">9.6 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
@@ -1266,7 +1266,7 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
         <tr>
             <td class="num"><strong>0.45</strong></td>
             <td class="num">0.0266</td><td class="num">15.8 dB</td><td class="num">26/69</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">22/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.55</strong></td>
@@ -1290,10 +1290,13 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
     <br>
     Le turbo Pass 2 EM (<a href="#turbo-passes">§10.3.3</a>) catche
     <strong>+1 CW</strong> sur HIGH++2X aux SNR clean (62 → 63 à
-    <code>if_noise=0</code>, 60 → 61 à 0.30) en raffinant les LLR via
-    les soft symbols post-LDPC P1 ; pas suffisant pour franchir le
-    cliff à 0.45 (canal trop dégradé pour que P2 LDPC re-converge sur
-    les 30+ CWs ratés par P1).
+    <code>if_noise=0</code>, 60 → 61 à 0.30) ET <strong>+1 CW au
+    cliff</strong> (22 → 23 à 0.45) en raffinant les LLR via les soft
+    symbols post-LDPC P1 — y compris quand P1 n'a pas convergé (le
+    posterior LDPC saturé partiellement reste informatif et l'EM
+    refit channel donne à P2 LDPC une seconde chance sur les CWs
+    borderline). Pas suffisant pour franchir le seuil RaptorQ à 0.45,
+    mais le mécanisme rescue est validé.
 </div>
 
 <p>
@@ -1494,7 +1497,7 @@ e_tangential = Im(e · conj(P))     ← composante perpendiculaire à P
    ├── llr_maxlog_per_ring(data, constellation, σ²_per_ring)
    └── LDPC.decode_with_posterior() → (info_bytes_p1, posterior_llr, converged_p1)
 
-Pass 2 EM (forward-backward Kalman + RTS, gated on Pass 1 convergence)
+Pass 2 EM (forward-backward Kalman + RTS, runs unconditionally)
    ├── posterior_llr → soft symbols
    │     s̃_k = E[s_k | LLR_post] = Σ_c P(s_k = c) · c
    │     ring_prob[r] = P(z_k = r), ring_cond_mean[r] = E[s_k | s_k ∈ ring r]
