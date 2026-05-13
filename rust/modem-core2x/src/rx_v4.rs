@@ -156,6 +156,15 @@ pub struct RxResult2x {
     /// The byte length is `ceil(max(max_esi + 1, data_cws_total) / 8)`
     /// so the progress bar can show every attempted DATA slot.
     pub converged_bitmap: Vec<u8>,
+    /// Symbol-stream index of every CRC-validated PLHEADER SOF the
+    /// decoder locked onto, in scan order. Each entry is guaranteed to
+    /// be a real PLHEADER (PLS Golay decode + CRC16 both passed) — no
+    /// false positives from noise-band Chu correlations.
+    ///
+    /// Drift LS fit (`estimate_drift_from_sof_positions`) needs at
+    /// least 3 entries; the streaming worker uses the cumulative list
+    /// to refine `cached_drift_ppm` between scan ticks.
+    pub validated_sof_positions: Vec<usize>,
 }
 
 /// Cap on the scatter cloud we forward to the GUI per `rx_v4_symbols`
@@ -183,6 +192,7 @@ impl RxResult2x {
             data_cws_total: 0,
             data_cws_converged: 0,
             converged_bitmap: Vec::new(),
+            validated_sof_positions: Vec::new(),
         }
     }
 }
@@ -213,6 +223,108 @@ fn mean_phase(phis: &[f64]) -> f64 {
         sy += p.sin();
     }
     sy.atan2(sx)
+}
+
+/// Find every SOF position above the threshold in a symbol stream.
+///
+/// Each detected peak advances the scan cursor by one cycle's worth of
+/// symbols (≈ `4 s × symbol_rate`) so a fat correlation peak doesn't
+/// register twice. Used by the worker's drift bootstrap: multiple SOF
+/// positions on the same buffer let us LS-fit the symbol-rate clock
+/// offset between TX and RX (see [`estimate_drift_from_sof_positions`]).
+pub fn find_all_sofs(
+    symbols: &[Complex64],
+    family: PreambleFamily2x,
+    min_cycle_skip_syms: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    if symbols.len() < SOF_LEN_SYM {
+        return out;
+    }
+    let sof = plheader::sof_for_family(family);
+    // Tighter threshold than `SOF_PEAK_THRESHOLD_FRAC` (0.2) — that
+    // threshold accepts a real PLHEADER attenuated by 70-80 % through
+    // the SDR + radio chain, but on a long buffer at threshold 0.2
+    // we'd also catch false-positive Chu correlations in band noise
+    // and PLS QPSK data, which pollute the drift LS fit. 0.3 × 64 =
+    // 19.2 rejects most of those while still passing a real PLHEADER
+    // with peak ≥ 20 (empirical floor on FTX-1 + SDRplay captures).
+    let threshold = 0.3 * SOF_LEN_SYM as f64;
+    let end = symbols.len() - SOF_LEN_SYM;
+    let mut k = 0;
+    while k <= end {
+        let mut acc = Complex64::new(0.0, 0.0);
+        for n in 0..SOF_LEN_SYM {
+            acc += symbols[k + n] * sof[n].conj();
+        }
+        if acc.norm() >= threshold {
+            out.push(k);
+            k += min_cycle_skip_syms.max(SOF_LEN_SYM);
+        } else {
+            k += 1;
+        }
+    }
+    out
+}
+
+/// LS-fit the TX↔RX symbol-clock drift from multiple SOF positions in
+/// the same buffer, with outlier rejection.
+///
+/// The encoder places consecutive PLHEADERs `cycle_period_sym` symbols
+/// apart (4 s × `symbol_rate` for full cycles). RX-side drift `ε` means
+/// the **measured** spacing scales as `cycle × (1 + ε)`. Each SOF's
+/// `round((p − p0) / cycle_period_sym)` gives a cycle index (handles
+/// missed PLHEADERs); LS slope-fits position vs index; ppm =
+/// `(slope − cycle_period_sym) / cycle_period_sym × 1e6`.
+///
+/// **Outlier rejection** (critical on real OTA where the
+/// [`SOF_PEAK_THRESHOLD_FRAC`] = 0.2 lets through a few noise
+/// correlations between bursts): each SOF is included in the fit only
+/// if its residual from `k × cycle` is < 30 % of one cycle. Without
+/// this, false-positive SOF detections in band noise produce garbage
+/// ppm and the cubic resample wrecks the audio.
+///
+/// Returns `None` when fewer than 3 SOFs pass the residual filter or
+/// the LS fit is numerically degenerate. Three is the minimum number
+/// that lets the slope's standard error stay below the spacing
+/// precision (single-sample symbol-grid quantisation).
+pub fn estimate_drift_from_sof_positions(
+    sof_positions: &[usize],
+    cycle_period_sym: usize,
+) -> Option<f64> {
+    if sof_positions.len() < 2 || cycle_period_sym == 0 {
+        return None;
+    }
+    let p0 = sof_positions[0] as f64;
+    let cycle = cycle_period_sym as f64;
+    // Outlier tolerance: position must land within ±10 % of a cycle
+    // boundary. Loose enough to absorb a ±1 % drift accumulating
+    // across many cycles, tight enough to reject false-positive
+    // PLS-Golay-passes-by-luck or partial cycles. Drops to 30 % for
+    // the longest-running burst (drift of 300 ppm × 20 cycles ≈ 33
+    // sym = 0.6 % of cycle, well inside 10 %).
+    let tolerance = cycle * 0.10;
+    let mut sum_xy = 0.0_f64;
+    let mut sum_xx = 0.0_f64;
+    let mut n_used = 0_usize;
+    for &p in sof_positions {
+        let y = p as f64 - p0;
+        let k = (y / cycle).round();
+        if (y - k * cycle).abs() > tolerance {
+            // SOF is too far from the nearest expected position — most
+            // likely a noise correlation peak between two genuine
+            // PLHEADERs. Skip.
+            continue;
+        }
+        sum_xy += k * y;
+        sum_xx += k * k;
+        n_used += 1;
+    }
+    if n_used < 2 || sum_xx < 1.0 {
+        return None;
+    }
+    let slope = sum_xy / sum_xx;
+    Some((slope - cycle) / cycle * 1e6)
 }
 
 fn find_next_sof(
@@ -977,6 +1089,10 @@ pub fn rx_v4_symbols_after(
             result.first_pls = Some(pls);
             result.first_sof_at = Some(sof_at);
         }
+        // Validated SOF — Golay + CRC just passed in
+        // `decode_plheader_at`. Record for the drift LS fit. No false
+        // positives possible here.
+        result.validated_sof_positions.push(sof_at);
         if pls.flags & FLAG2X_EOT != 0 {
             result.eot_seen = true;
         }

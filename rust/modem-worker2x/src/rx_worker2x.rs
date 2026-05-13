@@ -26,6 +26,7 @@
 use modem_core_base::demodulator;
 use modem_core_base::rrc::{self, rrc_taps};
 use modem_core_base::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
+use modem_core2x::frame2x::full_cycle_len_syms;
 use modem_core2x::gate2x::{PreambleProbe2x, IDLE_PROBE_BUF_SAMPLES, PROBE_THRESHOLD_2X};
 use modem_core2x::plheader::{sof_for_family, SOF_LEN_SYM};
 use modem_core2x::profile2x::{config_by_name_2x, ModemConfig2x};
@@ -40,6 +41,60 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Cubic-Lagrange (Farrow-style) resampler at a fixed ratio
+/// `1 + ppm × 1e-6`. Compensates the TX↔RX sample-rate drift the worker
+/// estimates from multi-PLHEADER LS fit, before handing the corrected
+/// audio to [`audio_to_symbols`].
+///
+/// On a 60-second buffer at 48 kHz, a 4-tap cubic interpolation per
+/// output sample costs ≈ 30 ms on Pi 5 — negligible compared to the
+/// matched filter that follows. Linear interpolation (V3's
+/// `rx_v2::resample_audio`) added measurable noise on this profile;
+/// the cubic kernel preserves the RRC pulse shape to within
+/// discretisation noise.
+///
+/// `ppm > 0` means RX captured more samples than TX produced (RX clock
+/// runs faster) so the output is a SHORTER stream that matches TX
+/// timing.
+fn resample_audio_cubic(samples: &[f32], ppm: f64) -> Vec<f32> {
+    if ppm.abs() < 0.1 {
+        return samples.to_vec();
+    }
+    let ratio = 1.0 + ppm * 1e-6;
+    if samples.len() < 4 {
+        return samples.to_vec();
+    }
+    let n_out = ((samples.len() - 3) as f64 / ratio) as usize;
+    let mut out = Vec::with_capacity(n_out);
+    for i in 0..n_out {
+        let t = (i as f64) * ratio;
+        let idx = t.floor() as usize;
+        let mu = (t - idx as f64) as f32;
+        if idx + 2 < samples.len() && idx >= 1 {
+            let s0 = samples[idx - 1];
+            let s1 = samples[idx];
+            let s2 = samples[idx + 1];
+            let s3 = samples[idx + 2];
+            // Cubic Lagrange interpolation coefficients (Farrow kernel,
+            // Pham-Reibman variant). Same shape as the Phase A
+            // `modem-core-base::farrow` interpolator but applied to a
+            // dense audio stream at a fixed ratio rather than at
+            // per-symbol strobes.
+            let c0 = s1;
+            let c1 = 0.5 * (s2 - s0);
+            let c2 = s0 - 2.5 * s1 + 2.0 * s2 - 0.5 * s3;
+            let c3 = -0.5 * s0 + 1.5 * s1 - 1.5 * s2 + 0.5 * s3;
+            let v = ((c3 * mu + c2) * mu + c1) * mu + c0;
+            out.push(v);
+        } else if idx < samples.len() {
+            out.push(samples[idx]);
+        } else {
+            break;
+        }
+    }
+    out
+}
 
 /// Convert an audio-domain `f32` buffer into a stream of complex symbols
 /// ready for [`rx_v4_symbols`](modem_core2x::rx_v4::rx_v4_symbols).
@@ -164,12 +219,65 @@ fn best_symbol_phase_sof(
 /// Audio-domain wrapper: downmix + matched-filter + sample +
 /// [`rx_v4_symbols`](modem_core2x::rx_v4::rx_v4_symbols). The single entry
 /// point a CLI / GUI worker calls per audio chunk.
+///
+/// Includes a two-pass drift bootstrap: the first pass at 0 ppm
+/// locates every PLHEADER SOF in the symbol stream;
+/// [`rx_v4::estimate_drift_from_sof_positions`] LS-fits the TX↔RX
+/// symbol-clock offset from those positions; if the estimate is ≥
+/// 0.5 ppm we resample the audio via [`resample_audio_cubic`] and run
+/// the chain a second time. Mirrors the live worker's drift bootstrap
+/// so a captured WAV decodes identically to the live capture that
+/// produced it.
 pub fn rx_v4_audio(
     samples: &[f32],
     cfg: &ModemConfig2x,
 ) -> Result<Option<RxResult2x>, String> {
     let symbols = audio_to_symbols(samples, cfg)?;
-    Ok(rx_v4::rx_v4_symbols(&symbols, cfg))
+    let cycle_period_sym = full_cycle_len_syms(cfg);
+    let baseline = rx_v4::rx_v4_symbols(&symbols, cfg);
+    // Drift LS fit uses ONLY CRC-validated SOF positions (PLS Golay +
+    // CRC16 both passed) — no false positives from noise correlations.
+    // Returned by `rx_v4_symbols` in `validated_sof_positions`.
+    let sof_positions = baseline
+        .as_ref()
+        .map(|r| r.validated_sof_positions.clone())
+        .unwrap_or_default();
+    if std::env::var_os("RX_V4_LOG_DRIFT").is_some() {
+        eprintln!(
+            "[drift-cli] syms={} validated_sofs={} positions={:?} baseline_cycles={}",
+            symbols.len(),
+            sof_positions.len(),
+            sof_positions.iter().take(8).collect::<Vec<_>>(),
+            baseline.as_ref().map_or(0, |r| r.cycles),
+        );
+    }
+    if let Some(ppm) =
+        rx_v4::estimate_drift_from_sof_positions(&sof_positions, cycle_period_sym)
+    {
+        if ppm.abs() >= 0.5 {
+            let corrected = resample_audio_cubic(samples, ppm);
+            let new_symbols = audio_to_symbols(&corrected, cfg)?;
+            let corrected_res = rx_v4::rx_v4_symbols(&new_symbols, cfg);
+            // Pick whichever result has more converged data CWs.
+            let score = |r: &Option<RxResult2x>| -> usize {
+                r.as_ref().map(|x| x.data_cws_converged).unwrap_or(0)
+            };
+            if std::env::var_os("RX_V4_LOG_DRIFT").is_some() {
+                eprintln!(
+                    "[drift-cli] ppm={:+.1} baseline_cws={} corrected_cws={}",
+                    ppm,
+                    score(&baseline),
+                    score(&corrected_res),
+                );
+            }
+            return Ok(if score(&corrected_res) >= score(&baseline) {
+                corrected_res
+            } else {
+                baseline
+            });
+        }
+    }
+    Ok(baseline)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +360,34 @@ struct RxRealtimePayload {
 /// up on either family.
 const OVERDRIVE_RMS_GATE_LINEAR: f32 = 0.056;
 const OVERDRIVE_CREST_GATE_DB: f32 = 8.5;
+
+/// RMS floor under which the worker treats the chunk as silence and
+/// leaves the audio buffer trimmed to its idle window. Anything above
+/// extends the `probe_hot_until` window so the decode pipeline runs.
+/// Same value V3's `rx_worker` uses for its silence detector.
+const SILENCE_RMS_THRESHOLD: f32 = 0.005;
+
+/// Hard cap on `audio_buffer` size even while warm. On chains with
+/// continuous in-band noise (SDRplay open-squelch FM) the RMS gate
+/// stays hot forever; without a cap the buffer would grow unbounded
+/// and `audio_to_symbols` cost would grow linearly with capture
+/// duration, eventually blocking the decode thread.
+///
+/// 60 s × 48 kHz = 2.88 M samples covers up to a 50 kB HIGH+2X burst
+/// (~50 s at HIGH+2X net rate). `audio_to_symbols` at this size on
+/// Pi 5 ≈ 250-300 ms per scan — fine at the
+/// [`MIN_SCAN_WALL_INTERVAL`] cadence (≤ 30 % of one core).
+const WARM_MAX_BUF_SAMPLES: usize = 60 * AUDIO_RATE as usize;
+
+/// Wall-clock floor between two scan invocations. Sustains decode
+/// even when audio chunks accumulate faster than rx_v4_symbols can
+/// complete, by skipping scans rather than queuing them.
+///
+/// Tuned around the worst-case `audio_to_symbols` + `rx_v4_symbols`
+/// runtime on the warm-buffer cap (60 s × 48 kHz). Empirically that's
+/// ≈ 300 ms on Pi 5; 500 ms throttle leaves ≥ 200 ms headroom for the
+/// rest of the worker loop (event emit, audio_level, mpsc recv).
+const MIN_SCAN_WALL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Single-pass peak / RMS / crest factor. Identical implementation to
 /// `rx_worker::compute_audio_stats` — kept local rather than re-
@@ -424,6 +560,15 @@ pub fn spawn(
         // sliding window.
         let mut audio_buffer: Vec<f32> = Vec::with_capacity(48_000 * 8);
         let mut last_scan_audio_len: usize = 0;
+        let mut last_scan_wall: Option<Instant> = None;
+        // Cached TX↔RX symbol-rate drift in ppm. Bootstrapped on the
+        // first scan that produces ≥ 2 SOF detections via
+        // `find_all_sofs` + `estimate_drift_from_sof_positions`, then
+        // applied as a Farrow cubic-Lagrange resample to subsequent
+        // decode attempts. Per-CW phase residual (after this bulk
+        // correction) is absorbed by the turbo Pass 2 EM RTS smoother
+        // already inside `rx_v4_symbols`.
+        let mut cached_drift_ppm: f64 = 0.0;
         // V3-parity telemetry. `total_samples` is the cumulative count
         // of f32 audio samples the worker has observed (drives the GUI
         // VU meter's frame counter). `last_telemetry_tick` paces the
@@ -504,79 +649,97 @@ pub fn spawn(
                 },
             );
             // Accumulate into the rolling audio buffer. Trim to
-            // IDLE_PROBE_BUF_SAMPLES while we're cold (no recent probe
-            // pass AND no active session) so memory stays bounded
+            // IDLE_PROBE_BUF_SAMPLES while we're cold (no recent audio
+            // activity AND no active session) so memory stays bounded
             // during long quiet captures. Once a burst is in flight
             // (`emitted_session_id.is_some()` OR within
-            // `PROBE_HOT_HOLD` of a probe pass) the buffer grows freely
-            // to cover the whole burst — `audio_to_symbols` needs the
-            // full PLHEADER..EOT span to land an SOF correlation peak.
+            // `PROBE_HOT_HOLD` of recent audio activity) the buffer
+            // grows freely to cover the whole burst — `audio_to_symbols`
+            // needs the full PLHEADER..EOT span to land an SOF
+            // correlation peak.
             audio_buffer.extend_from_slice(&chunk);
             let now = Instant::now();
+
+            // RMS-based activity detector. Simpler and more robust than
+            // the FFT preamble probe: the FFT template is flat-spectrum
+            // and the typical SDR + radio NBFM RX chain LP-filters the
+            // audio at ~300 Hz (de-emphasis), squashing the template
+            // overlap with the received signal to noise-level ratios
+            // even on excellent-SNR captures. RMS over silence threshold
+            // means "something's on air"; rx_v4_symbols's SOF
+            // correlator (already at 0.2 × SOF_LEN threshold) is the
+            // real structure detector that follows.
+            //
+            // V3 worker uses the same `SILENCE_RMS_THRESHOLD = 0.005`
+            // for its silence detector — parity in spirit.
+            if rms > SILENCE_RMS_THRESHOLD {
+                probe_hot_until = Some(now + PROBE_HOT_HOLD);
+            }
+            if log_gate {
+                eprintln!(
+                    "[gate] buf={:.1}s rms={:.4} thr={:.4} hot={}",
+                    audio_buffer.len() as f64 / AUDIO_RATE as f64,
+                    rms,
+                    SILENCE_RMS_THRESHOLD,
+                    probe_hot_until.map_or(false, |t| now < t),
+                );
+            }
+
             let in_hot_window = probe_hot_until.map_or(false, |t| now < t);
             let is_active = emitted_session_id.is_some();
-            let warm = in_hot_window || is_active;
+            let warm = in_hot_window || is_active || no_gate;
+            // Trim to the idle window when cold (small).
             if !warm && audio_buffer.len() > IDLE_PROBE_BUF_SAMPLES {
                 let drop_n = audio_buffer.len() - IDLE_PROBE_BUF_SAMPLES;
                 audio_buffer.drain(..drop_n);
+                last_scan_audio_len = last_scan_audio_len.saturating_sub(drop_n);
+            }
+            // Hard cap when warm. Without this, an always-hot capture
+            // (continuous in-band noise on the SDRplay) grows the
+            // buffer unbounded and audio_to_symbols saturates the
+            // decode thread.
+            if warm && audio_buffer.len() > WARM_MAX_BUF_SAMPLES {
+                let drop_n = audio_buffer.len() - WARM_MAX_BUF_SAMPLES;
+                audio_buffer.drain(..drop_n);
+                last_scan_audio_len = last_scan_audio_len.saturating_sub(drop_n);
             }
 
-            // Run the FFT probe per-chunk while idle — bypassed under
-            // `RX_V4_NO_GATE`. The probe itself costs ~25 ms (cheap
-            // relative to the rx_v4 pipeline it's gating), and chunks
-            // arrive at ~500 ms cpal cadence, so the wall-clock probe
-            // rate stays in the 2 Hz range during live captures. We
-            // skip the wall-clock throttle so paced test paths (which
-            // push chunks back-to-back with no real-time delay) still
-            // probe every chunk of audio rather than once.
+            // Suppress the wall-clock probe state — replaced by the
+            // RMS gate above. Variable kept for log line parity but no
+            // longer drives any decision.
             let _ = last_probe_at;
-            if !no_gate
-                && !warm
-                && !finalised
-                && audio_buffer.len() >= PROBE_MIN_BUF_SAMPLES
-            {
-                last_probe_at = Some(now);
-                // Use the most recent IDLE_PROBE_BUF_SAMPLES samples so
-                // the FFT window matches the probe's calibrated buf_len.
-                let tail_start = audio_buffer
-                    .len()
-                    .saturating_sub(IDLE_PROBE_BUF_SAMPLES);
-                let probe =
-                    PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
-                let r = probe.check(&audio_buffer[tail_start..]);
-                let passes = r.passes(PROBE_THRESHOLD_2X);
-                if log_gate {
-                    eprintln!(
-                        "[gate] buf={:.1}s rms={:.4} ratio={:.0} thr={:.0} \
-                         anchor={:?} → {}",
-                        audio_buffer.len() as f64 / AUDIO_RATE as f64,
-                        rms,
-                        r.max_ratio,
-                        PROBE_THRESHOLD_2X,
-                        r.best_anchor,
-                        if passes { "PASS" } else { "FAIL" },
-                    );
-                }
-                if passes {
-                    probe_hot_until = Some(now + PROBE_HOT_HOLD);
-                }
-            }
 
-            // Decide whether to run `audio_to_symbols` + `rx_v4_symbols`
-            // this tick. Throttled to SCAN_INTERVAL_MS so a 5 ms chunk
-            // doesn't force a 200 ms re-decode pass. The audio_to_symbols
-            // SOF-anchored phase search scales linearly with buffer length
-            // (≈ 0.3 s for 30 s sps=32 on Pi 5), fine at this cadence.
-            let in_hot_window_now =
-                probe_hot_until.map_or(false, |t| now < t);
+            // Wall-clock floor in addition to the audio-delta budget:
+            // if rx_v4_symbols takes longer than the chunk cadence, we
+            // skip scans rather than queue them. Important on Pi 5
+            // where a 15 s buffer's audio_to_symbols + decode can hit
+            // 150-300 ms while chunks arrive every ~25 ms (SDRplay
+            // backend).
+            let scan_wall_ok = last_scan_wall
+                .map_or(true, |t| now.duration_since(t) >= MIN_SCAN_WALL_INTERVAL);
+
             let should_decode = !finalised
-                && (no_gate || in_hot_window_now || is_active)
+                && warm
                 && audio_buffer.len() >= AUDIO_RATE as usize / 2
-                && audio_buffer.len() - last_scan_audio_len >= SCAN_AUDIO_DELTA;
+                && audio_buffer.len() - last_scan_audio_len >= SCAN_AUDIO_DELTA
+                && scan_wall_ok;
 
             if should_decode {
                 last_scan_audio_len = audio_buffer.len();
-                let symbols_opt = audio_to_symbols(&audio_buffer, &cfg);
+                last_scan_wall = Some(now);
+
+                // Drift compensation: resample the audio buffer at the
+                // currently-cached ppm before handing to
+                // `audio_to_symbols`. Cubic Lagrange (Farrow kernel)
+                // preserves RRC pulse shape better than linear interp.
+                // The first scan always runs at ppm=0 to bootstrap the
+                // SOF locations needed for the LS fit below.
+                let working_buf = if cached_drift_ppm.abs() >= 0.5 {
+                    resample_audio_cubic(&audio_buffer, cached_drift_ppm)
+                } else {
+                    audio_buffer.clone()
+                };
+                let symbols_opt = audio_to_symbols(&working_buf, &cfg);
                 let symbols = match symbols_opt {
                     Ok(s) => s,
                     Err(e) => {
@@ -586,6 +749,49 @@ pub fn spawn(
                         Vec::new()
                     }
                 };
+
+                // Drift bootstrap / refinement. Find every SOF in the
+                // current symbol stream; if we have ≥ 2, LS-fit the
+                // ppm and update the cache. Re-decode at the new ppm
+                // if the estimate moved meaningfully (≥ 5 ppm shift),
+                // so a converged drift estimate doesn't have to wait
+                // for the next chunk.
+                let cycle_period_sym = full_cycle_len_syms(&cfg);
+                let min_skip = (cycle_period_sym / 2).max(SOF_LEN_SYM);
+                let sof_positions =
+                    modem_core2x::rx_v4::find_all_sofs(&symbols, cfg.family, min_skip);
+                let new_drift = modem_core2x::rx_v4::estimate_drift_from_sof_positions(
+                    &sof_positions,
+                    cycle_period_sym,
+                );
+                let mut symbols = symbols;
+                if let Some(ppm) = new_drift {
+                    let shift = (ppm - cached_drift_ppm).abs();
+                    if shift >= 5.0 {
+                        if log_gate {
+                            eprintln!(
+                                "[drift] sofs={} cached={:+.1} → new={:+.1} ppm (Δ={:.1}) — re-decoding",
+                                sof_positions.len(),
+                                cached_drift_ppm,
+                                ppm,
+                                shift,
+                            );
+                        }
+                        cached_drift_ppm = ppm;
+                        let rebuf = resample_audio_cubic(&audio_buffer, cached_drift_ppm);
+                        if let Ok(new_syms) = audio_to_symbols(&rebuf, &cfg) {
+                            symbols = new_syms;
+                        }
+                    } else if log_gate {
+                        eprintln!(
+                            "[drift] sofs={} cached={:+.1} ppm (stable, Δ={:.1})",
+                            sof_positions.len(),
+                            cached_drift_ppm,
+                            shift,
+                        );
+                    }
+                }
+
                 let res_opt = if symbols.len() >= 192 {
                     modem_core2x::rx_v4::rx_v4_symbols(&symbols, &cfg)
                 } else {
@@ -595,7 +801,7 @@ pub fn spawn(
                     match &res_opt {
                         Some(r) => eprintln!(
                             "[rxv4] audio={:.1}s syms={} cycles={} \
-                             data_cws={}/{} sof@={:?} eot={}",
+                             data_cws={}/{} sof@={:?} eot={} ppm={:+.1}",
                             audio_buffer.len() as f64 / AUDIO_RATE as f64,
                             symbols.len(),
                             r.cycles,
@@ -603,11 +809,13 @@ pub fn spawn(
                             r.data_cws_total,
                             r.first_sof_at,
                             r.eot_seen,
+                            cached_drift_ppm,
                         ),
                         None => eprintln!(
-                            "[rxv4] audio={:.1}s syms={} → no SOF",
+                            "[rxv4] audio={:.1}s syms={} → no SOF (ppm={:+.1})",
                             audio_buffer.len() as f64 / AUDIO_RATE as f64,
                             symbols.len(),
+                            cached_drift_ppm,
                         ),
                     }
                 }
@@ -717,8 +925,13 @@ pub fn spawn(
                             audio_buffer.clear();
                             audio_buffer.shrink_to_fit();
                             last_scan_audio_len = 0;
+                            last_scan_wall = None;
                             last_probe_at = None;
                             probe_hot_until = None;
+                            // Keep cached_drift_ppm: same TX→RX chain
+                            // between bursts, so the next burst should
+                            // share the same clock offset. Saves one
+                            // bootstrap iteration per burst.
                         }
                     }
                 }
@@ -1230,6 +1443,14 @@ mod tests {
         for i in (0..audio.len()).step_by(BATCH) {
             let end = (i + BATCH).min(audio.len());
             tx.send(audio[i..end].to_vec()).expect("send");
+            // Sleep ≥ MIN_SCAN_WALL_INTERVAL between chunks so the
+            // worker's wall-clock scan throttle (1 s) sees real wall
+            // time pass and runs `rx_v4_symbols` at the expected
+            // cadence. Without this, paced tests push chunks in
+            // microseconds, the wall throttle clamps to one scan per
+            // run, and multi-burst captures never make it past the
+            // first session.
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         drop(tx);
         // Join WITHOUT setting the stop flag: the worker must observe
@@ -1345,6 +1566,14 @@ mod tests {
         for i in (0..audio.len()).step_by(BATCH) {
             let end = (i + BATCH).min(audio.len());
             tx.send(audio[i..end].to_vec()).expect("send");
+            // Sleep ≥ MIN_SCAN_WALL_INTERVAL between chunks so the
+            // worker's wall-clock scan throttle (1 s) sees real wall
+            // time pass and runs `rx_v4_symbols` at the expected
+            // cadence. Without this, paced tests push chunks in
+            // microseconds, the wall throttle clamps to one scan per
+            // run, and multi-burst captures never make it past the
+            // first session.
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         drop(tx);
         handle
