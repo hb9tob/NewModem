@@ -245,16 +245,20 @@ struct SfDetailPayload {
     /// which may differ from the user's pre-selected one after an
     /// auto-profile refinement from the Golay header.
     profile: String,
-    /// Current session-level drift estimate (ppm, positive = RX clock
-    /// faster) the modem is locked on. The worker maintains this as
-    /// `WorkerState.session_drift_ppm`, initialised by a forced Gardner
-    /// run on the first decoded SF and refreshed when the FFE centroid
-    /// shift exceeds `FFE_CENTROID_REESTIMATE_SAMPLES`. Uniform across
-    /// the tick (every CW in `blocks` was demodulated with the same
-    /// resample correction). Falls back to the per-window
-    /// `result.drift_ppm` only on the very first decoded tick before
-    /// Gardner has had a chance to lock.
+    /// Drift correction (ppm, positive = RX clock faster) actually
+    /// applied on the LAST decoded SF of this tick. Comes from the
+    /// per-window Gardner inside `rx_v2_with_options` (0.10.23+),
+    /// so it varies SF to SF as the channel's drift evolves.
+    /// Visualises the modem's live adaptation in the Info tab.
     ppm: f64,
+    /// Session-wide drift estimate (ppm) the worker holds from the
+    /// pre-decode Gardner. Mostly informational since 0.10.23 -- the
+    /// CLOSED-window decode path no longer reads it (every SF runs
+    /// its own Gardner); kept around for OPEN-window decoding in
+    /// idle pre-activation, FFE-centroid Phase-C trigger comparison,
+    /// and telemetry continuity. `None` until the first tick's
+    /// pre-decode Gardner manages to lock (>=3 markers in the buffer).
+    session_ppm: Option<f64>,
     /// FFE-tap centroid shift on this tick (`final - initial`, in
     /// FSE-input samples). Raw diagnostic. Higher = LMS had to work
     /// harder; profile-dependent meaning (a 0.1-sample shift on Normal
@@ -1327,16 +1331,19 @@ fn scan_and_route(
                 }
             })
             .collect();
-        // Prefer the fresh session estimate over `result.drift_ppm`:
-        // the latter is what was APPLIED (= the hint we passed in,
-        // possibly 0.0 if it was the cold-start tick); the former is
-        // what the modem now believes the channel actually has.
-        let reported_ppm = state.session_drift_ppm.unwrap_or(result.drift_ppm);
+        // 0.10.23+ : the CLOSED branch in `rx_v3_after` runs its own
+        // per-window Gardner inside `rx_v2_with_options`, so
+        // `result.drift_ppm` reflects the LAST SF's per-window estimate
+        // -- exactly what we want to show in the Info tab so the
+        // operator sees the modem adapting SF to SF. The session-level
+        // estimate (held in WorkerState) is now informational only ;
+        // emit it alongside under `session_ppm` for context.
         sink.emit(
             "sf_detail",
             SfDetailPayload {
                 profile: profile_name(state.profile).to_string(),
-                ppm: reported_ppm,
+                ppm: result.drift_ppm,
+                session_ppm: state.session_drift_ppm,
                 ffe_shift: centroid_shift,
                 residual_ppm: residual_ppm_estimate,
                 converged_blocks: result.converged_blocks,
