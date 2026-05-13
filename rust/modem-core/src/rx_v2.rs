@@ -385,47 +385,64 @@ pub fn rx_v2_with_options(
     config: &ModemConfig,
     allow_legacy_grid: bool,
 ) -> Option<RxV2Result> {
-    let first = rx_v2_single(samples, config);
     let clean = |r: &RxV2Result| -> bool {
         r.total_blocks > 0
             && r.converged_blocks * 100 >= r.total_blocks * 99
             && r.segments_decoded > 0
     };
-    if let Some(ref r) = first {
-        if clean(r) {
-            return first;
-        }
-    }
 
-    let mut best = first;
-    let mut best_score = best.as_ref().map(score_result).unwrap_or(-1.0);
-    let mut best_ppm = 0.0_f64;
+    let mut best: Option<RxV2Result> = None;
+    let mut best_score: f64 = -1.0;
+    let mut best_ppm: f64 = 0.0;
 
-    // Gardner TED one-shot estimate
+    // 1. Gardner one-shot FIRST.
+    //
+    // Rationale (2026-05-13 regression analysis on HIGH+ OTA): if we
+    // tried the 0-ppm fast-path first and returned early on "clean"
+    // (= 99 % LDPC), some SFs on a drifted channel would pass the
+    // gate via pilot-tracker absorption while still showing a
+    // scattered constellation -- AND the result would report
+    // `drift_ppm = 0.0`, hiding the actual channel drift from
+    // telemetry. Gardner is sub-ppm accurate on a CLOSED with ≥6
+    // markers and costs ~50 ms ; running it first gives the operator
+    // a faithful drift readout and a tighter constellation, with the
+    // fast-path retained as a fallback for the (rare) case where
+    // Gardner can't lock.
     if let Some(gardner_ppm) = estimate_drift_gardner(samples, config) {
+        // Only resample when Gardner returned a meaningful magnitude.
+        // Below 0.5 ppm the pilot tracker absorbs the residual cleanly
+        // and resampling adds interpolation noise for no gain ; we drop
+        // through to the fast-path below which leaves drift_ppm at 0.0
+        // for telemetry (= "channel is drift-free or within tracker
+        // tolerance, no correction applied").
         if gardner_ppm.abs() >= 0.5 {
-            let corrected = resample_audio(samples, gardner_ppm);
-            if let Some(r) = rx_v2_single(&corrected, config) {
-                let s = score_result(&r);
-                if s > best_score {
-                    best_score = s;
-                    best = Some(r);
-                    best_ppm = gardner_ppm;
-                }
+            if let Some(r) = rx_v2_with_hint(samples, config, gardner_ppm) {
+                best_score = score_result(&r);
+                best_ppm = gardner_ppm;
+                best = Some(r);
             }
         }
     }
 
-    // Safety grid: if Gardner estimate didn't give a clean decode,
-    // sweep ±15 ppm around its centre in 5-ppm steps. Covers cases
-    // where Gardner is off-calibration (rare for RRC pulses but
-    // possible on FTN profiles, dense constellations, low SNR).
-    //
-    // Skipped when `allow_legacy_grid = false` (Pi-class hosts). The
-    // fast-path + Gardner+rx_v2_with_hint above still ran, so we
-    // return whatever they produced -- nothing more is attempted.
-    let gardner_clean = best.as_ref().map(|r| clean(r)).unwrap_or(false);
-    if allow_legacy_grid && !gardner_clean {
+    // 2. Fast-path at 0 ppm. Always tried so a sub-0.5 ppm Gardner
+    //    estimate doesn't lock us out of the obvious decode at 0 ppm.
+    //    If Gardner already produced a clean decode at >=0.5 ppm,
+    //    this won't beat it (score equality keeps the existing best).
+    if let Some(r) = rx_v2_single(samples, config) {
+        let s = score_result(&r);
+        if s > best_score {
+            best_score = s;
+            best_ppm = 0.0;
+            best = Some(r);
+        }
+    }
+
+    // 3. Safety grid: ±15 ppm around best_ppm in 5-ppm steps. Covers
+    //    cases where Gardner is off-calibration (rare for RRC pulses
+    //    but possible on FTN profiles, dense constellations, low SNR).
+    //    Skipped when `allow_legacy_grid = false` (Pi-class hosts).
+    let still_not_clean = best.as_ref().map(|r| !clean(r)).unwrap_or(true);
+    if allow_legacy_grid && still_not_clean {
         let center = best_ppm;
         for &delta in &[-15.0, -10.0, -5.0, 5.0, 10.0, 15.0] {
             let ppm = center + delta;
@@ -1955,10 +1972,15 @@ mod tests {
             &data[..],
             "clean: payload mismatch",
         );
-        // Clean signal: first pass at 0 ppm should be clean -> estimator
-        // never runs, drift_ppm stays at 0.0. This test mainly catches a
-        // regression where the clean path stops being detected as clean.
-        assert!(r.drift_ppm.abs() < 0.1, "clean: drift_ppm={:+.2}", r.drift_ppm);
+        // Clean signal: 0.10.24+ runs Gardner unconditionally (per-window
+        // estimator surfaces the actual channel state, not just "no
+        // correction applied"). Gardner's OLS on synthetic markers has
+        // a ~1 ppm noise floor even on a literally drift-free stream,
+        // so we accept anything within ±2 ppm. The point is "no large
+        // bogus drift" -- we used to require literally 0 here, but
+        // that contract conflicted with the 2026-05-13 fix that made
+        // the estimator visible per-SF.
+        assert!(r.drift_ppm.abs() < 2.0, "clean: drift_ppm={:+.2}", r.drift_ppm);
     }
 
     /// Marker-fit drift estimator (Phase 1) on HIGH+ with injected

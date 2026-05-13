@@ -1256,6 +1256,32 @@ fn scan_and_route(
     // Both phases are gated on a non-empty pilot_sigma2_per_segment
     // (same guard as the [scan-segs] / sf_detail emits) so idle ticks
     // don't spin Gardner on noise.
+    // EWMA weighted propagation of the per-window drift into the
+    // session-level estimate. 0.10.25+ : each successful tick's
+    // `result.drift_ppm` (= last decoded SF's per-window Gardner)
+    // contributes 30 % weight ; the rolling session value contributes
+    // 70 %. This decouples the "live SF drift" reading (jittery,
+    // sub-ppm noise from Gardner OLS) from the "session anchor"
+    // (smooth, follows thermal walk). The OPEN-window hint cascade
+    // and the FFE-centroid Phase-C trigger both read the smoothed
+    // value, so a single noisy SF doesn't pollute the session state.
+    //
+    // Gated on `|result.drift_ppm| >= 0.5` so the fast-path's
+    // ppm=0 fallback (= "no correction was applied this SF") doesn't
+    // drag the smoothed estimate toward 0 when the channel really
+    // has drift. Phase A (cold start) and Phase C (FFE refresh)
+    // still snap session_drift_ppm to fresh Gardner values when
+    // they fire.
+    const DRIFT_EWMA_ALPHA: f64 = 0.30;
+    if !result.pilot_sigma2_per_segment.is_empty() && result.drift_ppm.abs() >= 0.5 {
+        let per_window = result.drift_ppm;
+        let new_session = match state.session_drift_ppm {
+            Some(s) => (1.0 - DRIFT_EWMA_ALPHA) * s + DRIFT_EWMA_ALPHA * per_window,
+            None => per_window,
+        };
+        state.session_drift_ppm = Some(new_session);
+    }
+
     let centroid_shift = result.ffe_centroid_final - result.ffe_centroid_initial;
     // Convert centroid_shift (in FSE-input samples accumulated over one
     // SF) to ppm. `fse_decim_factor` depends only on (sps, pitch) of
