@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Modem NBFM — Modem 2x (trame V4 & RX V4)</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --good: #2b9f5f;
+        --good-soft: #eafbf2;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem 6rem;
+    }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block;
+        font-size: 1rem;
+        font-weight: 400;
+        color: #666;
+        margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 {
+        margin-top: 1.8rem;
+        color: #444;
+    }
+    figure {
+        margin: 1.5rem 0;
+        padding: 0.8rem;
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    figcaption {
+        font-size: 0.9rem;
+        color: #555;
+        margin-top: 0.6rem;
+        font-style: italic;
+    }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em;
+        border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e;
+        color: #dcdcaa;
+        padding: 1rem;
+        border-radius: 5px;
+        overflow-x: auto;
+        font-size: 0.85rem;
+        line-height: 1.35;
+    }
+    pre code {
+        background: transparent;
+        color: inherit;
+        padding: 0;
+    }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+        font-size: 0.92rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.45rem 0.6rem;
+        text-align: left;
+        vertical-align: top;
+    }
+    th {
+        background: var(--accent-soft);
+        color: var(--accent);
+    }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: #fff8f0;
+        margin: 1rem 0;
+        border-radius: 0 4px 4px 0;
+    }
+    .callout.info {
+        border-left-color: var(--accent);
+        background: var(--accent-soft);
+    }
+    .callout.ok {
+        border-left-color: var(--good);
+        background: var(--good-soft);
+    }
+    nav.toc {
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 1rem 1.5rem;
+        margin: 1.5rem 0;
+        font-size: 0.95rem;
+    }
+    nav.toc ol {
+        margin: 0.4rem 0 0 1rem;
+        padding: 0;
+    }
+    nav.toc a {
+        color: var(--accent);
+        text-decoration: none;
+    }
+    nav.toc a:hover {
+        text-decoration: underline;
+    }
+    .meta {
+        color: #888;
+        font-size: 0.88rem;
+        margin-top: -0.3rem;
+    }
+    .tag {
+        display: inline-block;
+        padding: 0.1em 0.5em;
+        background: var(--accent);
+        color: white;
+        border-radius: 3px;
+        font-size: 0.75rem;
+        margin-right: 0.3rem;
+        letter-spacing: 0.5px;
+    }
+    .tag.v4 { background: #2b7fbf; }
+    .tag.rx { background: #bf5f2b; }
+    .tag.tx { background: #2bbf7f; }
+    .tag.done { background: #2b9f5f; }
+    .tag.todo { background: #999; }
+    .status-table td:first-child { white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Modem NBFM — Modem 2x (trame V4 &amp; pipeline RX V4)
+    <span class="sub">Documentation technique — 2026-05-13 — branche <code>feat/modem-2x</code>, HEAD <code>7d5f26c</code></span>
+</h1>
+
+<p class="meta">
+    Sources : <code>rust/modem-core2x/{profile2x,plheader,pilot_block,frame2x,rx_v4,modem2x}.rs</code>,
+    <code>rust/modem-core-base/{farrow,timing_loop,rrc,soft_demod}.rs</code>,
+    <code>rust/modem-worker2x/{streaming_frontend,rx_worker2x,tx_worker2x}.rs</code>.
+    <br>
+    Pour la lignée historique des choix : <a href="v3_architecture.html">v3_architecture.html</a> (préambule, trame, RX V3).
+</p>
+
+<nav class="toc">
+    <strong>Sommaire</strong>
+    <ol>
+        <li><a href="#intro">Pourquoi le 2x — objectifs et héritage</a></li>
+        <li><a href="#state">État actuel — phases livrées et reste à faire</a></li>
+        <li><a href="#blocks">Diagramme blocs TX et RX</a></li>
+        <li><a href="#frame">Trame V4 — PLHEADER, cycle, EOT</a></li>
+        <li><a href="#pilots">Blocs pilote sparse <code>(1+j)/√2</code></a></li>
+        <li><a href="#timing">Récupération d'horloge fil-de-l'eau (Farrow + Gardner)</a></li>
+        <li><a href="#ted">TED pilot-aided — D-1c-ii</a></li>
+        <li><a href="#profiles">Huit profils 2x — Rs, débits, overhead</a></li>
+        <li><a href="#sigma2">σ² — estimation, budget, lecture</a></li>
+        <li><a href="#perf">Performances mesurées et attendues</a></li>
+        <li><a href="#crates">Layout des crates Rust</a></li>
+        <li><a href="#cli">CLI et tests de référence</a></li>
+    </ol>
+</nav>
+
+<!-- ======================================================================= -->
+<h2 id="intro">1. Pourquoi le 2x — objectifs et héritage</h2>
+
+<p>
+    Le modem 2x est une <strong>refonte parallèle</strong> du modem V3 dans
+    le même workspace Rust, vivant dans les crates suffixées <code>2x</code>
+    (<code>modem-core2x</code>, <code>modem-worker2x</code>). Les modes legacy
+    (V3) et 2x sont <strong>mutuellement exclusifs</strong> à l'exécution :
+    le CLI les sélectionne via <code>--family &lt;legacy|2x&gt;</code> et la
+    GUI les dispatche via <code>is_2x_profile</code>.
+</p>
+
+<p>
+    Les trois objectifs visés étaient :
+</p>
+
+<ol>
+    <li><strong>Overhead trame divisé par ~5.</strong> V3 dépense
+        ~21 % du temps-symbole en non-payload (marqueurs, TDM pilots,
+        runout, ré-insertion préambule). V4 vise <strong>~4 %</strong> en
+        s'inspirant de DVB-S2X EN 302 307-1 : un PLHEADER compact (192
+        sym) une fois par cycle de ~4 s, plus un bloc pilote sparse de
+        36 symboles après chaque LDPC codeword.</li>
+    <li><strong>Récupération d'horloge en boucle fermée.</strong> V3
+        utilisait un estimateur open-loop <em>Phase 1d</em> (mesurer le
+        drift puis ré-échantillonner). V4 utilise la chaîne canonique
+        Farrow + Gardner TED + PI loop, capable de suivre &gt;100 ppm en
+        continu sans accumulation, et qui prépare la migration QO-100
+        (CFO ±30–50 kHz + bruit de phase 10 GHz, voir
+        <code>qo100-cfo-readiness</code>).</li>
+    <li><strong>Promotion 64-APSK hors expérimental.</strong> En V3,
+        HIGH++ était gated derrière un flag ; en V4 les huit profils
+        sont auto-détectés sans distinction.</li>
+</ol>
+
+<div class="callout info">
+    <strong>Décisions cardinales</strong> validées dans
+    <code>~/.claude/plans/je-voudrsis-edudier-la-precious-treasure.md</code> :
+    <ul>
+        <li>Crates parallèles, pas de migration in-place de V3.</li>
+        <li>PLHEADER &laquo; inspired only &raquo; — on garde la chaîne Golay(24,12)
+            du codebase plutôt que le PLSCODE biorthogonal (64,7) DVB-S2X.</li>
+        <li><code>HighPlusPlus2x</code> (64-APSK) promu dans
+            <code>ALL_AUTO_DETECT</code>.</li>
+        <li>Pilotes densifiés (2 blocs/CW) pour les APSK-32/64 où la
+            distance min quadratique réduite exige un anchor plus serré.</li>
+    </ul>
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="state">2. État actuel — phases livrées et reste à faire</h2>
+
+<p>
+    Branche <code>feat/modem-2x</code>, basée sur <code>c7b1264</code>
+    (release V3 finale 0.10.15). 18 commits ; 214 tests unitaires verts
+    sur les crates touchées + <code>cargo test --workspace --exclude
+    newmodem-collector</code> exit 0. Roundtrip TX→RX CLI byte-identique
+    sur les 8 profils (600 B et 800 B payloads).
+</p>
+
+<table class="status-table">
+    <thead>
+        <tr>
+            <th>Phase</th>
+            <th>Description</th>
+            <th>Commit</th>
+            <th>État</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Étape 0</td>
+            <td>Extraction du crate <code>modem-core-base</code> (DSP commun)</td>
+            <td><code>374a699</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>A</td>
+            <td>Interpolateur Farrow cubic-Lagrange</td>
+            <td><code>2ab1ff3</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>B</td>
+            <td>TimingLoop (Gardner / AbsGardner TED + PI loop)</td>
+            <td><code>924482e</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>C-0..C-4</td>
+            <td>Crate <code>modem-core2x</code> : PLHEADER, pilot_block, profile2x,
+                frame2x, rx_v4</td>
+            <td><code>0ad1865</code>→<code>87e02b8</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>C-5</td>
+            <td>Gate2x + detect2x (PreambleProbe2x FFT, auto-detect family)</td>
+            <td>—</td>
+            <td><span class="tag todo">déféré</span></td>
+        </tr>
+        <tr>
+            <td>C-6</td>
+            <td>V4Modem trait impl</td>
+            <td><code>29b4d58</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>C-7</td>
+            <td>Crate <code>modem-worker2x</code> (TX + RX audio domain)</td>
+            <td><code>97f10c6</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>C-8</td>
+            <td>CLI <code>nbfm-modem --family &lt;legacy|2x&gt;</code></td>
+            <td><code>bc2803d</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>D-0 / D-0.5</td>
+            <td>Extraction <code>modem-worker-base</code> (EventSink/PTT/WavSink +
+                <code>tx_runtime</code>)</td>
+            <td><code>139a4e8</code>, <code>70e0e12</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>D-1a / D-1b</td>
+            <td>GUI TX 2x + GUI RX 2x WAV-replay</td>
+            <td><code>4ac1c3c</code>, <code>1a1c8c4</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td>D-1c</td>
+            <td>Streaming RX fil-de-l'eau (Farrow + Gardner sans sliding-window)</td>
+            <td><code>636c578</code></td>
+            <td><span class="tag done">livré</span></td>
+        </tr>
+        <tr>
+            <td><strong>D-1c-ii</strong></td>
+            <td><strong>TED pilot-aided (AbsGardner sur intérieur strict des
+                pilotes)</strong></td>
+            <td><code>7d5f26c</code></td>
+            <td><span class="tag done">livré 2026-05-13</span></td>
+        </tr>
+        <tr>
+            <td>Étape D</td>
+            <td>Tests intégration <code>roundtrip_2x.rs</code> +
+                <code>cli_parity_2x.rs</code></td>
+            <td>—</td>
+            <td><span class="tag todo">à faire</span></td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout ok">
+    <strong>Validation actuelle.</strong> Sur sound-card 48 kHz NBFM
+    (canal modélisé), les 8 profils décodent à 100 % byte-identique
+    à travers le CLI roundtrip (TX WAV → RX WAV). La GUI exécute le
+    même pipeline 2x via <code>start_capture</code> en streaming.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="blocks">3. Diagramme blocs TX et RX</h2>
+
+<h3>3.1 TX (émission)</h3>
+
+<pre><code>EncodeRequest (payload, AppHeader, profile, callsign, session_id)
+   │
+   ▼
+RaptorQ codec      ┐
+   │               │   modem-framing
+   ▼               │   (transport-agnostique)
+PayloadEnvelope    ┘
+   │
+   ▼
+build_superframe_v4_range  ┐
+   ├─ AppHeader → META-CW   │
+   ├─ RaptorQ packets       │   modem-core2x
+   │   → DATA-CW × N         │
+   ├─ LDPC encoder           │
+   ├─ Interleaver            │
+   ├─ Constellation mapper   │
+   └─ Sparse pilot blocks    ┘
+   │   (36 sym (1+j)/√2 après chaque CW)
+   │
+   ▼
+[PLHEADER 192][LMS warmup 0/32/64][META-CW+pilot][DATA-CW+pilot]×N
+   │
+   ▼
+modulator (RRC pulse shaping + NCO upmix DATA_CENTER_HZ=1100 Hz)
+   │
+   ▼
+audio f32 mono 48 kHz (avec 0.2 s silence inter-frame pour VOX)
+</code></pre>
+
+<h3>3.2 RX (réception) — pipeline complet streaming</h3>
+
+<pre><code>audio f32 chunks (mic ou WAV replay)
+   │
+   ▼
+┌─────────────── modem-worker2x::StreamingFrontend ───────────────┐
+│                                                                 │
+│   NCO downmix continu  (phase absolue, no per-chunk reset)      │
+│        │                                                        │
+│        ▼                                                        │
+│   RRC matched filter   (overlap-save, mode='same')              │
+│        │                                                        │
+│        ▼                                                        │
+│   Farrow cubic Lagrange interp à position fractionnaire         │
+│        │                                                        │
+│        ▼                                                        │
+│   Gardner TED (data) | AbsGardner TED (intérieur pilote)        │
+│        │   + PI loop  →  correction sps                         │
+│        ▼                                                        │
+│   Vec&lt;Complex64&gt; symboles timing-corrects                       │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼   (buffer cumulatif)
+                  modem-core2x::rx_v4_symbols
+                          │
+                          ├── find_next_sof (Chu corr, peak ≥ 0.5)
+                          ├── decode_plheader (Golay×9, CRC16)
+                          ├── per-CW LS gain on pilots (mean / P)
+                          ├── deinterleave_pilot_blocks
+                          ├── soft_demod::llr_maxlog (σ² par CW)
+                          ├── LdpcDecoder (≤30 iter)
+                          └── RaptorQ reassembly (AppHeader-keyed)
+                          │
+                          ▼
+              RxResult2x { data, app_header, cycles,
+                           converged_cws, sigma2_data,
+                           first_sof_at, ... }
+                          │
+                          ▼   (one-shot après 1er SOF)
+              frontend.align_to_sof(first_sof_at)
+              ↳ active AbsGardner sur intérieur pilote (D-1c-ii)
+</code></pre>
+
+<div class="callout info">
+    Le streaming RX <strong>n'utilise plus de sliding-window</strong>
+    (différence de fond avec V3) : Gardner produit chaque symbole une
+    fois timing-correctement, donc <code>rx_v4_symbols</code> est appelé
+    périodiquement sur un buffer qui ne fait que croître ; les
+    re-décodes sont idempotents.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="frame">4. Trame V4 — PLHEADER, cycle, EOT</h2>
+
+<h3>4.1 PLHEADER (192 sym = 64 SOF + 128 PLS)</h3>
+
+<table>
+    <thead>
+        <tr><th>Champ</th><th>Taille</th><th>Contenu</th><th>Codage</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>SOF</strong> (Start Of Frame)</td>
+            <td>64 sym</td>
+            <td>Frank-Zadoff-Chu, root selon famille (A=1 sps≥1200, B=3
+                ROBUST, C=5 ULTRA)</td>
+            <td>QPSK unit-circle, autocorr cyclique parfaite</td>
+        </tr>
+        <tr>
+            <td><strong>PLS</strong></td>
+            <td>128 sym</td>
+            <td>Payload 13 B (104 bits + 4 zéros) → <code>PlsPayload</code>
+                : profile_index, seg_id, session_id_low, base_esi (24
+                bits), flags, frame_counter, freq_offset</td>
+            <td>9 blocs Golay(24,12) → 216 bits → 108 sym QPSK ;
+                + 12 sym redondance bloc 0 (profile_index) ; + 8 sym zéros</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3>4.2 Cycle (≈ 4 s)</h3>
+
+<p>
+    Un cycle PLHEADER est l'unité repérable côté RX. Layout :
+</p>
+
+<pre><code>[PLHEADER 192 sym]
+[LMS warmup 32 (APSK-32) ou 64 (APSK-64) sym, vide sinon]
+[META-CW + pilot block(s)]                ← AppHeader×4 dans le META
+[DATA-CW + pilot block(s)] × cw_per_cycle ← RaptorQ packets ESI base_esi..
+</code></pre>
+
+<p>
+    Cible : <code>V4_PREAMBLE_PERIOD_S = 4.0 s</code>. Le nombre de
+    DATA-CWs par cycle est calculé en remplissant le budget de
+    <code>4 × Rs</code> symboles après avoir consommé PLHEADER + warmup
+    + META-CW :
+</p>
+
+<pre><code>cw_per_cycle = max(1, (4·Rs − 192 − warmup − cw_with_pilots_meta) / cw_with_pilots)
+</code></pre>
+
+<h3>4.3 Cycle EOT (End-Of-Transmission)</h3>
+
+<p>
+    Une transmission se termine sur un cycle dédié avec :
+</p>
+<ul>
+    <li>PLHEADER avec flag <code>FLAG2X_EOT</code> (bit 1) levé.</li>
+    <li>Un META-CW portant une AppHeader sentinel (file_size = 0).</li>
+    <li>Aucun DATA-CW.</li>
+</ul>
+
+<div class="callout">
+    <strong>Bug subtil corrigé (897edb2).</strong> <code>decode_one_cw</code>
+    écrasait l'AppHeader à chaque META-CW décodé ; l'EOT (toujours
+    dernier) clobbrait donc la vraie AppHeader → reassembly RaptorQ
+    avec <code>n_source_cw=0</code> → buffer vide. Fix : conserver
+    l'AppHeader existante quand la nouvelle a <code>file_size=0</code>.
+    Test de régression : <code>data_then_eot_preserves_real_app_header</code>.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="pilots">5. Blocs pilote sparse <code>(1+j)/√2</code></h2>
+
+<p>
+    Chaque LDPC codeword est suivi sur le fil de
+    <code>pilot_blocks_per_cw × 36</code> symboles identiques :
+</p>
+
+<pre><code>P = (1 + j)/√2     |P| = 1     arg(P) = π/4
+</code></pre>
+
+<p>
+    Propriétés exploitées par le RX :
+</p>
+
+<ul>
+    <li><strong>AGC neutre</strong> — <code>|P|² = 1 = Es</code>, donc
+        ces symboles n'ajoutent pas d'énergie supplémentaire.</li>
+    <li><strong>Estimateur de gain trivial</strong> — moyenne complexe
+        des 36 symboles ÷ <code>P</code> donne le complex gain de la CW.</li>
+    <li><strong>Distinct des points data</strong> — sur 16/32/64-APSK,
+        <code>P</code> est à <code>|P|=1</code>, entre les rings, hors de
+        toute constellation data. Sur QPSK et 8PSK, c'est exactement un
+        point data (le rayon à π/4).</li>
+    <li><strong>Anchor TED pour D-1c-ii</strong> — l'intérieur strict
+        d'un bloc (34 symboles sur 36) est garantie de magnitude
+        constante, donc AbsGardner y est non-biaisé.</li>
+</ul>
+
+<p>
+    Pour les profils où la distance min quadratique est plus faible
+    (APSK-32, APSK-64), la densité passe à <strong>2 blocs/CW</strong> :
+    le CW est splitté en deux moitiés (de tailles inégales si
+    <code>cw_data_syms</code> est impair — Apsk32 : 461 = 230 + 231 → la
+    seconde moitié absorbe le reste). Le RX retrouve les positions de
+    manière déterministe via <code>chunk_offset_is_pilot</code>.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="timing">6. Récupération d'horloge fil-de-l'eau</h2>
+
+<p>
+    Le streaming RX implémente la chaîne <strong>Farrow + Gardner TED +
+    PI loop</strong> en boucle fermée. Quatre changements par rapport au
+    chemin V3 batch :
+</p>
+
+<ol>
+    <li><strong>NCO à phase absolue</strong> — un compteur
+        <code>nco_base_sample: u64</code> est avancé chunk par chunk,
+        donc la phase de la porteuse reste continue même quand le buffer
+        audio interne est trimmé. Pas de phase-step à chaque chunk.</li>
+    <li><strong>RRC matched filter overlap-save</strong> — le buffer
+        garde <code>taps.len() + sps + marge</code> samples de queue
+        entre chunks pour absorber la zone warm-up de la FIR.</li>
+    <li><strong>Farrow cubic-Lagrange interp</strong> — chaque strobe
+        échantillonne à une position fractionnaire <code>strobe_pos</code>
+        sans ré-échantillonner l'audio entier. Cubic Lagrange est exact
+        pour tout polynôme de degré ≤ 3 et reste à ≤ −50 dBc jusqu'à
+        ~0.4·fs.</li>
+    <li><strong>PI loop sur erreur Gardner</strong> — gains DVB-S2
+        références <code>Kp = 0.05</code>, <code>Ki = 0.005</code>,
+        soit une bande passante de boucle B<sub>L</sub>·T<sub>sym</sub>
+        ≈ 0.01 (lente, robuste au bruit). La correction
+        <code>±correction</code> est ajoutée au nominal
+        <code>sps</code> entre chaque strobe.</li>
+</ol>
+
+<h3>6.1 Strobes de lead-in</h3>
+
+<p>
+    Les ~6 premiers strobes (où la position EARLY de Farrow tombe dans
+    la zone de warmup FIR) utilisent <code>mf[k·sps]</code> directement
+    sans passer par Farrow, et <strong>ne touchent pas la TimingLoop</strong>.
+    L'intégrateur démarre à 0 propre.
+</p>
+
+<h3>6.2 Mémoire bornée</h3>
+
+<p>
+    Le buffer audio interne est trimmé après chaque chunk à
+    <code>taps.len() + sps + 4</code> samples ahead du prochain strobe.
+    Pas de croissance non bornée même sur une capture longue (heures).
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="ted">7. TED pilot-aided — phase D-1c-ii</h2>
+
+<p>
+    Sur les constellations multi-ring APSK, AbsGardner
+    (<code>|y_late|² − |y_early|²</code>) est <strong>biaisé par les
+    données</strong> : la transition entre symboles de rings différents
+    génère une erreur de timing fictive qui fait dériver l'intégrateur
+    PI loop. Gardner pur (<code>Re((y_late − y_early) · conj(y_on))</code>)
+    est moins précis sur PSK pur mais reste sans biais data.
+</p>
+
+<p>
+    La recette DVB-S2X §9.3.2 :
+</p>
+
+<ol>
+    <li>Tracker en Gardner pur tant qu'on n'a pas verrouillé un SOF.</li>
+    <li>Une fois le SOF localisé (via <code>rx_v4.first_sof_at</code>),
+        ancrer le frontend avec <code>align_to_sof(abs_sym_idx)</code>.</li>
+    <li>Pré-calculer un <code>cycle_pilot_map: Vec&lt;bool&gt;</code> sur
+        un cycle complet. <code>map[(abs_idx − anchor) % cycle_len]</code>
+        dit si le strobe courant est sur un pilote.</li>
+    <li>Sur l'<strong>intérieur strict</strong> d'un bloc pilote (les 34
+        symboles où <code>abs_idx</code>, <code>abs_idx−1</code> et
+        <code>abs_idx+1</code> sont tous pilotes), la TED bascule sur
+        AbsGardner. Le bord (1er et dernier symbole du bloc) reste sur
+        Gardner — sinon les Farrow lookups EARLY/LATE à
+        <code>strobe ± sps/2</code> tomberaient sur la transition
+        pilote/data et AbsGardner re-deviendrait biaisé par le saut
+        d'amplitude.</li>
+</ol>
+
+<p>
+    Validation : test <code>pilot_aided_at_100_ppm_apsk32_matches_gardner_only</code>
+    montre les deux modes décodent identiquement à 100 ppm sur HighPlus2x.
+    Test <code>pilot_aided_noise_free_apsk64</code> montre que l'activation
+    du gate sur burst noise-free ne fait pas dériver l'intégrateur
+    (|integ| &lt; 1e-2). Sweep <code>pilot_aided_all_apsk_profiles_decode_at_50_ppm</code>
+    sur les 5 profils APSK à +50 ppm : tous passent.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="profiles">8. Huit profils 2x — Rs, débits, overhead</h2>
+
+<p>
+    Toutes les valeurs ci-dessous sont calculées depuis le code source
+    (<code>frame2x::superframe_total_symbols_v4</code> et
+    <code>ModemConfig2x::net_bitrate</code>) :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>Constellation</th>
+            <th>Rs (Bd)</th>
+            <th>LDPC</th>
+            <th>Pilots/CW</th>
+            <th>cw_data_syms</th>
+            <th>cw_per_cycle</th>
+            <th>cycle (sym → s)</th>
+            <th>net bps<sup>(a)</sup></th>
+            <th>Overhead<sup>(b)</sup></th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>ULTRA2X</strong></td>
+            <td>QPSK</td>
+            <td class="num">500</td>
+            <td>1/2</td>
+            <td class="num">1</td>
+            <td class="num">1152</td>
+            <td class="num">1</td>
+            <td class="num">2568 → 5.14 s</td>
+            <td class="num">~485</td>
+            <td class="num">55.1 %</td>
+        </tr>
+        <tr>
+            <td><strong>ROBUST2X</strong></td>
+            <td>QPSK</td>
+            <td class="num">1000</td>
+            <td>1/2</td>
+            <td class="num">1</td>
+            <td class="num">1152</td>
+            <td class="num">2</td>
+            <td class="num">3756 → 3.76 s</td>
+            <td class="num">~970</td>
+            <td class="num">38.7 %</td>
+        </tr>
+        <tr>
+            <td><strong>NORMAL2X</strong></td>
+            <td>8PSK</td>
+            <td class="num">1500</td>
+            <td>1/2</td>
+            <td class="num">1</td>
+            <td class="num">768</td>
+            <td class="num">6</td>
+            <td class="num">5820 → 3.88 s</td>
+            <td class="num">~2150</td>
+            <td class="num">20.8 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH2X</strong></td>
+            <td>16-APSK</td>
+            <td class="num">1500</td>
+            <td>3/4</td>
+            <td class="num">1</td>
+            <td class="num">576</td>
+            <td class="num">8</td>
+            <td class="num">5700 → 3.80 s</td>
+            <td class="num">~4235</td>
+            <td class="num">19.2 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+2X</strong></td>
+            <td>32-APSK</td>
+            <td class="num">1500</td>
+            <td>3/4</td>
+            <td class="num">2</td>
+            <td class="num">461 (230+231)</td>
+            <td class="num">9</td>
+            <td class="num">5554 → 3.70 s</td>
+            <td class="num">~4865</td>
+            <td class="num">25.3 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH++2X</strong></td>
+            <td>64-APSK</td>
+            <td class="num">1500</td>
+            <td>3/4</td>
+            <td class="num">2</td>
+            <td class="num">384 (192+192)</td>
+            <td class="num">11</td>
+            <td class="num">5728 → 3.82 s</td>
+            <td class="num">~5685</td>
+            <td class="num">26.2 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH56_2X</strong></td>
+            <td>16-APSK</td>
+            <td class="num">1500</td>
+            <td>5/6</td>
+            <td class="num">1</td>
+            <td class="num">576</td>
+            <td class="num">8</td>
+            <td class="num">5700 → 3.80 s</td>
+            <td class="num">~4705</td>
+            <td class="num">19.2 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+56_2X</strong></td>
+            <td>32-APSK</td>
+            <td class="num">1500</td>
+            <td>5/6</td>
+            <td class="num">2</td>
+            <td class="num">461 (230+231)</td>
+            <td class="num">9</td>
+            <td class="num">5554 → 3.70 s</td>
+            <td class="num">~5405</td>
+            <td class="num">25.3 %</td>
+        </tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    <sup>(a)</sup> Débit utile avant codage RaptorQ — comprend l'overhead
+    pilots sparse + LDPC, exclut le PLHEADER (192 sym) et la META-CW. Le
+    débit applicatif final est ≈ <code>net_bps × cw_per_cycle / (cw_per_cycle+1)</code>
+    pour soustraire la META-CW, puis ≈ ×0.95 typique pour le surdimensionnement
+    RaptorQ.
+    <br>
+    <sup>(b)</sup> Overhead total cycle = 1 − (cw_per_cycle × cw_data_syms)
+    / cycle_total_syms — donc inclut PLHEADER + LMS warmup + META-CW +
+    pilots, comparé à un cycle qui ne transporterait que les DATA-CWs.
+</p>
+
+<div class="callout info">
+    <strong>Comparaison V3 → V4 sur HIGH</strong> :
+    overhead V3 mesuré ~21 % steady state (V3 frame includes marker,
+    intra-CW pilots, runout, periodic preamble re-insertion). Overhead
+    V4 HIGH2X = 19.2 %. La promesse "4 % overhead" du plan initial
+    s'évalue <em>une fois retirée la part META-CW</em> qui reste
+    techniquement payload (juste pas application-payload) ; les chiffres
+    bruts ci-dessus suréestiment donc l'overhead "structural" par
+    rapport à DVB-S2X strict.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="sigma2">9. σ² — estimation, budget, lecture</h2>
+
+<h3>9.1 Définition</h3>
+
+<p>
+    Le σ² rapporté dans <code>RxResult2x.sigma2_data</code> est la
+    <strong>variance résiduelle des symboles pilote après division par
+    le gain estimé</strong>, moyenné sur les CWs d'un burst :
+</p>
+
+<pre><code>// rx_v4::estimate_cw_sigma2 (par CW)
+for chaque symbole pilote p_recu dans la CW {
+    p_normé = p_recu / gain_estimé_CW
+    sum_sq += |p_normé − P|²       // P = (1+j)/√2
+}
+σ²_CW = sum_sq / N_pilotes
+
+// agrégation
+σ²_data = mean(σ²_CW pour chaque CW data) clampé à SIGMA2_FLOOR=1e-3
+</code></pre>
+
+<p>
+    L'unité est <strong>variance par dimension complexe pour Es = 1</strong>,
+    donc directement comparable à un Es/N0 :
+</p>
+
+<pre><code>Es/N0 [dB] ≈ −10·log10(σ²)
+</code></pre>
+
+<h3>9.2 Utilisation : échelle des LLR</h3>
+
+<p>
+    Le σ² par CW est passé à <code>soft_demod::llr_maxlog</code> :
+</p>
+
+<pre><code>LLR_k(y) = (min_{s:b_k=1} |y−s|² − min_{s:b_k=0} |y−s|²) / σ²
+</code></pre>
+
+<p>
+    Sous-estimer σ² produit des LLR sur-confiants → le LDPC fait des
+    décisions précoces sur du bruit. Sur-estimer σ² aplatit les LLR → le
+    décodeur converge plus lentement ou rate des erreurs corrigibles. La
+    chaîne est donc <strong>directement sensible</strong> à la qualité
+    de l'estimation pilote, ce qui motive la densification 2 blocs/CW
+    sur les APSK-32/64.
+</p>
+
+<h3>9.3 Budget et seuils par profil (référence V3, applicable au 2x)</h3>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>σ² typique<br>(sound-card propre, V3)</th>
+            <th>σ² budget<br>(threshold décodage)</th>
+            <th>Es/N0 équivalent</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td>ULTRA2X (QPSK 1/2)</td>   <td class="num">~0.01</td> <td class="num">≤ 0.40</td> <td class="num">≥ +4 dB</td></tr>
+        <tr><td>ROBUST2X (QPSK 1/2)</td>  <td class="num">~0.01</td> <td class="num">≤ 0.40</td> <td class="num">≥ +4 dB</td></tr>
+        <tr><td>NORMAL2X (8PSK 1/2)</td>  <td class="num">~0.01</td> <td class="num">≤ 0.20</td> <td class="num">≥ +7 dB</td></tr>
+        <tr><td>HIGH2X (16-APSK 3/4)</td> <td class="num">~0.01</td> <td class="num">≤ 0.10</td> <td class="num">≥ +10 dB</td></tr>
+        <tr><td>HIGH+2X (32-APSK 3/4)</td><td class="num">~0.012</td><td class="num">≤ 0.05</td> <td class="num">≥ +13 dB</td></tr>
+        <tr><td>HIGH++2X (64-APSK 3/4)</td><td class="num">~0.012</td><td class="num">≤ 0.025</td><td class="num">≥ +16 dB</td></tr>
+        <tr><td>HIGH56_2X (16-APSK 5/6)</td><td class="num">~0.01</td><td class="num">≤ 0.07</td><td class="num">≥ +11.5 dB</td></tr>
+        <tr><td>HIGH+56_2X (32-APSK 5/6)</td><td class="num">~0.012</td><td class="num">≤ 0.04</td><td class="num">≥ +14 dB</td></tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    Colonne "typique" : valeurs σ² observées sur signal V3 propre,
+    sound-card 48 kHz, NBFM modélisé SNR ~20 dB post-démod, sans canal.
+    Voir mémoire <code>constellation-blobs-drift-logging-todo</code>.
+    Le 2x devrait donner σ² <em>au moins aussi bon</em> grâce au timing
+    closed-loop (moins de smear data par drift résiduel).
+    <br>
+    Colonne "budget" : ordre de grandeur Es/N0 minimum pour décodage
+    LDPC convergent sur N=2304. Ce sont des références DVB-S2X +1.5 dB
+    de marge (notre LDPC est 28× plus court que DVB-S2X 64800).
+</p>
+
+<h3>9.4 Floor configuré</h3>
+
+<p>
+    <code>SIGMA2_FLOOR = 1e-3</code> dans <code>rx_v4.rs</code>. Sur un
+    burst noise-free, l'estimation pilote retournerait
+    σ² ≈ 0 ce qui ferait diverger les LLR ; le floor maintient une
+    échelle saine. Test : <code>pilot_sigma2_below_floor_when_noise_free</code>.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="perf">10. Performances mesurées et attendues</h2>
+
+<h3>10.1 Roundtrip CLI (mesuré)</h3>
+
+<p>
+    Sur Pi5 8 GB, 600 B et 800 B random payloads, à travers le pipeline
+    complet TX→WAV→RX :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>Taux décodage</th>
+            <th>Convergence LDPC</th>
+            <th>σ² mesuré</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td>ULTRA2X</td>    <td>100 %</td><td>11/11 CWs</td><td>~floor</td></tr>
+        <tr><td>ROBUST2X</td>   <td>100 %</td><td>11/11</td>    <td>~floor</td></tr>
+        <tr><td>NORMAL2X</td>   <td>100 %</td><td>11/11</td>    <td>~floor</td></tr>
+        <tr><td>HIGH2X</td>     <td>100 %</td><td>11/11</td>    <td>~floor</td></tr>
+        <tr><td>HIGH+2X</td>    <td>100 %</td><td>11/11</td>    <td>0.001–0.015</td></tr>
+        <tr><td>HIGH++2X</td>   <td>100 %</td><td>11/11</td>    <td>0.001–0.015</td></tr>
+        <tr><td>HIGH56_2X</td>  <td>100 %</td><td>11/11</td>    <td>~floor</td></tr>
+        <tr><td>HIGH+56_2X</td> <td>100 %</td><td>11/11</td>    <td>0.001–0.015</td></tr>
+    </tbody>
+</table>
+
+<h3>10.2 Tracking de drift (mesuré, streaming)</h3>
+
+<p>
+    Tests <code>timing_loop_tracks_resampled_audio_50ppm</code> et
+    <code>pilot_aided_at_100_ppm_apsk32_matches_gardner_only</code> :
+</p>
+
+<ul>
+    <li><strong>+50 ppm</strong> sur les 8 profils, Gardner pur :
+        décode 100 %, integ converge vers la bonne polarité.</li>
+    <li><strong>+100 ppm</strong> sur HIGH+2X, Gardner pur et pilot-aided :
+        les deux décodent 100 %.</li>
+    <li><strong>0 ppm noise-free</strong> avec pilot-aided activé :
+        |integ| reste &lt; 1e-2 (pas de dérive parasite induite par
+        AbsGardner sur pilotes).</li>
+</ul>
+
+<h3>10.3 Throughput applicatif attendu</h3>
+
+<p>
+    Net data rate × (cw_per_cycle / (cw_per_cycle+1)) − ~5 % marge RaptorQ :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>Throughput payload (bytes/s)</th>
+            <th>1 ko en…</th>
+            <th>100 ko en…</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td>ULTRA2X</td>    <td class="num">~30</td>   <td>~33 s</td>  <td>~55 min</td></tr>
+        <tr><td>ROBUST2X</td>   <td class="num">~80</td>   <td>~13 s</td>  <td>~21 min</td></tr>
+        <tr><td>NORMAL2X</td>   <td class="num">~230</td>  <td>~4.4 s</td> <td>~7.3 min</td></tr>
+        <tr><td>HIGH2X</td>     <td class="num">~470</td>  <td>~2.1 s</td> <td>~3.5 min</td></tr>
+        <tr><td>HIGH+2X</td>    <td class="num">~550</td>  <td>~1.8 s</td> <td>~3.0 min</td></tr>
+        <tr><td>HIGH++2X</td>   <td class="num">~650</td>  <td>~1.5 s</td> <td>~2.5 min</td></tr>
+        <tr><td>HIGH56_2X</td>  <td class="num">~520</td>  <td>~1.9 s</td> <td>~3.2 min</td></tr>
+        <tr><td>HIGH+56_2X</td> <td class="num">~615</td>  <td>~1.6 s</td> <td>~2.7 min</td></tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    Chiffres bruts ; pas encore mesurés OTA sur 2x — V3 HIGH+ référence
+    était ~480 B/s applicatif effectif.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="crates">11. Layout des crates Rust</h2>
+
+<pre><code>rust/
+├── modem-framing/         # PayloadEnvelope, AppHeader, RaptorQ codec, CRC.
+│                          # Transport-agnostique. Pas de DSP, pas d'IO.
+│
+├── modem-core-base/       # DSP commun aux deux familles. Phase 0.
+│   ├── constellation.rs   # QPSK, 8PSK, APSK-16/32/64
+│   ├── rrc.rs             # RRC pulse shaping (β, span)
+│   ├── farrow.rs          # Cubic-Lagrange fractional interp (Phase A)
+│   ├── timing_loop.rs     # Gardner / AbsGardner + PI loop (Phase B)
+│   ├── ldpc/              # Encoder + decoder (rate 1/2, 3/4, 5/6)
+│   ├── interleaver.rs     # Permutations padded_cw
+│   ├── soft_demod.rs      # max-log LLR (σ² scale)
+│   ├── golay.rs           # Golay(24,12) FEC for PLHEADER PLS
+│   ├── modulator.rs       # NCO upmix + silence helper
+│   ├── demodulator.rs     # NCO downmix + MF
+│   └── ...
+│
+├── modem-core/            # V3 (legacy). Inchangé.
+├── modem-core2x/          # V4 wire format + RX symbol-domain
+│   ├── plheader.rs        # 64 SOF + 128 PLS (Golay×9 + CRC16)
+│   ├── pilot_block.rs     # 36 sym (1+j)/√2, interleave_pilot_blocks
+│   ├── profile2x.rs       # 8 profils + ModemConfig2x
+│   ├── frame2x.rs         # build_superframe_v4_range, cycle_pilot_map
+│   ├── rx_v4.rs           # rx_v4_symbols(symbols, cfg) → RxResult2x
+│   └── modem2x.rs         # V4Modem `Modem` trait impl
+│
+├── modem-io/              # SampleSink + cpal + device enumeration
+├── modem-worker-base/     # EventSink, PTT, WavSink (extrait D-0/D-0.5)
+├── modem-worker/          # V3 worker (inchangé)
+├── modem-worker2x/        # V4 worker
+│   ├── tx_worker2x.rs     # encode_to_audio + encode_to_wav
+│   ├── rx_worker2x.rs     # spawn(), live RX + WAV replay
+│   ├── streaming_frontend.rs  # Farrow + Gardner streaming, D-1c & D-1c-ii
+│   └── session_store2x.rs # AppHeader + payload bytes keyed by session_id
+│
+├── modem-cli/             # nbfm-modem --family &lt;legacy|2x&gt;
+└── modem-gui/             # Tauri 2 GUI (dispatch V3/V4 via is_2x_profile)
+</code></pre>
+
+<p>
+    Direction de dépendance (pas de cycle) :
+    <code>modem-framing</code> ← <code>modem-core-base</code> ←
+    <code>modem-core / modem-core2x</code> ← <code>modem-worker / modem-worker2x</code>
+    → <code>modem-io</code>. CLI et GUI au sommet.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="cli">12. CLI et tests de référence</h2>
+
+<h3>12.1 CLI smoke roundtrip</h3>
+
+<pre><code>cd ~/git/NewModem/rust
+cargo build -p modem-cli --release
+
+BIN=./target/release/nbfm-modem
+TMP=$(mktemp -d)
+head -c 600 /dev/urandom &gt; "$TMP/in.bin"
+for p in ULTRA2X ROBUST2X NORMAL2X HIGH2X HIGH+2X HIGH++2X HIGH56_2X HIGH+56_2X; do
+  $BIN tx -i "$TMP/in.bin" -o "$TMP/$p.wav" --family 2x -p "$p" \
+       --callsign HB9TOB --vox 0 &gt;/dev/null
+  $BIN rx -i "$TMP/$p.wav" -o "$TMP/$p.out" --family 2x -p "$p" &gt;/dev/null
+  cmp -s "$TMP/in.bin" "$TMP/$p.out" &amp;&amp; echo "OK $p"
+done
+</code></pre>
+
+<h3>12.2 Tests unitaires touch-crates</h3>
+
+<pre><code>cd ~/git/NewModem/rust
+cargo test -p modem-core-base                 # 100/100
+cargo test -p modem-core2x                    # 77/77 (avec D-1c-ii)
+cargo test -p modem-worker-base               # 4/4
+cargo test -p modem-worker                    # 14/14 (V3 inchangé)
+cargo test -p modem-worker2x                  # 25/25 (incl. 14 streaming_frontend)
+cargo test --workspace --exclude newmodem-collector
+</code></pre>
+
+<div class="callout info">
+    Le crate <code>newmodem-collector</code> est exclu du workspace par
+    défaut : son <code>secret.txt</code> est dans <code>.gitignore</code>
+    et la compilation casse en absence du fichier. Voir mémoire
+    <code>exclude-newmodem-collector</code>.
+</div>
+
+<h3>12.3 Reprendre la session</h3>
+
+<pre><code>cd ~/git/NewModem
+git checkout feat/modem-2x
+git log --oneline -18              # HEAD = 7d5f26c
+cd rust
+cargo build -p modem-gui            # OK
+</code></pre>
+
+<p style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: #888; font-size: 0.85rem;">
+    Document généré 2026-05-13 à partir du code source de la branche
+    <code>feat/modem-2x</code> HEAD <code>7d5f26c</code>. Pour la version
+    machine-lisible de l'état d'avancement, voir
+    <code>~/.claude/projects/-home-hb9tob-git-NewModem/memory/modem-2x-branch-state.md</code>.
+</p>
+
+</div>
+</body>
+</html>
