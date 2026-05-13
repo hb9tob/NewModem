@@ -313,6 +313,18 @@ pub fn spawn(
             // worth ≈ 192 syms before SOF can be located).
             if !finalised && symbol_buffer.len() >= 192 {
                 if let Some(res) = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg) {
+                    // D-1c-ii: once rx_v4 has located the SOF, forward
+                    // its absolute symbol-stream position to the
+                    // StreamingFrontend so its closed-loop TED switches
+                    // to AbsGardner-on-pilot-interior (DVB-S2X §9.3.2
+                    // recipe). The symbol_buffer index matches the
+                    // frontend's symbols_emitted counter 1:1 because
+                    // the buffer is never trimmed in this thread.
+                    if frontend.sof_anchor().is_none() {
+                        if let Some(sof) = res.first_sof_at {
+                            frontend.align_to_sof(sof as u64);
+                        }
+                    }
                     if let Some(ah) = res.app_header.as_ref() {
                         // First-time AppHeader → arm the session.
                         if emitted_session_id.is_none() {

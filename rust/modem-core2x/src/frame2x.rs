@@ -178,6 +178,73 @@ pub fn eot_frame_symbols_v4(cfg: &ModemConfig2x) -> usize {
     cycle_total_syms(cfg, 0)
 }
 
+/// True when `chunk_offset` (within a `cw_with_pilots_len(cfg)`-sized
+/// CW chunk) lands inside a pilot block. Mirror of the encoder's
+/// [`pilot_block::interleave_pilot_blocks`] split logic, exposed here for
+/// receive-side machinery (timing recovery) that wants to know which
+/// emitted symbols are unit-magnitude pilots without having to drive the
+/// full deinterleaver.
+pub fn chunk_offset_is_pilot(
+    chunk_offset: usize,
+    cw_data_syms: usize,
+    pilot_blocks_per_cw: usize,
+) -> bool {
+    if pilot_blocks_per_cw == 0 {
+        return false;
+    }
+    let base_chunk = cw_data_syms / pilot_blocks_per_cw;
+    let mut data_cursor = 0usize;
+    let mut wire_cursor = 0usize;
+    for k in 0..pilot_blocks_per_cw {
+        let take = if k + 1 == pilot_blocks_per_cw {
+            cw_data_syms - data_cursor
+        } else {
+            base_chunk
+        };
+        wire_cursor += take;
+        if chunk_offset >= wire_cursor && chunk_offset < wire_cursor + PILOT_BLOCK_LEN {
+            return true;
+        }
+        wire_cursor += PILOT_BLOCK_LEN;
+        data_cursor += take;
+    }
+    false
+}
+
+/// Length of one PLHEADER cycle in symbols, for a full cycle carrying
+/// `data_cw_per_cycle(cfg)` data codewords. Convenience accessor for
+/// receive-side modules that need cycle-modular arithmetic.
+pub fn full_cycle_len_syms(cfg: &ModemConfig2x) -> usize {
+    cycle_total_syms(cfg, data_cw_per_cycle(cfg))
+}
+
+/// Pre-compute a per-cycle pilot-position map: `map[k] = true` iff symbol
+/// offset `k` within a full PLHEADER cycle is a pilot symbol (one of the
+/// 36-sym `(1+j)/√2` blocks). The PLHEADER (192 sym SOF+PLS), LMS warmup
+/// and every data symbol map to `false`.
+///
+/// The map length equals [`full_cycle_len_syms`]`(cfg)`. Receive-side
+/// timing recovery uses `map[(abs - sof_anchor) % len]` to gate a pilot-
+/// aware TED (AbsGardner on pilots, Gardner elsewhere) — the DVB-S2X
+/// §9.3.2 cure for AbsGardner's data-induced bias on multi-ring APSK.
+pub fn cycle_pilot_map(cfg: &ModemConfig2x) -> Vec<bool> {
+    let cw_with_pilots = cw_with_pilots_len(cfg);
+    let cw_per_cycle = data_cw_per_cycle(cfg);
+    let cycle_len = cycle_total_syms(cfg, cw_per_cycle);
+    let mut map = vec![false; cycle_len];
+    let cw_block_start = plheader::PLHEADER_LEN_SYM + cfg.lms_warmup_syms;
+    // META-CW + cw_per_cycle DATA-CWs all share the same chunk layout.
+    for cw_idx in 0..=cw_per_cycle {
+        let chunk_start = cw_block_start + cw_idx * cw_with_pilots;
+        for off in 0..cw_with_pilots {
+            if chunk_offset_is_pilot(off, cfg.cw_data_syms(), cfg.pilot_blocks_per_cw) {
+                map[chunk_start + off] = true;
+            }
+        }
+    }
+    map
+}
+
 // --- Wire-format encoders --------------------------------------------------
 
 /// Emit a complete RaptorQ-encoded burst as a stream of complex symbols.
@@ -661,5 +728,116 @@ mod tests {
             cfg.family,
         )
         .expect("PLHEADER decodes");
+    }
+
+    // --- pilot-position layout helpers (used by StreamingFrontend) -------
+
+    #[test]
+    fn chunk_offset_is_pilot_one_block_per_cw() {
+        // HIGH2X: 1 pilot block at the end of each cw_data_syms chunk.
+        let cfg = profile_high_2x();
+        let cw_data = cfg.cw_data_syms();
+        // Data region [0, cw_data) → never pilot.
+        for off in [0usize, 1, cw_data / 2, cw_data - 1] {
+            assert!(!chunk_offset_is_pilot(off, cw_data, cfg.pilot_blocks_per_cw));
+        }
+        // Pilot region [cw_data, cw_data + 36) → all pilot.
+        for off in cw_data..cw_data + PILOT_BLOCK_LEN {
+            assert!(chunk_offset_is_pilot(off, cw_data, cfg.pilot_blocks_per_cw));
+        }
+        // Past pilot → false (the lookup is for ONE chunk; the caller
+        // walks chunks separately).
+        assert!(!chunk_offset_is_pilot(
+            cw_data + PILOT_BLOCK_LEN,
+            cw_data,
+            cfg.pilot_blocks_per_cw,
+        ));
+    }
+
+    #[test]
+    fn chunk_offset_is_pilot_two_blocks_apsk32_uneven() {
+        // Apsk32 padded CW = 461 data sym + 2 pilot blocks → 230 / 36 / 231 / 36.
+        let cw_data = 461;
+        let blocks = 2;
+        // First data half [0, 230) → data.
+        for &off in &[0usize, 100, 229] {
+            assert!(!chunk_offset_is_pilot(off, cw_data, blocks));
+        }
+        // First pilot [230, 266) → pilot.
+        for off in 230..266 {
+            assert!(chunk_offset_is_pilot(off, cw_data, blocks));
+        }
+        // Second data chunk [266, 497) → data.
+        for &off in &[266usize, 400, 496] {
+            assert!(!chunk_offset_is_pilot(off, cw_data, blocks));
+        }
+        // Second pilot [497, 533) → pilot.
+        for off in 497..533 {
+            assert!(chunk_offset_is_pilot(off, cw_data, blocks));
+        }
+    }
+
+    #[test]
+    fn cycle_pilot_map_marks_only_pilot_symbols() {
+        // Build a real burst, then sample every position the lookup says
+        // is a pilot and verify it equals PILOT_SYMBOL.
+        let cfg = profile_high_2x();
+        let data = vec![0xA5u8; 800];
+        let symbols = build_superframe_v4(&data, &cfg, 0x42, mime::BINARY, 0);
+        let map = cycle_pilot_map(&cfg);
+        assert_eq!(map.len(), full_cycle_len_syms(&cfg));
+        // The first PLHEADER (192 sym) + warmup must NOT be marked.
+        for k in 0..PLHEADER_LEN_SYM + cfg.lms_warmup_syms {
+            assert!(!map[k], "PLHEADER/warmup pos {k} wrongly marked pilot");
+        }
+        // Every position marked as pilot must hold exactly PILOT_SYMBOL
+        // in the first cycle of the actual modulated burst.
+        let cycle_len = map.len();
+        for k in 0..cycle_len.min(symbols.len()) {
+            if map[k] {
+                assert!(
+                    (symbols[k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
+                    "lookup says pilot at {k} but sym is {:?}",
+                    symbols[k],
+                );
+            }
+        }
+        // And the FRACTION of pilot positions matches the expected
+        // pilot_blocks_per_cw · (1 + cw_per_cycle) · 36 / cycle_len.
+        let pilot_count: usize = map.iter().filter(|b| **b).count();
+        let cw_per_cycle = data_cw_per_cycle(&cfg);
+        let expected = cfg.pilot_blocks_per_cw * (1 + cw_per_cycle) * PILOT_BLOCK_LEN;
+        assert_eq!(pilot_count, expected, "pilot map cardinality off");
+    }
+
+    #[test]
+    fn cycle_pilot_map_covers_all_profiles() {
+        // Sanity: every shipped profile produces a non-empty pilot map
+        // with the correct cardinality and matches the burst content.
+        for p in ProfileIndex2x::ALL {
+            let cfg = p.to_config();
+            let map = cycle_pilot_map(&cfg);
+            assert_eq!(map.len(), full_cycle_len_syms(&cfg));
+            let pilot_count = map.iter().filter(|b| **b).count();
+            let cw_per_cycle = data_cw_per_cycle(&cfg);
+            let expected = cfg.pilot_blocks_per_cw * (1 + cw_per_cycle) * PILOT_BLOCK_LEN;
+            assert_eq!(
+                pilot_count, expected,
+                "{p:?} pilot map cardinality off (got {pilot_count} expected {expected})",
+            );
+            // Sample the burst against the lookup — every pilot-marked
+            // position must equal PILOT_SYMBOL.
+            let data = vec![0u8; 400];
+            let symbols = build_superframe_v4(&data, &cfg, 0x42, mime::BINARY, 0);
+            for k in 0..map.len().min(symbols.len()) {
+                if map[k] {
+                    assert!(
+                        (symbols[k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
+                        "{p:?} lookup pilot at {k} but sym={:?}",
+                        symbols[k],
+                    );
+                }
+            }
+        }
     }
 }

@@ -81,6 +81,16 @@ pub struct RxResult2x {
     /// Mean σ² over data CWs (max-log LLR scale). Defaults to a fixed
     /// floor when no pilot residual was available.
     pub sigma2_data: f64,
+    /// Symbol-buffer index of the first SOF the decoder locked onto in
+    /// the input symbol stream (relative to the buffer passed in), or
+    /// None if no SOF passed the PLHEADER CRC. The streaming worker
+    /// uses this to pin its [`StreamingFrontend`]'s pilot-aided TED
+    /// anchor — `frontend.align_to_sof(first_sof_at)` enables the
+    /// AbsGardner-on-pilot-interior gate (D-1c-ii), which keeps the
+    /// timing loop unbiased on multi-ring APSK profiles.
+    ///
+    /// [`StreamingFrontend`]: `modem_worker2x::streaming_frontend::StreamingFrontend`
+    pub first_sof_at: Option<usize>,
 }
 
 impl RxResult2x {
@@ -94,6 +104,7 @@ impl RxResult2x {
             first_pls: None,
             eot_seen: false,
             sigma2_data: SIGMA2_FLOOR,
+            first_sof_at: None,
         }
     }
 }
@@ -274,6 +285,7 @@ pub fn rx_v4_symbols_after(
         };
         if result.first_pls.is_none() {
             result.first_pls = Some(pls);
+            result.first_sof_at = Some(sof_at);
         }
         if pls.flags & FLAG2X_EOT != 0 {
             result.eot_seen = true;

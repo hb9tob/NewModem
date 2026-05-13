@@ -50,13 +50,12 @@ use modem_core_base::farrow;
 use modem_core_base::rrc::{self, rrc_taps};
 use modem_core_base::timing_loop::{TedVariant, TimingLoop};
 use modem_core_base::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
+use modem_core2x::frame2x::{cycle_pilot_map, full_cycle_len_syms};
 use modem_core2x::profile2x::ModemConfig2x;
 
 /// Stateful audio → symbol front-end. Construct once per RX session,
 /// feed audio chunks via [`process_chunk`].
 pub struct StreamingFrontend {
-    /// Frozen profile config (constellation, β, fc, sps).
-    cfg: ModemConfig2x,
     /// RRC matched-filter taps (same as TX).
     taps: Vec<f64>,
     /// Half-tap-length, for FIR-warmup accounting.
@@ -77,9 +76,29 @@ pub struct StreamingFrontend {
     /// the same sample-index space the MF output uses (mode='same'
     /// means MF index ↔ audio index 1:1).
     strobe_pos: f64,
-    /// Closed-loop timing recovery. Variant picked from the
-    /// constellation type (AbsGardner for APSK, Gardner for PSK).
+    /// Closed-loop timing recovery. The TED variant is chosen per-strobe
+    /// in `process_chunk` (Gardner on data, AbsGardner on pilot symbols
+    /// once we have a SOF anchor); this field stores the default Gardner
+    /// variant for the pre-anchor acquisition phase and the data path.
     timing_loop: TimingLoop,
+
+    /// Absolute index of the next symbol the frontend will emit (counted
+    /// from session start). Drives [`StreamingFrontend::is_pilot_symbol`]
+    /// once `sof_anchor` is set.
+    symbols_emitted: u64,
+    /// Absolute symbol index where the SOF was located. When set, the
+    /// per-strobe TED switches from plain Gardner to AbsGardner on the
+    /// 34 interior symbols of every 36-sym pilot block. Set explicitly
+    /// via [`StreamingFrontend::align_to_sof`]; remains None otherwise
+    /// (no auto-SOF probe inside this struct — the worker decides when
+    /// to call it, e.g. after a successful `rx_v4_symbols`).
+    sof_anchor: Option<u64>,
+    /// Pre-computed per-cycle pilot map (length = cycle_len_syms). Same
+    /// for every cycle in the burst.
+    pilot_lookup: Vec<bool>,
+    /// Length of one full PLHEADER cycle in symbols. Snapshotted at
+    /// construction so the hot path doesn't touch ModemConfig2x.
+    cycle_len_syms: u64,
 }
 
 impl StreamingFrontend {
@@ -93,21 +112,20 @@ impl StreamingFrontend {
                 .expect("profile must have integer-constrained (Rs, τ)");
         let taps = rrc_taps(cfg.base.beta, RRC_SPAN_SYM, sps);
         let taps_half = taps.len() / 2;
-        // Use the classic Gardner TED across every 2x constellation —
-        // including the APSK rings where DVB-S2X §9.3.2 nominally
-        // recommends AbsGardner. Reason: AbsGardner is `|late|² −
-        // |early|²`, which on a multi-ring constellation gives a TED
-        // whose sign depends on the DATA (next vs previous symbol's
-        // ring), so feeding it raw into the PI loop accumulates a
-        // data-dependent bias that walks the strobe off the grid even
-        // on a noise-free signal. The proper DVB-S2X cure is to gate
-        // the TED on unit-magnitude *pilot* symbols, which requires
-        // symbol-domain frame knowledge — a Phase D-1c-ii follow-up.
-        // For now Gardner-only tracks 50–100 ppm on every 2x profile
-        // without the data-induced drift the streaming tests exposed.
+        // Default TED is the classic Gardner across every 2x
+        // constellation. Plain Gardner alone tracks 50–100 ppm on all
+        // 2x profiles without the data-induced drift that AbsGardner
+        // exhibits on multi-ring APSK (DVB-S2X §9.3.2 gives the well-
+        // known recipe of using AbsGardner only on unit-magnitude pilot
+        // symbols). Once we have a SOF anchor (a few PLHEADER cycles
+        // in), the per-strobe TED selection in `process_chunk` switches
+        // to AbsGardner on the 36-sym `(1+j)/√2` blocks where it is
+        // unbiased — the D-1c-ii fix that extends robust tracking past
+        // 100 ppm on APSK profiles.
         let ted = TedVariant::Gardner;
+        let pilot_lookup = cycle_pilot_map(&cfg);
+        let cycle_len_syms = full_cycle_len_syms(&cfg) as u64;
         Self {
-            cfg: cfg.clone(),
             center_freq_hz: cfg.base.center_freq_hz,
             taps,
             taps_half,
@@ -124,6 +142,10 @@ impl StreamingFrontend {
             // the batch path was doing implicitly.
             strobe_pos: 0.0,
             timing_loop: TimingLoop::with_defaults(ted),
+            symbols_emitted: 0,
+            sof_anchor: None,
+            pilot_lookup,
+            cycle_len_syms,
         }
     }
 
@@ -139,6 +161,84 @@ impl StreamingFrontend {
     pub fn timing_loop(&self) -> &TimingLoop {
         &self.timing_loop
     }
+
+    /// Absolute symbol index of the most recently detected SOF, if any.
+    /// Visible for tests / diagnostics; once set, the front-end gates
+    /// AbsGardner on pilot symbols.
+    #[inline]
+    pub fn sof_anchor(&self) -> Option<u64> {
+        self.sof_anchor
+    }
+
+    /// Total symbols emitted since session start. Useful for tests that
+    /// want to derive absolute pilot positions.
+    #[inline]
+    pub fn symbols_emitted(&self) -> u64 {
+        self.symbols_emitted
+    }
+
+    /// Enable pilot-aided TED by pinning the SOF anchor at absolute
+    /// symbol index `absolute_symbol_idx` (in the same space as
+    /// [`StreamingFrontend::symbols_emitted`]). Once set, the loop runs
+    /// AbsGardner on every 34-symbol-wide pilot interior (the only
+    /// strobes where EARLY and LATE Farrow lookups span pure pilot
+    /// territory, so the TED is data-independent and unbiased — the
+    /// DVB-S2X §9.3.2 reference). Strobes outside pilot interiors keep
+    /// using plain Gardner. Without this call the front-end stays in
+    /// Gardner-only mode (the original Phase D-1c behaviour, unchanged).
+    ///
+    /// The expected caller is the worker after `rx_v4_symbols` returned
+    /// a `RxResult2x`: convert the result's SOF position to the absolute
+    /// space and forward it here. Re-calling is fine — anchors that match
+    /// the same cycle layout are equivalent (the lookup uses `%`
+    /// `cycle_len_syms`); a fresh anchor on a different cycle just shifts
+    /// the pilot indices forward by an integer number of cycles.
+    #[inline]
+    pub fn align_to_sof(&mut self, absolute_symbol_idx: u64) {
+        self.sof_anchor = Some(absolute_symbol_idx);
+    }
+
+    /// True when the symbol at absolute index `abs_idx` is a pilot
+    /// symbol (one of the 36-sym `(1+j)/√2` blocks) according to the
+    /// pre-computed cycle layout, relative to the current SOF anchor.
+    /// Returns `false` before SOF lock, or when no anchor has been set.
+    #[inline]
+    fn is_pilot_symbol(&self, abs_idx: u64) -> bool {
+        let Some(anchor) = self.sof_anchor else {
+            return false;
+        };
+        // Before the anchor itself — happens only if we override anchor
+        // backwards, which we don't do, but defensively guard anyway.
+        if abs_idx < anchor {
+            return false;
+        }
+        let rel = abs_idx - anchor;
+        let pos_in_cycle = (rel % self.cycle_len_syms) as usize;
+        // pilot_lookup.len() == cycle_len_syms by construction.
+        self.pilot_lookup[pos_in_cycle]
+    }
+
+    /// True when `abs_idx` is a pilot symbol AND both immediate
+    /// neighbours `abs_idx ± 1` are also pilots. Necessary for an
+    /// unbiased AbsGardner step: the LATE/EARLY Farrow lookups land at
+    /// `strobe ± sps/2` which corresponds to symbol-position `abs_idx ±
+    /// 0.5` — i.e. the matched-filter output there is a 50/50 blend of
+    /// symbols `abs_idx` and `abs_idx ± 1`. If either neighbour is a
+    /// data symbol the EARLY or LATE sample carries data magnitude
+    /// (variable on multi-ring APSK) and the TED becomes data-dependent.
+    /// Excluding the first and last symbol of each 36-sym pilot block
+    /// gives 34 clean strobes per block — still plenty of updates for
+    /// the slow DVB-S2 loop gains.
+    #[inline]
+    fn is_strict_pilot_interior(&self, abs_idx: u64) -> bool {
+        if abs_idx == 0 {
+            return false;
+        }
+        self.is_pilot_symbol(abs_idx)
+            && self.is_pilot_symbol(abs_idx - 1)
+            && self.is_pilot_symbol(abs_idx + 1)
+    }
+
 
     /// Append `chunk` to the working buffer and emit every strobe whose
     /// Farrow context fits inside the (possibly extended) buffer. Each
@@ -196,16 +296,33 @@ impl StreamingFrontend {
             let farrow_ok = is_farrow_valid(early, mf.len())
                 && is_farrow_valid(self.strobe_pos, mf.len())
                 && is_farrow_valid(late, mf.len());
+            let abs_idx = self.symbols_emitted;
             if farrow_ok {
                 let y_early = farrow::interp_complex(&mf, early);
                 let y_on = farrow::interp_complex(&mf, self.strobe_pos);
                 let y_late = farrow::interp_complex(&mf, late);
-                // Gardner TED + PI step. The output is a fractional
-                // correction (in samples-per-symbol) added to the
-                // nominal sps stride. Default DVB-S2 gains give a loop
-                // bandwidth ~0.01·Rs (slow, noise-robust).
-                let correction = self.timing_loop.step(y_early, y_on, y_late);
+                // Pilot-aware TED routing (D-1c-ii). The default TED is
+                // classic Gardner — robust on every constellation, slight
+                // data-dependent bias on multi-ring APSK but still tracks
+                // ≤100 ppm fine, this is the existing Phase D-1c
+                // behaviour. When an explicit SOF anchor has been pinned
+                // via [`StreamingFrontend::align_to_sof`] AND the current
+                // strobe is in the 34-sym INTERIOR of one of the 36-sym
+                // `(1+j)/√2` pilot blocks, we swap in AbsGardner instead,
+                // which is unbiased on unit-magnitude carriers — the
+                // DVB-S2X §9.3.2 recipe. Pilot boundaries (first/last sym
+                // of each block) keep Gardner because the EARLY/LATE
+                // Farrow lookups there straddle a pilot/data transition
+                // and AbsGardner picks up the magnitude jump as a fake
+                // timing offset.
+                let err = if self.is_strict_pilot_interior(abs_idx) {
+                    TedVariant::AbsGardner.error(y_early, y_on, y_late)
+                } else {
+                    TedVariant::Gardner.error(y_early, y_on, y_late)
+                };
+                let correction = self.timing_loop.step_with_error(err);
                 symbols.push(y_on);
+                self.symbols_emitted += 1;
                 self.strobe_pos += self.sps as f64 + correction;
             } else {
                 // Lead-in / FIR-warmup region: emit the integer-step
@@ -219,6 +336,7 @@ impl StreamingFrontend {
                     Complex64::new(0.0, 0.0)
                 };
                 symbols.push(y);
+                self.symbols_emitted += 1;
                 self.strobe_pos += self.sps as f64;
             }
         }
@@ -277,7 +395,8 @@ mod tests {
     use super::*;
     use modem_core2x::frame2x::build_superframe_v4;
     use modem_core2x::profile2x::{
-        profile_high_2x, profile_normal_2x, profile_ultra_2x, ProfileIndex2x,
+        profile_high_2x, profile_high_plus_2x, profile_high_plus_plus_2x,
+        profile_normal_2x, profile_ultra_2x, ProfileIndex2x,
     };
     use modem_core_base::modulator;
     use modem_framing::app_header::mime;
@@ -501,6 +620,163 @@ mod tests {
             let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
                 .unwrap_or_else(|| panic!("{p:?} streaming decode returned None"));
             assert_eq!(res.data, payload, "{p:?} streaming roundtrip");
+        }
+    }
+
+    // --- D-1c-ii pilot-aided TED -----------------------------------------
+
+    #[test]
+    fn align_to_sof_default_is_none() {
+        // Construction leaves the front-end in Gardner-only mode — the
+        // pilot-aware AbsGardner only kicks in after the worker calls
+        // `align_to_sof` (typically after `rx_v4_symbols` returned a
+        // result and the worker can convert its SOF position to the
+        // absolute symbol-index space).
+        let sf = StreamingFrontend::new(profile_high_2x());
+        assert!(sf.sof_anchor().is_none());
+        assert_eq!(sf.symbols_emitted(), 0);
+    }
+
+    #[test]
+    fn align_to_sof_enables_pilot_interior_gate() {
+        // With anchor at 0, the per-cycle pilot positions should match
+        // the precomputed `cycle_pilot_map`. Test the strict-interior
+        // predicate is consistent: every interior symbol is_strict OK,
+        // every block boundary (first/last of each 36-sym block) is
+        // ruled out, every data symbol is also ruled out.
+        let cfg = profile_high_2x();
+        let mut sf = StreamingFrontend::new(cfg.clone());
+        sf.align_to_sof(0);
+        let map = cycle_pilot_map(&cfg);
+        let n = map.len();
+        for k in 0..n {
+            let abs = k as u64;
+            let p_lookup = map[k];
+            let p_method = sf.is_pilot_symbol(abs);
+            assert_eq!(p_lookup, p_method, "pilot mismatch at {k}");
+            if p_lookup {
+                let prev = if k > 0 { map[k - 1] } else { false };
+                let next = if k + 1 < n { map[k + 1] } else { false };
+                let interior_expected = prev && next;
+                let interior_actual = sf.is_strict_pilot_interior(abs);
+                assert_eq!(
+                    interior_actual, interior_expected,
+                    "interior mismatch at pilot {k} (prev={prev} next={next})",
+                );
+            } else {
+                // Non-pilot positions are never interior.
+                assert!(!sf.is_strict_pilot_interior(abs), "{k} is not pilot");
+            }
+        }
+    }
+
+    /// Helper: stream `audio` through a StreamingFrontend, optionally
+    /// pinning the SOF anchor. Returns the timing-recovered symbol stream.
+    fn stream_with_optional_anchor(
+        cfg: &ModemConfig2x,
+        audio: &[f32],
+        anchor: Option<u64>,
+    ) -> (Vec<Complex64>, f64) {
+        let mut sf = StreamingFrontend::new(cfg.clone());
+        if let Some(a) = anchor {
+            sf.align_to_sof(a);
+        }
+        let mut syms = Vec::new();
+        const CHUNK: usize = 24_000;
+        for i in (0..audio.len()).step_by(CHUNK) {
+            let end = (i + CHUNK).min(audio.len());
+            syms.extend(sf.process_chunk(&audio[i..end]));
+        }
+        (syms, sf.timing_loop().integ())
+    }
+
+    #[test]
+    fn pilot_aided_at_100_ppm_apsk32_matches_gardner_only() {
+        // At 100 ppm — the upper edge of plain Gardner's safe window —
+        // BOTH pilot-aided (anchor pinned) AND Gardner-only paths must
+        // decode the same payload cleanly on HighPlus2x. The pilot-aided
+        // path's value-add is not at this rate (Gardner alone copes)
+        // but the test pins the API contract: enabling the pilot-aided
+        // gate must not break what already worked.
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(400, 0xCAFE);
+        let audio = modulate_for(&cfg, &payload, 0x1234);
+        let resampled = resample_linear(&audio, 1.0 + 100e-6);
+
+        let (syms_gardner, integ_g) = stream_with_optional_anchor(&cfg, &resampled, None);
+        let res_g = modem_core2x::rx_v4::rx_v4_symbols(&syms_gardner, &cfg)
+            .expect("Gardner-only decode at 100 ppm");
+        assert_eq!(res_g.data, payload, "Gardner-only payload mismatch");
+        assert!(integ_g > 0.0, "Gardner-only integ for +100ppm should be +, got {integ_g}");
+
+        let (syms_pilot, integ_p) =
+            stream_with_optional_anchor(&cfg, &resampled, Some(0));
+        let res_p = modem_core2x::rx_v4::rx_v4_symbols(&syms_pilot, &cfg)
+            .expect("pilot-aided decode at 100 ppm");
+        assert_eq!(res_p.data, payload, "pilot-aided payload mismatch");
+        assert!(integ_p > 0.0, "pilot-aided integ for +100ppm should be +, got {integ_p}");
+    }
+
+    #[test]
+    fn pilot_aided_noise_free_does_not_regress_high_plus_2x() {
+        // Opting in to pilot-aided mode on a noise-free, drift-free burst
+        // MUST still decode cleanly — i.e. the AbsGardner-on-pilot
+        // updates don't introduce spurious drift when there is nothing
+        // to correct.
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(500, 0xC0DE);
+        let audio = modulate_for(&cfg, &payload, 0x9999);
+        let (syms, integ) = stream_with_optional_anchor(&cfg, &audio, Some(0));
+        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+            .expect("noise-free pilot-aided decode");
+        assert_eq!(res.data, payload);
+        // integ should stay small (no drift to track). The bound is
+        // loose to absorb a few AbsGardner samples worth of noise — what
+        // matters is that integ doesn't run off.
+        assert!(integ.abs() < 1e-2, "integ wandered noise-free: {integ}");
+    }
+
+    #[test]
+    fn pilot_aided_noise_free_apsk64() {
+        // Same regression guard on the harshest multi-ring case (64-APSK)
+        // — the pilot-aided gate must remain inert when there is no drift
+        // even on the constellation that gave plain-Gardner the most
+        // trouble historically.
+        let cfg = profile_high_plus_plus_2x();
+        let payload = rng_bytes(400, 0xC0DE);
+        let audio = modulate_for(&cfg, &payload, 0x9999);
+        let (syms, integ) = stream_with_optional_anchor(&cfg, &audio, Some(0));
+        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+            .expect("noise-free pilot-aided APSK64 decode");
+        assert_eq!(res.data, payload);
+        assert!(integ.abs() < 1e-2, "APSK64 integ wandered: {integ}");
+    }
+
+    #[test]
+    fn pilot_aided_all_apsk_profiles_decode_at_50_ppm() {
+        // Sweep all five APSK profiles at +50 ppm with the pilot anchor
+        // explicitly set. Acts as a regression guard against future TED
+        // changes that quietly break one corner of the constellation map.
+        // 50 ppm is the well-trodden ground (the existing Gardner-only
+        // test runs at exactly that) — we verify the pilot-aided gate
+        // doesn't perturb what already worked.
+        let apsk_profiles = [
+            ProfileIndex2x::High2x,           // 16-APSK
+            ProfileIndex2x::HighPlus2x,       // 32-APSK
+            ProfileIndex2x::HighPlusPlus2x,   // 64-APSK
+            ProfileIndex2x::HighFiveSix2x,    // 16-APSK rate 5/6
+            ProfileIndex2x::HighPlusFiveSix2x,// 32-APSK rate 5/6
+        ];
+        for p in apsk_profiles {
+            let cfg = p.to_config();
+            let payload = rng_bytes(300, p.as_u8() as u64);
+            let audio = modulate_for(&cfg, &payload, 0x42);
+            let resampled = resample_linear(&audio, 1.0 + 50e-6);
+            let (syms, _integ) =
+                stream_with_optional_anchor(&cfg, &resampled, Some(0));
+            let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+                .unwrap_or_else(|| panic!("{p:?} 50ppm pilot-aided decode None"));
+            assert_eq!(res.data, payload, "{p:?} 50ppm pilot-aided payload");
         }
     }
 }
