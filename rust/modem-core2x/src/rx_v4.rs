@@ -366,37 +366,6 @@ impl ChannelModel {
     }
 }
 
-/// Build a per-data-symbol σ² array from the channel model and the
-/// constellation rings. For each symbol position `i`, hard-decides the
-/// nearest constellation point (gain-normalised input), looks up its
-/// ring, and assigns `model.sigma2_total_at_ring(R)` to that position.
-///
-/// Output length matches `data.len()`. Used by
-/// [`soft_demod::llr_maxlog_per_symbol`] to compute LLRs with per-ring
-/// σ² scaling — the right thing for non-AWGN APSK channels where
-/// the SNR varies across rings.
-fn sigma2_per_symbol_from_model(
-    data: &[Complex64],
-    constellation: &modem_core_base::constellation::Constellation,
-    model: &ChannelModel,
-) -> Vec<f64> {
-    let (radii, ring_of_point) = constellation.rings();
-    let sigma2_per_ring: Vec<f64> = radii.iter()
-        .map(|&r| model.sigma2_total_at_ring(r).max(SIGMA2_FLOOR))
-        .collect();
-    data.iter()
-        .map(|&y| {
-            let mut best_idx = 0usize;
-            let mut best_d2 = f64::INFINITY;
-            for (k, &s) in constellation.points.iter().enumerate() {
-                let d2 = (y - s).norm_sqr();
-                if d2 < best_d2 { best_d2 = d2; best_idx = k; }
-            }
-            sigma2_per_ring[ring_of_point[best_idx]]
-        })
-        .collect()
-}
-
 // --- turbo Pass 2: data-driven per-ring stats from re-encoded symbols -----
 
 /// Sanity-check bounds on the ratio of data-driven σ² to model σ² per
@@ -485,30 +454,6 @@ fn pass2_sanity_check_and_blend(
             } else {
                 m
             }
-        })
-        .collect()
-}
-
-/// Map a per-ring σ² vector to a per-symbol σ² vector, using the
-/// constellation point each `s_hat[i]` lands on (genie ring assignment,
-/// since `s_hat` is the re-encoded truth — no nearest-neighbour
-/// guesswork). Output length matches `s_hat.len()`.
-fn sigma2_per_symbol_from_dd(
-    s_hat: &[Complex64],
-    constellation: &modem_core_base::constellation::Constellation,
-    sigma2_per_ring: &[f64],
-) -> Vec<f64> {
-    let (_, ring_of_point) = constellation.rings();
-    s_hat
-        .iter()
-        .map(|&s| {
-            let mut best_idx = 0usize;
-            let mut best_d2 = f64::INFINITY;
-            for (k, &p) in constellation.points.iter().enumerate() {
-                let d2 = (s - p).norm_sqr();
-                if d2 < best_d2 { best_d2 = d2; best_idx = k; }
-            }
-            sigma2_per_ring[ring_of_point[best_idx]]
         })
         .collect()
 }
@@ -880,11 +825,18 @@ fn decode_one_cw(
     // bits and under-optimistic LLRs on inner-ring bits converges
     // worse than feeding it the actual per-bit noise level. Plays
     // well with the upcoming pass 2 (data-driven σ²_r,DD).
+    // Pass 1 LLR: per-ring σ² applied PER CANDIDATE (division before
+    // min, with the Bayesian +log σ²(s) term). See
+    // soft_demod::llr_maxlog_per_ring docstring for why this matters
+    // vs the naive "one σ² for all candidates of y_i" formulation.
     let channel_model = ChannelModel::from_pilot_split(split);
-    let sigma2_per_symbol = sigma2_per_symbol_from_model(
-        &data_norm, constellation, &channel_model);
-    let llr = soft_demod::llr_maxlog_per_symbol(
-        &data_norm, constellation, &sigma2_per_symbol);
+    let (radii_p1, _) = constellation.rings();
+    let sigma2_per_ring_p1: Vec<f64> = radii_p1
+        .iter()
+        .map(|&r| channel_model.sigma2_total_at_ring(r).max(SIGMA2_FLOOR))
+        .collect();
+    let llr = soft_demod::llr_maxlog_per_ring(
+        &data_norm, constellation, &sigma2_per_ring_p1);
     let llr_deint = interleaver::apply_permutation_f32(&llr, deinterleave_perm);
     let llr_for_ldpc = &llr_deint[..decoder.n()];
     let (info_bytes_p1, converged_p1) = decoder.decode_to_bytes(llr_for_ldpc);
@@ -920,10 +872,10 @@ fn decode_one_cw(
             &data_norm, &s_hat, constellation, &channel_model);
         let sigma2_blended = pass2_sanity_check_and_blend(
             &sigma2_dd, constellation, &channel_model);
-        let sigma2_p2 = sigma2_per_symbol_from_dd(
-            &s_hat, constellation, &sigma2_blended);
-        let llr_p2 = soft_demod::llr_maxlog_per_symbol(
-            &data_norm, constellation, &sigma2_p2);
+        // Pass 2 LLR: same per-ring per-candidate formulation as Pass 1,
+        // but with data-driven σ²_r,DD (sanity-checked vs model).
+        let llr_p2 = soft_demod::llr_maxlog_per_ring(
+            &data_norm, constellation, &sigma2_blended);
         let llr_p2_deint = interleaver::apply_permutation_f32(
             &llr_p2, deinterleave_perm);
         let llr_p2_for_ldpc = &llr_p2_deint[..decoder.n()];

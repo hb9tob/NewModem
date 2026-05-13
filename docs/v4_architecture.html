@@ -1482,7 +1482,7 @@ e_tangential = Im(e · conj(P))     ← composante perpendiculaire à P
    │     σ²_phi  = σ²_tangential_pilot − σ²_awgn_per_dim
    ├── σ²_r par anneau via modèle :
    │     σ²_total(R) = 2·σ²_awgn_per_dim + R²·(σ²_am + σ²_phi)
-   ├── llr_maxlog_per_symbol(data, constellation, σ²_per_symbol)
+   ├── llr_maxlog_per_ring(data, constellation, σ²_per_ring)
    │     σ²_per_symbol[i] = σ²_r(ring(s_hat[i]))
    └── LDPC → (info_bytes_p1, converged_p1)
 
@@ -1495,11 +1495,34 @@ Pass 2 (data-driven, gated on Pass 1 convergence)
    │     σ²_r,DD = median(|e|²) / ln(2)   (rings avec ≥ 8 syms)
    ├── Sanity check : si σ²_r,DD / σ²_r,model ∉ [0.2, 5.0]
    │     → fallback model σ² pour cet anneau (re-encode pathologique)
-   ├── llr_maxlog_per_symbol(data, constellation, σ²_per_symbol_blended)
+   ├── llr_maxlog_per_ring(data, constellation, σ²_per_ring_blended)
    └── LDPC → (info_bytes_p2, converged_p2)
        Si converged_p2 : trust pass 2 (LLR plus fidèle au canal réel)
        Sinon : fallback pass 1 (qui était déjà OK)
 </code></pre>
+
+<div class="callout">
+    <strong>Note importante sur la formule LLR.</strong> Quand σ²
+    dépend du <em>candidat</em> (chaque anneau a sa variance), la
+    division doit être faite <strong>par candidat avant le min</strong>,
+    pas après :
+    <pre style="margin:0.5rem 0;background:#f3f3f3;color:#222;padding:0.5rem;font-size:0.85rem">log p(y|s) = −|y−s|²/σ²(s) − log σ²(s) + const
+
+LLR(b_k) = min<sub>{s:b<sub>k</sub>=1}</sub> [|y−s|²/σ²(s) + log σ²(s)]
+        −  min<sub>{s:b<sub>k</sub>=0}</sub> [|y−s|²/σ²(s) + log σ²(s)]</pre>
+    Le terme <code>log σ²(s)</code> est le prior Bayésien sur
+    l'hypothèse de bruit : un candidat à haute σ² a une PDF de bruit
+    plus large, donc moins probable à distance égale. Souvent négligé
+    en "max-log lite", mais important quand σ² varie de plus de ~×2
+    entre anneaux — typique sur APSK multi-rings (HIGH+2X observation :
+    σ²_outer/σ²_inner ≈ 17× après channel model). La fonction
+    <code>llr_maxlog_per_ring</code> dans <code>modem-core-base</code>
+    fait la division <em>per-candidat avant min</em> et inclut le terme
+    <code>log σ²(s)</code>. Le test
+    <code>llr_maxlog_per_ring_matches_scalar_when_sigma2_uniform</code>
+    vérifie la consistance avec <code>llr_maxlog</code> scalaire quand
+    σ² est uniforme.
+</div>
 
 <div class="callout info">
     <strong>Pourquoi la même décodeur ré-itère sur la même donnée ?</strong>
