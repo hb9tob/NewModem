@@ -232,6 +232,15 @@ struct SfBlockEntry {
     /// Pilot-residual σ² for this segment's pilot groups. Lower = cleaner
     /// channel for this CW.
     sigma2: f64,
+    /// Skewness of the stacked Re/Im pilot residuals for this segment.
+    /// Gaussian baseline = 0 ; non-zero suggests asymmetric impairments
+    /// (bursty fade, residual carrier, AM-AM nonlinearity).
+    skew: f64,
+    /// Excess kurtosis (= kurtosis - 3) on the same. Gaussian baseline = 0 ;
+    /// values >> 0 indicate impulsive content (PLC noise, switching
+    /// supplies, ignition systems). Used to distinguish a "uniform QSB"
+    /// SF (low kurt) from a "punched by interferer" SF (high kurt).
+    kurt: f64,
 }
 
 /// Per-scan-tick decode detail. Lists every segment of every superframe
@@ -1218,7 +1227,7 @@ fn scan_and_route(
     // when no per-segment data exists (e.g. rx_v3=None path).
     if !result.pilot_sigma2_per_segment.is_empty() {
         let mut parts = String::with_capacity(
-            result.pilot_sigma2_per_segment.len() * 12,
+            result.pilot_sigma2_per_segment.len() * 28,
         );
         for (i, &s) in result.pilot_sigma2_per_segment.iter().enumerate() {
             let tag = if *result.pilot_phase_is_meta.get(i).unwrap_or(&false) {
@@ -1226,10 +1235,12 @@ fn scan_and_route(
             } else {
                 "D"
             };
+            let sk = result.pilot_skew_per_segment.get(i).copied().unwrap_or(f64::NAN);
+            let ku = result.pilot_kurt_per_segment.get(i).copied().unwrap_or(f64::NAN);
             if i > 0 {
                 parts.push(' ');
             }
-            parts.push_str(&format!("{tag}:{s:.4}"));
+            parts.push_str(&format!("{tag}:{s:.4}(s={sk:+.2},k={ku:+.2})"));
         }
         worker_log(&format!("[scan-segs] {parts}"));
     }
@@ -1350,10 +1361,14 @@ fn scan_and_route(
             .enumerate()
             .map(|(idx, &s)| {
                 let is_meta = *result.pilot_phase_is_meta.get(idx).unwrap_or(&false);
+                let sk = result.pilot_skew_per_segment.get(idx).copied().unwrap_or(f64::NAN);
+                let ku = result.pilot_kurt_per_segment.get(idx).copied().unwrap_or(f64::NAN);
                 SfBlockEntry {
                     idx,
                     kind: if is_meta { "M" } else { "D" },
                     sigma2: s,
+                    skew: sk,
+                    kurt: ku,
                 }
             })
             .collect();

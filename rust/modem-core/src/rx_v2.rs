@@ -91,6 +91,16 @@ pub struct RxV2Result {
     /// across segments or concentrated on a few. NaN if a segment had
     /// no pilots accumulated.
     pub pilot_sigma2_per_segment: Vec<f64>,
+    /// Per-segment skewness of pilot residuals (Re/Im stacked). Gaussian
+    /// baseline = 0 ; |skew| > ~0.3 suggests an asymmetric noise
+    /// distribution (bursty fade, residual carrier, AM-AM nonlinearity).
+    pub pilot_skew_per_segment: Vec<f64>,
+    /// Per-segment EXCESS kurtosis of pilot residuals (kurtosis - 3 of
+    /// stacked Re/Im samples). Gaussian baseline = 0 ; kurt_excess >
+    /// ~1 suggests impulsive content (PLC noise, switching supplies,
+    /// nearby ignition systems). Heavy-tailed alpha-stable noise can
+    /// easily reach 10-100.
+    pub pilot_kurt_per_segment: Vec<f64>,
     /// Offset (in samples, relative to the input slice) of the LAST preamble
     /// found by `rx_v3` in this call — closed or open. Callers maintaining a
     /// rolling capture buffer can drain everything before
@@ -874,6 +884,16 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let mut segments_lost: usize = 0;
     let mut sigma2_sum: f64 = 0.0;
     let mut sigma2_count: usize = 0;
+    // Higher central-moment accumulators on pilot residuals (Re/Im
+    // stacked as 2N real samples). Used to derive per-segment skewness
+    // (3rd moment / σ³) and excess kurtosis (4th moment / σ⁴ - 3),
+    // which classify the noise type per SF :
+    //   - Gaussian/thermal channel    : skew ~ 0, kurt_excess ~ 0
+    //   - Impulsive interferer (PLC,
+    //     switching supplies, RFI)    : kurt_excess >> 0
+    //   - Bursty fade / QSB           : skew ≠ 0 (asymmetric tails)
+    let mut pilot_x3_sum: f64 = 0.0;
+    let mut pilot_x4_sum: f64 = 0.0;
     // Hard-decision data-symbol σ² accumulators. Populated alongside
     // the pilot σ² but only on non-meta segments and only over actual
     // data symbols (post-equalisation). Surfaced separately to the GUI.
@@ -893,6 +913,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // Surfaced for diagnostic logging — confirms whether sigma² is
     // distributed evenly across segments or spikes on a subset.
     let mut pilot_sigma2_per_segment: Vec<f64> = Vec::new();
+    // Parallel : per-segment skewness and excess kurtosis on pilot
+    // residuals. Standard Gaussian baseline (0, 0); deviations help
+    // distinguish thermal noise from non-Gaussian impairments.
+    let mut pilot_skew_per_segment: Vec<f64> = Vec::new();
+    let mut pilot_kurt_per_segment: Vec<f64> = Vec::new();
 
     // Session: first valid marker we see locks session_id_low; later markers
     // with a different session_id_low indicate a session change → we stop
@@ -987,6 +1012,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         // pilot_sigma2_per_segment).
         let s2_sum_before = sigma2_sum;
         let s2_count_before = sigma2_count;
+        let x3_before = pilot_x3_sum;
+        let x4_before = pilot_x4_sum;
         let (seg_data_syms, seg_pilot_phases) = track_segment(
             seg_syms_raw,
             &config.pilot_pattern,
@@ -994,11 +1021,31 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             &constellation,
             &mut sigma2_sum,
             &mut sigma2_count,
+            &mut pilot_x3_sum,
+            &mut pilot_x4_sum,
         );
-        let seg_sigma2 = if sigma2_count > s2_count_before {
-            (sigma2_sum - s2_sum_before) / (sigma2_count - s2_count_before) as f64
+        // Per-segment moment derivation. N_seg counts pilot symbols
+        // (one complex residual each) ; the moment accumulators added
+        // 2 real samples per pilot (Re and Im), so the effective sample
+        // count is `2 * (sigma2_count - s2_count_before)`. Mean is
+        // assumed 0 (LS gain removes it).
+        let seg_pilots = sigma2_count - s2_count_before;
+        let (seg_sigma2, seg_skew, seg_kurt) = if seg_pilots > 0 {
+            let n2 = (2 * seg_pilots) as f64;
+            let s2 = (sigma2_sum - s2_sum_before) / n2; // σ² (stacked
+                                                       // Re+Im baseline)
+            let m3 = (pilot_x3_sum - x3_before) / n2;
+            let m4 = (pilot_x4_sum - x4_before) / n2;
+            let s2_safe = s2.max(1e-12);
+            let s3 = s2_safe.powf(1.5);
+            let skew = m3 / s3;
+            let kurt_excess = m4 / (s2_safe * s2_safe) - 3.0;
+            // Keep the legacy "σ² per pilot (complex)" semantics for
+            // the existing per-segment vector so the GUI doesn't see
+            // its values halve overnight. = 2 * (Re+Im stacked σ²).
+            (s2 * 2.0, skew, kurt_excess)
         } else {
-            f64::NAN
+            (f64::NAN, f64::NAN, f64::NAN)
         };
         cursor += seg_sym_len;
 
@@ -1016,6 +1063,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             pilot_phase_segments.push(seg_pilot_phases);
             pilot_phase_is_meta.push(marker_payload.is_meta());
             pilot_sigma2_per_segment.push(seg_sigma2);
+            pilot_skew_per_segment.push(seg_skew);
+            pilot_kurt_per_segment.push(seg_kurt);
         }
 
         // Data-symbol σ² (frame-only, hard-decision residuals). Skip meta
@@ -1177,6 +1226,8 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
         pilot_phase_segments,
         pilot_phase_is_meta,
         pilot_sigma2_per_segment,
+        pilot_skew_per_segment,
+        pilot_kurt_per_segment,
         last_preamble_offset: None,
         // Single-pass path never resamples; the caller (`rx_v2` /
         // `rx_v2_with_hint`) overwrites this when the decode was driven
@@ -1314,6 +1365,8 @@ pub fn rx_v3_after(
     let mut last_pilot_phases: Vec<Vec<f32>> = Vec::new();
     let mut last_pilot_phase_is_meta: Vec<bool> = Vec::new();
     let mut last_pilot_sigma2_per_segment: Vec<f64> = Vec::new();
+    let mut last_pilot_skew_per_segment: Vec<f64> = Vec::new();
+    let mut last_pilot_kurt_per_segment: Vec<f64> = Vec::new();
     // FFE-tap centroid pair of the most recent successful window.
     // Surfaced to the worker so it can compute `final - initial` and
     // trigger a Gardner re-estimate when the LMS adapter had to migrate
@@ -1466,6 +1519,8 @@ pub fn rx_v3_after(
             last_pilot_phases = r.pilot_phase_segments;
             last_pilot_phase_is_meta = r.pilot_phase_is_meta;
             last_pilot_sigma2_per_segment = r.pilot_sigma2_per_segment;
+            last_pilot_skew_per_segment = r.pilot_skew_per_segment;
+            last_pilot_kurt_per_segment = r.pilot_kurt_per_segment;
         }
         last_ffe_centroid_initial = r.ffe_centroid_initial;
         last_ffe_centroid_final = r.ffe_centroid_final;
@@ -1538,6 +1593,8 @@ pub fn rx_v3_after(
         pilot_phase_segments: last_pilot_phases,
         pilot_phase_is_meta: last_pilot_phase_is_meta,
         pilot_sigma2_per_segment: last_pilot_sigma2_per_segment,
+        pilot_skew_per_segment: last_pilot_skew_per_segment,
+        pilot_kurt_per_segment: last_pilot_kurt_per_segment,
         last_preamble_offset,
         // Drift correction of the LAST successfully decoded window in
         // this scan (CLOSED or OPEN). The per-window estimates are also
@@ -1580,6 +1637,13 @@ fn track_segment(
     constellation: &crate::constellation::Constellation,
     sigma2_sum: &mut f64,
     sigma2_count: &mut usize,
+    // Higher central moments of the pilot residuals (Re/Im stacked as
+    // 2N real samples; mean assumed ~0 because the LS gain removes it).
+    // Used downstream to compute per-segment skewness and excess kurtosis
+    // for noise-type diagnostics : Gaussian channel -> skew~0, kurt~0 ;
+    // impulsive interferer -> kurt > 0 ; bursty fade -> skew != 0.
+    pilot_x3_sum: &mut f64,
+    pilot_x4_sum: &mut f64,
 ) -> (Vec<Complex64>, Vec<f32>) {
     let d_syms = pattern.d_syms;
     let p_syms = pattern.p_syms;
@@ -1679,8 +1743,18 @@ fn track_segment(
             let group = i / group_sz;
             let pilots_tx = pilot::pilots_for_group(group, pattern);
             let expected = pilots_tx[inner - d_syms];
-            *sigma2_sum += (y_corrected - expected).norm_sqr();
+            let resid = y_corrected - expected;
+            *sigma2_sum += resid.norm_sqr();
             *sigma2_count += 1;
+            // Stack Re and Im as two independent real samples for the
+            // higher-moment accumulators -- doubles the effective N and
+            // keeps the Gaussian baseline at (skew=0, kurt_excess=0).
+            let re = resid.re;
+            let im = resid.im;
+            let re2 = re * re;
+            let im2 = im * im;
+            *pilot_x3_sum += re2 * re + im2 * im;
+            *pilot_x4_sum += re2 * re2 + im2 * im2;
         } else {
             data_syms.push(y_corrected);
         }
