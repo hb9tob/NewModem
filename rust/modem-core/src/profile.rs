@@ -291,9 +291,9 @@ impl ProfileIndex {
     }
 
     /// All profile indices in canonical order. EXPERIMENTAL profiles
-    /// (Mega, Fast, HighPlusPlus, HighFiveSix, HighPlusFiveSix) are
-    /// included so they can be selected in forced mode, but they do
-    /// NOT take part in auto-detection (cf. `is_experimental`).
+    /// (Mega, Fast, HighPlusFiveSix) are included so they can be
+    /// selected in forced mode, but they do NOT take part in
+    /// auto-detection (cf. `is_experimental`).
     pub const ALL: [Self; 10] = [
         Self::Ultra,
         Self::Robust,
@@ -318,12 +318,17 @@ impl ProfileIndex {
     /// - HIGH56 promoted to standard: best speed/robustness tradeoff
     ///   on HB9MM (4706 bps with 16-APSK, comfortable SNR margin).
     ///   Becomes the **default** profile GUI-side.
+    ///
+    /// Changes 2026-05-13:
+    /// - HIGH++ promoted to standard. Same family A preamble as the
+    ///   other Normal/High variants ; the header's profile_index
+    ///   refines the exact profile post-gate so the auto-detect tie
+    ///   resolves cleanly without forcing.
     pub fn is_experimental(self) -> bool {
         matches!(
             self,
             Self::Mega
                 | Self::Fast
-                | Self::HighPlusPlus
                 | Self::HighPlusFiveSix
         )
     }
@@ -462,8 +467,8 @@ impl ModemConfig {
     /// every profile : preamble[256] + warmup[32] + header[96] + ...).
     ///
     /// This uniformity is what makes the gate's anchor=Normal path work
-    /// for the family A pitch=32 cluster (Normal/High/HighPlus/HighFiveSix
-    /// + the two experimentals HighPlusPlus/HighPlusFiveSix). With a
+    /// for the family A pitch=32 cluster (Normal/High/HighPlus/HighPlusPlus/
+    /// HighFiveSix + the experimental HighPlusFiveSix). With a
     /// fixed warmup length, the header lands at a deterministic
     /// preamble-relative offset regardless of the underlying profile, so
     /// the worker can decode the header with `state.profile = Normal`

@@ -268,10 +268,10 @@ pub fn detect_best_profile(
     current: crate::profile::ProfileIndex,
 ) -> Option<crate::profile::ProfileIndex> {
     use crate::profile::ProfileIndex;
-    // Exclude experimental profiles (HIGH+, FAST, HIGH++) from auto-detect
-    // — they're forced-only on the RX side. Including them in the sweep
-    // would let a tie-broken pick land on an experimental profile that
-    // the worker isn't authorised to switch into.
+    // Exclude experimental profiles (Mega, Fast, HighPlusFiveSix) from
+    // auto-detect — they're forced-only on the RX side. Including them in
+    // the sweep would let a tie-broken pick land on an experimental
+    // profile that the worker isn't authorised to switch into.
     let scored: Vec<(ProfileIndex, f64)> = ProfileIndex::ALL
         .iter()
         .filter(|p| !p.is_experimental())
