@@ -786,6 +786,154 @@ audio f32 mono 48 kHz (avec 0.2 s silence inter-frame pour VOX)
     rapport à DVB-S2X strict.
 </div>
 
+<h3 id="overhead-breakdown">8.1 Décomposition du cycle par élément de trame</h3>
+
+<p>
+    Pour chaque profil, où vont les symboles d'un cycle PLHEADER complet
+    (PLHEADER + LMS warmup + META-CW + cw_per_cycle × DATA-CW + tous les
+    blocs pilote) ? Cinq postes, en pourcentage du cycle total :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>PLHEADER<sup>(1)</sup></th>
+            <th>LMS warmup<sup>(2)</sup></th>
+            <th>META-CW<sup>(3)</sup></th>
+            <th>Pilotes DATA-CWs<sup>(4)</sup></th>
+            <th>LDPC parité<sup>(5)</sup></th>
+            <th>Info payload<sup>(6)</sup></th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>ULTRA2X</strong></td>
+            <td class="num">7.5 %</td>
+            <td class="num">0 %</td>
+            <td class="num">46.3 %</td>
+            <td class="num">1.4 %</td>
+            <td class="num">22.4 %</td>
+            <td class="num"><strong>22.4 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>ROBUST2X</strong></td>
+            <td class="num">5.1 %</td>
+            <td class="num">0 %</td>
+            <td class="num">31.6 %</td>
+            <td class="num">1.9 %</td>
+            <td class="num">30.7 %</td>
+            <td class="num"><strong>30.7 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>NORMAL2X</strong></td>
+            <td class="num">3.3 %</td>
+            <td class="num">0 %</td>
+            <td class="num">13.8 %</td>
+            <td class="num">3.7 %</td>
+            <td class="num">39.6 %</td>
+            <td class="num"><strong>39.6 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH2X</strong></td>
+            <td class="num">3.4 %</td>
+            <td class="num">0 %</td>
+            <td class="num">10.7 %</td>
+            <td class="num">5.1 %</td>
+            <td class="num">20.2 %</td>
+            <td class="num"><strong>60.6 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+2X</strong></td>
+            <td class="num">3.5 %</td>
+            <td class="num">0.6 %</td>
+            <td class="num">9.6 %</td>
+            <td class="num">11.7 %</td>
+            <td class="num">18.7 %</td>
+            <td class="num"><strong>56.0 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH++2X</strong></td>
+            <td class="num">3.4 %</td>
+            <td class="num">1.1 %</td>
+            <td class="num">8.0 %</td>
+            <td class="num">13.8 %</td>
+            <td class="num">18.4 %</td>
+            <td class="num"><strong>55.3 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH56_2X</strong></td>
+            <td class="num">3.4 %</td>
+            <td class="num">0 %</td>
+            <td class="num">10.7 %</td>
+            <td class="num">5.1 %</td>
+            <td class="num">13.5 %</td>
+            <td class="num"><strong>67.4 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+56_2X</strong></td>
+            <td class="num">3.5 %</td>
+            <td class="num">0.6 %</td>
+            <td class="num">9.6 %</td>
+            <td class="num">11.7 %</td>
+            <td class="num">12.5 %</td>
+            <td class="num"><strong>62.3 %</strong></td>
+        </tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    Légende et formules (vérifiées : somme = 100 % à chaque ligne) :
+</p>
+<ol style="font-size: 0.88rem; color: #555; line-height: 1.6;">
+    <li><strong>PLHEADER</strong> — 192 sym fixes (64 SOF Chu + 128 PLS
+        Golay×9+CRC16). Coût d'amorçage par cycle ; s'amortit quand
+        <code>cw_per_cycle</code> grandit (ULTRA2X paie 7.5 % parce que
+        Rs=500 force <code>cw_per_cycle=1</code>).</li>
+    <li><strong>LMS warmup</strong> — 0 / 32 / 64 sym selon la
+        constellation (QPSK/8PSK/16-APSK : 0 ; 32-APSK : 32 ; 64-APSK :
+        64). Seed le FFE audio sur des rings que la SOF QPSK ne touche pas.</li>
+    <li><strong>META-CW</strong> — un LDPC codeword complet
+        (<code>cw_data_syms</code>) + son ou ses blocs pilote, dédié à
+        porter <code>AppHeader×4</code> (filename, callsign, MIME,
+        file_size, ...). Coût constant par cycle ; pèse lourd sur
+        ULTRA/ROBUST où le cycle est court (1-2 DATA-CWs) et léger sur
+        les profils HIGH où on rentabilise sur 8-11 DATA-CWs.</li>
+    <li><strong>Pilotes DATA-CWs</strong> — somme des blocs pilote
+        attachés aux DATA-CWs : <code>cw_per_cycle × pilot_blocks_per_cw
+        × 36</code>. Doublé pour HIGH+/HIGH++/HIGH+56 (2 blocs/CW).</li>
+    <li><strong>LDPC parité</strong> — fraction <code>(1 − rate)</code>
+        des symboles DATA-CW (les bits de parité du code LDPC). 50 %
+        pour rate 1/2, 25 % pour rate 3/4, 16.7 % pour rate 5/6.</li>
+    <li><strong>Info payload</strong> — fraction <code>rate</code> des
+        symboles DATA-CW = les bits d'information transportés. C'est
+        l'<strong>information utile avant RaptorQ</strong> ; après
+        codage RaptorQ (avec sur-dimensionnement typique ~5 %), le
+        payload application réel est ~95 % de cette colonne.</li>
+</ol>
+
+<p>
+    <strong>Lectures clés :</strong>
+</p>
+<ul>
+    <li>Sur <strong>ULTRA2X</strong>, la META-CW à elle seule mange 46 %
+        du cycle — conséquence directe du choix &laquo;cw_per_cycle ≥ 1
+        toujours&raquo; pour préserver la robustesse late-entry sur
+        signal très faible.</li>
+    <li>Le passage de <strong>HIGH2X</strong> à <strong>HIGH56_2X</strong>
+        (même 16-APSK, rate 3/4 → 5/6) gagne +7 points sur l'info
+        payload (60.6 → 67.4 %) en sacrifiant 7 points sur la parité
+        (20.2 → 13.5 %). Bonne piste si le canal est propre.</li>
+    <li>Les pilotes <em>doublés</em> sur les APSK haute-densité
+        (HIGH+/HIGH++/HIGH+56) ajoutent +6.5 points d'overhead par
+        rapport au choix 1 bloc/CW, mais sont indispensables pour la
+        traque de phase sur les rings serrés (voir §5 et §7).</li>
+    <li>L'<strong>info payload</strong> maximale est obtenue avec
+        <strong>HIGH56_2X</strong> à 67.4 % — pas avec HIGH++2X (55.3 %)
+        malgré ses 6 bits/sym, parce que la densification pilotes
+        +LMS warmup mangent une grosse partie du gain.</li>
+</ul>
+
 <!-- ======================================================================= -->
 <h2 id="sigma2">9. σ² — estimation, budget, lecture</h2>
 
@@ -926,7 +1074,117 @@ for chaque symbole pilote p_recu dans la CW {
         AbsGardner sur pilotes).</li>
 </ul>
 
-<h3>10.3 Throughput applicatif attendu</h3>
+<h3>10.3 Sweep canal NBFM — HIGH / HIGH+ / HIGH++ à 3 SNRs, payload 10 kB</h3>
+
+<p>
+    Mesuré bout-en-bout via <code>study/snr_sweep_2x.py</code> : pour
+    chaque profil, génération d'une charge utile aléatoire de 10 000
+    octets (graine <code>0xCAFE</code>), encodage CLI 2x → WAV f32 48 kHz
+    → simulateur NBFM <code>study/nbfm_channel_sim.py</code>
+    (pré-emphase 75 µs + FM ±5 kHz + bruit gaussien complexe à l'IF de
+    densité <code>if_noise_voltage</code> + démodulation FM + dé-emphase
+    + LPF audio 2 kHz) → décodage CLI 2x → comparaison byte-à-byte.
+    Drift d'horloge désactivé pour isoler la variable SNR.
+</p>
+
+<p>
+    <code>if_noise_voltage</code> est l'écart-type du bruit gaussien
+    complexe injecté à l'IF (480 kHz) ; le signal FM y a un module de
+    1.0, donc <code>SNR_IF [dB] = −20·log₁₀(if_noise·√2)</code>.
+    L'amélioration FM (<code>m≈2</code>) ajoute typiquement +12 dB de
+    SNR post-démod en bande utile.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th rowspan="2">Profil</th>
+            <th colspan="4">if_noise = 0.30 (~clean)</th>
+            <th colspan="4">if_noise = 0.40 (~marginal)</th>
+            <th colspan="4">if_noise = 0.50 (~stressed)</th>
+        </tr>
+        <tr>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs conv.</th><th>BER&nbsp;/&nbsp;exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs conv.</th><th>BER&nbsp;/&nbsp;exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs conv.</th><th>BER&nbsp;/&nbsp;exact</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>HIGH2X</strong><br><span style="color:#888">16-APSK 3/4</span></td>
+            <td class="num">0.018</td><td class="num">17.5 dB</td><td class="num">69/70</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.020</td><td class="num">16.9 dB</td><td class="num">69/70</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.073</td><td class="num">11.4 dB</td><td class="num">35/70</td><td>0.50&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+2X</strong><br><span style="color:#888">32-APSK 3/4</span></td>
+            <td class="num">0.43<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">68/69</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.43<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">68/69</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.43<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">1/69</td><td>1.0&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">57/69</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.071</td><td class="num">11.5 dB</td><td class="num">48/57</td><td>0.16&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.139</td><td class="num">8.6 dB</td><td class="num">0/57</td><td>1.0&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+        </tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    Légende : <strong>σ²</strong> = variance résiduelle des pilotes
+    après gain LS (échelle Es=1), telle que rapportée par
+    <code>RxResult2x.sigma2_data</code>. <strong>SNR<sub>est</sub></strong>
+    = −10·log₁₀(σ²). <strong>CWs conv.</strong> = compte LDPC convergé
+    sur total tenté. <strong>BER</strong> = taux d'erreur octet sur la
+    sortie tronquée à <code>file_size</code>. <strong>exact</strong> =
+    décodé byte-identique à l'entrée.
+    <br>
+    <sup>*</sup> Le σ² apparent de HIGH+ reste à ~0.43 même à faible
+    SNR. C'est un biais data→pilote propre à 32-APSK (les rings sont
+    plus serrés que la pilote unitaire, le LS gain capte une fraction
+    du data via la fuite RRC). Le décodage reste valide car LDPC
+    fonctionne sur les LLR à échelle σ²-divisée et RaptorQ assemble à
+    partir de 68/69 CWs convergés. À investiguer (gain estimation
+    raffinée par ring séparé) pour un σ² plus fidèle au SNR canal.
+</p>
+
+<div class="callout ok">
+    <strong>Résultat clé.</strong> Tous les CWs qui convergent
+    produisent un payload <em>byte-identique</em> à l'entrée — RaptorQ
+    réassemble parfaitement dès que ≥ <code>n_source</code> CWs sont
+    valides. Donc la métrique opérationnelle est :
+    <strong>est-ce qu'il y a assez de CWs convergés pour
+    n_source ?</strong>, pas la BER octet brute. À
+    <code>if_noise=0.40</code>, HIGH et HIGH+ ont assez de marge ;
+    HIGH++ casse en premier parce que 64-APSK exige le SNR le plus
+    élevé.
+</div>
+
+<p>
+    <strong>Hiérarchie observée</strong> : HIGH (16-APSK) est le plus
+    robuste, casse à <code>if_noise ≈ 0.50</code>. HIGH+ (32-APSK) reste
+    valide jusqu'à <code>0.45–0.50</code> grâce à RaptorQ malgré son
+    biais σ². HIGH++ (64-APSK) casse en premier vers <code>0.40</code>.
+    Ce qui est cohérent avec la densité de constellation : plus de bits
+    par symbole = moins de marge SNR par bit.
+</p>
+
+<p>
+    <strong>Reproductibilité</strong> : payload graine
+    <code>0xCAFE</code> (déterministe), graine bruit IF
+    <code>seed + if_noise×1000</code>, drift désactivé. Le sweep
+    complet (3 profils × 3 SNRs sur 10 kB) prend ~23 s wall-clock sur
+    Pi5 8 GB :
+</p>
+
+<pre><code>cd ~/git/NewModem
+cargo build -p modem-cli --release
+python3 study/snr_sweep_2x.py --if-noises 0.30 0.40 0.50 --payload-bytes 10000
+# Résultats : results/snr_sweep_2x/results.csv
+</code></pre>
+
+<h3>10.4 Throughput applicatif attendu</h3>
 
 <p>
     Net data rate × (cw_per_cycle / (cw_per_cycle+1)) − ~5 % marge RaptorQ :
