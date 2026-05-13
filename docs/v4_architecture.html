@@ -1074,12 +1074,12 @@ for chaque symbole pilote p_recu dans la CW {
         AbsGardner sur pilotes).</li>
 </ul>
 
-<h3>10.3 Sweep canal NBFM — HIGH / HIGH+ / HIGH++ à 3 SNRs, payload 10 kB</h3>
+<h3>10.3 Sweep canal NBFM — HIGH / HIGH+ / HIGH++ à 4 SNRs, payload 10 kB</h3>
 
 <p>
     Mesuré bout-en-bout via <code>study/snr_sweep_2x.py</code> : pour
     chaque profil, génération d'une charge utile aléatoire de 10 000
-    octets (graine <code>0xCAFE</code>), encodage CLI 2x → WAV f32 48 kHz
+    octets (graine <code>100</code>), encodage CLI 2x → WAV f32 48 kHz
     → simulateur NBFM <code>study/nbfm_channel_sim.py</code>
     (pré-emphase 75 µs + FM ±5 kHz + bruit gaussien complexe à l'IF de
     densité <code>if_noise_voltage</code> + démodulation FM + dé-emphase
@@ -1092,41 +1092,49 @@ for chaque symbole pilote p_recu dans la CW {
     complexe injecté à l'IF (480 kHz) ; le signal FM y a un module de
     1.0, donc <code>SNR_IF [dB] = −20·log₁₀(if_noise·√2)</code>.
     L'amélioration FM (<code>m≈2</code>) ajoute typiquement +12 dB de
-    SNR post-démod en bande utile.
+    SNR post-démod en bande utile. La colonne <strong>0.00</strong>
+    isole les non-linéarités intrinsèques du canal NBFM (préemph
+    +1−Hz·τ, hard-clip TX 0.55, LPF audio 2 kHz, dé-emphase 75 µs) en
+    l'absence de bruit ajouté.
 </p>
 
 <table>
     <thead>
         <tr>
             <th rowspan="2">Profil</th>
-            <th colspan="4">if_noise = 0.30 (~clean)</th>
-            <th colspan="4">if_noise = 0.40 (~marginal)</th>
-            <th colspan="4">if_noise = 0.50 (~stressed)</th>
+            <th colspan="4">if_noise = <strong>0.00</strong> (sans bruit)</th>
+            <th colspan="4">if_noise = 0.30 (clean)</th>
+            <th colspan="4">if_noise = 0.45 (marginal)</th>
+            <th colspan="4">if_noise = 0.55 (stressed)</th>
         </tr>
         <tr>
-            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs conv.</th><th>BER&nbsp;/&nbsp;exact</th>
-            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs conv.</th><th>BER&nbsp;/&nbsp;exact</th>
-            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs conv.</th><th>BER&nbsp;/&nbsp;exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs</th><th>exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs</th><th>exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs</th><th>exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs</th><th>exact</th>
         </tr>
     </thead>
     <tbody>
         <tr>
             <td><strong>HIGH2X</strong><br><span style="color:#888">16-APSK 3/4</span></td>
-            <td class="num">0.018</td><td class="num">17.5 dB</td><td class="num">69/70</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.020</td><td class="num">16.9 dB</td><td class="num">69/70</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.073</td><td class="num">11.4 dB</td><td class="num">35/70</td><td>0.50&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.018</td><td class="num">17.6 dB</td><td class="num">69/70</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.018</td><td class="num">17.5 dB</td><td class="num">69/70</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.032</td><td class="num">14.9 dB</td><td class="num">68/70</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.166</td><td class="num">7.8 dB</td><td class="num">0/52</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td><strong>HIGH+2X</strong><br><span style="color:#888">32-APSK 3/4</span></td>
-            <td class="num">0.43<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">68/69</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.43<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">68/69</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.43<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">1/69</td><td>1.0&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.435<sup>*</sup></td><td class="num">3.6 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.427<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.446<sup>*</sup></td><td class="num">3.5 dB</td><td class="num">55/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.539</td><td class="num">2.7 dB</td><td class="num">0/49</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">57/69</td><td>0&nbsp;/&nbsp;<span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.071</td><td class="num">11.5 dB</td><td class="num">48/57</td><td>0.16&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.139</td><td class="num">8.6 dB</td><td class="num">0/57</td><td>1.0&nbsp;/&nbsp;<span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.051</td><td class="num">13.0 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
+            <td class="num">0.051</td><td class="num">12.9 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.081</td><td class="num">10.9 dB</td><td class="num">15/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.303</td><td class="num">5.2 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
 </table>
@@ -1135,18 +1143,27 @@ for chaque symbole pilote p_recu dans la CW {
     Légende : <strong>σ²</strong> = variance résiduelle des pilotes
     après gain LS (échelle Es=1), telle que rapportée par
     <code>RxResult2x.sigma2_data</code>. <strong>SNR<sub>est</sub></strong>
-    = −10·log₁₀(σ²). <strong>CWs conv.</strong> = compte LDPC convergé
-    sur total tenté. <strong>BER</strong> = taux d'erreur octet sur la
-    sortie tronquée à <code>file_size</code>. <strong>exact</strong> =
-    décodé byte-identique à l'entrée.
+    = −10·log₁₀(σ²). <strong>CWs</strong> = compte LDPC convergé sur
+    total tenté. <strong>exact</strong> = payload décodé byte-identique
+    à l'entrée (RaptorQ assemble dès qu'on a ≥ <code>n_source</code>
+    CWs convergées : ~47 pour 10 kB en rate 3/4).
     <br>
-    <sup>*</sup> Le σ² apparent de HIGH+ reste à ~0.43 même à faible
-    SNR. C'est un biais data→pilote propre à 32-APSK (les rings sont
-    plus serrés que la pilote unitaire, le LS gain capte une fraction
-    du data via la fuite RRC). Le décodage reste valide car LDPC
-    fonctionne sur les LLR à échelle σ²-divisée et RaptorQ assemble à
-    partir de 68/69 CWs convergés. À investiguer (gain estimation
-    raffinée par ring séparé) pour un σ² plus fidèle au SNR canal.
+    <sup>*</sup> Le σ² apparent de HIGH+ reste plafonné à ~0.43-0.45
+    sur la zone basse-bruit, indépendamment du SNR canal. C'est un
+    biais data→pilote propre à 32-APSK (les rings serrés et la fuite
+    RRC saturent l'estimateur LS de gain sur les blocs pilote). Le
+    décodage reste valide car LDPC fonctionne sur les LLR à échelle
+    σ²-divisée. Au-delà de <code>if_noise ≈ 0.50</code>, le σ² mesuré
+    finit par dépasser ce plancher de bias et redevient indicatif.
+    À fixer plus tard : LS gain par ring séparé.
+    <br>
+    <sup>†</sup> HIGH++ à <code>if_noise=0.00</code> est <em>à la
+    limite des non-linéarités du canal</em> NBFM : sur 10 seeds testés,
+    9 réussissent (90 % succès byte-exact). Le payload-pattern
+    influence le décodage parce que les rings 64-APSK sont resserrés à
+    moins de 1.5 dB sur les ailes du LPF audio 2 kHz. Le tableau
+    rapporte un seed représentatif. HIGH et HIGH+ sont 100 %
+    déterministes sur ce point.
 </p>
 
 <div class="callout ok">
@@ -1155,34 +1172,148 @@ for chaque symbole pilote p_recu dans la CW {
     réassemble parfaitement dès que ≥ <code>n_source</code> CWs sont
     valides. Donc la métrique opérationnelle est :
     <strong>est-ce qu'il y a assez de CWs convergés pour
-    n_source ?</strong>, pas la BER octet brute. À
-    <code>if_noise=0.40</code>, HIGH et HIGH+ ont assez de marge ;
-    HIGH++ casse en premier parce que 64-APSK exige le SNR le plus
-    élevé.
+    n_source ?</strong>, pas la BER octet brute. HIGH+ tient grâce à
+    RaptorQ même quand un tiers de ses CWs ratent (55/69 à 0.45) car
+    47 sur 69 suffisent. HIGH++ casse en premier (15/57 à 0.45 = trop
+    juste).
 </div>
 
 <p>
-    <strong>Hiérarchie observée</strong> : HIGH (16-APSK) est le plus
-    robuste, casse à <code>if_noise ≈ 0.50</code>. HIGH+ (32-APSK) reste
-    valide jusqu'à <code>0.45–0.50</code> grâce à RaptorQ malgré son
-    biais σ². HIGH++ (64-APSK) casse en premier vers <code>0.40</code>.
-    Ce qui est cohérent avec la densité de constellation : plus de bits
-    par symbole = moins de marge SNR par bit.
+    <strong>Hiérarchie observée</strong> : HIGH (16-APSK) tient
+    <code>if_noise &lt; 0.55</code>, HIGH+ (32-APSK) tient
+    <code>&lt; 0.55</code> aussi grâce à RaptorQ, HIGH++ (64-APSK)
+    casse dès <code>0.45</code>. La colonne 0.00 montre que le canal
+    sans bruit ajouté est déjà <em>à la limite</em> pour 64-APSK —
+    confirmation que les rings serrés de HIGH++ n'ont quasiment plus de
+    marge sur ce canal NBFM. Pour de la transmission OTA fiable, HIGH
+    ou HIGH+ sont les choix sûrs.
 </p>
 
 <p>
-    <strong>Reproductibilité</strong> : payload graine
-    <code>0xCAFE</code> (déterministe), graine bruit IF
-    <code>seed + if_noise×1000</code>, drift désactivé. Le sweep
-    complet (3 profils × 3 SNRs sur 10 kB) prend ~23 s wall-clock sur
-    Pi5 8 GB :
+    <strong>Reproductibilité</strong> : payload graine <code>100</code>
+    (déterministe), graine bruit IF <code>seed + if_noise×1000</code>,
+    drift désactivé. Le sweep complet (3 profils × 4 SNRs sur 10 kB)
+    prend ~30 s wall-clock sur Pi5 8 GB :
 </p>
 
 <pre><code>cd ~/git/NewModem
 cargo build -p modem-cli --release
-python3 study/snr_sweep_2x.py --if-noises 0.30 0.40 0.50 --payload-bytes 10000
+python3 study/snr_sweep_2x.py --if-noises 0.00 0.30 0.45 0.55 \
+    --payload-bytes 10000 --seed 100
 # Résultats : results/snr_sweep_2x/results.csv
 </code></pre>
+
+<h3 id="v3-bench">10.3.1 Benchmark V3 HIGH++ vs V4 HIGH++2X aux 4 mêmes SNRs</h3>
+
+<p>
+    Même chaîne, même seed (<code>100</code>), même payload 10 kB, même
+    fréquence centrale audio <strong>1100 Hz</strong> (identique entre
+    V3 et V4 — voir <code>DATA_CENTER_HZ</code> dans
+    <code>modem-core-base/src/types.rs</code>). On change seulement le
+    pipeline TX/RX :
+</p>
+
+<pre><code># V4 (existing)
+python3 study/snr_sweep_2x.py --family 2x --profiles HIGH++2X \
+    --if-noises 0.00 0.30 0.45 0.55 --payload-bytes 10000 --seed 100
+
+# V3 benchmark (new --family flag)
+python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
+    --if-noises 0.00 0.30 0.45 0.55 --payload-bytes 10000 --seed 100 \
+    --out-dir results/snr_sweep_2x_v3_bench
+</code></pre>
+
+<table>
+    <thead>
+        <tr>
+            <th rowspan="2">if_noise</th>
+            <th colspan="4">V3 HIGH++<br><span style="color:#888;font-weight:400">(legacy, 64-APSK 3/4, TDM intra-CW pilots)</span></th>
+            <th colspan="4">V4 HIGH++2X<br><span style="color:#888;font-weight:400">(2x, 64-APSK 3/4, sparse 36-sym pilots)</span></th>
+        </tr>
+        <tr>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs</th><th>exact</th>
+            <th>σ²</th><th>SNR<sub>est</sub></th><th>CWs</th><th>exact</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td class="num"><strong>0.00</strong></td>
+            <td class="num">0.0073</td><td class="num">21.4 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.0505</td><td class="num">13.0 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span></td>
+        </tr>
+        <tr>
+            <td class="num"><strong>0.30</strong></td>
+            <td class="num">0.0074</td><td class="num">21.3 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.0509</td><td class="num">12.9 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span></td>
+        </tr>
+        <tr>
+            <td class="num"><strong>0.45</strong></td>
+            <td class="num">0.0266</td><td class="num">15.8 dB</td><td class="num">26/69</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.0813</td><td class="num">10.9 dB</td><td class="num">15/57</td><td><span style="color:#bf5f2b">✗</span></td>
+        </tr>
+        <tr>
+            <td class="num"><strong>0.55</strong></td>
+            <td class="num">0.2127</td><td class="num">6.7 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.3032</td><td class="num">5.2 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout">
+    <strong>Observation surprise.</strong> V3 HIGH++ a un σ² <em>~7×
+    plus bas</em> que V4 HIGH++2X dans la zone basse-bruit (0.0073 vs
+    0.0505 à <code>if_noise=0</code>) — soit <strong>+8.4 dB de
+    SNR<sub>est</sub> en moins de bruit perçu</strong>. Les deux
+    décodent à 0.00 et 0.30 sur ce seed, mais à 0.45 V3 a plus de marge
+    (26 vs 15 CWs convergés, σ² 6 dB meilleur). À 0.55 les deux
+    s'effondrent ensemble.
+</div>
+
+<p>
+    <strong>Pourquoi V4 a un plancher σ² plus haut ?</strong>
+    Deux causes plausibles :
+</p>
+<ul>
+    <li>V3 utilise des <em>pilotes TDM</em> distribués <strong>à
+        l'intérieur</strong> de chaque codeword (toutes les 32-64
+        symboles selon le profil) — moyennés sur ~30 % du CW, ils
+        donnent un estimateur de gain LS &laquo; chauffant &raquo; sur la
+        totalité de la durée du CW. V4 a un <em>bloc pilote sparse</em>
+        de 36 symboles <strong>après</strong> chaque CW : 36 échantillons
+        est moins de samples pour l'estimateur que ~150-200 chez V3, et
+        ils sont concentrés à un instant, pas répartis (plus sensible à
+        un fading rapide non-stationnaire dans la fenêtre).</li>
+    <li>V4 utilise une chaîne timing closed-loop
+        (Farrow + Gardner + PI) qui ajoute une jitter résiduelle de
+        timing aux strobes ; sur 64-APSK où l'écart inter-rings est
+        serré, cette jitter se traduit en variance constellation
+        non-prise-en-compte par l'estimateur de bruit pilote.</li>
+</ul>
+
+<p>
+    <strong>Implications pratiques :</strong>
+</p>
+<ul>
+    <li>Sur ce canal NBFM simulé (sans drift d'horloge, AWGN seul),
+        V3 HIGH++ a une marge SNR <strong>~5-6 dB supérieure</strong> à
+        V4 HIGH++2X pour la même charge utile. Si on veut le profil 64-
+        APSK <em>maximally robust</em>, V3 reste le plus fiable.</li>
+    <li>V4 ajoute en contrepartie : la tracking d'horloge continue (qui
+        protège des drifts &gt;50 ppm que V3 ne supporte pas), un
+        overhead trame ÷2 vs V3 (voir §2 et §8), et une PLHEADER courte
+        de 192 sym qui se retrouve plus vite après une perte de
+        synchro. Le compromis vise <strong>sound-card avec drift</strong>
+        et <strong>QO-100 SDR avec CFO</strong>, pas la performance σ²
+        pure sur canal stable.</li>
+    <li>Le gap σ² peut probablement être fermé en :
+        (a) <strong>densifiant les pilotes V4</strong> (passer de 36 à
+        64-72 syms par bloc sur HIGH++/HIGH+) ; (b) <strong>LS par
+        ring séparé</strong> au lieu d'un LS global, qui éliminerait le
+        biais data→pilote suspecté en §10.3 ; (c) <strong>activer
+        pilot-aided dans la TimingLoop</strong> (déjà fait en D-1c-ii)
+        pour réduire la jitter de timing sur APSK haute densité.
+        Investigations TODO post-merge feat/modem-2x.</li>
+</ul>
 
 <h3>10.4 Throughput applicatif attendu</h3>
 

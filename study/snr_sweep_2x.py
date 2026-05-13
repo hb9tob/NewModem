@@ -125,29 +125,36 @@ def write_wav_f32(path: str, samples: np.ndarray, sr: int = AUDIO_RATE) -> None:
 
 # --- CLI wrappers -----------------------------------------------------------
 
-def run_tx(cli: str, profile: str, payload_path: str, wav_path: str) -> float:
+def run_tx(cli: str, profile: str, payload_path: str, wav_path: str,
+           family: str = "2x") -> float:
     """Generate WAV TX for the given profile. Returns wall-clock seconds."""
     t0 = time.time()
     subprocess.run(
         [cli, "tx",
          "-i", payload_path, "-o", wav_path,
-         "--family", "2x", "-p", profile,
+         "--family", family, "-p", profile,
          "--callsign", "HB9TOB", "--vox", "0"],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return time.time() - t0
 
 
-_RX_LINE_RE = re.compile(
+_RX_LINE_RE_V4 = re.compile(
     r"Decoded: (\d+) bytes, (\d+)/(\d+) CWs converged, "
     r"(\d+) PLHEADER cycles, σ²=([\d.eE+\-]+), EOT_seen=(\w+)")
+_RX_LINE_RE_V3 = re.compile(
+    r"Decoded: (\d+) bytes, (\d+)/(\d+) LDPC blocks converged, "
+    r"(\d+) segments, (\d+) lost, sigma²=([\d.eE+\-]+)")
 
 
-def run_rx(cli: str, profile: str, wav_path: str, out_path: str) -> dict:
-    """RX one WAV. Parses CLI stderr for the canonical Decoded: line."""
+def run_rx(cli: str, profile: str, wav_path: str, out_path: str,
+           family: str = "2x") -> dict:
+    """RX one WAV. Parses CLI stderr. Supports both V3 ('legacy', LDPC
+    blocks + segments + sigma²) and V4 ('2x', CWs + PLHEADER cycles +
+    σ²) output formats."""
     r = subprocess.run(
         [cli, "rx",
          "-i", wav_path, "-o", out_path,
-         "--family", "2x", "-p", profile],
+         "--family", family, "-p", profile],
         capture_output=True, text=True)
     info = {
         "exit_code": r.returncode,
@@ -155,14 +162,23 @@ def run_rx(cli: str, profile: str, wav_path: str, out_path: str) -> dict:
         "cycles": None, "sigma2": None, "eot": None,
     }
     for line in r.stderr.splitlines():
-        m = _RX_LINE_RE.search(line)
-        if m:
-            info["decoded_bytes"] = int(m.group(1))
-            info["converged"] = int(m.group(2))
-            info["total"] = int(m.group(3))
-            info["cycles"] = int(m.group(4))
-            info["sigma2"] = float(m.group(5))
-            info["eot"] = (m.group(6) == "true")
+        m4 = _RX_LINE_RE_V4.search(line)
+        if m4:
+            info["decoded_bytes"] = int(m4.group(1))
+            info["converged"] = int(m4.group(2))
+            info["total"] = int(m4.group(3))
+            info["cycles"] = int(m4.group(4))
+            info["sigma2"] = float(m4.group(5))
+            info["eot"] = (m4.group(6) == "true")
+            break
+        m3 = _RX_LINE_RE_V3.search(line)
+        if m3:
+            info["decoded_bytes"] = int(m3.group(1))
+            info["converged"] = int(m3.group(2))
+            info["total"] = int(m3.group(3))
+            info["cycles"] = int(m3.group(4))  # = "segments" for V3
+            info["sigma2"] = float(m3.group(6))
+            info["eot"] = None  # V3 has no EOT
             break
     return info
 
@@ -199,6 +215,11 @@ def main() -> int:
                          "and results.csv")
     ap.add_argument("--profiles", nargs="+", default=PROFILES_DEFAULT,
                     help=f"Profiles to test (default {' '.join(PROFILES_DEFAULT)})")
+    ap.add_argument("--family", default="2x", choices=["2x", "legacy"],
+                    help="Wire-format family for the CLI (default 2x). Use "
+                         "'legacy' to benchmark V3 against the same channel "
+                         "(profile names use V3 naming: HIGH++, HIGH+, etc., "
+                         "without the 2X suffix).")
     ap.add_argument("--if-noises", nargs="+", type=float, default=IF_NOISES_DEFAULT,
                     help=f"IF noise voltages (default {IF_NOISES_DEFAULT})")
     ap.add_argument("--payload-bytes", type=int, default=PAYLOAD_BYTES_DEFAULT,
@@ -246,7 +267,8 @@ def main() -> int:
         for profile in args.profiles:
             safe = profile.replace("+", "p")
             tx_wav = os.path.join(args.out_dir, f"tx_{safe}.wav")
-            tx_time = run_tx(args.nbfm_modem, profile, payload_path, tx_wav)
+            tx_time = run_tx(args.nbfm_modem, profile, payload_path, tx_wav,
+                             family=args.family)
             tx_audio = read_wav_f32(tx_wav)
             print(f"\n>>> TX {profile}: {len(tx_audio)} samples "
                   f"({len(tx_audio) / AUDIO_RATE:.2f} s, build {tx_time:.1f}s)")
@@ -267,7 +289,8 @@ def main() -> int:
 
                 rx_bin = os.path.join(args.out_dir,
                                       f"rx_{safe}_if{if_noise:.2f}.bin")
-                info = run_rx(args.nbfm_modem, profile, ch_wav, rx_bin)
+                info = run_rx(args.nbfm_modem, profile, ch_wav, rx_bin,
+                              family=args.family)
                 ber, exact = measure_ber(payload, rx_bin)
                 sigma2 = info["sigma2"]
                 if sigma2 is not None and sigma2 > 0:
