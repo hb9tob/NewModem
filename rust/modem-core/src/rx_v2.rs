@@ -1333,22 +1333,33 @@ pub fn rx_v3_after(
         }
         let window = &samples[start..end];
         let r_opt = if is_closed {
-            // CLOSED window: bounded on both sides by a preamble. The full
-            // `rx_v2` grid search is safe here — the matched filter has an
-            // absolute timing anchor at both ends, so the drift estimate
-            // is reliable. The fast-path inside `rx_v2` skips the grid
-            // when the first-pass `rx_v2_single` is already clean.
+            // CLOSED window: always run per-window `rx_v2_with_options`.
+            // This gives each SF its own Gardner-estimated drift correction,
+            // matching the per-SF adaptation that the legacy `rx_v2()`
+            // grid path provided in 0.10.18 and earlier. Tested on HIGH+
+            // 32-APSK on a Ryzen 9 host (2026-05-13): the session-level
+            // hint path that 0.10.19 introduced dropped LDPC convergence
+            // from 100 % to 50-90 % because all SFs were resampled by a
+            // single fixed ppm even when the channel had sub-ppm SF-to-SF
+            // variation.
             //
-            // When a session-wide hint is provided (worker already
-            // locked onto the drift on the 1st CLOSED of the session),
-            // use it directly instead of re-running the grid -- saves
-            // the per-window cost and keeps the correction consistent
-            // across the whole session.
-            if let Some(hint) = session_hint_ppm {
-                rx_v2_with_hint(window, config, hint)
-            } else {
-                rx_v2_with_options(window, config, allow_legacy_grid)
-            }
+            // Internally `rx_v2_with_options` runs :
+            //   1. rx_v2_single @ 0 ppm (fast-path, ~0 if drift small)
+            //   2. Gardner one-shot + rx_v2_with_hint(gardner_ppm)
+            //   3. (only if allow_legacy_grid = true) ±15 ppm grid
+            //
+            // Step 2 alone is enough on a clean channel with ≥6 markers
+            // per SF (Gardner is sub-ppm accurate); step 3 is the safety
+            // net for outlier cases. `allow_legacy_grid` propagates from
+            // the worker's user-toggle.
+            //
+            // The `session_hint_ppm` plumbed by the worker is INFORMATIONAL
+            // for CLOSED windows -- not fed in here. It still drives the
+            // OPEN-window decode below (idle pre-activation typically has
+            // too few markers for a per-window Gardner) and the Info-tab
+            // `sf_detail` telemetry.
+            let _ = session_hint_ppm; // CLOSED uses per-window Gardner instead
+            rx_v2_with_options(window, config, allow_legacy_grid)
         } else {
             // OPEN window: trailing, no closing preamble.
             //
