@@ -1124,34 +1124,48 @@ for chaque symbole pilote p_recu dans la CW {
         </tr>
         <tr>
             <td><strong>HIGH+2X</strong><br><span style="color:#888">32-APSK 3/4</span></td>
-            <td class="num">0.081</td><td class="num">10.9 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.084</td><td class="num">10.8 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.086</td><td class="num">10.6 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.301</td><td class="num">5.2 dB</td><td class="num">0/49</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.0057</td><td class="num">22.4 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.0056</td><td class="num">22.5 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.0074</td><td class="num">21.3 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.026</td><td class="num">15.8 dB</td><td class="num">0/49</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
-            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
-            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">61/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.111</td><td class="num">9.6 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.021</td><td class="num">16.9 dB</td><td class="num">66/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
+            <td class="num">0.021</td><td class="num">16.9 dB</td><td class="num">66/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.026</td><td class="num">15.8 dB</td><td class="num">46/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.045</td><td class="num">13.5 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
 </table>
 
 <div class="callout ok">
-    <strong>Mise à jour 2026-05-13 — fix σ² MAD (commit <code>a appears</code>)</strong>
-    : l'estimateur σ² <em>par CW</em> est passé de la moyenne des
-    résidus pilotes (<code>mean(|e|²)</code>) à la médiane rescalée par
+    <strong>Mise à jour 2026-05-13 — SOF + PLS comme pilotes de cycle</strong>
+    : l'estimateur σ² <em>par CW</em> consomme maintenant
+    <strong>192 symboles de référence supplémentaires</strong> par
+    cycle (64 SOF Chu + 128 PLS QPSK), pas seulement les 36 du bloc
+    pilote interne au CW. Le pool effectif passe de 36 sym/CW à
+    228 sym/CW, mais surtout les 192 PLHEADER refs sont à
+    l'<em>extérieur</em> du flux data — donc immunes à la fuite RRC
+    data → pilote qui inflait artificiellement σ² sur les anneaux
+    serrés 32-APSK / 64-APSK. Impact sur les chiffres ci-dessus :
+    <strong>HIGH+2X σ² ÷ 14×</strong> (0.081 → 0.0057 à
+    <code>if_noise=0.00</code>, SNR mesuré 10.9 → 22.4 dB),
+    <strong>HIGH++2X σ² ÷ 2×</strong> (0.042 → 0.021, SNR 13.8 →
+    16.9 dB). Le ratio <code>σ²_R / σ²_T</code> passe de 53× à ~4×
+    sur HIGH+2X — la statistique de canal honnête, plus l'artifact
+    de mesure. Conséquence décodage : <strong>HIGH++2X
+    <code>if_noise=0.45</code> passe de 23/57 à 46/57</strong> CWs
+    convergés (à 1 CW du seuil RaptorQ 47) ;
+    <code>if_noise=0.30</code> gagne <strong>+5 CWs</strong>
+    (61 → 66), <code>if_noise=0.00</code> gagne <strong>+3 CWs</strong>
+    (63 → 66).
+    <br>
+    L'estimateur σ² <em>par CW</em> est aussi passé (commit
+    <code>495fad5</code>) de la moyenne des résidus pilotes
+    (<code>mean(|e|²)</code>) à la médiane rescalée par
     <code>ln(2)</code> (le facteur de cohérence MAD pour Gaussienne
-    complexe). Le σ² rapporté <strong>suit maintenant le SNR canal</strong>
-    sur HIGH+2X, là où la moyenne plafonnait à ~0.43 indépendamment du
-    SNR (biais data→pilote sur les rings 32-APSK serrés via fuite RRC,
-    voir <a href="#post-merge-todos">§10.5</a>). Sur HIGH+2X à
-    <code>if_noise=0.45</code> le nombre de CWs convergés est <em>aussi</em>
-    monté de 55 → 68 sur 69, parce que la LDPC reçoit des LLR à la
-    bonne échelle. Les chiffres ci-dessus reflètent <strong>après</strong>
-    la fix MAD.
+    complexe). Les deux changements (MAD + SOF/PLS pilots) composent.
 </div>
 
 <p style="font-size: 0.88rem; color: #555;">
@@ -1256,47 +1270,46 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
         <tr>
             <td class="num"><strong>0.00</strong></td>
             <td class="num">0.0073</td><td class="num">21.4 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.021</td><td class="num">16.9 dB</td><td class="num">66/69</td><td><span style="color:#2b9f5f">✓</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.30</strong></td>
             <td class="num">0.0074</td><td class="num">21.3 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">61/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.021</td><td class="num">16.9 dB</td><td class="num">66/69</td><td><span style="color:#2b9f5f">✓</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.45</strong></td>
             <td class="num">0.0266</td><td class="num">15.8 dB</td><td class="num">26/69</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.026</td><td class="num">15.8 dB</td><td class="num">46/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.55</strong></td>
             <td class="num">0.2127</td><td class="num">6.7 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.111</td><td class="num">9.6 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.045</td><td class="num">13.5 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
 </table>
 
 <div class="callout">
-    <strong>État après la fix MAD + turbo Pass 2 EM (commits
-    <code>495fad5</code> → HEAD).</strong> Le gap σ² V3 vs V4 sur
-    HIGH++ est inchangé (le σ² rapporté reflète le canal réel et est
-    indépendant du décodeur turbo) : V3=0.0073, V4=0.042 à
-    <code>if_noise=0</code> → <strong>7.6 dB</strong>. À
-    <code>if_noise=0.45</code> les deux sont au même régime (V3=0.027
-    15.8 dB, V4=0.053 12.7 dB) — différence ~3 dB. Le résidu vient de la
+    <strong>État après SOF+PLS-as-pilots + turbo Pass 2 EM (HEAD).</strong>
+    Le gap σ² V3 vs V4 sur HIGH++ s'est resserré : V3=0.0073,
+    V4=0.021 à <code>if_noise=0</code> → <strong>4.6 dB</strong>
+    (était 7.6 dB pré-SOF/PLS). À <code>if_noise=0.45</code> les σ²
+    sont <em>identiques</em> (V3=0.027, V4=0.026 — V4 légèrement
+    meilleur). Le résidu V3 vs V4 sur le SNR clean vient de la
     différence pilotique structurelle : V3 distribue ~200 syms pilotes
-    TDM intra-CW, V4 a 72 syms (2×36) en bord de CW. C'est la piste
-    fix #2 (densifier les blocs pilote) qui pourrait fermer le reste.
+    TDM intra-CW, V4 distribue 36 syms intra-CW + 192 syms PLHEADER
+    en bord de cycle. Sur <code>if_noise=0.45</code> V4 le rattrape :
+    <strong>46/57 CWs convergés (vs V3 26/69)</strong>, à 1 seul CW
+    du seuil RaptorQ 47.
     <br>
     Le turbo Pass 2 EM (<a href="#turbo-passes">§10.3.3</a>) catche
-    <strong>+1 CW</strong> sur HIGH++2X aux SNR clean (62 → 63 à
-    <code>if_noise=0</code>, 60 → 61 à 0.30) ET <strong>+1 CW au
-    cliff</strong> (22 → 23 à 0.45) en raffinant les LLR via les soft
-    symbols post-LDPC P1 — y compris quand P1 n'a pas convergé (le
-    posterior LDPC saturé partiellement reste informatif et l'EM
-    refit channel donne à P2 LDPC une seconde chance sur les CWs
-    borderline). Pas suffisant pour franchir le seuil RaptorQ à 0.45,
-    mais le mécanisme rescue est validé.
+    <strong>+1 CW</strong> au cliff (22 → 23 à 0.45) en raffinant les
+    LLR via les soft symbols post-LDPC P1 — y compris quand P1 n'a
+    pas convergé. Les <strong>+24 CWs gagnés vs pré-PR sur
+    HIGH++2X 0.45</strong> (22 → 46) viennent presque entièrement
+    de SOF+PLS comme pilotes : σ² ÷ 2× = LLR à la bonne échelle =
+    LDPC qui converge où il ne pouvait plus.
 </div>
 
 <p>

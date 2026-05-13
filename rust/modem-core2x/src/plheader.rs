@@ -227,6 +227,33 @@ fn unpack_cw_24(cw: u32) -> Vec<u8> {
 // --- PLS encode / decode --------------------------------------------------
 
 /// Encode the 13-byte PLS payload to 128 QPSK symbols.
+/// Reconstruct the 128 PLS symbols from a decoded payload. Public so
+/// the RX can re-derive the expected PLHEADER symbol sequence after a
+/// successful CRC, and use it (alongside the fixed SOF Chu sequence)
+/// as additional known-pilot references for the per-CW channel
+/// estimators. Returns exactly `PLS_LEN_SYM` (= 128) QPSK symbols at
+/// unit magnitude.
+pub fn pls_symbols(payload: &PlsPayload) -> Vec<Complex64> {
+    make_pls(payload)
+}
+
+/// Concatenation `[SOF (64) | PLS (128)]` = 192 unit-magnitude
+/// reference symbols. Use as the cycle-level pilot for the channel
+/// estimators in [`crate::rx_v4`]: they're at fully-known patterns so
+/// every received sample contributes to gain and σ² estimation
+/// without any decoding ambiguity.
+pub fn plheader_reference_symbols(
+    family: PreambleFamily2x,
+    pls: &PlsPayload,
+) -> Vec<Complex64> {
+    let sof = sof_for_family(family);
+    let mut out = Vec::with_capacity(PLHEADER_LEN_SYM);
+    out.extend_from_slice(sof);
+    out.extend(make_pls(pls));
+    debug_assert_eq!(out.len(), PLHEADER_LEN_SYM);
+    out
+}
+
 fn make_pls(payload: &PlsPayload) -> Vec<Complex64> {
     let bytes = payload.to_bytes();
     let mut bits = bytes_to_bits(&bytes);

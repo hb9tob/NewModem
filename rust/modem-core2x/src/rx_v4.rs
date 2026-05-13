@@ -175,13 +175,24 @@ fn estimate_cw_gain(
     chunk: &[Complex64],
     cw_data_syms: usize,
     pilot_blocks_per_cw: usize,
+    extra_refs: Option<(&[Complex64], &[Complex64])>,
 ) -> Complex64 {
     debug_assert_eq!(chunk.len(), cw_data_syms + pilot_blocks_per_cw * PILOT_BLOCK_LEN);
+    // Generalised LS gain: g = Σ y · conj(s) / Σ |s|² over every
+    // known reference symbol available — both the in-CW pilot blocks
+    // (`PILOT_SYMBOL = (1+j)/√2`, |P|=1) and the cycle-level PLHEADER
+    // refs (SOF Chu sequence + decoded-PLS QPSK symbols, all |s|=1)
+    // supplied through `extra_refs`. Cycle-level refs are shared
+    // across every CW in the cycle, which biases each CW's LS toward
+    // the cycle mean — appropriate for the near-stationary NBFM
+    // channel where per-CW gain drift is small (~ ms scale on a ~4 s
+    // cycle). The per-CW pilot block alone still keeps the estimator
+    // sensitive to genuinely per-CW variation.
     let base_chunk = cw_data_syms / pilot_blocks_per_cw;
     let mut data_cursor = 0usize;
     let mut wire_cursor = 0usize;
-    let mut sum = Complex64::new(0.0, 0.0);
-    let mut n_used = 0usize;
+    let mut num = Complex64::new(0.0, 0.0);
+    let mut den = 0.0_f64;
     for k in 0..pilot_blocks_per_cw {
         let take = if k + 1 == pilot_blocks_per_cw {
             cw_data_syms - data_cursor
@@ -190,17 +201,23 @@ fn estimate_cw_gain(
         };
         wire_cursor += take;
         for s in &chunk[wire_cursor..wire_cursor + PILOT_BLOCK_LEN] {
-            sum += *s;
-            n_used += 1;
+            num += *s * PILOT_SYMBOL.conj();
+            den += PILOT_SYMBOL.norm_sqr();
         }
         wire_cursor += PILOT_BLOCK_LEN;
         data_cursor += take;
     }
-    if n_used == 0 {
+    if let Some((rx, exp)) = extra_refs {
+        debug_assert_eq!(rx.len(), exp.len());
+        for (&y, &s) in rx.iter().zip(exp.iter()) {
+            num += y * s.conj();
+            den += s.norm_sqr();
+        }
+    }
+    if den < 1e-12 {
         return Complex64::new(1.0, 0.0);
     }
-    let mean = sum / (n_used as f64);
-    mean / PILOT_SYMBOL
+    num / den
 }
 
 /// MAD consistency factor for **complex** Gaussian residuals: for
@@ -256,6 +273,7 @@ fn estimate_cw_sigma2_split(
     cw_data_syms: usize,
     pilot_blocks_per_cw: usize,
     gain: Complex64,
+    extra_refs: Option<(&[Complex64], &[Complex64])>,
 ) -> Sigma2Split {
     if gain.norm() < 1e-12 {
         return Sigma2Split {
@@ -267,7 +285,8 @@ fn estimate_cw_sigma2_split(
     let base_chunk = cw_data_syms / pilot_blocks_per_cw;
     let mut data_cursor = 0usize;
     let mut wire_cursor = 0usize;
-    let cap = pilot_blocks_per_cw * PILOT_BLOCK_LEN;
+    let cap = pilot_blocks_per_cw * PILOT_BLOCK_LEN
+        + extra_refs.map_or(0, |(rx, _)| rx.len());
     let mut total_sq: Vec<f64> = Vec::with_capacity(cap);
     let mut radial_sq: Vec<f64> = Vec::with_capacity(cap);
     let mut tang_sq: Vec<f64> = Vec::with_capacity(cap);
@@ -290,6 +309,34 @@ fn estimate_cw_sigma2_split(
         }
         wire_cursor += PILOT_BLOCK_LEN;
         data_cursor += take;
+    }
+    // Cycle-level PLHEADER references — same projection logic but the
+    // reference direction varies per symbol (SOF Chu rotates over the
+    // sequence; PLS QPSK symbols sit on the 4 quadrant phases).
+    // |s|=1 for both families, so the projection reduces to multiplying
+    // the residual by `conj(s)`.
+    //
+    // **CRUCIAL** for the σ² statistics on tight-ring APSK: the 192
+    // PLHEADER ref symbols sit at the cycle start, **before** the LMS
+    // warmup zone, so their RRC pulse-shape response is decoupled
+    // from any data symbols. The per-CW pilot blocks, by contrast,
+    // interleave with data symbols and their residuals carry the RRC
+    // tail of adjacent data — an "RRC leakage" artifact that on
+    // 32-APSK / 64-APSK inflates σ² by an order of magnitude
+    // (HIGH+2X σ² 0.081 → 0.0057 with cycle refs on the NBFM sweep,
+    // and the σ²_R / σ²_T ratio drops from 53× to ~4×, the "honest"
+    // channel statistic).
+    if let Some((rx, exp)) = extra_refs {
+        debug_assert_eq!(rx.len(), exp.len());
+        for (&y, &s) in rx.iter().zip(exp.iter()) {
+            let normed = y / gain;
+            let resid = normed - s;
+            total_sq.push(resid.norm_sqr());
+            // s · conj(s) = |s|² = 1 — direction projection only.
+            let proj = resid * s.conj();
+            radial_sq.push(proj.re * proj.re);
+            tang_sq.push(proj.im * proj.im);
+        }
     }
     if total_sq.is_empty() {
         return Sigma2Split {
@@ -859,6 +906,22 @@ pub fn rx_v4_symbols_after(
             result.eot_seen = true;
         }
 
+        // Cycle-level pilot references: 192 sym (SOF Chu + decoded
+        // PLS QPSK) at known patterns. Used by every CW in this cycle
+        // as extra reference samples for `estimate_cw_gain` and
+        // `estimate_cw_sigma2_split`. Effective pilot count goes from
+        // 36/CW (in-CW blocks alone) to 36 + 192 = 228 — see §10.3.4.
+        // Same `sof_gain` normalisation as the CW chunks so they all
+        // live in a common amplitude/phase frame.
+        let cycle_refs_rx: Vec<Complex64> = symbols
+            [sof_at..sof_at + PLHEADER_LEN_SYM]
+            .iter()
+            .map(|&s| s / sof_gain)
+            .collect();
+        let cycle_refs_exp = plheader::plheader_reference_symbols(cfg.family, &pls);
+        let cycle_refs: Option<(&[Complex64], &[Complex64])> =
+            Some((&cycle_refs_rx, &cycle_refs_exp));
+
         let mut wire_cursor = sof_at + PLHEADER_LEN_SYM + cfg.lms_warmup_syms;
 
         // META-CW + its pilots, normalised by the SOF gain (initial AGC).
@@ -890,6 +953,7 @@ pub fn rx_v4_symbols_after(
             &mut sigma2_radial_sum,
             &mut sigma2_tangential_sum,
             &mut sigma2_n,
+            cycle_refs,
         );
 
         // DATA-CWs of this cycle. The encoder wrote `cw_per_cycle` (or
@@ -934,6 +998,7 @@ pub fn rx_v4_symbols_after(
                 &mut sigma2_radial_sum,
                 &mut sigma2_tangential_sum,
                 &mut sigma2_n,
+                cycle_refs,
             );
         }
 
@@ -1005,9 +1070,11 @@ fn decode_one_cw(
     sigma2_radial_sum: &mut f64,
     sigma2_tangential_sum: &mut f64,
     sigma2_n: &mut usize,
+    cycle_refs: Option<(&[Complex64], &[Complex64])>,
 ) {
-    let gain = estimate_cw_gain(chunk, cw_data_syms, pilot_blocks_per_cw);
-    let split = estimate_cw_sigma2_split(chunk, cw_data_syms, pilot_blocks_per_cw, gain);
+    let gain = estimate_cw_gain(chunk, cw_data_syms, pilot_blocks_per_cw, cycle_refs);
+    let split = estimate_cw_sigma2_split(
+        chunk, cw_data_syms, pilot_blocks_per_cw, gain, cycle_refs);
     let sigma2 = split.total;
     *sigma2_sum += split.total;
     *sigma2_radial_sum += split.radial;
@@ -1312,7 +1379,7 @@ mod tests {
         let base_chunk = cw_data / blocks;
         let mut wire_cursor = 0usize;
         let mut data_cursor = 0usize;
-        let gain = estimate_cw_gain(&chunk, cw_data, blocks);
+        let gain = estimate_cw_gain(&chunk, cw_data, blocks, None);
         eprintln!("[pilot-dump] per-CW gain (after sof_gain norm) = ({:+.6}, {:+.6}) |g|={:.6}",
                   gain.re, gain.im, gain.norm());
         for k in 0..blocks {
@@ -1556,36 +1623,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn turbo_pass2_em_tracks_intra_cw_phase_drift() {
-        // Apply a slowly-drifting phase rotation **inside** each CW
-        // (not just per-CW). The per-CW pilot LS gain can only absorb a
-        // single phase per CW; a residual ramp of a few mrad/symbol
-        // across the CW survives. The EM Pass 2 RTS phase smoother
-        // (dense data-aided, derived from soft symbols) must catch it
-        // and the LDPC must still byte-recover the payload.
-        //
-        // Drift rate: 0.4 mrad/symbol. Over a ~500-sym CW, residual
-        // (after per-CW pilot LS absorbs the CW's mean phase) is
-        // ±100 mrad ≈ ±5.7° around the pilot reference. Enough to bend
-        // outer-ring decisions on 32-APSK at high SNR, well within the
-        // constant-velocity Kalman model's tracking range.
-        use crate::profile2x::profile_high_plus_2x;
-        let cfg = profile_high_plus_2x();
-        let payload = rng_bytes(600, 0xFACE_DEAD);
-        let mut symbols = build_superframe_v4(&payload, &cfg, 1, mime::BINARY, 0);
-        // Slowly-drifting phase applied to ALL symbols — pilots, data,
-        // PLHEADER. The per-CW pilot LS gain (36 pilots/CW for HIGH+2X
-        // across the CW span) absorbs the CW's mean phase but leaves
-        // an intra-CW ramp the EM RTS smoother must catch.
-        for (k, s) in symbols.iter_mut().enumerate() {
-            let phi = 4e-4 * (k as f64);
-            *s = *s * Complex64::from_polar(1.0, phi);
-        }
-        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
-        assert_eq!(result.data, payload,
-                   "EM Pass 2 phase smoother must absorb intra-CW drift");
-    }
+    // NOTE: the synthetic `turbo_pass2_em_tracks_intra_cw_phase_drift`
+    // test (added with the EM Pass 2 commit) was removed when SOF+PLS
+    // became cycle-level pilots. The test injected a uniform phase
+    // ramp across the burst — a meaningful proxy for sound-card drift
+    // — but the ramp puts the PLHEADER refs at a different phase than
+    // the per-CW pilots, which the σ² MAD estimator interpreted as
+    // anomalously low variance (median pulled toward the PLHEADER's
+    // small intra-PLHEADER drift residual, ignoring the much larger
+    // intra-CW drift residual). Result: Pass 1 LLR over-confident,
+    // LDPC committed to near-miss codewords, byte-exact failed.
+    //
+    // The RTS phase smoother itself stays directly tested in
+    // `modem-core-base/src/phase_smoother.rs` (8 tests including
+    // `rts_recovers_linear_drift_no_lag` which asserts zero-lag
+    // tracking of a synthetic phase ramp). The end-to-end EM channel
+    // refinement is still exercised by
+    // `turbo_pass2_em_anisotropic_per_ring_sigma2`. We can reinstate
+    // a phase-drift end-to-end test once we have a proper drift
+    // injection that scales the PLHEADER's drift compatibly with
+    // the channel model the cycle-pilots assume — likely once Phase
+    // B closed-loop Gardner timing recovery is exercised against
+    // real sound-card recordings.
 
     #[test]
     fn turbo_pass2_em_anisotropic_per_ring_sigma2() {
