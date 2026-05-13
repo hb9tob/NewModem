@@ -59,9 +59,19 @@ const LDPC_MAX_ITER: usize = 30;
 const SIGMA2_FLOOR: f64 = 1e-3;
 
 /// SOF correlation peak threshold (fraction of `SOF_LEN_SYM`). For unit-
-/// magnitude Chu, autocorrelation peaks at 64; we accept ≥ 32 to cope
-/// with channel attenuation and modest sigma2.
-const SOF_PEAK_THRESHOLD_FRAC: f64 = 0.5;
+/// magnitude Chu, autocorrelation peaks at 64 on a clean roundtrip.
+///
+/// Real OTA paths (SDRplay + radio NBFM demod chain with audio-band
+/// LPF + de-emphasis + AGC) attenuate the SOF pulse magnitude by 70-80%
+/// — observed correlation peaks land in the 15-20 range on a FTX-1 →
+/// SDRplay capture even at high SNR. Threshold 0.2 × 64 = 12.8 admits
+/// those while staying well above the noise correlation level
+/// (random Chu match peaks ≈ √(64·2·ln(L))·σ ≈ 25·σ for L=5000 syms,
+/// so at σ=0.06 a noise peak is ~1.5 — 8× under threshold).
+///
+/// Was 0.5 pre-v0.11.0-2x4 (correct for synthetic WAV roundtrip, blew
+/// past every real OTA capture).
+const SOF_PEAK_THRESHOLD_FRAC: f64 = 0.2;
 
 /// One decoded V4 burst.
 #[derive(Clone, Debug)]

@@ -75,15 +75,25 @@ pub fn audio_to_symbols(
     let mf = demodulator::matched_filter(&bb, &taps);
 
     // The modulator places symbol k's pulse peak at audio sample
-    // `k*sps + (taps.len()-1)/2 = k*sps + 6*sps`. The matched filter
-    // is shift-invariant, so the strobe positions in the MF output are
-    // at audio offsets `6*sps + k*sps` — multiples of `sps`. Sampling
-    // with phase 0 thus lands on every strobe, after a 6-symbol lead-in
-    // that `find_next_sof` skips over harmlessly. The SOF-anchored
-    // variant `best_symbol_phase_sof` is kept for sound-card paths
-    // where the AGC/codec might shift the strobe by a few samples.
-    let _phase = best_symbol_phase_sof(&mf, sps, cfg);
-    let phase = 0usize;
+    // `k*sps + (taps.len()-1)/2 = k*sps + 6*sps`. On a clean WAV→WAV
+    // pipeline the matched filter is shift-invariant so the strobe
+    // positions in the MF output are multiples of `sps` and `phase = 0`
+    // is correct by construction.
+    //
+    // Real OTA paths (SDRplay, sound-card with AGC) introduce a sub-
+    // sample shift between the TX's symbol grid and the RX's audio
+    // sample grid. Locking `phase = 0` then samples between symbols
+    // and the SOF correlator inside `rx_v4_symbols` never finds a
+    // peak. Run the SOF-anchored phase search and USE its result —
+    // the cost is `sps` correlations across the full audio (≈ 0.3 s
+    // for 112 s @ sps=32 on Pi 5) and it scales linearly with capture
+    // length. Cheap relative to the rx_v4 pipeline that follows.
+    //
+    // Pre-`v0.11.0-2x4` the search result was assigned to `_phase`
+    // and `phase = 0` was hardcoded. That broke OTA captures with a
+    // long band-noise prefix before the actual burst because the
+    // 1024-sym cap landed entirely in noise.
+    let phase = best_symbol_phase_sof(&mf, sps, cfg);
 
     // Naive integer-step sampling at the symbol rate. The TimingLoop
     // upgrade (Phase B integration) replaces this with strobed Farrow
@@ -119,16 +129,19 @@ fn best_symbol_phase_sof(
         return 0;
     }
     let sof = sof_for_family(cfg.family);
-    // Bound the search window so the full burst search stays linear in
-    // sps × symbols (instead of sps × audio length). 1024 sym is enough
-    // to land on at least one PLHEADER in the typical 2x bursts.
-    let max_syms = (mf.len() / sps).min(1024);
+    // No upper cap on the symbol-position scan: the caller may hand us
+    // a long capture (e.g. 112 s SDRplay grab with a band-noise prefix
+    // followed by a brief burst near the end). A pre-`v0.11.0-2x4`
+    // 1024-symbol cap (~0.7 s @ sps=32) landed entirely in noise and
+    // picked a noise-optimal phase. Cost is `sps × (n_syms − SOF_LEN)`
+    // 64-tap complex inner products — ≈ 32 × 168 k × 64 = 344 M
+    // mults for 112 s sps=32, ≈ 0.3 s on Pi 5. Cheap relative to the
+    // rx_v4 pipeline that runs after.
 
     let mut best_phase = 0usize;
     let mut best_peak = 0.0_f64;
     for p in 0..sps {
         let n_syms = (mf.len() - p) / sps;
-        let n_syms = n_syms.min(max_syms);
         if n_syms < SOF_LEN_SYM + 1 {
             continue;
         }
@@ -398,6 +411,19 @@ pub fn spawn(
         let mut last_telemetry_tick = Instant::now();
         let mut last_batch_processing_ms: f64 = 0.0;
         let mut max_batch_processing_ms: f64 = 0.0;
+        // Diagnostic logging for OTA bring-up. Set `RX_V4_LOG_GATE=1`
+        // before launching the GUI (or CLI) to dump one line per probe
+        // call (audio RMS, peak² / mean² ratio, anchor, pass/fail) and
+        // one line per `rx_v4_symbols` call (cycles found, SOF locked,
+        // converged CW counts). Mute by default so production captures
+        // don't spew. Snapshot once at thread start — env reads in a
+        // tight loop add measurable latency on Pi 5.
+        let log_gate = std::env::var_os("RX_V4_LOG_GATE").is_some();
+        // `RX_V4_NO_GATE=1` bypasses the FFT probe entirely — every
+        // chunk goes straight into `rx_v4_symbols` (= pre-C-5
+        // behaviour). Useful when bringing up OTA on a new radio and
+        // unsure whether the gate or the decoder is the blocker.
+        let no_gate = std::env::var_os("RX_V4_NO_GATE").is_some();
         // Absolute index (in the front-end's `symbols_emitted` space) of
         // `symbol_buffer[0]`. Bumped when the buffer is reset between
         // bursts so the `first_sof_at` returned by `rx_v4_symbols`
@@ -492,7 +518,16 @@ pub fn spawn(
             let is_active =
                 emitted_session_id.is_some() || frontend.sof_anchor().is_some();
             let should_decode = if !finalised && symbol_buffer.len() >= 192 {
-                if is_active {
+                if no_gate {
+                    // RX_V4_NO_GATE=1 → bypass the probe. Always decode
+                    // once we have enough symbols. Idle buffer stays
+                    // empty so it can't compete for memory.
+                    if !idle_audio_buf.is_empty() {
+                        idle_audio_buf.clear();
+                        idle_audio_buf.shrink_to_fit();
+                    }
+                    true
+                } else if is_active {
                     // Active session — free the idle buffer; we won't
                     // use it again for this session.
                     if !idle_audio_buf.is_empty() {
@@ -528,7 +563,26 @@ pub fn spawn(
                         let probe =
                             PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
                         let r = probe.check(&buf);
-                        if r.passes(PROBE_THRESHOLD_2X) {
+                        let passes = r.passes(PROBE_THRESHOLD_2X);
+                        if log_gate {
+                            eprintln!(
+                                "[gate] buf={}s rms={:.4} ratio={:.0} \
+                                 thr={:.0} anchor={:?} per_template={:?} \
+                                 → {}",
+                                idle_audio_buf.len() as f64
+                                    / AUDIO_RATE as f64,
+                                rms,
+                                r.max_ratio,
+                                PROBE_THRESHOLD_2X,
+                                r.best_anchor,
+                                r.per_template_ratio
+                                    .iter()
+                                    .map(|x| format!("{x:.0}"))
+                                    .collect::<Vec<_>>(),
+                                if passes { "PASS" } else { "FAIL" },
+                            );
+                        }
+                        if passes {
                             probe_hot_until = Some(now + PROBE_HOT_HOLD);
                             true
                         } else {
@@ -543,7 +597,28 @@ pub fn spawn(
             };
 
             if should_decode {
-                if let Some(res) = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg) {
+                let res_opt = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg);
+                if log_gate {
+                    match &res_opt {
+                        Some(r) => eprintln!(
+                            "[rxv4] syms={} cycles={} cws={}/{} \
+                             data_cws={}/{} sof@={:?} eot={}",
+                            symbol_buffer.len(),
+                            r.cycles,
+                            r.converged_cws,
+                            r.total_cws,
+                            r.data_cws_converged,
+                            r.data_cws_total,
+                            r.first_sof_at,
+                            r.eot_seen,
+                        ),
+                        None => eprintln!(
+                            "[rxv4] syms={} → no SOF",
+                            symbol_buffer.len(),
+                        ),
+                    }
+                }
+                if let Some(res) = res_opt {
                     // D-1c-ii: once rx_v4 has located the SOF, forward
                     // its absolute symbol-stream position to the
                     // StreamingFrontend so its closed-loop TED switches
