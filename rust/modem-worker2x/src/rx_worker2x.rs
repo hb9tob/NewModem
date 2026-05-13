@@ -224,6 +224,20 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(1000);
 /// entirely).
 const PROBE_HOT_HOLD: Duration = Duration::from_secs(4);
 
+/// Minimum samples in `idle_audio_buf` before the probe is willing to
+/// run. The FFT zero-pads short buffers, so a partial fill still
+/// produces a meaningful peak² / mean² ratio — the floor exists only
+/// to keep us from probing a single dust mote of audio on every chunk.
+///
+/// 0.5 s @ 48 kHz = ~1.5 PLHEADER cycles' worth at the densest profile
+/// (sps=32, full PLHEADER ≈ 0.13 s). Even a multi-burst capture with
+/// 1.5 s of inter-burst silence has the next burst's PLHEADER landing
+/// inside this much audio by the time the gate fires, so we don't lock
+/// onto the EOT cycle by mistake. Previous floor of `BUF_SAMPLES / 2`
+/// (1 s) was too patient — it would miss the second burst's PLHEADER #1
+/// and grab PLHEADER #2 (the EOT sentinel) instead.
+const PROBE_MIN_BUF_SAMPLES: usize = 24_000;
+
 // ---------------------------------------------------------------------------
 // Streaming RX worker (Phase D-1c) — no sliding-window
 // ---------------------------------------------------------------------------
@@ -318,6 +332,15 @@ pub fn spawn(
         };
         let mut frontend = crate::streaming_frontend::StreamingFrontend::new(cfg.clone());
         let mut symbol_buffer: Vec<Complex64> = Vec::with_capacity(8192);
+        // Absolute index (in the front-end's `symbols_emitted` space) of
+        // `symbol_buffer[0]`. Bumped when the buffer is reset between
+        // bursts so the `first_sof_at` returned by `rx_v4_symbols`
+        // (relative to the slice we hand it) can be translated back to
+        // the absolute axis that `StreamingFrontend::align_to_sof`
+        // expects. Always equals `frontend.symbols_emitted() -
+        // symbol_buffer.len()` just before the buffer is appended to
+        // each tick.
+        let mut symbol_buffer_base: u64 = 0;
         // Dedup state: once we emit `session_armed` / `session_decoded`
         // / `file_complete` for a given session_id, we don't re-emit
         // them on a later tick that still sees the same session. The
@@ -325,7 +348,19 @@ pub fn spawn(
         // payload is finalised either on EOT or at channel close.
         let mut emitted_session_id: Option<u32> = None;
         let mut last_progress_converged: usize = 0;
+        // Set when the current burst's `file_complete` has fired. Reset
+        // back to `false` after the worker swallows the EOT and the
+        // session state has been rolled over for a possible next burst
+        // (multi-burst capture). The channel-close fallback path below
+        // honours `finalised = true` to skip a redundant final pass when
+        // the LAST burst ended cleanly on its EOT.
         let mut finalised = false;
+        // True as soon as the worker has finalised at least one session
+        // in this capture. Used to suppress spurious "no burst detected"
+        // / "decode incomplete" errors at channel close in a multi-burst
+        // capture: a burst that didn't make it through after a clean
+        // one already landed is silence, not failure.
+        let mut any_session_finalised = false;
 
         // Idle-gate state (Phase C-5). The audio buffer is only
         // populated while the worker hasn't yet locked an SOF — once
@@ -395,7 +430,7 @@ pub fn spawn(
                         true
                     } else if last_probe_at
                         .map_or(true, |t| now.duration_since(t) >= PROBE_INTERVAL)
-                        && idle_audio_buf.len() >= IDLE_PROBE_BUF_SAMPLES / 2
+                        && idle_audio_buf.len() >= PROBE_MIN_BUF_SAMPLES
                     {
                         last_probe_at = Some(now);
                         // VecDeque → contiguous Vec for the FFT input.
@@ -427,12 +462,15 @@ pub fn spawn(
                     // its absolute symbol-stream position to the
                     // StreamingFrontend so its closed-loop TED switches
                     // to AbsGardner-on-pilot-interior (DVB-S2X §9.3.2
-                    // recipe). The symbol_buffer index matches the
-                    // frontend's symbols_emitted counter 1:1 because
-                    // the buffer is never trimmed in this thread.
+                    // recipe). `first_sof_at` is relative to
+                    // `symbol_buffer`'s current contents; add
+                    // `symbol_buffer_base` to convert back to the
+                    // absolute axis the front-end keeps. Within a single
+                    // burst the base stays at 0; it advances only after
+                    // an EOT-driven buffer reset (multi-burst capture).
                     if frontend.sof_anchor().is_none() {
                         if let Some(sof) = res.first_sof_at {
-                            frontend.align_to_sof(sof as u64);
+                            frontend.align_to_sof(symbol_buffer_base + sof as u64);
                         }
                     }
                     if let Some(ah) = res.app_header.as_ref() {
@@ -508,7 +546,11 @@ pub fn spawn(
                         }
                         // EOT seen on at least one cycle → finalise
                         // immediately, no need to wait for channel
-                        // close.
+                        // close. Then roll the worker's session-decode
+                        // state back to "idle, looking for next burst"
+                        // so a subsequent TX on the same capture
+                        // produces another session_armed / file_complete
+                        // pair instead of being silently dropped.
                         if res.eot_seen && !res.data.is_empty() {
                             let dir = save_dir
                                 .lock()
@@ -523,7 +565,37 @@ pub fn spawn(
                                 &res.data,
                                 res.sigma2_data,
                             );
-                            finalised = true;
+                            any_session_finalised = true;
+                            // Multi-burst reset: rewind everything for
+                            // a fresh burst-acquisition cycle. We
+                            // rebuild `frontend` rather than just
+                            // clearing its SOF anchor because the
+                            // Gardner timing loop has been integrating
+                            // through the inter-burst silence (TED ≈ 0
+                            // on zeros, but NCO phase still drifts vs
+                            // the next burst's actual symbol grid).
+                            // Without this rebuild the second burst's
+                            // PLHEADER #1 lands on misaligned strobes
+                            // and the SOF correlator picks up
+                            // PLHEADER #2 (the EOT sentinel) by
+                            // mistake — see regression test
+                            // `spawn_decodes_two_consecutive_bursts_…`.
+                            // The cost is one PLHEADER's worth of
+                            // re-acquisition per burst (~0.13 s at
+                            // sps=32), same as V3's per-burst
+                            // `WorkerState::soft_reset_buffer`.
+                            emitted_session_id = None;
+                            last_progress_converged = 0;
+                            finalised = false;
+                            symbol_buffer.clear();
+                            symbol_buffer_base = 0;
+                            frontend = crate::streaming_frontend::
+                                StreamingFrontend::new(cfg.clone());
+                            // Idle-gate state: probe re-fires on the
+                            // next burst's PLHEADER.
+                            idle_audio_buf.clear();
+                            last_probe_at = None;
+                            probe_hot_until = None;
                         }
                     }
                 }
@@ -535,16 +607,24 @@ pub fn spawn(
 
         // Channel-close or stop: one final pass to catch a burst that
         // ended without an EOT (truncated WAV, stop button mid-frame,
-        // ...). If we already emitted via the EOT path above, skip.
+        // ...). If the LAST burst already EOT-finalised, skip — there
+        // are no leftover symbols worth scanning. A multi-burst capture
+        // that finalised an earlier burst on its EOT and saw no later
+        // burst at all also falls through here; the `any_session_finalised`
+        // flag suppresses the "no burst detected" / "decode incomplete"
+        // errors below, which would otherwise contradict the earlier
+        // successful `file_complete`.
         if finalised {
             return;
         }
         let result = modem_core2x::rx_v4::rx_v4_symbols(&symbol_buffer, &cfg);
         let Some(rx_result) = result else {
-            // Only complain if we never saw a SOF. Otherwise emitted_id
-            // is Some and the GUI's session pane already shows progress
-            // — silence is the better UX than a bogus error.
-            if emitted_session_id.is_none() {
+            // Only complain if we never saw a SOF AND never finalised a
+            // prior burst. Otherwise emitted_id is Some (active session
+            // in progress, GUI already shows it) or any_session_finalised
+            // is true (multi-burst case: earlier burst landed cleanly,
+            // trailing silence is normal) — silence is the right UX.
+            if emitted_session_id.is_none() && !any_session_finalised {
                 sink.emit(
                     "error",
                     ErrorPayload {
@@ -555,27 +635,31 @@ pub fn spawn(
             return;
         };
         let Some(app_header) = rx_result.app_header else {
-            sink.emit(
-                "error",
-                ErrorPayload {
-                    message: format!(
-                        "RX V4 : décodage incomplet ({}/{} CW)",
-                        rx_result.converged_cws, rx_result.total_cws
-                    ),
-                },
-            );
+            if !any_session_finalised {
+                sink.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!(
+                            "RX V4 : décodage incomplet ({}/{} CW)",
+                            rx_result.converged_cws, rx_result.total_cws
+                        ),
+                    },
+                );
+            }
             return;
         };
         if rx_result.data.is_empty() {
-            sink.emit(
-                "error",
-                ErrorPayload {
-                    message: format!(
-                        "RX V4 : payload vide (cycles={}, CW {}/{})",
-                        rx_result.cycles, rx_result.converged_cws, rx_result.total_cws
-                    ),
-                },
-            );
+            if !any_session_finalised {
+                sink.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!(
+                            "RX V4 : payload vide (cycles={}, CW {}/{})",
+                            rx_result.cycles, rx_result.converged_cws, rx_result.total_cws
+                        ),
+                    },
+                );
+            }
             return;
         }
         let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
@@ -1033,6 +1117,126 @@ mod tests {
             .expect("saved_path string");
         let written = std::fs::read(saved_path).expect("read saved");
         assert_eq!(written, content, "decoded file != original content");
+    }
+
+    #[test]
+    fn spawn_decodes_two_consecutive_bursts_in_one_capture() {
+        // Multi-burst contract: two payloads encoded back-to-back with
+        // INTER_BURST_SILENCE_S of zeros between them. The worker should
+        // emit two `file_complete` events with distinct session_id /
+        // filenames and write both decoded files. Regression for the
+        // old single-shot behaviour where `finalised = true` froze the
+        // worker after burst 1 and burst 2 was silently dropped.
+        use modem_framing::payload_envelope::PayloadEnvelope;
+        use modem_worker_base::RecordingSink;
+        use std::sync::mpsc;
+
+        let content_a = rng_bytes(200, 0x11);
+        let content_b = rng_bytes(220, 0x22);
+        let env_a =
+            PayloadEnvelope::new("burst_a.bin", "HB9TOB", content_a.clone()).expect("env A");
+        let env_b =
+            PayloadEnvelope::new("burst_b.bin", "HB9TOB", content_b.clone()).expect("env B");
+        let cfg = profile_high_2x();
+        let k_bytes = cfg.base.ldpc_rate.k() / 8;
+
+        let mut audio: Vec<f32> = Vec::new();
+        for (env, sid) in [(&env_a, 0xAA00_0001_u32), (&env_b, 0xBB00_0002_u32)] {
+            let wire = env.encode();
+            let k_source =
+                modem_framing::raptorq_codec::k_from_payload(wire.len(), k_bytes) as u32;
+            let n_packets =
+                k_source + modem_framing::raptorq_codec::n_repair_default(k_source);
+            let req = EncodeRequest {
+                profile: "HIGH2X",
+                wire_payload: &wire,
+                session_id: sid,
+                mime_type: mime::BINARY,
+                hash_short: 0x1234,
+                esi_start: 0,
+                n_packets,
+                vox_seconds: 0.0,
+            };
+            audio.extend_from_slice(
+                &V4Modem.encode_to_samples(&req).expect("encode"),
+            );
+            // Inter-burst silence — ≥ a few PROBE_INTERVALs so the gate
+            // closes between bursts. 1.5 s is plenty without bloating
+            // the test runtime.
+            const INTER_BURST_SILENCE_S: f64 = 1.5;
+            let n_silence =
+                (INTER_BURST_SILENCE_S * AUDIO_RATE as f64).round() as usize;
+            audio.extend(std::iter::repeat(0.0_f32).take(n_silence));
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
+        let wav_sink: SharedWavSink = Arc::new(Mutex::new(None));
+        let recording: Arc<RecordingSink> = Arc::new(RecordingSink::new());
+        let sink: Arc<dyn EventSink> = recording.clone();
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let mut handle = spawn(
+            rx,
+            sink,
+            save_dir,
+            wav_sink,
+            "HIGH2X".to_string(),
+            false,
+            Arc::new(AtomicU64::new(0)),
+        );
+        const BATCH: usize = 24_000;
+        for i in (0..audio.len()).step_by(BATCH) {
+            let end = (i + BATCH).min(audio.len());
+            tx.send(audio[i..end].to_vec()).expect("send");
+        }
+        drop(tx);
+        handle
+            .thread
+            .take()
+            .expect("worker thread present")
+            .join()
+            .expect("worker join");
+
+        let events = recording.events();
+        let file_completes: Vec<_> = events
+            .iter()
+            .filter(|(n, _)| n == "file_complete")
+            .map(|(_, v)| v.clone())
+            .collect();
+        let err_msg = events
+            .iter()
+            .find(|(n, _)| n == "error")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        let event_names: Vec<_> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            file_completes.len(),
+            2,
+            "expected 2 file_complete events, got {}: error={err_msg} events={event_names:?}",
+            file_completes.len(),
+        );
+        // file_complete[i].filename must match what each envelope set.
+        let names: Vec<&str> = file_completes
+            .iter()
+            .map(|fc| fc["filename"].as_str().expect("filename"))
+            .collect();
+        assert!(names.contains(&"burst_a.bin"), "missing burst_a: {names:?}");
+        assert!(names.contains(&"burst_b.bin"), "missing burst_b: {names:?}");
+        // Both decoded files exist on disk and match the originals.
+        for (fc, expected) in file_completes
+            .iter()
+            .zip([&content_a, &content_b].iter())
+        {
+            let path = fc["saved_path"].as_str().expect("saved_path");
+            let written = std::fs::read(path).expect("read saved");
+            // Same-named files in the same save_dir would clobber each
+            // other; the envelopes use distinct filenames so they don't.
+            // Match either order — file_completes come in arrival order.
+            let matches_a = written == content_a;
+            let matches_b = written == content_b;
+            assert!(matches_a || matches_b, "decoded file ≠ either original");
+            let _ = expected;
+        }
     }
 
     #[test]

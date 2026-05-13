@@ -198,6 +198,22 @@ impl StreamingFrontend {
         self.sof_anchor = Some(absolute_symbol_idx);
     }
 
+    /// Drop the current SOF anchor. The front-end falls back to plain
+    /// Gardner (no pilot interior gating) until a fresh
+    /// [`align_to_sof`](Self::align_to_sof) is called.
+    ///
+    /// Used by the worker between bursts: once the EOT cycle has been
+    /// decoded and the session finalised, the SOF anchor of that burst
+    /// is no longer meaningful — the next burst starts at a different
+    /// (and yet-unknown) absolute symbol position. Clearing here forces
+    /// the next `rx_v4_symbols` tick to re-acquire on the new burst's
+    /// PLHEADER. The Farrow + Gardner timing-loop state is preserved
+    /// (clock drift is continuous between bursts on the same channel).
+    #[inline]
+    pub fn clear_sof_anchor(&mut self) {
+        self.sof_anchor = None;
+    }
+
     /// True when the symbol at absolute index `abs_idx` is a pilot
     /// symbol (one of the 36-sym `(1+j)/√2` blocks) according to the
     /// pre-computed cycle layout, relative to the current SOF anchor.
