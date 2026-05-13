@@ -31,3 +31,9 @@ pub mod farrow;
 // `farrow` to drive a continuous timing-recovery strobe. Standard
 // Gardner for PSK + AbsGardner for APSK constellations.
 pub mod timing_loop;
+
+// Turbo Pass 2 EM — Kalman + RTS (Rauch–Tung–Striebel) phase smoother
+// on 2-state {φ, ω} constant-velocity model. Data-aided phase tracking
+// inside a codeword using soft-symbol references from the LDPC
+// posterior. Used by `modem-core2x/src/rx_v4.rs::decode_one_cw`.
+pub mod phase_smoother;

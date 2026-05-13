@@ -38,6 +38,24 @@ impl LdpcDecoder {
     /// LLR convention: positive = bit 0 more likely.
     /// Returns (decoded_info_bits, converged).
     pub fn decode(&self, llr_channel: &[f32]) -> (Vec<u8>, bool) {
+        let (bits, _posterior, converged) = self.decode_with_posterior(llr_channel);
+        (bits, converged)
+    }
+
+    /// Decode LLR values and **also return the full-codeword posterior
+    /// LLR vector** (length `self.n`, with the standard convention
+    /// positive = bit 0 more likely). Used by turbo Pass 2 to compute
+    /// soft symbols via E[s_k] = Σ_c P(s=c) · c.
+    ///
+    /// The posterior LLR is the sum of channel LLR + all check-to-variable
+    /// messages after iteration converged (or `max_iter` hit). On
+    /// `converged == true` the sign vector matches the hard decisions
+    /// exactly; magnitudes are the per-bit confidence and are usable
+    /// for soft symbol expectation.
+    pub fn decode_with_posterior(
+        &self,
+        llr_channel: &[f32],
+    ) -> (Vec<u8>, Vec<f32>, bool) {
         assert_eq!(llr_channel.len(), self.n);
 
         // Q messages: variable-to-check. Indexed as [row][position_in_row].
@@ -126,7 +144,7 @@ impl LdpcDecoder {
             .map(|&l| if l < 0.0 { 1 } else { 0 })
             .collect();
 
-        (info_bits, converged)
+        (info_bits, total_llr, converged)
     }
 
     /// Check if all parity checks are satisfied (hard decision).

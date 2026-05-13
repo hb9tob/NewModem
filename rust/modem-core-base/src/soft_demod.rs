@@ -139,6 +139,65 @@ pub fn llr_maxlog_per_ring(
     llr
 }
 
+/// Max-log LLR with σ² indexed by **both** symbol position and
+/// candidate ring — the per-symbol generalisation of
+/// [`llr_maxlog_per_ring`]. Used by the turbo Pass 2 EM loop to feed a
+/// time-varying per-ring variance `σ²_r(k)` (produced by the RTS
+/// log-variance smoother) into the re-LLR step.
+///
+/// Per-candidate Bayesian PDF (identical to `llr_maxlog_per_ring`):
+///
+/// ```text
+///   neg_log_p(s | y_k) = |y_k − s|² / σ²(s, k) + log σ²(s, k)
+/// ```
+///
+/// with `σ²(s, k) = sigma2_per_sym_per_ring[k][ring_of_point[s]]`.
+///
+/// Length contracts:
+/// - `sigma2_per_sym_per_ring.len() == symbols.len()`
+/// - Each inner vector has length `constellation.rings().0.len()`.
+pub fn llr_maxlog_per_sym_per_ring(
+    symbols: &[Complex64],
+    constellation: &Constellation,
+    sigma2_per_sym_per_ring: &[Vec<f64>],
+) -> Vec<f32> {
+    assert_eq!(
+        sigma2_per_sym_per_ring.len(),
+        symbols.len(),
+        "sigma2_per_sym_per_ring must have one entry per received symbol",
+    );
+    let (radii, ring_of_point) = constellation.rings();
+    let n_rings = radii.len();
+    let bps = constellation.bits_per_sym;
+    let n_points = constellation.points.len();
+    let mut llr = Vec::with_capacity(symbols.len() * bps);
+    let mut neg_log_p = vec![0.0_f64; n_points];
+
+    for (sym_idx, &y) in symbols.iter().enumerate() {
+        let sigma2_per_ring = &sigma2_per_sym_per_ring[sym_idx];
+        debug_assert_eq!(sigma2_per_ring.len(), n_rings);
+        for k in 0..n_points {
+            let r_idx = ring_of_point[k];
+            let s2 = sigma2_per_ring[r_idx].max(1e-12);
+            let d2 = (y - constellation.points[k]).norm_sqr();
+            neg_log_p[k] = d2 / s2 + s2.ln();
+        }
+        for bit_pos in 0..bps {
+            let mut min_b0 = f64::INFINITY;
+            let mut min_b1 = f64::INFINITY;
+            for (idx, &val) in neg_log_p.iter().enumerate() {
+                if constellation.bit_map[idx][bit_pos] == 0 {
+                    if val < min_b0 { min_b0 = val; }
+                } else {
+                    if val < min_b1 { min_b1 = val; }
+                }
+            }
+            llr.push((min_b1 - min_b0) as f32);
+        }
+    }
+    llr
+}
+
 /// **Deprecated** scalar-per-symbol variant: takes one σ² per received
 /// `y_i`, applies it to ALL candidates of that y, and divides AFTER the
 /// min. Mathematically equivalent to [`llr_maxlog`] when `sigma2_per_symbol`
@@ -175,6 +234,119 @@ pub fn llr_maxlog_per_symbol(
         }
     }
     llr
+}
+
+/// One soft-symbol estimate, derived from per-bit posterior LLRs.
+///
+/// Captures the full posterior over constellation points under the
+/// per-bit-independence (factorised / max-log) approximation:
+///   P(s = c) ≈ Π_k P(b_k = bit_map[c][k])
+/// where P(b_k = 0) = σ(LLR_k) (logistic). The independence assumption
+/// drops the BICM bit correlations induced by the LDPC parity checks
+/// — adequate for EM channel-parameter updates (g_r, σ²_r, phase
+/// tracking) where what matters is having a sharper-than-hard estimate
+/// of E[s_k]. The next LDPC pass restores the joint posterior.
+#[derive(Debug, Clone)]
+pub struct SoftSymbol {
+    /// E[s_k | LLR_post] = Σ_c P(s=c) · c.
+    pub mean: Complex64,
+    /// Var[s_k] = E[|s_k|²] − |E[s_k]|² ≥ 0.
+    pub var: f64,
+    /// Posterior probability mass per ring (sums to 1.0 to within
+    /// numerical precision). Length = `constellation.rings().0.len()`.
+    pub ring_prob: Vec<f64>,
+    /// Ring-conditional mean `E[s_k | s_k ∈ ring r] = (1/ring_prob[r])
+    /// · Σ_{c ∈ ring r} P(s=c) · c`. Falls back to 0 for rings with
+    /// `ring_prob[r] = 0` (no posterior support on that ring). Used by
+    /// turbo EM per-ring gain and per-ring soft-residual σ² estimators.
+    pub ring_cond_mean: Vec<Complex64>,
+}
+
+/// Compute soft-symbol expectations from per-bit posterior LLRs in
+/// **symbol-major order** (sym0_bit0..sym0_bit_{bps-1}, sym1_bit0..., …).
+///
+/// LLR convention: positive = bit 0 more likely.
+///
+/// Used by the turbo Pass 2 EM loop: posterior LLRs from the previous
+/// LDPC pass produce a soft estimate of E[s_k] that drives the channel
+/// parameter refit (per-ring gain, σ², phase smoother). Sharper than
+/// hard re-encoding when posteriors are intermediate (typical at the
+/// SNR edge where LDPC just barely converges).
+pub fn soft_symbols_from_posterior_llr(
+    post_llr_symbol_major: &[f32],
+    constellation: &Constellation,
+) -> Vec<SoftSymbol> {
+    let bps = constellation.bits_per_sym;
+    let n_points = constellation.points.len();
+    assert_eq!(
+        post_llr_symbol_major.len() % bps,
+        0,
+        "post LLR length must be a multiple of bits_per_sym",
+    );
+    let n_sym = post_llr_symbol_major.len() / bps;
+    let (_radii, ring_of_point) = constellation.rings();
+    let n_rings = constellation.rings().0.len();
+
+    let mut out = Vec::with_capacity(n_sym);
+    let mut p0_per_bit = vec![0.0_f64; bps];
+    for s in 0..n_sym {
+        // P(b_k = 0) = σ(LLR_k); σ stable form via tanh to avoid overflow.
+        for k in 0..bps {
+            let l = post_llr_symbol_major[s * bps + k] as f64;
+            // 1 / (1 + exp(-l)) = (1 + tanh(l/2)) / 2 — numerically safe
+            // for |l| up to ~25 (LDPC clip), no over/underflow.
+            p0_per_bit[k] = 0.5 * (1.0 + (0.5 * l).tanh());
+        }
+
+        let mut mean = Complex64::new(0.0, 0.0);
+        let mut sum_pmag2 = 0.0_f64;
+        let mut ring_prob = vec![0.0_f64; n_rings];
+        // Numerator of the ring-conditional mean = Σ_{c ∈ ring r} P(s=c) · c.
+        let mut ring_cond_num = vec![Complex64::new(0.0, 0.0); n_rings];
+        let mut sum_p = 0.0_f64;
+        for c in 0..n_points {
+            let mut p = 1.0_f64;
+            for k in 0..bps {
+                let bit = constellation.bit_map[c][k];
+                p *= if bit == 0 {
+                    p0_per_bit[k]
+                } else {
+                    1.0 - p0_per_bit[k]
+                };
+            }
+            sum_p += p;
+            let pt = constellation.points[c];
+            mean += pt * p;
+            sum_pmag2 += pt.norm_sqr() * p;
+            let r_idx = ring_of_point[c];
+            ring_prob[r_idx] += p;
+            ring_cond_num[r_idx] += pt * p;
+        }
+        // Normalise (≈1 already under per-bit independence, but guard
+        // against numerical drift from many tiny products).
+        if sum_p > 0.0 {
+            mean = mean / sum_p;
+            sum_pmag2 /= sum_p;
+            for r in ring_prob.iter_mut() {
+                *r /= sum_p;
+            }
+            for r in ring_cond_num.iter_mut() {
+                *r = *r / sum_p;
+            }
+        }
+        // Convert ring_cond_num (un-normalised, currently a posterior-
+        // weighted sum) into the ring-conditional mean by dividing by
+        // ring_prob. Rings with zero posterior mass get a zero mean —
+        // callers must check ring_prob[r] before using ring_cond_mean[r].
+        let ring_cond_mean: Vec<Complex64> = ring_cond_num
+            .iter()
+            .zip(ring_prob.iter())
+            .map(|(&n, &p)| if p > 1e-12 { n / p } else { Complex64::new(0.0, 0.0) })
+            .collect();
+        let var = (sum_pmag2 - mean.norm_sqr()).max(0.0);
+        out.push(SoftSymbol { mean, var, ring_prob, ring_cond_mean });
+    }
+    out
 }
 
 /// Estimate sigma^2 from FSE residuals (outputs - decisions).
@@ -290,6 +462,90 @@ mod tests {
         ] {
             let llr = llr_maxlog(&syms, &c, 1.0);
             assert_eq!(llr.len(), 10 * bps, "Wrong LLR length for {bps}-bit constellation");
+        }
+    }
+
+    #[test]
+    fn soft_symbols_collapse_to_hard_at_high_confidence() {
+        // With saturated posterior LLR (|LLR| at the clip), every symbol's
+        // posterior collapses to a single constellation point — soft mean
+        // should equal that point and Var ≈ 0.
+        let c = apsk16_dvbs2(2.85);
+        let bps = c.bits_per_sym;
+        // Build a 1-symbol LLR vector encoding bit pattern [0,0,0,0] = point
+        // index 0 — very positive LLR for "bit=0".
+        let pt_idx = 5usize;
+        let mut llr = vec![0.0f32; bps];
+        for k in 0..bps {
+            let bit = c.bit_map[pt_idx][k];
+            llr[k] = if bit == 0 { 25.0 } else { -25.0 };
+        }
+        let out = soft_symbols_from_posterior_llr(&llr, &c);
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        let err = (s.mean - c.points[pt_idx]).norm();
+        assert!(err < 1e-6, "soft mean should match hard point: err={err}");
+        assert!(s.var < 1e-6, "Var should be ~0 at saturated LLR: var={}", s.var);
+        // Ring prob mass: ≈1 on the ring containing point pt_idx.
+        let (_radii, ring_of_point) = c.rings();
+        let r = ring_of_point[pt_idx];
+        assert!((s.ring_prob[r] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn soft_symbols_uniform_at_zero_llr() {
+        // With all LLRs = 0, every constellation point has equal posterior
+        // probability. For a symmetric constellation (QPSK, 8PSK) the mean
+        // should be exactly the origin and Var ≈ E[|s|²] = 1 (unit-energy).
+        let c = qpsk_gray();
+        let bps = c.bits_per_sym;
+        let llr = vec![0.0f32; bps];
+        let out = soft_symbols_from_posterior_llr(&llr, &c);
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        assert!(s.mean.norm() < 1e-9, "uniform posterior must center at 0");
+        assert!((s.var - 1.0).abs() < 1e-6,
+                "Var should be ≈Es=1 at uniform posterior; got {}", s.var);
+        // Ring prob: only 1 ring for QPSK, mass = 1.
+        assert!((s.ring_prob[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn llr_per_sym_per_ring_matches_per_ring_when_constant() {
+        // When the per-symbol per-ring σ² is the same scalar for all
+        // (sym, ring) pairs, the per-sym-per-ring LLR must equal the
+        // per-ring LLR with that uniform σ²-per-ring vector.
+        let c = apsk16_dvbs2(2.85);
+        let symbols: Vec<Complex64> = c.points.iter().copied().collect();
+        let sigma2 = 0.1_f64;
+        let n_rings = c.rings().0.len();
+        let sigma2_per_ring = vec![sigma2; n_rings];
+        let llr_per_ring = llr_maxlog_per_ring(&symbols, &c, &sigma2_per_ring);
+        // Build (sym, ring) matrix with same scalar throughout.
+        let per_sym_per_ring: Vec<Vec<f64>> = symbols
+            .iter()
+            .map(|_| vec![sigma2; n_rings])
+            .collect();
+        let llr_per_sym = llr_maxlog_per_sym_per_ring(&symbols, &c, &per_sym_per_ring);
+        assert_eq!(llr_per_ring.len(), llr_per_sym.len());
+        for (i, (&a, &b)) in llr_per_ring.iter().zip(llr_per_sym.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3,
+                    "per-sym-per-ring should match per-ring at uniform σ²: bit {i} {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn soft_symbols_ring_prob_sums_to_one() {
+        // Sanity: ring_prob should always sum to ≈1 across any LLR pattern.
+        let c = apsk32_dvbs2(2.84, 5.27);
+        let bps = c.bits_per_sym;
+        // 3 symbols with arbitrary LLR patterns.
+        let llr: Vec<f32> = (0..3 * bps).map(|i| ((i * 7 + 3) as f32 % 11.0) - 5.0).collect();
+        let out = soft_symbols_from_posterior_llr(&llr, &c);
+        for s in out {
+            let sum: f64 = s.ring_prob.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "ring_prob sum != 1: {sum}");
+            assert!(s.var >= 0.0, "Var must be non-negative");
         }
     }
 
