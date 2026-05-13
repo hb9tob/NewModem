@@ -144,6 +144,9 @@ _RX_LINE_RE_V4 = re.compile(
 _RX_LINE_RE_V3 = re.compile(
     r"Decoded: (\d+) bytes, (\d+)/(\d+) LDPC blocks converged, "
     r"(\d+) segments, (\d+) lost, sigma²=([\d.eE+\-]+)")
+_RX_LINE_RE_SPLIT = re.compile(
+    r"Channel σ² split: radial=([\d.eE+\-]+), "
+    r"tangential=([\d.eE+\-]+), ratio_R/T=([\d.eE+\-]+)")
 
 
 def run_rx(cli: str, profile: str, wav_path: str, out_path: str,
@@ -160,26 +163,35 @@ def run_rx(cli: str, profile: str, wav_path: str, out_path: str,
         "exit_code": r.returncode,
         "decoded_bytes": None, "converged": None, "total": None,
         "cycles": None, "sigma2": None, "eot": None,
+        "sigma2_radial": None, "sigma2_tangential": None, "ratio_rt": None,
     }
+    # Both lines (Decoded + Channel σ² split) appear on V4 RX. V3 RX only
+    # emits the Decoded line. Walk every line and absorb whatever matches.
     for line in r.stderr.splitlines():
         m4 = _RX_LINE_RE_V4.search(line)
-        if m4:
+        if m4 and info["decoded_bytes"] is None:
             info["decoded_bytes"] = int(m4.group(1))
             info["converged"] = int(m4.group(2))
             info["total"] = int(m4.group(3))
             info["cycles"] = int(m4.group(4))
             info["sigma2"] = float(m4.group(5))
             info["eot"] = (m4.group(6) == "true")
-            break
+            continue
         m3 = _RX_LINE_RE_V3.search(line)
-        if m3:
+        if m3 and info["decoded_bytes"] is None:
             info["decoded_bytes"] = int(m3.group(1))
             info["converged"] = int(m3.group(2))
             info["total"] = int(m3.group(3))
             info["cycles"] = int(m3.group(4))  # = "segments" for V3
             info["sigma2"] = float(m3.group(6))
             info["eot"] = None  # V3 has no EOT
-            break
+            continue
+        ms = _RX_LINE_RE_SPLIT.search(line)
+        if ms:
+            info["sigma2_radial"] = float(ms.group(1))
+            info["sigma2_tangential"] = float(ms.group(2))
+            info["ratio_rt"] = float(ms.group(3))
+            continue
     return info
 
 
@@ -259,11 +271,15 @@ def main() -> int:
     csv_path = os.path.join(args.out_dir, "results.csv")
     with open(csv_path, "w") as csv_f:
         csv_f.write(
-            "profile,if_noise,sigma2,snr_est_db,converged,total,cycles,"
+            "profile,if_noise,sigma2,snr_est_db,sigma2_radial,"
+            "sigma2_tangential,ratio_rt,converged,total,cycles,"
             "decoded_bytes,ber_byte,exact,tx_time_s,total_time_s\n")
 
-        # Pretty-printed live table
+        # Pretty-printed live table. σ²_R/σ²_T split appended on V4 RX
+        # (V3 only emits the scalar σ²; the split columns stay blank
+        # there).
         header = (f"{'profile':<10} {'if_n':>5} {'σ²':>8} {'SNRdB':>6} "
+                  f"{'σ²_R':>7} {'σ²_T':>7} {'R/T':>5} "
                   f"{'conv':>9} {'cyc':>4} {'rx_B':>6} {'BER':>9} "
                   f"{'exact':>5} {'t(s)':>5}")
         print("\n" + header)
@@ -310,6 +326,9 @@ def main() -> int:
                     f"{profile},{if_noise},"
                     f"{sigma2 if sigma2 is not None else ''},"
                     f"{snr_est},"
+                    f"{info['sigma2_radial'] if info['sigma2_radial'] is not None else ''},"
+                    f"{info['sigma2_tangential'] if info['sigma2_tangential'] is not None else ''},"
+                    f"{info['ratio_rt'] if info['ratio_rt'] is not None else ''},"
                     f"{info['converged'] if info['converged'] is not None else ''},"
                     f"{info['total'] if info['total'] is not None else ''},"
                     f"{info['cycles'] if info['cycles'] is not None else ''},"
@@ -329,6 +348,9 @@ def main() -> int:
                     f"{if_noise:>5.2f} "
                     f"{fmt(sigma2, 8, 4)} "
                     f"{fmt(snr_est, 6, 1)} "
+                    f"{fmt(info['sigma2_radial'], 7, 4)} "
+                    f"{fmt(info['sigma2_tangential'], 7, 4)} "
+                    f"{fmt(info['ratio_rt'], 5, 2)} "
                     f"{str(info['converged'] or '-'):>4}/"
                     f"{str(info['total'] or '-'):<4} "
                     f"{str(info['cycles'] or '-'):>4} "
@@ -347,9 +369,12 @@ def main() -> int:
                 os.remove(tx_wav)
 
     print(f"\nResults CSV: {csv_path}")
-    print(f"To regenerate the doc table, see results.csv columns:")
-    print(f"  profile,if_noise,sigma2,snr_est_db,converged,total,cycles,"
-          f"decoded_bytes,ber_byte,exact")
+    print(f"  CSV columns: profile,if_noise,sigma2,snr_est_db,"
+          f"sigma2_radial,sigma2_tangential,ratio_rt,converged,total,"
+          f"cycles,decoded_bytes,ber_byte,exact,tx_time_s,total_time_s")
+    print(f"  ratio_rt = sigma2_radial / sigma2_tangential. "
+          f"On pure AWGN ≈ 1.")
+    print(f"  > 2 ⇒ AM-AM/AM-PM compression-heavy; < 0.5 ⇒ phase-noise-heavy.")
     return 0
 
 

@@ -81,6 +81,20 @@ pub struct RxResult2x {
     /// Mean σ² over data CWs (max-log LLR scale). Defaults to a fixed
     /// floor when no pilot residual was available.
     pub sigma2_data: f64,
+    /// Mean radial-axis pilot residual variance (along the pilot
+    /// direction `P = (1+j)/√2`), MAD-rescaled. Captures amplitude
+    /// distortion: AM-AM compression, hard-clipping, AGC error. On a
+    /// pure-AWGN channel `σ²_radial ≈ σ²_tangential ≈ σ²_data / 2`.
+    /// An imbalance `σ²_radial / σ²_tangential > 2` or `< 0.5` signals
+    /// a non-AWGN channel — diagnostic input for channel
+    /// characterisation post-decode.
+    pub sigma2_radial: f64,
+    /// Mean tangential-axis pilot residual variance (perpendicular to
+    /// the pilot direction), MAD-rescaled. Captures phase noise:
+    /// AM-PM distortion, LO phase noise, residual timing/frequency
+    /// jitter. Same interpretation rules as
+    /// [`sigma2_radial`](Self::sigma2_radial).
+    pub sigma2_tangential: f64,
     /// Symbol-buffer index of the first SOF the decoder locked onto in
     /// the input symbol stream (relative to the buffer passed in), or
     /// None if no SOF passed the PLHEADER CRC. The streaming worker
@@ -104,6 +118,8 @@ impl RxResult2x {
             first_pls: None,
             eot_seen: false,
             sigma2_data: SIGMA2_FLOOR,
+            sigma2_radial: SIGMA2_FLOOR / 2.0,
+            sigma2_tangential: SIGMA2_FLOOR / 2.0,
             first_sof_at: None,
         }
     }
@@ -183,48 +199,74 @@ fn estimate_cw_gain(
     mean / PILOT_SYMBOL
 }
 
-/// MAD-style consistency factor: for complex Gaussian residuals e ~ CN(0,σ²),
-/// |e|² is Exponential(σ²), so median(|e|²) = σ²·ln(2). To recover σ²
-/// from the median we divide by ln(2). This makes the median-based
-/// estimator unbiased on clean Gaussian inliers while remaining
-/// breakdown-50% robust against outliers — exactly the property we
-/// want when the FM channel produces a handful of pilot symbols that
-/// land far from the bulk on multi-ring APSK constellations (HIGH+2X
-/// observation: with `mean(|e|²)` the bias-floor was σ²≈0.43 even on
-/// noise-free FM; with the median estimator it tracks the channel SNR).
-const MAD_CONSISTENCY_FACTOR: f64 = std::f64::consts::LN_2;
+/// MAD consistency factor for **complex** Gaussian residuals: for
+/// e ~ CN(0,σ²), |e|² is Exponential(σ²), so median(|e|²) = σ²·ln(2).
+/// To recover σ² from the median we divide by ln(2). Used for the
+/// total σ² estimate when the residual is treated as a 2D complex
+/// vector and we only care about its scalar magnitude.
+const MAD_CONSISTENCY_FACTOR_COMPLEX: f64 = std::f64::consts::LN_2;
 
-/// Per-CW σ² across the pilot blocks: **median** of squared residuals
-/// after dividing pilots by the estimated gain, rescaled by `ln(2)` to
-/// match a mean-of-squares estimator on clean Gaussian inliers.
+/// MAD consistency factor for **real** Gaussian residuals projected on
+/// one axis: for x ~ N(0, σ²), x² ~ σ²·χ²(1), and the median of χ²(1)
+/// is ≈ 0.45494 (computed from the inverse CDF of the standard normal
+/// at 0.75, then squared). Used by the radial/tangential decomposition
+/// below, where each axis is a 1D real-Gaussian projection of the
+/// complex residual.
+const MAD_CONSISTENCY_FACTOR_REAL: f64 = 0.454936423119572;
+
+/// Output of [`estimate_cw_sigma2_split`]: total σ², plus the radial
+/// (along the pilot direction `P`) and tangential (perpendicular to
+/// `P`) MAD-rescaled per-axis variances. The sum
+/// `radial + tangential` equals the total only when the residuals are
+/// jointly Gaussian; an imbalance signals a non-AWGN channel
+/// (AM-AM/AM-PM distortion, phase noise, ...).
+#[derive(Clone, Copy, Debug)]
+struct Sigma2Split {
+    total: f64,
+    radial: f64,
+    tangential: f64,
+}
+
+/// Per-CW σ² estimator: **median** of pilot residuals (MAD-style),
+/// decomposed into radial and tangential axes relative to the pilot
+/// direction `P = (1+j)/√2`.
+///
+/// Each pilot residual `e_k = y_k / gain − P` is a complex number. We
+/// project it onto the pilot reference vector:
+///
+///   e_k · conj(P) / |P|   →   real part = radial, imag part = tangential
+///
+/// (|P| = 1 so the division is trivial.) The radial axis captures
+/// amplitude distortion (AM-AM, hard-clipping, AGC error). The
+/// tangential axis captures phase noise (AM-PM, LO drift, residual
+/// timing jitter). On pure AWGN, the two are equal.
+///
+/// The total σ² is computed from `|e|²` directly (separate medianing
+/// for robustness), not from `radial + tangential`. This keeps the
+/// LDPC LLR scaling drop-in compatible with the previous single-axis
+/// estimator.
 ///
 /// Falls back to the configured floor when no pilots contributed.
-///
-/// Why median instead of mean: the mean is sensitive to outliers, and
-/// the FM channel produces a handful of high-residual pilots on
-/// 32-APSK (HIGH+2X / HIGH+56_2X) — likely RRC inter-symbol
-/// interference from the high-magnitude outer ring data symbols
-/// adjacent to the pilot block, amplified by FM nonlinearity. The
-/// median is unbiased on clean Gaussian residuals (via the
-/// [`MAD_CONSISTENCY_FACTOR`] = ln 2 rescale) and rejects up to 50% of
-/// outliers. The [`estimate_cw_gain`] estimator still uses the LS mean
-/// because (a) first moments are linear so the mean already integrates
-/// over outliers fine, and (b) gain estimation accuracy is essential
-/// for soft-demap.
-fn estimate_cw_sigma2(
+fn estimate_cw_sigma2_split(
     chunk: &[Complex64],
     cw_data_syms: usize,
     pilot_blocks_per_cw: usize,
     gain: Complex64,
-) -> f64 {
+) -> Sigma2Split {
     if gain.norm() < 1e-12 {
-        return SIGMA2_FLOOR;
+        return Sigma2Split {
+            total: SIGMA2_FLOOR,
+            radial: SIGMA2_FLOOR / 2.0,
+            tangential: SIGMA2_FLOOR / 2.0,
+        };
     }
     let base_chunk = cw_data_syms / pilot_blocks_per_cw;
     let mut data_cursor = 0usize;
     let mut wire_cursor = 0usize;
-    let mut resid_sq: Vec<f64> = Vec::with_capacity(
-        pilot_blocks_per_cw * PILOT_BLOCK_LEN);
+    let cap = pilot_blocks_per_cw * PILOT_BLOCK_LEN;
+    let mut total_sq: Vec<f64> = Vec::with_capacity(cap);
+    let mut radial_sq: Vec<f64> = Vec::with_capacity(cap);
+    let mut tang_sq: Vec<f64> = Vec::with_capacity(cap);
     for k in 0..pilot_blocks_per_cw {
         let take = if k + 1 == pilot_blocks_per_cw {
             cw_data_syms - data_cursor
@@ -234,21 +276,38 @@ fn estimate_cw_sigma2(
         wire_cursor += take;
         for s in &chunk[wire_cursor..wire_cursor + PILOT_BLOCK_LEN] {
             let normed = *s / gain;
-            resid_sq.push((normed - PILOT_SYMBOL).norm_sqr());
+            let resid = normed - PILOT_SYMBOL;
+            total_sq.push(resid.norm_sqr());
+            // Project the residual onto the pilot reference direction.
+            // Since |P| = 1, projection = resid * conj(P).
+            let proj = resid * PILOT_SYMBOL.conj();
+            radial_sq.push(proj.re * proj.re);
+            tang_sq.push(proj.im * proj.im);
         }
         wire_cursor += PILOT_BLOCK_LEN;
         data_cursor += take;
     }
-    if resid_sq.is_empty() {
-        return SIGMA2_FLOOR;
+    if total_sq.is_empty() {
+        return Sigma2Split {
+            total: SIGMA2_FLOOR,
+            radial: SIGMA2_FLOOR / 2.0,
+            tangential: SIGMA2_FLOOR / 2.0,
+        };
     }
-    // Partial sort to the median position (O(n) selection, not full O(n log n)).
-    let mid = resid_sq.len() / 2;
-    resid_sq.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-    let median = resid_sq[mid];
-    // For complex Gaussian residuals e ~ CN(0,σ²), median(|e|²)=σ²·ln(2).
-    (median / MAD_CONSISTENCY_FACTOR).max(SIGMA2_FLOOR)
+    // Median selection in O(n) on each of the three buffers.
+    let median = |v: &mut Vec<f64>| -> f64 {
+        let mid = v.len() / 2;
+        v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+        v[mid]
+    };
+    let total = (median(&mut total_sq) / MAD_CONSISTENCY_FACTOR_COMPLEX).max(SIGMA2_FLOOR);
+    let radial = (median(&mut radial_sq) / MAD_CONSISTENCY_FACTOR_REAL)
+        .max(SIGMA2_FLOOR / 2.0);
+    let tangential = (median(&mut tang_sq) / MAD_CONSISTENCY_FACTOR_REAL)
+        .max(SIGMA2_FLOOR / 2.0);
+    Sigma2Split { total, radial, tangential }
 }
+
 
 // --- per-ring decision-directed LS gain (SSD à la Meyr) -------------------
 
@@ -391,6 +450,8 @@ pub fn rx_v4_symbols_after(
     let mut result = RxResult2x::empty();
     let mut cw_bytes: HashMap<u32, Vec<u8>> = HashMap::new();
     let mut sigma2_sum = 0.0_f64;
+    let mut sigma2_radial_sum = 0.0_f64;
+    let mut sigma2_tangential_sum = 0.0_f64;
     let mut sigma2_n = 0usize;
 
     let mut scan = cursor;
@@ -444,6 +505,8 @@ pub fn rx_v4_symbols_after(
             &mut cw_bytes,
             &mut result,
             &mut sigma2_sum,
+            &mut sigma2_radial_sum,
+            &mut sigma2_tangential_sum,
             &mut sigma2_n,
         );
 
@@ -484,6 +547,8 @@ pub fn rx_v4_symbols_after(
                 &mut cw_bytes,
                 &mut result,
                 &mut sigma2_sum,
+                &mut sigma2_radial_sum,
+                &mut sigma2_tangential_sum,
                 &mut sigma2_n,
             );
         }
@@ -524,7 +589,10 @@ pub fn rx_v4_symbols_after(
     }
 
     if sigma2_n > 0 {
-        result.sigma2_data = (sigma2_sum / sigma2_n as f64).max(SIGMA2_FLOOR);
+        let n = sigma2_n as f64;
+        result.sigma2_data = (sigma2_sum / n).max(SIGMA2_FLOOR);
+        result.sigma2_radial = (sigma2_radial_sum / n).max(SIGMA2_FLOOR / 2.0);
+        result.sigma2_tangential = (sigma2_tangential_sum / n).max(SIGMA2_FLOOR / 2.0);
     }
 
     if result.cycles == 0 {
@@ -548,11 +616,16 @@ fn decode_one_cw(
     cw_bytes: &mut HashMap<u32, Vec<u8>>,
     result: &mut RxResult2x,
     sigma2_sum: &mut f64,
+    sigma2_radial_sum: &mut f64,
+    sigma2_tangential_sum: &mut f64,
     sigma2_n: &mut usize,
 ) {
     let gain = estimate_cw_gain(chunk, cw_data_syms, pilot_blocks_per_cw);
-    let sigma2 = estimate_cw_sigma2(chunk, cw_data_syms, pilot_blocks_per_cw, gain);
-    *sigma2_sum += sigma2;
+    let split = estimate_cw_sigma2_split(chunk, cw_data_syms, pilot_blocks_per_cw, gain);
+    let sigma2 = split.total;
+    *sigma2_sum += split.total;
+    *sigma2_radial_sum += split.radial;
+    *sigma2_tangential_sum += split.tangential;
     *sigma2_n += 1;
 
     // De-interleave the data symbols, divide by the gain (residual phase
@@ -891,6 +964,69 @@ mod tests {
         for s in &mut symbols { *s = *s * g; }
         let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
         assert_eq!(result.data, payload);
+    }
+
+    #[test]
+    fn sigma2_split_isotropic_on_pure_awgn() {
+        // On a clean roundtrip the residuals are at the floor. Splitting
+        // them radially / tangentially must give two near-equal values
+        // (both ≈ floor/2, since complex variance σ² splits evenly across
+        // axes for jointly-Gaussian noise). The ratio R/T must stay near
+        // 1 — anything wildly different signals a non-AWGN channel.
+        let cfg = profile_high_2x();
+        let payload = rng_bytes(400, 0xCAFE);
+        let symbols = build_superframe_v4(&payload, &cfg, 0x42, mime::BINARY, 0);
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        let r = result.sigma2_radial;
+        let t = result.sigma2_tangential;
+        // Both clamped to floor/2 = 5e-4 on a noise-free roundtrip.
+        assert!(r >= SIGMA2_FLOOR / 2.0 - 1e-12);
+        assert!(t >= SIGMA2_FLOOR / 2.0 - 1e-12);
+        // On a noise-free signal both axes hit the floor → ratio is 1.
+        let ratio = r / t;
+        assert!(
+            (0.5..=2.0).contains(&ratio),
+            "noise-free R/T ratio should be near 1.0, got {ratio} (R={r}, T={t})"
+        );
+    }
+
+    #[test]
+    fn sigma2_split_captures_phase_only_distortion() {
+        // Apply a per-symbol phase noise (rotational, no amplitude
+        // change) and verify σ²_tangential >> σ²_radial. Verifies the
+        // diagnostic correctly identifies a phase-noise-heavy channel.
+        let cfg = profile_high_2x();
+        let payload = rng_bytes(400, 0xC0DE);
+        let mut symbols = build_superframe_v4(&payload, &cfg, 0x42, mime::BINARY, 0);
+        // Apply small random per-symbol phase rotations: e^(j·θ_k) with
+        // θ_k ~ N(0, σ_θ²), σ_θ = 0.05 rad → tangential residual ≈ |s|·σ_θ.
+        let mut rng_state = 0xDEAD_BEEFu64;
+        for s in &mut symbols {
+            // LCG → uniform → Box-Muller → Gaussian (cheap, no deps).
+            let u1 = {
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng_state as f64) / (u64::MAX as f64)
+            };
+            let u2 = {
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng_state as f64) / (u64::MAX as f64)
+            };
+            let g = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let theta = 0.05 * g;
+            let rot = Complex64::new(theta.cos(), theta.sin());
+            *s = *s * rot;
+        }
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        // On phase-only distortion, tangential should dominate. (R/T < 1)
+        assert!(
+            result.sigma2_tangential > result.sigma2_radial * 1.5,
+            "phase-only noise should give T > 1.5·R, got R={} T={}",
+            result.sigma2_radial, result.sigma2_tangential
+        );
     }
 
     #[test]

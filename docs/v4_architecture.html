@@ -1338,6 +1338,133 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
         Investigations TODO post-merge feat/modem-2x.</li>
 </ul>
 
+<h3 id="channel-split">10.3.2 Décomposition radiale/tangentielle des pilotes —
+    extraction des stats canal</h3>
+
+<p>
+    Chaque résidu pilote <code>e_k = y_k / gain − P</code> est un nombre
+    complexe. On le projette sur la direction de la pilote
+    <code>P = (1+j)/√2</code> :
+</p>
+
+<pre><code>e_radial     = Re(e · conj(P))     ← composante le long de P
+e_tangential = Im(e · conj(P))     ← composante perpendiculaire à P
+</code></pre>
+
+<p>
+    Puis estimateur MAD par axe avec la constante de cohérence
+    <strong>χ²(1) à 50%</strong> (≈ 0.4549, soit Φ⁻¹(0.75)² pour la
+    loi normale standard, valide pour des résidus réels gaussiens 1D).
+    L'output : <code>σ²_radial</code> et <code>σ²_tangential</code>
+    indépendants. Sur AWGN pur les deux sont égaux ; tout écart révèle
+    une <strong>structure non-AWGN</strong> du canal.
+</p>
+
+<p>
+    Exposé via <code>RxResult2x.sigma2_radial</code> /
+    <code>sigma2_tangential</code> et la ligne CLI :
+</p>
+
+<pre><code>Channel σ² split: radial=0.0323, tangential=0.0006, ratio_R/T=53.24
+</code></pre>
+
+<table>
+    <thead>
+        <tr>
+            <th rowspan="2">Profil</th>
+            <th colspan="3">if_noise = 0.00</th>
+            <th colspan="3">if_noise = 0.30</th>
+            <th colspan="3">if_noise = 0.45</th>
+            <th colspan="3">if_noise = 0.55</th>
+        </tr>
+        <tr>
+            <th>σ²_R</th><th>σ²_T</th><th>R/T</th>
+            <th>σ²_R</th><th>σ²_T</th><th>R/T</th>
+            <th>σ²_R</th><th>σ²_T</th><th>R/T</th>
+            <th>σ²_R</th><th>σ²_T</th><th>R/T</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>HIGH2X</strong><br><span style="color:#888">16-APSK 3/4</span></td>
+            <td class="num">0.0065</td><td class="num">0.0168</td><td class="num">0.39</td>
+            <td class="num">0.0064</td><td class="num">0.0169</td><td class="num">0.38</td>
+            <td class="num">0.0069</td><td class="num">0.0174</td><td class="num">0.39</td>
+            <td class="num">0.024</td><td class="num">0.031</td><td class="num">0.79</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+2X</strong><br><span style="color:#888">32-APSK 3/4</span></td>
+            <td class="num">0.0323</td><td class="num"><strong>0.0006</strong></td><td class="num"><strong>53.24</strong></td>
+            <td class="num">0.0376</td><td class="num">0.0009</td><td class="num">42.70</td>
+            <td class="num">0.0408</td><td class="num">0.0013</td><td class="num">30.71</td>
+            <td class="num">0.115</td><td class="num">0.026</td><td class="num">4.44</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
+            <td class="num">0.039</td><td class="num">0.012</td><td class="num">3.18</td>
+            <td class="num">0.041</td><td class="num">0.012</td><td class="num">3.43</td>
+            <td class="num">0.051</td><td class="num">0.016</td><td class="num">3.12</td>
+            <td class="num">0.092</td><td class="num">0.030</td><td class="num">3.05</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout ok">
+    <strong>Lecture du canal NBFM sur 32-APSK</strong> — le ratio
+    <code>R/T</code> de HIGH+2X est <strong>53× à
+    <code>if_noise=0</code></strong> et reste &gt; 30× jusqu'à
+    <code>if_noise=0.45</code>. La composante tangentielle est à
+    <strong>σ²_T ≈ 6·10⁻⁴ (~32 dB SNR)</strong> — un canal
+    quasi-parfait en phase. L'erreur résiduelle est presque entièrement
+    <em>radiale</em> : c'est de l'<strong>AM-AM</strong>, conséquence
+    de la fuite RRC des data symboles à magnitude ≈ pilote (R₂/γ₂ pour
+    32-APSK) qui contamine l'amplitude perçue des pilotes. La
+    distorsion est <em>structurée</em> (corrélée au pattern data
+    voisin), pas du bruit additif blanc.
+</div>
+
+<p>
+    <strong>Signatures par profil :</strong>
+</p>
+<ul>
+    <li><strong>HIGH2X (16-APSK)</strong> : <code>R/T ≈ 0.39</code> —
+        tangentielle dominante. La pilote à |P|=1 est <em>au-dessus</em>
+        des 2 rings 16-APSK (R₀=0.45, R₁=1.27·R₀=0.57·1=... attendre
+        non : R₀=0.45·1=0.45, R₁=γ·R₀=2.85·0.198=0.564 — la pilote |P|=1
+        est <em>hors</em> du domaine data), donc peu d'ISI radiale. Le
+        résidu vient surtout de phase noise FM / drift résiduel — d'où la
+        dominance tangentielle.</li>
+    <li><strong>HIGH+2X (32-APSK)</strong> : <code>R/T &gt; 30×</code>
+        — radiale écrasante. Pilote |P|=1 sandwich entre R₂=0.69 et
+        R₃=1.27. Fuite RRC depuis les data symboles à
+        <code>|s|=R_outer=1.27</code> tombe en phase avec la pilote
+        (mêmes angles π/4 sur le ring extérieur), donc bias purement
+        radial.</li>
+    <li><strong>HIGH++2X (64-APSK)</strong> : <code>R/T ≈ 3</code> —
+        radiale dominante mais pas extrême. Plus de rings, donc plus
+        d'angles relatifs entre data voisin et pilote → mélange
+        d'erreurs radiale et tangentielle.</li>
+</ul>
+
+<p>
+    <strong>Implications pour les fixes prévues</strong> :
+</p>
+<ul>
+    <li>La fix #2 §10.5 (SSD per-ring LS gain) attaque l'AM-AM par
+        anneau, donc devrait surtout aider la composante radiale. Sur
+        le canal NBFM simulé son effet est marginal (la distorsion
+        AM-AM est faible). Sur un canal OTA réel où le transceiver
+        compresse plus, le gain devrait être plus visible.</li>
+    <li>La fix #3 §10.5 (densifier pilotes) attaque le bruit
+        d'estimation pilote, indépendant de R vs T. Donnerait un gain
+        proportionnel sur les deux.</li>
+    <li>Une fix future spécifique 32-APSK serait <strong>filtrage de
+        pilote temporel</strong> : convoluer les pilotes du bloc avec
+        un noyau passe-bas pour atténuer l'ISI radiale stricture, qui
+        est haute-fréquence par symbole. Atypique mais ciblerait
+        précisément l'origine du R/T=53.</li>
+</ul>
+
 <h3>10.4 Throughput applicatif attendu</h3>
 
 <p>

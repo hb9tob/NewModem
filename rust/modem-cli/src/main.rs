@@ -981,6 +981,16 @@ fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
         result.sigma2_data,
         result.eot_seen,
     );
+    // Channel diagnostic: pilot-residual variance decomposed along the
+    // pilot direction P=(1+j)/√2 vs perpendicular. On pure AWGN
+    // radial == tangential. An imbalance signals AM-AM/AM-PM distortion
+    // or phase noise — see rx_v4::estimate_cw_sigma2_split docstring.
+    eprintln!(
+        "Channel σ² split: radial={:.4}, tangential={:.4}, ratio_R/T={:.2}",
+        result.sigma2_radial,
+        result.sigma2_tangential,
+        result.sigma2_radial / result.sigma2_tangential.max(1e-12),
+    );
     if let Some(ref ah) = result.app_header {
         eprintln!(
             "App header: session_id=0x{:08X}, file_size={}, K={}, T={}, mime=0x{:02X}, hash=0x{:04X}",
