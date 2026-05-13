@@ -183,9 +183,34 @@ fn estimate_cw_gain(
     mean / PILOT_SYMBOL
 }
 
-/// Per-CW σ² across the pilot blocks: residual variance of pilots after
-/// dividing out the estimated gain. Falls back to the configured floor
-/// when no pilots contributed.
+/// MAD-style consistency factor: for complex Gaussian residuals e ~ CN(0,σ²),
+/// |e|² is Exponential(σ²), so median(|e|²) = σ²·ln(2). To recover σ²
+/// from the median we divide by ln(2). This makes the median-based
+/// estimator unbiased on clean Gaussian inliers while remaining
+/// breakdown-50% robust against outliers — exactly the property we
+/// want when the FM channel produces a handful of pilot symbols that
+/// land far from the bulk on multi-ring APSK constellations (HIGH+2X
+/// observation: with `mean(|e|²)` the bias-floor was σ²≈0.43 even on
+/// noise-free FM; with the median estimator it tracks the channel SNR).
+const MAD_CONSISTENCY_FACTOR: f64 = std::f64::consts::LN_2;
+
+/// Per-CW σ² across the pilot blocks: **median** of squared residuals
+/// after dividing pilots by the estimated gain, rescaled by `ln(2)` to
+/// match a mean-of-squares estimator on clean Gaussian inliers.
+///
+/// Falls back to the configured floor when no pilots contributed.
+///
+/// Why median instead of mean: the mean is sensitive to outliers, and
+/// the FM channel produces a handful of high-residual pilots on
+/// 32-APSK (HIGH+2X / HIGH+56_2X) — likely RRC inter-symbol
+/// interference from the high-magnitude outer ring data symbols
+/// adjacent to the pilot block, amplified by FM nonlinearity. The
+/// median is unbiased on clean Gaussian residuals (via the
+/// [`MAD_CONSISTENCY_FACTOR`] = ln 2 rescale) and rejects up to 50% of
+/// outliers. The [`estimate_cw_gain`] estimator still uses the LS mean
+/// because (a) first moments are linear so the mean already integrates
+/// over outliers fine, and (b) gain estimation accuracy is essential
+/// for soft-demap.
 fn estimate_cw_sigma2(
     chunk: &[Complex64],
     cw_data_syms: usize,
@@ -198,8 +223,8 @@ fn estimate_cw_sigma2(
     let base_chunk = cw_data_syms / pilot_blocks_per_cw;
     let mut data_cursor = 0usize;
     let mut wire_cursor = 0usize;
-    let mut sum_sq = 0.0_f64;
-    let mut n_used = 0usize;
+    let mut resid_sq: Vec<f64> = Vec::with_capacity(
+        pilot_blocks_per_cw * PILOT_BLOCK_LEN);
     for k in 0..pilot_blocks_per_cw {
         let take = if k + 1 == pilot_blocks_per_cw {
             cw_data_syms - data_cursor
@@ -209,17 +234,20 @@ fn estimate_cw_sigma2(
         wire_cursor += take;
         for s in &chunk[wire_cursor..wire_cursor + PILOT_BLOCK_LEN] {
             let normed = *s / gain;
-            sum_sq += (normed - PILOT_SYMBOL).norm_sqr();
-            n_used += 1;
+            resid_sq.push((normed - PILOT_SYMBOL).norm_sqr());
         }
         wire_cursor += PILOT_BLOCK_LEN;
         data_cursor += take;
     }
-    if n_used == 0 {
-        SIGMA2_FLOOR
-    } else {
-        (sum_sq / n_used as f64).max(SIGMA2_FLOOR)
+    if resid_sq.is_empty() {
+        return SIGMA2_FLOOR;
     }
+    // Partial sort to the median position (O(n) selection, not full O(n log n)).
+    let mid = resid_sq.len() / 2;
+    resid_sq.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    let median = resid_sq[mid];
+    // For complex Gaussian residuals e ~ CN(0,σ²), median(|e|²)=σ²·ln(2).
+    (median / MAD_CONSISTENCY_FACTOR).max(SIGMA2_FLOOR)
 }
 
 // --- main entry point -----------------------------------------------------
@@ -493,6 +521,211 @@ mod tests {
                 ((state >> 56) & 0xFF) as u8
             })
             .collect()
+    }
+
+    /// Test helper: extract the raw received pilot symbols from a HIGH+
+    /// burst run through the modulator (no FM channel), to inspect their
+    /// values directly and identify any pilot-block-internal bias.
+    #[test]
+    #[ignore] // run with: cargo test sigma2_diag_high_plus_pilots -- --ignored --nocapture
+    fn sigma2_diag_high_plus_pilots_dump() {
+        // Look at the per-pilot residual structure on HIGH+2X after the
+        // modulator + matched-filter audio roundtrip (no FM channel). If
+        // the per-pilot residuals show a *systematic pattern* (e.g.,
+        // first/last symbols of each block much further from P than the
+        // interior), then the bias is RRC pulse-shape leakage from
+        // adjacent data symbols. If they're random, it's something else.
+        use crate::profile2x::profile_high_plus_2x;
+        use modem_core_base::modulator;
+        use modem_core_base::rrc;
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(200, 0xCAFE);
+        let symbols = build_superframe_v4(&payload, &cfg, 0x42, mime::BINARY, 0);
+        let (sps, pitch) = rrc::check_integer_constraints(
+            modem_core_base::types::AUDIO_RATE, cfg.base.symbol_rate, cfg.base.tau,
+        ).expect("sps");
+        let taps = rrc::rrc_taps(
+            cfg.base.beta, modem_core_base::types::RRC_SPAN_SYM, sps);
+        let audio = modulator::modulate(
+            &symbols, sps, pitch, &taps, cfg.base.center_freq_hz);
+        // Downmix + MF
+        let mut iq = Vec::with_capacity(audio.len());
+        for (n, &s) in audio.iter().enumerate() {
+            let theta = -2.0 * std::f64::consts::PI * cfg.base.center_freq_hz
+                * (n as f64) / (modem_core_base::types::AUDIO_RATE as f64);
+            iq.push(Complex64::new(
+                (s as f64) * theta.cos(),
+                (s as f64) * theta.sin(),
+            ));
+        }
+        let mf = modem_core_base::demodulator::matched_filter(&iq, &taps);
+        let n_syms = mf.len() / sps;
+        let sof = crate::plheader::sof_for_family(cfg.family);
+        let mut best_peak = 0.0_f64;
+        let mut best_phase = 0usize;
+        for ph in 0..sps {
+            let mut peak = 0.0_f64;
+            let limit = n_syms.saturating_sub(crate::plheader::SOF_LEN_SYM);
+            for k0 in 0..limit {
+                let mut acc = Complex64::new(0.0, 0.0);
+                for n in 0..crate::plheader::SOF_LEN_SYM {
+                    acc += mf[ph + (k0 + n) * sps] * sof[n].conj();
+                }
+                if acc.norm() > peak { peak = acc.norm(); }
+            }
+            if peak > best_peak { best_peak = peak; best_phase = ph; }
+        }
+        let rx_symbols: Vec<Complex64> =
+            (0..n_syms).map(|k| mf[best_phase + k * sps]).collect();
+
+        // Replicate the rx_v4 production pipeline: PLHEADER decode →
+        // sof_gain → divide all CW symbols by sof_gain before per-CW
+        // gain estimate.
+        let cw_with_pilots = cfg.cw_data_syms()
+            + cfg.pilot_blocks_per_cw * PILOT_BLOCK_LEN;
+        let sof_at = find_next_sof(&rx_symbols, 0, cfg.family)
+            .expect("SOF in noise-free audio");
+        let plheader_slice = &rx_symbols[sof_at..sof_at + PLHEADER_LEN_SYM];
+        let (_, sof_gain) = crate::plheader::decode_plheader_at(plheader_slice, cfg.family)
+            .expect("PLHEADER decodes");
+        eprintln!("[pilot-dump] sof_gain = ({:+.6}, {:+.6}) |g|={:.6}",
+                  sof_gain.re, sof_gain.im, sof_gain.norm());
+        eprintln!("[pilot-dump] training_amplitude = {:.6}", cfg.training_amplitude);
+
+        let cursor = sof_at + PLHEADER_LEN_SYM + cfg.lms_warmup_syms + cw_with_pilots;
+        // Apply sof_gain normalisation (same as rx_v4_symbols_after does).
+        let chunk: Vec<Complex64> = rx_symbols[cursor..cursor + cw_with_pilots]
+            .iter().map(|&s| s / sof_gain).collect();
+        let cw_data = cfg.cw_data_syms();
+        let blocks = cfg.pilot_blocks_per_cw;
+        let base_chunk = cw_data / blocks;
+        let mut wire_cursor = 0usize;
+        let mut data_cursor = 0usize;
+        let gain = estimate_cw_gain(&chunk, cw_data, blocks);
+        eprintln!("[pilot-dump] per-CW gain (after sof_gain norm) = ({:+.6}, {:+.6}) |g|={:.6}",
+                  gain.re, gain.im, gain.norm());
+        for k in 0..blocks {
+            let take = if k + 1 == blocks { cw_data - data_cursor } else { base_chunk };
+            wire_cursor += take;
+            eprintln!("[pilot-dump] === pilot block {k} at wire offset {wire_cursor} ===");
+            let mut sum_resid_sq = 0.0_f64;
+            for j in 0..PILOT_BLOCK_LEN {
+                let s = chunk[wire_cursor + j];
+                let normed = s / gain;
+                let resid = normed - PILOT_SYMBOL;
+                sum_resid_sq += resid.norm_sqr();
+                if j < 6 || j >= 30 {
+                    // print edges + 2 middle samples for context
+                    eprintln!(
+                        "  [{j:2}] raw=({:+.4},{:+.4}) |raw|={:.4}  normed=({:+.4},{:+.4}) |n|={:.4}  resid=|{:.4}|",
+                        s.re, s.im, s.norm(), normed.re, normed.im, normed.norm(), resid.norm()
+                    );
+                } else if j == 16 || j == 17 {
+                    eprintln!(
+                        "  [{j:2}] (mid) raw=({:+.4},{:+.4}) normed=|{:.4}| resid=|{:.4}|",
+                        s.re, s.im, normed.norm(), resid.norm()
+                    );
+                }
+            }
+            eprintln!("[pilot-dump] block {k} σ²={:.6}",
+                      sum_resid_sq / PILOT_BLOCK_LEN as f64);
+            wire_cursor += PILOT_BLOCK_LEN;
+            data_cursor += take;
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic, run with: cargo test sigma2_diag_audio -- --ignored --nocapture
+    fn sigma2_diag_audio_roundtrip_no_channel() {
+        // build_superframe_v4 → modulator → matched filter → strobe →
+        // rx_v4_symbols. No FM channel. If σ² stays at floor here, the
+        // bias seen in OTA sweeps comes from the FM channel itself
+        // (preemph / hard-clip / FM nonlinearity). If σ² spikes here on
+        // HIGH+/HIGH+56, the bias is in the RRC pulse-shape + sampling
+        // round-trip (likely the SOF-anchored integer-step sampling
+        // accumulating phase error on multi-ring APSK).
+        use modem_core_base::modulator;
+        use modem_core_base::rrc;
+        for p in ProfileIndex2x::ALL {
+            let cfg = p.to_config();
+            let payload = rng_bytes(400, 0xCAFE);
+            let symbols = build_superframe_v4(&payload, &cfg, 0x42, mime::BINARY, 0);
+            let (sps, pitch) = rrc::check_integer_constraints(
+                modem_core_base::types::AUDIO_RATE, cfg.base.symbol_rate, cfg.base.tau,
+            ).expect("sps");
+            let taps = rrc::rrc_taps(
+                cfg.base.beta, modem_core_base::types::RRC_SPAN_SYM, sps);
+            let audio = modulator::modulate(
+                &symbols, sps, pitch, &taps, cfg.base.center_freq_hz);
+            // Downmix + MF
+            let mut iq = Vec::with_capacity(audio.len());
+            for (n, &s) in audio.iter().enumerate() {
+                let theta = -2.0 * std::f64::consts::PI * cfg.base.center_freq_hz
+                    * (n as f64) / (modem_core_base::types::AUDIO_RATE as f64);
+                iq.push(modem_core_base::types::Complex64::new(
+                    (s as f64) * theta.cos(),
+                    (s as f64) * theta.sin(),
+                ));
+            }
+            let mf = modem_core_base::demodulator::matched_filter(&iq, &taps);
+            // SOF-anchored integer-step sampling
+            let n_syms = mf.len() / sps;
+            let sof = crate::plheader::sof_for_family(cfg.family);
+            let mut best_peak = 0.0_f64;
+            let mut best_phase = 0usize;
+            for ph in 0..sps {
+                let mut peak = 0.0_f64;
+                let limit = n_syms.saturating_sub(crate::plheader::SOF_LEN_SYM);
+                for k0 in 0..limit {
+                    let mut acc = modem_core_base::types::Complex64::new(0.0, 0.0);
+                    for n in 0..crate::plheader::SOF_LEN_SYM {
+                        acc += mf[ph + (k0 + n) * sps] * sof[n].conj();
+                    }
+                    let mag = acc.norm();
+                    if mag > peak { peak = mag; }
+                }
+                if peak > best_peak { best_peak = peak; best_phase = ph; }
+            }
+            let rx_symbols: Vec<modem_core_base::types::Complex64> =
+                (0..n_syms).map(|k| mf[best_phase + k * sps]).collect();
+            let result = rx_v4_symbols(&rx_symbols, &cfg).expect("decode");
+            eprintln!(
+                "[sigma2-audio] {} cons={:?} sigma2={:.6} converged={}/{}",
+                p.name(),
+                cfg.base.constellation,
+                result.sigma2_data,
+                result.converged_cws,
+                result.total_cws,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic, run with: cargo test sigma2_diag -- --ignored --nocapture
+    fn sigma2_diag_pure_symbol_domain_all_profiles() {
+        // Pure symbol-domain roundtrip — no audio, no FM, no channel.
+        // The σ² reported here is whatever floor the LS estimator
+        // produces on synthetic perfect pilots. If it matches the
+        // OTA-channel σ² seen in §10.3 (~0.43 for HIGH+) then the bias
+        // is in the modem itself; if it's near the SIGMA2_FLOOR then
+        // the bias comes from the audio/FM chain.
+        for p in ProfileIndex2x::ALL {
+            let cfg = p.to_config();
+            let payload = rng_bytes(400, 0xCAFE);
+            let symbols = build_superframe_v4(&payload, &cfg, 0x42, mime::BINARY, 0);
+            let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+            eprintln!(
+                "[sigma2-diag] {} cons={:?} pilot_blocks_per_cw={} \
+                 cw_data_syms={} sigma2={:.6} converged={}/{}",
+                p.name(),
+                cfg.base.constellation,
+                cfg.pilot_blocks_per_cw,
+                cfg.cw_data_syms(),
+                result.sigma2_data,
+                result.converged_cws,
+                result.total_cws,
+            );
+        }
     }
 
     #[test]

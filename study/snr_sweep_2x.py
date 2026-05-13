@@ -233,6 +233,11 @@ def main() -> int:
                     help="Clock drift applied by the channel sim (default 0 "
                          "to isolate the SNR variable; pass -16 to reproduce "
                          "the calibrated sound-card drift)")
+    ap.add_argument("--tx-clip", type=float, default=None,
+                    help="Override the channel sim's TX hard-clip threshold "
+                         "(default from nbfm_channel_sim = 0.55). Pass 0 to "
+                         "disable clipping entirely; useful to isolate "
+                         "channel-nonlinearity effects from AWGN.")
     args = ap.parse_args()
 
     if not os.path.exists(args.nbfm_modem):
@@ -275,14 +280,16 @@ def main() -> int:
 
             for if_noise in args.if_noises:
                 t0 = time.time()
-                ch_audio = simulate(
-                    tx_audio,
+                sim_kwargs = dict(
                     if_noise_voltage=if_noise,
                     drift_ppm=args.drift_ppm,
                     start_delay_s=0.5,
                     rng_seed=args.seed + int(if_noise * 1000),
                     verbose=False,
                 )
+                if args.tx_clip is not None:
+                    sim_kwargs["tx_hard_clip"] = args.tx_clip
+                ch_audio = simulate(tx_audio, **sim_kwargs)
                 ch_wav = os.path.join(args.out_dir,
                                       f"ch_{safe}_if{if_noise:.2f}.wav")
                 write_wav_f32(ch_wav, ch_audio.astype(np.float32))

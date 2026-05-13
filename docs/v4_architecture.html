@@ -1117,27 +1117,42 @@ for chaque symbole pilote p_recu dans la CW {
     <tbody>
         <tr>
             <td><strong>HIGH2X</strong><br><span style="color:#888">16-APSK 3/4</span></td>
-            <td class="num">0.018</td><td class="num">17.6 dB</td><td class="num">69/70</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.018</td><td class="num">17.5 dB</td><td class="num">69/70</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.032</td><td class="num">14.9 dB</td><td class="num">68/70</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.166</td><td class="num">7.8 dB</td><td class="num">0/52</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.014</td><td class="num">18.6 dB</td><td class="num">69/70</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.014</td><td class="num">18.5 dB</td><td class="num">69/70</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.015</td><td class="num">18.4 dB</td><td class="num">68/70</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.037</td><td class="num">14.3 dB</td><td class="num">0/52</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td><strong>HIGH+2X</strong><br><span style="color:#888">32-APSK 3/4</span></td>
-            <td class="num">0.435<sup>*</sup></td><td class="num">3.6 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.427<sup>*</sup></td><td class="num">3.7 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.446<sup>*</sup></td><td class="num">3.5 dB</td><td class="num">55/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.539</td><td class="num">2.7 dB</td><td class="num">0/49</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.081</td><td class="num">10.9 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.084</td><td class="num">10.8 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.086</td><td class="num">10.6 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.301</td><td class="num">5.2 dB</td><td class="num">0/49</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
-            <td class="num">0.051</td><td class="num">13.0 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
-            <td class="num">0.051</td><td class="num">12.9 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.081</td><td class="num">10.9 dB</td><td class="num">15/57</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.303</td><td class="num">5.2 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
+            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">60/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.111</td><td class="num">9.6 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
 </table>
+
+<div class="callout ok">
+    <strong>Mise à jour 2026-05-13 — fix σ² MAD (commit <code>a appears</code>)</strong>
+    : l'estimateur σ² <em>par CW</em> est passé de la moyenne des
+    résidus pilotes (<code>mean(|e|²)</code>) à la médiane rescalée par
+    <code>ln(2)</code> (le facteur de cohérence MAD pour Gaussienne
+    complexe). Le σ² rapporté <strong>suit maintenant le SNR canal</strong>
+    sur HIGH+2X, là où la moyenne plafonnait à ~0.43 indépendamment du
+    SNR (biais data→pilote sur les rings 32-APSK serrés via fuite RRC,
+    voir <a href="#post-merge-todos">§10.5</a>). Sur HIGH+2X à
+    <code>if_noise=0.45</code> le nombre de CWs convergés est <em>aussi</em>
+    monté de 55 → 68 sur 69, parce que la LDPC reçoit des LLR à la
+    bonne échelle. Les chiffres ci-dessus reflètent <strong>après</strong>
+    la fix MAD.
+</div>
 
 <p style="font-size: 0.88rem; color: #555;">
     Légende : <strong>σ²</strong> = variance résiduelle des pilotes
@@ -1148,14 +1163,16 @@ for chaque symbole pilote p_recu dans la CW {
     à l'entrée (RaptorQ assemble dès qu'on a ≥ <code>n_source</code>
     CWs convergées : ~47 pour 10 kB en rate 3/4).
     <br>
-    <sup>*</sup> Le σ² apparent de HIGH+ reste plafonné à ~0.43-0.45
-    sur la zone basse-bruit, indépendamment du SNR canal. C'est un
-    biais data→pilote propre à 32-APSK (les rings serrés et la fuite
-    RRC saturent l'estimateur LS de gain sur les blocs pilote). Le
-    décodage reste valide car LDPC fonctionne sur les LLR à échelle
-    σ²-divisée. Au-delà de <code>if_noise ≈ 0.50</code>, le σ² mesuré
-    finit par dépasser ce plancher de bias et redevient indicatif.
-    À fixer plus tard : LS gain par ring séparé.
+    <sup>*</sup> (Historique, avant la fix MAD) Le σ² apparent de
+    HIGH+ plafonnait à ~0.43-0.45 sur la zone basse-bruit avec
+    l'estimateur <code>mean(|e|²)</code> initial. C'est un biais
+    data→pilote propre à 32-APSK : quelques pilotes par bloc sont
+    perturbés par les data symboles à magnitude proche (la fuite RRC +
+    la nonlinéarité FM les déplacent significativement), et la moyenne
+    des |e|² amplifie ces outliers. <strong>Résolu</strong> par le
+    passage à l'estimateur médian (commit <code>à venir</code>), qui
+    rejette jusqu'à 50% d'outliers — voir <a href="#post-merge-todos">§10.5</a>
+    fix #1.
     <br>
     <sup>†</sup> HIGH++ à <code>if_noise=0.00</code> est <em>à la
     limite des non-linéarités du canal</em> NBFM : sur 10 seeds testés,
@@ -1239,34 +1256,40 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
         <tr>
             <td class="num"><strong>0.00</strong></td>
             <td class="num">0.0073</td><td class="num">21.4 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.0505</td><td class="num">13.0 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.30</strong></td>
             <td class="num">0.0074</td><td class="num">21.3 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.0509</td><td class="num">12.9 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">60/69</td><td><span style="color:#2b9f5f">✓</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.45</strong></td>
             <td class="num">0.0266</td><td class="num">15.8 dB</td><td class="num">26/69</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.0813</td><td class="num">10.9 dB</td><td class="num">15/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.55</strong></td>
             <td class="num">0.2127</td><td class="num">6.7 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.3032</td><td class="num">5.2 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.111</td><td class="num">9.6 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
 </table>
 
 <div class="callout">
-    <strong>Observation surprise.</strong> V3 HIGH++ a un σ² <em>~7×
-    plus bas</em> que V4 HIGH++2X dans la zone basse-bruit (0.0073 vs
-    0.0505 à <code>if_noise=0</code>) — soit <strong>+8.4 dB de
-    SNR<sub>est</sub> en moins de bruit perçu</strong>. Les deux
-    décodent à 0.00 et 0.30 sur ce seed, mais à 0.45 V3 a plus de marge
-    (26 vs 15 CWs convergés, σ² 6 dB meilleur). À 0.55 les deux
-    s'effondrent ensemble.
+    <strong>État après la fix MAD (commit à venir).</strong> Le gap σ²
+    V3 vs V4 sur HIGH++ s'est resserré : V3=0.0073, V4=0.042 à
+    <code>if_noise=0</code> → <strong>7.6 dB</strong> (était 8.4 dB).
+    À <code>if_noise=0.45</code> les deux sont au même régime (V3=0.027
+    15.8 dB, V4=0.053 12.7 dB) — différence ~3 dB. Le résidu vient de la
+    différence pilotique structurelle : V3 distribue ~200 syms pilotes
+    TDM intra-CW, V4 a 72 syms (2×36) en bord de CW. C'est la piste
+    fix #2 (densifier les blocs pilote) qui pourrait fermer le reste.
+    <br>
+    À <code>if_noise=0.45</code>, V3 et V4 échouent maintenant tous les
+    deux avec un nombre de CWs convergés similaire (V3 26/69, V4 23/57)
+    — la fix MAD a aussi amélioré la LDPC convergence en passant de
+    15/57 à 23/57 (LLR à meilleure échelle).
 </div>
 
 <p>
@@ -1373,22 +1396,30 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
     <tbody>
         <tr>
             <td class="num">1</td>
-            <td><strong>LS gain par ring séparé</strong> sur APSK.
-                L'estimateur actuel <code>mean(pilots) / P</code> traite
-                tous les symboles pilote comme un seul ensemble. Une
-                version par-ring (chaque APSK ring décodé en regardant
-                d'abord la magnitude pour assigner le ring, puis LS sur
-                phase) éliminerait le biais data→pilote via fuite RRC.</td>
+            <td><strong>Estimateur σ² médian (MAD-style)</strong> au lieu
+                de <code>mean(|e|²)</code>.
+                Après instrumentation, le biais σ²=0.43 sur HIGH+2X
+                vient de <em>quelques pilotes outliers par bloc</em>
+                (RRC ISI des data symboles à magnitude proche du pilote
+                sur 32-APSK, amplifié par la nonlinéarité FM) — pas
+                d'un biais uniforme du LS gain. La médiane de
+                <code>|e|²</code> rescalée par <code>ln(2)</code> (facteur
+                de cohérence MAD pour Gaussienne complexe) est
+                <em>unbiased</em> sur le bulk Gaussien et rejette
+                jusqu'à 50% d'outliers. Implémentée dans
+                <code>rx_v4::estimate_cw_sigma2</code> (commit à venir).</td>
             <td>HIGH+ σ²=0.43 plafond <strong>indépendant du SNR</strong>
                 (§10.3, footnote *)</td>
-            <td>Modéré — réécriture de
-                <code>rx_v4::estimate_cw_sigma2</code> + LS par ring sur
-                les <em>data</em> symboles voisins des pilotes</td>
-            <td>~4-6 dB sur le σ² rapporté pour HIGH+ ; <em>n'affecte
-                pas le décodage actuel</em> (déjà OK via LDPC) mais
-                rend le σ² interprétable et exploitable pour link
-                quality assessment</td>
-            <td><span style="background:#bf5f2b;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P1</span></td>
+            <td>Faible — 6 lignes de Rust
+                (<code>select_nth_unstable_by</code> sur les résidus
+                + facteur <code>LN_2</code>)</td>
+            <td><strong>Mesuré</strong> : HIGH+2X σ² passe de 0.435 →
+                <strong>0.081</strong> à <code>if_noise=0</code>
+                (7.3 dB d'amélioration) et suit désormais le SNR canal.
+                Bonus : LDPC convergence HIGH+2X à
+                <code>if_noise=0.45</code> grimpe de 55/69 → 68/69 grâce
+                aux LLR à meilleure échelle.</td>
+            <td><span style="background:#2b9f5f;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P1 ✓</span></td>
         </tr>
         <tr>
             <td class="num">2</td>
@@ -1397,13 +1428,14 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
                 3 blocs / CW). Aligne la taille effective de
                 l'estimateur sur celle de V3 (~150-200 syms moyennés en
                 TDM intra-CW).</td>
-            <td>V4 HIGH++ σ² <strong>~7× plus haut</strong> que V3
-                HIGH++ sur le même canal (§10.3.1)</td>
+            <td>V4 HIGH++ σ² <strong>~5.7× plus haut</strong> que V3
+                HIGH++ sur le même canal (§10.3.1 : 0.042 vs 0.0073
+                après la fix MAD ; était 7× avant)</td>
             <td>Élevé — change la cycle layout, le PLS frame_counter, le
                 pilot_blocks_per_cw, et requiert un test de migration
                 bit-for-bit avec les anciens captures V4</td>
-            <td>Doit récupérer la majorité des 8 dB de gap σ² ; OTA
-                stability gain proportionnel</td>
+            <td>Devrait fermer les 7.6 dB restants du gap σ² après MAD ;
+                OTA stability gain proportionnel</td>
             <td><span style="background:#999;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P2</span></td>
         </tr>
         <tr>
