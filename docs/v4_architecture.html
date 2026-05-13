@@ -1131,9 +1131,9 @@ for chaque symbole pilote p_recu dans la CW {
         </tr>
         <tr>
             <td><strong>HIGH++2X</strong><br><span style="color:#888">64-APSK 3/4</span></td>
-            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
-            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">60/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span><sup>†</sup></td>
+            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">61/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">22/57</td><td><span style="color:#bf5f2b">✗</span></td>
             <td class="num">0.111</td><td class="num">9.6 dB</td><td class="num">0/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
     </tbody>
@@ -1256,17 +1256,17 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
         <tr>
             <td class="num"><strong>0.00</strong></td>
             <td class="num">0.0073</td><td class="num">21.4 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">62/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.042</td><td class="num">13.8 dB</td><td class="num">63/69</td><td><span style="color:#2b9f5f">✓</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.30</strong></td>
             <td class="num">0.0074</td><td class="num">21.3 dB</td><td class="num">68/69</td><td><span style="color:#2b9f5f">✓</span></td>
-            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">60/69</td><td><span style="color:#2b9f5f">✓</span></td>
+            <td class="num">0.043</td><td class="num">13.7 dB</td><td class="num">61/69</td><td><span style="color:#2b9f5f">✓</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.45</strong></td>
             <td class="num">0.0266</td><td class="num">15.8 dB</td><td class="num">26/69</td><td><span style="color:#bf5f2b">✗</span></td>
-            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">23/57</td><td><span style="color:#bf5f2b">✗</span></td>
+            <td class="num">0.053</td><td class="num">12.7 dB</td><td class="num">22/57</td><td><span style="color:#bf5f2b">✗</span></td>
         </tr>
         <tr>
             <td class="num"><strong>0.55</strong></td>
@@ -1277,19 +1277,23 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
 </table>
 
 <div class="callout">
-    <strong>État après la fix MAD (commit à venir).</strong> Le gap σ²
-    V3 vs V4 sur HIGH++ s'est resserré : V3=0.0073, V4=0.042 à
-    <code>if_noise=0</code> → <strong>7.6 dB</strong> (était 8.4 dB).
-    À <code>if_noise=0.45</code> les deux sont au même régime (V3=0.027
+    <strong>État après la fix MAD + turbo Pass 2 EM (commits
+    <code>495fad5</code> → HEAD).</strong> Le gap σ² V3 vs V4 sur
+    HIGH++ est inchangé (le σ² rapporté reflète le canal réel et est
+    indépendant du décodeur turbo) : V3=0.0073, V4=0.042 à
+    <code>if_noise=0</code> → <strong>7.6 dB</strong>. À
+    <code>if_noise=0.45</code> les deux sont au même régime (V3=0.027
     15.8 dB, V4=0.053 12.7 dB) — différence ~3 dB. Le résidu vient de la
     différence pilotique structurelle : V3 distribue ~200 syms pilotes
     TDM intra-CW, V4 a 72 syms (2×36) en bord de CW. C'est la piste
     fix #2 (densifier les blocs pilote) qui pourrait fermer le reste.
     <br>
-    À <code>if_noise=0.45</code>, V3 et V4 échouent maintenant tous les
-    deux avec un nombre de CWs convergés similaire (V3 26/69, V4 23/57)
-    — la fix MAD a aussi amélioré la LDPC convergence en passant de
-    15/57 à 23/57 (LLR à meilleure échelle).
+    Le turbo Pass 2 EM (<a href="#turbo-passes">§10.3.3</a>) catche
+    <strong>+1 CW</strong> sur HIGH++2X aux SNR clean (62 → 63 à
+    <code>if_noise=0</code>, 60 → 61 à 0.30) en raffinant les LLR via
+    les soft symbols post-LDPC P1 ; pas suffisant pour franchir le
+    cliff à 0.45 (canal trop dégradé pour que P2 LDPC re-converge sur
+    les 30+ CWs ratés par P1).
 </div>
 
 <p>

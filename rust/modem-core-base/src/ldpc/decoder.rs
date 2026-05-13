@@ -166,20 +166,44 @@ impl LdpcDecoder {
     /// Decode LLR and return info bytes. Convenience wrapper.
     pub fn decode_to_bytes(&self, llr: &[f32]) -> (Vec<u8>, bool) {
         let (bits, converged) = self.decode(llr);
-        let bytes: Vec<u8> = bits.chunks(8)
-            .map(|chunk| {
-                let mut byte = 0u8;
-                for (i, &b) in chunk.iter().enumerate() {
-                    byte |= (b & 1) << (7 - i);
-                }
-                byte
-            })
-            .collect();
+        let bytes = pack_bits_to_bytes(&bits);
         (bytes, converged)
+    }
+
+    /// Decode LLR and return both info **bytes** and the full-codeword
+    /// posterior LLR vector (length `self.n`). Same as `decode_to_bytes`
+    /// but also yields the posterior — used by turbo Pass 2 EM to
+    /// compute soft-symbol expectations via
+    /// [`crate::soft_demod::soft_symbols_from_posterior_llr`].
+    pub fn decode_to_bytes_with_posterior(
+        &self,
+        llr: &[f32],
+    ) -> (Vec<u8>, Vec<f32>, bool) {
+        let (bits, posterior, converged) = self.decode_with_posterior(llr);
+        let bytes = pack_bits_to_bytes(&bits);
+        (bytes, posterior, converged)
     }
 
     pub fn k(&self) -> usize { self.k }
     pub fn n(&self) -> usize { self.n }
+}
+
+/// Pack a slice of bits (one bit per byte, MSB-first within each byte
+/// group) into a `Vec<u8>`. Used by `decode_to_bytes` and
+/// `decode_to_bytes_with_posterior` — extracted so both share the same
+/// packing convention. The input length is rounded down to a multiple
+/// of 8 (any trailing partial byte is dropped, which matches the LDPC
+/// info-bit length always being a multiple of 8 for our rates).
+fn pack_bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+    bits.chunks(8)
+        .map(|chunk| {
+            let mut byte = 0u8;
+            for (i, &b) in chunk.iter().enumerate() {
+                byte |= (b & 1) << (7 - i);
+            }
+            byte
+        })
+        .collect()
 }
 
 #[cfg(test)]
