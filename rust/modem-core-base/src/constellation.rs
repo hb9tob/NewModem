@@ -71,6 +71,54 @@ impl Constellation {
         best
     }
 
+    /// Ring decomposition of the constellation. Returns
+    /// `(ring_radii, ring_of_point)` where:
+    ///
+    /// - `ring_radii[r]` is the magnitude of ring `r` (sorted ascending,
+    ///   deduplicated within a 1e-6 magnitude tolerance).
+    /// - `ring_of_point[i]` is the index in `ring_radii` of the ring
+    ///   containing `self.points[i]`.
+    ///
+    /// QPSK and 8PSK return a single ring at |s|=1. APSK-16/32/64
+    /// return 2/3/4 rings respectively. Used by the per-ring LS gain
+    /// estimator in `modem-core2x::rx_v4` (synchronous-substream-
+    /// decoder à la Meyr/Moeneclaey/Fechtel, Wiley 1998 §8.4) — for
+    /// each ring we run a separate LS gain on the data symbols that
+    /// decoded to that ring, capturing AM-AM/AM-PM distortion the
+    /// pilot-only LS misses (the FM channel's nonlinearity hits
+    /// different rings differently, especially on multi-ring 32/64-
+    /// APSK).
+    pub fn rings(&self) -> (Vec<f64>, Vec<usize>) {
+        const TOL: f64 = 1e-6;
+        let mut radii: Vec<f64> = Vec::new();
+        let mut ring_of_point: Vec<usize> = Vec::with_capacity(self.points.len());
+        for &p in &self.points {
+            let r = p.norm();
+            // Find existing ring within tolerance, or push a new one.
+            let idx = radii
+                .iter()
+                .position(|&existing| (existing - r).abs() < TOL)
+                .unwrap_or_else(|| {
+                    radii.push(r);
+                    radii.len() - 1
+                });
+            ring_of_point.push(idx);
+        }
+        // Sort radii ascending and remap ring_of_point.
+        let mut sort_idx: Vec<usize> = (0..radii.len()).collect();
+        sort_idx.sort_by(|&a, &b| radii[a].partial_cmp(&radii[b]).unwrap());
+        let rank: Vec<usize> = {
+            let mut r = vec![0usize; radii.len()];
+            for (new, &old) in sort_idx.iter().enumerate() {
+                r[old] = new;
+            }
+            r
+        };
+        let sorted_radii: Vec<f64> = sort_idx.iter().map(|&i| radii[i]).collect();
+        let remapped: Vec<usize> = ring_of_point.iter().map(|&r| rank[r]).collect();
+        (sorted_radii, remapped)
+    }
+
     /// Convert symbol indices to bits (MSB first per symbol).
     pub fn symbols_to_bits(&self, indices: &[usize]) -> Vec<u8> {
         let mut bits = Vec::with_capacity(indices.len() * self.bits_per_sym);
@@ -406,6 +454,68 @@ mod tests {
         let c = qpsk_gray();
         let es: f64 = c.points.iter().map(|p| p.norm_sqr()).sum::<f64>() / c.points.len() as f64;
         assert!((es - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rings_qpsk_is_single_unit_ring() {
+        let c = qpsk_gray();
+        let (radii, of_point) = c.rings();
+        assert_eq!(radii.len(), 1, "QPSK has 1 ring");
+        assert!((radii[0] - 1.0).abs() < 1e-9);
+        assert!(of_point.iter().all(|&r| r == 0));
+        assert_eq!(of_point.len(), c.points.len());
+    }
+
+    #[test]
+    fn rings_psk8_is_single_unit_ring() {
+        let c = psk8_gray();
+        let (radii, of_point) = c.rings();
+        assert_eq!(radii.len(), 1);
+        assert!((radii[0] - 1.0).abs() < 1e-9);
+        assert!(of_point.iter().all(|&r| r == 0));
+    }
+
+    #[test]
+    fn rings_apsk16_two_rings_sorted_ascending() {
+        let c = apsk16_dvbs2(2.85);
+        let (radii, of_point) = c.rings();
+        assert_eq!(radii.len(), 2, "16-APSK has 2 rings");
+        assert!(radii[0] < radii[1], "rings sorted ascending");
+        // First 4 points are inner ring, next 12 outer (DVB-S2 layout).
+        // We only check the partition cardinalities here.
+        let inner = of_point.iter().filter(|&&r| r == 0).count();
+        let outer = of_point.iter().filter(|&&r| r == 1).count();
+        assert_eq!(inner + outer, c.points.len());
+        assert_eq!(inner, 4);
+        assert_eq!(outer, 12);
+    }
+
+    #[test]
+    fn rings_apsk32_three_rings() {
+        let c = apsk32_dvbs2(2.84, 5.27);
+        let (radii, of_point) = c.rings();
+        assert_eq!(radii.len(), 3);
+        assert!(radii[0] < radii[1] && radii[1] < radii[2]);
+        // DVB-S2 32-APSK: 4 / 12 / 16 layout.
+        let counts: Vec<usize> = (0..3)
+            .map(|r| of_point.iter().filter(|&&x| x == r).count())
+            .collect();
+        assert_eq!(counts, vec![4, 12, 16]);
+    }
+
+    #[test]
+    fn rings_apsk64_four_rings() {
+        let c = apsk64_dvbs2x(2.4, 4.3, 7.0);
+        let (radii, of_point) = c.rings();
+        assert_eq!(radii.len(), 4);
+        for w in radii.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+        // DVB-S2X 64-APSK: 4 / 12 / 20 / 28 layout (Table 13e).
+        let counts: Vec<usize> = (0..4)
+            .map(|r| of_point.iter().filter(|&&x| x == r).count())
+            .collect();
+        assert_eq!(counts, vec![4, 12, 20, 28]);
     }
 
     #[test]

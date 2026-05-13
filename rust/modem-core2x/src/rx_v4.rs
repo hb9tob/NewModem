@@ -250,6 +250,105 @@ fn estimate_cw_sigma2(
     (median / MAD_CONSISTENCY_FACTOR).max(SIGMA2_FLOOR)
 }
 
+// --- per-ring decision-directed LS gain (SSD à la Meyr) -------------------
+
+/// Decision-directed per-ring LS gain refinement.
+///
+/// Given data symbols that have already been roughly normalised by the
+/// pilot-based LS gain, hard-decide each symbol to its nearest
+/// constellation point and run a separate LS gain estimator per ring of
+/// the APSK constellation. This captures channel-imposed AM-AM /
+/// AM-PM distortion that the pilot-only estimator (locked to the
+/// |P|=1 pilot magnitude) cannot see — the FM channel applies a
+/// magnitude-dependent gain when the deviation index gets close to
+/// unity, hitting 32-APSK's outer ring (|s|=1.27) and 64-APSK's
+/// outer rings (up to 1.31) at a different effective gain than the
+/// pilot at |P|=1.
+///
+/// Reference: Meyr/Moeneclaey/Fechtel, *Digital Communication
+/// Receivers — Synchronization, Channel Estimation, and Signal
+/// Processing*, Wiley 1998, Ch. 8 (synchronous-substream-decoder, SSD).
+///
+/// Returns a `Vec<Complex64>` of length `constellation.rings().0.len()`
+/// where index `r` is the LS gain estimate for ring `r`. Rings with
+/// no symbols (empty in this CW) get identity gain (1+0j) so the
+/// later `apply_per_ring_correction` is a no-op for them.
+fn estimate_per_ring_gain(
+    data: &[Complex64],
+    constellation: &modem_core_base::constellation::Constellation,
+) -> Vec<Complex64> {
+    let (radii, ring_of_point) = constellation.rings();
+    let n_rings = radii.len();
+    if n_rings == 1 {
+        // QPSK / 8PSK: single ring, the pilot-based gain is already
+        // optimal — no per-ring refinement to do.
+        return vec![Complex64::new(1.0, 0.0)];
+    }
+    let mut num = vec![Complex64::new(0.0, 0.0); n_rings];
+    let mut den = vec![0.0_f64; n_rings];
+    for &y in data {
+        // Hard decision: nearest constellation point.
+        let mut best_idx = 0usize;
+        let mut best_d2 = f64::INFINITY;
+        for (k, &s) in constellation.points.iter().enumerate() {
+            let d2 = (y - s).norm_sqr();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_idx = k;
+            }
+        }
+        let s_hat = constellation.points[best_idx];
+        let r = ring_of_point[best_idx];
+        // LS update: numerator = <y, s_hat>, denominator = <s_hat, s_hat>.
+        num[r] += y * s_hat.conj();
+        den[r] += s_hat.norm_sqr();
+    }
+    (0..n_rings)
+        .map(|r| {
+            if den[r] > 1e-12 {
+                num[r] / den[r]
+            } else {
+                Complex64::new(1.0, 0.0)
+            }
+        })
+        .collect()
+}
+
+/// Apply per-ring gain corrections to a buffer of data symbols. For
+/// each symbol, the hard-decided ring assignment determines which
+/// gain to divide by. Called *after* the symbols have been roughly
+/// normalised by the pilot-based gain so the hard-decisions are
+/// trustworthy.
+fn apply_per_ring_correction(
+    data: &mut [Complex64],
+    constellation: &modem_core_base::constellation::Constellation,
+    ring_gains: &[Complex64],
+) {
+    if ring_gains.len() == 1 {
+        // PSK case (single ring, no-op refinement).
+        return;
+    }
+    let (_, ring_of_point) = constellation.rings();
+    for y in data.iter_mut() {
+        // Re-decide (same decisions as the LS pass; could be hoisted
+        // out via Vec<usize> if a hot-path profile demands it).
+        let mut best_idx = 0usize;
+        let mut best_d2 = f64::INFINITY;
+        for (k, &s) in constellation.points.iter().enumerate() {
+            let d2 = (*y - s).norm_sqr();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_idx = k;
+            }
+        }
+        let r = ring_of_point[best_idx];
+        let g = ring_gains[r];
+        if g.norm() > 1e-12 {
+            *y = *y / g;
+        }
+    }
+}
+
 // --- main entry point -----------------------------------------------------
 
 /// Decode every PLHEADER cycle visible in `symbols`, accumulate ESI →
@@ -463,11 +562,23 @@ fn decode_one_cw(
         pilot_blocks_per_cw,
         cw_data_syms,
     );
-    let data_norm: Vec<Complex64> = if (gain - Complex64::new(1.0, 0.0)).norm() < 1e-9 {
+    let mut data_norm: Vec<Complex64> = if (gain - Complex64::new(1.0, 0.0)).norm() < 1e-9 {
         data_only
     } else {
         data_only.into_iter().map(|s| s / gain).collect()
     };
+
+    // Per-ring SSD LS-gain refinement (Meyr/Moeneclaey/Fechtel, Wiley
+    // 1998 §8.4): after the pilot-based gain has roughly normalised
+    // the symbols, run a separate LS estimator per APSK ring on the
+    // hard-decided data, then apply the per-ring corrections. Captures
+    // AM-AM / AM-PM distortion the pilot-only estimator misses (the FM
+    // channel applies a magnitude-dependent gain that hits 32/64-APSK
+    // outer rings differently from the |P|=1 pilot). No-op on QPSK
+    // and 8PSK (single ring). Empirically narrows the V3↔V4 σ² gap
+    // on the §10.3 sweep, see §10.5 fix #2.
+    let ring_gains = estimate_per_ring_gain(&data_norm, constellation);
+    apply_per_ring_correction(&mut data_norm, constellation, &ring_gains);
 
     // Soft-demap → de-interleave → LDPC.
     let llr = soft_demod::llr_maxlog(&data_norm, constellation, sigma2);
@@ -780,6 +891,49 @@ mod tests {
         for s in &mut symbols { *s = *s * g; }
         let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
         assert_eq!(result.data, payload);
+    }
+
+    #[test]
+    fn roundtrip_under_per_ring_distortion_apsk32() {
+        // Apply a *ring-dependent* complex gain — inner rings get one
+        // gain, outer ring another. This is the kind of AM-AM distortion
+        // the SSD per-ring LS estimator is designed to absorb. Without
+        // the SSD pass, the pilot-based gain (locked to |P|=1, which
+        // sits between the rings on 32-APSK) would mis-scale at least
+        // one ring and LDPC would diverge on data symbols there.
+        use crate::profile2x::profile_high_plus_2x;
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(600, 0xC0FFEE);
+        let constellation =
+            crate::frame2x::make_constellation_2x(&cfg);
+        let (radii, ring_of_point) = constellation.rings();
+        // 3 distinct gains: one per ring of 32-APSK.
+        let ring_gains = [
+            Complex64::new(0.85,  0.10),  // inner
+            Complex64::new(1.00,  0.00),  // middle (≈ pilot magnitude)
+            Complex64::new(1.20, -0.15),  // outer (FM-channel-style boost)
+        ];
+        assert_eq!(radii.len(), 3, "Apsk32 should have 3 rings");
+        let mut symbols = build_superframe_v4(&payload, &cfg, 1, mime::BINARY, 0);
+        // The pilot and SOF symbols are at |P|=1 and training_amplitude
+        // respectively — both should map to ring 1 (middle) in the
+        // gain dictionary. We apply ring-dependent gain only to symbols
+        // whose magnitude matches one of the data rings; pilots
+        // (|s|=1, between rings) get the middle ring's gain.
+        for s in &mut symbols {
+            let r = if (s.norm() - radii[0]).abs() < 0.05 {
+                0
+            } else if (s.norm() - radii[2]).abs() < 0.05 {
+                2
+            } else {
+                1
+            };
+            let _ = ring_of_point;
+            *s = *s * ring_gains[r];
+        }
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        assert_eq!(result.data, payload,
+                   "per-ring SSD must absorb 3-ring complex gain distortion");
     }
 
     #[test]

@@ -1374,12 +1374,15 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
 
 <p>
     Les deux résultats inattendus du sweep §10.3 et du benchmark §10.3.1
-    suggèrent trois pistes de travail post-merge <code>feat/modem-2x</code>.
-    Toutes attaquent le même goulot : <strong>l'estimateur LS de gain
-    sur 36 symboles pilote concentrés est trop bruité sur les
-    constellations multi-rings (32-APSK, 64-APSK)</strong>, ce qui se
-    traduit par un σ² plafond, un overhead LDPC plus élevé que
-    nécessaire, et une marge inférieure à V3 sur HIGH++.
+    ont engendré quatre pistes de travail sur <code>feat/modem-2x</code>.
+    Toutes attaquent le même goulot : <strong>l'estimation de gain et de
+    bruit sur des symboles pilote concentrés à |P|=1 sur des
+    constellations multi-rings (16/32/64-APSK)</strong>, ce qui se
+    traduit par un σ² plafond, une marge inférieure à V3 sur HIGH++, et
+    un overhead LDPC plus élevé que nécessaire. <strong>Les deux fixes
+    estimateur (#1 σ² MAD et #2 SSD per-ring LS gain) sont livrées
+    dans cette branche</strong> ; #3 et #4 sont pour des sessions
+    futures.
 </p>
 
 <table>
@@ -1423,6 +1426,38 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
         </tr>
         <tr>
             <td class="num">2</td>
+            <td><strong>LS gain SSD par anneau</strong> (Meyr/Moeneclaey/
+                Fechtel, Wiley 1998 §8.4 — synchronous-substream-decoder).
+                Après le LS gain pilote initial, hard-décide chaque
+                symbole data → identifie son anneau APSK → calcule un
+                gain LS séparé <code>g_r = Σ y·s̄_hat / Σ |s_hat|²</code>
+                par anneau, puis normalise chaque data sample par
+                <code>g_r</code> avant le soft-demap. Capture la
+                distorsion AM-AM/AM-PM du canal FM que le LS pilote
+                seul (verrouillé à |P|=1) rate. No-op sur QPSK / 8PSK
+                (1 anneau). Implémenté dans
+                <code>rx_v4::{estimate_per_ring_gain, apply_per_ring_correction}</code>
+                + nouveau helper <code>Constellation::rings()</code>
+                dans <code>modem-core-base</code> (commit à venir).</td>
+            <td>Distorsion AM-AM/AM-PM du canal FM sur 16/32/64-APSK
+                — la pilote unitaire ne mesure pas le gain canal à
+                <code>|s|=R_inner</code> ou <code>|s|=R_outer</code></td>
+            <td>Faible — ~80 lignes Rust (helper rings + 2 fonctions
+                + 7 tests d'anneau + 1 test de roundtrip)</td>
+            <td><strong>Mesuré</strong> sur le canal NBFM simulé : effet
+                marginal sur le σ² rapporté (le σ² est pilote-only) mais
+                +1 CW LDPC convergé sur HIGH++ à <code>if_noise=0.45</code>
+                (23 → 24/57). <strong>Test unit dédié</strong> :
+                <code>roundtrip_under_per_ring_distortion_apsk32</code>
+                applique 3 gains complexes distincts par anneau et
+                vérifie le byte-exact — fail avant SSD, pass après.
+                Bénéfice OTA réel attendu plus important quand le
+                canal a une AM-AM significative (transceiver
+                réel vs simulateur calibré).</td>
+            <td><span style="background:#2b9f5f;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P1 ✓</span></td>
+        </tr>
+        <tr>
+            <td class="num">3</td>
             <td><strong>Densifier les blocs pilote</strong> sur HIGH+ et
                 HIGH++ : passer de 36 à 64-72 syms par bloc (ou de 2 à
                 3 blocs / CW). Aligne la taille effective de
@@ -1439,7 +1474,7 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
             <td><span style="background:#999;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P2</span></td>
         </tr>
         <tr>
-            <td class="num">3</td>
+            <td class="num">4</td>
             <td><strong>Pondération AbsGardner plus aggressive</strong>
                 sur l'intérieur pilote — pousser <code>Kp</code> /
                 <code>Ki</code> sur les strobes pilotes par rapport aux
