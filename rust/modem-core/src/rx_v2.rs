@@ -30,6 +30,143 @@ use crate::soft_demod;
 use crate::sync;
 use crate::types::{Complex64, AUDIO_RATE, N_PREAMBLE, RRC_SPAN_SYM};
 
+use std::cell::RefCell;
+use std::time::Instant;
+
+/// Per-stage CPU breakdown of a single tick's decode work, in microseconds.
+///
+/// Accumulated via the thread-local in [`PERF`] and harvested by the worker
+/// with [`take_perf`] after every `rx_v2_with_options` / `rx_v3_after` call.
+/// Each field accumulates across **all internal passes** that ran for the
+/// tick (Gardner estimator, hint-resampled decode, fast-path decode,
+/// optional ±15 ppm grid). The worker reports a 30-SF rolling average + max
+/// in the `[perf]` log entry.
+///
+/// Diagnostic only — no behaviour depends on these numbers. The cost of
+/// `Instant::now()` per stage is negligible (~100 ns) against stages that
+/// run in 1-100 ms range on lowpower hosts (Pi5).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerfBreakdown {
+    pub downmix_us: u64,
+    pub matched_filter_us: u64,
+    pub find_preamble_us: u64,
+    pub decimate_us: u64,
+    pub ffe_ls_us: u64,
+    pub ffe_lms_us: u64,
+    pub marker_scan_us: u64,
+    pub ldpc_us: u64,
+    pub raptorq_us: u64,
+    pub resample_us: u64,
+    /// Number of *internal passes* that contributed to this aggregate
+    /// (typically 1-3 : Gardner + hint-decode + fast-path). Lets the
+    /// worker spot ticks that hit the slow ±15 ppm grid path.
+    pub n_passes: u32,
+}
+
+impl std::ops::AddAssign for PerfBreakdown {
+    fn add_assign(&mut self, rhs: Self) {
+        self.downmix_us += rhs.downmix_us;
+        self.matched_filter_us += rhs.matched_filter_us;
+        self.find_preamble_us += rhs.find_preamble_us;
+        self.decimate_us += rhs.decimate_us;
+        self.ffe_ls_us += rhs.ffe_ls_us;
+        self.ffe_lms_us += rhs.ffe_lms_us;
+        self.marker_scan_us += rhs.marker_scan_us;
+        self.ldpc_us += rhs.ldpc_us;
+        self.raptorq_us += rhs.raptorq_us;
+        self.resample_us += rhs.resample_us;
+        self.n_passes += rhs.n_passes;
+    }
+}
+
+impl PerfBreakdown {
+    pub fn total_us(&self) -> u64 {
+        self.downmix_us
+            + self.matched_filter_us
+            + self.find_preamble_us
+            + self.decimate_us
+            + self.ffe_ls_us
+            + self.ffe_lms_us
+            + self.marker_scan_us
+            + self.ldpc_us
+            + self.raptorq_us
+            + self.resample_us
+    }
+}
+
+thread_local! {
+    /// Thread-local accumulator for the per-stage timings. Stages inside
+    /// `rx_v2_single` / `estimate_drift_gardner` / `resample_audio` write
+    /// into this ; the worker reads + resets via [`take_perf`] once per
+    /// tick. Single-threaded by construction (the worker pipeline is
+    /// sync) -- the thread_local is a quiet way to thread the timings
+    /// through without polluting every function signature.
+    static PERF: RefCell<PerfBreakdown> = RefCell::new(PerfBreakdown::default());
+}
+
+/// Atomically take the current per-stage accumulator and reset it to zero.
+/// Called by the worker once per tick after `rx_v3_after` returns, so each
+/// `[perf]` log entry reflects exactly one tick's work.
+pub fn take_perf() -> PerfBreakdown {
+    PERF.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+
+/// Record `dt` (in microseconds) into the named field of the thread-local
+/// accumulator. Used by the staged macros below ; not part of the public
+/// surface.
+fn record_stage(stage: PerfStage, dt_us: u64) {
+    PERF.with(|p| {
+        let mut b = p.borrow_mut();
+        match stage {
+            PerfStage::Downmix => b.downmix_us += dt_us,
+            PerfStage::MatchedFilter => b.matched_filter_us += dt_us,
+            PerfStage::FindPreamble => b.find_preamble_us += dt_us,
+            PerfStage::Decimate => b.decimate_us += dt_us,
+            PerfStage::FfeLs => b.ffe_ls_us += dt_us,
+            PerfStage::FfeLms => b.ffe_lms_us += dt_us,
+            PerfStage::MarkerScan => b.marker_scan_us += dt_us,
+            PerfStage::Ldpc => b.ldpc_us += dt_us,
+            PerfStage::RaptorQ => b.raptorq_us += dt_us,
+            PerfStage::Resample => b.resample_us += dt_us,
+            PerfStage::PassDone => b.n_passes += 1,
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PerfStage {
+    Downmix,
+    MatchedFilter,
+    FindPreamble,
+    Decimate,
+    FfeLs,
+    FfeLms,
+    MarkerScan,
+    Ldpc,
+    RaptorQ,
+    Resample,
+    PassDone,
+}
+
+/// Helper RAII timer : records `stage` with the elapsed time when dropped.
+/// Wrap heavy code blocks with `let _t = StageTimer::new(stage);`.
+struct StageTimer {
+    stage: PerfStage,
+    t0: Instant,
+}
+
+impl StageTimer {
+    fn new(stage: PerfStage) -> Self {
+        Self { stage, t0: Instant::now() }
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        record_stage(self.stage, self.t0.elapsed().as_micros() as u64);
+    }
+}
+
 /// Result of decoding a v2 superframe.
 pub struct RxV2Result {
     pub data: Vec<u8>,
@@ -329,6 +466,7 @@ fn ffe_tap_centroid(taps: &[Complex64]) -> f64 {
 /// than TX (RX captured `(1 + ε)` samples for each TX sample) and the output
 /// is a SHORTER stream that matches TX timing.
 fn resample_audio(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
+    let _t = StageTimer::new(PerfStage::Resample);
     let ratio = 1.0 + drift_ppm * 1e-6;
     let n_out = ((samples.len() as f64) / ratio) as usize;
     let mut out = Vec::with_capacity(n_out);
@@ -551,10 +689,19 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
-    let bb = demodulator::downmix(samples, config.center_freq_hz);
-    let mf = demodulator::matched_filter(&bb, &taps);
+    let bb = {
+        let _t = StageTimer::new(PerfStage::Downmix);
+        demodulator::downmix(samples, config.center_freq_hz)
+    };
+    let mf = {
+        let _t = StageTimer::new(PerfStage::MatchedFilter);
+        demodulator::matched_filter(&bb, &taps)
+    };
     let preamble_syms = preamble::make_preamble_for_config(config);
-    let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
+    let sync_pos = {
+        let _t = StageTimer::new(PerfStage::FindPreamble);
+        sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?
+    };
 
     // Build the constellation of marker SYNC pattern as the "pilot block"
     // reference. Same 32-sym QPSK known-sequence the marker decoder uses.
@@ -565,7 +712,10 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     // the same path as the production decoder so the markers we find
     // are exactly the ones that would be decoded). This gives us a list
     // of (symbol_index_in_FFE_output, is_meta) tuples.
-    let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
+    let (fse_input, fse_start, d_fse) = {
+        let _t = StageTimer::new(PerfStage::Decimate);
+        sync::decimate_for_fse(&mf, sync_pos, sps, pitch)
+    };
     let pitch_fse = pitch / d_fse;
     let sps_fse = sps / d_fse;
     let tau_eff = pitch_fse as f64 / sps_fse as f64;
@@ -574,17 +724,23 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     let half_ff = n_ff / 2;
     let training_positions: Vec<usize> =
         (0..N_PREAMBLE).map(|k| fse_start + k * pitch_fse).collect();
-    let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
+    let ffe_initial = {
+        let _t = StageTimer::new(PerfStage::FfeLs);
+        ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff)
+    };
     let max_syms = if fse_input.len() > fse_start + half_ff {
         (fse_input.len() - fse_start - half_ff) / pitch_fse + 1
     } else { 0 };
     let preamble_training: Vec<(usize, Complex64)> = preamble_syms
         .iter().enumerate().map(|(k, &s)| (k, s)).collect();
     let constellation = frame::make_constellation(config);
-    let (all_rx_syms, _final_taps) = ffe::apply_ffe_lms_with_training(
-        &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
-        &preamble_training, &constellation, 0.10, 0.02,
-    );
+    let (all_rx_syms, _final_taps) = {
+        let _t = StageTimer::new(PerfStage::FfeLms);
+        ffe::apply_ffe_lms_with_training(
+            &fse_input, &ffe_initial, fse_start, pitch_fse, max_syms,
+            &preamble_training, &constellation, 0.10, 0.02,
+        )
+    };
     // Global gain normalisation from preamble LS (so marker scan threshold is meaningful)
     let warmup_len = config.lms_warmup_syms();
     let header_end = N_PREAMBLE + warmup_len + 96;
@@ -614,6 +770,7 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     let p_syms = config.pilot_pattern.p_syms;
     let mut markers: Vec<(usize, bool)> = Vec::new();
     let mut cursor = 0_usize;
+    let _t_scan = StageTimer::new(PerfStage::MarkerScan);
     while cursor + MARKER_LEN <= data_region.len() {
         let window = 64_usize;
         let end = (cursor + window).min(data_region.len().saturating_sub(MARKER_LEN));
@@ -742,6 +899,7 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     // Quality gates: residual RMS should be << 1 audio sample, ppm in bound.
     if rms > 2.0 { return None; }
     if drift_ppm.abs() > 200.0 { return None; }
+    record_stage(PerfStage::PassDone, 0);
     Some(drift_ppm)
 }
 
@@ -757,16 +915,28 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let padded_n_v2 = interleaver::padded_cw_bits(decoder.n(), config.constellation);
     let deinterleave_perm = interleaver::deinterleave_table(padded_n_v2, config.constellation);
 
-    let bb = demodulator::downmix(samples, config.center_freq_hz);
-    let mf = demodulator::matched_filter(&bb, &taps);
+    let bb = {
+        let _t = StageTimer::new(PerfStage::Downmix);
+        demodulator::downmix(samples, config.center_freq_hz)
+    };
+    let mf = {
+        let _t = StageTimer::new(PerfStage::MatchedFilter);
+        demodulator::matched_filter(&bb, &taps)
+    };
 
     let preamble_syms = preamble::make_preamble_for_config(config);
     let warmup_syms = preamble::make_lms_warmup_for_config(config);
     let warmup_len = warmup_syms.len();
-    let sync_pos = sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?;
+    let sync_pos = {
+        let _t = StageTimer::new(PerfStage::FindPreamble);
+        sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?
+    };
 
     // Decimate + LS-trained FFE on preamble (same as rx.rs prelude)
-    let (fse_input, fse_start, d_fse) = sync::decimate_for_fse(&mf, sync_pos, sps, pitch);
+    let (fse_input, fse_start, d_fse) = {
+        let _t = StageTimer::new(PerfStage::Decimate);
+        sync::decimate_for_fse(&mf, sync_pos, sps, pitch)
+    };
     let pitch_fse = pitch / d_fse;
     let sps_fse = sps / d_fse;
     let tau_eff = pitch_fse as f64 / sps_fse as f64;
@@ -784,7 +954,10 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     let training_positions: Vec<usize> = (0..N_PREAMBLE)
         .map(|k| fse_start + k * pitch_fse)
         .collect();
-    let ffe_initial = ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff);
+    let ffe_initial = {
+        let _t = StageTimer::new(PerfStage::FfeLs);
+        ffe::train_ffe_ls(&fse_input, &preamble_syms, &training_positions, n_ff)
+    };
     let ffe_centroid_initial = ffe_tap_centroid(&ffe_initial);
 
     let half = n_ff / 2;
@@ -816,17 +989,20 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     }
     let mu_train = 0.10;
     let mu_dd = 0.02;
-    let (all_rx_syms, final_taps) = ffe::apply_ffe_lms_with_training(
-        &fse_input,
-        &ffe_initial,
-        fse_start,
-        pitch_fse,
-        max_syms,
-        &preamble_training,
-        &constellation,
-        mu_train,
-        mu_dd,
-    );
+    let (all_rx_syms, final_taps) = {
+        let _t = StageTimer::new(PerfStage::FfeLms);
+        ffe::apply_ffe_lms_with_training(
+            &fse_input,
+            &ffe_initial,
+            fse_start,
+            pitch_fse,
+            max_syms,
+            &preamble_training,
+            &constellation,
+            mu_train,
+            mu_dd,
+        )
+    };
     let ffe_centroid_final = ffe_tap_centroid(&final_taps);
     if all_rx_syms.len() < N_PREAMBLE + warmup_len + header_sym_count {
         return None;
@@ -1133,7 +1309,10 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
             // Drop the padding LLRs (bits added on TX to align on
             // bits_per_sym) -- they sit at the tail after deinterleave.
             let llr_for_ldpc = &llr_deint[..decoder.n()];
-            let (info_bytes, converged) = decoder.decode_to_bytes(llr_for_ldpc);
+            let (info_bytes, converged) = {
+                let _t = StageTimer::new(PerfStage::Ldpc);
+                decoder.decode_to_bytes(llr_for_ldpc)
+            };
             let bytes = info_bytes[..k_bytes].to_vec();
 
             total_blocks += 1;
@@ -1166,9 +1345,11 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
     // result once enough source/repair symbols are collected.
     let mut assembled: Vec<u8> = Vec::new();
     if let Some(ref h) = app_hdr {
-        if let Some(payload) =
+        let raptorq_result = {
+            let _t = StageTimer::new(PerfStage::RaptorQ);
             modem_framing::raptorq_codec::try_decode(&cw_bytes, h.file_size, h.t_bytes as u16)
-        {
+        };
+        if let Some(payload) = raptorq_result {
             assembled = payload;
         } else {
             // Not enough packets collected : fall back to zero-padded ESI
@@ -1209,6 +1390,7 @@ pub fn rx_v2_single(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result>
 
     let data_blocks_recovered = cw_bytes.len();
     let eot_seen = decoded_header.flags & header::FLAG_EOT != 0;
+    record_stage(PerfStage::PassDone, 0);
     Some(RxV2Result {
         data: assembled,
         header: Some(decoded_header),
@@ -1325,11 +1507,20 @@ pub fn rx_v3_after(
         .ok()?;
     let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
 
-    let bb = demodulator::downmix(samples, config.center_freq_hz);
-    let mf = demodulator::matched_filter(&bb, &taps);
+    let bb = {
+        let _t = StageTimer::new(PerfStage::Downmix);
+        demodulator::downmix(samples, config.center_freq_hz)
+    };
+    let mf = {
+        let _t = StageTimer::new(PerfStage::MatchedFilter);
+        demodulator::matched_filter(&bb, &taps)
+    };
 
     let preamble_syms = preamble::make_preamble_for_config(config);
-    let mut positions = sync::find_all_preambles(&mf, &preamble_syms, sps, pitch, config.beta);
+    let mut positions = {
+        let _t = StageTimer::new(PerfStage::FindPreamble);
+        sync::find_all_preambles(&mf, &preamble_syms, sps, pitch, config.beta)
+    };
     if positions.is_empty() {
         return None;
     }
@@ -1534,9 +1725,11 @@ pub fn rx_v3_after(
 
     let mut assembled: Vec<u8> = Vec::new();
     if let Some(ref h) = app_hdr {
-        if let Some(payload) =
+        let raptorq_result = {
+            let _t = StageTimer::new(PerfStage::RaptorQ);
             modem_framing::raptorq_codec::try_decode(&merged, h.file_size, h.t_bytes as u16)
-        {
+        };
+        if let Some(payload) = raptorq_result {
             assembled = payload;
         } else {
             let n_source_cw = ((h.file_size as usize) + k_bytes - 1) / k_bytes;
@@ -1924,11 +2117,22 @@ mod tests {
         );
 
         // Same burst but worker currently in ULTRA : should switch to the
-        // Rs=1500 group (picks the first of the tied profiles by ALL order).
+        // Rs=1500 family A group. Which exact profile is picked is a
+        // tie-break detail (sort_by is stable on equal ratios, so the
+        // first family-A entry in `ProfileIndex::ALL` wins) -- what
+        // matters is that the switch DOES occur and lands on a family-A
+        // standard. The header's profile_index refines downstream.
         let detected = detect_best_profile(&normal, ProfileIndex::Ultra);
         assert!(
-            matches!(detected, Some(ProfileIndex::High) | Some(ProfileIndex::Normal)),
-            "from ULTRA on NORMAL burst, expected HIGH or NORMAL pick, got {:?}",
+            matches!(
+                detected,
+                Some(ProfileIndex::High)
+                    | Some(ProfileIndex::Normal)
+                    | Some(ProfileIndex::HighPlus)
+                    | Some(ProfileIndex::HighPlusPlus)
+                    | Some(ProfileIndex::HighFiveSix)
+            ),
+            "from ULTRA on NORMAL burst, expected a family-A standard pick, got {:?}",
             detected
         );
     }

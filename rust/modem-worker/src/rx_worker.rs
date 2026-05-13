@@ -106,6 +106,57 @@ fn worker_log(msg: &str) {
     }
 }
 
+/// Fold one tick's per-stage breakdown into the rolling accumulator + max
+/// counters on `state`. Emits a single `[perf]` log line every
+/// `PERF_LOG_INTERVAL_SF` SFs with the average + max for each stage and the
+/// average pass count. Idle ticks (`perf.n_passes == 0`) are skipped : the
+/// thread-local emits zeros when no decode ran, and counting those would
+/// bias the average toward zero during silent stretches.
+fn perf_log_accumulate(state: &mut WorkerState, perf: modem_core::rx_v2::PerfBreakdown) {
+    if perf.n_passes == 0 {
+        return;
+    }
+    state.perf_acc += perf;
+    let m = &mut state.perf_max;
+    m.downmix_us = m.downmix_us.max(perf.downmix_us);
+    m.matched_filter_us = m.matched_filter_us.max(perf.matched_filter_us);
+    m.find_preamble_us = m.find_preamble_us.max(perf.find_preamble_us);
+    m.decimate_us = m.decimate_us.max(perf.decimate_us);
+    m.ffe_ls_us = m.ffe_ls_us.max(perf.ffe_ls_us);
+    m.ffe_lms_us = m.ffe_lms_us.max(perf.ffe_lms_us);
+    m.marker_scan_us = m.marker_scan_us.max(perf.marker_scan_us);
+    m.ldpc_us = m.ldpc_us.max(perf.ldpc_us);
+    m.raptorq_us = m.raptorq_us.max(perf.raptorq_us);
+    m.resample_us = m.resample_us.max(perf.resample_us);
+    m.n_passes = m.n_passes.max(perf.n_passes);
+    state.perf_sf_count += 1;
+    if state.perf_sf_count >= PERF_LOG_INTERVAL_SF {
+        let n = state.perf_sf_count as u64;
+        let acc = &state.perf_acc;
+        let total_avg_us = acc.total_us() / n;
+        // Sorted by typical cost (matched filter + FFE LMS dominate on
+        // every host we've measured) for at-a-glance scanning of the log.
+        worker_log(&format!(
+            "[perf] {n} SF avg/max us : total={}/{} dn={}/{} mf={}/{} ffe_lms={}/{} ffe_ls={}/{} ldpc={}/{} fp={}/{} dec={}/{} mks={}/{} rs={}/{} rq={}/{} passes={:.1}",
+            total_avg_us, state.perf_max.total_us(),
+            acc.downmix_us / n, state.perf_max.downmix_us,
+            acc.matched_filter_us / n, state.perf_max.matched_filter_us,
+            acc.ffe_lms_us / n, state.perf_max.ffe_lms_us,
+            acc.ffe_ls_us / n, state.perf_max.ffe_ls_us,
+            acc.ldpc_us / n, state.perf_max.ldpc_us,
+            acc.find_preamble_us / n, state.perf_max.find_preamble_us,
+            acc.decimate_us / n, state.perf_max.decimate_us,
+            acc.marker_scan_us / n, state.perf_max.marker_scan_us,
+            acc.resample_us / n, state.perf_max.resample_us,
+            acc.raptorq_us / n, state.perf_max.raptorq_us,
+            acc.n_passes as f64 / n as f64,
+        ));
+        state.perf_acc = modem_core::rx_v2::PerfBreakdown::default();
+        state.perf_max = modem_core::rx_v2::PerfBreakdown::default();
+        state.perf_sf_count = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event payloads (shared with the frontend listeners)
 // ---------------------------------------------------------------------------
@@ -546,6 +597,16 @@ struct WorkerState {
     ///    shift converted to ppm against `REESTIMATE_RESIDUAL_PPM`;
     ///    on overshoot we re-run Gardner and refresh the value.
     session_drift_ppm: Option<f64>,
+    /// Rolling per-stage timing accumulator. Filled by
+    /// `modem_core::rx_v2::take_perf()` after each successful
+    /// `rx_v3_after` and logged every `PERF_LOG_INTERVAL_SF` SFs as a
+    /// single `[perf]` line with averages + max. Lowpower-host
+    /// optimisation target : reveals where the per-tick CPU actually
+    /// goes (downmix / MF / FFE / LDPC / RaptorQ) without needing a
+    /// profiler.
+    perf_acc: rx_v2::PerfBreakdown,
+    perf_max: rx_v2::PerfBreakdown,
+    perf_sf_count: u32,
 }
 
 /// Residual drift (ppm) above which we re-run the Gardner estimator on
@@ -564,6 +625,12 @@ struct WorkerState {
 /// SDR backends. Gardner amortises easily: re-fires only on actual drift
 /// events, not on every tick.
 const REESTIMATE_RESIDUAL_PPM: f64 = 2.0;
+
+/// Number of decoded SFs between `[perf]` log entries. 10 SFs ≈ 20 s of
+/// live OTA traffic on V3, enough samples for stable averages without
+/// drowning the log. The accumulator and max counter reset after every
+/// emission.
+const PERF_LOG_INTERVAL_SF: u32 = 10;
 
 impl WorkerState {
     fn new(
@@ -593,6 +660,9 @@ impl WorkerState {
             deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
             allow_legacy_grid,
             session_drift_ppm: None,
+            perf_acc: rx_v2::PerfBreakdown::default(),
+            perf_max: rx_v2::PerfBreakdown::default(),
+            perf_sf_count: 0,
         }
     }
 
@@ -1097,6 +1167,12 @@ fn scan_and_route(
         state.allow_legacy_grid,
     );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
+    // Harvest the per-stage breakdown the rx_v2 thread-local accumulated
+    // during this rx_v3_after call (includes every internal pass : Gardner
+    // estimator, hint-resampled decode, fast-path single-shot, optional
+    // ±15 ppm grid). Resets the accumulator -- next tick gets a fresh one.
+    let perf_this_tick = rx_v2::take_perf();
+    perf_log_accumulate(state, perf_this_tick);
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
             "[scan] active={} buf={:.1}s rx_v3=None profile={:?} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} t_detect_us={} t_rx_v3_us={}",
@@ -1142,14 +1218,20 @@ fn scan_and_route(
                     // the refreshed result. `!session_active` correctly
                     // forces the OPEN decode for the activation path.
                     let finalize = !state.session_active;
-                    match rx_v2::rx_v3_after(
+                    let auto_redecode = rx_v2::rx_v3_after(
                         &state.session_buffer,
                         &new_config,
                         0,
                         finalize,
                         state.session_drift_ppm,
                         state.allow_legacy_grid,
-                    ) {
+                    );
+                    // Auto-profile re-decode is real work; fold it into
+                    // the same per-tick perf accumulator as the primary
+                    // path. (The `take_perf()` clears the thread-local,
+                    // so we can't lose this contribution by not harvesting.)
+                    perf_log_accumulate(state, rx_v2::take_perf());
+                    match auto_redecode {
                         Some(refresh) => {
                             // Defensive : if the fresh header still claims a
                             // different profile, give up rather than loop.
