@@ -1347,6 +1347,121 @@ python3 study/snr_sweep_2x.py --family legacy --profiles HIGH++ \
     était ~480 B/s applicatif effectif.
 </p>
 
+<h3 id="post-merge-todos">10.5 Pistes d'amélioration identifiées par le sweep</h3>
+
+<p>
+    Les deux résultats inattendus du sweep §10.3 et du benchmark §10.3.1
+    suggèrent trois pistes de travail post-merge <code>feat/modem-2x</code>.
+    Toutes attaquent le même goulot : <strong>l'estimateur LS de gain
+    sur 36 symboles pilote concentrés est trop bruité sur les
+    constellations multi-rings (32-APSK, 64-APSK)</strong>, ce qui se
+    traduit par un σ² plafond, un overhead LDPC plus élevé que
+    nécessaire, et une marge inférieure à V3 sur HIGH++.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Fix</th>
+            <th>Symptôme cible</th>
+            <th>Coût</th>
+            <th>Gain estimé</th>
+            <th>Priorité</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td class="num">1</td>
+            <td><strong>LS gain par ring séparé</strong> sur APSK.
+                L'estimateur actuel <code>mean(pilots) / P</code> traite
+                tous les symboles pilote comme un seul ensemble. Une
+                version par-ring (chaque APSK ring décodé en regardant
+                d'abord la magnitude pour assigner le ring, puis LS sur
+                phase) éliminerait le biais data→pilote via fuite RRC.</td>
+            <td>HIGH+ σ²=0.43 plafond <strong>indépendant du SNR</strong>
+                (§10.3, footnote *)</td>
+            <td>Modéré — réécriture de
+                <code>rx_v4::estimate_cw_sigma2</code> + LS par ring sur
+                les <em>data</em> symboles voisins des pilotes</td>
+            <td>~4-6 dB sur le σ² rapporté pour HIGH+ ; <em>n'affecte
+                pas le décodage actuel</em> (déjà OK via LDPC) mais
+                rend le σ² interprétable et exploitable pour link
+                quality assessment</td>
+            <td><span style="background:#bf5f2b;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P1</span></td>
+        </tr>
+        <tr>
+            <td class="num">2</td>
+            <td><strong>Densifier les blocs pilote</strong> sur HIGH+ et
+                HIGH++ : passer de 36 à 64-72 syms par bloc (ou de 2 à
+                3 blocs / CW). Aligne la taille effective de
+                l'estimateur sur celle de V3 (~150-200 syms moyennés en
+                TDM intra-CW).</td>
+            <td>V4 HIGH++ σ² <strong>~7× plus haut</strong> que V3
+                HIGH++ sur le même canal (§10.3.1)</td>
+            <td>Élevé — change la cycle layout, le PLS frame_counter, le
+                pilot_blocks_per_cw, et requiert un test de migration
+                bit-for-bit avec les anciens captures V4</td>
+            <td>Doit récupérer la majorité des 8 dB de gap σ² ; OTA
+                stability gain proportionnel</td>
+            <td><span style="background:#999;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P2</span></td>
+        </tr>
+        <tr>
+            <td class="num">3</td>
+            <td><strong>Pondération AbsGardner plus aggressive</strong>
+                sur l'intérieur pilote — pousser <code>Kp</code> /
+                <code>Ki</code> sur les strobes pilotes par rapport aux
+                strobes data. Réduit la timing jitter résiduelle qui
+                fuit dans la variance pilote sur 64-APSK où les rings
+                sont serrés. Déjà partiellement traitée en
+                <strong>D-1c-ii</strong> (commit
+                <code>7d5f26c</code>) : AbsGardner activée sur les 34
+                symboles intérieurs de chaque bloc, mais le gain est
+                identique à Gardner sur data.</td>
+            <td>V4 HIGH++ shows seed-dependent ~10 % failure rate at
+                <code>if_noise=0</code> (§10.3, footnote †) — symptôme
+                cohérent avec jitter timing qui rend certains payloads
+                inopérants</td>
+            <td>Faible — un nouveau champ <code>kp_pilot</code> dans
+                <code>TimingLoop</code> + branch dans
+                <code>StreamingFrontend::process_chunk</code></td>
+            <td>~1-2 dB sur jitter timing → ~1-2 dB sur σ² 64-APSK ;
+                porte le taux noise-free à 100 %</td>
+            <td><span style="background:#999;color:white;padding:0.1em 0.5em;border-radius:3px;font-size:0.75rem">P2</span></td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout info">
+    <strong>Note de méthode</strong> — les chiffres &laquo;gain
+    estimé&raquo; sont des estimations à partir du gap V3↔V4 sur
+    HIGH++. Pour chaque piste, le critère de validation est <em>simple
+    et mesurable</em> : reproduire le sweep §10.3.1 V3 vs V4 et
+    constater que le delta σ² se résorbe (idéalement &lt; 2 dB
+    résiduel). Étape D du plan inclut déjà un test
+    <code>roundtrip_2x.rs</code> qui peut être étendu pour gater ces
+    régressions/améliorations.
+</div>
+
+<p>
+    <strong>Hors-périmètre de ce document mais déjà identifiées en
+    mémoire</strong> (voir les notes <code>~/.claude/projects/.../memory/</code>) :
+</p>
+<ul>
+    <li><strong>C-5</strong> — gate2x + detect2x (FFT PreambleProbe2x
+        pour auto-détection de la famille). Déféré, traqué dans
+        <code>modem-2x-branch-state</code>.</li>
+    <li><strong>Étape D</strong> — tests intégration
+        <code>roundtrip_2x.rs</code> + <code>cli_parity_2x.rs</code>
+        (drift synthétique, late-entry, détection auto). Le harness
+        <code>study/snr_sweep_2x.py</code> introduit ici servira de
+        base de comparaison out-of-process.</li>
+    <li><strong>Stale-preamble timer</strong> — déjà documenté dans
+        <code>stale-preamble-timer-todo</code>. Forcer un finalize
+        après <em>interval × 2</em> sans nouveau SOF, plutôt que
+        d'attendre le brickwall 5 min.</li>
+</ul>
+
 <!-- ======================================================================= -->
 <h2 id="crates">11. Layout des crates Rust</h2>
 
