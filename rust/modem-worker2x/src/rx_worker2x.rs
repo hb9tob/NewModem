@@ -208,6 +208,61 @@ struct ErrorPayload {
     message: String,
 }
 
+/// Per-batch level metric the GUI's top-bar VU meter consumes. Same
+/// shape and emit cadence as V3's `rx_worker::AudioLevelPayload` so the
+/// `audio_level` listener in `main.js` drives both families without
+/// branching.
+#[derive(Debug, Clone, Serialize)]
+struct AudioLevelPayload {
+    rms: f32,
+    peak: f32,
+    total_samples: u64,
+    overdrive: bool,
+    crest_db: f32,
+}
+
+/// Real-time margin telemetry, emitted every ~2 s. Carries lag,
+/// per-batch processing time and the cumulative cpal drop counter so
+/// the GUI's `noteRxRealtime` chip can flag CPU overload. Same wire
+/// contract as V3's `rx_worker::RxRealtimePayload`.
+#[derive(Debug, Clone, Serialize)]
+struct RxRealtimePayload {
+    lag_ms: f64,
+    last_batch_ms: f64,
+    max_batch_ms: f64,
+    session_buf_ms: f64,
+    dropped_samples: u64,
+}
+
+/// V3-parity overdrive thresholds. RMS above gate AND crest factor
+/// below `OVERDRIVE_CREST_GATE_DB` triggers a hard-clipped diagnostic
+/// — mirrors `rx_worker.rs` so the same TX-overdrive UI badge lights
+/// up on either family.
+const OVERDRIVE_RMS_GATE_LINEAR: f32 = 0.056;
+const OVERDRIVE_CREST_GATE_DB: f32 = 8.5;
+
+/// Single-pass peak / RMS / crest factor. Identical implementation to
+/// `rx_worker::compute_audio_stats` — kept local rather than re-
+/// exported to keep modem-worker2x free of a hard dependency on V3.
+fn compute_audio_stats(batch: &[f32]) -> (f32, f32, f32) {
+    let mut peak: f32 = 0.0;
+    let mut sqsum: f64 = 0.0;
+    for &s in batch {
+        let a = s.abs();
+        if a > peak {
+            peak = a;
+        }
+        sqsum += (s as f64) * (s as f64);
+    }
+    let rms = (sqsum / batch.len().max(1) as f64).sqrt() as f32;
+    let crest_db = if peak > 1e-9 && rms > 1e-9 {
+        20.0 * (peak / rms).log10()
+    } else {
+        0.0
+    };
+    (peak, rms, crest_db)
+}
+
 // ---------------------------------------------------------------------------
 // Idle-gate tuning (Phase C-5)
 // ---------------------------------------------------------------------------
@@ -313,7 +368,7 @@ pub fn spawn(
     wav_sink: SharedWavSink,
     profile_name: String,
     _deemphasis_enabled: bool,
-    _dropped_samples: Arc<AtomicU64>,
+    dropped_samples: Arc<AtomicU64>,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -332,6 +387,17 @@ pub fn spawn(
         };
         let mut frontend = crate::streaming_frontend::StreamingFrontend::new(cfg.clone());
         let mut symbol_buffer: Vec<Complex64> = Vec::with_capacity(8192);
+        // V3-parity telemetry. `total_samples` is the cumulative count
+        // of f32 audio samples the worker has observed (drives the GUI
+        // VU meter's frame counter). `last_telemetry_tick` paces the
+        // 2 s rx_realtime emit; `*_batch_processing_ms` track the wall
+        // time spent in each chunk so the chip can show the worst
+        // recent batch.
+        let started = Instant::now();
+        let mut total_samples: u64 = 0;
+        let mut last_telemetry_tick = Instant::now();
+        let mut last_batch_processing_ms: f64 = 0.0;
+        let mut max_batch_processing_ms: f64 = 0.0;
         // Absolute index (in the front-end's `symbols_emitted` space) of
         // `symbol_buffer[0]`. Bumped when the buffer is reset between
         // bursts so the `first_sof_at` returned by `rx_v4_symbols`
@@ -376,11 +442,31 @@ pub fn spawn(
                 Ok(c) => c,
                 Err(_) => break, // sender dropped → exit and run a final tick.
             };
+            let batch_start = Instant::now();
+            total_samples += chunk.len() as u64;
             if let Ok(mut g) = wav_sink.lock() {
                 if let Some(ws) = g.as_mut() {
                     ws.write_chunk(&chunk);
                 }
             }
+            // V3-parity VU meter feed. Emit on every chunk (~500 ms at
+            // 48 kHz) so the GUI's top-bar level indicator stays alive
+            // regardless of decode activity — without this the bar
+            // freezes the moment the user picks a 2x profile because
+            // no `audio_level` event ever reaches the frontend.
+            let (peak, rms, crest_db) = compute_audio_stats(&chunk);
+            let overdrive =
+                rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
+            sink.emit(
+                "audio_level",
+                AudioLevelPayload {
+                    rms,
+                    peak,
+                    total_samples,
+                    overdrive,
+                    crest_db,
+                },
+            );
             // Closed-loop streaming front-end: returns timing-recovered
             // symbols for the chunk. Cheap (~O(chunk_len)). MUST run
             // every chunk regardless of the gate so the Farrow + Gardner
@@ -599,6 +685,35 @@ pub fn spawn(
                         }
                     }
                 }
+            }
+            // V3-parity rx_realtime telemetry. Track per-batch wall
+            // time and emit a digest every ~2 s so the GUI's CPU-margin
+            // chip has fresh state. dropped_samples comes from the cpal
+            // mpsc backpressure counter (still 0 on SDR backends, which
+            // pre-buffer in-thread).
+            last_batch_processing_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            if last_batch_processing_ms > max_batch_processing_ms {
+                max_batch_processing_ms = last_batch_processing_ms;
+            }
+            if last_telemetry_tick.elapsed() >= Duration::from_secs(2) {
+                let wall_s = started.elapsed().as_secs_f64();
+                let audio_s = total_samples as f64 / AUDIO_RATE as f64;
+                let lag_ms = (wall_s - audio_s) * 1000.0;
+                let session_buf_ms = symbol_buffer.len() as f64 * 1000.0
+                    / cfg.base.symbol_rate;
+                let dropped = dropped_samples.load(Ordering::Relaxed);
+                sink.emit(
+                    "rx_realtime",
+                    RxRealtimePayload {
+                        lag_ms,
+                        last_batch_ms: last_batch_processing_ms,
+                        max_batch_ms: max_batch_processing_ms,
+                        session_buf_ms,
+                        dropped_samples: dropped,
+                    },
+                );
+                last_telemetry_tick = Instant::now();
+                max_batch_processing_ms = 0.0;
             }
             if stop_thread.load(Ordering::Relaxed) {
                 break;
