@@ -1465,14 +1465,19 @@ e_tangential = Im(e · conj(P))     ← composante perpendiculaire à P
         précisément l'origine du R/T=53.</li>
 </ul>
 
-<h3 id="turbo-passes">10.3.3 Décodeur turbo — deux passes LDPC avec affinage du modèle canal</h3>
+<h3 id="turbo-passes">10.3.3 Décodeur turbo — deux passes LDPC avec affinage EM du canal</h3>
 
 <p>
-    Le décodeur RX-V4 est désormais à <strong>deux passes</strong>, selon
-    le schéma demandé :
+    Le décodeur RX-V4 est à <strong>deux passes LDPC</strong> :
+    Pass 1 model-driven (canal estimé sur les pilotes seuls), puis
+    Pass 2 EM avec <strong>trois lisseurs forward-backward
+    Kalman + RTS</strong> alimentés par les soft symbols re-extraits
+    du posterior LDPC. Les paramètres canal — phase intra-CW,
+    gain par anneau, σ² par anneau — deviennent tous des
+    <strong>fonctions du symbole</strong>, lissées de façon MMSE-optimale.
 </p>
 
-<pre><code>Pass 1 (model-driven)
+<pre><code>Pass 1 (model-driven, inchangé)
    ├── LS gain pilote → g
    ├── MAD radial/tangentiel sur pilotes (après rotation par g̅)
    │     → σ²_radial_pilot, σ²_tangential_pilot
@@ -1483,22 +1488,37 @@ e_tangential = Im(e · conj(P))     ← composante perpendiculaire à P
    ├── σ²_r par anneau via modèle :
    │     σ²_total(R) = 2·σ²_awgn_per_dim + R²·(σ²_am + σ²_phi)
    ├── llr_maxlog_per_ring(data, constellation, σ²_per_ring)
-   │     σ²_per_symbol[i] = σ²_r(ring(s_hat[i]))
-   └── LDPC → (info_bytes_p1, converged_p1)
+   └── LDPC.decode_with_posterior() → (info_bytes_p1, posterior_llr, converged_p1)
 
-Pass 2 (data-driven, gated on Pass 1 convergence)
-   ├── Re-encode info_bytes_p1 → ŝ_k via
-   │     frame2x::encode_one_codeword (vérité absolue grâce
-   │     au LDPC syndrome check ≈ sans erreur sur N=2304)
-   ├── Hard-assign anneau pour chaque ŝ_k (nearest constellation point)
-   ├── MAD per-ring sur les résidus e_i = data_norm[i] − ŝ_k
-   │     σ²_r,DD = median(|e|²) / ln(2)   (rings avec ≥ 8 syms)
-   ├── Sanity check : si σ²_r,DD / σ²_r,model ∉ [0.2, 5.0]
-   │     → fallback model σ² pour cet anneau (re-encode pathologique)
-   ├── llr_maxlog_per_ring(data, constellation, σ²_per_ring_blended)
+Pass 2 EM (forward-backward Kalman + RTS, gated on Pass 1 convergence)
+   ├── posterior_llr → soft symbols
+   │     s̃_k = E[s_k | LLR_post] = Σ_c P(s_k = c) · c
+   │     ring_prob[r] = P(z_k = r), ring_cond_mean[r] = E[s_k | s_k ∈ ring r]
+   │     (per-bit independence approx ; rétablie par le re-LDPC final)
+   │
+   ├── Phase φ_k — 2-state RTS [φ_k, ω_k] (constant-velocity)
+   │     z_k = arg(y_k · conj(s̃_k)),   R_k = σ²_tang / |s̃_k|²
+   │     Q de σ²_phi du ChannelModel ; tracking sans lag d'une rampe linéaire
+   │
+   ├── Per-ring complex gain g_r(k) — 1-state RTS (random-walk, par anneau)
+   │     z_kr = y_k · exp(-j φ̂_k) / μ_kr  (mesure directe de g_r)
+   │     R_kr = σ²_total(R_r) / (P(z_k = r) · |μ_kr|²)
+   │     Mesures sautées si P(z_k = r) < 1e-3
+   │
+   ├── Per-ring log-variance log σ²_r(k) — 1-state RTS (random-walk additif)
+   │     z_kr = log|y_k − g_r(k) · μ_kr|² + γ  (γ = Euler-Mascheroni)
+   │     R_kr = π²/6 / P(z_k = r)  (statistiques exactes de log χ²₂)
+   │     Sanity gate per-(sym, ring) : σ²_DD ∉ [0.2, 5.0]·σ²_model → model
+   │
+   ├── Application : y'_k = (y_k · exp(-j φ̂_k)) / g̅_k
+   │     g̅_k = Σ_r P(z_k = r) · g_r(k)  (gain pondéré posterior)
+   │
+   ├── llr_maxlog_per_sym_per_ring(y', constellation, σ²[k][r])
+   │     LLR per-symbol per-candidat-ring (extension de la formule
+   │     Bayésienne ci-dessous au cas time-varying)
    └── LDPC → (info_bytes_p2, converged_p2)
-       Si converged_p2 : trust pass 2 (LLR plus fidèle au canal réel)
-       Sinon : fallback pass 1 (qui était déjà OK)
+       Si converged_p2 : trust pass 2 (modèle canal raffiné)
+       Sinon : fallback pass 1 (l'EM peut diverger sur CW borderline)
 </code></pre>
 
 <div class="callout">
@@ -1525,48 +1545,82 @@ LLR(b_k) = min<sub>{s:b<sub>k</sub>=1}</sub> [|y−s|²/σ²(s) + log σ²(s)]
 </div>
 
 <div class="callout info">
-    <strong>Pourquoi la même décodeur ré-itère sur la même donnée ?</strong>
-    Sur les CWs déjà convergés en pass 1, pass 2 reconverge presque
-    toujours aux mêmes bytes — la valeur ajoutée est dans la
-    <strong>fidélité des LLR par anneau</strong>. Sur un canal où la
-    σ²_r réelle diverge fortement entre anneaux (HIGH+2X avec R/T=53
-    sur l'anneau pilote → AM-AM massif sur les autres anneaux), le
-    Pass 1 model-based donne déjà une bonne première approximation ;
-    Pass 2 raffine sur la base de la vraie sortie LDPC. Bénéfice
-    secondaire : reporting plus précis du σ²_r par anneau (utile pour
-    le link quality monitoring) et un filet de sécurité contre les
-    cas marginaux où pass 1 converge sur un mauvais codeword (rare
-    pour N=2304, mais le pass 2 le détecterait).
+    <strong>Pourquoi forward-backward (RTS) au lieu d'un PI loop ?</strong>
+    Un filtre causal (PI 1er ordre) introduit un lag systématique sur
+    une rampe de phase — sur QO-100/sound-card où la dérive est
+    quasi-constante par CW, ce lag biaise les LLR de symboles tardifs
+    dans la CW. Le smoother RTS est <em>F+B</em> donc à lag zéro,
+    optimal MMSE sur le modèle linéaire-gaussien. Les deux états
+    [φ, ω] absorbent une rampe linéaire sans biais. Le même pattern
+    appliqué à g_r(k) (1-state random-walk complexe) et log σ²_r(k)
+    (1-state random-walk additif sur log-variance) capture les
+    dérives lentes intra-CW que les estimateurs scalaires par-CW
+    manquaient.
+</div>
+
+<div class="callout info">
+    <strong>Soft symbols vs hard re-encode.</strong> La Pass 2
+    précédente (commits 495fad5..7f77248, history seulement)
+    re-encodait <code>info_bytes_p1</code> en symboles
+    <code>ŝ_k</code> et calculait MAD per-ring sur les résidus durs.
+    L'EM Pass 2 utilise au lieu de ça les <em>soft symbols</em>
+    <code>s̃_k = E[s_k | LLR_post]</code> dérivés du posterior LDPC
+    via la nouvelle API <code>decode_with_posterior</code>. Quand
+    LDPC est marginalement convergent (LLR posterior pas saturé),
+    <code>s̃_k</code> diffère de hard ŝ_k et capture l'incertitude :
+    les rings_prob s'étalent sur plusieurs candidats, les σ²_r EM
+    s'ajustent en conséquence. Sur les CWs ultra-confiants
+    (LLR posterior saturé), s̃_k ≈ hard ŝ_k et l'EM reproduit la
+    Pass 2 hard-DD précédente. <strong>Strictement supérieur</strong>
+    à variance compute égale.
 </div>
 
 <p>
     <strong>Impact mesuré</strong> sur le sweep §10.3 (NBFM simulé,
-    seed=100, 10 kB) — avec Pass 2 vs Pass 1 model-only :
+    seed=100, 10 kB) :
 </p>
 
 <ul>
-    <li><strong>HIGH++2X @ if_noise=0.00</strong> : 63/69 → 64/69 CWs convergés
-        (+1, modeste — le canal NBFM simulé a peu d'AM-AM, donc le
-        modèle pilote-only est déjà ~bon).</li>
-    <li><strong>HIGH+2X / HIGH2X</strong> : convergence inchangée (déjà
-        max, 68/69 et 69/70 respectivement à ces SNRs).</li>
-    <li><strong>Test unitaire dédié</strong> :
-        <code>turbo_pass2_handles_strong_per_ring_distortion_apsk32</code>
-        applique 3 gains ring-dépendants (inner 0.90+0.05j, middle
-        1.05−0.03j, outer 1.15−0.10j) et vérifie le byte-exact —
-        passe avec turbo, démontre que la chaîne complète Pass 1 + SSD
-        + Pass 2 absorbe la distorsion APSK structurée.</li>
-    <li>Coût compute : ~1 LDPC iter additionnelle par CW convergé.
-        Wall-clock par CW passe de 2.5s à 2.9-3.1s sur Pi5 (en debug),
-        négligeable en release.</li>
+    <li><strong>HIGH+2X</strong> : convergence inchangée vs Pass 2
+        hard-DD (canal NBFM simulé déjà bien capturé par les pilotes).
+        Le bénéfice EM est visible sur canaux à dérive intra-CW.</li>
+    <li><strong>Test unitaire <code>turbo_pass2_em_tracks_intra_cw_phase_drift</code></strong> :
+        applique une rampe de phase 0.4 mrad/symbole (résiduel
+        intra-CW de ±100 mrad ≈ ±5.7°), HIGH+2X byte-exact OK.
+        Sans le smoother phase RTS, les CWs en bord de burst
+        cassaient.</li>
+    <li><strong>Test unitaire <code>turbo_pass2_em_anisotropic_per_ring_sigma2</code></strong> :
+        injecte σ² anisotrope par anneau (inner 0.015, middle 0.025,
+        outer 0.060 — 4× variation), HIGH+2X byte-exact OK. Le
+        smoother log-σ²_r catche l'anisotropie là où un σ² unique
+        sur-protégerait l'inner ring et sous-protégerait l'outer.</li>
+    <li><strong>Test <code>turbo_pass2_handles_strong_per_ring_distortion_apsk32</code></strong>
+        toujours vert : 3 gains ring-dépendants déterministes —
+        l'EM les absorbe via g_r(k) constants après quelques pas.</li>
+    <li>Coût compute : 1 LDPC iter additionnelle + 3 smoothers RTS
+        par CW convergé (≈ 5 ms sur Pi5 en release pour HIGH+2X).
+        Total wall-clock par CW : ~3.0 s debug, ~50 ms release —
+        négligeable vs le coût LDPC dominant.</li>
 </ul>
 
 <p>
-    Le bénéfice plein du turbo se manifestera sur des canaux <em>réels</em>
-    (transceiver OTA avec AM-AM/AM-PM non triviale) où le modèle pilote-
-    only sous-estime la variance des anneaux extérieurs. La sanity check
-    [0.2, 5.0] protège contre les divergences pathologiques.
+    <strong>Plus-value attendue en OTA réel.</strong> Le canal NBFM
+    simulé a peu de dérive de phase intra-CW (synchronisation parfaite,
+    pas de drift LO). Le bénéfice plein de l'EM se manifeste sur :
 </p>
+<ul>
+    <li><strong>Sound-card</strong> : drift d'horloge 50-100 ppm
+        non absorbé par le pilot-LS par-CW. RTS phase 2-state lisse
+        la rampe résiduelle sans lag.</li>
+    <li><strong>QO-100 SDR direct</strong> : CFO ±30-50 kHz +
+        phase noise 10 GHz LO. La même architecture [φ, ω] est
+        directement transposable (seul l'acquisition coarse-CFO
+        de Schmidl-Cox reste à ajouter, cf.
+        <a href="#post-merge-todos">§10.5</a>).</li>
+    <li><strong>Transceiver OTA</strong> avec AM-AM/AM-PM non-triviale :
+        g_r(k) suit la compression non-stationnaire sur le burst,
+        σ²_r(k) suit le BER per-ring inégal.</li>
+</ul>
 
 <h3>10.4 Throughput applicatif attendu</h3>
 

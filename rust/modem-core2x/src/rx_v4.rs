@@ -34,7 +34,11 @@ use std::collections::HashMap;
 
 use modem_core_base::interleaver;
 use modem_core_base::ldpc::decoder::LdpcDecoder;
-use modem_core_base::soft_demod;
+use modem_core_base::phase_smoother::{
+    rts_phase_smooth, rts_smooth_scalar, PhaseObs, PhaseSmootherParams,
+    ScalarObs, ScalarRtsParams,
+};
+use modem_core_base::soft_demod::{self, SoftSymbol};
 use modem_core_base::types::Complex64;
 use modem_framing::app_header::{self, AppHeader};
 
@@ -366,77 +370,300 @@ impl ChannelModel {
     }
 }
 
-// --- turbo Pass 2: data-driven per-ring stats from re-encoded symbols -----
+// --- turbo Pass 2 EM: forward-backward (Kalman + RTS) per-ring g, σ² ------
 
 /// Sanity-check bounds on the ratio of data-driven σ² to model σ² per
-/// ring. Outside this range, the DD estimate is suspect (either too
-/// few symbols on the ring, or a degenerate decode, or genuine model
-/// failure that we'd rather not propagate as truth) — we fall back
-/// to the model's σ² for that ring.
+/// ring. Outside this range, the DD estimate is suspect (either a
+/// degenerate decode or a genuine model failure we'd rather not
+/// propagate as truth) — we fall back to the model's σ² for that ring.
+/// Used by [`pass2_em_sigma2_to_per_sym_per_ring`].
 const SIGMA2_DD_RATIO_MIN: f64 = 0.2;
 const SIGMA2_DD_RATIO_MAX: f64 = 5.0;
 
-/// Minimum number of data symbols that must fall on a ring before we
-/// trust the data-driven MAD σ² for that ring. Below this we use the
-/// model σ². Picked so each ring has enough samples for a stable
-/// median (rule-of-thumb 8+).
-const SIGMA2_DD_MIN_PER_RING: usize = 8;
+//
+// The hard-DD Pass 2 above (`pass2_dd_sigma2_per_ring`) treats one CW as a
+// stationary block: a single σ² per ring, hard-decided ŝ_k from re-encoded
+// LDPC. The EM variant in this section replaces that with a soft,
+// time-varying estimator:
+//
+// - Soft references s̃_k = E[s_k | LLR_post] (computed in core-base from
+//   the LDPC posterior LLRs, with per-bit-independence approximation).
+// - Per-ring complex gain g_r(k): 1-state random-walk Kalman + backward RTS
+//   smoothing. Tracks slow AGC drift / AM-AM compression that the per-CW
+//   scalar SSD gain misses. One smoother per ring × {real, imag}.
+// - Per-ring log-variance log σ²_r(k): 1-state random-walk Kalman + RTS,
+//   measurement = log|y_k − g_r(k)·μ_kr|² with Euler-Mascheroni bias
+//   correction and π²/6 measurement variance (the exact statistics of
+//   log(χ²₂)).
+// - Phase φ_k: 2-state {phase, drift} Kalman + RTS — see
+//   [`phase_smoother::rts_phase_smooth`].
+//
+// All three feed back into the re-LLR step via
+// `llr_maxlog_per_sym_per_ring`: per-symbol-per-ring σ²(s, k) drives the
+// Bayesian LLR, the gain pre-rotates each y_k, the smoothed phase
+// derotates after gain.
+//
+// "Soft" doesn't just mean "without hard decisions" — it also means
+// gracefully ignoring symbols that the LDPC posterior cannot confidently
+// assign to a ring. Low `P(z_k = r)` ⇒ no measurement contribution to
+// ring r's smoothers at step k (the ScalarObs.z is set to None) — the
+// state just propagates the prior.
 
-/// Compute the data-driven per-ring total σ² from a known truth
-/// sequence `s_hat` (the re-encoded constellation symbols after pass-1
-/// LDPC convergence — equivalent to a genie having handed us the
-/// transmitted symbols, since LDPC's syndrome check is essentially
-/// error-free at N=2304).
-///
-/// For each ring r, collects the residuals `e_i = data_norm[i] − s_hat[i]`
-/// over symbols `i` where `s_hat[i]` is on ring r, then MAD-rescales
-/// `median(|e|²)` by `ln(2)` to get the unbiased σ² estimate. Rings
-/// with fewer than [`SIGMA2_DD_MIN_PER_RING`] symbols receive the
-/// model σ² as fallback.
-///
-/// Returns `Vec<f64>` of length `constellation.rings().0.len()`.
-fn pass2_dd_sigma2_per_ring(
-    data_norm: &[Complex64],
-    s_hat: &[Complex64],
+/// Posterior support threshold below which a symbol contributes no
+/// measurement to a per-ring smoother. Picked low so we keep most
+/// reasonably-likely assignments; the per-measurement R already
+/// down-weights low-confidence ones.
+const EM_MIN_RING_PROB: f64 = 1e-3;
+
+/// Process noise floor for g_r(k) random-walk (per-step variance of the
+/// gain innovation). Empirically tiny: the channel gain barely moves
+/// inside a 10 ms CW. Bumped up at runtime by `σ²_am` of the channel
+/// model when AM-AM distortion is significant.
+const EM_GAIN_Q_FLOOR: f64 = 1e-7;
+
+/// Process noise on `log σ²_r(k)`. The log scale absorbs σ² magnitude
+/// (a random walk on log handles a few-dB σ² drift over the CW).
+const EM_LOG_SIGMA2_Q: f64 = 1e-3;
+
+/// Bias of `E[log X]` when `X ~ χ²₂` scaled to mean 1 (i.e. unit
+/// exponential): `-γ` where γ is Euler–Mascheroni. The full complex
+/// residual `|e_k|²` under iid `N(0, σ²/2)` real/imag components has
+/// `|e_k|² / σ² ~ Exp(1)`, hence `E[log|e_k|²] = log σ² − γ`.
+const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
+
+/// Variance of `log X` when `X ~ Exp(1)`: `π²/6`. This is the
+/// measurement noise on the log-variance smoother (per single-symbol
+/// residual observation, before re-weighting by posterior support).
+const LOG_EXP_VAR: f64 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+
+/// EM per-ring time-varying complex gain `g_r(k)`. Returns one smoothed
+/// gain trajectory per ring of length `data.len()`. Single ring (QPSK /
+/// 8PSK) collapses to identity since the pilot-based scalar gain is
+/// already optimal.
+fn pass2_em_gain_smoother(
+    data: &[Complex64],
+    soft: &[SoftSymbol],
     constellation: &modem_core_base::constellation::Constellation,
     model: &ChannelModel,
-) -> Vec<f64> {
-    debug_assert_eq!(data_norm.len(), s_hat.len());
-    let (radii, ring_of_point) = constellation.rings();
+) -> Vec<Vec<Complex64>> {
+    let (radii, _) = constellation.rings();
     let n_rings = radii.len();
-    let mut resid_sq_per_ring: Vec<Vec<f64>> = vec![Vec::new(); n_rings];
-    for (i, &y) in data_norm.iter().enumerate() {
-        // Find which constellation point s_hat[i] is, then look up its ring.
-        let mut best_idx = 0usize;
-        let mut best_d2 = f64::INFINITY;
-        for (k, &s) in constellation.points.iter().enumerate() {
-            let d2 = (s_hat[i] - s).norm_sqr();
-            if d2 < best_d2 { best_d2 = d2; best_idx = k; }
-        }
-        let r = ring_of_point[best_idx];
-        let e = y - s_hat[i];
-        resid_sq_per_ring[r].push(e.norm_sqr());
+    let n_sym = data.len();
+    if n_rings == 1 {
+        return vec![vec![Complex64::new(1.0, 0.0); n_sym]];
     }
-    (0..n_rings)
-        .map(|r| {
-            let v = &mut resid_sq_per_ring[r];
-            if v.len() < SIGMA2_DD_MIN_PER_RING {
-                // Too few samples — fall back to model.
-                return model.sigma2_total_at_ring(radii[r]).max(SIGMA2_FLOOR);
+    debug_assert_eq!(soft.len(), n_sym);
+
+    let mut out: Vec<Vec<Complex64>> = (0..n_rings)
+        .map(|_| Vec::with_capacity(n_sym))
+        .collect();
+
+    // Common process-noise scale. `σ²_am` is the radial channel
+    // imbalance — when it's significant (AM-AM), allow more gain drift.
+    let q = (model.sigma2_am + EM_GAIN_Q_FLOOR).max(EM_GAIN_Q_FLOOR);
+
+    for r in 0..n_rings {
+        let mut obs_re: Vec<ScalarObs> = Vec::with_capacity(n_sym);
+        let mut obs_im: Vec<ScalarObs> = Vec::with_capacity(n_sym);
+        for k in 0..n_sym {
+            let w = soft[k].ring_prob[r];
+            let mu = soft[k].ring_cond_mean[r];
+            let mu2 = mu.norm_sqr();
+            if w > EM_MIN_RING_PROB && mu2 > 1e-9 {
+                // y_k = g_r · μ_kr + noise. Move to a direct measurement
+                // of g_r: z = y_k / μ_kr. Var(z) = σ²_total(R_r) / |μ_kr|²
+                // for AWGN; the soft-assignment weight w_kr further
+                // down-weights inconfident assignments (effective sample
+                // size = w).
+                let z = data[k] / mu;
+                let sigma2_ring = model.sigma2_total_at_ring(radii[r]).max(SIGMA2_FLOOR);
+                let r_meas = sigma2_ring / (w * mu2);
+                obs_re.push(ScalarObs { z: Some(z.re), r: r_meas });
+                obs_im.push(ScalarObs { z: Some(z.im), r: r_meas });
+            } else {
+                obs_re.push(ScalarObs { z: None, r: 0.0 });
+                obs_im.push(ScalarObs { z: None, r: 0.0 });
             }
-            let mid = v.len() / 2;
-            v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-            (v[mid] / MAD_CONSISTENCY_FACTOR_COMPLEX).max(SIGMA2_FLOOR)
+        }
+        // Prior: g = 1 + 0j (data already roughly normalised by the
+        // pilot-based gain upstream), with a loose variance.
+        let params_re = ScalarRtsParams { q, prior_mean: 1.0, prior_var: 1.0 };
+        let params_im = ScalarRtsParams { q, prior_mean: 0.0, prior_var: 1.0 };
+        let smooth_re = rts_smooth_scalar(&obs_re, &params_re);
+        let smooth_im = rts_smooth_scalar(&obs_im, &params_im);
+        for k in 0..n_sym {
+            out[r].push(Complex64::new(smooth_re[k], smooth_im[k]));
+        }
+    }
+    out
+}
+
+/// Posterior-weighted gain at each symbol position: convex combination
+/// of the per-ring trajectories, weighted by `P(z_k = r)`.
+///
+/// Used to derotate `y_k` before re-LLR. When the posterior is sharply
+/// peaked on a single ring (high-confidence symbols), this collapses to
+/// that ring's smoothed gain; when uncertain, it averages across rings
+/// — appropriate "softness" instead of a hard ring decision that
+/// might be wrong.
+fn pass2_em_weighted_gain(
+    soft: &[SoftSymbol],
+    gain_per_ring: &[Vec<Complex64>],
+) -> Vec<Complex64> {
+    let n_sym = soft.len();
+    let n_rings = gain_per_ring.len();
+    if n_rings == 1 {
+        return gain_per_ring[0].clone();
+    }
+    (0..n_sym)
+        .map(|k| {
+            let mut g_acc = Complex64::new(0.0, 0.0);
+            let mut w_sum = 0.0_f64;
+            for r in 0..n_rings {
+                let w = soft[k].ring_prob[r];
+                if w > 0.0 {
+                    g_acc += gain_per_ring[r][k] * w;
+                    w_sum += w;
+                }
+            }
+            if w_sum > 1e-12 {
+                g_acc / w_sum
+            } else {
+                Complex64::new(1.0, 0.0)
+            }
         })
         .collect()
 }
 
-/// Sanity-check the data-driven per-ring σ² vs the channel-model per-
-/// ring σ². Returns a mixed array where each entry is either the DD
-/// value (if within [SIGMA2_DD_RATIO_MIN, MAX] of model) or the model
-/// value as fallback. This guards against pathological re-encodes
-/// (e.g., on a borderline CW where LDPC's "converged" flag is right
-/// but the residuals are still wide enough to skew the median).
+/// EM per-ring time-varying noise variance `σ²_r(k)`. State =
+/// `log σ²_r(k)`, random walk; measurement = `log |y_k − g_r(k)·μ_kr|²`
+/// with bias `−γ` and variance `π²/6` (the exact log-Exp(1) statistics
+/// of a per-sample squared residual under complex-Gaussian noise). The
+/// log-domain state model converts multiplicative σ² drift to additive,
+/// making the random-walk model trivially valid even when σ² varies by
+/// an order of magnitude across the CW.
+fn pass2_em_sigma2_smoother(
+    data: &[Complex64],
+    soft: &[SoftSymbol],
+    gain_per_ring: &[Vec<Complex64>],
+    constellation: &modem_core_base::constellation::Constellation,
+    model: &ChannelModel,
+) -> Vec<Vec<f64>> {
+    let (radii, _) = constellation.rings();
+    let n_rings = radii.len();
+    let n_sym = data.len();
+    debug_assert_eq!(soft.len(), n_sym);
+    debug_assert_eq!(gain_per_ring.len(), n_rings);
+
+    let mut out: Vec<Vec<f64>> = vec![Vec::new(); n_rings];
+    for r in 0..n_rings {
+        let mut obs: Vec<ScalarObs> = Vec::with_capacity(n_sym);
+        for k in 0..n_sym {
+            let w = soft[k].ring_prob[r];
+            let mu = soft[k].ring_cond_mean[r];
+            if w > EM_MIN_RING_PROB && mu.norm_sqr() > 1e-9 {
+                let g = gain_per_ring[r][k];
+                let e = data[k] - g * mu;
+                let e2 = e.norm_sqr().max(1e-12);
+                // E[log|e|²] = log σ² − γ ⇒ measurement = log|e|² + γ.
+                let z = e2.ln() + EULER_MASCHERONI;
+                // Per-sample variance π²/6; posterior weight scales the
+                // effective sample count (low-confidence → high r_meas).
+                let r_meas = LOG_EXP_VAR / w;
+                obs.push(ScalarObs { z: Some(z), r: r_meas });
+            } else {
+                obs.push(ScalarObs { z: None, r: 0.0 });
+            }
+        }
+        let prior_mean = model
+            .sigma2_total_at_ring(radii[r])
+            .max(SIGMA2_FLOOR)
+            .ln();
+        let params = ScalarRtsParams {
+            q: EM_LOG_SIGMA2_Q,
+            prior_mean,
+            // Loose prior in log-domain (≈ ±2 stddev = ±2 nats ≈ ×7).
+            prior_var: 4.0,
+        };
+        let log_sigma2 = rts_smooth_scalar(&obs, &params);
+        out[r] = log_sigma2
+            .into_iter()
+            .map(|l| l.exp().max(SIGMA2_FLOOR))
+            .collect();
+    }
+    out
+}
+
+/// Build the per-symbol per-ring σ² matrix `[k][r]` consumed by
+/// [`soft_demod::llr_maxlog_per_sym_per_ring`]. Transposes the ring-major
+/// EM smoother output (`[r][k]`) into symbol-major, applies the same
+/// sanity gate (ratio bounds vs the per-ring model σ²) — entries
+/// outside the band fall back to model.
+fn pass2_em_sigma2_to_per_sym_per_ring(
+    sigma2_em: &[Vec<f64>],
+    constellation: &modem_core_base::constellation::Constellation,
+    model: &ChannelModel,
+    n_sym: usize,
+) -> Vec<Vec<f64>> {
+    let (radii, _) = constellation.rings();
+    let n_rings = radii.len();
+    debug_assert_eq!(sigma2_em.len(), n_rings);
+    let model_per_ring: Vec<f64> = radii
+        .iter()
+        .map(|&r| model.sigma2_total_at_ring(r).max(SIGMA2_FLOOR))
+        .collect();
+    let mut out = Vec::with_capacity(n_sym);
+    for k in 0..n_sym {
+        let mut row = Vec::with_capacity(n_rings);
+        for r in 0..n_rings {
+            let dd = sigma2_em[r][k];
+            let m = model_per_ring[r];
+            let ratio = dd / m;
+            let chosen = if (SIGMA2_DD_RATIO_MIN..=SIGMA2_DD_RATIO_MAX).contains(&ratio) {
+                dd
+            } else {
+                m
+            };
+            row.push(chosen);
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Build a phase-observation stream for [`rts_phase_smooth`] from the
+/// (gain-corrected) data and the soft references. Measurement noise R
+/// per symbol = σ²_tang / |s̃_k|² — the standard small-angle approximation
+/// of the AWGN phase variance for a sample of magnitude |s̃|, with the
+/// tangential pilot σ² as the AWGN scale.
+fn pass2_em_phase_obs(
+    data: &[Complex64],
+    soft: &[SoftSymbol],
+    sigma2_tangential: f64,
+) -> Vec<PhaseObs> {
+    data.iter()
+        .zip(soft.iter())
+        .map(|(&y, s)| {
+            let mu = s.mean;
+            let mu2 = mu.norm_sqr();
+            if mu2 > 1e-9 {
+                let theta = (y * mu.conj()).arg();
+                let r = (sigma2_tangential / mu2).max(1e-9);
+                PhaseObs { theta, r }
+            } else {
+                // No usable soft reference — treat as missing (huge R).
+                PhaseObs { theta: 0.0, r: 1e9 }
+            }
+        })
+        .collect()
+}
+
+/// Sanity-check the per-ring data-driven σ² vs the channel-model per-
+/// ring σ², element-wise. Used by the legacy hard-DD Pass 2 path and
+/// (in its per-symbol variant) by [`pass2_em_sigma2_to_per_sym_per_ring`];
+/// kept around as a free function for future scalar checks even though
+/// the EM path goes through the per-symbol gating now.
+#[allow(dead_code)]
 fn pass2_sanity_check_and_blend(
     sigma2_dd_per_ring: &[f64],
     constellation: &modem_core_base::constellation::Constellation,
@@ -839,52 +1066,108 @@ fn decode_one_cw(
         &data_norm, constellation, &sigma2_per_ring_p1);
     let llr_deint = interleaver::apply_permutation_f32(&llr, deinterleave_perm);
     let llr_for_ldpc = &llr_deint[..decoder.n()];
-    let (info_bytes_p1, converged_p1) = decoder.decode_to_bytes(llr_for_ldpc);
+    let (info_bytes_p1, posterior_ldpc_order, converged_p1) =
+        decoder.decode_with_posterior(llr_for_ldpc);
     let _ = sigma2; // kept for back-compat sum aggregation above
+    let _ = encoder; // EM Pass 2 no longer re-encodes hard symbols
+    let _ = k_bytes;
 
-    // --- Turbo Pass 2 (data-driven σ²_r) --------------------------------
+    // --- Turbo Pass 2 EM (forward-backward Kalman + RTS) ----------------
     //
-    // If pass-1 LDPC converged, its info_bytes are correct (the LDPC
-    // syndrome check is essentially error-free at N=2304, p(false-OK)
-    // < 1e-12). Re-encode them to the constellation symbol sequence
-    // and use that as truth for a per-ring data-driven σ² estimate.
-    // Sanity-check vs the model — accept the DD value when it sits
-    // in [0.2x, 5x] of the model, otherwise fall back to model for
-    // that ring. Re-LLR with the refined σ²_r and re-decode.
+    // Pass 1 LDPC produced bit posteriors. Convert them to **soft
+    // constellation symbols** (E[s_k | LLR_post] and ring-conditional
+    // means), then run three Kalman + RTS smoothers in succession to
+    // refine the channel model with the full LDPC information:
     //
-    // Pass-2 LDPC almost always reconverges to the same bytes (we
-    // already have truth — the re-decode mostly validates the
-    // refined LLRs). The benefit is twofold:
-    //   1. Reports more accurate σ²_r per ring (useful for link
-    //      quality monitoring and future ARQ-style features).
-    //   2. Catches the rare false-positive convergence where the
-    //      pass-1 syndrome was zero but on a different codeword;
-    //      pass-2 with tighter LLRs reveals the inconsistency.
+    //   1. Phase φ_k        — 2-state {phase, drift} smoother
+    //                         (`phase_smoother::rts_phase_smooth`).
+    //   2. Per-ring gain g_r(k) — 1-state complex random-walk (real
+    //                         and imag smoothed independently).
+    //   3. Per-ring log-σ²_r(k) — 1-state random-walk on the log scale
+    //                         (additive model for multiplicative σ²
+    //                         drift, with χ²₂-derived bias correction).
     //
-    // If pass-1 didn't converge, skip pass 2 (the truth sequence
-    // would be wrong and bias the DD σ²). Use pass-1 result anyway.
+    // The three smoothers feed `llr_maxlog_per_sym_per_ring` for the
+    // Pass 2 re-LLR. Sanity gate: if Pass 2 LDPC fails to converge,
+    // we fall back to the Pass 1 info_bytes (the EM trajectory may
+    // have diverged on a borderline CW).
+    //
+    // We only run Pass 2 if Pass 1 converged — soft symbols built from
+    // an unconverged posterior carry the LDPC's wrong-codeword bias
+    // and the EM would lock onto that. Pre-convergence Pass 1 LLRs
+    // remain the best estimate in that case.
     let (info_bytes, converged) = if converged_p1 {
-        let s_hat = crate::frame2x::encode_one_codeword(
-            &info_bytes_p1[..k_bytes], encoder, interleave_perm, constellation);
-        // s_hat has length cw_data_syms (data only, pre-pilot-interleave).
-        debug_assert_eq!(s_hat.len(), data_norm.len());
-        let sigma2_dd = pass2_dd_sigma2_per_ring(
-            &data_norm, &s_hat, constellation, &channel_model);
-        let sigma2_blended = pass2_sanity_check_and_blend(
-            &sigma2_dd, constellation, &channel_model);
-        // Pass 2 LLR: same per-ring per-candidate formulation as Pass 1,
-        // but with data-driven σ²_r,DD (sanity-checked vs model).
-        let llr_p2 = soft_demod::llr_maxlog_per_ring(
-            &data_norm, constellation, &sigma2_blended);
+        // Step 1. Re-interleave posterior LLR (n bits) back to the
+        // symbol-major space (cw_data_syms × bps bits). The padding bit
+        // (when present, e.g. Apsk32 R=1/2 pads 2304 → 2305) sits at
+        // index `decoder.n()` in symbol-major space — TX padded with
+        // bit 0, so we inject a very confident positive LLR.
+        let padded_len = interleave_perm.len();
+        let mut posterior_padded = vec![25.0_f32; padded_len];
+        posterior_padded[..decoder.n()].copy_from_slice(&posterior_ldpc_order);
+        let posterior_symbol_major =
+            interleaver::apply_permutation_f32(&posterior_padded, interleave_perm);
+        let bps = constellation.bits_per_sym;
+        let n_data_bits = cw_data_syms * bps;
+        let posterior_for_symbols = &posterior_symbol_major[..n_data_bits];
+
+        // Step 2. Soft symbols.
+        let soft = soft_demod::soft_symbols_from_posterior_llr(
+            posterior_for_symbols, constellation);
+        debug_assert_eq!(soft.len(), data_norm.len());
+
+        // Step 3. RTS phase smoother on raw (gain-untouched) data. The
+        // measurement angle arg(y · conj(s̃)) is invariant to a small
+        // residual gain magnitude error — phase is mostly orthogonal
+        // to gain estimation at this stage.
+        let sigma2_tang = split.tangential.max(SIGMA2_FLOOR / 2.0);
+        let phase_obs = pass2_em_phase_obs(&data_norm, &soft, sigma2_tang);
+        let phase_params = PhaseSmootherParams::from_channel(channel_model.sigma2_phi);
+        let phi_smooth = rts_phase_smooth(&phase_obs, &phase_params);
+
+        // Step 4. EM per-ring gain g_r(k) on phase-derotated data.
+        let mut data_p2: Vec<Complex64> = data_norm
+            .iter()
+            .zip(phi_smooth.iter())
+            .map(|(&y, &phi)| y * Complex64::from_polar(1.0, -phi))
+            .collect();
+        let gain_per_ring =
+            pass2_em_gain_smoother(&data_p2, &soft, constellation, &channel_model);
+
+        // Apply posterior-weighted gain at each symbol.
+        let g_weighted = pass2_em_weighted_gain(&soft, &gain_per_ring);
+        for (y, g) in data_p2.iter_mut().zip(g_weighted.iter()) {
+            if g.norm_sqr() > 1e-12 {
+                *y = *y / *g;
+            }
+        }
+
+        // Step 5. EM per-ring σ²_r(k) on the now phase + gain corrected
+        // data. Uses the *unit* g_r expected after correction (so we
+        // pass identity gains for σ² estimation — residuals e = y − μ).
+        let identity_gain: Vec<Vec<Complex64>> = (0..gain_per_ring.len())
+            .map(|_| vec![Complex64::new(1.0, 0.0); data_p2.len()])
+            .collect();
+        let sigma2_em =
+            pass2_em_sigma2_smoother(&data_p2, &soft, &identity_gain,
+                                     constellation, &channel_model);
+        let sigma2_per_sym_per_ring = pass2_em_sigma2_to_per_sym_per_ring(
+            &sigma2_em, constellation, &channel_model, data_p2.len());
+
+        // Step 6. Re-LLR with the time-varying per-symbol per-ring σ²,
+        // then re-LDPC.
+        let llr_p2 = soft_demod::llr_maxlog_per_sym_per_ring(
+            &data_p2, constellation, &sigma2_per_sym_per_ring);
         let llr_p2_deint = interleaver::apply_permutation_f32(
             &llr_p2, deinterleave_perm);
         let llr_p2_for_ldpc = &llr_p2_deint[..decoder.n()];
         let (info_bytes_p2, converged_p2) = decoder.decode_to_bytes(llr_p2_for_ldpc);
-        // If pass 2 converges too (almost always), trust it (refined
-        // channel model). Otherwise fall back to the converged pass 1.
         if converged_p2 {
             (info_bytes_p2, true)
         } else {
+            // EM trajectory diverged or LDPC drifted — keep the
+            // Pass 1 result (which IS converged, just from a coarser
+            // channel model).
             (info_bytes_p1, true)
         }
     } else {
@@ -1259,6 +1542,91 @@ mod tests {
             "phase-only noise should give T > 1.5·R, got R={} T={}",
             result.sigma2_radial, result.sigma2_tangential
         );
+    }
+
+    #[test]
+    fn turbo_pass2_em_tracks_intra_cw_phase_drift() {
+        // Apply a slowly-drifting phase rotation **inside** each CW
+        // (not just per-CW). The per-CW pilot LS gain can only absorb a
+        // single phase per CW; a residual ramp of a few mrad/symbol
+        // across the CW survives. The EM Pass 2 RTS phase smoother
+        // (dense data-aided, derived from soft symbols) must catch it
+        // and the LDPC must still byte-recover the payload.
+        //
+        // Drift rate: 0.4 mrad/symbol. Over a ~500-sym CW, residual
+        // (after per-CW pilot LS absorbs the CW's mean phase) is
+        // ±100 mrad ≈ ±5.7° around the pilot reference. Enough to bend
+        // outer-ring decisions on 32-APSK at high SNR, well within the
+        // constant-velocity Kalman model's tracking range.
+        use crate::profile2x::profile_high_plus_2x;
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(600, 0xFACE_DEAD);
+        let mut symbols = build_superframe_v4(&payload, &cfg, 1, mime::BINARY, 0);
+        // Slowly-drifting phase applied to ALL symbols — pilots, data,
+        // PLHEADER. The per-CW pilot LS gain (36 pilots/CW for HIGH+2X
+        // across the CW span) absorbs the CW's mean phase but leaves
+        // an intra-CW ramp the EM RTS smoother must catch.
+        for (k, s) in symbols.iter_mut().enumerate() {
+            let phi = 4e-4 * (k as f64);
+            *s = *s * Complex64::from_polar(1.0, phi);
+        }
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        assert_eq!(result.data, payload,
+                   "EM Pass 2 phase smoother must absorb intra-CW drift");
+    }
+
+    #[test]
+    fn turbo_pass2_em_anisotropic_per_ring_sigma2() {
+        // Inject anisotropic per-ring AWGN: low noise on the inner ring,
+        // moderate on the middle (pilot), high on the outer ring. This
+        // mimics the AM-AM compression that hits 32-APSK's outer ring
+        // harder than the pilot's |P|=1. The EM σ²_r smoother should
+        // catch this and feed per-ring LLR scaling — better than a
+        // single global σ² that under-protects the outer ring.
+        use crate::profile2x::profile_high_plus_2x;
+        let cfg = profile_high_plus_2x();
+        let payload = rng_bytes(600, 0xBADD_CAFE);
+        let constellation = crate::frame2x::make_constellation_2x(&cfg);
+        let (radii, _) = constellation.rings();
+        assert_eq!(radii.len(), 3);
+        // σ² per ring, with the outer ring 4× noisier than the inner.
+        let sigma_per_ring = [0.015_f64, 0.025_f64, 0.060_f64];
+        let mut symbols = build_superframe_v4(&payload, &cfg, 1, mime::BINARY, 0);
+        let mut rng_state = 0xC0FFEE_u64;
+        let mut next_u01 = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng_state as f64) / (u64::MAX as f64)
+        };
+        let mut box_muller = || {
+            let u1 = next_u01().max(1e-12);
+            let u2 = next_u01();
+            (
+                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos(),
+                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).sin(),
+            )
+        };
+        for s in &mut symbols {
+            // Pick which ring (or pilot/SOF treated as middle).
+            let r = if (s.norm() - radii[0]).abs() < 0.05 {
+                0
+            } else if (s.norm() - radii[2]).abs() < 0.05 {
+                2
+            } else {
+                1
+            };
+            let sigma = sigma_per_ring[r];
+            let (g1, g2) = box_muller();
+            *s = *s + Complex64::new(sigma * g1, sigma * g2);
+        }
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+        assert_eq!(result.data, payload,
+                   "EM Pass 2 σ²_r smoother must absorb 3× anisotropy");
+        // Diagnostic sanity: the RX-side σ²_radial / σ²_tangential
+        // should be > 0 (we injected isotropic AWGN per ring, but the
+        // total σ² aggregate over the CW reflects the per-ring scale).
+        assert!(result.sigma2_data > 0.0);
     }
 
     #[test]
