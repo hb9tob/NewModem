@@ -480,12 +480,20 @@ pub fn spawn(
                                 .iter()
                                 .map(|&p| vec![p as f32])
                                 .collect();
+                            // V3's progress bar denominator is DATA-only
+                            // (META is framing overhead, not part of the
+                            // RaptorQ ESI space). V4 mirrors that with
+                            // `data_cws_total / data_cws_converged` so the
+                            // fountain-fill math and the `converged_bitmap`
+                            // hole map line up bit-for-bit with V3.
                             sink.emit(
                                 "v2_progress",
                                 serde_json::json!({
-                                    "blocks_converged": res.converged_cws,
-                                    "blocks_total": res.total_cws,
-                                    "blocks_expected": res.total_cws,
+                                    "blocks_converged": res.data_cws_converged,
+                                    "blocks_total": res.data_cws_total,
+                                    "blocks_expected": res.data_cws_total,
+                                    "converged_bitmap":
+                                        res.converged_bitmap.clone(),
                                     "sigma2": res.sigma2_data,
                                     "sigma2_data": res.sigma2_data,
                                     "constellation_sample":

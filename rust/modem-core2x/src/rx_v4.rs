@@ -128,6 +128,24 @@ pub struct RxResult2x {
     /// contract as V3's
     /// `RxV2Result::pilot_phase_is_meta`.
     pub pilot_phase_is_meta: Vec<bool>,
+    /// Count of DATA CWs the decoder visited (META excluded). Mirrors
+    /// V3's `blocks_total / blocks_expected` semantics for the progress
+    /// bar: total CWs the LDPC pipeline attempted in this burst.
+    pub data_cws_total: usize,
+    /// Count of DATA CWs that converged (META excluded). Subset of
+    /// [`data_cws_total`](Self::data_cws_total). Surfaced separately
+    /// from [`converged_cws`](Self::converged_cws) so the GUI's progress
+    /// bar can display DATA-only without META biasing the numerator.
+    pub data_cws_converged: usize,
+    /// Bitmap of converged DATA-CW ESIs (LSB-first byte order, same
+    /// wire encoding the V3 worker emits). Bit `n` set ⇒ ESI `n`
+    /// converged through the LDPC stage; the RaptorQ reassembly may
+    /// still drop the CW later if the ESI exceeds the source range,
+    /// but for visualization "ESI converged at LDPC" is what the
+    /// operator wants to see. Empty until the first DATA CW converges.
+    /// The byte length is `ceil(max(max_esi + 1, data_cws_total) / 8)`
+    /// so the progress bar can show every attempted DATA slot.
+    pub converged_bitmap: Vec<u8>,
 }
 
 /// Cap on the scatter cloud we forward to the GUI per `rx_v4_symbols`
@@ -152,6 +170,9 @@ impl RxResult2x {
             constellation_sample: Vec::new(),
             pilot_phase_per_cw: Vec::new(),
             pilot_phase_is_meta: Vec::new(),
+            data_cws_total: 0,
+            data_cws_converged: 0,
+            converged_bitmap: Vec::new(),
         }
     }
 }
@@ -1146,6 +1167,7 @@ pub fn rx_v4_symbols_after(
     if result.cycles == 0 {
         None
     } else {
+        finalize_progress_bitmap(&mut result);
         Some(result)
     }
 }
@@ -1399,6 +1421,13 @@ fn decode_one_cw(
             split.tangential,
         );
     }
+    if !is_meta {
+        // Count every DATA CW the decoder visited (whether or not it
+        // converged) so `data_cws_total` matches the progress bar's
+        // denominator — V3's `blocks_expected` is DATA-only, V4 must
+        // mirror that for the GUI fountain-fill math to line up.
+        result.data_cws_total += 1;
+    }
     if converged {
         result.converged_cws += 1;
         let bytes = info_bytes[..k_bytes].to_vec();
@@ -1420,7 +1449,34 @@ fn decode_one_cw(
             }
         } else {
             cw_bytes.insert(esi, bytes);
+            // Light the GUI's fountain-fill bit for this ESI. LSB-first
+            // byte order, same encoding as `modem-worker::rx_worker`
+            // emits — see V3 `V2ProgressPayload::converged_bitmap`. The
+            // bitmap auto-grows; the final pad to `data_cws_total`
+            // happens in `finalize_progress_bitmap` so the GUI sees the
+            // full DATA slot count even when the highest ESI failed.
+            result.data_cws_converged += 1;
+            let bit_idx = esi as usize;
+            let byte_idx = bit_idx >> 3;
+            if result.converged_bitmap.len() <= byte_idx {
+                result.converged_bitmap.resize(byte_idx + 1, 0);
+            }
+            result.converged_bitmap[byte_idx] |= 1 << (bit_idx & 7);
         }
+    }
+}
+
+/// Pad `result.converged_bitmap` to cover every visited DATA CW slot.
+/// Without this, a burst where the highest ESI failed would emit a
+/// bitmap shorter than the progress bar's denominator and the GUI's
+/// rightmost slots would all default to "missing" — true in spirit but
+/// the byte length should match the wire contract regardless. Called
+/// once at the end of `rx_v4_symbols_after`, after every cycle has
+/// been walked.
+fn finalize_progress_bitmap(result: &mut RxResult2x) {
+    let needed_bytes = result.data_cws_total.div_ceil(8);
+    if result.converged_bitmap.len() < needed_bytes {
+        result.converged_bitmap.resize(needed_bytes, 0);
     }
 }
 
@@ -1703,6 +1759,42 @@ mod tests {
         for s in &mut symbols { *s = *s * g; }
         let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
         assert_eq!(result.data, payload);
+    }
+
+    #[test]
+    fn converged_bitmap_marks_every_data_esi_on_clean_burst() {
+        // Noise-free decode: every DATA CW converges → every bit in
+        // [0, data_cws_total) must be set, and the byte length must
+        // exactly equal ceil(data_cws_total / 8).
+        let cfg = profile_normal_2x();
+        let payload = rng_bytes(600, 0xBEAD);
+        let symbols = build_superframe_v4(
+            &payload, &cfg, 0x42, mime::BINARY, 0);
+        let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
+
+        assert!(result.data_cws_total >= 1);
+        assert_eq!(
+            result.data_cws_converged, result.data_cws_total,
+            "every DATA CW should converge on a noise-free burst",
+        );
+        let expected_bytes = result.data_cws_total.div_ceil(8);
+        assert_eq!(
+            result.converged_bitmap.len(),
+            expected_bytes,
+            "bitmap byte length must match ceil(data_cws_total / 8)",
+        );
+        for esi in 0..result.data_cws_total {
+            let byte = result.converged_bitmap[esi >> 3];
+            assert!(
+                (byte >> (esi & 7)) & 1 == 1,
+                "ESI {esi} should be marked converged",
+            );
+        }
+
+        // META CWs DON'T count toward `data_cws_*` — V3's progress bar
+        // contract is DATA-only and V4 must mirror it.
+        assert!(result.converged_cws > result.data_cws_converged,
+            "converged_cws should include META; data_cws_converged shouldn't");
     }
 
     #[test]
