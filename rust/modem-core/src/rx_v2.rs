@@ -581,17 +581,30 @@ pub fn rx_v2_with_options(
         }
     }
 
-    // 2. Fast-path at 0 ppm. Gated by `allow_fast_path` so the caller
-    //    (rx_v3_after on a CLOSED window in low-power mode) can drop
-    //    this redundant MF pass when Gardner has already locked. On a
-    //    drifted channel Gardner is sub-ppm accurate and `best` is
-    //    already set ; the fast-path can only tie or lose. On Pi 4 the
-    //    skip saves ~230 ms per CLOSED SF.
+    // 2. Fast-path at 0 ppm. Two gates :
+    //    - `allow_fast_path = true` (desktop / OPEN cold-start) always
+    //      runs the fast-path. Preserves the score comparison that
+    //      lets the rare "fast-path-beats-Gardner" outlier still win.
+    //    - `allow_fast_path = false` (lowpower CLOSED) skips the pass
+    //      ONLY when Gardner already produced a clean decode -- the
+    //      stated rationale of the 0.10.29 commit. When Gardner failed
+    //      to lock (sub-0.5 ppm channel where the branch is gated out
+    //      at line 566, OR a noisy channel where rx_v2_with_hint
+    //      returned None) the fast-path stays ON as the safety net
+    //      that lets the SF still decode.
     //
-    //    Kept ON for desktop (rx_v2 wrapper, x86_64 worker) and for
-    //    OPEN windows where the cold-start cascade may still benefit
-    //    from a clean 0-ppm attempt.
-    if allow_fast_path {
+    //    REGRESSION GUARD (2026-05-14 OTA, 0.10.31) : an earlier
+    //    version of this gate skipped the fast-path unconditionally
+    //    when `allow_fast_path = false`. On a near-zero-drift channel
+    //    Gardner skipped its own resample (|ppm| < 0.5), the fast-path
+    //    was also skipped, and EVERY SF returned None. The GUI
+    //    constellation degraded (only the rare >0.5 ppm SFs survived,
+    //    via Gardner-resample whose interpolation is noisier than the
+    //    fast-path 0-ppm pass) AND the worker never re-armed on a
+    //    fresh transmission because its first SFs typically land near
+    //    zero drift.
+    let gardner_clean = best.as_ref().map(|r| clean(r)).unwrap_or(false);
+    if allow_fast_path || !gardner_clean {
         if let Some(r) = rx_v2_single(samples, config) {
             let s = score_result(&r);
             if s > best_score {
@@ -2939,33 +2952,38 @@ mod tests {
         );
     }
 
-    /// Axis 1 regression : on a clean drift-free single-SF buffer, the
-    /// 0-ppm fast-path is the only pipeline that increments
-    /// `PerfStage::PassDone` from `rx_v2_single` (Gardner under 0.5 ppm
-    /// skips the resample + hint-decode path entirely, line 566). So
-    /// `take_perf().n_passes` is a direct counter of fast-path runs.
+    /// Axis 1 regression (refined in 0.10.32) : the 0-ppm fast-path is
+    /// skipped ONLY when Gardner has already produced a clean decode.
+    /// On a drifted CLEAN channel where Gardner locks (=> >0.5 ppm
+    /// resample => clean rx_v2_with_hint), the fast-path becomes pure
+    /// redundancy and the lowpower path drops it.
     ///
-    /// Pre-Axis-1 (allow_fast_path baked to true): n_passes >= 1.
-    /// Post-Axis-1 (allow_fast_path = false on CLOSED + lowpower):
-    /// n_passes == 0 from the fast-path; Gardner's markeraudio
-    /// instrumentation may still contribute its own PassDone but we
-    /// compare deltas, not absolute counts.
+    /// Uses +30 ppm injected drift (well above the 0.5 ppm gate, well
+    /// below the legacy-grid corner cases) so Gardner is the path that
+    /// decodes the SF in both desktop and lowpower modes ; the only
+    /// per-mode difference is whether the fast-path PassDone+MF cost
+    /// also gets paid.
     #[test]
-    fn rx_v2_with_options_skips_fast_path_when_gated() {
-        let config = profile_high();
-        let data: Vec<u8> = (0..2000)
-            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
-            .collect();
+    fn rx_v2_with_options_skips_fast_path_when_gardner_clean() {
+        // HIGH+ has more markers per SF than HIGH -> Gardner OLS is
+        // more reliable at +30 ppm. Same recipe as the existing
+        // marker_fit_drift_high_plus_plus_30_ppm test.
+        let config = crate::profile::profile_high_plus();
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(7)).collect();
         let samples = tx_v3(&data, &config, 0xCAFE_BABE);
+        // resample_audio(x, -ppm) simulates "RX clock faster than TX
+        // by ppm". 30 ppm well above the 0.5 ppm gate so Gardner's
+        // rx_v2_with_hint branch fires and produces a clean decode.
+        let drifted = resample_audio(&samples, -30.0);
 
-        // Baseline : fast-path allowed, grid allowed (= desktop semantics).
-        let _ = take_perf(); // clear thread-local accumulator
-        let _ = rx_v2_with_options(&samples, &config, true, true);
+        // Baseline : fast-path allowed, grid allowed (= desktop).
+        let _ = take_perf();
+        let r_desktop = rx_v2_with_options(&drifted, &config, true, true);
         let perf_desktop = take_perf();
 
-        // Lowpower : both gated off.
+        // Lowpower : fast-path AND grid gated off.
         let _ = take_perf();
-        let _ = rx_v2_with_options(&samples, &config, false, false);
+        let r_lowpower = rx_v2_with_options(&drifted, &config, false, false);
         let perf_lowpower = take_perf();
 
         eprintln!(
@@ -2975,6 +2993,11 @@ mod tests {
             perf_lowpower.n_passes,
             perf_lowpower.matched_filter_us,
         );
+
+        // Both modes must still decode the SF -- the fast-path skip is
+        // an OPTIMIZATION, not a behaviour change for the lock case.
+        assert!(r_desktop.is_some(), "desktop must decode +30 ppm signal");
+        assert!(r_lowpower.is_some(), "lowpower must still decode +30 ppm via Gardner");
 
         // Fast-path elimination must strictly reduce the pass count and
         // the matched-filter wall-clock. We don't pin absolute numbers
@@ -2988,6 +3011,51 @@ mod tests {
             perf_lowpower.matched_filter_us < perf_desktop.matched_filter_us,
             "lowpower must spend less time in matched_filter (got {}us vs {}us)",
             perf_lowpower.matched_filter_us, perf_desktop.matched_filter_us,
+        );
+    }
+
+    /// 0.10.32 regression : on a NEAR-ZERO-DRIFT channel Gardner gates
+    /// itself out (|ppm| < 0.5, line 566) so the rx_v2_with_hint
+    /// branch never runs and `best` stays None after step 1. The
+    /// fast-path MUST run as a fallback even in lowpower mode --
+    /// otherwise the SF is silently lost. This is the bug spotted on
+    /// Pi 4 OTA 2026-05-14 between 0.10.30 and 0.10.32 : new
+    /// transmissions whose early SFs land near zero drift never armed
+    /// the worker, and constellations on borderline-drift channels
+    /// degraded (only the >0.5 ppm SFs survived, via Gardner-resample).
+    #[test]
+    fn rx_v2_with_options_lowpower_falls_back_to_fast_path_on_zero_drift() {
+        let config = profile_high();
+        let data: Vec<u8> = (0..2000)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        // Zero-drift signal : Gardner returns ppm < 0.5 (or even None),
+        // its branch never produces a `best`, and the fast-path is the
+        // only viable decoder. Lowpower must still decode this.
+        let samples = tx_v3(&data, &config, 0xCAFE_BABE);
+
+        let _ = take_perf();
+        let r_lowpower = rx_v2_with_options(&samples, &config, false, false);
+        let perf_lowpower = take_perf();
+
+        eprintln!(
+            "0.10.32 fallback: zero-drift lowpower n_passes={} mf={}us decoded={}",
+            perf_lowpower.n_passes,
+            perf_lowpower.matched_filter_us,
+            r_lowpower.is_some(),
+        );
+
+        assert!(
+            r_lowpower.is_some(),
+            "lowpower MUST decode a zero-drift SF via fast-path fallback : \
+             Gardner gates itself out under 0.5 ppm and the fast-path is \
+             the only remaining decoder. Returning None here corresponds to \
+             the 0.10.30/0.10.31 bug : new transmissions never re-armed."
+        );
+        // The fast-path ran -> at least one PassDone fired from rx_v2_single.
+        assert!(
+            perf_lowpower.n_passes >= 1,
+            "fast-path must contribute >= 1 PassDone on zero-drift lowpower"
         );
     }
 }
