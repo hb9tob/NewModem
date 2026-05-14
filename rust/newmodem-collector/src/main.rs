@@ -132,8 +132,17 @@ async fn health() -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReportMeta {
     callsign: String,
+    /// Maidenhead grid locator of the *submitting* station (the one
+    /// running the sounder / RX app on its side of the link). For a
+    /// sounding, this is the receiver — the transmitter's locator is
+    /// in `tx_locator`.
     #[serde(default)]
     locator: Option<String>,
+    /// Maidenhead grid locator of the remote TX station, as dictated
+    /// by phonie from the far end during the sounding. Only filled by
+    /// sounding submissions (RX captures leave it `None`).
+    #[serde(default)]
+    tx_locator: Option<String>,
     #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
@@ -359,6 +368,7 @@ fn render_index(rows: &[IndexRow]) -> String {
             let meta_default = ReportMeta {
                 callsign: "?".to_string(),
                 locator: None,
+                tx_locator: None,
                 profile: None,
                 relay: None,
                 tx_model: None,

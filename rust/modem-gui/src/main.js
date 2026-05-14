@@ -4832,6 +4832,12 @@ function buildRxChainMetadata() {
   const rxModel = (
     document.getElementById("sounder-rx-rx-model")?.value || ""
   ).trim();
+  // The TX station's Maidenhead grid is dictated by phonie from the
+  // remote operator (the local locator lives in Paramètres). It's
+  // optional — leave empty if not communicated.
+  const txLocator = (
+    document.getElementById("sounder-rx-tx-locator")?.value || ""
+  ).trim();
   const relay = (
     document.getElementById("sounder-rx-relay")?.value || "none"
   ).trim();
@@ -4847,8 +4853,10 @@ function buildRxChainMetadata() {
   const notes = `relay=${relay} mode=${mode}`;
   // Also surface the individual fields so the collector-submit code
   // can map them onto the structured `ReportMeta` (tx_model, relay,
-  // profile) the server expects.
-  return { equipment, notes, txModel, rxModel, relay, mode };
+  // profile) the server expects. `txLocator` rides alongside as an
+  // extra `tx_locator` field — the server doesn't parse it today but
+  // preserves it in the on-disk metadata.json for later indexing.
+  return { equipment, notes, txModel, rxModel, txLocator, relay, mode };
 }
 
 async function runSounderAnalyze() {
@@ -4979,6 +4987,7 @@ async function runSounderAnalyze() {
       wavPath: capture,
       signatureJson: JSON.stringify(sig),
       txModel: chain.txModel || null,
+      txLocator: chain.txLocator || null,
       relay: chain.relay && chain.relay !== "none" ? chain.relay : null,
       profile: chain.mode || null,
       notes: noteParts.length ? noteParts.join(" / ") : null,
@@ -5051,6 +5060,7 @@ async function runSounderCollectorSend() {
         collector_url: collectorUrl,
         signature_json: lastSounderResult.signatureJson,
         locator: locator || null,
+        tx_locator: lastSounderResult.txLocator || null,
         profile: lastSounderResult.profile || null,
         relay: lastSounderResult.relay || null,
         tx_model: lastSounderResult.txModel || null,

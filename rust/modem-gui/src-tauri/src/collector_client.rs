@@ -203,6 +203,12 @@ pub struct SubmitSoundingArgs {
     /// `Settings.locator`.
     #[serde(default)]
     pub locator: Option<String>,
+    /// Remote-TX-station Maidenhead grid as dictated by phonie from
+    /// the far end. Optional. Sent as a `tx_locator` field in the
+    /// metadata JSON — the server doesn't parse it today but stores
+    /// the whole file verbatim, so future indexers can pick it up.
+    #[serde(default)]
+    pub tx_locator: Option<String>,
     /// Sounder profile (typically the family: `fm`, `qo100`, `ssb_hf`
     /// — or the sounder-rx mode dropdown selection).
     #[serde(default)]
@@ -262,6 +268,7 @@ pub async fn submit_sounding(args: SubmitSoundingArgs) -> Result<SubmitResult, S
     // needed — extra fields are tolerated by serde, the parsed struct
     // simply ignores them.
     let locator = args.locator.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let tx_locator = args.tx_locator.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let profile = args.profile.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let relay = args.relay.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let tx_model = args.tx_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -269,6 +276,7 @@ pub async fn submit_sounding(args: SubmitSoundingArgs) -> Result<SubmitResult, S
     let metadata = serde_json::json!({
         "callsign": callsign,
         "locator": locator,
+        "tx_locator": tx_locator,
         "profile": profile,
         "relay": relay,
         "tx_model": tx_model,
