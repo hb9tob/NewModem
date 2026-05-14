@@ -37,3 +37,12 @@ pub mod timing_loop;
 // inside a codeword using soft-symbol references from the LDPC
 // posterior. Used by `modem-core2x/src/rx_v4.rs::decode_one_cw`.
 pub mod phase_smoother;
+
+// Channel sounder — probe-signal generators (tone, two-tone, chirp,
+// multitone, AWGN, level sweep) for characterising the radio chain
+// (transceiver + soundcard + SDR). The matching analyser lives in
+// `probe_analyze`. Both modules are pure functions; the TX
+// orchestration (PTT, soundcard playback, raw RX capture) is wired in
+// `modem-worker-base/src/sounder.rs`.
+pub mod probe;
+pub mod probe_analyze;

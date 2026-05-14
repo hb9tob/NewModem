@@ -19,6 +19,13 @@ pub mod tx_runtime;
 pub mod wav_sink;
 pub mod worker_handle;
 
+// Channel sounder — TX-side probe-schedule build + RX-side capture
+// analyse, designed for two-machine deployments (one operator TX, one
+// RX). Wires the `modem-core-base::probe` generators and the matching
+// `probe_analyze` measurers into a workflow protected by a wake-up
+// tone (VOX/squelch chain) + sync chirp (sample-accurate alignment).
+pub mod sounder;
+
 pub use event_sink::{EventSink, EventSinkExt, NoopSink, RecordingSink};
 pub use tx_runtime::{
     archive_payload, build_tx_wav_path, run_playback, sanitize_filename, write_tx_wav,
