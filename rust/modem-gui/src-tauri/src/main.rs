@@ -1411,9 +1411,12 @@ struct SoundingTxEmitResult {
 /// proven by the md5-matches-across-runs property of
 /// `build_probe_schedule`).
 ///
-/// The operator's radio is expected to be VOX-keyed (or the operator
-/// holds PTT manually); the 5 s @ 1750 Hz repeater-opening preamble
-/// at the start of the probe gives VOX plenty of time to engage.
+/// PTT discipline: if a serial-port PTT is configured (Paramètres
+/// tab), it is engaged before opening the audio stream and released
+/// `PTT_GUARD_MS` after the last sample plays — same pattern as
+/// `tx_runtime::run_playback`. With PTT disabled the radio is assumed
+/// to be VOX-keyed; the 5 s @ 1750 Hz repeater-opening preamble at
+/// the start of the probe gives VOX plenty of time to engage.
 ///
 /// Stashes the playback handle in `AppState::sounder_tx_handle` so
 /// the cpal stream stays alive until the audio finishes (Drop on the
@@ -1435,19 +1438,34 @@ fn sounding_tx_emit(
     let cfg = settings::load();
     let sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let device = args.tx_device.clone();
+    let ptt_slot = state.ptt.clone();
     // Run the playback on a dedicated thread — the PlaybackHandle wraps
     // a cpal `Stream` whose underlying object is `Box<dyn Any>` (not
     // marked Send), so we can't move it across threads after creation.
     // Instead, we build it ON the worker thread; the Arc<dyn
     // SampleSink> + the audio Vec are both Send.
     std::thread::spawn(move || {
+        // PTT engage: best-effort, mirrors tx_runtime::run_playback. If
+        // no controller is open (PTT disabled in Paramètres) this is a
+        // no-op and the user is expected to rely on VOX or hold PTT.
+        let ptt_engaged = engage_ptt(&ptt_slot);
+        if ptt_engaged {
+            std::thread::sleep(std::time::Duration::from_millis(
+                ptt::PTT_GUARD_MS,
+            ));
+        }
         let handle = match sink.play_buffer(
             &device,
             modem_core_base::types::AUDIO_RATE,
             audio,
         ) {
             Ok(h) => h,
-            Err(_) => return,
+            Err(_) => {
+                if ptt_engaged {
+                    release_ptt(&ptt_slot);
+                }
+                return;
+            }
         };
         // Hold the handle until playback completes (Drop stops the
         // stream — premature Drop = audio cut short).
@@ -1462,9 +1480,48 @@ fn sounding_tx_emit(
             }
         }
         drop(handle);
+        // 200 ms of silence trail before releasing PTT — gives the
+        // transceiver time to flush its TX path.
+        if ptt_engaged {
+            std::thread::sleep(std::time::Duration::from_millis(
+                ptt::PTT_GUARD_MS,
+            ));
+            release_ptt(&ptt_slot);
+        }
     });
 
     Ok(SoundingTxEmitResult { duration_s })
+}
+
+/// Mirror of `tx_runtime::ptt_engage` — kept private to that module,
+/// so we re-implement the 4-line helper here rather than make it `pub`
+/// just for the sounder. Returns `true` iff a controller was present
+/// AND `set_tx` succeeded.
+fn engage_ptt(slot: &SharedPtt) -> bool {
+    let mut g = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(ctrl) = g.as_mut() else { return false };
+    match ctrl.set_tx() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[ptt] sounder set_tx: {e}");
+            false
+        }
+    }
+}
+
+fn release_ptt(slot: &SharedPtt) {
+    let mut g = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(ctrl) = g.as_mut() {
+        if let Err(e) = ctrl.set_rx() {
+            eprintln!("[ptt] sounder set_rx: {e}");
+        }
+    }
 }
 
 /// Run the sounder analyser on a recorded capture WAV. Writes

@@ -4712,19 +4712,23 @@ function buildStandardSoundingRequest() {
 }
 
 // TX-side: one-shot button that builds the standard probe sequence
-// and plays it directly through the soundcard output device the
-// operator already selected at the top of the TX panel. No files
-// written, no fields to fill — the user just clicks once and waits.
+// and plays it directly through the TX soundcard configured in the
+// Paramètres tab (single source of truth — same field used by
+// `txStart` for the regular modem TX). No files written, no fields
+// to fill — the user just clicks once and waits.
 async function runSounderTxEmit() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke } = window.__TAURI__.core;
-  // The TX device dropdown is the same one used by the main modem TX
-  // (top of the TX panel). Re-use whatever the operator picked.
-  const txDevice = (document.getElementById("tx-device")?.value || "").trim();
+  // Read the device from the persisted settings (Paramètres tab).
+  // The previous version queried `getElementById("tx-device")` which
+  // never existed in the DOM (the actual id is `tx-device-select` and
+  // it lives under Paramètres), so the button always errored out
+  // even with a device configured.
+  const txDevice = ((currentSettings && currentSettings.tx_device) || "").trim();
   if (!txDevice) {
     setSounderStatus(
       "sounder-tx-status",
-      "Choisir un device de sortie audio (en haut)",
+      "Choisir un périphérique TX dans Paramètres",
       "err",
     );
     return;
