@@ -1604,16 +1604,6 @@ pub fn rx_v3_after(
     // `chosen_ppm`, which is gated to CLOSED windows because it feeds
     // the OPEN-window hint path.
     let mut reported_ppm: f64 = 0.0;
-    // Deepest preamble whose window actually decoded (Some(r) returned)
-    // in this call. Reported back as `last_preamble_offset` so the
-    // worker advances its `session_buffer` watermark only past
-    // *processed* preambles -- any tail position that was skipped
-    // (low-power cap deferring the boundary to next tick, or OPEN
-    // window in non-finalize mode) stays in the buffer for re-scan.
-    // Fallback to `positions.last()` when nothing decoded, so a
-    // hard-failing tick still drains the head and lets the worker
-    // re-arm next tick.
-    let mut last_processed: Option<usize> = None;
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -1709,9 +1699,6 @@ pub fn rx_v3_after(
         let Some(r) = r_opt else {
             continue;
         };
-        // Decode succeeded -- this preamble is now consumed and the
-        // worker may drain everything up to (p - TRUNCATE_MARGIN_MS).
-        last_processed = Some(p);
         if is_closed {
             chosen_ppm = r.drift_ppm;
             have_hint = true;
@@ -1817,10 +1804,21 @@ pub fn rx_v3_after(
     // the skip_until filter, so `.last()` is Some). The caller (rx_worker)
     // uses this to truncate its rolling capture buffer right behind P_last,
     // turning the buffer into a self-purging queue.
-    // Watermark = deepest *processed* preamble. Falls back to the last
-    // seen position when no decode succeeded so the worker still drains
-    // past a hard-failing burst instead of pinning the buffer.
-    let last_preamble_offset = last_processed.or_else(|| positions.last().copied());
+    // Watermark = deepest preamble SEEN. The capped path (Axis 2,
+    // low-power) returns `positions = [p_processed, p_boundary]` -- so
+    // `positions.last() = p_boundary`. The worker drains the buffer to
+    // `p_boundary - TRUNCATE_MARGIN_MS` (rx_worker.rs:1701-1706),
+    // which drops the just-processed CLOSED window (p_processed) and
+    // preserves p_boundary at margin offset for next tick's re-scan
+    // with a fresh per-window Gardner. **Reporting `last_processed`
+    // here would preserve p_processed AND cause it to be re-detected
+    // on every subsequent tick -> infinite re-decode -> GUI freeze
+    // (regression spotted on Pi 4 OTA 2026-05-14).**
+    //
+    // Uncapped path (desktop / CLI / finalize=true tests) keeps the
+    // same semantics: positions.last() is the last preamble of the
+    // batch, processed or not, and the worker drains past it.
+    let last_preamble_offset = positions.last().copied();
 
     Some(RxV2Result {
         data: assembled,
@@ -2847,14 +2845,20 @@ mod tests {
     /// Axis 2 : low-power live worker tick (`allow_legacy_grid = false`,
     /// `finalize = false`) caps the per-tick scan at 2 preambles. On a
     /// 3+ SF audio buffer, the call decodes only the first CLOSED
-    /// window (positions[0]) and surfaces it via
-    /// `last_preamble_offset`. The second preamble stays in the
-    /// caller's buffer for the next tick's re-scan, where Gardner is
-    /// re-estimated fresh -- the property the user requested.
+    /// window (positions[0]) and surfaces `positions[1]` -- the
+    /// **unprocessed** boundary -- via `last_preamble_offset`. The
+    /// worker drains everything up to `positions[1] - TRUNCATE_MARGIN`
+    /// (rx_worker.rs:1701-1706), which drops positions[0] but keeps
+    /// positions[1] at margin offset for next tick's re-scan where
+    /// Gardner is re-estimated fresh.
     ///
-    /// Compares against the same buffer decoded with `finalize = true`
-    /// (= one-shot CLI semantics, no cap) which must walk every
-    /// preamble and recover the full payload.
+    /// **REGRESSION GUARD (2026-05-14 OTA)** : an earlier draft of
+    /// Axis 2 made `last_preamble_offset = last_processed = positions[0]`.
+    /// That kept positions[0] in the buffer AFTER drain, so the next
+    /// tick re-detected it and re-decoded indefinitely -- the GUI
+    /// froze on the second SF. This test asserts the watermark is
+    /// **strictly past** positions[0] by simulating one drain cycle
+    /// and checking the second tick advances to a new preamble.
     #[test]
     fn rx_v3_after_lowpower_one_sf_per_tick() {
         let config = profile_high();
@@ -2899,6 +2903,39 @@ mod tests {
         assert!(
             cap_off < unc_off,
             "capped watermark must be earlier than uncapped: {cap_off} >= {unc_off}",
+        );
+
+        // **REGRESSION GUARD** : simulate one worker drain cycle and a
+        // second rx_v3_after call on the drained tail. If the watermark
+        // is positions[0] instead of positions[1] (the old bug), the
+        // drained buffer still contains positions[0] and the second
+        // call re-decodes the same SF -- producing the same
+        // `last_preamble_offset`. With the correct watermark
+        // (positions[1]), the second call locks on a different SF and
+        // the watermark advances.
+        const TRUNCATE_MARGIN_SAMPLES: usize = (AUDIO_RATE as usize * 100) / 1000; // 4800
+        let drain_end = cap_off.saturating_sub(TRUNCATE_MARGIN_SAMPLES);
+        assert!(drain_end > 0, "drain_end must advance past head");
+        let tail = &samples[drain_end..];
+        let capped2 = rx_v3_after(tail, &config, 0, false, None, false)
+            .expect("second-tick rx_v3_after returned None");
+        let cap_off2 = capped2.last_preamble_offset.expect("second-tick watermark");
+
+        // In the broken implementation, cap_off2 would re-find positions[0]
+        // (which is at offset TRUNCATE_MARGIN_SAMPLES in `tail`). With the
+        // fix, cap_off2 points further (to positions[2] or later in the
+        // original buffer = positions[1] of `tail` after re-scan).
+        eprintln!(
+            "Axis-2 second-tick: tail_len={} drain_end={} cap_off2={} -- absolute = {}",
+            tail.len(), drain_end, cap_off2, drain_end + cap_off2,
+        );
+        let absolute_cap_off2 = drain_end + cap_off2;
+        assert!(
+            absolute_cap_off2 > cap_off,
+            "second tick MUST advance the watermark : got {absolute_cap_off2} \
+             (= drain_end {drain_end} + cap_off2 {cap_off2}) which is not > {cap_off}. \
+             Likely regression : `last_preamble_offset` reports positions[0] \
+             (= last_processed) instead of positions[1] (= boundary)."
         );
     }
 
