@@ -26,18 +26,22 @@ use crate::types::AUDIO_RATE;
 // uniformly rather than mixing `probe::two_tone` with `modulator::tone`.
 pub use crate::modulator::{silence, tone};
 
-/// VOX/squelch wake-up tone. TX and RX run on physically separate
-/// machines, possibly via a repeater; before any probe data lands on the
-/// receive side we need to engage:
+/// VOX/squelch + repeater wake-up tone. TX and RX run on physically
+/// separate machines, possibly via a repeater; before any probe data
+/// lands on the receive side we need to engage:
 ///   - the TX rig's VOX (commonly 300-500 ms of carrier audio),
-///   - the local repeater squelch (≈ 500 ms),
+///   - the **repeater opening tone** (5 s @ 1750 Hz — the European /
+///     IARU R1 standard, recognised by virtually every VHF/UHF
+///     repeater on the band),
 ///   - the RX rig's squelch (≈ 200 ms).
 ///
-/// A 1.5 s continuous tone at 1500 Hz (well inside the SSB/NBFM voice
-/// bandpass) is the safe blanket. Pick `amplitude ≤ 0.7` so the tone
-/// fits comfortably under the soundcard's clip ceiling.
+/// 1750 Hz is the carrier of the opening burst; many repeaters drop
+/// access after a few seconds of silence, so the 5 s length doubles
+/// as a margin for the repeater's hang time to settle before the
+/// sync chirp lands. Pick `amplitude ≤ 0.7` so the tone fits
+/// comfortably under the soundcard's clip ceiling.
 pub fn wake_up_tone(amplitude: f32) -> Vec<f32> {
-    tone(1500.0, 1.5, amplitude)
+    tone(1750.0, 5.0, amplitude)
 }
 
 /// Sync marker: a 0.5 s linear chirp 500 → 2500 Hz. The chirp's
@@ -291,6 +295,109 @@ where
     (audio, stamps)
 }
 
+// --- Golay complementary pair (channel impulse response probe) -----------
+
+/// Build a Golay complementary pair (A, B) of length `length_bits`,
+/// which must be a power of two ≥ 1. Values are ±1.
+///
+/// Built via the standard recursive construction starting from
+/// `A_0 = [1], B_0 = [1]`:
+///
+/// ```text
+/// A_{n+1} = [A_n  B_n]
+/// B_{n+1} = [A_n -B_n]
+/// ```
+///
+/// The defining property is `R_A[k] + R_B[k] = 2N · δ[k]` (the
+/// autocorrelations sum to a perfect Kronecker δ), which means
+/// matched-filtering received(A) ⊕ received(B) yields a sidelobe-free
+/// estimate of the channel's impulse response — the *whole reason* we
+/// use Golay rather than e.g. plain PN sequences.
+pub fn golay_complementary(length_bits: usize) -> (Vec<i8>, Vec<i8>) {
+    assert!(
+        length_bits.is_power_of_two() && length_bits >= 1,
+        "Golay length must be a power of two, got {length_bits}",
+    );
+    let mut a: Vec<i8> = vec![1];
+    let mut b: Vec<i8> = vec![1];
+    while a.len() < length_bits {
+        let mut new_a: Vec<i8> = Vec::with_capacity(2 * a.len());
+        new_a.extend_from_slice(&a);
+        new_a.extend_from_slice(&b);
+        let mut new_b: Vec<i8> = Vec::with_capacity(2 * a.len());
+        new_b.extend_from_slice(&a);
+        new_b.extend(b.iter().map(|x| -x));
+        a = new_a;
+        b = new_b;
+    }
+    (a, b)
+}
+
+/// Modulate a ±1 chip sequence as BPSK on `carrier_hz`, with chip
+/// duration matching `chip_rate_hz`. The carrier phase is **continuous
+/// across chips** — no phase reset — to keep the spectrum confined to
+/// `[carrier - chip_rate/2, carrier + chip_rate/2]`, which lets the
+/// caller pick a chip rate that fits the audio passband.
+///
+/// Returns a buffer of length `bits.len() * round(sr / chip_rate)`.
+fn modulate_bpsk(
+    bits: &[i8],
+    chip_rate_hz: f64,
+    carrier_hz: f64,
+    amplitude: f32,
+) -> Vec<f32> {
+    let sr = AUDIO_RATE as f64;
+    let samples_per_chip = (sr / chip_rate_hz).round() as usize;
+    let mut out = Vec::with_capacity(bits.len() * samples_per_chip);
+    let omega = 2.0 * PI * carrier_hz / sr;
+    let mut n = 0_usize;
+    for &b in bits {
+        let s = b as f32 * amplitude;
+        for _ in 0..samples_per_chip {
+            out.push(s * (omega * n as f64).sin() as f32);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// Build the audio probe for a Golay complementary-pair channel sounder:
+/// BPSK-modulated A, `gap_s` of silence, BPSK B, **`gap_s` of trailing
+/// silence**. The trailing silence is the receive-side window where
+/// the analyser observes the channel impulse-response tail for B (and
+/// matches the gap between A and B, where A's tail lives). The
+/// receiver matched-filters each half against its known sequence and
+/// sums to recover the channel impulse response with zero correlation
+/// sidelobes.
+///
+/// Returns `(audio, samples_per_chip)` so the analyser can locate A
+/// and B inside the recording. Total length is
+/// `2 · bits.len() · samples_per_chip + 2 · gap_s · sr`.
+///
+/// Pick `gap_s` ≥ longest expected channel delay spread; ≥ 50 ms is
+/// adequate for terrestrial VHF/UHF, ≥ 200 ms for ionospheric HF.
+pub fn golay_pair_audio(
+    length_bits: usize,
+    chip_rate_hz: f64,
+    carrier_hz: f64,
+    amplitude: f32,
+    gap_s: f64,
+) -> (Vec<f32>, usize) {
+    let (a, b) = golay_complementary(length_bits);
+    let wave_a = modulate_bpsk(&a, chip_rate_hz, carrier_hz, amplitude);
+    let wave_b = modulate_bpsk(&b, chip_rate_hz, carrier_hz, amplitude);
+    let samples_per_chip = wave_a.len() / length_bits;
+    let gap = silence(gap_s);
+    let tail = silence(gap_s);
+    let mut out =
+        Vec::with_capacity(wave_a.len() + gap.len() + wave_b.len() + tail.len());
+    out.extend(wave_a);
+    out.extend(gap);
+    out.extend(wave_b);
+    out.extend(tail);
+    (out, samples_per_chip)
+}
+
 // --- Tests -------------------------------------------------------------
 
 #[cfg(test)]
@@ -463,5 +570,57 @@ mod tests {
             "-12dB ratio {} ≠ 0.251",
             peaks[2] / peaks[0],
         );
+    }
+
+    #[test]
+    fn golay_complementary_autocorrelations_sum_to_kronecker_delta() {
+        // The defining property: R_A[k] + R_B[k] = 2N if k = 0, else 0.
+        for n in [2usize, 4, 8, 16, 64, 256] {
+            let (a, b) = golay_complementary(n);
+            assert_eq!(a.len(), n);
+            assert_eq!(b.len(), n);
+            // Autocorrelation: R_x[k] = Σ x[i]·x[i+k] for i in [0, n-k).
+            for k in 0..n {
+                let ra: i64 =
+                    (0..n - k).map(|i| (a[i] as i64) * (a[i + k] as i64)).sum();
+                let rb: i64 =
+                    (0..n - k).map(|i| (b[i] as i64) * (b[i + k] as i64)).sum();
+                let sum = ra + rb;
+                if k == 0 {
+                    assert_eq!(sum, 2 * n as i64, "n={n} k=0 sum={sum}");
+                } else {
+                    assert_eq!(sum, 0, "n={n} k={k} sum={sum}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn golay_pair_audio_layout_matches_bits() {
+        let (audio, samples_per_chip) =
+            golay_pair_audio(64, 1200.0, 1500.0, 0.5, 0.05);
+        // Two BPSK sequences of 64 chips at ≈ 40 samples/chip + a
+        // 50 ms gap + a 50 ms trailing tail (matching the gap).
+        let expected_seq_len = 64 * samples_per_chip;
+        let gap_len = (0.05 * AUDIO_RATE as f64) as usize;
+        let expected_total = 2 * expected_seq_len + 2 * gap_len;
+        // Allow ±2 sample slack on rounding.
+        let dev = (audio.len() as i64 - expected_total as i64).abs();
+        assert!(dev <= 2, "len {} expected ≈ {}", audio.len(), expected_total);
+        // Most samples in each sequence should be non-zero.
+        let nonzero =
+            audio[..expected_seq_len].iter().filter(|&&x| x.abs() > 1e-6).count();
+        assert!(
+            nonzero > expected_seq_len / 2,
+            "first half mostly zero ({nonzero}/{expected_seq_len})",
+        );
+        // The gap should be silence.
+        let gap_start = expected_seq_len;
+        let gap_end = gap_start + gap_len;
+        let gap_peak = audio[gap_start..gap_end]
+            .iter()
+            .map(|&x| x.abs())
+            .fold(0.0f32, f32::max);
+        assert!(gap_peak < 1e-6, "gap peak {gap_peak} should be silent");
     }
 }

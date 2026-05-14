@@ -4565,34 +4565,101 @@ function setupChannelTab() {
 // noise floor, frequency response, and a 10-step level sweep so the
 // operator gets P1dB + sweet-spot estimates from a single TX render.
 
+// The reference TX level grid: 11 amplitudes from -30 to 0 dBFS in 3 dB
+// steps. The orchestrator emits every probe family at every level so
+// the analyser can compare each metric (SNR, IMD3, BW, group delay,
+// impulse response) against TX level — and flag the operator when
+// the TX rig is set too loud (the typical mistake: peak well above
+// the sweet spot, which produces gross IMD3 + clipping artefacts).
+const SOUNDER_LEVELS_DBFS = [
+  -30, -27, -24, -21, -18, -15, -12, -9, -6, -3, 0,
+];
+
+// Convert a dBFS level to a linear amplitude scale factor.
+function levelDbToAmp(level_db) {
+  return Math.pow(10, level_db / 20);
+}
+
+// Build the multi-level expansion of a probe family. `factory(amp)`
+// returns a ProbeSpec for one level given the linear amplitude scale.
+// Returns `{ probes, levels }` parallel arrays so the caller can pass
+// the per-probe level_db across to the Rust side.
+function expandLevels(factory) {
+  const probes = [];
+  const levels = [];
+  for (const level_db of SOUNDER_LEVELS_DBFS) {
+    probes.push(factory(levelDbToAmp(level_db)));
+    levels.push(level_db);
+  }
+  return { probes, levels };
+}
+
+// Returns `{ probes, levels }`. `levels[i]` is the intended TX dBFS
+// for `probes[i]`, or `null` for multi-level probes (level_sweep)
+// where the level is encoded internally.
 function defaultSounderProbes() {
-  return [
-    // 1 — single tone @ 1500 Hz, our wake-up anchor frequency. Confirms
-    //     SNR / amplitude reference under real-world AGC.
-    { kind: "tone", freq_hz: 1500.0, amplitude: 0.6 },
-    // 2 — two-tone 1100/1900 Hz for IMD3 / IP3 measurement.
-    { kind: "two_tone", f1_hz: 1100.0, f2_hz: 1900.0, amp_each: 0.4 },
-    // 3 — linear chirp covering the NBFM audio passband (-3 dB BW,
-    //     group delay deviation).
-    { kind: "chirp_linear", f0_hz: 200.0, f1_hz: 2600.0, amplitude: 0.6 },
-    // 4 — multitone for the frequency response (gain vs freq).
-    {
+  const probes = [];
+  const levels = [];
+  // 1 — Level sweep on tone @ 1500 Hz. Runs FIRST so the analyser
+  //     can pin down the sweet spot before evaluating the other
+  //     probe families. Each family is then evaluated at the same
+  //     11 levels so the analyser can chart degradation against
+  //     TX level (and flag over-modulation explicitly).
+  probes.push({
+    kind: "level_sweep",
+    inner_tone_freq_hz: 1500.0,
+    levels_db: SOUNDER_LEVELS_DBFS,
+    duration_s_per_level: 0.6,
+    gap_s: 0.15,
+  });
+  levels.push(null);
+  const families = [
+    // 2 — Two-tone IMD3. f1=1300/f2=1700 so the IMD3 bins
+    //     (2·f1−f2=900 Hz, 2·f2−f1=2100 Hz) land inside the clean
+    //     part of the NBFM audio band.
+    (amp) => ({
+      kind: "two_tone",
+      f1_hz: 1300.0,
+      f2_hz: 1700.0,
+      amp_each: 0.5 * amp,
+    }),
+    // 3 — Linear chirp (group delay, BW).
+    (amp) => ({
+      kind: "chirp_linear",
+      f0_hz: 200.0,
+      f1_hz: 2600.0,
+      amplitude: 0.9 * amp,
+    }),
+    // 4 — Multitone (frequency response).
+    (amp) => ({
       kind: "multitone",
       freqs_hz: [300, 600, 900, 1200, 1500, 1800, 2100, 2400],
-      amp_each: 0.12,
-    },
-    // 5 — AWGN burst, characterises post-AGC noise behaviour.
-    { kind: "awgn", rms: 0.2, seed: 0xC0FFEE },
-    // 6 — level sweep at 1500 Hz from -30 to 0 dBFS by 3 dB → P1dB +
-    //     sweet spot. 0.6 s/level keeps total airtime reasonable.
-    {
-      kind: "level_sweep",
-      inner_tone_freq_hz: 1500.0,
-      levels_db: [-30, -27, -24, -21, -18, -15, -12, -9, -6, -3, 0],
-      duration_s_per_level: 0.6,
-      gap_s: 0.15,
-    },
+      amp_each: 0.3 * amp,
+    }),
+    // 5 — AWGN (noise-floor shape under AGC).
+    (amp) => ({
+      kind: "awgn",
+      rms: 0.2 * amp,
+      seed: 0xc0ffee,
+    }),
+    // 6 — Golay complementary-pair impulse response. BPSK on
+    //     1500 Hz carrier, 256 chips at 1200 chip/s → ≈ 213 ms per
+    //     sequence × 2 + 100 ms gap × 2 ≈ 0.63 s / level instance.
+    (amp) => ({
+      kind: "golay_pair",
+      length_bits: 256,
+      chip_rate_hz: 1200.0,
+      carrier_hz: 1500.0,
+      amplitude: 0.7 * amp,
+      gap_s: 0.1,
+    }),
   ];
+  for (const factory of families) {
+    const ex = expandLevels(factory);
+    probes.push(...ex.probes);
+    levels.push(...ex.levels);
+  }
+  return { probes, levels };
 }
 
 function setSounderStatus(id, text, level) {
@@ -4611,71 +4678,186 @@ function fmtNumOrDash(v, digits) {
   return n.toFixed(digits ?? 2);
 }
 
+// Build the standard SoundingRequest the TX emit + RX regenerate
+// paths share. Deterministic at the JS level: the same defaults yield
+// byte-identical schedule.json + probe audio on TX and RX machines.
+function buildStandardSoundingRequest() {
+  const { probes, levels } = defaultSounderProbes();
+  return {
+    channel_family: "fm",
+    probes,
+    probe_levels_db: levels,
+    wake_up_amplitude: 0.6,
+    sync_marker_amplitude: 0.7,
+    // 0.4 s per non-sweep probe instance keeps 56 segments × 0.4 ≈
+    // 22 s of probe airtime in the new ramp-first schedule. The
+    // level sweep (probe #1) has its own duration_s_per_level (0.6).
+    default_probe_duration_s: 0.4,
+    // 0.1 s inter-probe gap reduces total gap airtime to ~5.6 s
+    // across the 56 segments — enough for AGC settle between probes
+    // but avoiding the 16 s we'd get with the legacy 0.3 s default.
+    inter_probe_gap_s: 0.1,
+    metadata: {
+      tx_callsign: "",
+      rx_callsign: "",
+      equipment: "",
+      notes: "",
+      // Deterministic timestamp (0) so the schedule stays
+      // byte-identical between machines that run the sounder at
+      // different wall-clock times; metadata.ts_unix is only used
+      // to label the signature on the RX side anyway.
+      ts_unix: 0,
+    },
+  };
+}
+
+// TX-side: one-shot button that builds the standard probe sequence
+// and plays it directly through the soundcard output device the
+// operator already selected at the top of the TX panel. No files
+// written, no fields to fill — the user just clicks once and waits.
+async function runSounderTxEmit() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  // The TX device dropdown is the same one used by the main modem TX
+  // (top of the TX panel). Re-use whatever the operator picked.
+  const txDevice = (document.getElementById("tx-device")?.value || "").trim();
+  if (!txDevice) {
+    setSounderStatus(
+      "sounder-tx-status",
+      "Choisir un device de sortie audio (en haut)",
+      "err",
+    );
+    return;
+  }
+  const btn = document.getElementById("sounder-tx-emit");
+  const oldText = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Émission en cours…";
+  }
+  setSounderStatus("sounder-tx-status", "préparation…");
+  try {
+    const request = buildStandardSoundingRequest();
+    const res = await invoke("sounding_tx_emit", {
+      args: { request, tx_device: txDevice },
+    });
+    // Update the duration estimate next to the helper text.
+    const est = document.getElementById("sounder-tx-duration-est");
+    if (est) est.textContent = res.duration_s.toFixed(0);
+    setSounderStatus(
+      "sounder-tx-status",
+      `émission ${res.duration_s.toFixed(0)} s…`,
+    );
+    // Re-enable the button after the airtime + a small safety margin.
+    const reenableMs = Math.ceil(res.duration_s * 1000) + 500;
+    setTimeout(() => {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+      }
+      setSounderStatus("sounder-tx-status", `terminé ${now()}`, "ok");
+    }, reenableMs);
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+    }
+    setSounderStatus("sounder-tx-status", `erreur : ${err}`, "err");
+  }
+}
+
+// RX-side helper: regenerate the reference probe.wav + schedule.json
+// locally with the standard parameters, then auto-fill the analyse
+// pane's schedule path. The generator is deterministic, so the bytes
+// match whatever the TX side emitted with the same JS — no file
+// transfer between machines required.
 async function runSounderTxRender() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke } = window.__TAURI__.core;
-  const family = (document.getElementById("sounder-tx-family")?.value || "fm");
-  const txCall = (document.getElementById("sounder-tx-call")?.value || "").trim();
-  const rxCall = (document.getElementById("sounder-rx-call")?.value || "").trim();
-  const equipment = (document.getElementById("sounder-equipment")?.value || "").trim();
-  const notes = (document.getElementById("sounder-notes")?.value || "").trim();
-  const request = {
-    channel_family: family,
-    probes: defaultSounderProbes(),
-    wake_up_amplitude: 0.6,
-    sync_marker_amplitude: 0.7,
-    default_probe_duration_s: 1.0,
-    inter_probe_gap_s: 0.3,
-    metadata: {
-      tx_callsign: txCall,
-      rx_callsign: rxCall,
-      equipment,
-      notes,
-      ts_unix: Math.floor(Date.now() / 1000),
-    },
-  };
-  setSounderStatus("sounder-tx-status", "génération…");
+  setSounderStatus("sounder-an-status", "génération…");
   try {
+    const request = buildStandardSoundingRequest();
     const res = await invoke("sounding_tx_render", { request });
-    document.getElementById("sounder-probe-wav-path").textContent = res.probe_wav;
-    document.getElementById("sounder-schedule-path").textContent = res.schedule_json;
-    document.getElementById("sounder-duration").textContent = res.duration_s.toFixed(2);
-    const paths = document.getElementById("sounder-tx-paths");
-    if (paths) paths.hidden = false;
-    // Pre-fill the analyse-side schedule path so a same-machine loopback
-    // run is one click away.
     const sched = document.getElementById("sounder-an-schedule");
-    if (sched && !sched.value) sched.value = res.schedule_json;
-    setSounderStatus("sounder-tx-status", `prêt ${now()}`, "ok");
+    if (sched) sched.value = res.schedule_json;
+    setSounderStatus(
+      "sounder-an-status",
+      `référence régénérée (${res.duration_s.toFixed(0)} s)`,
+      "ok",
+    );
   } catch (err) {
-    setSounderStatus("sounder-tx-status", `erreur : ${err}`, "err");
+    setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
   }
+}
+
+// Stitch the RX chain-metadata form fields into a free-text equipment
+// + notes string so the analyser side can persist them in the
+// signature JSON. The Rust `SoundingMetadata` keeps a flat shape
+// (text fields only) for backwards compatibility with the legacy
+// schedule.
+function buildRxChainMetadata() {
+  const txModel = (
+    document.getElementById("sounder-rx-tx-model")?.value || ""
+  ).trim();
+  const rxModel = (
+    document.getElementById("sounder-rx-rx-model")?.value || ""
+  ).trim();
+  const relay = (
+    document.getElementById("sounder-rx-relay")?.value || "none"
+  ).trim();
+  const mode = (
+    document.getElementById("sounder-rx-mode")?.value || "fm_5khz"
+  ).trim();
+  // Compact human-readable equipment string.
+  const eqParts = [];
+  if (txModel) eqParts.push(`TX=${txModel}`);
+  if (rxModel) eqParts.push(`RX=${rxModel}`);
+  const equipment = eqParts.join(" / ");
+  const notes = `relay=${relay} mode=${mode}`;
+  return { equipment, notes };
 }
 
 async function runSounderAnalyze() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke } = window.__TAURI__.core;
-  const capture = (document.getElementById("sounder-an-capture")?.value || "").trim();
-  const schedule = (document.getElementById("sounder-an-schedule")?.value || "").trim();
-  if (!capture || !schedule) {
-    setSounderStatus("sounder-an-status", "renseigner capture + schedule", "err");
+  const capture = (
+    document.getElementById("sounder-an-capture")?.value || ""
+  ).trim();
+  let schedule = (
+    document.getElementById("sounder-an-schedule")?.value || ""
+  ).trim();
+  if (!capture) {
+    setSounderStatus("sounder-an-status", "aucune capture (cliquez Démarrer)", "err");
     return;
   }
-  const family = document.getElementById("sounder-tx-family")?.value || "fm";
-  const threshold = Number(document.getElementById("sounder-an-threshold")?.value) || 6;
-  const txCall = (document.getElementById("sounder-tx-call")?.value || "").trim();
-  const rxCall = (document.getElementById("sounder-rx-call")?.value || "").trim();
-  const equipment = (document.getElementById("sounder-equipment")?.value || "").trim();
-  const notes = (document.getElementById("sounder-notes")?.value || "").trim();
+  // Auto-regenerate the reference schedule if the user didn't already
+  // produce one. The generator is deterministic so re-running on the
+  // RX side gives bit-identical bytes to whatever the TX side built.
+  if (!schedule) {
+    setSounderStatus("sounder-an-status", "génération de la référence…");
+    try {
+      const request = buildStandardSoundingRequest();
+      const ref = await invoke("sounding_tx_render", { request });
+      schedule = ref.schedule_json;
+      const sched = document.getElementById("sounder-an-schedule");
+      if (sched) sched.value = schedule;
+    } catch (err) {
+      setSounderStatus("sounder-an-status", `erreur ref: ${err}`, "err");
+      return;
+    }
+  }
+  const threshold =
+    Number(document.getElementById("sounder-an-threshold")?.value) || 6;
+  const { equipment, notes } = buildRxChainMetadata();
   setSounderStatus("sounder-an-status", "analyse en cours…");
   try {
     const sig = await invoke("sounding_analyze", {
       captureWav: capture,
       scheduleJson: schedule,
-      family,
+      family: "fm",
       metadata: {
-        tx_callsign: txCall,
-        rx_callsign: rxCall,
+        tx_callsign: "",
+        rx_callsign: "",
         equipment,
         notes,
         ts_unix: Math.floor(Date.now() / 1000),
@@ -4686,19 +4868,50 @@ async function runSounderAnalyze() {
     document.getElementById("sd-snr").textContent = fmtNumOrDash(d.snr_est_db, 2);
     document.getElementById("sd-ip3").textContent = fmtNumOrDash(d.ip3_dbfs, 2);
     document.getElementById("sd-p1db").textContent = fmtNumOrDash(d.p1db_dbfs, 2);
-    document.getElementById("sd-sweet").textContent = fmtNumOrDash(d.sweet_spot_dbfs, 2);
+    document.getElementById("sd-sweet").textContent =
+      fmtNumOrDash(d.sweet_spot_dbfs, 2);
     if (d.bw_3db_hz && d.bw_3db_hz[1] > 0) {
-      document.getElementById("sd-bw").textContent =
-        `${Math.round(d.bw_3db_hz[0])}–${Math.round(d.bw_3db_hz[1])}`;
+      document.getElementById("sd-bw").textContent = `${Math.round(
+        d.bw_3db_hz[0],
+      )}–${Math.round(d.bw_3db_hz[1])}`;
     } else {
       document.getElementById("sd-bw").textContent = "—";
     }
-    document.getElementById("sd-gd").textContent = fmtNumOrDash(d.group_delay_peak_us, 0);
-    document.getElementById("sd-noise").textContent = fmtNumOrDash(d.noise_floor_dbfs, 2);
+    document.getElementById("sd-gd").textContent = fmtNumOrDash(
+      d.group_delay_peak_us,
+      0,
+    );
+    document.getElementById("sd-noise").textContent = fmtNumOrDash(
+      d.noise_floor_dbfs,
+      2,
+    );
+    document.getElementById("sd-d50").textContent = fmtNumOrDash(
+      d.delay_spread_50_us,
+      0,
+    );
+    document.getElementById("sd-d90").textContent = fmtNumOrDash(
+      d.delay_spread_90_us,
+      0,
+    );
+    document.getElementById("sd-echo").textContent = fmtNumOrDash(
+      d.strongest_echo_dbc,
+      1,
+    );
     document.getElementById("sd-anchor").textContent =
-      sig.capture_anchor_sample != null ? String(sig.capture_anchor_sample) : "—";
+      sig.capture_anchor_sample != null
+        ? String(sig.capture_anchor_sample)
+        : "—";
     document.getElementById("sounder-an-signature-path").textContent =
       `signature.json écrite à côté du WAV (${sig.measurements?.length ?? 0} mesures)`;
+    // Verdict from the over-modulation analyser.
+    const vEl = document.getElementById("sd-verdict");
+    if (vEl) {
+      const v = sig.verdict || {};
+      vEl.textContent = v.message || "—";
+      vEl.classList.remove("ok", "warn");
+      if ((v.message || "").includes("OK")) vEl.classList.add("ok");
+      else if ((v.message || "").includes("⚠️")) vEl.classList.add("warn");
+    }
     const res = document.getElementById("sounder-an-results");
     if (res) res.hidden = false;
     setSounderStatus("sounder-an-status", `OK ${now()}`, "ok");
@@ -4707,18 +4920,73 @@ async function runSounderAnalyze() {
   }
 }
 
+// Integrated capture + analyse toggle for the RX panel. First click =
+// start a raw soundcard recording (the RX pipeline must already be
+// running — same prerequisite as the legacy "⏺ capture brute"
+// button); second click = stop the recording, then immediately fire
+// the analyser. The WAV path is auto-stitched into the analyse
+// input.
+let sounderRxRecording = false;
+async function runSounderRxCaptureToggle() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const btn = document.getElementById("sounder-rx-capture-toggle");
+  const analyseBtn = document.getElementById("sounder-an-run");
+  if (!sounderRxRecording) {
+    try {
+      const path = await invoke("start_raw_recording");
+      sounderRxRecording = true;
+      const captureInput = document.getElementById("sounder-an-capture");
+      if (captureInput) captureInput.value = path;
+      if (btn) {
+        btn.textContent = "⏹ Arrêter & analyser";
+        btn.classList.add("recording");
+      }
+      if (analyseBtn) analyseBtn.disabled = true;
+      setSounderStatus(
+        "sounder-an-status",
+        "capture en cours — émettez côté TX, puis cliquez pour arrêter",
+      );
+    } catch (err) {
+      setSounderStatus("sounder-an-status", `erreur capture : ${err}`, "err");
+    }
+  } else {
+    try {
+      const info = await invoke("stop_raw_recording");
+      sounderRxRecording = false;
+      const captureInput = document.getElementById("sounder-an-capture");
+      if (captureInput) captureInput.value = info.path;
+      if (btn) {
+        btn.textContent = "⏺ Démarrer la capture";
+        btn.classList.remove("recording");
+      }
+      if (analyseBtn) analyseBtn.disabled = false;
+      setSounderStatus(
+        "sounder-an-status",
+        `capture ${info.duration_sec.toFixed(0)} s — analyse…`,
+      );
+      // Auto-fire the analyser. The function regenerates the
+      // reference schedule itself if the field is empty.
+      await runSounderAnalyze();
+    } catch (err) {
+      setSounderStatus("sounder-an-status", `erreur stop : ${err}`, "err");
+    }
+  }
+}
+
 function setupSounderTab() {
   document
-    .getElementById("sounder-tx-render")
-    ?.addEventListener("click", runSounderTxRender);
+    .getElementById("sounder-tx-emit")
+    ?.addEventListener("click", runSounderTxEmit);
+  document
+    .getElementById("sounder-rx-capture-toggle")
+    ?.addEventListener("click", runSounderRxCaptureToggle);
   document
     .getElementById("sounder-an-run")
     ?.addEventListener("click", runSounderAnalyze);
-  // RX-standalone path: same render command, the schedule.json bytes
-  // are identical to whatever TX would have produced with the same
-  // (defaultSounderProbes + family) inputs. runSounderTxRender already
-  // auto-fills #sounder-an-schedule with the freshly written path so
-  // the operator can hit "Analyser" right after their capture.
+  // Advanced: regenerate the reference schedule manually (the
+  // analyse-side does it automatically when the field is blank, but
+  // power users may want to ferry the file or inspect it).
   document
     .getElementById("sounder-an-regen-ref")
     ?.addEventListener("click", runSounderTxRender);

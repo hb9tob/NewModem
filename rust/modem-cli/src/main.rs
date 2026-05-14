@@ -864,6 +864,28 @@ fn run_sounding_analyze(
             sig.derived.noise_floor_dbfs
         );
     }
+    if sig.derived.delay_spread_50_us.is_finite() {
+        println!(
+            "    delay spread 50% : {:.0} µs",
+            sig.derived.delay_spread_50_us
+        );
+    }
+    if sig.derived.delay_spread_90_us.is_finite() {
+        println!(
+            "    delay spread 90% : {:.0} µs",
+            sig.derived.delay_spread_90_us
+        );
+    }
+    if sig.derived.strongest_echo_dbc.is_finite() {
+        println!(
+            "    strongest echo   : {:.1} dBc",
+            sig.derived.strongest_echo_dbc
+        );
+    }
+    if !sig.verdict.message.is_empty() {
+        println!("  verdict:");
+        println!("    {}", sig.verdict.message);
+    }
 }
 
 fn parse_explicit_session_id(s: &str) -> u32 {

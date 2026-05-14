@@ -1392,6 +1392,81 @@ fn sounding_tx_render(
     })
 }
 
+#[derive(serde::Deserialize)]
+struct SoundingTxEmitArgs {
+    request: modem_worker_base::sounder::SoundingRequest,
+    tx_device: String,
+}
+
+#[derive(serde::Serialize)]
+struct SoundingTxEmitResult {
+    /// Total airtime of the probe sequence in seconds — the front-end
+    /// uses this to enable a countdown / disable the button.
+    duration_s: f64,
+}
+
+/// Emit a probe sequence directly through `tx_device` — no probe.wav
+/// on disk, no schedule.json shown to the user. The RX side will
+/// regenerate the same schedule locally (deterministic generation,
+/// proven by the md5-matches-across-runs property of
+/// `build_probe_schedule`).
+///
+/// The operator's radio is expected to be VOX-keyed (or the operator
+/// holds PTT manually); the 5 s @ 1750 Hz repeater-opening preamble
+/// at the start of the probe gives VOX plenty of time to engage.
+///
+/// Stashes the playback handle in `AppState::sounder_tx_handle` so
+/// the cpal stream stays alive until the audio finishes (Drop on the
+/// handle stops the stream — moving it into a thread that polls
+/// `is_done()` keeps it alive until the last sample is consumed).
+#[tauri::command]
+fn sounding_tx_emit(
+    args: SoundingTxEmitArgs,
+    state: State<'_, AppState>,
+) -> Result<SoundingTxEmitResult, String> {
+    use modem_worker_base::sounder::build_probe_schedule;
+    if args.tx_device.trim().is_empty() {
+        return Err("Choisir un device de sortie audio".into());
+    }
+    let (audio, _schedule) = build_probe_schedule(&args.request);
+    let duration_s =
+        audio.len() as f64 / modem_core_base::types::AUDIO_RATE as f64;
+
+    let cfg = settings::load();
+    let sink = resolve_tx_sink(&args.tx_device, &cfg)?;
+    let device = args.tx_device.clone();
+    // Run the playback on a dedicated thread — the PlaybackHandle wraps
+    // a cpal `Stream` whose underlying object is `Box<dyn Any>` (not
+    // marked Send), so we can't move it across threads after creation.
+    // Instead, we build it ON the worker thread; the Arc<dyn
+    // SampleSink> + the audio Vec are both Send.
+    std::thread::spawn(move || {
+        let handle = match sink.play_buffer(
+            &device,
+            modem_core_base::types::AUDIO_RATE,
+            audio,
+        ) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        // Hold the handle until playback completes (Drop stops the
+        // stream — premature Drop = audio cut short).
+        let mut consecutive_done = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if handle.is_done() {
+                consecutive_done += 1;
+                if consecutive_done >= 5 {
+                    break;
+                }
+            }
+        }
+        drop(handle);
+    });
+
+    Ok(SoundingTxEmitResult { duration_s })
+}
+
 /// Run the sounder analyser on a recorded capture WAV. Writes
 /// `signature.json` next to the capture and returns the signature so
 /// the GUI can render the derived parameters directly.
@@ -1700,6 +1775,7 @@ fn main() {
             list_rx_history,
             delete_history_item,
             sounding_tx_render,
+            sounding_tx_emit,
             sounding_analyze,
         ])
         .run(tauri::generate_context!())

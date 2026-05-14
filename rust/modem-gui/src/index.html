@@ -550,83 +550,112 @@
           </fieldset>
 
           <fieldset class="sounder-tx">
-            <legend>Sondeur — référence partagée (TX + RX)</legend>
+            <legend>Sondeur — émission TX</legend>
             <p class="tx-hint">
-              Génère <code>probe.wav</code> (chirp + multi-ton + deux-tons + sweep
-              de niveau + AWGN) et <code>schedule.json</code> sous le dossier de
-              sauvegarde. Le contenu est <strong>déterministe</strong> : à
-              paramètres identiques, TX et RX produisent le même
-              <code>schedule.json</code> bit-pour-bit. Côté TX on joue
-              <code>probe.wav</code> (« ▶ Lire WAV » de l'onglet RX ou lecteur
-              audio externe). Côté RX, on enregistre la bande (« ⏺ capture
-              brute »), puis on analyse en bas en pointant le
-              <code>schedule.json</code> reproduit localement.
+              Émet la séquence de sondage standard
+              (préambule 1750 Hz pour ouvrir un relais, sync chirp,
+              rampe d'amplitude, two-tone, chirp, multitone, AWGN, Golay).
+              Le device de sortie est celui sélectionné en haut de
+              l'onglet TX. La séquence dure environ
+              <span id="sounder-tx-duration-est">45</span> s.
+              Activez VOX ou maintenez PTT — le préambule 1750 Hz de 5 s
+              laisse aux relais et au VOX le temps de s'engager.
             </p>
-            <div class="sounder-row">
-              <label>Famille
-                <select id="sounder-tx-family">
-                  <option value="fm" selected>FM (NBFM amateur)</option>
-                  <option value="qo100">QO-100 (réservé)</option>
-                  <option value="ssb_hf">SSB HF (réservé)</option>
-                </select>
-              </label>
-              <label>Mon indicatif
-                <input type="text" id="sounder-tx-call" maxlength="12" placeholder="HB9TOB">
-              </label>
-              <label>Indicatif RX
-                <input type="text" id="sounder-rx-call" maxlength="12" placeholder="HB9XYZ">
-              </label>
-            </div>
-            <div class="sounder-row">
-              <label>Équipement
-                <input type="text" id="sounder-equipment" placeholder="FTX-1 + sound-card">
-              </label>
-              <label>Notes
-                <input type="text" id="sounder-notes" placeholder="Bande 2 m, simplex">
-              </label>
-            </div>
             <div class="sounder-row sounder-row-actions">
-              <button type="button" id="sounder-tx-render">Générer probe.wav + schedule.json</button>
+              <button type="button" id="sounder-tx-emit" class="sounder-emit-btn">▶ Émettre la séquence de sondage</button>
               <span class="sounder-status" id="sounder-tx-status">—</span>
-            </div>
-            <div class="sounder-paths" id="sounder-tx-paths" hidden>
-              <div><span class="tx-hint">probe.wav :</span> <code id="sounder-probe-wav-path"></code></div>
-              <div><span class="tx-hint">schedule.json :</span> <code id="sounder-schedule-path"></code></div>
-              <div><span class="tx-hint">Durée :</span> <span id="sounder-duration">—</span> s</div>
             </div>
           </fieldset>
 
           <fieldset class="sounder-rx">
-            <legend>Sondeur — analyser une capture</legend>
+            <legend>Sondeur — capture + analyse RX</legend>
             <p class="tx-hint">
-              Capturez la bande audio (onglet RX → « ⏺ capture brute ») puis
-              analysez. Le <code>schedule.json</code> est déterministe : si TX
-              ne vous l'a pas envoyé, cliquez « Générer la référence ici » —
-              tant que les deux opérateurs lancent le sondeur avec les mêmes
-              paramètres (famille + probes par défaut), les fichiers sont
-              identiques. L'analyseur écrit <code>capture.signature.json</code>
-              à côté du WAV.
+              Renseignez la chaîne (équipement TX, équipement RX, relais
+              éventuel, mode), cliquez <strong>Démarrer la capture</strong>,
+              demandez au TX d'émettre la séquence, puis cliquez
+              <strong>Arrêter &amp; analyser</strong>. La référence
+              <code>schedule.json</code> est régénérée localement
+              (déterministe) — pas de fichier à transférer.
             </p>
             <div class="sounder-row">
-              <label>Capture WAV
-                <input type="text" id="sounder-an-capture" placeholder="/chemin/vers/capture.wav">
+              <label>Équipement TX
+                <select id="sounder-rx-tx-model">
+                  <option value="">—</option>
+                  <option value="FT-991A">Yaesu FT-991A</option>
+                  <option value="FT-857D">Yaesu FT-857D</option>
+                  <option value="FTM-300D">Yaesu FTM-300D</option>
+                  <option value="IC-7300">Icom IC-7300</option>
+                  <option value="IC-705">Icom IC-705</option>
+                  <option value="IC-9700">Icom IC-9700</option>
+                  <option value="TS-590">Kenwood TS-590</option>
+                  <option value="Adalm-Pluto">ADALM-Pluto SDR</option>
+                  <option value="Sound-card only">Carte son uniquement</option>
+                </select>
+              </label>
+              <label>Équipement RX
+                <select id="sounder-rx-rx-model">
+                  <option value="">—</option>
+                  <option value="FTX-1">Yaesu FTX-1</option>
+                  <option value="FT-991A">Yaesu FT-991A</option>
+                  <option value="IC-705">Icom IC-705</option>
+                  <option value="IC-7300">Icom IC-7300</option>
+                  <option value="SDRplay RSP1">SDRplay RSP1</option>
+                  <option value="SDRplay RSPdx">SDRplay RSPdx</option>
+                  <option value="Adalm-Pluto">ADALM-Pluto SDR</option>
+                  <option value="RTL-SDR">RTL-SDR</option>
+                  <option value="Sound-card only">Carte son uniquement</option>
+                </select>
               </label>
             </div>
             <div class="sounder-row">
-              <label>Schedule JSON
-                <input type="text" id="sounder-an-schedule" placeholder="/chemin/vers/schedule.json">
+              <label>Relais
+                <select id="sounder-rx-relay">
+                  <option value="none">Aucun (simplex)</option>
+                  <option value="1750hz">1750 Hz (IARU R1)</option>
+                  <option value="ctcss">CTCSS / sub-audible</option>
+                  <option value="dtmf">DTMF</option>
+                  <option value="dmr">DMR / numérique</option>
+                </select>
               </label>
-              <button type="button" id="sounder-an-regen-ref" title="Régénère la référence localement (probe.wav + schedule.json) avec les paramètres actuels et auto-remplit ce chemin">Générer la référence ici</button>
+              <label>Mode
+                <select id="sounder-rx-mode">
+                  <option value="fm_5khz" selected>NBFM 5 kHz (standard amateur)</option>
+                  <option value="fm_2k5">NBFM 2.5 kHz (étroit)</option>
+                  <option value="fm_wide">FM large (broadcast)</option>
+                  <option value="usb">SSB USB</option>
+                  <option value="lsb">SSB LSB</option>
+                  <option value="am">AM</option>
+                </select>
+              </label>
             </div>
-            <div class="sounder-row">
-              <label>Seuil sync
-                <input type="number" id="sounder-an-threshold" min="2" max="20" step="0.5" value="6">
-              </label>
-              <button type="button" id="sounder-an-run">Analyser</button>
+            <div class="sounder-row sounder-row-actions">
+              <button type="button" id="sounder-rx-capture-toggle">⏺ Démarrer la capture</button>
+              <button type="button" id="sounder-an-run" disabled>Analyser la capture</button>
               <span class="sounder-status" id="sounder-an-status">—</span>
             </div>
+            <details class="sounder-advanced">
+              <summary>Options avancées</summary>
+              <div class="sounder-row">
+                <label>Capture WAV
+                  <input type="text" id="sounder-an-capture" placeholder="rempli automatiquement après capture">
+                </label>
+              </div>
+              <div class="sounder-row">
+                <label>Schedule JSON
+                  <input type="text" id="sounder-an-schedule" placeholder="rempli automatiquement par 'Générer la référence ici'">
+                </label>
+                <button type="button" id="sounder-an-regen-ref" title="Régénère la référence localement (probe.wav + schedule.json) avec les paramètres standard">Générer la référence ici</button>
+              </div>
+              <div class="sounder-row">
+                <label>Seuil sync
+                  <input type="number" id="sounder-an-threshold" min="2" max="20" step="0.5" value="6">
+                </label>
+              </div>
+            </details>
             <div class="sounder-results" id="sounder-an-results" hidden>
-              <h4>Paramètres dérivés</h4>
+              <h4>Verdict</h4>
+              <div class="sounder-verdict" id="sd-verdict">—</div>
+              <h4>Paramètres dérivés (au sweet-spot)</h4>
               <table class="sounder-derived">
                 <tbody>
                   <tr><th>SNR moyen</th><td><span id="sd-snr">—</span> dB</td></tr>
@@ -636,6 +665,9 @@
                   <tr><th>BW −3 dB</th><td><span id="sd-bw">—</span> Hz</td></tr>
                   <tr><th>Group delay (pic)</th><td><span id="sd-gd">—</span> µs</td></tr>
                   <tr><th>Plancher de bruit</th><td><span id="sd-noise">—</span> dBFS</td></tr>
+                  <tr><th>Delay spread 50 %</th><td><span id="sd-d50">—</span> µs</td></tr>
+                  <tr><th>Delay spread 90 %</th><td><span id="sd-d90">—</span> µs</td></tr>
+                  <tr><th>Plus fort écho</th><td><span id="sd-echo">—</span> dBc</td></tr>
                   <tr><th>Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
                 </tbody>
               </table>

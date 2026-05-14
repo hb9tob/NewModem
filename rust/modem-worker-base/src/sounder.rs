@@ -7,11 +7,11 @@
 //! band noise on the capture and no common clock:
 //!
 //! 1. **TX side** generates a probe sequence that starts with a
-//!    [`crate::wake_up_tone`]-equivalent — 1.5 s @ 1500 Hz to engage
-//!    the TX rig's VOX, the repeater's squelch, and the RX rig's
-//!    squelch — followed by a [`crate::sync_marker`] chirp for
-//!    sample-accurate alignment. Then the actual probes interleaved
-//!    with silent gaps.
+//!    [`crate::wake_up_tone`]-equivalent — 5 s @ 1750 Hz (the IARU R1
+//!    repeater-opening standard) to engage the TX rig's VOX, fire the
+//!    repeater open, and settle the RX rig's squelch — followed by a
+//!    [`crate::sync_marker`] chirp for sample-accurate alignment.
+//!    Then the actual probes interleaved with silent gaps.
 //!
 //! 2. **TX side** writes `probe.wav` (what's played) and
 //!    `schedule.json` (the sample offsets and probe parameters the
@@ -35,13 +35,14 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use modem_core_base::probe::{
-    awgn, chirp_linear, multitone, silence, sync_marker, tone, two_tone,
-    wake_up_tone, LevelStamp,
+    awgn, chirp_linear, golay_pair_audio, multitone, silence, sync_marker, tone,
+    two_tone, wake_up_tone, LevelStamp,
 };
 use modem_core_base::probe_analyze::{
-    find_sync_marker, measure_chirp, measure_level_sweep, measure_multitone,
-    measure_tone, measure_two_tone, ChirpMeasure, LevelSweepMeasure,
-    MultiToneMeasure, ToneMeasure, TwoToneMeasure,
+    find_sync_marker, measure_chirp, measure_golay, measure_level_sweep,
+    measure_multitone, measure_tone, measure_two_tone, ChirpMeasure,
+    GolayMeasure, LevelSweepMeasure, MultiToneMeasure, ToneMeasure,
+    TwoToneMeasure,
 };
 use modem_core_base::types::AUDIO_RATE;
 
@@ -88,6 +89,18 @@ pub enum ProbeSpec {
         duration_s_per_level: f64,
         gap_s: f64,
     },
+    /// Golay complementary-pair channel-impulse-response sounder.
+    /// BPSK-modulated, sequences A then B with `gap_s` of silence
+    /// between them and another `gap_s` of trailing silence — the
+    /// analyser uses both silent intervals as the IR observation
+    /// window. Pick `gap_s` ≥ expected channel delay spread.
+    GolayPair {
+        length_bits: usize,
+        chip_rate_hz: f64,
+        carrier_hz: f64,
+        amplitude: f32,
+        gap_s: f64,
+    },
 }
 
 /// Sounding-schedule envelope as it travels across machines.
@@ -125,6 +138,13 @@ pub struct ProbeSegment {
     /// `None` for non-sweep probes.
     #[serde(default)]
     pub level_stamps: Option<Vec<LevelStamp>>,
+    /// Intended TX level for this probe instance, in dBFS. Set by the
+    /// orchestrator / JS when expanding a probe family across the
+    /// 11-level grid; `None` for legacy single-level schedules. The
+    /// analyser uses this to group measurements by level and pick the
+    /// sweet-spot one for the `derived` headline numbers.
+    #[serde(default)]
+    pub level_db: Option<f32>,
 }
 
 // --- Build side (TX) ----------------------------------------------------
@@ -139,9 +159,18 @@ pub const INTER_PROBE_GAP_S: f64 = 0.3;
 pub struct SoundingRequest {
     pub channel_family: ChannelFamily,
     pub probes: Vec<ProbeSpec>,
-    /// Amplitude of the wake-up tone (1.5 s @ 1500 Hz). 0.6 is the
-    /// safe default — comfortably under the soundcard ceiling, loud
-    /// enough to defeat noise-blanker squelches.
+    /// Optional parallel array (same length as `probes`) recording the
+    /// intended TX dBFS for each entry. Set when expanding a probe
+    /// family across the 11-level grid so the analyser can group by
+    /// level. `None` slots (or a fully-empty vec) mean "single-level
+    /// probe" — the legacy behaviour.
+    #[serde(default)]
+    pub probe_levels_db: Vec<Option<f32>>,
+    /// Amplitude of the wake-up / repeater-opening tone (5 s @ 1750 Hz).
+    /// 0.6 is the safe default — comfortably under the soundcard
+    /// ceiling, loud enough to defeat noise-blanker squelches and
+    /// trigger repeater open-tone detectors that require ~5-10 % FM
+    /// deviation.
     pub wake_up_amplitude: f32,
     /// Amplitude of the sync chirp. 0.7 is the recommended default —
     /// the chirp has lower crest factor than a single tone so we can
@@ -245,15 +274,37 @@ pub fn build_probe_schedule(req: &SoundingRequest) -> (Vec<f32>, ProbeSchedule) 
                 audio.extend(&seg_audio);
                 level_stamps = Some(seg_stamps);
             }
+            ProbeSpec::GolayPair {
+                length_bits,
+                chip_rate_hz,
+                carrier_hz,
+                amplitude,
+                gap_s,
+            } => {
+                let (seg_audio, _spc) = golay_pair_audio(
+                    *length_bits,
+                    *chip_rate_hz,
+                    *carrier_hz,
+                    *amplitude,
+                    *gap_s,
+                );
+                audio.extend(&seg_audio);
+            }
         }
         let end = audio.len();
         audio.extend(&gap);
+        let level_db = req
+            .probe_levels_db
+            .get(idx)
+            .copied()
+            .flatten();
         probes_out.push(ProbeSegment {
             idx,
             spec: spec.clone(),
             start_sample: start,
             end_sample: end,
             level_stamps,
+            level_db,
         });
     }
 
@@ -286,6 +337,14 @@ pub enum ProbeMeasurement {
         inner_tone_freq_hz: f64,
         result: LevelSweepMeasure,
     },
+    GolayPair {
+        idx: usize,
+        length_bits: usize,
+        chip_rate_hz: f64,
+        carrier_hz: f64,
+        gap_s: f64,
+        result: GolayMeasure,
+    },
 }
 
 /// Derived channel parameters — directly consumable by
@@ -314,11 +373,54 @@ pub struct DerivedChannelParams {
     pub group_delay_peak_us: f32,
     /// Multitone noise-floor estimate (dBFS), NaN if no multitone.
     pub noise_floor_dbfs: f32,
+    /// 50 % cumulative-power delay spread (µs) from the Golay
+    /// impulse-response probe, NaN if no Golay probe in the schedule.
+    /// A bigger number means more group-delay smear / multipath.
+    #[serde(default = "f32_nan")]
+    pub delay_spread_50_us: f32,
+    /// 90 % cumulative-power delay spread (µs), same definition.
+    #[serde(default = "f32_nan")]
+    pub delay_spread_90_us: f32,
+    /// Strongest echo in dBc relative to the main impulse, NaN if no
+    /// Golay probe. Useful to detect repeater-relay echoes,
+    /// ground-bounce multipath, or filter ringing.
+    #[serde(default = "f32_nan")]
+    pub strongest_echo_dbc: f32,
     // Phase-2 reserved
     #[serde(default)]
     pub lorentzian_corner_hz: Option<f32>,
     #[serde(default)]
     pub fading_doppler_spread_hz: Option<f32>,
+}
+
+fn f32_nan() -> f32 {
+    f32::NAN
+}
+
+/// Verdict on whether the operator's TX level matches the sweet spot,
+/// and how badly the link metrics degrade at the highest tested level.
+/// Populated when the schedule contains a level sweep **plus** at
+/// least one multi-level non-sweep probe (the standard ramp-first
+/// schedule does both); otherwise all fields are NaN / empty.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OverModulationVerdict {
+    /// Sweet-spot level identified from the AM-AM curve (dBFS).
+    pub sweet_spot_dbfs: f32,
+    /// Highest level tested in the schedule (dBFS, typically 0).
+    pub max_tested_dbfs: f32,
+    /// Over-modulation margin = `max_tested - sweet_spot` (dB). A
+    /// positive number means the schedule tested above sweet-spot; if
+    /// the operator's modem TX is at `max_tested_dbfs` they are
+    /// over-modulating by this many dB.
+    pub over_modulation_db: f32,
+    /// IMD3 at sweet spot (dBc); the realistic figure of merit for
+    /// the chain once gain is correctly set.
+    pub imd3_at_sweet_dbc: f32,
+    /// IMD3 at the highest level (dBc); shows how bad it gets when
+    /// driven into compression.
+    pub imd3_at_max_dbc: f32,
+    /// Human-readable summary: "OK / surmodulé de X dB → IMD3 …".
+    pub message: String,
 }
 
 /// Full channel signature emitted by [`analyze_capture`].
@@ -332,6 +434,12 @@ pub struct ChannelSignature {
     pub capture_anchor_sample: usize,
     pub measurements: Vec<ProbeMeasurement>,
     pub derived: DerivedChannelParams,
+    /// Over-modulation verdict — populated when the schedule has both
+    /// a level sweep and at least one multi-level non-sweep family.
+    /// Empty `Default::default()` when the legacy single-level
+    /// schedule is in use.
+    #[serde(default)]
+    pub verdict: OverModulationVerdict,
 }
 
 /// Errors returned by [`analyze_capture`].
@@ -364,17 +472,20 @@ pub fn analyze_capture(
     // coordinates (capture_audio[*]).
     let shift = anchor as i64 - schedule.sync_marker_start as i64;
 
-    // 2. Apply each probe's measurer at its known offset.
+    // 2. Apply each probe's measurer at its known offset. We collect
+    //    `(level_db, kind_tag, ProbeMeasurement)` side-by-side so
+    //    pass 3 can group multi-level families by intended TX level
+    //    and pick the sweet-spot measurement for the headline numbers.
     let sr = schedule.sample_rate;
     let mut measurements: Vec<ProbeMeasurement> =
         Vec::with_capacity(schedule.probes.len());
+    // Parallel array: `levels[i]` is the level_db (or NaN if unknown)
+    // associated with `measurements[i]`. We use NaN as a sentinel
+    // rather than Option to keep the second-pass picker terse.
+    let mut levels: Vec<f32> = Vec::with_capacity(schedule.probes.len());
     let mut snr_samples: Vec<f32> = Vec::new();
-    let mut ip3 = f32::NAN;
     let mut p1db = f32::NAN;
     let mut sweet = f32::NAN;
-    let mut bw_3db = (0.0_f32, 0.0_f32);
-    let mut gd_peak = 0.0_f32;
-    let mut noise_floor = f32::NAN;
 
     for seg in &schedule.probes {
         let cap_start = (seg.start_sample as i64 + shift).max(0) as usize;
@@ -396,6 +507,7 @@ pub fn analyze_capture(
         }
         let seg_audio = &capture_audio[inner_start..inner_end];
 
+        let lvl = seg.level_db.unwrap_or(f32::NAN);
         match &seg.spec {
             ProbeSpec::Tone { freq_hz, .. } => {
                 let r = measure_tone(seg_audio, sr, *freq_hz);
@@ -405,40 +517,36 @@ pub fn analyze_capture(
                     freq_hz: *freq_hz,
                     result: r,
                 });
+                levels.push(lvl);
             }
             ProbeSpec::TwoTone { f1_hz, f2_hz, .. } => {
                 let r = measure_two_tone(seg_audio, sr, *f1_hz, *f2_hz);
-                ip3 = r.ip3_dbfs;
                 measurements.push(ProbeMeasurement::TwoTone {
                     idx: seg.idx,
                     f1_hz: *f1_hz,
                     f2_hz: *f2_hz,
                     result: r,
                 });
+                levels.push(lvl);
             }
             ProbeSpec::ChirpLinear { f0_hz, f1_hz, .. } => {
                 let r = measure_chirp(seg_audio, sr, *f0_hz, *f1_hz);
-                bw_3db = r.bw_3db_hz;
-                gd_peak = r
-                    .group_delay_per_freq
-                    .iter()
-                    .map(|(_, v)| v.abs())
-                    .fold(0.0_f32, f32::max);
                 measurements.push(ProbeMeasurement::Chirp {
                     idx: seg.idx,
                     f0_hz: *f0_hz,
                     f1_hz: *f1_hz,
                     result: r,
                 });
+                levels.push(lvl);
             }
             ProbeSpec::Multitone { freqs_hz, .. } => {
                 let r = measure_multitone(seg_audio, sr, freqs_hz);
-                noise_floor = r.noise_floor_dbfs;
                 measurements.push(ProbeMeasurement::Multitone {
                     idx: seg.idx,
                     freqs_hz: freqs_hz.clone(),
                     result: r,
                 });
+                levels.push(lvl);
             }
             ProbeSpec::Awgn { .. } => {
                 // RMS of the segment — useful as a noise-floor sanity
@@ -455,6 +563,38 @@ pub fn analyze_capture(
                     idx: seg.idx,
                     rms_measured: var.sqrt(),
                 });
+                levels.push(lvl);
+            }
+            ProbeSpec::GolayPair {
+                length_bits,
+                chip_rate_hz,
+                carrier_hz,
+                gap_s,
+                ..
+            } => {
+                // Golay has no internal fade ramp (modulate_bpsk emits
+                // the chips at full amplitude immediately); pass the
+                // un-trimmed segment so we don't slice the BPSK head /
+                // tail and starve `measure_golay` of the IR-window
+                // samples it needs.
+                let raw = &capture_audio[cap_start..cap_end];
+                let r = measure_golay(
+                    raw,
+                    sr,
+                    *length_bits,
+                    *chip_rate_hz,
+                    *carrier_hz,
+                    *gap_s,
+                );
+                measurements.push(ProbeMeasurement::GolayPair {
+                    idx: seg.idx,
+                    length_bits: *length_bits,
+                    chip_rate_hz: *chip_rate_hz,
+                    carrier_hz: *carrier_hz,
+                    gap_s: *gap_s,
+                    result: r,
+                });
+                levels.push(lvl);
             }
             ProbeSpec::LevelSweep { inner_tone_freq_hz, .. } => {
                 // The schedule's level stamps are in TX-side
@@ -494,6 +634,7 @@ pub fn analyze_capture(
                     inner_tone_freq_hz: *inner_tone_freq_hz,
                     result: r,
                 });
+                levels.push(f32::NAN); // sweep stores its levels inside
             }
         }
     }
@@ -503,6 +644,108 @@ pub fn analyze_capture(
     } else {
         snr_samples.iter().sum::<f32>() / snr_samples.len() as f32
     };
+
+    // 3. Pick the sweet-spot instance of each multi-level family for
+    //    the headline `derived` numbers — when the schedule is
+    //    ramp-first (the new default), each non-sweep family was
+    //    emitted 11 times across -30..0 dBFS and the "real" link
+    //    quality is whichever instance landed closest to the
+    //    sweet-spot level. Falls back gracefully to first-seen when
+    //    no level annotation is available (legacy single-level
+    //    schedules).
+    let pick = |kind_match: &dyn Fn(&ProbeMeasurement) -> bool, target: f32| {
+        if !target.is_finite() {
+            return measurements.iter().position(kind_match);
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (i, m) in measurements.iter().enumerate() {
+            if !kind_match(m) {
+                continue;
+            }
+            let lv = levels[i];
+            let dist = if lv.is_finite() { (lv - target).abs() } else { 1e9 };
+            match best {
+                None => best = Some((i, dist)),
+                Some((_, d)) if dist < d => best = Some((i, dist)),
+                _ => {}
+            }
+        }
+        best.map(|(i, _)| i)
+    };
+    // Same as `pick` but selects the instance with the HIGHEST level
+    // — used to capture the "worst case" metric for the verdict
+    // (typically the 0 dBFS instance once over-modulation kicks in).
+    let pick_highest = |kind_match: &dyn Fn(&ProbeMeasurement) -> bool| {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, m) in measurements.iter().enumerate() {
+            if !kind_match(m) {
+                continue;
+            }
+            let lv = levels[i];
+            if !lv.is_finite() {
+                continue;
+            }
+            match best {
+                None => best = Some((i, lv)),
+                Some((_, l)) if lv > l => best = Some((i, lv)),
+                _ => {}
+            }
+        }
+        best.map(|(i, _)| i)
+    };
+
+    let is_two_tone = |m: &ProbeMeasurement| matches!(m, ProbeMeasurement::TwoTone { .. });
+    let is_chirp = |m: &ProbeMeasurement| matches!(m, ProbeMeasurement::Chirp { .. });
+    let is_multitone = |m: &ProbeMeasurement| matches!(m, ProbeMeasurement::Multitone { .. });
+    let is_golay = |m: &ProbeMeasurement| matches!(m, ProbeMeasurement::GolayPair { .. });
+
+    let mut ip3 = f32::NAN;
+    let mut imd3_sweet_dbc = f32::NAN;
+    if let Some(idx) = pick(&is_two_tone, sweet) {
+        if let ProbeMeasurement::TwoTone { result, .. } = &measurements[idx] {
+            ip3 = result.ip3_dbfs;
+            imd3_sweet_dbc = 0.5 * (result.imd3_low_dbc + result.imd3_high_dbc);
+        }
+    }
+    let mut bw_3db = (0.0_f32, 0.0_f32);
+    let mut gd_peak = 0.0_f32;
+    if let Some(idx) = pick(&is_chirp, sweet) {
+        if let ProbeMeasurement::Chirp { result, .. } = &measurements[idx] {
+            bw_3db = result.bw_3db_hz;
+            gd_peak = result
+                .group_delay_per_freq
+                .iter()
+                .map(|(_, v)| v.abs())
+                .fold(0.0_f32, f32::max);
+        }
+    }
+    let mut noise_floor = f32::NAN;
+    if let Some(idx) = pick(&is_multitone, sweet) {
+        if let ProbeMeasurement::Multitone { result, .. } = &measurements[idx] {
+            noise_floor = result.noise_floor_dbfs;
+        }
+    }
+    let mut delay_50 = f32::NAN;
+    let mut delay_90 = f32::NAN;
+    let mut echo_dbc = f32::NAN;
+    if let Some(idx) = pick(&is_golay, sweet) {
+        if let ProbeMeasurement::GolayPair { result, .. } = &measurements[idx] {
+            delay_50 = result.delay_spread_50_us;
+            delay_90 = result.delay_spread_90_us;
+            echo_dbc = result.strongest_echo_dbc;
+        }
+    }
+
+    // 4. Build the over-modulation verdict.
+    let verdict = build_verdict(
+        sweet,
+        &measurements,
+        &levels,
+        imd3_sweet_dbc,
+        &is_two_tone,
+        &pick_highest,
+    );
+
     Ok(ChannelSignature {
         schema_version: 1,
         channel_family,
@@ -517,10 +760,65 @@ pub fn analyze_capture(
             bw_3db_hz: bw_3db,
             group_delay_peak_us: gd_peak,
             noise_floor_dbfs: noise_floor,
+            delay_spread_50_us: delay_50,
+            delay_spread_90_us: delay_90,
+            strongest_echo_dbc: echo_dbc,
             lorentzian_corner_hz: None,
             fading_doppler_spread_hz: None,
         },
+        verdict,
     })
+}
+
+/// Assemble the over-modulation verdict from the per-level
+/// measurements. Compares the IMD3 at sweet-spot level vs the IMD3 at
+/// the highest level the schedule tested. If the schedule didn't run
+/// a multi-level two-tone (legacy or partial schedule), the verdict
+/// is `Default::default()` (all NaN, empty message).
+fn build_verdict(
+    sweet_spot_dbfs: f32,
+    measurements: &[ProbeMeasurement],
+    levels: &[f32],
+    imd3_at_sweet_dbc: f32,
+    is_two_tone: &dyn Fn(&ProbeMeasurement) -> bool,
+    pick_highest: &dyn Fn(&dyn Fn(&ProbeMeasurement) -> bool) -> Option<usize>,
+) -> OverModulationVerdict {
+    if !sweet_spot_dbfs.is_finite() || !imd3_at_sweet_dbc.is_finite() {
+        return OverModulationVerdict::default();
+    }
+    let max_idx = match pick_highest(is_two_tone) {
+        Some(i) => i,
+        None => return OverModulationVerdict::default(),
+    };
+    let max_level = levels[max_idx];
+    let imd3_at_max_dbc = match &measurements[max_idx] {
+        ProbeMeasurement::TwoTone { result, .. } => {
+            0.5 * (result.imd3_low_dbc + result.imd3_high_dbc)
+        }
+        _ => return OverModulationVerdict::default(),
+    };
+    let over_db = max_level - sweet_spot_dbfs;
+    let imd3_deg = imd3_at_max_dbc - imd3_at_sweet_dbc; // negative dBc difference = worse
+    let message = if over_db <= 2.0 {
+        format!(
+            "OK — sweet-spot à {sweet_spot_dbfs:.0} dBFS, niveau max testé {max_level:.0} dBFS."
+        )
+    } else {
+        format!(
+            "⚠️ Niveau max testé {:.0} dBFS = +{:.1} dB au-dessus du sweet-spot ({:.0} dBFS). \
+             IMD3 passe de {:.1} dBc (sweet) à {:.1} dBc (max) — dégradation {:+.1} dB.",
+            max_level, over_db, sweet_spot_dbfs,
+            imd3_at_sweet_dbc, imd3_at_max_dbc, imd3_deg,
+        )
+    };
+    OverModulationVerdict {
+        sweet_spot_dbfs,
+        max_tested_dbfs: max_level,
+        over_modulation_db: over_db,
+        imd3_at_sweet_dbc,
+        imd3_at_max_dbc,
+        message,
+    }
 }
 
 // --- File-IO helpers (loaded/saved by the GUI Tauri commands) -----------
@@ -588,6 +886,7 @@ mod tests {
             default_probe_duration_s: 0.6,
             inter_probe_gap_s: 0.2,
             metadata: synthetic_metadata(),
+            probe_levels_db: vec![],
         }
     }
 
@@ -603,10 +902,10 @@ mod tests {
             assert!(p.end_sample <= audio.len());
             last_end = p.end_sample;
         }
-        // The wake-up tone segment looks right.
+        // The wake-up tone segment looks right (5 s @ 1750 Hz).
         let wake_dur = (sched.wake_up_end - sched.wake_up_start) as f64
             / sched.sample_rate as f64;
-        assert!((wake_dur - 1.5).abs() < 0.01, "wake-up dur {wake_dur}");
+        assert!((wake_dur - 5.0).abs() < 0.01, "wake-up dur {wake_dur}");
         // The sync chirp segment is 0.5 s.
         let sync_dur = (sched.sync_marker_end - sched.sync_marker_start) as f64
             / sched.sample_rate as f64;
@@ -697,6 +996,7 @@ mod tests {
             default_probe_duration_s: 0.5,
             inter_probe_gap_s: 0.2,
             metadata: synthetic_metadata(),
+            probe_levels_db: vec![],
         };
         let (probe_audio, sched) = build_probe_schedule(&req);
         // Loopback through a synthetic compressor: any input above
@@ -745,6 +1045,148 @@ mod tests {
             "sweet {} vs p1db {}",
             sig.derived.sweet_spot_dbfs,
             sig.derived.p1db_dbfs,
+        );
+    }
+
+    #[test]
+    fn analyze_capture_recovers_golay_impulse_response() {
+        // Schedule with a GolayPair probe; build the audio; roundtrip it
+        // unchanged through a synthetic capture (clean channel). The
+        // recovered impulse response should peak strongly and the
+        // delay spread should be small.
+        let req = SoundingRequest {
+            channel_family: ChannelFamily::Fm,
+            probes: vec![ProbeSpec::GolayPair {
+                length_bits: 64,
+                chip_rate_hz: 1200.0,
+                carrier_hz: 1500.0,
+                amplitude: 0.5,
+                gap_s: 0.05,
+            }],
+            wake_up_amplitude: 0.5,
+            sync_marker_amplitude: 0.7,
+            default_probe_duration_s: 0.5,
+            inter_probe_gap_s: 0.3,
+            metadata: synthetic_metadata(),
+            probe_levels_db: vec![],
+        };
+        let (probe_audio, sched) = build_probe_schedule(&req);
+        let mut capture: Vec<f32> = Vec::new();
+        capture.extend(modem_core_base::probe::awgn(1.0, 0.005, 21));
+        capture.extend(&probe_audio);
+        capture.extend(modem_core_base::probe::awgn(0.5, 0.005, 23));
+        let sig = analyze_capture(
+            &capture,
+            &sched,
+            ChannelFamily::Fm,
+            req.metadata.clone(),
+            6.0,
+        )
+        .expect("analyze ok");
+        // Find the golay measurement.
+        let g = sig
+            .measurements
+            .iter()
+            .find_map(|m| match m {
+                ProbeMeasurement::GolayPair { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("golay measurement present");
+        assert!(
+            g.peak_amplitude > 0.05,
+            "peak {} too small — golay didn't lock",
+            g.peak_amplitude,
+        );
+        assert!(
+            g.delay_spread_50_us.is_finite() && g.delay_spread_50_us < 2000.0,
+            "delay50 {} too large for clean channel",
+            g.delay_spread_50_us,
+        );
+        // Derived fields propagated.
+        assert!(sig.derived.delay_spread_50_us.is_finite());
+        assert!(sig.derived.strongest_echo_dbc.is_finite());
+    }
+
+    #[test]
+    fn verdict_flags_over_modulation_from_multi_level_two_tone() {
+        // Build a schedule with a level sweep + two two-tone probes at
+        // -15 dBFS (sweet-spot region) and 0 dBFS (clipping region).
+        // Synthesise a capture where the 0 dBFS two-tone is heavily
+        // distorted (strong IMD3 product) and the -15 dBFS one is
+        // clean. The verdict should report over-modulation and a
+        // measurable IMD3 degradation.
+        let f1 = 1300.0_f64;
+        let f2 = 1700.0_f64;
+        let req = SoundingRequest {
+            channel_family: ChannelFamily::Fm,
+            probes: vec![
+                ProbeSpec::LevelSweep {
+                    inner_tone_freq_hz: 1500.0,
+                    levels_db: vec![-30.0, -24.0, -18.0, -12.0, -6.0, 0.0],
+                    duration_s_per_level: 0.3,
+                    gap_s: 0.15,
+                },
+                ProbeSpec::TwoTone { f1_hz: f1, f2_hz: f2, amp_each: 0.5 * 0.1778 }, // -15 dBFS
+                ProbeSpec::TwoTone { f1_hz: f1, f2_hz: f2, amp_each: 0.5 },        // 0 dBFS
+            ],
+            wake_up_amplitude: 0.5,
+            sync_marker_amplitude: 0.7,
+            default_probe_duration_s: 0.4,
+            inter_probe_gap_s: 0.15,
+            metadata: synthetic_metadata(),
+            probe_levels_db: vec![None, Some(-15.0), Some(0.0)],
+        };
+        let (probe_audio, sched) = build_probe_schedule(&req);
+        // Inject IMD3 only on the 0 dBFS two-tone segment.
+        let mut capture = probe_audio.clone();
+        let hi_seg = &sched.probes[2];
+        // Add a strong tone at 2·f1−f2 = 900 Hz inside the segment.
+        let bad_seg = hi_seg.end_sample - hi_seg.start_sample;
+        let imd_freq = 2.0 * f1 - f2;
+        for i in 0..bad_seg {
+            let t = i as f64 / AUDIO_RATE as f64;
+            let s = 0.15 * (2.0 * std::f64::consts::PI * imd_freq * t).sin() as f32;
+            capture[hi_seg.start_sample + i] += s;
+        }
+        let sig = analyze_capture(
+            &capture,
+            &sched,
+            ChannelFamily::Fm,
+            req.metadata.clone(),
+            6.0,
+        )
+        .expect("analyze ok");
+        // Verdict is populated.
+        assert!(
+            sig.verdict.sweet_spot_dbfs.is_finite(),
+            "sweet spot not detected",
+        );
+        assert!(
+            sig.verdict.max_tested_dbfs == 0.0,
+            "max level should be 0 dBFS, got {}",
+            sig.verdict.max_tested_dbfs,
+        );
+        // Over-modulation should be positive (max above sweet spot).
+        assert!(
+            sig.verdict.over_modulation_db > 0.0,
+            "over_modulation_db {} expected > 0",
+            sig.verdict.over_modulation_db,
+        );
+        // IMD3 at max should be much worse than at sweet (i.e.,
+        // imd3_at_max_dbc > imd3_at_sweet_dbc since the injected IMD3
+        // raises the dBc value).
+        assert!(
+            sig.verdict.imd3_at_max_dbc > sig.verdict.imd3_at_sweet_dbc + 5.0,
+            "IMD3 at max ({}) should be ≥ 5 dB worse than at sweet ({})",
+            sig.verdict.imd3_at_max_dbc,
+            sig.verdict.imd3_at_sweet_dbc,
+        );
+        // Message exists and warns.
+        assert!(
+            sig.verdict.message.contains("surmodulé")
+                || sig.verdict.message.contains("au-dessus"),
+            "message {} should warn about over-modulation",
+            sig.verdict.message,
         );
     }
 

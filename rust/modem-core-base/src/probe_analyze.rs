@@ -19,7 +19,7 @@ use std::sync::Arc;
 use num_complex::Complex64;
 use rustfft::{Fft, FftPlanner};
 
-use crate::probe::LevelStamp;
+use crate::probe::{golay_pair_audio, LevelStamp};
 
 // --- Output structs -------------------------------------------------------
 
@@ -77,6 +77,39 @@ pub struct MultiToneMeasure {
     /// midway between the tones.
     pub noise_floor_dbfs: f32,
 }
+
+/// Result of a Golay complementary-pair impulse-response measurement.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GolayMeasure {
+    /// Estimated baseband impulse response magnitude, |h(t)|, sampled
+    /// at `sample_rate`. Stored as the first
+    /// [`GOLAY_IR_RETAIN_SAMPLES`] samples *after* the main peak (the
+    /// pre-peak is discarded — it's just numerical correlation noise).
+    pub impulse_response: Vec<f32>,
+    /// Peak amplitude of the recovered |h(t)|. A larger value means a
+    /// stronger / less attenuated channel at the probe's carrier
+    /// frequency.
+    pub peak_amplitude: f32,
+    /// Time, in µs, from the main peak to the level where the
+    /// cumulative power of the impulse response reaches 50 %.
+    /// Small (≈ 1-2 ms) on a clean direct channel; large (10+ ms) when
+    /// there's significant filter group-delay smear or a discrete echo.
+    pub delay_spread_50_us: f32,
+    /// 90 % cumulative-power delay (same definition, deeper tail).
+    pub delay_spread_90_us: f32,
+    /// Strongest secondary peak in dBc relative to the main peak, NaN
+    /// if no secondary peak above noise floor. A −10 dBc echo at 5 ms
+    /// reveals a path-difference multipath of ~1 km on VHF.
+    pub strongest_echo_dbc: f32,
+    /// Delay of the strongest secondary peak in µs (NaN if none).
+    pub strongest_echo_us: f32,
+}
+
+/// How many samples of impulse response we keep after the main peak.
+/// At 48 kHz this is 100 ms — enough to capture filter group-delay
+/// tails and any ground-bounce / repeater-relay echoes typical of
+/// terrestrial VHF/UHF paths.
+pub const GOLAY_IR_RETAIN_SAMPLES: usize = 4800;
 
 /// Result of an amplitude / level sweep.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -434,11 +467,45 @@ pub fn measure_chirp(
     for (_, v) in gd.iter_mut() {
         *v -= median;
     }
-    // -3 dB BW: envelope = |z|, smooth, find edges where envelope <
-    // peak/√2.
-    let env: Vec<f64> = z.iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect();
-    let env_peak = env.iter().cloned().fold(0.0_f64, f64::max);
-    let thresh = env_peak / std::f64::consts::SQRT_2;
+    // -3 dB BW: envelope = |z|. The naive "peak / √2" reference is
+    // brittle on real radio chains because pre/de-emphasis slants the
+    // envelope monotonically across the band — the global peak ends
+    // up at one edge and everything else falls under -3 dB, producing
+    // a fake-narrow BW. Use the *median of the middle 80 %* of the
+    // smoothed envelope as the reference instead: it's the level at
+    // which the signal actually sits inside the passband, regardless
+    // of any monotonic slope from emphasis or AGC.
+    let env_raw: Vec<f64> = z.iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect();
+    // Smooth envelope with a 20 ms boxcar — kills tone-period
+    // ripple but keeps roll-off edges visible.
+    let env_w = ((sr as f64 * 0.020) as usize).max(1);
+    let mut env: Vec<f64> = Vec::with_capacity(n);
+    {
+        let mut running = 0.0_f64;
+        let mut window: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(env_w);
+        for &v in &env_raw {
+            if window.len() == env_w {
+                running -= window.pop_front().unwrap();
+            }
+            running += v;
+            window.push_back(v);
+            env.push(running / window.len() as f64);
+        }
+    }
+    let lo_mid = n / 10;
+    let hi_mid = n - n / 10;
+    let mut mid_env: Vec<f64> = env[lo_mid..hi_mid].to_vec();
+    mid_env.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let env_ref = if mid_env.is_empty() {
+        env.iter().cloned().fold(0.0_f64, f64::max)
+    } else {
+        mid_env[mid_env.len() / 2]
+    };
+    let thresh = env_ref / std::f64::consts::SQRT_2;
+    // From each end, advance inward until the envelope first crosses
+    // above the threshold — that's the -3 dB edge relative to the
+    // passband level.
     let mut low_edge_idx = 0usize;
     while low_edge_idx < n && env[low_edge_idx] < thresh {
         low_edge_idx += 1;
@@ -536,25 +603,31 @@ pub fn measure_level_sweep(
     });
     let am_am: Vec<(f32, f32)> =
         samples.iter().map(|t| (t.0, t.1)).collect();
-    // Reference phase = lowest-level segment (least distorted).
+    // Reference phase = lowest-level segment (least distorted). Walk
+    // up the levels and *accumulate* phase deltas, each delta wrapped
+    // into (-π, π]. This unwraps cleanly across the ±π boundary —
+    // without unwrap, a gradual AM-PM shift of e.g. −3 → −π → +π
+    // would jump to a fake +3 rad on the chart, hiding the real
+    // monotonic compression-induced phase drift.
     let ref_phase = samples
         .first()
         .map(|t| t.2)
         .unwrap_or(0.0);
-    let am_pm: Vec<(f32, f32)> = samples
-        .iter()
-        .map(|t| {
-            // Wrap difference into (-π, π]
-            let mut d = t.2 - ref_phase;
-            while d > std::f32::consts::PI {
-                d -= 2.0 * std::f32::consts::PI;
-            }
-            while d <= -std::f32::consts::PI {
-                d += 2.0 * std::f32::consts::PI;
-            }
-            (t.0, d)
-        })
-        .collect();
+    let mut am_pm: Vec<(f32, f32)> = Vec::with_capacity(samples.len());
+    let mut acc = 0.0_f32;
+    let mut prev = ref_phase;
+    for t in &samples {
+        let mut d = t.2 - prev;
+        while d > std::f32::consts::PI {
+            d -= 2.0 * std::f32::consts::PI;
+        }
+        while d <= -std::f32::consts::PI {
+            d += 2.0 * std::f32::consts::PI;
+        }
+        acc += d;
+        prev = t.2;
+        am_pm.push((t.0, acc));
+    }
     let snr: Vec<(f32, f32)> =
         samples.iter().map(|t| (t.0, t.3)).collect();
 
@@ -605,6 +678,193 @@ pub fn measure_level_sweep(
         p1db_dbfs: p1db,
         sweet_spot_dbfs: sweet,
         snr_db_per_level: snr,
+    }
+}
+
+// --- Golay impulse response ---------------------------------------------
+
+/// FFT-based cross-correlation: returns `corr[k] = Σ_n x[n+k]·y[n]`
+/// for k in `[0, x.len() - y.len()]`. Linear (zero-padded), not
+/// circular. The output length is `x.len() - y.len() + 1`.
+fn fft_xcorr(x: &[f32], y: &[f32]) -> Vec<f32> {
+    let n_x = x.len();
+    let n_y = y.len();
+    if n_y == 0 || n_x < n_y {
+        return Vec::new();
+    }
+    let fft_len = (n_x + n_y).next_power_of_two();
+    let mut planner = FftPlanner::<f64>::new();
+    let fwd: Arc<dyn Fft<f64>> = planner.plan_fft_forward(fft_len);
+    let inv: Arc<dyn Fft<f64>> = planner.plan_fft_inverse(fft_len);
+    let mut bx: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (i, &v) in x.iter().enumerate() {
+        bx[i] = Complex64::new(v as f64, 0.0);
+    }
+    fwd.process(&mut bx);
+    let mut by: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (i, &v) in y.iter().enumerate() {
+        by[i] = Complex64::new(v as f64, 0.0);
+    }
+    fwd.process(&mut by);
+    for b in by.iter_mut() {
+        *b = b.conj();
+    }
+    for i in 0..fft_len {
+        bx[i] *= by[i];
+    }
+    inv.process(&mut bx);
+    let scale = 1.0 / fft_len as f64;
+    let valid = n_x - n_y + 1;
+    bx[..valid].iter().map(|c| (c.re * scale) as f32).collect()
+}
+
+/// Run the Golay-pair channel-sounder measurer. `audio` must contain at
+/// least one full pair (A · gap · B) of BPSK-modulated chips, starting
+/// at the segment's first sample (no extra fade slop; the orchestrator
+/// strips the global fade on its side).
+///
+/// The reference sequences are rebuilt deterministically from
+/// `length_bits` / `chip_rate_hz` / `carrier_hz` (no shared state with
+/// the TX renderer beyond these parameters).
+///
+/// The returned [`GolayMeasure::impulse_response`] is centred on the
+/// strongest correlation peak; energies/delays are relative to that
+/// peak. If the analyser can't even find a peak (capture lost / too
+/// short), the struct's fields are NaN / empty.
+pub fn measure_golay(
+    audio: &[f32],
+    sr: u32,
+    length_bits: usize,
+    chip_rate_hz: f64,
+    carrier_hz: f64,
+    gap_s: f64,
+) -> GolayMeasure {
+    // Reconstruct the reference pair audio + segmentation offsets.
+    // Layout: [A seq_len] [gap gap_len] [B seq_len] [tail gap_len].
+    // We correlate each (sequence + tail-after-it) against the
+    // reference sequence alone, which yields up to `gap_len + 1`
+    // valid lags of impulse response — that's our IR window.
+    let (ref_audio, samples_per_chip) =
+        golay_pair_audio(length_bits, chip_rate_hz, carrier_hz, 1.0, gap_s);
+    let seq_len = length_bits * samples_per_chip;
+    let gap_len = (gap_s * sr as f64) as usize;
+    let need = 2 * seq_len + 2 * gap_len;
+    if audio.len() < need {
+        return GolayMeasure {
+            impulse_response: Vec::new(),
+            peak_amplitude: f32::NAN,
+            delay_spread_50_us: f32::NAN,
+            delay_spread_90_us: f32::NAN,
+            strongest_echo_dbc: f32::NAN,
+            strongest_echo_us: f32::NAN,
+        };
+    }
+    // rx_a covers A + the gap that follows (A's tail decays into the gap).
+    let rx_a = &audio[..seq_len + gap_len];
+    // rx_b covers B + the trailing silence (B's tail decays into the tail).
+    let rx_b = &audio[seq_len + gap_len..2 * seq_len + 2 * gap_len];
+    let ref_a = &ref_audio[..seq_len];
+    let ref_b = &ref_audio[seq_len + gap_len..2 * seq_len + gap_len];
+
+    // Correlate each half. The matched-filter output peaks at the
+    // alignment offset between rx and ref; we keep the first
+    // `GOLAY_IR_RETAIN_SAMPLES * 2` samples on each side so we can
+    // re-centre on the peak without truncating.
+    let corr_a = fft_xcorr(rx_a, ref_a);
+    let corr_b = fft_xcorr(rx_b, ref_b);
+    let n_corr = corr_a.len().min(corr_b.len());
+    if n_corr == 0 {
+        return GolayMeasure {
+            impulse_response: Vec::new(),
+            peak_amplitude: f32::NAN,
+            delay_spread_50_us: f32::NAN,
+            delay_spread_90_us: f32::NAN,
+            strongest_echo_dbc: f32::NAN,
+            strongest_echo_us: f32::NAN,
+        };
+    }
+    // Sum and normalise. The 2N normalisation comes from the Golay
+    // identity R_A + R_B = 2N·δ; for BPSK chips of amplitude 1 each
+    // ref sample contributes ±1 inside one chip, so the autocorr peak
+    // amplitude is 2·N·samples_per_chip (each chip contributes
+    // `samples_per_chip` correlated samples). Dividing recovers the
+    // channel response at unit input amplitude.
+    let norm = (2 * length_bits * samples_per_chip) as f32;
+    let h_sum: Vec<f32> =
+        (0..n_corr).map(|i| (corr_a[i] + corr_b[i]) / norm).collect();
+
+    // Find the main peak (|h|).
+    let (peak_idx, peak_amp) = h_sum
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v.abs()))
+        .max_by(|a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or((0, 0.0));
+
+    // Retain impulse response starting at the peak, magnitude only.
+    let retain_end = (peak_idx + GOLAY_IR_RETAIN_SAMPLES).min(h_sum.len());
+    let ir: Vec<f32> = h_sum[peak_idx..retain_end]
+        .iter()
+        .map(|v| v.abs())
+        .collect();
+
+    // Delay spread: cumulative power.
+    let powers: Vec<f64> = ir.iter().map(|v| (*v as f64) * (*v as f64)).collect();
+    let total: f64 = powers.iter().sum();
+    let mut cum = 0.0_f64;
+    let mut idx_50 = 0_usize;
+    let mut idx_90 = 0_usize;
+    let mut hit_50 = false;
+    let mut hit_90 = false;
+    for (i, &p) in powers.iter().enumerate() {
+        cum += p;
+        if !hit_50 && cum >= 0.5 * total {
+            idx_50 = i;
+            hit_50 = true;
+        }
+        if !hit_90 && cum >= 0.9 * total {
+            idx_90 = i;
+            hit_90 = true;
+            break;
+        }
+    }
+    let to_us = |samples: usize| (samples as f64 / sr as f64 * 1.0e6) as f32;
+    let delay_50 = if hit_50 { to_us(idx_50) } else { f32::NAN };
+    let delay_90 = if hit_90 { to_us(idx_90) } else { f32::NAN };
+
+    // Strongest secondary peak: skip a guard band of one chip duration
+    // around the main peak, then find the max of |h| within the
+    // retained window.
+    let guard = samples_per_chip.max(1);
+    let echo_search_start = guard.min(ir.len());
+    let mut best_echo_idx = 0_usize;
+    let mut best_echo_amp = 0.0_f32;
+    for (i, &v) in ir.iter().enumerate().skip(echo_search_start) {
+        if v > best_echo_amp {
+            best_echo_amp = v;
+            best_echo_idx = i;
+        }
+    }
+    // On a clean channel best_echo_amp can be numerically near zero
+    // (Golay zero-sidelobe property). Floor it at 1e-12 so the log
+    // doesn't blow up; the resulting dBc is just very negative
+    // (≈ −240 dBc) which the caller can interpret as "no echo".
+    let (echo_dbc, echo_us) = if peak_amp > 1e-9 {
+        let dbc = 20.0 * (best_echo_amp.max(1e-12) / peak_amp).log10();
+        (dbc, to_us(best_echo_idx))
+    } else {
+        (f32::NAN, f32::NAN)
+    };
+
+    GolayMeasure {
+        impulse_response: ir,
+        peak_amplitude: peak_amp,
+        delay_spread_50_us: delay_50,
+        delay_spread_90_us: delay_90,
+        strongest_echo_dbc: echo_dbc,
+        strongest_echo_us: echo_us,
     }
 }
 
@@ -834,6 +1094,81 @@ mod tests {
             "sweet {} vs p1db {}",
             m.sweet_spot_dbfs,
             m.p1db_dbfs,
+        );
+    }
+
+    #[test]
+    fn measure_golay_clean_channel_peaks_at_zero_delay() {
+        // Build a Golay pair audio probe, hand it back to the analyser
+        // unchanged (clean channel == identity). The recovered impulse
+        // response should peak strongly, with very small delay-spread
+        // numbers (limited only by the chip rolloff, not by any
+        // channel effect).
+        let length_bits = 64_usize;
+        let chip_rate = 1200.0_f64;
+        let carrier = 1500.0_f64;
+        let gap_s = 0.05_f64;
+        let (audio, _spc) = crate::probe::golay_pair_audio(
+            length_bits, chip_rate, carrier, 0.5, gap_s,
+        );
+        let m = measure_golay(
+            &audio, AUDIO_RATE, length_bits, chip_rate, carrier, gap_s,
+        );
+        assert!(
+            m.peak_amplitude > 0.1,
+            "peak amplitude {} should be strong on a clean channel",
+            m.peak_amplitude,
+        );
+        // Delay spread on a clean BPSK probe is dominated by the
+        // chip's matched-filter mainlobe width (≈ 1 chip ≈ 833 µs at
+        // 1200 chips/s), but it's a one-sided 50 %, so we expect
+        // ≤ ~1 ms.
+        assert!(
+            m.delay_spread_50_us.is_finite() && m.delay_spread_50_us < 1500.0,
+            "delay_spread_50 {} too high — clean channel should give ≈ 0",
+            m.delay_spread_50_us,
+        );
+        // No real echo: strongest "echo" beyond the chip guard is
+        // mostly noise and should be many dB below the peak.
+        assert!(
+            m.strongest_echo_dbc.is_finite() && m.strongest_echo_dbc < -15.0,
+            "echo {} dBc — expected deep null on clean channel",
+            m.strongest_echo_dbc,
+        );
+    }
+
+    #[test]
+    fn measure_golay_detects_synthetic_echo() {
+        // Build the Golay pair audio, then add a delayed attenuated
+        // copy of itself: rx[n] = tx[n] + 0.3 · tx[n - delay].
+        let length_bits = 64_usize;
+        let chip_rate = 1200.0_f64;
+        let carrier = 1500.0_f64;
+        let gap_s = 0.05_f64;
+        let (tx, _spc) = crate::probe::golay_pair_audio(
+            length_bits, chip_rate, carrier, 0.5, gap_s,
+        );
+        let delay = 240_usize; // 5 ms @ 48 kHz
+        let alpha = 0.3_f32;
+        let mut rx = vec![0.0_f32; tx.len()];
+        for i in 0..tx.len() {
+            rx[i] = tx[i] + if i >= delay { alpha * tx[i - delay] } else { 0.0 };
+        }
+        let m = measure_golay(
+            &rx, AUDIO_RATE, length_bits, chip_rate, carrier, gap_s,
+        );
+        // Echo should land near 5 ms with amplitude ≈ -10 dBc (20·log10 0.3).
+        assert!(
+            m.strongest_echo_dbc.is_finite()
+                && (m.strongest_echo_dbc - (-10.0)).abs() < 3.0,
+            "echo {} dBc expected ≈ -10",
+            m.strongest_echo_dbc,
+        );
+        assert!(
+            m.strongest_echo_us.is_finite()
+                && (m.strongest_echo_us - 5000.0).abs() < 800.0,
+            "echo delay {} µs expected ≈ 5000",
+            m.strongest_echo_us,
         );
     }
 }
