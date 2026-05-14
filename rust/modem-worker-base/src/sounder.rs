@@ -639,7 +639,35 @@ pub fn analyze_capture(
         }
     }
 
-    let snr_est = if snr_samples.is_empty() {
+    // Headline SNR: prefer the LevelSweep's per-level SNR sample
+    // closest to sweet_spot — that's the realistic figure of merit
+    // for the link once TX gain is correctly set. Fall back to the
+    // mean of standalone Tone probes (legacy single-level schedules),
+    // and ultimately to NaN if nothing usable was measured.
+    let snr_est = if sweet.is_finite() {
+        measurements
+            .iter()
+            .find_map(|m| match m {
+                ProbeMeasurement::LevelSweep { result, .. } => result
+                    .snr_db_per_level
+                    .iter()
+                    .min_by(|a, b| {
+                        (a.0 - sweet)
+                            .abs()
+                            .partial_cmp(&(b.0 - sweet).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(_, snr)| *snr),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                if snr_samples.is_empty() {
+                    f32::NAN
+                } else {
+                    snr_samples.iter().sum::<f32>() / snr_samples.len() as f32
+                }
+            })
+    } else if snr_samples.is_empty() {
         f32::NAN
     } else {
         snr_samples.iter().sum::<f32>() / snr_samples.len() as f32
@@ -725,10 +753,32 @@ pub fn analyze_capture(
             noise_floor = result.noise_floor_dbfs;
         }
     }
+    // For Golay impulse response we deliberately *don't* pick at
+    // sweet-spot: the IR measurement is signal-strength-limited (the
+    // matched-filter output has to clear the channel noise floor),
+    // not linearity-limited. Pick the instance with the highest
+    // recovered |h(t)| peak — that's the level where the IR has the
+    // best SNR, which gives the cleanest delay-spread / echo numbers.
     let mut delay_50 = f32::NAN;
     let mut delay_90 = f32::NAN;
     let mut echo_dbc = f32::NAN;
-    if let Some(idx) = pick(&is_golay, sweet) {
+    let golay_strongest = {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, m) in measurements.iter().enumerate() {
+            if let ProbeMeasurement::GolayPair { result, .. } = m {
+                let p = result.peak_amplitude;
+                if p.is_finite() {
+                    match best {
+                        None => best = Some((i, p)),
+                        Some((_, q)) if p > q => best = Some((i, p)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    };
+    if let Some(idx) = golay_strongest {
         if let ProbeMeasurement::GolayPair { result, .. } = &measurements[idx] {
             delay_50 = result.delay_spread_50_us;
             delay_90 = result.delay_spread_90_us;

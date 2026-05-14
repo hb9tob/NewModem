@@ -4918,6 +4918,13 @@ async function runSounderAnalyze() {
     }
     const res = document.getElementById("sounder-an-results");
     if (res) res.hidden = false;
+    // Render the channel-characterisation plots from the per-segment
+    // measurements that are now in the signature.
+    try {
+      renderSounderPlots(sig);
+    } catch (plotErr) {
+      console.error("renderSounderPlots", plotErr);
+    }
     setSounderStatus("sounder-an-status", `OK ${now()}`, "ok");
   } catch (err) {
     setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
@@ -4989,6 +4996,331 @@ async function runSounderRxCaptureToggle() {
     } catch (err) {
       setSounderStatus("sounder-an-status", `erreur stop : ${err}`, "err");
     }
+  }
+}
+
+// ─────────────── Sounder plots (inline SVG, no external lib)
+//
+// Renders 6 channel-characterisation plots into <svg> tags inside the
+// results panel after a successful sounding_analyze run. Each plot is
+// self-contained: SVG nodes are wiped + rebuilt every call (cheap,
+// the panels are small).
+
+// Generic XY plotter. `points` = [[x, y], …]. Auto-scales axes unless
+// `xMin/xMax/yMin/yMax` are supplied. Optional secondary trace, sweet-
+// spot vertical line, and y=x reference diagonal.
+function svgXY(svgId, points, opts) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  if (!points || points.length === 0) return;
+  const o = Object.assign(
+    {
+      w: 360,
+      h: 220,
+      padL: 38,
+      padR: 12,
+      padT: 12,
+      padB: 28,
+      xMin: null,
+      xMax: null,
+      yMin: null,
+      yMax: null,
+      xLabel: "",
+      yLabel: "",
+      diagonal: false,
+      sweet: null,
+      secondary: null, // [[x, y], …]
+    },
+    opts,
+  );
+  let xMin = o.xMin,
+    xMax = o.xMax,
+    yMin = o.yMin,
+    yMax = o.yMax;
+  if (xMin === null) xMin = Math.min(...points.map((p) => p[0]));
+  if (xMax === null) xMax = Math.max(...points.map((p) => p[0]));
+  if (yMin === null) yMin = Math.min(...points.map((p) => p[1]));
+  if (yMax === null) yMax = Math.max(...points.map((p) => p[1]));
+  if (o.secondary && o.secondary.length) {
+    yMin = Math.min(yMin, ...o.secondary.map((p) => p[1]));
+    yMax = Math.max(yMax, ...o.secondary.map((p) => p[1]));
+  }
+  if (xMin === xMax) xMax = xMin + 1;
+  if (yMin === yMax) yMax = yMin + 1;
+  // Add 5% margin so traces don't kiss the axes.
+  const dy = yMax - yMin;
+  yMin -= dy * 0.05;
+  yMax += dy * 0.05;
+
+  const plotW = o.w - o.padL - o.padR;
+  const plotH = o.h - o.padT - o.padB;
+  const sx = (x) => o.padL + ((x - xMin) / (xMax - xMin)) * plotW;
+  const sy = (y) => o.padT + (1 - (y - yMin) / (yMax - yMin)) * plotH;
+
+  const NS = "http://www.w3.org/2000/svg";
+  const mk = (tag, attrs, text) => {
+    const el = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    if (text != null) el.textContent = text;
+    return el;
+  };
+
+  // Grid + axes (5 vertical, 4 horizontal ticks).
+  for (let i = 0; i <= 5; i++) {
+    const x = sx(xMin + (i / 5) * (xMax - xMin));
+    svg.appendChild(
+      mk("line", { class: "grid", x1: x, y1: o.padT, x2: x, y2: o.padT + plotH }),
+    );
+    svg.appendChild(
+      mk(
+        "text",
+        { class: "label", x: x, y: o.padT + plotH + 12, "text-anchor": "middle" },
+        (xMin + (i / 5) * (xMax - xMin)).toFixed(
+          Math.abs(xMax - xMin) > 50 ? 0 : 1,
+        ),
+      ),
+    );
+  }
+  for (let i = 0; i <= 4; i++) {
+    const y = sy(yMin + (i / 4) * (yMax - yMin));
+    svg.appendChild(
+      mk("line", { class: "grid", x1: o.padL, y1: y, x2: o.padL + plotW, y2: y }),
+    );
+    svg.appendChild(
+      mk(
+        "text",
+        { class: "label", x: o.padL - 4, y: y + 3, "text-anchor": "end" },
+        (yMin + (i / 4) * (yMax - yMin)).toFixed(
+          Math.abs(yMax - yMin) > 50 ? 0 : 1,
+        ),
+      ),
+    );
+  }
+  svg.appendChild(
+    mk("line", {
+      class: "axis",
+      x1: o.padL,
+      y1: o.padT,
+      x2: o.padL,
+      y2: o.padT + plotH,
+    }),
+  );
+  svg.appendChild(
+    mk("line", {
+      class: "axis",
+      x1: o.padL,
+      y1: o.padT + plotH,
+      x2: o.padL + plotW,
+      y2: o.padT + plotH,
+    }),
+  );
+  if (o.xLabel)
+    svg.appendChild(
+      mk(
+        "text",
+        {
+          class: "axis-title",
+          x: o.padL + plotW / 2,
+          y: o.h - 4,
+          "text-anchor": "middle",
+        },
+        o.xLabel,
+      ),
+    );
+  if (o.yLabel)
+    svg.appendChild(
+      mk(
+        "text",
+        {
+          class: "axis-title",
+          x: 9,
+          y: o.padT + plotH / 2,
+          "text-anchor": "middle",
+          transform: `rotate(-90 9 ${o.padT + plotH / 2})`,
+        },
+        o.yLabel,
+      ),
+    );
+
+  if (o.diagonal) {
+    // y=x reference (only meaningful when both axes have the same units).
+    const xa = Math.max(xMin, yMin);
+    const xb = Math.min(xMax, yMax);
+    if (xb > xa) {
+      svg.appendChild(
+        mk("line", {
+          class: "ref",
+          x1: sx(xa),
+          y1: sy(xa),
+          x2: sx(xb),
+          y2: sy(xb),
+        }),
+      );
+    }
+  }
+
+  if (o.sweet != null && isFinite(o.sweet) && o.sweet >= xMin && o.sweet <= xMax) {
+    const xs = sx(o.sweet);
+    svg.appendChild(
+      mk("line", {
+        class: "sweet",
+        x1: xs,
+        y1: o.padT,
+        x2: xs,
+        y2: o.padT + plotH,
+      }),
+    );
+    svg.appendChild(
+      mk(
+        "text",
+        {
+          class: "sweet-label",
+          x: xs + 3,
+          y: o.padT + 10,
+          "text-anchor": "start",
+        },
+        "sweet",
+      ),
+    );
+  }
+
+  // Secondary trace first so it sits BEHIND the main trace.
+  if (o.secondary && o.secondary.length > 1) {
+    const d = o.secondary
+      .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p[0])} ${sy(p[1])}`)
+      .join(" ");
+    svg.appendChild(mk("path", { class: "trace-secondary", d }));
+  }
+  const d = points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p[0])} ${sy(p[1])}`)
+    .join(" ");
+  svg.appendChild(mk("path", { class: "trace", d }));
+  // Add small dots so sparse data is visible.
+  if (points.length <= 32) {
+    for (const p of points) {
+      svg.appendChild(
+        mk("circle", { class: "point", cx: sx(p[0]), cy: sy(p[1]), r: 2 }),
+      );
+    }
+  }
+}
+
+// Render the 6 sounder plots from a signature object. Walks the
+// measurements array to find the right per-family instance for each
+// plot (sweet-spot for chirp/multitone; highest-peak for Golay).
+function renderSounderPlots(sig) {
+  const meas = sig.measurements || [];
+  const d = sig.derived || {};
+  const sweet = d.sweet_spot_dbfs;
+
+  // (1) AM-AM — from the unique LevelSweep entry.
+  const sweep = meas.find((m) => m.kind === "level_sweep");
+  if (sweep && sweep.result && sweep.result.am_am_curve) {
+    svgXY("sd-plot-amam", sweep.result.am_am_curve, {
+      xLabel: "Entrée (dBFS)",
+      yLabel: "Sortie (dBFS)",
+      diagonal: true,
+      sweet,
+    });
+    // (1bis) AM-PM curve overlay onto the AM-PM panel.
+    if (sweep.result.am_pm_curve) {
+      svgXY("sd-plot-ampm", sweep.result.am_pm_curve, {
+        xLabel: "Entrée (dBFS)",
+        yLabel: "Phase (rad)",
+        sweet,
+      });
+    }
+  }
+
+  // (2) IMD3 vs level — group all two-tone measurements with their
+  //     parent ProbeSegment's level_db (from the schedule, which the
+  //     analyse pass doesn't echo back, so we reverse-engineer from
+  //     amp_each: level = 20·log10(amp_each / 0.5)).
+  //
+  //     We don't have the schedule here, but we have measurements with
+  //     amp inside each spec's result. The two-tone measurements
+  //     return a1_dbfs / a2_dbfs (output level), and we can map
+  //     measurement index back to its input level if the schedule was
+  //     standard. As a pragmatic shortcut, use a1_dbfs as the x-axis
+  //     proxy (output level at the receiver — what actually matters
+  //     for IMD3 anyway).
+  const tts = meas
+    .filter((m) => m.kind === "two_tone")
+    .map((m) => [m.result.a1_dbfs, 0.5 * (m.result.imd3_low_dbc + m.result.imd3_high_dbc)])
+    .sort((a, b) => a[0] - b[0]);
+  if (tts.length > 0) {
+    svgXY("sd-plot-imd3", tts, {
+      xLabel: "Sortie f₁ (dBFS)",
+      yLabel: "IMD3 moyen (dBc)",
+    });
+  }
+
+  // (3) Frequency response — from the multitone at sweet-spot.
+  let mtPick = null;
+  let mtBestDist = Infinity;
+  for (const m of meas) {
+    if (m.kind !== "multitone") continue;
+    // We don't carry level_db on the measurement, so we approximate
+    // "sweet-spot multitone" as the one whose strongest bin is closest
+    // to sweet_spot in dBFS. The peak bin amp is the multitone result's
+    // ref level (gain_db_per_freq is normalised to peak).
+    // Practical fallback: pick the highest output level (= highest
+    // measured raw multitone peak amp ≈ middle-of-band tone amplitude).
+    // We just look at the first gain entry which is normalised to 0 dB
+    // at peak, so all multitones look similar shape-wise. Pick the
+    // last one (highest TX level) for the curve display.
+    mtPick = m;
+  }
+  if (mtPick && mtPick.result && mtPick.result.gain_db_per_freq) {
+    svgXY("sd-plot-freq", mtPick.result.gain_db_per_freq, {
+      xLabel: "Fréquence (Hz)",
+      yLabel: "Gain (dB)",
+    });
+  }
+
+  // (4) Group delay — from chirp at sweet-spot. Take the last chirp
+  //     (highest level, best SNR for the IF estimator).
+  let chPick = null;
+  for (const m of meas) {
+    if (m.kind === "chirp") chPick = m;
+  }
+  if (chPick && chPick.result && chPick.result.group_delay_per_freq) {
+    svgXY("sd-plot-gd", chPick.result.group_delay_per_freq, {
+      xLabel: "Fréquence (Hz)",
+      yLabel: "Δ group delay (µs)",
+    });
+  }
+
+  // (5) Impulse response — pick the Golay with the highest peak amp
+  //     (same heuristic as the derived numbers).
+  let irPick = null;
+  let irBest = -Infinity;
+  for (const m of meas) {
+    if (m.kind !== "golay_pair") continue;
+    if (m.result && m.result.peak_amplitude > irBest) {
+      irBest = m.result.peak_amplitude;
+      irPick = m;
+    }
+  }
+  if (irPick && irPick.result && irPick.result.impulse_response) {
+    const ir = irPick.result.impulse_response;
+    const peak = irPick.result.peak_amplitude || 1;
+    // Show in dBc relative to peak. Sample down to ~120 points so
+    // SVG stays light.
+    const stride = Math.max(1, Math.floor(ir.length / 120));
+    const pts = [];
+    for (let i = 0; i < ir.length; i += stride) {
+      const v = ir[i];
+      const dbc = 20 * Math.log10(Math.max(v / peak, 1e-6));
+      pts.push([(i / 48), dbc]); // x in ms (48k -> 48 samples per ms)
+    }
+    svgXY("sd-plot-ir", pts, {
+      xLabel: "Retard (ms)",
+      yLabel: "|h| (dBc)",
+      yMin: -40,
+      yMax: 3,
+    });
   }
 }
 

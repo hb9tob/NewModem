@@ -1431,6 +1431,27 @@ main {
   padding: 0.35rem 0.5rem;
   font-size: 0.9rem;
   min-width: 0;
+  /* Force dark theme over the WebView default — WebKit/Chromium on
+     Linux often picks system light colours for native <select> and
+     for <input list> dropdown arrows when not explicitly overridden. */
+  appearance: none;
+  -webkit-appearance: none;
+  color-scheme: dark;
+}
+.sounder-row input[type="text"]::placeholder {
+  color: #5d728c;
+}
+/* Native dropdown indicator for <input list> — give the input a
+   subtle chevron so the user knows there's a suggestion list. */
+.sounder-row input[list] {
+  background-image: linear-gradient(45deg, transparent 50%, #8aa3bd 50%),
+                    linear-gradient(135deg, #8aa3bd 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 9px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 1.5rem;
 }
 .sounder-row-actions {
   align-items: center;
@@ -1536,6 +1557,80 @@ main {
   background: #b03030;
   color: #fff;
   border-color: #c84545;
+}
+/* Sounder plots — grid of SVG diagrams populated after analyse. */
+.sounder-plots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 0.6rem;
+  margin: 0.4rem 0 0.6rem;
+}
+.sounder-plot {
+  background: #0e1620;
+  border: 1px solid #2a3344;
+  border-radius: 3px;
+  padding: 0.4rem 0.5rem 0.5rem;
+}
+.sounder-plot-title {
+  font-size: 0.85rem;
+  color: #b9d6ff;
+  margin-bottom: 0.2rem;
+  font-weight: 500;
+}
+.sounder-plot-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.sounder-plot-svg .axis {
+  stroke: #4a5a70;
+  stroke-width: 0.7;
+  fill: none;
+}
+.sounder-plot-svg .grid {
+  stroke: #1f2a3a;
+  stroke-width: 0.5;
+  fill: none;
+}
+.sounder-plot-svg .label {
+  fill: #8aa3bd;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+}
+.sounder-plot-svg .axis-title {
+  fill: #c8d4df;
+  font-size: 9.5px;
+  font-family: ui-monospace, monospace;
+}
+.sounder-plot-svg .trace {
+  stroke: #4a9eff;
+  stroke-width: 1.4;
+  fill: none;
+}
+.sounder-plot-svg .trace-secondary {
+  stroke: #9e6df0;
+  stroke-width: 1.2;
+  fill: none;
+}
+.sounder-plot-svg .ref {
+  stroke: #4a5a70;
+  stroke-width: 0.7;
+  stroke-dasharray: 3 3;
+  fill: none;
+}
+.sounder-plot-svg .sweet {
+  stroke: #66bb6a;
+  stroke-width: 0.8;
+  stroke-dasharray: 2 2;
+  fill: none;
+}
+.sounder-plot-svg .sweet-label {
+  fill: #66bb6a;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+}
+.sounder-plot-svg .point {
+  fill: #4a9eff;
 }
 
 /* ─────────── Prompt post-capture brute (Phase D) */

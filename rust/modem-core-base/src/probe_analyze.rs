@@ -834,11 +834,39 @@ pub fn measure_golay(
     let delay_50 = if hit_50 { to_us(idx_50) } else { f32::NAN };
     let delay_90 = if hit_90 { to_us(idx_90) } else { f32::NAN };
 
-    // Strongest secondary peak: skip a guard band of one chip duration
-    // around the main peak, then find the max of |h| within the
-    // retained window.
-    let guard = samples_per_chip.max(1);
-    let echo_search_start = guard.min(ir.len());
+    // Strongest secondary peak: dynamic guard = end-of-main-lobe, i.e.
+    // the first delay past the peak where the smoothed |h(t)| envelope
+    // drops below peak / √10 (≈ −10 dBc). The BPSK chip-mainlobe is
+    // already ~2·samples_per_chip wide, but the *channel* further
+    // smears it by the group-delay span (5-20 ms typical for an FM
+    // chain). Using a static guard of a few chips lands inside that
+    // smeared blob and the loop reports the descent itself as an
+    // "echo" near 0 dBc. Walking the smoothed envelope forward gives
+    // the true tail of the IR — beyond it, any remaining energy is a
+    // genuine multipath echo or numerical correlation floor.
+    let smooth_w = samples_per_chip.max(1);
+    let mut smoothed: Vec<f32> = Vec::with_capacity(ir.len());
+    let mut sum = 0.0_f32;
+    for (i, &v) in ir.iter().enumerate() {
+        sum += v;
+        if i >= smooth_w {
+            sum -= ir[i - smooth_w];
+        }
+        let denom = (i + 1).min(smooth_w) as f32;
+        smoothed.push(sum / denom);
+    }
+    let smoothed_peak =
+        smoothed.iter().cloned().fold(0.0_f32, f32::max);
+    let drop_thresh = smoothed_peak / 10.0_f32.sqrt(); // −10 dB
+    let min_guard = (3 * samples_per_chip).max(1);
+    let mut end_of_main = min_guard;
+    for (i, &v) in smoothed.iter().enumerate().skip(min_guard) {
+        if v < drop_thresh {
+            end_of_main = i;
+            break;
+        }
+    }
+    let echo_search_start = end_of_main.min(ir.len());
     let mut best_echo_idx = 0_usize;
     let mut best_echo_amp = 0.0_f32;
     for (i, &v) in ir.iter().enumerate().skip(echo_search_start) {

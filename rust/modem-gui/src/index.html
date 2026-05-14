@@ -536,6 +536,23 @@
               <button type="button" id="cascade-clear" class="cascade-clear">Vider</button>
             </div>
           </fieldset>
+
+          <fieldset class="sounder-tx">
+            <legend>Sondeur — émission TX</legend>
+            <p class="tx-hint">
+              Émet la séquence de sondage standard
+              (préambule 1750 Hz pour ouvrir un relais, sync chirp,
+              rampe d'amplitude, two-tone, chirp, multitone, AWGN, Golay).
+              Device de sortie : celui des Paramètres. Durée ≈
+              <span id="sounder-tx-duration-est">45</span> s.
+              Activez VOX ou maintenez PTT — le préambule 1750 Hz de
+              5 s laisse aux relais et au VOX le temps de s'engager.
+            </p>
+            <div class="sounder-row sounder-row-actions">
+              <button type="button" id="sounder-tx-emit" class="sounder-emit-btn">▶ Émettre la séquence de sondage</button>
+              <span class="sounder-status" id="sounder-tx-status">—</span>
+            </div>
+          </fieldset>
         </div>
 
         <div class="channel-col channel-rx">
@@ -547,24 +564,6 @@
               Valeur à communiquer à la station émettrice. Mesure automatique
               en phase B (sondeur de canal).
             </p>
-          </fieldset>
-
-          <fieldset class="sounder-tx">
-            <legend>Sondeur — émission TX</legend>
-            <p class="tx-hint">
-              Émet la séquence de sondage standard
-              (préambule 1750 Hz pour ouvrir un relais, sync chirp,
-              rampe d'amplitude, two-tone, chirp, multitone, AWGN, Golay).
-              Le device de sortie est celui sélectionné en haut de
-              l'onglet TX. La séquence dure environ
-              <span id="sounder-tx-duration-est">45</span> s.
-              Activez VOX ou maintenez PTT — le préambule 1750 Hz de 5 s
-              laisse aux relais et au VOX le temps de s'engager.
-            </p>
-            <div class="sounder-row sounder-row-actions">
-              <button type="button" id="sounder-tx-emit" class="sounder-emit-btn">▶ Émettre la séquence de sondage</button>
-              <span class="sounder-status" id="sounder-tx-status">—</span>
-            </div>
           </fieldset>
 
           <fieldset class="sounder-rx">
@@ -582,55 +581,105 @@
             </p>
             <div class="sounder-row">
               <label>Équipement TX
-                <select id="sounder-rx-tx-model">
-                  <option value="">—</option>
-                  <option value="FT-991A">Yaesu FT-991A</option>
-                  <option value="FT-857D">Yaesu FT-857D</option>
-                  <option value="FTM-300D">Yaesu FTM-300D</option>
-                  <option value="IC-7300">Icom IC-7300</option>
-                  <option value="IC-705">Icom IC-705</option>
-                  <option value="IC-9700">Icom IC-9700</option>
-                  <option value="TS-590">Kenwood TS-590</option>
-                  <option value="Adalm-Pluto">ADALM-Pluto SDR</option>
-                  <option value="Sound-card only">Carte son uniquement</option>
-                </select>
+                <input type="text" id="sounder-rx-tx-model" list="sounder-rig-models" placeholder="ex: FT-991A, IC-705, perso…">
               </label>
               <label>Équipement RX
-                <select id="sounder-rx-rx-model">
-                  <option value="">—</option>
-                  <option value="FTX-1">Yaesu FTX-1</option>
-                  <option value="FT-991A">Yaesu FT-991A</option>
-                  <option value="IC-705">Icom IC-705</option>
-                  <option value="IC-7300">Icom IC-7300</option>
-                  <option value="SDRplay RSP1">SDRplay RSP1</option>
-                  <option value="SDRplay RSPdx">SDRplay RSPdx</option>
-                  <option value="Adalm-Pluto">ADALM-Pluto SDR</option>
-                  <option value="RTL-SDR">RTL-SDR</option>
-                  <option value="Sound-card only">Carte son uniquement</option>
-                </select>
+                <input type="text" id="sounder-rx-rx-model" list="sounder-rig-models" placeholder="ex: FTX-1, SDRplay, perso…">
               </label>
             </div>
+            <datalist id="sounder-rig-models">
+              <!-- Yaesu -->
+              <option value="Yaesu FTX-1"></option>
+              <option value="Yaesu FT-991A"></option>
+              <option value="Yaesu FT-857D"></option>
+              <option value="Yaesu FT-817ND"></option>
+              <option value="Yaesu FT-818ND"></option>
+              <option value="Yaesu FTM-300D"></option>
+              <option value="Yaesu FTM-400DR"></option>
+              <option value="Yaesu FT-450D"></option>
+              <option value="Yaesu FT-710"></option>
+              <option value="Yaesu FT-891"></option>
+              <option value="Yaesu FT-DX10"></option>
+              <option value="Yaesu FT-DX101"></option>
+              <option value="Yaesu FT-2DR"></option>
+              <option value="Yaesu FT-5DR"></option>
+              <!-- Icom -->
+              <option value="Icom IC-705"></option>
+              <option value="Icom IC-7300"></option>
+              <option value="Icom IC-7610"></option>
+              <option value="Icom IC-7100"></option>
+              <option value="Icom IC-9700"></option>
+              <option value="Icom IC-R8600"></option>
+              <option value="Icom IC-705"></option>
+              <option value="Icom IC-V86"></option>
+              <option value="Icom ID-52"></option>
+              <option value="Icom IC-2730"></option>
+              <option value="Icom IC-5100"></option>
+              <!-- Kenwood -->
+              <option value="Kenwood TS-590S"></option>
+              <option value="Kenwood TS-590SG"></option>
+              <option value="Kenwood TS-890S"></option>
+              <option value="Kenwood TS-2000"></option>
+              <option value="Kenwood TM-V71E"></option>
+              <option value="Kenwood TM-D710"></option>
+              <option value="Kenwood TH-D74"></option>
+              <option value="Kenwood TH-D75"></option>
+              <!-- Elecraft -->
+              <option value="Elecraft K3S"></option>
+              <option value="Elecraft K4"></option>
+              <option value="Elecraft KX2"></option>
+              <option value="Elecraft KX3"></option>
+              <!-- Xiegu / portable / SDR -->
+              <option value="Xiegu G90"></option>
+              <option value="Xiegu X6100"></option>
+              <option value="Xiegu G106"></option>
+              <option value="Anytone AT-D878UV"></option>
+              <option value="ADALM-Pluto SDR"></option>
+              <option value="HackRF One"></option>
+              <option value="SDRplay RSP1A"></option>
+              <option value="SDRplay RSP1B"></option>
+              <option value="SDRplay RSPdx"></option>
+              <option value="SDRplay RSPduo"></option>
+              <option value="Airspy HF+ Discovery"></option>
+              <option value="Airspy R2"></option>
+              <option value="Airspy Mini"></option>
+              <option value="RTL-SDR v3"></option>
+              <option value="RTL-SDR Blog v4"></option>
+              <option value="LimeSDR USB"></option>
+              <option value="LimeSDR Mini"></option>
+              <option value="QO-100 LNB direct"></option>
+              <option value="Carte son uniquement"></option>
+            </datalist>
             <div class="sounder-row">
               <label>Relais
-                <select id="sounder-rx-relay">
-                  <option value="none">Aucun (simplex)</option>
-                  <option value="1750hz">1750 Hz (IARU R1)</option>
-                  <option value="ctcss">CTCSS / sub-audible</option>
-                  <option value="dtmf">DTMF</option>
-                  <option value="dmr">DMR / numérique</option>
-                </select>
+                <input type="text" id="sounder-rx-relay" list="sounder-relay-list" value="Aucun (simplex)" placeholder="ex: 1750 Hz, CTCSS, DCS, DMR…">
               </label>
               <label>Mode
-                <select id="sounder-rx-mode">
-                  <option value="fm_5khz" selected>NBFM 5 kHz (standard amateur)</option>
-                  <option value="fm_2k5">NBFM 2.5 kHz (étroit)</option>
-                  <option value="fm_wide">FM large (broadcast)</option>
-                  <option value="usb">SSB USB</option>
-                  <option value="lsb">SSB LSB</option>
-                  <option value="am">AM</option>
-                </select>
+                <input type="text" id="sounder-rx-mode" list="sounder-mode-list" value="NBFM 5 kHz" placeholder="NBFM / SSB / AM / digital…">
               </label>
             </div>
+            <datalist id="sounder-relay-list">
+              <option value="Aucun (simplex)"></option>
+              <option value="1750 Hz (IARU R1)"></option>
+              <option value="CTCSS / PL"></option>
+              <option value="DCS"></option>
+              <option value="DTMF"></option>
+              <option value="DMR"></option>
+              <option value="D-STAR"></option>
+              <option value="C4FM / Fusion"></option>
+              <option value="Echolink / IRLP"></option>
+              <option value="QO-100 (NB transponder)"></option>
+            </datalist>
+            <datalist id="sounder-mode-list">
+              <option value="NBFM 5 kHz (standard amateur)"></option>
+              <option value="NBFM 2.5 kHz (étroit)"></option>
+              <option value="FM large (broadcast)"></option>
+              <option value="SSB USB"></option>
+              <option value="SSB LSB"></option>
+              <option value="AM"></option>
+              <option value="CW"></option>
+              <option value="Numérique (DV/DMR/C4FM)"></option>
+            </datalist>
             <div class="sounder-row sounder-row-actions">
               <button type="button" id="sounder-rx-capture-toggle">⏺ Démarrer la capture</button>
               <button type="button" id="sounder-an-run" disabled>Analyser la capture</button>
@@ -674,6 +723,33 @@
                   <tr><th>Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
                 </tbody>
               </table>
+              <h4>Diagrammes</h4>
+              <div class="sounder-plots">
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">AM-AM (compression d'amplitude)</div>
+                  <svg id="sd-plot-amam" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">AM-PM (déphasage vs niveau)</div>
+                  <svg id="sd-plot-ampm" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">IMD3 vs niveau (sortie two-tone)</div>
+                  <svg id="sd-plot-imd3" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">Réponse en fréquence (multitone)</div>
+                  <svg id="sd-plot-freq" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">Group delay (chirp)</div>
+                  <svg id="sd-plot-gd" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">Réponse impulsionnelle (Golay)</div>
+                  <svg id="sd-plot-ir" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+              </div>
               <div class="tx-hint" id="sounder-an-signature-path"></div>
             </div>
           </fieldset>
