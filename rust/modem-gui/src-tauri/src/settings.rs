@@ -40,6 +40,12 @@ pub struct Settings {
     pub settings_schema_version: u32,
 
     pub callsign: String,
+    /// Maidenhead grid locator of the local station (`JN36ld`, `IN98`,
+    /// …). 4-, 6-, or 8-character grid; trimmed on save. Surfaces in
+    /// the `metadata.json` sent to the collector and is the default
+    /// `locator` for any sounding submission. Empty = unset.
+    #[serde(default)]
+    pub locator: String,
     /// Composite device name produced by `SdrBackend::list_devices`,
     /// e.g. `"pluto:usb:1.6.5"`, `"sdrplay:22340A2A34"`, or a plain
     /// cpal name like `"USB Audio (hw:1,0)"`. The registry's
@@ -273,6 +279,7 @@ impl Default for Settings {
         Settings {
             settings_schema_version: SETTINGS_SCHEMA_VERSION,
             callsign: String::new(),
+            locator: String::new(),
             rx_device: String::new(),
             tx_device: String::new(),
             ptt_enabled: false,

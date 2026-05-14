@@ -291,6 +291,11 @@
           <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
         <fieldset>
+          <legend>Locator Maidenhead</legend>
+          <input type="text" id="locator-input" placeholder="JN36ld" maxlength="8">
+          <div class="tx-hint">Position de la station (4, 6 ou 8 caractères). Envoyé au collector avec chaque sondage.</div>
+        </fieldset>
+        <fieldset>
           <legend>Périphérique réception (RX)</legend>
           <select id="rx-device-select">
             <option>Chargement…</option>
@@ -557,15 +562,6 @@
 
         <div class="channel-col channel-rx">
           <h3 class="channel-col-title">Réception (RX)</h3>
-          <fieldset class="channel-rx-recommend">
-            <legend>Atténuation recommandée</legend>
-            <div class="channel-recommend-value" id="rx-recommend-value">—</div>
-            <p class="tx-hint">
-              Valeur à communiquer à la station émettrice. Mesure automatique
-              en phase B (sondeur de canal).
-            </p>
-          </fieldset>
-
           <fieldset class="sounder-rx">
             <legend>Sondeur — capture + analyse RX</legend>
             <p class="tx-hint">

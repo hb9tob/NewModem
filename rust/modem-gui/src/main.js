@@ -1458,7 +1458,7 @@ async function loadSettings() {
   } catch (err) {
     console.error("get_settings", err);
     currentSettings = {
-      callsign: "", rx_device: "", tx_device: "",
+      callsign: "", locator: "", rx_device: "", tx_device: "",
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
@@ -1474,6 +1474,8 @@ async function loadSettings() {
   ensureOverlaySlots();
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
+  const locInit = document.getElementById("locator-input");
+  if (locInit) locInit.value = currentSettings.locator || "";
   // Fetch profile list from modem-core BEFORE any code that touches the
   // tx-mode / rx-forced-profile selects (they're empty in index.html).
   await loadModemProfiles();
@@ -1756,6 +1758,8 @@ async function persistSettings() {
   const colUrl = document.getElementById("collector-url");
   const histMax = document.getElementById("tx-history-max-input");
   currentSettings.callsign = (call && call.value || "").trim().toUpperCase();
+  const loc = document.getElementById("locator-input");
+  if (loc) currentSettings.locator = (loc.value || "").trim();
   currentSettings.rx_device = rxSel ? rxSel.value || "" : "";
   currentSettings.tx_device = txSel ? txSel.value || "" : "";
   if (colUrl) currentSettings.collector_url = (colUrl.value || "").trim();
@@ -1785,6 +1789,7 @@ async function persistSettings() {
 
 function setupSettingsTab() {
   const call = document.getElementById("callsign-input");
+  const loc = document.getElementById("locator-input");
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
   if (call) {
@@ -1794,6 +1799,13 @@ function setupSettingsTab() {
     };
     call.addEventListener("change", onCallsignChange);
     call.addEventListener("blur", onCallsignChange);
+  }
+  if (loc) {
+    // The locator is informational only — persist on blur/change like
+    // the callsign so it round-trips into the sounder metadata.
+    const onLocChange = () => { persistSettings(); };
+    loc.addEventListener("change", onLocChange);
+    loc.addEventListener("blur", onLocChange);
   }
   if (rxSel) {
     rxSel.addEventListener("change", async () => {
@@ -4826,13 +4838,17 @@ function buildRxChainMetadata() {
   const mode = (
     document.getElementById("sounder-rx-mode")?.value || "fm_5khz"
   ).trim();
-  // Compact human-readable equipment string.
+  // Compact human-readable equipment string for the in-signature
+  // `SoundingMetadata` (legacy flat schema).
   const eqParts = [];
   if (txModel) eqParts.push(`TX=${txModel}`);
   if (rxModel) eqParts.push(`RX=${rxModel}`);
   const equipment = eqParts.join(" / ");
   const notes = `relay=${relay} mode=${mode}`;
-  return { equipment, notes };
+  // Also surface the individual fields so the collector-submit code
+  // can map them onto the structured `ReportMeta` (tx_model, relay,
+  // profile) the server expects.
+  return { equipment, notes, txModel, rxModel, relay, mode };
 }
 
 async function runSounderAnalyze() {
@@ -4949,12 +4965,23 @@ async function runSounderAnalyze() {
       }
     }
     // Stash the result so the collector-send button can pick it up
-    // later without re-invoking the analyser.
+    // later without re-invoking the analyser. Keep both the raw form
+    // fields (mapped to the collector's ReportMeta schema) and a
+    // free-text `notes` line that carries the rx_model — for which
+    // the server schema has no dedicated field yet.
+    const chain = buildRxChainMetadata();
+    const noteParts = [];
+    if (chain.rxModel) noteParts.push(`RX=${chain.rxModel}`);
+    if (chain.mode && chain.mode !== "fm_5khz") {
+      noteParts.push(`mode=${chain.mode}`);
+    }
     lastSounderResult = {
       wavPath: capture,
       signatureJson: JSON.stringify(sig),
-      equipment,
-      notes,
+      txModel: chain.txModel || null,
+      relay: chain.relay && chain.relay !== "none" ? chain.relay : null,
+      profile: chain.mode || null,
+      notes: noteParts.length ? noteParts.join(" / ") : null,
     };
     const sendBtn = document.getElementById("sd-collector-send");
     if (sendBtn) sendBtn.disabled = false;
@@ -5016,13 +5043,17 @@ async function runSounderCollectorSend() {
   if (btn) btn.disabled = true;
   setStatus("envoi en cours…");
   try {
+    const locator = (currentSettings && currentSettings.locator || "").trim();
     const res = await invoke("submit_sounding", {
       args: {
         wav_path: lastSounderResult.wavPath || "",
         callsign,
         collector_url: collectorUrl,
         signature_json: lastSounderResult.signatureJson,
-        equipment: lastSounderResult.equipment || null,
+        locator: locator || null,
+        profile: lastSounderResult.profile || null,
+        relay: lastSounderResult.relay || null,
+        tx_model: lastSounderResult.txModel || null,
         notes: lastSounderResult.notes || null,
         include_wav: !!(wavChk && wavChk.checked),
       },

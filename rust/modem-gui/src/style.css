@@ -1237,17 +1237,6 @@ main {
 .channel-rx .channel-col-title {
   color: #ffb74d;
 }
-.channel-recommend-value {
-  font-size: 2.2rem;
-  font-family: ui-monospace, monospace;
-  color: #ffb74d;
-  text-align: center;
-  padding: 0.6rem 0;
-  letter-spacing: 0.04em;
-}
-.channel-rx-recommend {
-  background: rgba(0, 0, 0, 0.15);
-}
 .channel-form fieldset {
   border: 1px solid #3a3a3a;
   border-radius: 4px;

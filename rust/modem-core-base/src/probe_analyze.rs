@@ -655,10 +655,14 @@ pub fn measure_level_sweep(
     } else {
         f32::NAN
     };
-    // Sweet spot: P1dB − 3 dB, clamped to the observed input range.
+    // Sweet spot: P1dB − 6 dB, clamped to the observed input range.
+    // 6 dB back-off (instead of the textbook 3 dB) keeps the rig
+    // comfortably linear for traffic with PAPR up to ~5 dB; 3 dB sits
+    // right at the compression elbow with no headroom for envelope
+    // peaks, which we observed in OTA testing 2026-05-14.
     let sweet = if p1db.is_finite() && !am_am.is_empty() {
         let lo = am_am.first().map(|t| t.0).unwrap_or(p1db);
-        (p1db - 3.0).max(lo)
+        (p1db - 6.0).max(lo)
     } else if !samples.is_empty() {
         // No compression observed in the sweep: pick the highest-SNR
         // segment as a fallback recommendation.
@@ -1116,11 +1120,15 @@ mod tests {
             "p1db {} expected ≈ -1",
             m.p1db_dbfs,
         );
-        // Sweet spot = P1dB − 3 dB ≈ -4 dBFS.
+        // Sweet spot = P1dB − 6 dB ≈ -7 dBFS (clamped to lowest tested
+        // level if the schedule didn't reach that low).
+        let lowest_tested = -30.0_f32; // matches the stamps generated above
+        let expected = (m.p1db_dbfs - 6.0).max(lowest_tested);
         assert!(
-            (m.sweet_spot_dbfs - (m.p1db_dbfs - 3.0)).abs() < 0.1,
-            "sweet {} vs p1db {}",
+            (m.sweet_spot_dbfs - expected).abs() < 0.1,
+            "sweet {} vs expected {} (p1db {})",
             m.sweet_spot_dbfs,
+            expected,
             m.p1db_dbfs,
         );
     }

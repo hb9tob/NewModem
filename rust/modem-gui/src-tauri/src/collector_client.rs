@@ -184,6 +184,10 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
 /// the on-disk file — the on-disk layout differs between TX-rendered
 /// soundings (`<id>/signature.json`) and RX-standalone soundings
 /// (`<capture-stem>.signature.json` next to the WAV).
+///
+/// Field names match the server's `ReportMeta` schema verbatim
+/// (`rust/newmodem-collector/src/main.rs:132`) so the deserialiser on
+/// the other end is happy without an extra translation step.
 #[derive(Debug, Deserialize)]
 pub struct SubmitSoundingArgs {
     /// Absolute path to the capture WAV (whichever it sits, including
@@ -195,16 +199,29 @@ pub struct SubmitSoundingArgs {
     /// the frontend received from `sounding_analyze`. Stored verbatim
     /// as `report.json` on the server.
     pub signature_json: String,
-    /// Free-form rig-chain summary (TX rig, RX rig, relay) from the
-    /// sounder RX form. Surfaces in metadata.json alongside the
-    /// signature's own embedded metadata.
+    /// Local-station Maidenhead grid (`JN36ld`, …). Filled from
+    /// `Settings.locator`.
     #[serde(default)]
-    pub equipment: Option<String>,
+    pub locator: Option<String>,
+    /// Sounder profile (typically the family: `fm`, `qo100`, `ssb_hf`
+    /// — or the sounder-rx mode dropdown selection).
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Relay/repeater name if the run went over one (else
+    /// `"none"`/null). Surfaces from `sounder-rx-relay`.
+    #[serde(default)]
+    pub relay: Option<String>,
+    /// Far-end transmitter model. Surfaces from `sounder-rx-tx-model`.
+    #[serde(default)]
+    pub tx_model: Option<String>,
+    /// Free-form notes. The frontend prepends the RX rig model here
+    /// because the collector schema doesn't (yet) have a dedicated
+    /// `rx_model` field.
     #[serde(default)]
     pub notes: Option<String>,
     /// When `true` the capture WAV (typically 5–30 MiB) is attached to
     /// the multipart so the server can re-run analysis. Capped at the
-    /// collector's `--max-upload-mb` (50 MiB by default).
+    /// collector's `--max-upload-mb`.
     #[serde(default)]
     pub include_wav: bool,
 }
@@ -238,13 +255,27 @@ pub async fn submit_sounding(args: SubmitSoundingArgs) -> Result<SubmitResult, S
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Match the server's ReportMeta schema fields one-for-one
+    // (callsign, locator, profile, relay, tx_model, notes,
+    // gui_version, timestamp). We keep a non-schema `source` marker so
+    // the same endpoint can later branch RX captures vs soundings if
+    // needed — extra fields are tolerated by serde, the parsed struct
+    // simply ignores them.
+    let locator = args.locator.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let profile = args.profile.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let relay = args.relay.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let tx_model = args.tx_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let notes = args.notes.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let metadata = serde_json::json!({
         "callsign": callsign,
-        "source": "sounding",
-        "equipment": args.equipment,
-        "notes": args.notes,
+        "locator": locator,
+        "profile": profile,
+        "relay": relay,
+        "tx_model": tx_model,
+        "notes": notes,
         "gui_version": env!("CARGO_PKG_VERSION"),
         "timestamp": ts,
+        "source": "sounding",
     });
     let metadata_bytes = serde_json::to_vec(&metadata)
         .map_err(|e| format!("metadata serialize: {e}"))?;
