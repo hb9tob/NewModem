@@ -4924,12 +4924,12 @@ async function runSounderAnalyze() {
   }
 }
 
-// Integrated capture + analyse toggle for the RX panel. First click =
-// start a raw soundcard recording (the RX pipeline must already be
-// running — same prerequisite as the legacy "⏺ capture brute"
-// button); second click = stop the recording, then immediately fire
-// the analyser. The WAV path is auto-stitched into the analyse
-// input.
+// Integrated capture + analyse toggle for the RX panel. Independent
+// of the modem rx_worker — the Sounder tab stops the worker so the
+// audio device is free. First click = spin up a standalone cpal/SDR
+// → WAV writer; second click = stop the writer, finalise the WAV,
+// then immediately fire the analyser. The WAV path auto-fills the
+// analyse input.
 let sounderRxRecording = false;
 async function runSounderRxCaptureToggle() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
@@ -4937,8 +4937,22 @@ async function runSounderRxCaptureToggle() {
   const btn = document.getElementById("sounder-rx-capture-toggle");
   const analyseBtn = document.getElementById("sounder-an-run");
   if (!sounderRxRecording) {
+    // Reuse the RX device the user has already configured in
+    // Paramètres — same dropdown as the main RX play button.
+    const deviceSelect = document.getElementById("rx-device-select");
+    const deviceName = deviceSelect ? deviceSelect.value : "";
+    if (!deviceName) {
+      setSounderStatus(
+        "sounder-an-status",
+        "Sélectionner une carte RX dans Paramètres",
+        "err",
+      );
+      return;
+    }
     try {
-      const path = await invoke("start_raw_recording");
+      const path = await invoke("sounding_rx_start_capture", {
+        deviceName,
+      });
       sounderRxRecording = true;
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = path;
@@ -4956,7 +4970,7 @@ async function runSounderRxCaptureToggle() {
     }
   } else {
     try {
-      const info = await invoke("stop_raw_recording");
+      const info = await invoke("sounding_rx_stop_capture");
       sounderRxRecording = false;
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = info.path;

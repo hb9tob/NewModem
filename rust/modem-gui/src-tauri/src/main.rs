@@ -75,6 +75,18 @@ struct CaptureSession {
     device_name: String,
 }
 
+/// Standalone sound-card → WAV capture used exclusively by the
+/// Sounder tab. Independent of [`CaptureSession`] (the modem
+/// rx_worker is intentionally stopped while sounding so the cpal/SDR
+/// device is free for raw capture; see Canal-tab tab-switch logic).
+struct SounderCapture {
+    capture: CaptureKind,
+    /// Drains the sample receiver into a 16-bit mono WAV. Returns
+    /// `(path, samples_written)` when the receiver hangs up (= the
+    /// capture handle is dropped on stop).
+    writer_thread: Option<std::thread::JoinHandle<(PathBuf, usize)>>,
+}
+
 struct AppState {
     session: Mutex<Option<CaptureSession>>,
     save_dir: Arc<Mutex<PathBuf>>,
@@ -86,6 +98,7 @@ struct AppState {
     tx_payload_path: Arc<Mutex<Option<PathBuf>>>,
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
+    sounder_capture: Mutex<Option<SounderCapture>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -654,8 +667,14 @@ struct RawRecordingStatus {
     duration_sec: f64,
 }
 
-/// Arm raw-audio capture. Returns the absolute path of the new WAV. Fails if
-/// a recording is already in progress.
+/// Arm raw-audio capture. Returns the absolute path of the new WAV.
+/// Fails if a recording is already in progress.
+///
+/// Note: this just attaches a WavSink to the existing capture pipeline.
+/// If `start_capture` isn't running, the file stays empty. For the
+/// sounder use case (Canal tab intentionally stops the worker to free
+/// the pipeline), see `sounding_rx_start_capture` which spins up its
+/// own standalone cpal input → WavSink without the rx_worker.
 #[tauri::command]
 fn start_raw_recording(state: State<'_, AppState>) -> Result<String, String> {
     let mut sink_guard = state.wav_sink.lock().map_err(|e| e.to_string())?;
@@ -1524,6 +1543,139 @@ fn release_ptt(slot: &SharedPtt) {
     }
 }
 
+/// Open `device_name` (same composite-name form as `start_capture`:
+/// `<backend>:<id>` for SDRs, plain cpal name otherwise) and dump
+/// every received sample to a 48 kHz / 16-bit / mono WAV under the
+/// configured save_dir. Returns the absolute path of the WAV.
+///
+/// This is **independent of the rx_worker / modem decoding pipeline**:
+/// the Sounder tab intentionally stops the worker before sounding so
+/// the cpal/SDR device is free for raw capture. The writer thread
+/// just drains the same `Receiver<Vec<f32>>` the worker would have
+/// consumed, but writes it to disk instead of running the demodulator.
+#[tauri::command]
+fn sounding_rx_start_capture(
+    device_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut guard = state.sounder_capture.lock().map_err(|e| e.to_string())?;
+    if guard.is_some() {
+        return Err("Capture sondeur déjà active".into());
+    }
+    if state.session.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return Err(
+            "Arrêter d'abord la réception (▶) avant d'utiliser le sondeur — \
+             le device audio doit être libre"
+                .into(),
+        );
+    }
+    if device_name.trim().is_empty() {
+        return Err("Sélectionner une carte RX dans Paramètres".into());
+    }
+
+    let cfg = settings::load();
+    let (capture, samples_rx) = if let Some((backend, device_id)) =
+        sdr_registry::parse_composite_name(&device_name)
+    {
+        let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
+        let descriptor = DeviceDescriptor::new(
+            backend.id(),
+            device_id,
+            format!("{}:{device_id}", backend.id()),
+        );
+        let mut device = backend
+            .open(&descriptor, &sdr_cfg)
+            .map_err(|e| format!("{}: {e}", backend.id()))?;
+        let (cap_handle, rx) = device
+            .start_rx()
+            .map_err(|e| format!("{}: {e}", backend.id()))?;
+        (CaptureKind::Sdr(device, cap_handle), rx)
+    } else {
+        let (h, rx) = cpal_capture::start(&device_name)?;
+        (CaptureKind::Cpal(h), rx)
+    };
+
+    let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("capture-{ts}.wav"));
+    let path_str = path.to_string_lossy().into_owned();
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: modem_core_base::types::AUDIO_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&path, spec)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+
+    let path_thread = path.clone();
+    let writer_thread = std::thread::spawn(move || {
+        let mut total = 0_usize;
+        // `samples_rx.recv()` returns Err once every sender has been
+        // dropped — that's exactly what happens on stop, when the
+        // CaptureKind goes out of scope and shuts down the cpal/SDR
+        // backend.
+        while let Ok(chunk) = samples_rx.recv() {
+            for &s in &chunk {
+                let v = (s.clamp(-1.0, 1.0) * 32_767.0) as i16;
+                let _ = w.write_sample(v);
+            }
+            total += chunk.len();
+        }
+        let _ = w.finalize();
+        (path_thread, total)
+    });
+
+    *guard = Some(SounderCapture {
+        capture,
+        writer_thread: Some(writer_thread),
+    });
+    Ok(path_str)
+}
+
+/// Stop the standalone sounder capture: drops the [`CaptureKind`]
+/// (which closes the cpal/SDR backend → the writer thread's recv()
+/// errors out → it finalises the WAV and exits), then joins the
+/// writer thread and returns the final path + sample count.
+#[tauri::command]
+fn sounding_rx_stop_capture(
+    state: State<'_, AppState>,
+) -> Result<RawRecordingStatus, String> {
+    let cap = {
+        let mut guard = state
+            .sounder_capture
+            .lock()
+            .map_err(|e| e.to_string())?;
+        guard
+            .take()
+            .ok_or_else(|| "Aucune capture sondeur active".to_string())?
+    };
+    let SounderCapture {
+        capture,
+        writer_thread,
+    } = cap;
+    // Shut the device down first → the writer thread sees recv() Err
+    // and exits cleanly.
+    capture.stop();
+    let (path, samples) = if let Some(t) = writer_thread {
+        t.join()
+            .map_err(|_| "Writer thread panicked".to_string())?
+    } else {
+        return Err("Pas de writer thread".into());
+    };
+    Ok(RawRecordingStatus {
+        path: path.to_string_lossy().into_owned(),
+        samples: samples as u64,
+        duration_sec: samples as f64
+            / modem_core_base::types::AUDIO_RATE as f64,
+    })
+}
+
 /// Run the sounder analyser on a recorded capture WAV. Writes
 /// `signature.json` next to the capture and returns the signature so
 /// the GUI can render the derived parameters directly.
@@ -1732,6 +1884,7 @@ fn main() {
                 tx_payload_path: Arc::new(Mutex::new(None)),
                 tx_handle: Mutex::new(None),
                 ptt,
+                sounder_capture: Mutex::new(None),
             });
             // Auto-kiosk on tiny touchscreens (e.g. Pi 7" 800x480) or
             // when `NBFM_KIOSK=1` is set in the environment. Both paths
@@ -1833,6 +1986,8 @@ fn main() {
             delete_history_item,
             sounding_tx_render,
             sounding_tx_emit,
+            sounding_rx_start_capture,
+            sounding_rx_stop_capture,
             sounding_analyze,
         ])
         .run(tauri::generate_context!())

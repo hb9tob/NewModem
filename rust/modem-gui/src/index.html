@@ -570,9 +570,12 @@
           <fieldset class="sounder-rx">
             <legend>Sondeur — capture + analyse RX</legend>
             <p class="tx-hint">
-              Renseignez la chaîne (équipement TX, équipement RX, relais
-              éventuel, mode), cliquez <strong>Démarrer la capture</strong>,
-              demandez au TX d'émettre la séquence, puis cliquez
+              Renseignez la chaîne (équipement TX, équipement RX,
+              relais éventuel, mode), cliquez
+              <strong>Démarrer la capture</strong> (la capture
+              utilise directement le device RX des Paramètres,
+              indépendamment du worker), demandez au TX d'émettre la
+              séquence, puis cliquez
               <strong>Arrêter &amp; analyser</strong>. La référence
               <code>schedule.json</code> est régénérée localement
               (déterministe) — pas de fichier à transférer.
