@@ -1536,7 +1536,18 @@ pub fn rx_v3_after(
     let preamble_syms = preamble::make_preamble_for_config(config);
     let mut positions = {
         let _t = StageTimer::new(PerfStage::FindPreamble);
-        sync::find_all_preambles(&mf, &preamble_syms, sps, pitch, config.beta)
+        // Low-power live worker (`allow_legacy_grid = false` AND
+        // `finalize = false`) caps the per-tick search at 2 preambles :
+        // one CLOSED to decode + one boundary that stays in the buffer
+        // for next tick's re-scan with a fresh Gardner. Desktop / CLI /
+        // tests (`finalize = true` or grid allowed) keep the uncapped
+        // behaviour so multi-SF buffers fully decode in one call.
+        let max_positions = if !allow_legacy_grid && !finalize {
+            Some(2)
+        } else {
+            None
+        };
+        sync::find_all_preambles(&mf, &preamble_syms, sps, pitch, config.beta, max_positions)
     };
     if positions.is_empty() {
         return None;
@@ -1593,6 +1604,16 @@ pub fn rx_v3_after(
     // `chosen_ppm`, which is gated to CLOSED windows because it feeds
     // the OPEN-window hint path.
     let mut reported_ppm: f64 = 0.0;
+    // Deepest preamble whose window actually decoded (Some(r) returned)
+    // in this call. Reported back as `last_preamble_offset` so the
+    // worker advances its `session_buffer` watermark only past
+    // *processed* preambles -- any tail position that was skipped
+    // (low-power cap deferring the boundary to next tick, or OPEN
+    // window in non-finalize mode) stays in the buffer for re-scan.
+    // Fallback to `positions.last()` when nothing decoded, so a
+    // hard-failing tick still drains the head and lets the worker
+    // re-arm next tick.
+    let mut last_processed: Option<usize> = None;
 
     for (i, &p) in positions.iter().enumerate() {
         let start = p.saturating_sub(margin).min(samples.len());
@@ -1688,6 +1709,9 @@ pub fn rx_v3_after(
         let Some(r) = r_opt else {
             continue;
         };
+        // Decode succeeded -- this preamble is now consumed and the
+        // worker may drain everything up to (p - TRUNCATE_MARGIN_MS).
+        last_processed = Some(p);
         if is_closed {
             chosen_ppm = r.drift_ppm;
             have_hint = true;
@@ -1793,7 +1817,10 @@ pub fn rx_v3_after(
     // the skip_until filter, so `.last()` is Some). The caller (rx_worker)
     // uses this to truncate its rolling capture buffer right behind P_last,
     // turning the buffer into a self-purging queue.
-    let last_preamble_offset = positions.last().copied();
+    // Watermark = deepest *processed* preamble. Falls back to the last
+    // seen position when no decode succeeded so the worker still drains
+    // past a hard-failing burst instead of pinning the buffer.
+    let last_preamble_offset = last_processed.or_else(|| positions.last().copied());
 
     Some(RxV2Result {
         data: assembled,
@@ -2815,6 +2842,64 @@ mod tests {
             ah.k_symbols, result.data_blocks_recovered,
         );
         assert_eq!(&result.data[..data.len()], &data[..]);
+    }
+
+    /// Axis 2 : low-power live worker tick (`allow_legacy_grid = false`,
+    /// `finalize = false`) caps the per-tick scan at 2 preambles. On a
+    /// 3+ SF audio buffer, the call decodes only the first CLOSED
+    /// window (positions[0]) and surfaces it via
+    /// `last_preamble_offset`. The second preamble stays in the
+    /// caller's buffer for the next tick's re-scan, where Gardner is
+    /// re-estimated fresh -- the property the user requested.
+    ///
+    /// Compares against the same buffer decoded with `finalize = true`
+    /// (= one-shot CLI semantics, no cap) which must walk every
+    /// preamble and recover the full payload.
+    #[test]
+    fn rx_v3_after_lowpower_one_sf_per_tick() {
+        let config = profile_high();
+        // 15 kB payload triggers several superframe wraps on HIGH (same
+        // size as the loopback_v3_high_sliding_window test above).
+        let data: Vec<u8> = (0..15_000)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect();
+        let samples = tx_v3(&data, &config, 0xC0DE_BEEFu32);
+
+        // Uncapped: finalize=true => no cap, decodes every SF.
+        let uncapped = rx_v3_after(&samples, &config, 0, true, None, true)
+            .expect("uncapped rx_v3_after returned None");
+
+        // Capped: live-worker pattern (finalize=false, allow_legacy_grid=false).
+        let capped = rx_v3_after(&samples, &config, 0, false, None, false)
+            .expect("capped rx_v3_after returned None");
+
+        eprintln!(
+            "Axis-2 cap: uncapped segs={} converged={} last_off={:?}  |  capped segs={} converged={} last_off={:?}",
+            uncapped.segments_decoded,
+            uncapped.converged_blocks,
+            uncapped.last_preamble_offset,
+            capped.segments_decoded,
+            capped.converged_blocks,
+            capped.last_preamble_offset,
+        );
+
+        // Cap must produce STRICTLY FEWER decoded segments than uncapped
+        // on a multi-SF buffer (else the cap had no effect).
+        assert!(
+            capped.segments_decoded < uncapped.segments_decoded,
+            "cap must throttle multi-SF buffer: capped segs={} vs uncapped segs={}",
+            capped.segments_decoded, uncapped.segments_decoded,
+        );
+
+        // Watermark must point at a position STRICTLY EARLIER than the
+        // uncapped run's last offset -- meaning at least one preamble
+        // remains in the buffer for the next tick to re-find.
+        let cap_off = capped.last_preamble_offset.expect("capped watermark");
+        let unc_off = uncapped.last_preamble_offset.expect("uncapped watermark");
+        assert!(
+            cap_off < unc_off,
+            "capped watermark must be earlier than uncapped: {cap_off} >= {unc_off}",
+        );
     }
 
     /// Axis 1 regression : on a clean drift-free single-SF buffer, the

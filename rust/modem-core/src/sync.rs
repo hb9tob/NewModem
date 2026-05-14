@@ -76,12 +76,26 @@ pub fn find_preamble(
 ///
 /// Returns sorted sample indices. Empty vec if no candidate clears the
 /// threshold (e.g. a noise-only buffer).
+/// Sweep `mf` for every preamble landing and return their sample
+/// indices in ascending temporal order.
+///
+/// `max_positions` caps the returned vector after NMS + fine refine.
+/// `None` (default) returns every NMS survivor — desktop / CLI / tests.
+/// `Some(N)` keeps the **earliest-in-time** N survivors — low-power
+/// callers (Pi 4 `rx_v3_after` on live worker ticks) use `Some(2)` so
+/// each tick decodes at most one CLOSED window (positions[0]) plus the
+/// boundary preamble (positions[1]) ; the boundary stays in
+/// `session_buffer` for the next tick and is re-found there with a
+/// fresh per-window Gardner estimate. The cap is applied AFTER the NMS
+/// sort, so the fine-refine loop (which dominates the call cost on
+/// busy buffers) only runs `cap+1` times instead of N.
 pub fn find_all_preambles(
     mf: &[Complex64],
     preamble_syms: &[Complex64],
     _sps: usize,
     pitch: usize,
     _beta: f64,
+    max_positions: Option<usize>,
 ) -> Vec<usize> {
     // [perf] Optional instrumentation gated by `MODEM_PERF=1`. Splits
     // `find_all_preambles` into its 3 sub-stages (coarse scan, NMS,
@@ -148,6 +162,16 @@ pub fn find_all_preambles(
         }
     }
     kept.sort();
+    // Cap AFTER the time-sort so we get the temporally-earliest N. This
+    // pairs with `rx_v3_after`'s positions-loop semantics : the first
+    // entry is decoded as CLOSED (next entry serves as closing boundary)
+    // and any tail beyond the cap is naturally deferred to the next tick
+    // via the `session_buffer` watermark.
+    if let Some(cap) = max_positions {
+        if kept.len() > cap {
+            kept.truncate(cap);
+        }
+    }
     let nms_us = t_nms.map(|t| t.elapsed().as_micros()).unwrap_or(0);
     let n_kept = kept.len();
 
@@ -310,5 +334,82 @@ mod tests {
     fn fse_decim_96() {
         // tau=1, sps=96, pitch=96 -> d_fse=48
         assert_eq!(fse_decim_factor(96, 96), 48);
+    }
+
+    /// Build a synthetic `mf` buffer with `n` preamble landings spaced
+    /// `spacing` samples apart. The matched-filter output at a perfect
+    /// landing equals the preamble autocorrelation (= sum |syms[k]|^2,
+    /// real and large) at index `p`, so `find_all_preambles` should
+    /// surface exactly those `p` values.
+    fn synth_mf_with_peaks(
+        preamble: &[Complex64],
+        pitch: usize,
+        landings: &[usize],
+        total_len: usize,
+    ) -> Vec<Complex64> {
+        let mut mf = vec![Complex64::new(0.0, 0.0); total_len];
+        for &p in landings {
+            for (k, &sym) in preamble.iter().enumerate() {
+                let idx = p + k * pitch;
+                if idx < mf.len() {
+                    mf[idx] = sym;
+                }
+            }
+        }
+        mf
+    }
+
+    /// Reference preamble large enough to produce a sharp
+    /// autocorrelation in the synthetic buffer. Uses the production
+    /// preamble (256 symbols, designed for clean autocorrelation) so
+    /// off-peak side lobes stay well under the 0.3×max NMS threshold.
+    fn synth_preamble() -> Vec<Complex64> {
+        crate::preamble::make_preamble()
+    }
+
+    /// Axis 2 : with `max_positions = Some(2)` the cap kicks in after
+    /// NMS sort. Verify the function returns exactly 2 of the 4
+    /// injected preamble peaks, and that the kept pair is the
+    /// temporally earliest (positions[0] and positions[1] of the
+    /// uncapped result).
+    ///
+    /// Uses pitch=1 so the coarse scan steps every sample and lands
+    /// directly on each injected peak -- avoids the alignment issues
+    /// you'd get from a real-profile pitch (e.g. 30) where coarse
+    /// stride misses peaks unless they're multiples of pitch.
+    #[test]
+    fn find_all_preambles_caps_at_max() {
+        let pre = synth_preamble();
+        let pitch = 1usize;
+        let min_sep = (pre.len() * pitch) / 2; // 64 / 2 = 32
+        let landings = [100usize, 100 + 2 * min_sep, 100 + 4 * min_sep, 100 + 6 * min_sep];
+        let total = landings.last().unwrap() + pre.len() * pitch + 100;
+        let mf = synth_mf_with_peaks(&pre, pitch, &landings, total);
+
+        let uncapped = find_all_preambles(&mf, &pre, 1, pitch, 0.0, None);
+        assert_eq!(uncapped.len(), 4, "all 4 peaks should survive NMS");
+
+        let capped = find_all_preambles(&mf, &pre, 1, pitch, 0.0, Some(2));
+        assert_eq!(capped.len(), 2, "cap=Some(2) must truncate to 2");
+        // After-NMS truncation happens post `kept.sort()`, so the kept
+        // pair is the earliest in time -- matches the first two of the
+        // uncapped result.
+        assert_eq!(capped[0], uncapped[0]);
+        assert_eq!(capped[1], uncapped[1]);
+    }
+
+    /// Axis 2 regression : `max_positions = None` must preserve the
+    /// pre-0.10.30 behaviour (return every NMS survivor).
+    #[test]
+    fn find_all_preambles_no_cap_unchanged() {
+        let pre = synth_preamble();
+        let pitch = 1usize;
+        let min_sep = (pre.len() * pitch) / 2;
+        let landings = [50usize, 50 + 2 * min_sep, 50 + 4 * min_sep];
+        let total = landings.last().unwrap() + pre.len() * pitch + 50;
+        let mf = synth_mf_with_peaks(&pre, pitch, &landings, total);
+
+        let positions = find_all_preambles(&mf, &pre, 1, pitch, 0.0, None);
+        assert_eq!(positions.len(), 3, "no cap = all 3 peaks returned");
     }
 }
