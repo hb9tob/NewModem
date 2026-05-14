@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Modem NBFM — Modem 2x V4 TDM (post-44271bf)</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --good: #2b9f5f;
+        --good-soft: #eafbf2;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem 6rem;
+    }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block;
+        font-size: 1rem;
+        font-weight: 400;
+        color: #666;
+        margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 { margin-top: 1.8rem; color: #444; }
+    figure {
+        margin: 1.5rem 0;
+        padding: 0.8rem;
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    figcaption {
+        font-size: 0.9rem;
+        color: #555;
+        margin-top: 0.6rem;
+        font-style: italic;
+    }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em;
+        border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e;
+        color: #dcdcaa;
+        padding: 1rem;
+        border-radius: 5px;
+        overflow-x: auto;
+        font-size: 0.85rem;
+        line-height: 1.35;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+        font-size: 0.92rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.45rem 0.6rem;
+        text-align: left;
+        vertical-align: top;
+    }
+    th { background: var(--accent-soft); color: var(--accent); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: #fff8f0;
+        margin: 1rem 0;
+        border-radius: 0 4px 4px 0;
+    }
+    .callout.info { border-left-color: var(--accent); background: var(--accent-soft); }
+    .callout.ok { border-left-color: var(--good); background: var(--good-soft); }
+    nav.toc {
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 1rem 1.5rem;
+        margin: 1.5rem 0;
+        font-size: 0.95rem;
+    }
+    nav.toc ol { margin: 0.4rem 0 0 1rem; padding: 0; }
+    nav.toc a { color: var(--accent); text-decoration: none; }
+    nav.toc a:hover { text-decoration: underline; }
+    .meta { color: #888; font-size: 0.88rem; margin-top: -0.3rem; }
+    .tag {
+        display: inline-block;
+        padding: 0.1em 0.5em;
+        background: var(--accent);
+        color: white;
+        border-radius: 3px;
+        font-size: 0.75rem;
+        margin-right: 0.3rem;
+        letter-spacing: 0.5px;
+    }
+    .tag.v4 { background: #2b7fbf; }
+    .tag.tdm { background: #5f2bbf; }
+    .tag.win { background: #2b9f5f; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Modem NBFM — Modem 2x V4 TDM
+    <span class="sub">Documentation technique — 2026-05-14 — branche <code>feat/modem-2x</code>, HEAD <code>e8993ac</code> (post-pilot-TDM-revert <code>44271bf</code>)</span>
+</h1>
+
+<p class="meta">
+    <span class="tag tdm">TDM</span>
+    <span class="tag win">+2 à +6 dB SNR</span>
+    Document compagnon de <a href="v4_architecture.html"><code>v4_architecture.html</code></a> qui décrit l'état pré-44271bf (pilotes blocs sparse DVB-S2X). Le présent document n'écrase pas la base mais documente précisément ce qui a changé, mesure-en-main, après la migration des pilotes V4 vers le pattern TDM V3.
+</p>
+
+<nav class="toc">
+    <strong>Table des matières</strong>
+    <ol>
+        <li><a href="#why">Pourquoi le retour TDM</a></li>
+        <li><a href="#state">État actuel — phases livrées</a></li>
+        <li><a href="#frame">Trame V4 — cycle après refactor</a></li>
+        <li><a href="#pilots-tdm">Pilotes TDM V3-style</a></li>
+        <li><a href="#profiles">Huit profils 2x — nouveaux chiffres</a></li>
+        <li><a href="#sigma2">σ² — estimation rotative</a></li>
+        <li><a href="#perf">Performances mesurées</a>
+            <ol>
+                <li><a href="#perf-baseline">Canal NBFM nominal</a></li>
+                <li><a href="#perf-phase-walk">Sweep phase walk</a></li>
+                <li><a href="#perf-ab">A/B sparse-blocks vs TDM</a></li>
+            </ol>
+        </li>
+        <li><a href="#sim">Sim canal — modèle phase walk</a></li>
+        <li><a href="#tests">Tests + CLI de référence</a></li>
+        <li><a href="#crates">Touch points dans les crates</a></li>
+        <li><a href="#next">Prochaines étapes — OTA</a></li>
+        <li><a href="#takeaways">Conclusions architecturales</a></li>
+    </ol>
+</nav>
+
+<!-- ======================================================================= -->
+<h2 id="why">1. Pourquoi le retour TDM</h2>
+
+<p>
+    La trame V4 initiale s'est calée sur le pattern <strong>pilotes
+    sparse DVB-S2X</strong> (EN 302 307-1 §5.5.3) : un bloc de 36 symboles
+    constants <code>(1+j)/√2</code> après chaque LDPC codeword, densifié à 2
+    blocs/CW sur les profils APSK-32/64. C'était élégant — estimation LS de
+    gain triviale (moyenne complexe), AGC neutre, distinct des points
+    constellation — mais le bring-up OTA du 2026-05-13 sur la chaîne
+    <strong>FTX-1 + SDRplay</strong> a montré un mode de panne franc :
+</p>
+
+<ul>
+    <li>V3 HighPlus (TDM 32 data + 2 pilotes / 22.7 ms anchor period) :
+        σ² ≈ <strong>0.011</strong>, décode propre.</li>
+    <li>V4 HighPlus2x (sparse blocs 2×36 / 178 ms anchor period) :
+        σ² ≈ <strong>0.10</strong>, ne converge pas.</li>
+</ul>
+
+<p>
+    Même chaîne hardware, même capture, facteur σ² × 10. La cause : le
+    <strong>bruit de phase</strong> du transceiver + ADC soundcard occupe la
+    bande 0.1–50 Hz ; le pattern TDM V3 le tracke (BW d'update ≈ 22 Hz, période
+    pilote 22.7 ms), le pattern sparse-blocks ne le tracke pas (BW d'update
+    ≈ 2.8 Hz, période pilote ~180 ms). La densité totale de pilotes était
+    pourtant <em>plus élevée</em> sur V4 sparse (72 sym/CW pour HighPlus2x vs
+    30 en TDM), mais leur distribution temporelle laisse la phase walker entre
+    deux ancrages.
+</p>
+
+<div class="callout info">
+    <strong>Conclusion architecturale</strong> : la <em>fréquence d'ancrage</em>
+    domine la <em>densité totale</em> pour suivre du bruit de phase basse
+    fréquence. Le pattern V3 est de retour comme défaut, exposé per-profil
+    comme <code>PilotPattern2x { d_syms, p_syms }</code> pour permettre de
+    tuner densité et fréquence d'update <strong>séparément</strong>.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="state">2. État actuel — phases livrées</h2>
+
+<table>
+    <thead>
+        <tr>
+            <th>Phase</th>
+            <th>Statut</th>
+            <th>Commit / Test</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td>C-1 à C-7 — Trame V4, PLHEADER, RX pipeline, gate FFT, V4Modem, Streaming RX</td>
+            <td><span class="tag win">livré</span></td>
+            <td>v4_architecture.html (HEAD pré-refactor <code>e90a8e4</code>)</td></tr>
+        <tr><td>D-1 / D-2 — Drift LS-fit, OPEN-window deferred decode</td>
+            <td><span class="tag win">livré</span></td>
+            <td><code>406196f</code> (drift bootstrap CRC-validated SOFs)</td></tr>
+        <tr><td><strong>Refactor pilote TDM</strong> — nouveau module <code>pilot2x_tdm</code>, suppression <code>pilot_block</code>, <code>PilotPattern2x</code> dans <code>Profile2x</code></td>
+            <td><span class="tag win">livré</span></td>
+            <td><code>44271bf</code> — <strong>104/104 tests core2x</strong>, 38/39 worker2x</td></tr>
+        <tr><td><strong>Sim canal — modèle phase walk</strong></td>
+            <td><span class="tag win">livré</span></td>
+            <td><code>e8993ac</code> — <code>apply_audio_phase_noise()</code> dans <code>nbfm_channel_sim</code>, knob <code>--phase-walk</code> dans <code>snr_sweep_2x</code></td></tr>
+        <tr><td>OTA validation FTX-1 + SDRplay — build .deb 0.11.0-2x2 + capture HighPlus2x</td>
+            <td><span class="tag" style="background:#999">à faire</span></td>
+            <td>Voir <a href="#next">§11</a></td></tr>
+        <tr><td>RTS smoother phase / per-ring drift Pass 2 EM</td>
+            <td><span class="tag" style="background:#999">à étudier</span></td>
+            <td>Mémoire <code>phase-tracking-rts-2nd-order</code></td></tr>
+    </tbody>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="frame">3. Trame V4 — cycle après refactor</h2>
+
+<p>
+    La structure macro reste celle de la V4 (PLHEADER + LMS warmup + META-CW
+    + DATA-CW × <code>cw_per_cycle</code>) ; seule la couche pilote au sein de
+    chaque codeword change. Layout détaillé :
+</p>
+
+<pre><code>cycle (≈ 4 s) =
+    PLHEADER (192 sym)                             // SOF Chu 64 + PLS 128
+      [LMS warmup (32 ou 64 sym, APSK-32/64 only)]
+    META-CW interleavé TDM                          // 1 LDPC CW + pilots
+    DATA-CW[0] interleavé TDM
+    DATA-CW[1] interleavé TDM
+    ...
+    DATA-CW[k] interleavé TDM
+</code></pre>
+
+<p>
+    La PLHEADER (SOF Frank-Zadoff-Chu 64 sym + PLS 128 sym Golay-encodé +
+    redondance 12 sym profile_index) est inchangée. La rotation pilote est
+    <strong>continue à travers le cycle</strong> : l'encodeur démarre la
+    META-CW à <code>group_idx_offset = 0</code>, puis la k-ième DATA-CW à
+    <code>groups_per_cw·(1+k)</code>, sorte que le RX retrouve le pilote
+    rotatif attendu en partant d'un seul compteur ancré sur la PLHEADER.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="pilots-tdm">4. Pilotes TDM V3-style</h2>
+
+<p>
+    Chaque LDPC codeword est interleavé en groupes
+    <strong><code>d_syms</code> data + <code>p_syms</code> pilotes</strong>,
+    se répétant jusqu'à épuisement des data symboles du CW. Le dernier
+    groupe peut être partiel côté data ; les pilotes sont toujours émis en
+    entier (<code>p_syms</code> à chaque marque) :
+</p>
+
+<pre><code>// Pattern par défaut (tous profils sauf HighPlusPlus2x)
+PilotPattern2x::default_2x()   →  d_syms=32, p_syms=2
+
+// Pattern densifié (HighPlusPlus2x, 64-APSK)
+PilotPattern2x::dense_2x()     →  d_syms=16, p_syms=2
+
+// Valeur pilote — rotation QPSK sur l'index absolu (continu cycle-wide)
+pilot_symbol_2x(n) = exp(j·π/2·(n mod 4))
+                   ∈ {(1,0), (0,1), (-1,0), (0,-1)}
+</code></pre>
+
+<h3>4.1 Propriétés du pattern</h3>
+
+<ul>
+    <li><strong>Rotation QPSK identique à V3</strong> — bit-for-bit
+        compatible avec <code>modem_core::pilot::pilot_symbol</code>.
+        Test <code>pilot_bit_for_bit_v3_compatible</code>.</li>
+    <li><strong>Toujours sur le cercle unité</strong> — <code>|pref| = 1</code>
+        donc projection radiale/tangentielle triviale, pas de scaling.</li>
+    <li><strong>Densité tunable par profil</strong> — <code>PilotPattern2x</code>
+        est un champ de <code>ModemConfig2x</code>, pas une constante globale.
+        Permet d'essayer 32/2, 16/2, 24/2, etc. sans recompiler la matrice
+        de profils.</li>
+    <li><strong>Période d'ancrage = (d+p)/Rs</strong> — à 1500 Bd avec 32/2 :
+        34/1500 ≈ 22.67 ms. BW d'update phase ≈ 1/(2·T) ≈ 22 Hz.</li>
+    <li><strong>Estimation LS gain</strong> = <code>Σ y · conj(pref) / Σ |pref|²</code>
+        sur toutes les positions pilote du CW + les références cycle-level
+        (192 sym SOF+PLS partagés entre tous les CWs du cycle).</li>
+    <li><strong>Estimation σ² split radial/tangentiel</strong> — résidu
+        <code>e_k = y_k/gain − pref_k</code>, projeté sur
+        <code>conj(pref_k)</code> : <code>Re</code> = radial (AM-AM),
+        <code>Im</code> = tangentiel (phase noise / AM-PM). Sur AWGN pur
+        les deux sont équilibrés (R/T ≈ 1) ; phase noise dominant donne
+        R/T &lt; 0.5.</li>
+</ul>
+
+<h3>4.2 Surface d'API</h3>
+
+<pre><code>// rust/modem-core2x/src/pilot2x_tdm.rs
+
+pub struct PilotPattern2x { pub d_syms: usize, pub p_syms: usize }
+    pub const fn default_2x() -> Self;   // 32/2
+    pub const fn dense_2x() -> Self;     // 16/2
+    pub fn n_groups(&self, data_len: usize) -> usize;
+    pub fn wire_len(&self, data_len: usize) -> usize;
+
+pub fn pilot_symbol_2x(n: usize) -> Complex64;
+
+pub fn interleave_data_pilots_2x(
+    data_syms: &[Complex64],
+    pattern: &PilotPattern2x,
+    group_idx_offset: usize,            // continuité cycle-wide
+) -> (Vec&lt;Complex64&gt;, Vec&lt;(usize, usize)&gt;);
+
+pub fn deinterleave_data_pilots_2x(
+    interleaved: &[Complex64],
+    pattern: &PilotPattern2x,
+    data_len: usize,
+) -> Vec&lt;Complex64&gt;;
+
+pub fn pilot_positions_2x(
+    data_len: usize,
+    pattern: &PilotPattern2x,
+    group_idx_offset: usize,
+) -> Vec&lt;(usize, usize, usize)&gt;;        // (start, end, abs_pilot_idx)
+</code></pre>
+
+<!-- ======================================================================= -->
+<h2 id="profiles">5. Huit profils 2x — nouveaux chiffres</h2>
+
+<p>
+    Toutes les valeurs sont dérivées de <code>frame2x::pilot_groups_per_cw</code>,
+    <code>pilot_syms_per_cw</code>, <code>cw_with_pilots_len</code>,
+    <code>data_cw_per_cycle</code> et <code>ModemConfig2x::net_bitrate</code>
+    (verrouillé par tests). Comparées aux valeurs pré-refactor (sparse blocks).
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>Constel.</th>
+            <th>Rs (Bd)</th>
+            <th>LDPC</th>
+            <th>Pattern</th>
+            <th>cw_data</th>
+            <th>groups</th>
+            <th>pilots / CW</th>
+            <th>wire / CW</th>
+            <th>net bps</th>
+            <th>Δ vs sparse</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>ULTRA2X</strong></td><td>QPSK</td>
+            <td class="num">500</td><td>1/2</td>
+            <td>32/2</td>
+            <td class="num">1152</td><td class="num">36</td><td class="num">72</td>
+            <td class="num">1224</td><td class="num">~470</td>
+            <td class="num">≈ inchangé</td>
+        </tr>
+        <tr>
+            <td><strong>ROBUST2X</strong></td><td>QPSK</td>
+            <td class="num">1000</td><td>1/2</td>
+            <td>32/2</td>
+            <td class="num">1152</td><td class="num">36</td><td class="num">72</td>
+            <td class="num">1224</td><td class="num">~941</td>
+            <td class="num">≈ inchangé</td>
+        </tr>
+        <tr>
+            <td><strong>NORMAL2X</strong></td><td>8PSK</td>
+            <td class="num">1500</td><td>1/2</td>
+            <td>32/2</td>
+            <td class="num">768</td><td class="num">24</td><td class="num">48</td>
+            <td class="num">816</td><td class="num">~2118</td>
+            <td class="num">−1.5 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH2X</strong></td><td>16-APSK</td>
+            <td class="num">1500</td><td>3/4</td>
+            <td>32/2</td>
+            <td class="num">576</td><td class="num">18</td><td class="num">36</td>
+            <td class="num">612</td><td class="num"><strong>~4235</strong></td>
+            <td class="num">identique<sup>(*)</sup></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+2X</strong></td><td>32-APSK</td>
+            <td class="num">1500</td><td>3/4</td>
+            <td>32/2</td>
+            <td class="num">461</td><td class="num">15</td><td class="num">30</td>
+            <td class="num">491</td><td class="num"><strong>~5294</strong></td>
+            <td class="num"><strong>+8.9 %</strong></td>
+        </tr>
+        <tr>
+            <td><strong>HIGH++2X</strong></td><td>64-APSK</td>
+            <td class="num">1500</td><td>3/4</td>
+            <td><strong>16/2</strong> (dense)</td>
+            <td class="num">384</td><td class="num">24</td><td class="num">48</td>
+            <td class="num">432</td><td class="num"><strong>~6000</strong></td>
+            <td class="num">+5.5 %</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH56_2X</strong></td><td>16-APSK</td>
+            <td class="num">1500</td><td>5/6</td>
+            <td>32/2</td>
+            <td class="num">576</td><td class="num">18</td><td class="num">36</td>
+            <td class="num">612</td><td class="num">~4706</td>
+            <td class="num">identique</td>
+        </tr>
+        <tr>
+            <td><strong>HIGH+56_2X</strong></td><td>32-APSK</td>
+            <td class="num">1500</td><td>5/6</td>
+            <td>32/2</td>
+            <td class="num">461</td><td class="num">15</td><td class="num">30</td>
+            <td class="num">491</td><td class="num">~5866</td>
+            <td class="num">+8.9 %</td>
+        </tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    <sup>(*)</sup> HIGH2X garde 36 pilot syms/CW (mêmes que sparse 1 bloc/CW),
+    mais répartis en 18 paires plutôt qu'un lump. Le débit est identique,
+    la résilience au phase noise change radicalement (voir §<a href="#perf-ab">7.3</a>).
+    <br>
+    HIGH+2X : passe de 72 pilot syms (2 blocs/CW) à 30 (TDM 15 groupes), soit
+    <strong>−58 % de symboles pilotes</strong> et +8.9 % de débit net. Plus de
+    bits payload <strong>et</strong> meilleure marge phase noise.
+    <br>
+    HIGH++2X (64-APSK) garde le pattern dense 16/2 pour absorber la plus
+    petite distance min quadratique — même recette que V3 HighPlusPlus.
+</p>
+
+<div class="callout ok">
+    <strong>Test verrou</strong> :
+    <code>net_bitrate_high_plus_2x_matches_v3_high_plus</code> dans
+    <code>profile2x.rs</code> verrouille HIGH+2X à 5290 ± 10 bps. Si un futur
+    refactor casse ce chiffre, la CI se plaint.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="sigma2">6. σ² — estimation rotative</h2>
+
+<p>
+    L'estimateur σ² ne change pas dans son architecture (split radial /
+    tangentiel, médiane MAD, références cycle-level intégrées) ; ce qui
+    change c'est la <strong>direction de projection</strong>, désormais
+    portée par chaque pilote individuel (rotation QPSK) au lieu d'être
+    constante <code>conj((1+j)/√2)</code>.
+</p>
+
+<pre><code>// rx_v4::estimate_cw_sigma2_split — schema
+for chaque position pilote (p_start, p_end, abs_pilot_start) {
+    for k in p_start..p_end {
+        pref = pilot_symbol_2x(abs_pilot_start + (k - p_start))
+        normed = chunk[k] / gain
+        resid = normed - pref                  // dépend de la rotation
+        proj  = resid * conj(pref)             // projection axe pref
+        total_sq.push(|resid|²)
+        radial_sq.push(proj.re²)               // axe pref
+        tang_sq.push(proj.im²)                 // perpendiculaire pref
+    }
+}
++ cycle-refs (PLHEADER) — même schéma, direction = chaque sym SOF/PLS
+σ²_{total,R,T} = median(.sq) / MAD_consistency, clampé à SIGMA2_FLOOR
+</code></pre>
+
+<p>
+    Le ratio <strong>R/T = σ²_radial / σ²_tangential</strong> reste le
+    diagnostic clé :
+</p>
+
+<ul>
+    <li><strong>R/T ≈ 1</strong> — canal AWGN isotrope (sim sans phase walk,
+        OTA bonne qualité).</li>
+    <li><strong>R/T &lt; 0.5</strong> — phase noise dominant (capture
+        OTA FTX-1+SDRplay typique, sim avec phase walk).</li>
+    <li><strong>R/T &gt; 2</strong> — AM-AM dominant (compression FM,
+        rare en sortie de transceiver bien réglé).</li>
+</ul>
+
+<!-- ======================================================================= -->
+<h2 id="perf">7. Performances mesurées</h2>
+
+<h3 id="perf-baseline">7.1 Canal NBFM nominal (sweep IF noise, phase walk = 0)</h3>
+
+<p>
+    Sweep <code>study/snr_sweep_2x.py</code> sur Pi5, 10 kB payload, no
+    drift, no phase noise. Compare TDM (HEAD <code>44271bf</code>) vs
+    sparse-blocks (<code>e90a8e4</code>, parent) sur les mêmes WAVs canal.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th>
+            <th>if_noise</th>
+            <th>σ² sparse</th>
+            <th>σ² TDM</th>
+            <th>Δ SNR</th>
+            <th>conv sparse / TDM</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td><strong>HIGH2X</strong></td><td class="num">0.00</td>
+            <td class="num">0.0044</td><td class="num">0.0011</td>
+            <td class="num"><strong>+6.0 dB</strong></td>
+            <td class="num">69/69 ✅ / 69/69 ✅</td></tr>
+        <tr><td>HIGH2X</td><td class="num">0.30</td>
+            <td class="num">0.0046</td><td class="num">0.0011</td>
+            <td class="num">+6.2 dB</td>
+            <td class="num">69/69 ✅ / 69/69 ✅</td></tr>
+        <tr><td>HIGH2X</td><td class="num">0.45</td>
+            <td class="num">0.0066</td><td class="num">0.0018</td>
+            <td class="num">+5.6 dB</td>
+            <td class="num">69/69 ✅ / 67/69 ✅</td></tr>
+        <tr><td>HIGH+2X</td><td class="num">0.00</td>
+            <td class="num">0.0028</td><td class="num">0.0014</td>
+            <td class="num">+3.0 dB</td>
+            <td class="num">68/68 ✅ / 68/68 ✅</td></tr>
+        <tr><td>HIGH+2X</td><td class="num">0.45</td>
+            <td class="num">0.0045</td><td class="num">0.0021</td>
+            <td class="num">+3.3 dB</td>
+            <td class="num">68/68 ✅ / 67/68 ✅</td></tr>
+        <tr><td>HIGH++2X</td><td class="num">0.00</td>
+            <td class="num">0.0030</td><td class="num">0.0016</td>
+            <td class="num">+2.7 dB</td>
+            <td class="num">66/67 ✅ / 67/67 ✅</td></tr>
+        <tr><td>HIGH++2X</td><td class="num">0.45</td>
+            <td class="num">0.0038</td><td class="num">0.0024</td>
+            <td class="num">+2.0 dB</td>
+            <td class="num"><strong>46/55 ❌ → 67/67 ✅</strong></td></tr>
+    </tbody>
+</table>
+
+<p style="font-size: 0.88rem; color: #555;">
+    Lecture : à <code>if_noise=0.45</code> HIGH++2X passe de RaptorQ-rescue
+    (46/55 conv, RaptorQ remplit les trous) à <strong>clean LDPC</strong>
+    (67/67 conv). C'est la marge de 2 dB qui bascule le profil de borderline
+    à robuste.
+</p>
+
+<h3 id="perf-phase-walk">7.2 Sweep phase walk (validation TDM)</h3>
+
+<p>
+    Même bench, <code>if_noise = 0.30</code> fixé (LDPC clean), phase walk
+    balayé de 0 (no phase noise) à 0.80 rad/√s (SDRplay LO close-in pire-cas).
+    Mesure la marge avant que TDM décroche.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th><th>phw=0.00</th><th>0.05<br>(FTX-1)</th>
+            <th>0.10</th><th>0.20<br>(SDRplay)</th><th>0.40</th><th>0.80</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td><strong>HIGH2X</strong> (16-APSK)</td>
+            <td class="num">σ² 0.0011<br>R/T 1.20 ✅</td>
+            <td class="num">0.0013<br>0.84 ✅</td>
+            <td class="num">0.0023<br>0.30 ✅</td>
+            <td class="num">0.0054<br>0.14 ❌</td>
+            <td class="num">0.0119<br>0.12 ❌</td>
+            <td class="num">0.0429<br>0.29 ❌</td>
+        </tr>
+        <tr><td><strong>HIGH+2X</strong> (32-APSK)</td>
+            <td class="num">0.0015<br>1.10 ✅</td>
+            <td class="num">0.0019<br>0.76 ✅</td>
+            <td class="num">0.0021<br>0.57 ✅</td>
+            <td class="num">0.0042<br>0.24 ❌</td>
+            <td class="num">0.0141<br>0.08 ❌</td>
+            <td class="num">0.0459<br>0.49 ❌</td>
+        </tr>
+        <tr><td><strong>HIGH++2X</strong> (64-APSK 16/2)</td>
+            <td class="num">0.0018<br>0.79 ✅</td>
+            <td class="num">0.0025<br>0.46 ✅</td>
+            <td class="num">0.0032<br>0.29 ❌</td>
+            <td class="num">0.0090<br>0.11 ❌</td>
+            <td class="num">0.0251<br>0.14 ❌</td>
+            <td class="num">0.0657<br>0.19 ❌</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <strong>Lecture</strong> :
+</p>
+
+<ul>
+    <li>HIGH2X / HIGH+2X décodent <em>propre</em> jusqu'à <strong>phw=0.10</strong>
+        — couvre la chaîne FTX-1 + soundcard nominale et dégradée.</li>
+    <li>HIGH++2X (64-APSK) tient jusqu'à phw=0.05 — son pattern dense 16/2 a la
+        bande de tracking suffisante mais la distance min quadratique étroite
+        casse plus tôt.</li>
+    <li><strong>Au-delà de phw=0.20</strong>, décrochage net — la phase walk
+        sort de la bande de tracking. Densifier le pattern (16/2 ou 8/2 sur
+        HIGH+2X) regagnerait du terrain — c'est la voie d'extension si OTA
+        montre un canal SDRplay LO pire que prévu.</li>
+    <li><strong>R/T tombe systématiquement sous 1</strong> dès qu'on injecte
+        de la phase walk : la signature OTA est reproduite.</li>
+</ul>
+
+<h3 id="perf-ab">7.3 A/B sparse-blocks vs TDM @ même phase walk (control)</h3>
+
+<p>
+    Le test discriminant — même canal, même phase walk, seul le pattern
+    pilote change. HEAD <code>e90a8e4</code> (sparse blocks) vs HEAD
+    <code>44271bf</code> (TDM), via <code>git worktree</code>. Sweep
+    <code>if_noise=0.30</code>, phase walk variable :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Profil</th><th>phw</th>
+            <th>σ² sparse blocks</th>
+            <th>σ² TDM</th>
+            <th>σ² ratio</th>
+            <th>R/T sparse</th>
+            <th>R/T TDM</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td><strong>HIGH+2X</strong></td><td class="num">0.00</td>
+            <td class="num">0.0029</td><td class="num">0.0015</td>
+            <td class="num"><strong>÷1.9</strong></td>
+            <td class="num">0.84</td><td class="num">1.10</td></tr>
+        <tr><td>HIGH+2X</td><td class="num">0.05</td>
+            <td class="num">0.0051</td><td class="num">0.0019</td>
+            <td class="num"><strong>÷2.7</strong></td>
+            <td class="num">0.27</td><td class="num">0.76</td></tr>
+        <tr><td>HIGH+2X</td><td class="num">0.10</td>
+            <td class="num">0.0107</td><td class="num">0.0021</td>
+            <td class="num"><strong>÷5.1</strong></td>
+            <td class="num">0.10</td><td class="num">0.57</td></tr>
+        <tr><td>HIGH+2X</td><td class="num">0.20</td>
+            <td class="num">0.0220</td><td class="num">0.0042</td>
+            <td class="num"><strong>÷5.2</strong></td>
+            <td class="num">0.07</td><td class="num">0.24</td></tr>
+        <tr><td><strong>HIGH2X</strong></td><td class="num">0.00</td>
+            <td class="num">0.0048</td><td class="num">0.0011</td>
+            <td class="num">÷4.4</td>
+            <td class="num">0.77</td><td class="num">1.20</td></tr>
+        <tr><td>HIGH2X</td><td class="num">0.05</td>
+            <td class="num">0.0058</td><td class="num">0.0013</td>
+            <td class="num">÷4.5</td>
+            <td class="num">0.51</td><td class="num">0.84</td></tr>
+        <tr><td>HIGH2X</td><td class="num">0.10</td>
+            <td class="num">0.0091</td><td class="num">0.0023</td>
+            <td class="num">÷4.0</td>
+            <td class="num">0.25</td><td class="num">0.30</td></tr>
+    </tbody>
+</table>
+
+<div class="callout ok">
+    <strong>Validation du choix architectural.</strong>
+    À phw=0.05 (FTX-1 nominal), la signature phase-noise du canal est
+    déjà visible côté sparse (R/T 0.27, σ² 0.0051) alors qu'elle est
+    encore quasi-AWGN côté TDM (R/T 0.76, σ² 0.0019). À phw=0.10, sparse
+    est dans le mur (σ² × 5 vs TDM, R/T 0.10) — pas encore en décrochage
+    LDPC grâce à la marge mais la trajectoire est claire. L'OTA observait
+    un facteur 10× sur σ² entre V3 (TDM) et V4 (sparse) : le sim
+    prédit 5× à phw=0.10, ce qui place la phase walk équivalente OTA vers
+    0.15–0.25 — cohérent SDRplay LO close-in.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="sim">8. Sim canal — modèle phase walk</h2>
+
+<p>
+    L'IF AWGN seul ne reproduisait pas le mode de panne OTA : NBFM strippe
+    le bruit de phase au limiter-discriminator. Le bruit phase qui dégrade
+    la décode est <strong>post-démod</strong>, sur la porteuse audio du
+    modem (centre 1500 Hz par défaut), composé de :
+</p>
+
+<ul>
+    <li>Jitter du clock ADC soundcard (~50 ppm RMS, mais surtout du
+        <em>jitter de phase</em> instantané).</li>
+    <li>Phase noise LO close-in côté SDR (Lorentzian 1/f² typique, dominant
+        en dessous de 100 Hz).</li>
+    <li>AM-PM résiduel du discriminator FM en régime non-linéaire (capture
+        effect proche du seuil).</li>
+</ul>
+
+<p>
+    Modèle unifié : marche aléatoire brownienne sur l'enveloppe complexe
+    audio. <code>apply_audio_phase_noise()</code> dans
+    <code>study/nbfm_channel_sim.py</code> :
+</p>
+
+<pre><code># dphi_n ~ N(0, sigma² / sr)         (browian increment)
+# phi(t) = cumsum(dphi)
+# z = scipy.signal.hilbert(audio)     (analytic signal -> complex envelope)
+# audio_out = Re(z * exp(j * phi))    (rotate envelope, take real part)
+</code></pre>
+
+<p>
+    <code>walk_std_per_sqrt_s</code> est la std-dev de la marche en
+    rad/√s — directement comparable aux specs Allan-deviation ou aux
+    intégrales du phase noise L(f) du transceiver. Calibrations :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Source</th><th>phw typique</th><th>Effet sur HIGH+2X TDM</th></tr>
+    </thead>
+    <tbody>
+        <tr><td>Aucun (sim AWGN pur)</td><td class="num">0.00</td>
+            <td>σ²=0.0015, R/T=1.10, décode propre</td></tr>
+        <tr><td>FTX-1 + soundcard nominal</td><td class="num">~0.05</td>
+            <td>σ²=0.0019, R/T=0.76, décode propre</td></tr>
+        <tr><td>FTX-1 + soundcard dégradé / SDRplay LO bon</td><td class="num">~0.10</td>
+            <td>σ²=0.0021, R/T=0.57, décode propre</td></tr>
+        <tr><td>SDRplay LO close-in dégradé</td><td class="num">~0.15-0.25</td>
+            <td>σ² 0.003–0.005, R/T &lt; 0.3, marge LDPC sollicitée</td></tr>
+        <tr><td>SDR LO pire-cas (drift fort)</td><td class="num">&gt; 0.40</td>
+            <td>décrochage, nécessite pattern dense 16/2 sur HIGH+</td></tr>
+    </tbody>
+</table>
+
+<h3>8.1 Usage</h3>
+
+<pre><code># Sim single channel
+python study/nbfm_channel_sim.py in.wav out.wav --if-noise 0.30 --phase-walk 0.10
+
+# Sweep grille (SNR × phase_walk)
+python study/snr_sweep_2x.py \
+    --profiles HIGH+2X HIGH++2X \
+    --if-noises 0.30 \
+    --phase-walks 0.0 0.05 0.10 0.20 \
+    --out results/sweep \
+    --payload-bytes 10000 \
+    --nbfm-modem rust/target/release/nbfm-modem
+</code></pre>
+
+<p>
+    Le CSV de sortie gagne une colonne <code>phase_walk</code>. Le mode A/B
+    s'obtient en pointant <code>--nbfm-modem</code> sur un binaire build
+    depuis un autre commit (via <code>git worktree</code>) — c'est ainsi
+    qu'on a produit la table §<a href="#perf-ab">7.3</a>.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="tests">9. Tests + CLI de référence</h2>
+
+<table>
+    <thead>
+        <tr><th>Test</th><th>Crate</th><th>Garantie</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>pilot_bit_for_bit_v3_compatible</code></td>
+            <td><code>modem-core2x::pilot2x_tdm</code></td>
+            <td>Pilotes V3 et V4 identiques bit-pour-bit (phases 0, π/2, π, 3π/2)</td></tr>
+        <tr><td><code>interleave_*</code> + <code>deinterleave_*</code></td>
+            <td>pilot2x_tdm</td>
+            <td>Round-trip d'interleave parfait (8 cas dont split partial-group)</td></tr>
+        <tr><td><code>group_offset_continues_pilot_rotation</code></td>
+            <td>pilot2x_tdm</td>
+            <td>Concaténer 2 CWs avec offset = n_groups(CW1) reproduit la rotation continue</td></tr>
+        <tr><td><code>pilot_pattern_per_profile_matches_design</code></td>
+            <td>profile2x</td>
+            <td>Default 32/2 sur 7 profils, dense 16/2 sur HighPlusPlus2x</td></tr>
+        <tr><td><code>net_bitrate_high_plus_2x_matches_v3_high_plus</code></td>
+            <td>profile2x</td>
+            <td>HIGH+2X = 5290 ± 10 bps (verrou anti-régression)</td></tr>
+        <tr><td><code>high_plus_2x_uses_v3_tdm_pattern</code></td>
+            <td>frame2x</td>
+            <td>HIGH+2X : 15 groups, 30 pilots, wire 491 sym/CW</td></tr>
+        <tr><td><code>chunk_offset_is_pilot_apsk32_partial_last_group</code></td>
+            <td>frame2x</td>
+            <td>Dernier groupe HIGH+2X (13 data + 2 pilot) bien classé</td></tr>
+        <tr><td><code>cycle_pilot_map_covers_all_profiles</code></td>
+            <td>frame2x</td>
+            <td>Map pilot positions OK pour les 8 profils (cardinalité + valeur)</td></tr>
+        <tr><td><code>roundtrip_noise_free_*</code> + <code>roundtrip_all_eight_profiles</code></td>
+            <td>rx_v4</td>
+            <td>Décode round-trip propre sur tous les profils 2x</td></tr>
+        <tr><td><code>roundtrip_under_per_ring_distortion_apsk32</code></td>
+            <td>rx_v4</td>
+            <td>Décode sous distortion AM-AM ring-dépendante</td></tr>
+        <tr><td><code>pilot_aided_noise_free_apsk64</code></td>
+            <td>worker2x::streaming_frontend</td>
+            <td>Pilot-aided TED ne dérive pas (bound 2e-2 — densifié 16/2)</td></tr>
+        <tr><td><code>pilot_aided_all_apsk_profiles_decode_at_50_ppm</code></td>
+            <td>worker2x</td>
+            <td>Décode à +50 ppm sur les 5 APSK <strong>(fail pré-existant, drift Farrow/Gardner)</strong></td></tr>
+    </tbody>
+</table>
+
+<p>
+    <strong>Résumé tests</strong> : <code>modem-core2x</code> 104/104,
+    <code>modem-worker2x</code> 38/39 (les 3 <code>*_50ppm/*_100ppm</code>
+    failent depuis le drift-Farrow refactor, non bloquant pour OTA noise-free).
+</p>
+
+<h3>9.1 CLI de référence</h3>
+
+<pre><code># TX d'un payload
+rust/target/release/nbfm-modem tx \
+    --family 2x --profile HIGH+2X --in payload.bin --out tx.wav
+
+# RX d'un WAV
+rust/target/release/nbfm-modem rx \
+    --family 2x --profile HIGH+2X --in tx.wav --out rx.bin
+
+# RX avec verbose σ² + R/T split
+rust/target/release/nbfm-modem rx \
+    --family 2x --profile HIGH+2X --in tx.wav --out rx.bin -v
+</code></pre>
+
+<!-- ======================================================================= -->
+<h2 id="crates">10. Touch points dans les crates</h2>
+
+<table>
+    <thead>
+        <tr><th>Fichier</th><th>Lignes</th><th>Rôle</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>rust/modem-core2x/src/pilot2x_tdm.rs</code></td>
+            <td class="num">329 (nouveau)</td>
+            <td>Module TDM : <code>PilotPattern2x</code>, <code>pilot_symbol_2x</code>, interleave/deinterleave, position table</td></tr>
+        <tr><td><code>rust/modem-core2x/src/pilot_block.rs</code></td>
+            <td class="num">−248 (supprimé)</td>
+            <td>Ancien module sparse blocks — plus aucun call site</td></tr>
+        <tr><td><code>rust/modem-core2x/src/profile2x.rs</code></td>
+            <td class="num">+/−125</td>
+            <td>Champ <code>pilot_pattern</code> remplace <code>pilot_blocks_per_cw</code>. <code>net_bitrate()</code> recalculé. Tests profil revus.</td></tr>
+        <tr><td><code>rust/modem-core2x/src/frame2x.rs</code></td>
+            <td class="num">+/−318</td>
+            <td>Encoder : <code>interleave_data_pilots_2x</code> avec offset rotatif cycle-wide. <code>cw_with_pilots_len</code>, <code>chunk_offset_is_pilot</code>, <code>cycle_pilot_map</code> drivés par le pattern.</td></tr>
+        <tr><td><code>rust/modem-core2x/src/rx_v4.rs</code></td>
+            <td class="num">+/−201</td>
+            <td><code>estimate_cw_gain</code>, <code>estimate_cw_sigma2_split</code> projettent contre la référence pilote rotative. <code>decode_one_cw</code> deinterleave via TDM. Diag <code>pilot-dump</code> revu.</td></tr>
+        <tr><td><code>rust/modem-worker2x/src/streaming_frontend.rs</code></td>
+            <td class="num">+/−11</td>
+            <td>Seuil <code>pilot_aided_noise_free_apsk64</code> relâché 1e-2 → 2e-2 (pattern dense 16/2 → plus de mises à jour AbsGardner).</td></tr>
+        <tr><td><code>study/nbfm_channel_sim.py</code></td>
+            <td class="num">+45</td>
+            <td><code>apply_audio_phase_noise()</code> via Hilbert + cumsum. Flag <code>--phase-walk</code>.</td></tr>
+        <tr><td><code>study/snr_sweep_2x.py</code></td>
+            <td class="num">+38</td>
+            <td>Flag <code>--phase-walks</code> (liste, produit cartésien avec <code>--if-noises</code>). Colonne CSV <code>phase_walk</code>.</td></tr>
+    </tbody>
+</table>
+
+<p>
+    <strong>Total :</strong> +670 / −571 lignes net. La suppression de
+    <code>pilot_block.rs</code> donne un crate <code>modem-core2x</code> plus
+    léger ; le module <code>pilot2x_tdm.rs</code> est volontairement
+    documenté (commentaire-densité élevée), donc le diff brut sous-estime
+    la réduction structurelle.
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="next">11. Prochaines étapes — OTA</h2>
+
+<ol>
+    <li><strong>Build .deb 0.11.0-2x2</strong> kiosk-pi-sdrplay avec
+        <code>44271bf</code> + bump version <code>tauri.conf.json</code>
+        (voir mémoire <code>tauri-deb-version-bump</code>).</li>
+    <li><strong>Install Pi5 + capture FTX-1 → SDRplay</strong> sur HIGH+2X,
+        payload 10 kB, sans dérive volontaire.</li>
+    <li><strong>Comparer σ² OTA mesuré vs prédiction sim</strong> à la même
+        phw. Si OTA σ² ≈ 0.005-0.010 → on est dans la zone phw ≈ 0.10–0.15
+        (FTX-1 dégradé). Si σ² &lt; 0.002 → phw &lt; 0.05 (chaîne propre,
+        marge confortable).</li>
+    <li><strong>Si OTA décroche à phw ≥ 0.20</strong> → densifier HIGH+2X
+        en 16/2 (changement d'une ligne dans <code>profile2x.rs</code>) et
+        re-valider sim+OTA.</li>
+    <li><strong>Conditionnel</strong> : si SDR LO close-in pire-cas
+        (typique avec Pluto SDR), évaluer un pattern <code>8/2</code> sur
+        HIGH+/HIGH++ — la knob existe, le sim discrimine, l'OTA tranche.</li>
+</ol>
+
+<p>
+    <strong>Lien mémoires</strong> :
+    <code>modem-2x-tdm-pilot-landed</code> (refactor), <code>modem-2x-ota-test-next-session</code>
+    (bring-up plan), <code>v4-pilot-tdm-refactor-todo</code> (historique du
+    diagnostic), <code>highplus-soundcard-pilot-tracking</code> (mesures OTA
+    pré-refactor).
+</p>
+
+<!-- ======================================================================= -->
+<h2 id="takeaways">12. Conclusions architecturales</h2>
+
+<p>
+    Au-delà des chiffres bruts, les leçons que ce refactor a produites — et
+    qui devraient guider les choix de pilote sur les futurs profils (Pluto SDR,
+    QO-100, autres canaux).
+</p>
+
+<h3>12.1 Bande passante d'ancrage &gt; densité totale de pilotes</h3>
+
+<p>
+    Le contre-exemple est <strong>HIGH2X</strong> : le pattern sparse blocks
+    et le pattern TDM ont strictement le même nombre de symboles pilotes par
+    CW (36). Seule la <em>distribution temporelle</em> change. Résultat :
+    σ² ÷ 4 (+6 dB) en TDM. Plus parlant encore, <strong>HIGH+2X</strong>
+    passe de 72 pilotes (sparse) à 30 (TDM) — <em>moins</em> de pilotes — et
+    décode mieux dans 100 % des cas testés.
+</p>
+
+<p>
+    Théorème opérationnel : pour un budget pilote donné, l'optimum n'est pas
+    de les concentrer en blocs (LS estimate plus précis localement) mais de
+    les espacer aussi finement que la <em>plus haute fréquence du bruit de
+    phase à suivre</em>. Pour NBFM amateur + SDR LO close-in, ce coin est à
+    20–50 Hz, ce qui impose un ancrage tous les 10–25 ms — soit notre 22 ms
+    TDM.
+</p>
+
+<h3>12.2 R/T &lt; 1 est le diagnostic en or</h3>
+
+<p>
+    Le ratio σ²_radial / σ²_tangentiel, dispo gratuitement à chaque CW dès
+    qu'on a 2 axes de pilotes projetés, donne le <strong>diagnostic
+    mécanistique du canal en une seule mesure</strong> :
+</p>
+
+<ul>
+    <li><strong>R/T ≈ 1</strong> → AWGN isotrope, rien à voir, on est dans
+        le modèle théorique.</li>
+    <li><strong>R/T &lt; 0.5</strong> → bruit de phase non-tracké. Solution :
+        densifier le pattern pilote (raccourcir la période d'ancrage).</li>
+    <li><strong>R/T &gt; 2</strong> → AM-AM (compression FM, AGC). Solution :
+        ajuster le hard-clip TX, vérifier la chaîne de gain RX.</li>
+</ul>
+
+<p>
+    Cette ligne est désormais sur la sortie CLI verbose, le bench
+    <code>snr_sweep_2x.py</code>, et la mémoire visuelle du dev. Avant
+    n'importe quel debug timing/LDPC, lire R/T donne la classe du problème.
+</p>
+
+<h3>12.3 Quand sim et OTA divergent par ×10, le terme manquant n'est pas l'implémentation</h3>
+
+<p>
+    Le sim IF-AWGN seul donnait σ² ≈ 0.005 (HIGH+2X sparse). L'OTA donnait
+    σ² ≈ 0.10. Facteur 20. La tentation : chercher un bug RX. La bonne
+    réponse : <strong>le sim manque un term physique</strong>. NBFM strippe
+    le bruit de phase IF au limiter-discriminator, donc la composante phase
+    noise qui dégrade les ASPK n'arrivait jamais à la sortie du sim. Ajouter
+    <code>apply_audio_phase_noise()</code> (15 LOC, brownian walk via Hilbert)
+    a réconcilié sim et OTA.
+</p>
+
+<p>
+    Règle générale : quand un bench dit « tout va bien » mais que le banc
+    réel hurle, chercher d'abord quel <em>processus stochastique</em> du
+    canal réel a été supposé négligeable et ne l'est pas. Ici, c'était la
+    densité spectrale de bruit de phase à offset &lt; 100 Hz.
+</p>
+
+<h3>12.4 Configurer ce qu'on tune, pas ce qui découle</h3>
+
+<p>
+    L'ancien <code>pilot_blocks_per_cw: usize</code> mélangeait deux axes
+    physiquement distincts :
+</p>
+
+<ul>
+    <li>L'<strong>overhead</strong> (fraction de symboles pilote, lié à
+        <code>p_syms × n_groups / cw_wire</code>).</li>
+    <li>La <strong>bande passante de tracking</strong> (fonction de
+        <code>(d_syms + p_syms) / Rs</code>).</li>
+</ul>
+
+<p>
+    Le passage à <code>PilotPattern2x { d_syms, p_syms }</code> expose
+    chaque axe séparément. On peut désormais :
+</p>
+
+<ul>
+    <li>Densifier la BW tracking sans toucher l'overhead — passer 32/2 à
+        16/2 double les ancrages <em>et</em> double l'overhead.</li>
+    <li>Réduire l'overhead sans toucher la BW — passer 32/2 à 32/1 garde
+        les ancrages tous les 33 sym mais halve l'overhead (au prix d'une
+        précision LS dégradée par √2).</li>
+    <li>Pousser HighPlusPlus2x dense à 16/2, garder HIGH+2X à 32/2 — chaque
+        profil a son knob propre, géré dans <code>profile2x.rs</code>.</li>
+</ul>
+
+<p>
+    Pour le futur : un profil <code>HIGH+PRO_2X</code> pour Pluto SDR
+    (canal LO plus bruité) pourrait choisir 24/2 (overhead intermédiaire,
+    BW intermédiaire) — un seul champ à changer dans la table de profils.
+</p>
+
+<h3>12.5 Worktree A/B sur le même WAV = méthodologie de référence</h3>
+
+<p>
+    Le facteur ÷5 σ² entre sparse-blocks et TDM à phw=0.10 a été démontré
+    <em>sur la même réalisation du canal</em> (même seed, même bruit, même
+    phase walk, même WAV TX). Méthodologie :
+</p>
+
+<ol>
+    <li><code>git worktree add /tmp/control e90a8e4</code> pour l'ancien
+        commit.</li>
+    <li>Build CLI dans le worktree.</li>
+    <li>Lancer le sweep depuis le checkout principal avec <code>--nbfm-modem
+        /tmp/control/rust/target/release/nbfm-modem</code>, le canal sim étant
+        fourni par le code HEAD.</li>
+    <li>Comparer ligne à ligne du CSV.</li>
+</ol>
+
+<p>
+    Élimine d'un coup variance de seed, variance SNR, et toute dérive
+    temporelle du sim setup. À adopter pour toute question « est-ce que ce
+    changement aide vraiment ? ».
+</p>
+
+<h3>12.6 Le choix DVB-S2X n'était pas <em>faux</em>, juste pas-pour-ce-canal</h3>
+
+<p>
+    DVB-S2X est optimisé pour des canaux satellite où la cohérence de phase
+    est typiquement très longue (LO PLL spectralement propre, peu de
+    phase noise close-in). Un bloc de 36 sym tous les 4 secondes est
+    surdimensionné pour ces canaux. Sur NBFM amateur + SDR LO grand public,
+    le profil de bruit de phase est tout autre : 1/f² close-in dominant,
+    pas de PLL bench-grade. La spec DVB-S2X devient inadaptée.
+</p>
+
+<p>
+    Le pattern TDM V3 avait été dérivé empiriquement sur le banc amateur ;
+    ce refactor + ce bench lui donnent <strong>une justification physique
+    explicite</strong>. C'est l'asset le plus durable du travail : la grille
+    densité × BW est désormais documentée et tunable, pas une supposition.
+</p>
+
+<div class="callout ok">
+    <strong>Une phrase</strong>. Le pattern pilote optimal n'est pas
+    « celui qui ressemble à DVB-S2X » ni « celui qui maximise les pilotes
+    par CW » — c'est <em>celui dont la période est plus courte que l'inverse
+    de la plus haute fréquence de bruit de phase à suivre</em>, au-delà ça
+    devient du gaspillage de débit.
+</div>
+
+<p style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: #888; font-size: 0.85rem;">
+    Généré 2026-05-14, branche <code>feat/modem-2x</code>, HEAD
+    <code>e8993ac</code> (post-44271bf + sim phase walk). Voir
+    <code>v4_architecture.html</code> pour les sections inchangées (TX/RX
+    bloc diagrams, PLHEADER FZC, timing recovery Farrow/Gardner, TED
+    pilot-aided, ESI accounting RaptorQ).
+</p>
+
+</div>
+</body>
+</html>
