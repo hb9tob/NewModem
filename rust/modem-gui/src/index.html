@@ -550,13 +550,17 @@
           </fieldset>
 
           <fieldset class="sounder-tx">
-            <legend>Sondeur — préparer le signal d'émission</legend>
+            <legend>Sondeur — référence partagée (TX + RX)</legend>
             <p class="tx-hint">
               Génère <code>probe.wav</code> (chirp + multi-ton + deux-tons + sweep
               de niveau + AWGN) et <code>schedule.json</code> sous le dossier de
-              sauvegarde. Le WAV se joue via « ▶ Lire WAV » de l'onglet RX, côté
-              récepteur le micro/SDR enregistre puis l'analyse en bas reconstruit
-              la signature.
+              sauvegarde. Le contenu est <strong>déterministe</strong> : à
+              paramètres identiques, TX et RX produisent le même
+              <code>schedule.json</code> bit-pour-bit. Côté TX on joue
+              <code>probe.wav</code> (« ▶ Lire WAV » de l'onglet RX ou lecteur
+              audio externe). Côté RX, on enregistre la bande (« ⏺ capture
+              brute »), puis on analyse en bas en pointant le
+              <code>schedule.json</code> reproduit localement.
             </p>
             <div class="sounder-row">
               <label>Famille
@@ -596,8 +600,11 @@
             <legend>Sondeur — analyser une capture</legend>
             <p class="tx-hint">
               Capturez la bande audio (onglet RX → « ⏺ capture brute ») puis
-              indiquez ici le chemin du WAV reçu et du <code>schedule.json</code>
-              correspondant. L'analyseur écrit <code>capture.signature.json</code>
+              analysez. Le <code>schedule.json</code> est déterministe : si TX
+              ne vous l'a pas envoyé, cliquez « Générer la référence ici » —
+              tant que les deux opérateurs lancent le sondeur avec les mêmes
+              paramètres (famille + probes par défaut), les fichiers sont
+              identiques. L'analyseur écrit <code>capture.signature.json</code>
               à côté du WAV.
             </p>
             <div class="sounder-row">
@@ -609,6 +616,7 @@
               <label>Schedule JSON
                 <input type="text" id="sounder-an-schedule" placeholder="/chemin/vers/schedule.json">
               </label>
+              <button type="button" id="sounder-an-regen-ref" title="Régénère la référence localement (probe.wav + schedule.json) avec les paramètres actuels et auto-remplit ce chemin">Générer la référence ici</button>
             </div>
             <div class="sounder-row">
               <label>Seuil sync

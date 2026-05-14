@@ -4714,6 +4714,14 @@ function setupSounderTab() {
   document
     .getElementById("sounder-an-run")
     ?.addEventListener("click", runSounderAnalyze);
+  // RX-standalone path: same render command, the schedule.json bytes
+  // are identical to whatever TX would have produced with the same
+  // (defaultSounderProbes + family) inputs. runSounderTxRender already
+  // auto-fills #sounder-an-schedule with the freshly written path so
+  // the operator can hit "Analyser" right after their capture.
+  document
+    .getElementById("sounder-an-regen-ref")
+    ?.addEventListener("click", runSounderTxRender);
 }
 
 // ─────────────────────────────────────────── History tab
