@@ -250,6 +250,10 @@ def main() -> int:
                          "(default from nbfm_channel_sim = 0.55). Pass 0 to "
                          "disable clipping entirely; useful to isolate "
                          "channel-nonlinearity effects from AWGN.")
+    ap.add_argument("--phase-walks", nargs="+", type=float, default=[0.0],
+                    help="Audio-domain random-walk phase noise levels "
+                         "(rad/sqrt(s)). Cartesian-product with --if-noises. "
+                         "0.05=FTX-1+soundcard, 0.15=SDRplay LO. Default [0.0].")
     args = ap.parse_args()
 
     if not os.path.exists(args.nbfm_modem):
@@ -271,14 +275,14 @@ def main() -> int:
     csv_path = os.path.join(args.out_dir, "results.csv")
     with open(csv_path, "w") as csv_f:
         csv_f.write(
-            "profile,if_noise,sigma2,snr_est_db,sigma2_radial,"
+            "profile,if_noise,phase_walk,sigma2,snr_est_db,sigma2_radial,"
             "sigma2_tangential,ratio_rt,converged,total,cycles,"
             "decoded_bytes,ber_byte,exact,tx_time_s,total_time_s\n")
 
         # Pretty-printed live table. σ²_R/σ²_T split appended on V4 RX
         # (V3 only emits the scalar σ²; the split columns stay blank
         # there).
-        header = (f"{'profile':<10} {'if_n':>5} {'σ²':>8} {'SNRdB':>6} "
+        header = (f"{'profile':<10} {'if_n':>5} {'phw':>5} {'σ²':>8} {'SNRdB':>6} "
                   f"{'σ²_R':>7} {'σ²_T':>7} {'R/T':>5} "
                   f"{'conv':>9} {'cyc':>4} {'rx_B':>6} {'BER':>9} "
                   f"{'exact':>5} {'t(s)':>5}")
@@ -295,23 +299,25 @@ def main() -> int:
                   f"({len(tx_audio) / AUDIO_RATE:.2f} s, build {tx_time:.1f}s)")
 
             for if_noise in args.if_noises:
+              for phase_walk in args.phase_walks:
                 t0 = time.time()
                 sim_kwargs = dict(
                     if_noise_voltage=if_noise,
                     drift_ppm=args.drift_ppm,
+                    phase_walk_rad_per_sqrt_s=phase_walk,
                     start_delay_s=0.5,
-                    rng_seed=args.seed + int(if_noise * 1000),
+                    rng_seed=args.seed + int(if_noise * 1000)
+                              + int(phase_walk * 10000),
                     verbose=False,
                 )
                 if args.tx_clip is not None:
                     sim_kwargs["tx_hard_clip"] = args.tx_clip
                 ch_audio = simulate(tx_audio, **sim_kwargs)
-                ch_wav = os.path.join(args.out_dir,
-                                      f"ch_{safe}_if{if_noise:.2f}.wav")
+                tag = f"if{if_noise:.2f}_pw{phase_walk:.3f}"
+                ch_wav = os.path.join(args.out_dir, f"ch_{safe}_{tag}.wav")
                 write_wav_f32(ch_wav, ch_audio.astype(np.float32))
 
-                rx_bin = os.path.join(args.out_dir,
-                                      f"rx_{safe}_if{if_noise:.2f}.bin")
+                rx_bin = os.path.join(args.out_dir, f"rx_{safe}_{tag}.bin")
                 info = run_rx(args.nbfm_modem, profile, ch_wav, rx_bin,
                               family=args.family)
                 ber, exact = measure_ber(payload, rx_bin)
@@ -323,7 +329,7 @@ def main() -> int:
                 t_total = time.time() - t0
 
                 csv_f.write(
-                    f"{profile},{if_noise},"
+                    f"{profile},{if_noise},{phase_walk},"
                     f"{sigma2 if sigma2 is not None else ''},"
                     f"{snr_est},"
                     f"{info['sigma2_radial'] if info['sigma2_radial'] is not None else ''},"
@@ -346,6 +352,7 @@ def main() -> int:
                 print(
                     f"{profile:<10} "
                     f"{if_noise:>5.2f} "
+                    f"{phase_walk:>5.2f} "
                     f"{fmt(sigma2, 8, 4)} "
                     f"{fmt(snr_est, 6, 1)} "
                     f"{fmt(info['sigma2_radial'], 7, 4)} "

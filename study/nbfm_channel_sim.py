@@ -25,6 +25,7 @@ import argparse
 import math
 import os
 import numpy as np
+import scipy.signal
 import wave
 from gnuradio import gr, blocks, analog, filter as gr_filter
 
@@ -57,6 +58,18 @@ DRIFT_THERMAL_PERIOD_S = 120.0  # periode de la variation (s)
 START_DELAY_MIN_S = 2.0
 START_DELAY_MAX_S = 5.0
 
+# Random-walk phase noise sur l'enveloppe complexe audio post-demod.
+# Modelise le jitter du clock soundcard + le phase noise LO SDR (le terme
+# qui reste apres que le limiter-discriminator FM ait nettoye le bruit
+# IF). dphi ~ N(0, sigma^2/sr), phi(t) = cumsum(dphi). Multiplie le
+# signal analytique de l'audio par exp(j*phi).
+#
+# Ordres de grandeur calibres :
+#   0.05 rad/sqrt(s)  -> FTX-1 + soundcard standard
+#   0.15 rad/sqrt(s)  -> SDRplay LO close-in (1/f^2)
+#   0.0  par defaut   -> pas de phase noise (compatibilite)
+PHASE_WALK_RAD_PER_SQRT_S = 0.0
+
 
 def load_wav(path):
     with wave.open(path, "r") as wf:
@@ -81,6 +94,40 @@ def write_wav(path, samples, sr):
         wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(s.tobytes())
+
+
+def apply_audio_phase_noise(audio, sr, walk_std_per_sqrt_s, rng_seed=0):
+    """Random-walk phase noise applique a l'enveloppe complexe audio.
+
+    Modele combine du jitter de clock soundcard + phase noise LO SDR : la
+    phase de la porteuse audio modem (centre vers 1500 Hz dans la bande
+    NBFM utile) suit un processus brownien d phi/dt ~ N(0, sigma^2). Sur
+    un echantillon, dphi ~ N(0, sigma^2 / sr).
+
+    NBFM strippe le bruit de phase IF au limiter-discriminator, donc on
+    l'applique APRES la chaine GR, sur l'audio sortant. Le signal etant
+    reel, on passe par le signal analytique (Hilbert) pour obtenir
+    l'enveloppe complexe, on rotate par exp(j*phi(t)), puis on reprend
+    la partie reelle.
+
+    walk_std_per_sqrt_s : ecart-type de la marche aleatoire de phase,
+    en radians par racine seconde (equivalent Allan-deviation-style).
+    Typique : 0.05 rad/sqrt(s) (FTX-1 + soundcard), 0.15 (SDRplay LO).
+    """
+    if walk_std_per_sqrt_s <= 0:
+        return audio
+    rng = np.random.RandomState(rng_seed)
+    n = len(audio)
+    # Increments brownien : variance par sample = sigma^2 / sr.
+    dphi = rng.normal(0.0,
+                      walk_std_per_sqrt_s / math.sqrt(sr),
+                      n).astype(np.float64)
+    phi = np.cumsum(dphi)
+    # Hilbert -> enveloppe complexe; rotation; partie reelle.
+    # scipy.signal.hilbert renvoie audio + j*Hilbert(audio).
+    z = scipy.signal.hilbert(audio.astype(np.float64))
+    out = np.real(z * np.exp(1j * phi))
+    return out.astype(audio.dtype)
 
 
 def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
@@ -115,6 +162,7 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              thermal_period_s=DRIFT_THERMAL_PERIOD_S,
              tx_hard_clip=TX_HARD_CLIP,
              audio_noise_rms=AUDIO_NOISE_RMS,
+             phase_walk_rad_per_sqrt_s=PHASE_WALK_RAD_PER_SQRT_S,
              multipath_paths=None,
              start_delay_s=None, rng_seed=None, verbose=True):
     """Fait passer audio_in par TX -> bruit IF -> RX, retourne audio_out.
@@ -231,6 +279,21 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
     if audio_noise_rms and audio_noise_rms > 0:
         audio_out = audio_out + rng.normal(0.0, audio_noise_rms, len(audio_out))
 
+    # Random-walk phase noise (jitter clock soundcard + LO SDR close-in).
+    # NBFM strippe le bruit de phase IF, donc on l'applique post-demod
+    # sur l'enveloppe complexe audio. Voir apply_audio_phase_noise() pour
+    # le modele complet.
+    if phase_walk_rad_per_sqrt_s and phase_walk_rad_per_sqrt_s > 0:
+        if verbose:
+            print(f"[sim] audio phase walk: "
+                  f"{phase_walk_rad_per_sqrt_s:.3f} rad/sqrt(s)")
+        # rng_seed derive du rng_seed global pour reproductibilite
+        # sans collision avec le bruit IF.
+        ph_seed = (rng_seed if rng_seed is not None else 0) ^ 0xBEEF
+        audio_out = apply_audio_phase_noise(
+            audio_out, AUDIO_RATE, phase_walk_rad_per_sqrt_s,
+            rng_seed=ph_seed)
+
     # Derive d'horloge (post-traitement)
     if drift_ppm != 0.0 or thermal_ppm != 0.0:
         if verbose:
@@ -269,6 +332,10 @@ def main():
                          "0=desactive)")
     ap.add_argument("--audio-noise", type=float, default=AUDIO_NOISE_RMS,
                     help=f"RMS bruit audio post-demod (defaut {AUDIO_NOISE_RMS})")
+    ap.add_argument("--phase-walk", type=float, default=PHASE_WALK_RAD_PER_SQRT_S,
+                    help="Random-walk phase noise std (rad/sqrt(s)). "
+                         "0.05=FTX-1+soundcard, 0.15=SDRplay LO. "
+                         f"Defaut {PHASE_WALK_RAD_PER_SQRT_S}")
     args = ap.parse_args()
 
     audio_in, sr = load_wav(args.input_wav)
@@ -283,6 +350,7 @@ def main():
                          thermal_period_s=args.thermal_period,
                          tx_hard_clip=args.tx_clip,
                          audio_noise_rms=args.audio_noise,
+                         phase_walk_rad_per_sqrt_s=args.phase_walk,
                          start_delay_s=args.start_delay,
                          rng_seed=args.seed)
 
