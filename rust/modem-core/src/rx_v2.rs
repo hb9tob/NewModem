@@ -515,23 +515,32 @@ fn resample_audio(samples: &[f32], drift_ppm: f64) -> Vec<f32> {
 /// 1 estimator + 1 final decode ≈ 2.3× a single decode. Down from
 /// the 0.10.12 blind grid's 14× and from the 0.10.14 hint-grid's 8.85×.
 pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
-    rx_v2_with_options(samples, config, true)
+    rx_v2_with_options(samples, config, true, true)
 }
 
 /// Same as [`rx_v2`] but lets the caller skip the post-Gardner ±15 ppm
-/// safety grid. The grid is the most CPU-heavy fallback (6 extra
-/// `rx_v2_single` passes on resampled buffers) ; on weak hosts (Pi-class)
-/// it's pure waste when the channel is noise-limited (LDPC fails at every
-/// trial point anyway, but we still pay the resample + MF + FFE + LMS
-/// + LDPC cost per point). Set `allow_legacy_grid = false` to bypass it.
+/// safety grid AND/OR the 0-ppm fast-path. The grid is the most CPU-heavy
+/// fallback (6 extra `rx_v2_single` passes on resampled buffers) ; on weak
+/// hosts (Pi-class) it's pure waste when the channel is noise-limited
+/// (LDPC fails at every trial point anyway, but we still pay the
+/// resample + MF + FFE + LMS + LDPC cost per point). Set
+/// `allow_legacy_grid = false` to bypass it.
 ///
-/// The fast-path (`rx_v2_single` @ 0 ppm) and the Gardner-one-shot
-/// (`estimate_drift_gardner` + `rx_v2_with_hint`) always run -- they're
-/// cheap and cover the common cases.
+/// The Gardner-one-shot (`estimate_drift_gardner` + `rx_v2_with_hint`)
+/// always runs -- it's cheap and gives the operator a faithful drift
+/// readout. The 0-ppm fast-path (`rx_v2_single` on the raw buffer) is a
+/// second matched-filter pass that costs ~230 ms on a Pi 4 ; when
+/// Gardner already produced a clean decode at >=0.5 ppm it's pure
+/// redundancy. Set `allow_fast_path = false` (paired with
+/// `allow_legacy_grid = false` in low-power mode on CLOSED windows where
+/// Gardner is sub-ppm accurate) to skip it. OPEN windows on cold start
+/// still benefit from the fast-path so its caller should keep
+/// `allow_fast_path = true` there.
 pub fn rx_v2_with_options(
     samples: &[f32],
     config: &ModemConfig,
     allow_legacy_grid: bool,
+    allow_fast_path: bool,
 ) -> Option<RxV2Result> {
     let clean = |r: &RxV2Result| -> bool {
         r.total_blocks > 0
@@ -572,16 +581,24 @@ pub fn rx_v2_with_options(
         }
     }
 
-    // 2. Fast-path at 0 ppm. Always tried so a sub-0.5 ppm Gardner
-    //    estimate doesn't lock us out of the obvious decode at 0 ppm.
-    //    If Gardner already produced a clean decode at >=0.5 ppm,
-    //    this won't beat it (score equality keeps the existing best).
-    if let Some(r) = rx_v2_single(samples, config) {
-        let s = score_result(&r);
-        if s > best_score {
-            best_score = s;
-            best_ppm = 0.0;
-            best = Some(r);
+    // 2. Fast-path at 0 ppm. Gated by `allow_fast_path` so the caller
+    //    (rx_v3_after on a CLOSED window in low-power mode) can drop
+    //    this redundant MF pass when Gardner has already locked. On a
+    //    drifted channel Gardner is sub-ppm accurate and `best` is
+    //    already set ; the fast-path can only tie or lose. On Pi 4 the
+    //    skip saves ~230 ms per CLOSED SF.
+    //
+    //    Kept ON for desktop (rx_v2 wrapper, x86_64 worker) and for
+    //    OPEN windows where the cold-start cascade may still benefit
+    //    from a clean 0-ppm attempt.
+    if allow_fast_path {
+        if let Some(r) = rx_v2_single(samples, config) {
+            let s = score_result(&r);
+            if s > best_score {
+                best_score = s;
+                best_ppm = 0.0;
+                best = Some(r);
+            }
         }
     }
 
@@ -1620,7 +1637,12 @@ pub fn rx_v3_after(
             // too few markers for a per-window Gardner) and the Info-tab
             // `sf_detail` telemetry.
             let _ = session_hint_ppm; // CLOSED uses per-window Gardner instead
-            rx_v2_with_options(window, config, allow_legacy_grid)
+            // Low-power mode (`allow_legacy_grid = false` on aarch64 / Pi):
+            // also skip the 0-ppm fast-path on CLOSED. Gardner is sub-ppm
+            // accurate with ≥6 markers and Pi 4 cannot afford the redundant
+            // ~230 ms MF pass per SF. Desktop keeps both stages.
+            let allow_fast_path = allow_legacy_grid;
+            rx_v2_with_options(window, config, allow_legacy_grid, allow_fast_path)
         } else {
             // OPEN window: trailing, no closing preamble.
             //
@@ -1656,7 +1678,11 @@ pub fn rx_v3_after(
             } else if let Some(hint) = session_hint_ppm {
                 rx_v2_with_hint(window, config, hint)
             } else {
-                rx_v2_with_options(window, config, allow_legacy_grid)
+                // OPEN cold-start cascade keeps the 0-ppm fast-path even
+                // in low-power mode: Gardner often fails to lock on a
+                // trailing window with <3 markers, the fast-path is the
+                // safety net that lets the burst land its OPEN header.
+                rx_v2_with_options(window, config, allow_legacy_grid, /*allow_fast_path=*/ true)
             }
         };
         let Some(r) = r_opt else {
@@ -2789,5 +2815,57 @@ mod tests {
             ah.k_symbols, result.data_blocks_recovered,
         );
         assert_eq!(&result.data[..data.len()], &data[..]);
+    }
+
+    /// Axis 1 regression : on a clean drift-free single-SF buffer, the
+    /// 0-ppm fast-path is the only pipeline that increments
+    /// `PerfStage::PassDone` from `rx_v2_single` (Gardner under 0.5 ppm
+    /// skips the resample + hint-decode path entirely, line 566). So
+    /// `take_perf().n_passes` is a direct counter of fast-path runs.
+    ///
+    /// Pre-Axis-1 (allow_fast_path baked to true): n_passes >= 1.
+    /// Post-Axis-1 (allow_fast_path = false on CLOSED + lowpower):
+    /// n_passes == 0 from the fast-path; Gardner's markeraudio
+    /// instrumentation may still contribute its own PassDone but we
+    /// compare deltas, not absolute counts.
+    #[test]
+    fn rx_v2_with_options_skips_fast_path_when_gated() {
+        let config = profile_high();
+        let data: Vec<u8> = (0..2000)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        let samples = tx_v3(&data, &config, 0xCAFE_BABE);
+
+        // Baseline : fast-path allowed, grid allowed (= desktop semantics).
+        let _ = take_perf(); // clear thread-local accumulator
+        let _ = rx_v2_with_options(&samples, &config, true, true);
+        let perf_desktop = take_perf();
+
+        // Lowpower : both gated off.
+        let _ = take_perf();
+        let _ = rx_v2_with_options(&samples, &config, false, false);
+        let perf_lowpower = take_perf();
+
+        eprintln!(
+            "Axis-1 gate: desktop n_passes={} mf={}us  vs  lowpower n_passes={} mf={}us",
+            perf_desktop.n_passes,
+            perf_desktop.matched_filter_us,
+            perf_lowpower.n_passes,
+            perf_lowpower.matched_filter_us,
+        );
+
+        // Fast-path elimination must strictly reduce the pass count and
+        // the matched-filter wall-clock. We don't pin absolute numbers
+        // (those depend on host) ; the delta is the contract.
+        assert!(
+            perf_lowpower.n_passes < perf_desktop.n_passes,
+            "lowpower must skip at least one PassDone (got {} vs {})",
+            perf_lowpower.n_passes, perf_desktop.n_passes,
+        );
+        assert!(
+            perf_lowpower.matched_filter_us < perf_desktop.matched_filter_us,
+            "lowpower must spend less time in matched_filter (got {}us vs {}us)",
+            perf_lowpower.matched_filter_us, perf_desktop.matched_filter_us,
+        );
     }
 }
