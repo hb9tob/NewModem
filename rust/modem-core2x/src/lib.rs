@@ -51,10 +51,11 @@
 //! - `gate2x` + `detect2x` — FFT-gate + auto-detect 2x.
 //! - `modem2x` — `V4Modem` impl of the `Modem` trait.
 
-// Phase C-1 — PLHEADER (192 sym SOF+PLS) and pilot blocks (36 sym
-// (1+j)/√2 each). Both are isolated frame primitives: no profile or
-// frame-builder dependency.
-pub mod pilot_block;
+// Phase C-1 — PLHEADER (192 sym SOF+PLS) and TDM pilots (V3-style
+// rotating-QPSK groups of `d_syms` data + `p_syms` pilots).
+// Both are isolated frame primitives: no profile or frame-builder
+// dependency.
+pub mod pilot2x_tdm;
 pub mod plheader;
 
 // Phase C-2 — `ProfileIndex2x` enum (8 profiles, HighPlusPlus2x

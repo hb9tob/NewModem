@@ -17,11 +17,12 @@
 //! 3. Skip the LMS warmup (its symbols are consumed only by the audio-
 //!    domain FFE; in symbol domain we already have a clean reference).
 //! 4. For META-CW + each DATA-CW:
-//!    - Read `cw_data_syms` data symbols, interleaved with
-//!      `pilot_blocks_per_cw` pilot blocks.
-//!    - LS-estimate the per-CW complex gain across the pilot blocks
-//!      (mean of the pilot symbols ÷ `(1+j)/√2`).
-//!    - Pull data symbols out via [`pilot_block::deinterleave_pilot_blocks`].
+//!    - Read `cw_with_pilots_len(cfg)` symbols: `cw_data_syms` data syms
+//!      interleaved with TDM pilots (`pilot_pattern.d_syms` data + `p_syms`
+//!      rotating-QPSK pilots per group).
+//!    - LS-estimate the per-CW complex gain across the pilot positions
+//!      against the known rotating reference.
+//!    - Pull data symbols out via [`pilot2x_tdm::deinterleave_data_pilots_2x`].
 //!    - Phase-correct by dividing by the gain.
 //!    - Soft-demap → LDPC decode → record bytes keyed by ESI.
 //! 5. Try RaptorQ assembly with the AppHeader from the META-CW.
@@ -43,9 +44,10 @@ use modem_core_base::types::Complex64;
 use modem_framing::app_header::{self, AppHeader};
 
 use crate::frame2x::{
-    data_cw_per_cycle, make_constellation_2x, FLAG2X_EOT, FLAG2X_LAST,
+    cw_with_pilots_len, data_cw_per_cycle, make_constellation_2x, pilot_groups_per_cw,
+    FLAG2X_EOT, FLAG2X_LAST,
 };
-use crate::pilot_block::{self, PILOT_BLOCK_LEN, PILOT_SYMBOL};
+use crate::pilot2x_tdm::{self, pilot_symbol_2x, PilotPattern2x};
 use crate::plheader::{
     self, decode_plheader_at, PlsPayload, PreambleFamily2x, PLHEADER_LEN_SYM, SOF_LEN_SYM,
 };
@@ -352,47 +354,37 @@ fn find_next_sof(
 
 // --- per-CW pilot LS gain estimate ---------------------------------------
 
-/// Extract the pilot block(s) embedded inside one CW chunk and return
-/// their LS-estimated complex gain (mean of pilot samples ÷ `(1+j)/√2`).
+/// LS gain estimate `g = Σ y · conj(p) / Σ |p|²` over all known
+/// reference symbols in one CW chunk.
 ///
-/// `chunk` is the slice of `cw_data_syms + pilot_blocks_per_cw·36` symbols
-/// emitted by [`pilot_block::interleave_pilot_blocks`]; the pilot blocks
-/// sit at deterministic offsets the encoder used (uneven for Apsk32).
+/// The pilots are now V3-style TDM groups (`pattern.d_syms` data +
+/// `pattern.p_syms` rotating-QPSK pilots, repeating). `group_idx_offset`
+/// is the absolute group index of the first group in this chunk — the
+/// encoder uses 0 for META-CW and `groups_per_cw·(1+k)` for the k-th
+/// DATA-CW so the pilot rotation stays continuous across the cycle.
+///
+/// `extra_refs` carries the cycle-level PLHEADER references (192 sym,
+/// |s|=1) shared by every CW in the cycle. They bias each CW's LS
+/// toward the cycle mean — appropriate for the near-stationary NBFM
+/// channel — while the per-CW TDM pilots still preserve sensitivity to
+/// genuine intra-cycle drift.
 fn estimate_cw_gain(
     chunk: &[Complex64],
     cw_data_syms: usize,
-    pilot_blocks_per_cw: usize,
+    pattern: &PilotPattern2x,
+    group_idx_offset: usize,
     extra_refs: Option<(&[Complex64], &[Complex64])>,
 ) -> Complex64 {
-    debug_assert_eq!(chunk.len(), cw_data_syms + pilot_blocks_per_cw * PILOT_BLOCK_LEN);
-    // Generalised LS gain: g = Σ y · conj(s) / Σ |s|² over every
-    // known reference symbol available — both the in-CW pilot blocks
-    // (`PILOT_SYMBOL = (1+j)/√2`, |P|=1) and the cycle-level PLHEADER
-    // refs (SOF Chu sequence + decoded-PLS QPSK symbols, all |s|=1)
-    // supplied through `extra_refs`. Cycle-level refs are shared
-    // across every CW in the cycle, which biases each CW's LS toward
-    // the cycle mean — appropriate for the near-stationary NBFM
-    // channel where per-CW gain drift is small (~ ms scale on a ~4 s
-    // cycle). The per-CW pilot block alone still keeps the estimator
-    // sensitive to genuinely per-CW variation.
-    let base_chunk = cw_data_syms / pilot_blocks_per_cw;
-    let mut data_cursor = 0usize;
-    let mut wire_cursor = 0usize;
+    debug_assert_eq!(chunk.len(), pattern.wire_len(cw_data_syms));
+    let positions = pilot2x_tdm::pilot_positions_2x(cw_data_syms, pattern, group_idx_offset);
     let mut num = Complex64::new(0.0, 0.0);
     let mut den = 0.0_f64;
-    for k in 0..pilot_blocks_per_cw {
-        let take = if k + 1 == pilot_blocks_per_cw {
-            cw_data_syms - data_cursor
-        } else {
-            base_chunk
-        };
-        wire_cursor += take;
-        for s in &chunk[wire_cursor..wire_cursor + PILOT_BLOCK_LEN] {
-            num += *s * PILOT_SYMBOL.conj();
-            den += PILOT_SYMBOL.norm_sqr();
+    for (p_start, p_end, abs_pilot_start) in positions {
+        for (i, k) in (p_start..p_end).enumerate() {
+            let pref = pilot_symbol_2x(abs_pilot_start + i);
+            num += chunk[k] * pref.conj();
+            den += pref.norm_sqr();
         }
-        wire_cursor += PILOT_BLOCK_LEN;
-        data_cursor += take;
     }
     if let Some((rx, exp)) = extra_refs {
         debug_assert_eq!(rx.len(), exp.len());
@@ -436,29 +428,29 @@ struct Sigma2Split {
 }
 
 /// Per-CW σ² estimator: **median** of pilot residuals (MAD-style),
-/// decomposed into radial and tangential axes relative to the pilot
-/// direction `P = (1+j)/√2`.
+/// decomposed into radial and tangential axes relative to each pilot's
+/// own direction `pref_k = pilot_symbol_2x(abs_idx_k)`.
 ///
-/// Each pilot residual `e_k = y_k / gain − P` is a complex number. We
-/// project it onto the pilot reference vector:
+/// Each pilot residual `e_k = y_k / gain − pref_k` is a complex number,
+/// projected onto its pilot reference:
 ///
-///   e_k · conj(P) / |P|   →   real part = radial, imag part = tangential
+///   e_k · conj(pref_k) / |pref_k|   →   real = radial, imag = tangential
 ///
-/// (|P| = 1 so the division is trivial.) The radial axis captures
+/// (`|pref_k| = 1` so the division is trivial.) The radial axis captures
 /// amplitude distortion (AM-AM, hard-clipping, AGC error). The
 /// tangential axis captures phase noise (AM-PM, LO drift, residual
 /// timing jitter). On pure AWGN, the two are equal.
 ///
-/// The total σ² is computed from `|e|²` directly (separate medianing
-/// for robustness), not from `radial + tangential`. This keeps the
-/// LDPC LLR scaling drop-in compatible with the previous single-axis
-/// estimator.
+/// The total σ² is computed from `|e|²` directly for robustness, not
+/// from `radial + tangential`. This keeps the LDPC LLR scaling
+/// drop-in compatible with the previous estimator.
 ///
 /// Falls back to the configured floor when no pilots contributed.
 fn estimate_cw_sigma2_split(
     chunk: &[Complex64],
     cw_data_syms: usize,
-    pilot_blocks_per_cw: usize,
+    pattern: &PilotPattern2x,
+    group_idx_offset: usize,
     gain: Complex64,
     extra_refs: Option<(&[Complex64], &[Complex64])>,
 ) -> Sigma2Split {
@@ -469,33 +461,23 @@ fn estimate_cw_sigma2_split(
             tangential: SIGMA2_FLOOR / 2.0,
         };
     }
-    let base_chunk = cw_data_syms / pilot_blocks_per_cw;
-    let mut data_cursor = 0usize;
-    let mut wire_cursor = 0usize;
-    let cap = pilot_blocks_per_cw * PILOT_BLOCK_LEN
+    let positions = pilot2x_tdm::pilot_positions_2x(cw_data_syms, pattern, group_idx_offset);
+    let cap = positions.len() * pattern.p_syms
         + extra_refs.map_or(0, |(rx, _)| rx.len());
     let mut total_sq: Vec<f64> = Vec::with_capacity(cap);
     let mut radial_sq: Vec<f64> = Vec::with_capacity(cap);
     let mut tang_sq: Vec<f64> = Vec::with_capacity(cap);
-    for k in 0..pilot_blocks_per_cw {
-        let take = if k + 1 == pilot_blocks_per_cw {
-            cw_data_syms - data_cursor
-        } else {
-            base_chunk
-        };
-        wire_cursor += take;
-        for s in &chunk[wire_cursor..wire_cursor + PILOT_BLOCK_LEN] {
-            let normed = *s / gain;
-            let resid = normed - PILOT_SYMBOL;
+    for (p_start, p_end, abs_pilot_start) in positions {
+        for (i, k) in (p_start..p_end).enumerate() {
+            let pref = pilot_symbol_2x(abs_pilot_start + i);
+            let normed = chunk[k] / gain;
+            let resid = normed - pref;
             total_sq.push(resid.norm_sqr());
-            // Project the residual onto the pilot reference direction.
-            // Since |P| = 1, projection = resid * conj(P).
-            let proj = resid * PILOT_SYMBOL.conj();
+            // |pref| = 1 → projection = resid · conj(pref).
+            let proj = resid * pref.conj();
             radial_sq.push(proj.re * proj.re);
             tang_sq.push(proj.im * proj.im);
         }
-        wire_cursor += PILOT_BLOCK_LEN;
-        data_cursor += take;
     }
     // Cycle-level PLHEADER references — same projection logic but the
     // reference direction varies per symbol (SOF Chu rotates over the
@@ -1043,8 +1025,9 @@ pub fn rx_v4_symbols_after(
 ) -> Option<RxResult2x> {
     let constellation = make_constellation_2x(cfg);
     let cw_data_syms = cfg.cw_data_syms();
-    let cw_with_pilots = cw_data_syms + cfg.pilot_blocks_per_cw * PILOT_BLOCK_LEN;
+    let cw_with_pilots = cw_with_pilots_len(cfg);
     let cw_per_cycle = data_cw_per_cycle(cfg);
+    let groups_per_cw = pilot_groups_per_cw(cfg);
 
     let interleave_perm = interleaver::interleave_table(
         interleaver::padded_cw_bits(cfg.base.ldpc_rate.n(), cfg.base.constellation),
@@ -1129,7 +1112,8 @@ pub fn rx_v4_symbols_after(
         decode_one_cw(
             &meta_chunk,
             cw_data_syms,
-            cfg.pilot_blocks_per_cw,
+            &cfg.pilot_pattern,
+            0,                     // META-CW: pilot rotation starts at 0
             &constellation,
             &interleave_perm,
             &deinterleave_perm,
@@ -1229,7 +1213,8 @@ pub fn rx_v4_symbols_after(
             decode_one_cw(
                 &chunk,
                 cw_data_syms,
-                cfg.pilot_blocks_per_cw,
+                &cfg.pilot_pattern,
+                groups_per_cw * (1 + k), // match encoder's rotation
                 &constellation,
                 &interleave_perm,
                 &deinterleave_perm,
@@ -1302,7 +1287,8 @@ pub fn rx_v4_symbols_after(
 fn decode_one_cw(
     chunk: &[Complex64],
     cw_data_syms: usize,
-    pilot_blocks_per_cw: usize,
+    pattern: &PilotPattern2x,
+    group_idx_offset: usize,
     constellation: &modem_core_base::constellation::Constellation,
     interleave_perm: &[usize],
     deinterleave_perm: &[usize],
@@ -1319,9 +1305,9 @@ fn decode_one_cw(
     sigma2_n: &mut usize,
     cycle_refs: Option<(&[Complex64], &[Complex64])>,
 ) {
-    let gain = estimate_cw_gain(chunk, cw_data_syms, pilot_blocks_per_cw, cycle_refs);
+    let gain = estimate_cw_gain(chunk, cw_data_syms, pattern, group_idx_offset, cycle_refs);
     let split = estimate_cw_sigma2_split(
-        chunk, cw_data_syms, pilot_blocks_per_cw, gain, cycle_refs);
+        chunk, cw_data_syms, pattern, group_idx_offset, gain, cycle_refs);
     let sigma2 = split.total;
     *sigma2_sum += split.total;
     *sigma2_radial_sum += split.radial;
@@ -1330,9 +1316,9 @@ fn decode_one_cw(
 
     // De-interleave the data symbols, divide by the gain (residual phase
     // / amplitude on top of the SOF reference).
-    let data_only = pilot_block::deinterleave_pilot_blocks(
+    let data_only = pilot2x_tdm::deinterleave_data_pilots_2x(
         chunk,
-        pilot_blocks_per_cw,
+        pattern,
         cw_data_syms,
     );
     let mut data_norm: Vec<Complex64> = if (gain - Complex64::new(1.0, 0.0)).norm() < 1e-9 {
@@ -1686,8 +1672,7 @@ mod tests {
         // Replicate the rx_v4 production pipeline: PLHEADER decode →
         // sof_gain → divide all CW symbols by sof_gain before per-CW
         // gain estimate.
-        let cw_with_pilots = cfg.cw_data_syms()
-            + cfg.pilot_blocks_per_cw * PILOT_BLOCK_LEN;
+        let cw_with_pilots = cw_with_pilots_len(&cfg);
         let sof_at = find_next_sof(&rx_symbols, 0, cfg.family)
             .expect("SOF in noise-free audio");
         let plheader_slice = &rx_symbols[sof_at..sof_at + PLHEADER_LEN_SYM];
@@ -1697,46 +1682,39 @@ mod tests {
                   sof_gain.re, sof_gain.im, sof_gain.norm());
         eprintln!("[pilot-dump] training_amplitude = {:.6}", cfg.training_amplitude);
 
+        // Walk to the first DATA-CW (offset = PLHEADER + warmup + META-CW).
         let cursor = sof_at + PLHEADER_LEN_SYM + cfg.lms_warmup_syms + cw_with_pilots;
-        // Apply sof_gain normalisation (same as rx_v4_symbols_after does).
         let chunk: Vec<Complex64> = rx_symbols[cursor..cursor + cw_with_pilots]
             .iter().map(|&s| s / sof_gain).collect();
         let cw_data = cfg.cw_data_syms();
-        let blocks = cfg.pilot_blocks_per_cw;
-        let base_chunk = cw_data / blocks;
-        let mut wire_cursor = 0usize;
-        let mut data_cursor = 0usize;
-        let gain = estimate_cw_gain(&chunk, cw_data, blocks, None);
+        let pattern = cfg.pilot_pattern;
+        let groups_per_cw = pilot_groups_per_cw(&cfg);
+        // DATA-CW[0] pilot rotation continues from META-CW's groups.
+        let group_offset = groups_per_cw;
+        let gain = estimate_cw_gain(&chunk, cw_data, &pattern, group_offset, None);
         eprintln!("[pilot-dump] per-CW gain (after sof_gain norm) = ({:+.6}, {:+.6}) |g|={:.6}",
                   gain.re, gain.im, gain.norm());
-        for k in 0..blocks {
-            let take = if k + 1 == blocks { cw_data - data_cursor } else { base_chunk };
-            wire_cursor += take;
-            eprintln!("[pilot-dump] === pilot block {k} at wire offset {wire_cursor} ===");
-            let mut sum_resid_sq = 0.0_f64;
-            for j in 0..PILOT_BLOCK_LEN {
-                let s = chunk[wire_cursor + j];
+        let positions =
+            pilot2x_tdm::pilot_positions_2x(cw_data, &pattern, group_offset);
+        let mut sum_resid_sq = 0.0_f64;
+        let mut n_pilot = 0usize;
+        for (g, (p_start, p_end, abs_pilot_start)) in positions.iter().enumerate() {
+            eprintln!("[pilot-dump] === group {g} pilot slot @ wire offset {p_start} ===");
+            for (i, k) in (*p_start..*p_end).enumerate() {
+                let pref = pilot_symbol_2x(abs_pilot_start + i);
+                let s = chunk[k];
                 let normed = s / gain;
-                let resid = normed - PILOT_SYMBOL;
+                let resid = normed - pref;
                 sum_resid_sq += resid.norm_sqr();
-                if j < 6 || j >= 30 {
-                    // print edges + 2 middle samples for context
-                    eprintln!(
-                        "  [{j:2}] raw=({:+.4},{:+.4}) |raw|={:.4}  normed=({:+.4},{:+.4}) |n|={:.4}  resid=|{:.4}|",
-                        s.re, s.im, s.norm(), normed.re, normed.im, normed.norm(), resid.norm()
-                    );
-                } else if j == 16 || j == 17 {
-                    eprintln!(
-                        "  [{j:2}] (mid) raw=({:+.4},{:+.4}) normed=|{:.4}| resid=|{:.4}|",
-                        s.re, s.im, normed.norm(), resid.norm()
-                    );
-                }
+                n_pilot += 1;
+                eprintln!(
+                    "  [{i}] raw=({:+.4},{:+.4}) |raw|={:.4}  normed=({:+.4},{:+.4}) |n|={:.4}  resid=|{:.4}|",
+                    s.re, s.im, s.norm(), normed.re, normed.im, normed.norm(), resid.norm()
+                );
             }
-            eprintln!("[pilot-dump] block {k} σ²={:.6}",
-                      sum_resid_sq / PILOT_BLOCK_LEN as f64);
-            wire_cursor += PILOT_BLOCK_LEN;
-            data_cursor += take;
         }
+        eprintln!("[pilot-dump] mean σ² over {n_pilot} pilots = {:.6}",
+                  sum_resid_sq / n_pilot as f64);
     }
 
     #[test]
@@ -1820,11 +1798,12 @@ mod tests {
             let symbols = build_superframe_v4(&payload, &cfg, 0x42, mime::BINARY, 0);
             let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
             eprintln!(
-                "[sigma2-diag] {} cons={:?} pilot_blocks_per_cw={} \
+                "[sigma2-diag] {} cons={:?} pattern={}/{}  \
                  cw_data_syms={} sigma2={:.6} converged={}/{}",
                 p.name(),
                 cfg.base.constellation,
-                cfg.pilot_blocks_per_cw,
+                cfg.pilot_pattern.d_syms,
+                cfg.pilot_pattern.p_syms,
                 cfg.cw_data_syms(),
                 result.sigma2_data,
                 result.converged_cws,

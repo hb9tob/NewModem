@@ -4,25 +4,26 @@
 //!
 //! ```text
 //! [PLHEADER 192]
-//!   [LMS warmup 32/64]      (only when constellation = APSK-32 or APSK-64)
-//! [META-CW + pilot_block]   (LDPC codeword carrying AppHeader×4)
-//! [DATA-CW[0] + pilot_block]
-//! [DATA-CW[1] + pilot_block]
+//!   [LMS warmup 32/64]                (APSK-32 / APSK-64 only)
+//! [META-CW data interleaved with TDM pilots]    (LDPC CW carrying AppHeader×4)
+//! [DATA-CW[0] data interleaved with TDM pilots]
+//! [DATA-CW[1] data interleaved with TDM pilots]
 //! ...
-//! [DATA-CW[k] + pilot_block]
 //! ```
 //!
-//! For HighPlus2x / HighPlusPlus2x / HighPlusFiveSix2x the pilot blocks are
-//! densified to 2 per CW (data half / pilot / data half / pilot) — see
-//! [`crate::pilot_block::interleave_pilot_blocks`].
+//! Each LDPC codeword is interleaved with the V3-style TDM pilot pattern
+//! ([`pilot2x_tdm::PilotPattern2x`]): `d_syms` data + `p_syms` rotating
+//! QPSK pilots per group, repeating across the CW. Default 32/2 for the
+//! whole catalogue; HighPlusPlus2x densifies to 16/2 for the
+//! squared-min-distance reason that drove V3 HighPlusPlus.
 //!
 //! Differences vs V3 frame:
 //!
-//! - No marker between segments (the implicit boundary is the pilot block
-//!   that follows every CW; the new PLHEADER cycle is anchored on the SOF).
-//! - No TDM intra-CW pilots — sparse blocks only.
-//! - No runout symbols — the last pilot block already gives the RX a clean
-//!   reference; a fresh PLHEADER is the only re-anchor.
+//! - No marker between segments (PLHEADER cycle re-anchors directly).
+//! - No runout symbols — the last pilot group already gives the RX a
+//!   clean reference; a fresh PLHEADER is the only re-anchor.
+//! - Pilots continue rotating across the META → DATA-CW boundary so
+//!   the rotation index reconstructs from one per-cycle counter.
 //!
 //! ESI accounting: the PLS payload carries `base_esi` = ESI of the *first*
 //! DATA-CW in the cycle (i.e. the CW immediately after the META-CW). The
@@ -37,7 +38,7 @@ use modem_core_base::profile_types::ConstellationType;
 use modem_core_base::types::Complex64;
 use modem_framing::app_header::{self, AppHeader};
 
-use crate::pilot_block::{self, PILOT_BLOCK_LEN};
+use crate::pilot2x_tdm::{self, PilotPattern2x};
 use crate::plheader::{self, PlsPayload};
 use crate::profile2x::ModemConfig2x;
 
@@ -129,9 +130,19 @@ pub fn encode_one_codeword(
 
 // --- Symbol-accurate cycle / superframe layout ----------------------------
 
-/// Symbols emitted per LDPC codeword *after* pilot interleaving.
-fn cw_with_pilots_len(cfg: &ModemConfig2x) -> usize {
-    cfg.cw_data_syms() + cfg.pilot_blocks_per_cw * PILOT_BLOCK_LEN
+/// Symbols emitted per LDPC codeword *after* TDM pilot interleaving.
+pub(crate) fn cw_with_pilots_len(cfg: &ModemConfig2x) -> usize {
+    cfg.pilot_pattern.wire_len(cfg.cw_data_syms())
+}
+
+/// Number of pilot symbols emitted per LDPC codeword.
+pub(crate) fn pilot_syms_per_cw(cfg: &ModemConfig2x) -> usize {
+    cfg.pilot_pattern.n_groups(cfg.cw_data_syms()) * cfg.pilot_pattern.p_syms
+}
+
+/// Number of TDM groups (data+pilot pairs) per LDPC codeword.
+pub(crate) fn pilot_groups_per_cw(cfg: &ModemConfig2x) -> usize {
+    cfg.pilot_pattern.n_groups(cfg.cw_data_syms())
 }
 
 /// Symbols emitted by one PLHEADER cycle that carries `n_data_cw` data
@@ -184,33 +195,30 @@ pub fn eot_frame_symbols_v4(cfg: &ModemConfig2x) -> usize {
 }
 
 /// True when `chunk_offset` (within a `cw_with_pilots_len(cfg)`-sized
-/// CW chunk) lands inside a pilot block. Mirror of the encoder's
-/// [`pilot_block::interleave_pilot_blocks`] split logic, exposed here for
-/// receive-side machinery (timing recovery) that wants to know which
-/// emitted symbols are unit-magnitude pilots without having to drive the
-/// full deinterleaver.
+/// CW chunk) lands inside a TDM pilot slot. Mirror of
+/// [`pilot2x_tdm::pilot_positions_2x`], exposed for receive-side
+/// machinery (timing recovery) that wants pilot/data classification
+/// without driving the full deinterleaver.
 pub fn chunk_offset_is_pilot(
     chunk_offset: usize,
     cw_data_syms: usize,
-    pilot_blocks_per_cw: usize,
+    pattern: &PilotPattern2x,
 ) -> bool {
-    if pilot_blocks_per_cw == 0 {
+    if pattern.p_syms == 0 {
         return false;
     }
-    let base_chunk = cw_data_syms / pilot_blocks_per_cw;
-    let mut data_cursor = 0usize;
+    let d = pattern.d_syms;
+    let p = pattern.p_syms;
+    let n_groups = pattern.n_groups(cw_data_syms);
     let mut wire_cursor = 0usize;
-    for k in 0..pilot_blocks_per_cw {
-        let take = if k + 1 == pilot_blocks_per_cw {
-            cw_data_syms - data_cursor
-        } else {
-            base_chunk
-        };
+    let mut data_cursor = 0usize;
+    for _ in 0..n_groups {
+        let take = (d).min(cw_data_syms - data_cursor);
         wire_cursor += take;
-        if chunk_offset >= wire_cursor && chunk_offset < wire_cursor + PILOT_BLOCK_LEN {
+        if chunk_offset >= wire_cursor && chunk_offset < wire_cursor + p {
             return true;
         }
-        wire_cursor += PILOT_BLOCK_LEN;
+        wire_cursor += p;
         data_cursor += take;
     }
     false
@@ -223,10 +231,10 @@ pub fn full_cycle_len_syms(cfg: &ModemConfig2x) -> usize {
     cycle_total_syms(cfg, data_cw_per_cycle(cfg))
 }
 
-/// Pre-compute a per-cycle pilot-position map: `map[k] = true` iff symbol
-/// offset `k` within a full PLHEADER cycle is a pilot symbol (one of the
-/// 36-sym `(1+j)/√2` blocks). The PLHEADER (192 sym SOF+PLS), LMS warmup
-/// and every data symbol map to `false`.
+/// Pre-compute a per-cycle pilot-position map: `map[k] = true` iff
+/// symbol offset `k` within a full PLHEADER cycle is a TDM pilot. The
+/// PLHEADER (192 sym SOF+PLS), LMS warmup and every data symbol map to
+/// `false`.
 ///
 /// The map length equals [`full_cycle_len_syms`]`(cfg)`. Receive-side
 /// timing recovery uses `map[(abs - sof_anchor) % len]` to gate a pilot-
@@ -238,11 +246,12 @@ pub fn cycle_pilot_map(cfg: &ModemConfig2x) -> Vec<bool> {
     let cycle_len = cycle_total_syms(cfg, cw_per_cycle);
     let mut map = vec![false; cycle_len];
     let cw_block_start = plheader::PLHEADER_LEN_SYM + cfg.lms_warmup_syms;
+    let cw_data_syms = cfg.cw_data_syms();
     // META-CW + cw_per_cycle DATA-CWs all share the same chunk layout.
     for cw_idx in 0..=cw_per_cycle {
         let chunk_start = cw_block_start + cw_idx * cw_with_pilots;
         for off in 0..cw_with_pilots {
-            if chunk_offset_is_pilot(off, cfg.cw_data_syms(), cfg.pilot_blocks_per_cw) {
+            if chunk_offset_is_pilot(off, cw_data_syms, &cfg.pilot_pattern) {
                 map[chunk_start + off] = true;
             }
         }
@@ -316,6 +325,7 @@ pub fn build_superframe_v4_range(
     let cw_per_cycle = data_cw_per_cycle(cfg);
     let n_data_cw = data_cw_syms.len();
     let session_id_low = (session_id & 0xFF) as u8;
+    let groups_per_cw = pilot_groups_per_cw(cfg);
 
     let mut out: Vec<Complex64> = Vec::with_capacity(
         superframe_total_symbols_v4(cfg, n_data_cw as u32),
@@ -347,17 +357,25 @@ pub fn build_superframe_v4_range(
         out.extend(plheader::make_plheader(&pls, cfg.family));
         out.extend_from_slice(&warmup_syms);
 
-        // META-CW + its pilot block(s).
-        let (meta_w_pilot, _pos) =
-            pilot_block::interleave_pilot_blocks(&meta_cw_syms, cfg.pilot_blocks_per_cw);
+        // Pilot rotation index resets at every cycle (PLHEADER acts as
+        // anchor). META-CW starts at group 0, the k-th DATA-CW continues
+        // from groups_per_cw*(1+k) so the rotation is continuous across
+        // CW boundaries — RX reconstructs the same sequence from the
+        // PLHEADER position alone.
+        let (meta_w_pilot, _pos) = pilot2x_tdm::interleave_data_pilots_2x(
+            &meta_cw_syms,
+            &cfg.pilot_pattern,
+            0,
+        );
         out.extend(meta_w_pilot);
 
-        // Data CWs of this cycle.
         let cw_take = cw_per_cycle.min(n_data_cw.saturating_sub(data_cursor));
         for k in 0..cw_take {
-            let (cw_w_pilot, _pos) = pilot_block::interleave_pilot_blocks(
+            let group_offset = groups_per_cw * (1 + k);
+            let (cw_w_pilot, _pos) = pilot2x_tdm::interleave_data_pilots_2x(
                 &data_cw_syms[data_cursor + k],
-                cfg.pilot_blocks_per_cw,
+                &cfg.pilot_pattern,
+                group_offset,
             );
             out.extend(cw_w_pilot);
         }
@@ -433,8 +451,11 @@ pub fn build_eot_frame_v4(cfg: &ModemConfig2x, session_id: u32) -> Vec<Complex64
     let mut out = Vec::with_capacity(eot_frame_symbols_v4(cfg));
     out.extend(plheader::make_plheader(&pls, cfg.family));
     out.extend(make_lms_warmup_2x(cfg));
-    let (meta_w_pilot, _pos) =
-        pilot_block::interleave_pilot_blocks(&meta_cw_syms, cfg.pilot_blocks_per_cw);
+    let (meta_w_pilot, _pos) = pilot2x_tdm::interleave_data_pilots_2x(
+        &meta_cw_syms,
+        &cfg.pilot_pattern,
+        0,
+    );
     out.extend(meta_w_pilot);
     out
 }
@@ -442,6 +463,7 @@ pub fn build_eot_frame_v4(cfg: &ModemConfig2x, session_id: u32) -> Vec<Complex64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pilot2x_tdm::pilot_symbol_2x;
     use crate::plheader::{decode_plheader_at, PLHEADER_LEN_SYM};
     use crate::profile2x::{
         profile_high_2x, profile_high_plus_2x, profile_high_plus_plus_2x,
@@ -487,12 +509,14 @@ mod tests {
 
     #[test]
     fn data_cw_per_cycle_close_to_target_period() {
-        // ULTRA at 500 Bd: cycle ~4 s = 2000 sym. PLHEADER 192 + meta CW
-        // (1152+36=1188) = 1380 → 620 budget / 1188 per CW → 0 → clamped to 1.
-        // ROBUST at 1000 Bd: 4000 sym budget; PLHEADER+meta+0 warmup =
-        // 192+1188 = 1380 → 2620 / 1188 = 2 data CW.
-        // HIGH at 1500 Bd: 6000 sym; PLHEADER + meta(576+36) = 192+612 = 804
-        //   → 5196 / 612 = 8 data CW.
+        // TDM 32/2 pattern → CW wire size:
+        //   ULTRA  QPSK    1152 data → 36 groups × 2 = 72 pilot → 1224 wire.
+        //          Cycle ~2000 sym ; PLHEADER+meta = 192+1224 = 1416 →
+        //          budget 584 / 1224 = 0 → clamped to 1.
+        //   ROBUST QPSK    1152 data → 1224 wire. Cycle 4000; PLHEADER+meta
+        //          = 1416 → 2584 / 1224 = 2.
+        //   HIGH   16-APSK 576 data → 18 groups × 2 = 36 pilot → 612 wire.
+        //          Cycle 6000 ; PLHEADER+meta = 804 → 5196 / 612 = 8.
         assert_eq!(data_cw_per_cycle(&profile_ultra_2x()), 1);
         assert_eq!(data_cw_per_cycle(&profile_robust_2x()), 2);
         let n_high = data_cw_per_cycle(&profile_high_2x());
@@ -576,36 +600,23 @@ mod tests {
     }
 
     #[test]
-    fn data_cw_pilot_block_sequence() {
-        // After the PLHEADER + warmup + META-CW the layout is:
-        //   pilot_block, then DATA-CW[0] data, then pilot_block, ...
-        // Since the META-CW interleaver puts pilot blocks at the END of
-        // each chunk, the symbol immediately after warmup is the first
-        // data symbol of the META-CW (not a pilot). Past meta_with_pilot
-        // we should land on a data sym of CW[0].
-        let cfg = profile_high_2x(); // 16-APSK, 1 block/CW
+    fn first_tdm_pilot_group_after_warmup_carries_rotating_qpsk() {
+        // After PLHEADER + warmup the META-CW starts with d_syms data
+        // symbols, then p_syms pilots whose values are the rotating
+        // QPSK reference pilot_symbol_2x(k) for k=0..p_syms.
+        let cfg = profile_high_2x();
         let data = vec![0u8; 200];
         let syms = build_superframe_v4(&data, &cfg, 1, mime::BINARY, 0);
-        let cw_data = cfg.cw_data_syms();
-        let p = PILOT_BLOCK_LEN;
-        // Index of the start of the first pilot block (end of META-CW).
-        let pilot_start = PLHEADER_LEN_SYM + cfg.lms_warmup_syms + cw_data;
-        let pilot_end = pilot_start + p;
-        // All pilot symbols equal PILOT_SYMBOL.
-        for k in pilot_start..pilot_end {
+        let pattern = cfg.pilot_pattern;
+        let pilot_start = PLHEADER_LEN_SYM + cfg.lms_warmup_syms + pattern.d_syms;
+        for k in 0..pattern.p_syms {
+            let want = pilot_symbol_2x(k);
+            let got = syms[pilot_start + k];
             assert!(
-                (syms[k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
-                "expected pilot at index {k}",
+                (got - want).norm() < 1e-12,
+                "first pilot slot {k}: got {got:?} want {want:?}",
             );
         }
-        // Symbol at pilot_end must be a data symbol of DATA-CW[0]: real or
-        // imag != ±1/√2 (would be a pilot collision) — for 16-APSK no data
-        // point sits exactly at PILOT_SYMBOL.
-        let s = syms[pilot_end];
-        assert!(
-            (s - pilot_block::PILOT_SYMBOL).norm() > 1e-6,
-            "first data sym after pilot should not be a pilot value: {s}",
-        );
     }
 
     #[test]
@@ -639,9 +650,10 @@ mod tests {
 
     #[test]
     fn meta_cw_decodes_back_to_app_header() {
-        // Encode a known burst, manually pull the META-CW slice (no pilots),
-        // re-run LDPC, recover AppHeader. This protects the encode_one_codeword
-        // path against silent regressions in the interleaver or the encoder.
+        // Encode a known burst, manually pull the META-CW slice (data
+        // symbols only, after TDM deinterleave), re-run LDPC, recover
+        // AppHeader. This protects the encode_one_codeword path against
+        // silent regressions in the interleaver or the encoder.
         use modem_core_base::ldpc::decoder::LdpcDecoder;
         let cfg = profile_normal_2x();
         let data = b"hello world".to_vec();
@@ -654,13 +666,20 @@ mod tests {
             0x55AA,
         );
 
-        // META-CW spans from end of PLHEADER+warmup to + cw_data_syms.
+        // META-CW spans from end of PLHEADER+warmup over the full
+        // interleaved CW wire (data + TDM pilots). Strip the pilots.
         let cons = make_constellation_2x(&cfg);
         let cw_data = cfg.cw_data_syms();
+        let wire_len = cw_with_pilots_len(&cfg);
         let start = PLHEADER_LEN_SYM + cfg.lms_warmup_syms;
-        let meta_data_syms = &syms[start..start + cw_data];
+        let wire = &syms[start..start + wire_len];
+        let meta_data_syms = pilot2x_tdm::deinterleave_data_pilots_2x(
+            wire,
+            &cfg.pilot_pattern,
+            cw_data,
+        );
         // Hard-decision demap.
-        let indices = cons.slice_nearest(meta_data_syms);
+        let indices = cons.slice_nearest(&meta_data_syms);
         let mut bits = cons.symbols_to_bits(&indices);
         // De-interleave.
         let perm = interleaver::interleave_table(
@@ -690,34 +709,26 @@ mod tests {
     }
 
     #[test]
-    fn high_plus_2x_uses_two_pilot_blocks_per_cw() {
-        // HIGH+2X (Apsk32, 461 data sym/CW, 2 pilot blocks/CW):
-        //   META-CW first chunk (floor 461/2 = 230) | pilot | second chunk
-        //   (461-230 = 231) | pilot.
+    fn high_plus_2x_uses_v3_tdm_pattern() {
+        // HIGH+2X (Apsk32, 461 data sym/CW) with pattern 32/2:
+        //   ⌈461/32⌉ = 15 groups → 30 pilot sym, wire len 491.
+        //   Last group has only 461 - 14·32 = 13 data syms.
         let cfg = profile_high_plus_2x();
-        assert_eq!(cfg.pilot_blocks_per_cw, 2);
-        let data = vec![0u8; 200];
-        let syms = build_superframe_v4(&data, &cfg, 1, mime::BINARY, 0);
-        let cw_data = cfg.cw_data_syms();
-        let warmup = cfg.lms_warmup_syms;
-        let chunk_sz = cw_data / 2; // 230
-        // First pilot block: at sym = PLHEADER + warmup + chunk_sz.
-        let p1_start = PLHEADER_LEN_SYM + warmup + chunk_sz;
-        for k in 0..PILOT_BLOCK_LEN {
-            assert!(
-                (syms[p1_start + k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
-                "first pilot block of META-CW corrupted at +{k}",
-            );
-        }
-        // Second pilot block: skip first pilot + remaining chunk (cw_data
-        // - chunk_sz = 231 sym).
-        let p2_start = p1_start + PILOT_BLOCK_LEN + (cw_data - chunk_sz);
-        for k in 0..PILOT_BLOCK_LEN {
-            assert!(
-                (syms[p2_start + k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
-                "second pilot block of META-CW corrupted at +{k}",
-            );
-        }
+        assert_eq!(cfg.pilot_pattern, PilotPattern2x::default_2x());
+        assert_eq!(pilot_groups_per_cw(&cfg), 15);
+        assert_eq!(pilot_syms_per_cw(&cfg), 30);
+        assert_eq!(cw_with_pilots_len(&cfg), 491);
+    }
+
+    #[test]
+    fn high_plus_plus_2x_uses_dense_tdm_pattern() {
+        // HIGH++2X (Apsk64, 384 data sym/CW) with pattern 16/2:
+        //   384/16 = 24 groups → 48 pilot, wire len 432.
+        let cfg = profile_high_plus_plus_2x();
+        assert_eq!(cfg.pilot_pattern, PilotPattern2x::dense_2x());
+        assert_eq!(pilot_groups_per_cw(&cfg), 24);
+        assert_eq!(pilot_syms_per_cw(&cfg), 48);
+        assert_eq!(cw_with_pilots_len(&cfg), 432);
     }
 
     #[test]
@@ -738,54 +749,48 @@ mod tests {
     // --- pilot-position layout helpers (used by StreamingFrontend) -------
 
     #[test]
-    fn chunk_offset_is_pilot_one_block_per_cw() {
-        // HIGH2X: 1 pilot block at the end of each cw_data_syms chunk.
+    fn chunk_offset_is_pilot_default_pattern() {
+        // HIGH2X (16-APSK, 576 data, pattern 32/2): pilots fall at wire
+        // offsets {32..34, 66..68, 100..102, ...}.
         let cfg = profile_high_2x();
         let cw_data = cfg.cw_data_syms();
-        // Data region [0, cw_data) → never pilot.
-        for off in [0usize, 1, cw_data / 2, cw_data - 1] {
-            assert!(!chunk_offset_is_pilot(off, cw_data, cfg.pilot_blocks_per_cw));
+        let p = cfg.pilot_pattern;
+        // Position 0..32 → data.
+        for off in [0usize, 1, 31] {
+            assert!(!chunk_offset_is_pilot(off, cw_data, &p));
         }
-        // Pilot region [cw_data, cw_data + 36) → all pilot.
-        for off in cw_data..cw_data + PILOT_BLOCK_LEN {
-            assert!(chunk_offset_is_pilot(off, cw_data, cfg.pilot_blocks_per_cw));
+        // 32..34 → first pilot pair.
+        assert!(chunk_offset_is_pilot(32, cw_data, &p));
+        assert!(chunk_offset_is_pilot(33, cw_data, &p));
+        // 34..66 → data again.
+        for off in [34usize, 50, 65] {
+            assert!(!chunk_offset_is_pilot(off, cw_data, &p));
         }
-        // Past pilot → false (the lookup is for ONE chunk; the caller
-        // walks chunks separately).
-        assert!(!chunk_offset_is_pilot(
-            cw_data + PILOT_BLOCK_LEN,
-            cw_data,
-            cfg.pilot_blocks_per_cw,
-        ));
+        // 66..68 → second pilot pair.
+        assert!(chunk_offset_is_pilot(66, cw_data, &p));
+        assert!(chunk_offset_is_pilot(67, cw_data, &p));
     }
 
     #[test]
-    fn chunk_offset_is_pilot_two_blocks_apsk32_uneven() {
-        // Apsk32 padded CW = 461 data sym + 2 pilot blocks → 230 / 36 / 231 / 36.
-        let cw_data = 461;
-        let blocks = 2;
-        // First data half [0, 230) → data.
-        for &off in &[0usize, 100, 229] {
-            assert!(!chunk_offset_is_pilot(off, cw_data, blocks));
-        }
-        // First pilot [230, 266) → pilot.
-        for off in 230..266 {
-            assert!(chunk_offset_is_pilot(off, cw_data, blocks));
-        }
-        // Second data chunk [266, 497) → data.
-        for &off in &[266usize, 400, 496] {
-            assert!(!chunk_offset_is_pilot(off, cw_data, blocks));
-        }
-        // Second pilot [497, 533) → pilot.
-        for off in 497..533 {
-            assert!(chunk_offset_is_pilot(off, cw_data, blocks));
-        }
+    fn chunk_offset_is_pilot_apsk32_partial_last_group() {
+        // HIGH+2X: 461 data, pattern 32/2 → 15 groups.
+        // Last group: groups 14 carries only 461 - 14·32 = 13 data,
+        // pilots fall at wire offsets after 14·34 + 13 = 489..491.
+        let cfg = profile_high_plus_2x();
+        let cw_data = cfg.cw_data_syms();
+        let p = cfg.pilot_pattern;
+        assert!(!chunk_offset_is_pilot(488, cw_data, &p));
+        assert!(chunk_offset_is_pilot(489, cw_data, &p));
+        assert!(chunk_offset_is_pilot(490, cw_data, &p));
+        // wire_len is 491 — anything past it is out of chunk.
+        assert!(!chunk_offset_is_pilot(491, cw_data, &p));
     }
 
     #[test]
     fn cycle_pilot_map_marks_only_pilot_symbols() {
         // Build a real burst, then sample every position the lookup says
-        // is a pilot and verify it equals PILOT_SYMBOL.
+        // is a pilot and verify it sits on the unit circle and matches
+        // the rotating-QPSK reference.
         let cfg = profile_high_2x();
         let data = vec![0xA5u8; 800];
         let symbols = build_superframe_v4(&data, &cfg, 0x42, mime::BINARY, 0);
@@ -795,49 +800,44 @@ mod tests {
         for k in 0..PLHEADER_LEN_SYM + cfg.lms_warmup_syms {
             assert!(!map[k], "PLHEADER/warmup pos {k} wrongly marked pilot");
         }
-        // Every position marked as pilot must hold exactly PILOT_SYMBOL
-        // in the first cycle of the actual modulated burst.
         let cycle_len = map.len();
         for k in 0..cycle_len.min(symbols.len()) {
             if map[k] {
                 assert!(
-                    (symbols[k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
-                    "lookup says pilot at {k} but sym is {:?}",
+                    (symbols[k].norm() - 1.0).abs() < 1e-9,
+                    "pilot sym at {k} off the unit circle: {:?}",
                     symbols[k],
                 );
             }
         }
-        // And the FRACTION of pilot positions matches the expected
-        // pilot_blocks_per_cw · (1 + cw_per_cycle) · 36 / cycle_len.
+        // Expected count: (1 META + cw_per_cycle DATA) × pilot_syms_per_cw.
         let pilot_count: usize = map.iter().filter(|b| **b).count();
         let cw_per_cycle = data_cw_per_cycle(&cfg);
-        let expected = cfg.pilot_blocks_per_cw * (1 + cw_per_cycle) * PILOT_BLOCK_LEN;
+        let expected = (1 + cw_per_cycle) * pilot_syms_per_cw(&cfg);
         assert_eq!(pilot_count, expected, "pilot map cardinality off");
     }
 
     #[test]
     fn cycle_pilot_map_covers_all_profiles() {
-        // Sanity: every shipped profile produces a non-empty pilot map
-        // with the correct cardinality and matches the burst content.
         for p in ProfileIndex2x::ALL {
             let cfg = p.to_config();
             let map = cycle_pilot_map(&cfg);
             assert_eq!(map.len(), full_cycle_len_syms(&cfg));
             let pilot_count = map.iter().filter(|b| **b).count();
             let cw_per_cycle = data_cw_per_cycle(&cfg);
-            let expected = cfg.pilot_blocks_per_cw * (1 + cw_per_cycle) * PILOT_BLOCK_LEN;
+            let expected = (1 + cw_per_cycle) * pilot_syms_per_cw(&cfg);
             assert_eq!(
                 pilot_count, expected,
                 "{p:?} pilot map cardinality off (got {pilot_count} expected {expected})",
             );
             // Sample the burst against the lookup — every pilot-marked
-            // position must equal PILOT_SYMBOL.
+            // position must lie on the unit circle (rotating QPSK).
             let data = vec![0u8; 400];
             let symbols = build_superframe_v4(&data, &cfg, 0x42, mime::BINARY, 0);
             for k in 0..map.len().min(symbols.len()) {
                 if map[k] {
                     assert!(
-                        (symbols[k] - pilot_block::PILOT_SYMBOL).norm() < 1e-12,
+                        (symbols[k].norm() - 1.0).abs() < 1e-9,
                         "{p:?} lookup pilot at {k} but sym={:?}",
                         symbols[k],
                     );

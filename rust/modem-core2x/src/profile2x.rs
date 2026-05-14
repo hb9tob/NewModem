@@ -1,10 +1,17 @@
 //! 2x profiles — `ProfileIndex2x` enum and `ModemConfig2x` struct.
 //!
-//! Mirrors the V3 profile catalogue (see `modem_core::profile`) but drops
-//! every V3-only knob:
+//! Mirrors the V3 profile catalogue (see `modem_core::profile`). The
+//! original 2x design dropped TDM pilots in favour of sparse pilot
+//! blocks (DVB-S2X §5.5.3), but OTA bring-up on FTX-1 + SDRplay showed
+//! the block pattern could not track sound-card phase noise on
+//! HIGH+/HIGH++ (see memory `v4-pilot-tdm-refactor-todo`). The TDM
+//! pattern is now back as the standard pilot scheme for all 2x
+//! profiles, exposed as a per-profile [`PilotPattern2x`] so density
+//! and update-bandwidth axes can be tuned independently of the
+//! encoder.
 //!
-//! - `pilot_pattern` (TDM intra-CW) — replaced by `pilot_blocks_per_cw`
-//!   (sparse blocks following each codeword), see [`crate::pilot_block`].
+//! Other V3 knobs we still skip in 2x:
+//!
 //! - `mode_code` byte — the 2x wire format puts the full
 //!   `ProfileIndex2x::as_u8()` into the PLS payload; `mode_code` is
 //!   redundant.
@@ -21,6 +28,7 @@
 use modem_core_base::profile_types::{ConstellationType, LdpcRate};
 use modem_core_base::types::DATA_CENTER_HZ;
 
+use crate::pilot2x_tdm::PilotPattern2x;
 use crate::plheader::PreambleFamily2x;
 
 /// Reserved sentinel — used in PLS payload when no profile has been
@@ -41,14 +49,14 @@ pub enum ProfileIndex2x {
     Normal2x = 2,
     /// 16-APSK 1500 Bd LDPC 3/4 (mirrors V3 HIGH).
     High2x = 3,
-    /// 32-APSK 1500 Bd LDPC 3/4 (mirrors V3 HIGH+). 2 pilot blocks/CW.
+    /// 32-APSK 1500 Bd LDPC 3/4 (mirrors V3 HIGH+).
     HighPlus2x = 4,
     /// 64-APSK 1500 Bd LDPC 3/4 — promoted out of experimental in 2x.
-    /// 2 pilot blocks/CW. (Mirrors V3 HIGH++.)
+    /// (Mirrors V3 HIGH++.)
     HighPlusPlus2x = 5,
     /// 16-APSK 1500 Bd LDPC 5/6 (mirrors V3 HIGH56).
     HighFiveSix2x = 6,
-    /// 32-APSK 1500 Bd LDPC 5/6 (mirrors V3 HIGH+56). 2 pilot blocks/CW.
+    /// 32-APSK 1500 Bd LDPC 5/6 (mirrors V3 HIGH+56).
     HighPlusFiveSix2x = 7,
 }
 
@@ -167,11 +175,12 @@ pub struct ModemConfigBase2x {
 pub struct ModemConfig2x {
     pub base: ModemConfigBase2x,
 
-    /// Number of 36-symbol pilot blocks emitted **after** each LDPC
-    /// codeword. Default 1 (DVB-S2X-fidèle); densified to 2 for the
-    /// APSK-32 and APSK-64 profiles where the squared min-distance is
-    /// smaller and phase tracking needs a denser anchor.
-    pub pilot_blocks_per_cw: usize,
+    /// TDM pilot pattern (`d_syms` data + `p_syms` rotating-QPSK pilots
+    /// per group, repeating across every LDPC codeword). Defaults to
+    /// 32/2 for all 8 profiles — same density and update bandwidth as
+    /// V3 HIGH+. Tunable per profile so we can experiment with denser
+    /// patterns on APSK-32/64 without recompiling the catalogue.
+    pub pilot_pattern: PilotPattern2x,
 
     /// LMS warmup symbols inserted right after the PLHEADER for APSK
     /// profiles whose constellation has rings the QPSK SOF doesn't
@@ -195,17 +204,16 @@ pub struct ModemConfig2x {
 }
 
 impl ModemConfig2x {
-    /// Net data rate (bits/s) after LDPC + sparse pilot overhead.
+    /// Net data rate (bits/s) after LDPC + TDM pilot overhead.
     /// Excludes the PLHEADER (its overhead is amortised across multi-CW
     /// cycles and depends on `V4_PREAMBLE_PERIOD_S`); see
     /// `frame2x::superframe_total_symbols_v4` for the symbol-accurate
     /// count used by the duration estimator.
     pub fn net_bitrate(&self) -> f64 {
         let bits_per_sym = self.base.constellation.bits_per_sym() as f64;
-        let cw_data_syms = self.cw_data_syms() as f64;
-        let pilot_syms =
-            (self.pilot_blocks_per_cw * crate::pilot_block::PILOT_BLOCK_LEN) as f64;
-        let pilot_eff = cw_data_syms / (cw_data_syms + pilot_syms);
+        let cw_data_syms = self.cw_data_syms();
+        let wire_len = self.pilot_pattern.wire_len(cw_data_syms) as f64;
+        let pilot_eff = cw_data_syms as f64 / wire_len;
         self.base.symbol_rate * bits_per_sym * self.base.tau * self.base.ldpc_rate.rate()
             * pilot_eff
     }
@@ -269,7 +277,7 @@ fn make(
     apsk_gamma: f64,
     apsk_gamma2: f64,
     apsk_gamma3: f64,
-    pilot_blocks_per_cw: usize,
+    pilot_pattern: PilotPattern2x,
 ) -> ModemConfig2x {
     let base = ModemConfigBase2x {
         constellation,
@@ -286,7 +294,7 @@ fn make(
     let lms_warmup_syms = ModemConfig2x::computed_lms_warmup(constellation);
     let mut cfg = ModemConfig2x {
         base,
-        pilot_blocks_per_cw,
+        pilot_pattern,
         lms_warmup_syms,
         training_amplitude: 1.0,
         family,
@@ -305,7 +313,7 @@ pub fn profile_ultra_2x() -> ModemConfig2x {
         2.85,
         0.0,
         0.0,
-        1,
+        PilotPattern2x::default_2x(),
     )
 }
 
@@ -319,7 +327,7 @@ pub fn profile_robust_2x() -> ModemConfig2x {
         2.85,
         0.0,
         0.0,
-        1,
+        PilotPattern2x::default_2x(),
     )
 }
 
@@ -333,7 +341,7 @@ pub fn profile_normal_2x() -> ModemConfig2x {
         2.85,
         0.0,
         0.0,
-        1,
+        PilotPattern2x::default_2x(),
     )
 }
 
@@ -347,12 +355,11 @@ pub fn profile_high_2x() -> ModemConfig2x {
         2.85,
         0.0,
         0.0,
-        1,
+        PilotPattern2x::default_2x(),
     )
 }
 
-/// 32-APSK 1500 Bd 3/4 — densified pilots (2 blocks/CW) for the smaller
-/// min-distance.
+/// 32-APSK 1500 Bd 3/4 — V3-style TDM pilots (32 data + 2 pilots / group).
 pub fn profile_high_plus_2x() -> ModemConfig2x {
     make(
         ConstellationType::Apsk32,
@@ -362,11 +369,12 @@ pub fn profile_high_plus_2x() -> ModemConfig2x {
         2.84,
         5.27,
         0.0,
-        2,
+        PilotPattern2x::default_2x(),
     )
 }
 
-/// 64-APSK 1500 Bd 3/4 — densified pilots (2 blocks/CW).
+/// 64-APSK 1500 Bd 3/4 — densified TDM pilots (16 data + 2 pilots /
+/// group) for the small squared min-distance.
 pub fn profile_high_plus_plus_2x() -> ModemConfig2x {
     make(
         ConstellationType::Apsk64,
@@ -376,7 +384,7 @@ pub fn profile_high_plus_plus_2x() -> ModemConfig2x {
         2.4,
         4.3,
         7.0,
-        2,
+        PilotPattern2x::dense_2x(),
     )
 }
 
@@ -390,11 +398,11 @@ pub fn profile_high_5_6_2x() -> ModemConfig2x {
         2.85,
         0.0,
         0.0,
-        1,
+        PilotPattern2x::default_2x(),
     )
 }
 
-/// 32-APSK 1500 Bd 5/6 — densified pilots (2 blocks/CW).
+/// 32-APSK 1500 Bd 5/6 — V3-style TDM pilots.
 pub fn profile_high_plus_5_6_2x() -> ModemConfig2x {
     make(
         ConstellationType::Apsk32,
@@ -404,7 +412,7 @@ pub fn profile_high_plus_5_6_2x() -> ModemConfig2x {
         2.84,
         5.27,
         0.0,
-        2,
+        PilotPattern2x::default_2x(),
     )
 }
 
@@ -467,20 +475,19 @@ mod tests {
     }
 
     #[test]
-    fn pilot_density_per_profile_matches_design() {
-        // Plan §"Bilan d'overhead" — 1 block/CW everywhere, 2 blocks/CW
-        // for the APSK-32 and APSK-64 profiles.
+    fn pilot_pattern_per_profile_matches_design() {
+        // After the TDM revert: default 32/2 for everyone except
+        // HighPlusPlus2x (64-APSK) which uses the V3-style dense 16/2
+        // pattern to anchor the smaller squared min-distance.
         for p in ProfileIndex2x::ALL {
             let cfg = p.to_config();
             let expected = match p {
-                ProfileIndex2x::HighPlus2x
-                | ProfileIndex2x::HighPlusPlus2x
-                | ProfileIndex2x::HighPlusFiveSix2x => 2,
-                _ => 1,
+                ProfileIndex2x::HighPlusPlus2x => PilotPattern2x::dense_2x(),
+                _ => PilotPattern2x::default_2x(),
             };
             assert_eq!(
-                cfg.pilot_blocks_per_cw, expected,
-                "{p:?} should have {expected} pilot blocks/CW"
+                cfg.pilot_pattern, expected,
+                "{p:?} should have pattern {expected:?}",
             );
         }
     }
@@ -579,13 +586,14 @@ mod tests {
     }
 
     #[test]
-    fn net_bitrate_high_2x_close_to_v3_high_minus_pilot_overhead() {
-        // V3 HIGH is 1500 × 4 × 0.75 × (32/34) ≈ 4235 bps.
-        // V4 HIGH2X with 1 block/CW: 1500 × 4 × 0.75 × (576/612) ≈ 4235 bps too
-        // (576 data sym + 36 pilot).
+    fn net_bitrate_high_2x_matches_v3_tdm_overhead() {
+        // V3 HIGH and V4 HIGH2X now share the same TDM pattern (32/2):
+        //   576 data sym/CW → ⌈576/32⌉ = 18 groups → 36 pilot sym → 612 wire.
+        //   1500 × 4 × 0.75 × (576/612) ≈ 4235 bps.
         let r = profile_high_2x().net_bitrate();
         let cw_data = 576.0;
-        let expected = 1500.0 * 4.0 * 0.75 * (cw_data / (cw_data + 36.0));
+        let pilot = 36.0; // 18 groups × 2 pilots
+        let expected = 1500.0 * 4.0 * 0.75 * (cw_data / (cw_data + pilot));
         assert!(
             (r - expected).abs() < 1.0,
             "rate={r} expected={expected}"
@@ -593,13 +601,34 @@ mod tests {
     }
 
     #[test]
-    fn net_bitrate_high_plus_plus_2x_two_blocks() {
-        // 64-APSK: 384 data sym/CW + 2×36 = 72 pilot sym → eff 384/(384+72).
+    fn net_bitrate_high_plus_plus_2x_dense_pattern() {
+        // 64-APSK with dense pattern (16/2): 384 data sym/CW
+        //   → ⌈384/16⌉ = 24 groups → 48 pilot sym → 432 wire.
         let cfg = profile_high_plus_plus_2x();
-        let expected = 1500.0 * 6.0 * 0.75 * (384.0 / (384.0 + 72.0));
+        let expected = 1500.0 * 6.0 * 0.75 * (384.0 / (384.0 + 48.0));
         assert!(
             (cfg.net_bitrate() - expected).abs() < 1.0,
             "rate={} expected={expected}",
+            cfg.net_bitrate()
+        );
+    }
+
+    #[test]
+    fn net_bitrate_high_plus_2x_matches_v3_high_plus() {
+        // The headline number: V3 HIGH+ delivered 5294 bps with the
+        // 32/2 TDM pattern; V4 HighPlus2x must match it now that the
+        // 2x catalogue reverted to the same pattern.
+        // 461 data sym/CW + ⌈461/32⌉=15 groups × 2 = 30 pilot → 491 wire.
+        let cfg = profile_high_plus_2x();
+        let expected = 1500.0 * 5.0 * 0.75 * (461.0 / 491.0);
+        assert!(
+            (cfg.net_bitrate() - expected).abs() < 1.0,
+            "rate={} expected={expected}",
+            cfg.net_bitrate()
+        );
+        assert!(
+            (cfg.net_bitrate() - 5290.0).abs() < 10.0,
+            "expected ~5294 bps got {}",
             cfg.net_bitrate()
         );
     }
