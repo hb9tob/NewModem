@@ -705,8 +705,28 @@
               </div>
             </details>
             <div class="sounder-results" id="sounder-an-results" hidden>
+              <h4>Recommandation à dicter à l'OM TX</h4>
+              <div class="sd-reco">
+                <span class="sd-reco-label">Atténuation TX :</span>
+                <span id="sd-reco-att" class="sd-reco-value">—</span>
+                <span class="sd-reco-unit">dB</span>
+              </div>
+              <p class="sd-reco-hint">
+                Valeur entière à transmettre par phonie à la station émettrice.
+                Côté TX, l'opérateur la saisit dans Canal → Cascade de rapports.
+              </p>
               <h4>Verdict</h4>
               <div class="sounder-verdict" id="sd-verdict">—</div>
+              <div class="sd-collector">
+                <button type="button" id="sd-collector-send" disabled>
+                  Envoyer au collector
+                </button>
+                <label class="sd-collector-opt">
+                  <input type="checkbox" id="sd-collector-with-wav">
+                  joindre capture.wav
+                </label>
+                <span id="sd-collector-status" class="status"></span>
+              </div>
               <h4>Paramètres dérivés (au sweet-spot)</h4>
               <table class="sounder-derived">
                 <tbody>

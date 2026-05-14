@@ -22,6 +22,15 @@ fn default_true() -> bool {
     true
 }
 
+/// Default base URL of the Phase-D collector. Used both for the
+/// `Default for Settings` factory and as a soft migration target when
+/// loading an old settings file with an empty `collector_url`.
+pub const DEFAULT_COLLECTOR_URL: &str = "https://hb9tob.duckdns.org";
+
+fn default_collector_url() -> String {
+    DEFAULT_COLLECTOR_URL.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -66,8 +75,12 @@ pub struct Settings {
     #[serde(default)]
     pub rx_deemphasis_enabled: bool,
 
-    /// Base URL of the Phase-D collector. If empty, the post-raw-capture
-    /// prompt does not appear and submission is disabled for the session.
+    /// Base URL of the Phase-D collector. Pre-filled with
+    /// [`DEFAULT_COLLECTOR_URL`] so out-of-the-box installs talk to the
+    /// shared aggregator at `hb9tob.duckdns.org`. The user can override
+    /// in Paramètres → Collecteur to point at a private collector;
+    /// setting the field empty disables submission for that session.
+    #[serde(default = "default_collector_url")]
     pub collector_url: String,
     /// AVIF quality remembered across sessions (0-100). Default 10:
     /// compact file for slow NBFM passes.
@@ -271,7 +284,7 @@ impl Default for Settings {
             tx_attenuation_db: 0.0,
             tx_preemphasis_enabled: false,
             rx_deemphasis_enabled: false,
-            collector_url: String::new(),
+            collector_url: default_collector_url(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),
             tx_mode: default_tx_mode(),
@@ -324,6 +337,13 @@ pub fn load() -> Settings {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    // Soft migration for existing installs: previous versions defaulted
+    // `collector_url` to an empty string, which disabled submission. We
+    // now ship a baked-in default pointing at the public aggregator —
+    // backfill it once so an in-place upgrade lights up the upload UI.
+    if s.collector_url.trim().is_empty() {
+        s.collector_url = default_collector_url();
+    }
     if s.settings_schema_version < SETTINGS_SCHEMA_VERSION {
         eprintln!(
             "[settings] schema upgrade {} → {}: SDR settings reset to defaults",

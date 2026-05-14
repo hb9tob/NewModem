@@ -4535,10 +4535,24 @@ function setupChannelTab() {
     });
   }
   if (applyBtn) {
-    applyBtn.addEventListener("click", () => {
+    applyBtn.addEventListener("click", async () => {
       const vals = cascadeFeedback.map(r => r.db);
       const m = median(vals);
-      if (m !== null) applyAttenuation(m, "médiane cascade");
+      if (m === null) return;
+      // Round to the nearest integer dB: that's what the RX operator
+      // dictates on the air, and what the TX operator types back here.
+      // Also avoids float-precision quirks (e.g. -12.499999 vs -12.5)
+      // that made the value silently fail to be persisted before.
+      const rounded = Math.round(m);
+      // Disable the button while save_settings is in flight, await
+      // the async persist so a quick second click can't race the disk
+      // write, and surface any error in the status line.
+      applyBtn.disabled = true;
+      try {
+        await applyAttenuation(rounded, "médiane cascade");
+      } finally {
+        applyBtn.disabled = cascadeFeedback.length === 0;
+      }
     });
   }
   if (clearBtn) {
@@ -4908,13 +4922,46 @@ async function runSounderAnalyze() {
     document.getElementById("sounder-an-signature-path").textContent =
       `signature.json écrite à côté du WAV (${sig.measurements?.length ?? 0} mesures)`;
     // Verdict from the over-modulation analyser.
+    const v = sig.verdict || {};
     const vEl = document.getElementById("sd-verdict");
     if (vEl) {
-      const v = sig.verdict || {};
       vEl.textContent = v.message || "—";
       vEl.classList.remove("ok", "warn");
       if ((v.message || "").includes("OK")) vEl.classList.add("ok");
       else if ((v.message || "").includes("⚠️")) vEl.classList.add("warn");
+    }
+    // Recommended attenuation to dictate over the air to the TX
+    // operator. The sweet_spot_dbfs is the peak level (relative to
+    // full-scale) at which the rig stops over-modulating; the TX
+    // operator types that same negative value into Canal → Cascade.
+    // Round to the nearest integer dB because that's what gets
+    // dictated by voice (and matches the cascade slider's effective
+    // resolution after the recent fix).
+    const recoEl = document.getElementById("sd-reco-att");
+    if (recoEl) {
+      const sweet = Number(v.sweet_spot_dbfs);
+      if (Number.isFinite(sweet)) {
+        // Clamp to [-30, 0] like the TX attenuation chain itself.
+        const clamped = Math.min(0, Math.max(-30, sweet));
+        recoEl.textContent = String(Math.round(clamped));
+      } else {
+        recoEl.textContent = "—";
+      }
+    }
+    // Stash the result so the collector-send button can pick it up
+    // later without re-invoking the analyser.
+    lastSounderResult = {
+      wavPath: capture,
+      signatureJson: JSON.stringify(sig),
+      equipment,
+      notes,
+    };
+    const sendBtn = document.getElementById("sd-collector-send");
+    if (sendBtn) sendBtn.disabled = false;
+    const sendStatus = document.getElementById("sd-collector-status");
+    if (sendStatus) {
+      sendStatus.textContent = "";
+      sendStatus.classList.remove("ok", "err");
     }
     const res = document.getElementById("sounder-an-results");
     if (res) res.hidden = false;
@@ -4928,6 +4975,73 @@ async function runSounderAnalyze() {
     setSounderStatus("sounder-an-status", `OK ${now()}`, "ok");
   } catch (err) {
     setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
+  }
+}
+
+// Holds the most recent successful sounder analysis so the "Envoyer au
+// collector" button can ship it without re-running anything. Reset
+// implicitly each time `runSounderAnalyze` succeeds; we never clear it
+// on error so a transient analyse-fail doesn't wipe a good result.
+let lastSounderResult = null;
+
+// Phone-by-phone manual: the RX operator reads `#sd-reco-att` to the
+// TX operator, who types it into Channel → Cascade. This button does
+// NOT touch local tx_attenuation_db (the local machine is the receiver,
+// it isn't the one transmitting); it only ships the result to the
+// shared collector at hb9tob.duckdns.org.
+async function runSounderCollectorSend() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  if (!lastSounderResult) return;
+  const { invoke } = window.__TAURI__.core;
+  const btn = document.getElementById("sd-collector-send");
+  const statusEl = document.getElementById("sd-collector-status");
+  const wavChk = document.getElementById("sd-collector-with-wav");
+  const setStatus = (msg, kind) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.classList.remove("ok", "err");
+    if (kind) statusEl.classList.add(kind);
+  };
+  const callsign = (currentSettings && currentSettings.callsign || "").trim();
+  if (!callsign) {
+    setStatus("indicatif vide (Paramètres → Indicatif)", "err");
+    return;
+  }
+  const collectorUrl =
+    (currentSettings && currentSettings.collector_url || "").trim();
+  if (!collectorUrl) {
+    setStatus("URL collecteur vide (Paramètres → Collecteur)", "err");
+    return;
+  }
+  if (btn) btn.disabled = true;
+  setStatus("envoi en cours…");
+  try {
+    const res = await invoke("submit_sounding", {
+      args: {
+        wav_path: lastSounderResult.wavPath || "",
+        callsign,
+        collector_url: collectorUrl,
+        signature_json: lastSounderResult.signatureJson,
+        equipment: lastSounderResult.equipment || null,
+        notes: lastSounderResult.notes || null,
+        include_wav: !!(wavChk && wavChk.checked),
+      },
+    });
+    const link = `${collectorUrl.replace(/\/+$/, "")}${res.url || ""}`;
+    setStatus(`OK ${(res.bytes_uploaded / 1024).toFixed(0)} KiB — ${link}`, "ok");
+    // Best-effort: open the entry in the OS browser. The opener
+    // plugin is optional; swallow the error if it's not registered.
+    try {
+      if (window.__TAURI__.opener && window.__TAURI__.opener.openUrl) {
+        await window.__TAURI__.opener.openUrl(link);
+      }
+    } catch (_) {
+      /* the URL is shown in the status line anyway */
+    }
+  } catch (err) {
+    setStatus(`erreur : ${err}`, "err");
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -5340,6 +5454,9 @@ function setupSounderTab() {
   document
     .getElementById("sounder-an-regen-ref")
     ?.addEventListener("click", runSounderTxRender);
+  document
+    .getElementById("sd-collector-send")
+    ?.addEventListener("click", runSounderCollectorSend);
 }
 
 // ─────────────────────────────────────────── History tab

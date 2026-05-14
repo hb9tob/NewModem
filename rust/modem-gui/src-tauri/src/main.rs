@@ -729,6 +729,17 @@ async fn submit_capture(
     collector_client::submit(args).await
 }
 
+/// Upload a finished sounding run (the directory holding signature.json
+/// + metadata.json, and optionally capture.wav) to the Phase-D
+/// collector. Same HMAC contract as `submit_capture`, but reads its
+/// payload from disk rather than re-building it from an event log.
+#[tauri::command]
+async fn submit_sounding(
+    args: collector_client::SubmitSoundingArgs,
+) -> Result<collector_client::SubmitResult, String> {
+    collector_client::submit_sounding(args).await
+}
+
 #[derive(serde::Serialize)]
 struct CompressResult {
     preview_path: String,
@@ -1967,6 +1978,7 @@ fn main() {
             stop_raw_recording,
             is_raw_recording,
             submit_capture,
+            submit_sounding,
             set_tx_source,
             set_tx_source_from_path,
             clear_tx_source,

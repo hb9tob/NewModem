@@ -1511,6 +1511,83 @@ main {
   padding: 0.2rem 0;
   font-variant-numeric: tabular-nums;
 }
+/* Recommendation block — big numeric attenuation the RX operator
+ * dictates to the TX operator on the air. Sits right above the
+ * verdict prose. The number wants to be reading-from-across-the-shack
+ * sized; the rest stays at body weight. */
+.sd-reco {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  margin: 0.4rem 0 0.3rem;
+  background: #1a2530;
+  border: 1px solid #354a5e;
+  border-left: 4px solid #4ea3ff;
+  border-radius: 4px;
+}
+.sd-reco-label {
+  color: #9aa6b3;
+  font-size: 0.95rem;
+}
+.sd-reco-value {
+  color: #f0f6ff;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Mono", monospace;
+  font-size: 2.4rem;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.sd-reco-unit {
+  color: #cfd8e3;
+  font-size: 1.1rem;
+}
+.sd-reco-hint {
+  margin: 0 0 0.6rem;
+  padding: 0 0.1rem;
+  color: #8aa3bd;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+/* Send-to-collector block placed under the verdict prose. */
+.sd-collector {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin: 0.4rem 0 0.6rem;
+  padding: 0.5rem 0.7rem;
+  background: #131a24;
+  border: 1px solid #2a3344;
+  border-radius: 4px;
+}
+.sd-collector button {
+  padding: 0.35rem 0.9rem;
+  font-size: 0.92rem;
+}
+.sd-collector-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #cfd8e3;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+.sd-collector .status {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #9aa6b3;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+.sd-collector .status.ok {
+  color: #7fe095;
+}
+.sd-collector .status.err {
+  color: #ff8a80;
+}
+
 /* Sounder verdict box — over-modulation warning / OK confirmation. */
 .sounder-verdict {
   padding: 0.6rem 0.9rem;
