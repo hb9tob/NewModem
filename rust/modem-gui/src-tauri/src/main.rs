@@ -1300,6 +1300,214 @@ fn overlays_logos_dir() -> Result<String, String> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
+// --- Channel sounder commands ------------------------------------------
+//
+// `sounding_tx_render` builds the probe audio + schedule on TX side and
+// drops them under `<save_dir>/sounder/<id>/` so the operator can play
+// `probe.wav` through their soundcard. `sounding_analyze` consumes a
+// recorded capture WAV against the matching schedule and writes a
+// `signature.json` ready to feed back into `study/nbfm_channel_sim`.
+//
+// Pure file-IO wrappers around `modem_worker_base::sounder` — no Tauri
+// state involved beyond the configured save_dir; same DSP path the
+// CLI's `sounding-analyze` subcommand uses.
+
+#[derive(serde::Serialize)]
+struct SoundingTxResult {
+    /// Unique run id (`<unix>-<rand>`), also the subdirectory name
+    /// under `<save_dir>/sounder/`.
+    id: String,
+    /// Absolute path of `probe.wav` (48 kHz mono, 16-bit PCM).
+    probe_wav: String,
+    /// Absolute path of `schedule.json` (the contract the RX side
+    /// needs to run `sounding_analyze`).
+    schedule_json: String,
+    /// Total duration of `probe.wav` in seconds, so the GUI can show
+    /// "play, then wait N seconds".
+    duration_s: f64,
+}
+
+/// Render a probe schedule + WAV from a `SoundingRequest` and drop both
+/// under `<save_dir>/sounder/<id>/`. Front-end: TX operator picks
+/// probes, calls this, plays `probe.wav` through their soundcard while
+/// the RX side records.
+#[tauri::command]
+fn sounding_tx_render(
+    request: modem_worker_base::sounder::SoundingRequest,
+    state: State<'_, AppState>,
+) -> Result<SoundingTxResult, String> {
+    use modem_worker_base::sounder::build_probe_schedule;
+    let (audio, schedule) = build_probe_schedule(&request);
+
+    // Land everything under <save_dir>/sounder/<id>/.
+    let save_dir = state
+        .save_dir
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let id = format!(
+        "{}-{:04x}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        rand_u16(),
+    );
+    let run_dir = save_dir.join("sounder").join(&id);
+    std::fs::create_dir_all(&run_dir)
+        .map_err(|e| format!("create {}: {e}", run_dir.display()))?;
+
+    let probe_wav = run_dir.join("probe.wav");
+    let schedule_json = run_dir.join("schedule.json");
+
+    // Same 16-bit mono encoding the CLI uses.
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: modem_core_base::types::AUDIO_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&probe_wav, spec)
+        .map_err(|e| format!("create {}: {e}", probe_wav.display()))?;
+    for &s in &audio {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        w.write_sample(v)
+            .map_err(|e| format!("write sample: {e}"))?;
+    }
+    w.finalize()
+        .map_err(|e| format!("finalize {}: {e}", probe_wav.display()))?;
+
+    let sched_bytes = serde_json::to_vec_pretty(&schedule)
+        .map_err(|e| format!("serialize schedule: {e}"))?;
+    std::fs::write(&schedule_json, &sched_bytes)
+        .map_err(|e| format!("write {}: {e}", schedule_json.display()))?;
+
+    let duration_s =
+        audio.len() as f64 / modem_core_base::types::AUDIO_RATE as f64;
+    Ok(SoundingTxResult {
+        id,
+        probe_wav: probe_wav.to_string_lossy().into_owned(),
+        schedule_json: schedule_json.to_string_lossy().into_owned(),
+        duration_s,
+    })
+}
+
+/// Run the sounder analyser on a recorded capture WAV. Writes
+/// `signature.json` next to the capture and returns the signature so
+/// the GUI can render the derived parameters directly.
+#[tauri::command]
+fn sounding_analyze(
+    capture_wav: String,
+    schedule_json: String,
+    family: String,
+    metadata: modem_worker_base::sounder::SoundingMetadata,
+    sync_threshold: f32,
+) -> Result<modem_worker_base::sounder::ChannelSignature, String> {
+    use modem_worker_base::sounder::{
+        analyze_capture, ChannelFamily, ProbeSchedule,
+    };
+    let capture_path = PathBuf::from(&capture_wav);
+    let schedule_path = PathBuf::from(&schedule_json);
+
+    // 1. Load the schedule JSON.
+    let sched_bytes = std::fs::read(&schedule_path)
+        .map_err(|e| format!("read {}: {e}", schedule_path.display()))?;
+    let sched: ProbeSchedule = serde_json::from_slice(&sched_bytes)
+        .map_err(|e| format!("parse {}: {e}", schedule_path.display()))?;
+    if sched.sample_rate != modem_core_base::types::AUDIO_RATE {
+        return Err(format!(
+            "schedule sample_rate {} != GUI AUDIO_RATE {}",
+            sched.sample_rate,
+            modem_core_base::types::AUDIO_RATE,
+        ));
+    }
+
+    // 2. Decode the capture WAV → f32 mono at AUDIO_RATE. Same
+    //    int/float branches the CLI's read_wav uses.
+    let mut reader = hound::WavReader::open(&capture_path)
+        .map_err(|e| format!("open {}: {e}", capture_path.display()))?;
+    let spec = reader.spec();
+    if spec.sample_rate != modem_core_base::types::AUDIO_RATE {
+        return Err(format!(
+            "capture sample_rate {} != {} Hz",
+            spec.sample_rate,
+            modem_core_base::types::AUDIO_RATE,
+        ));
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let scale = ((1u32 << (spec.bits_per_sample - 1)) - 1) as f32;
+            reader
+                .samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|s| s as f32 / scale)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .filter_map(Result::ok)
+            .collect(),
+    };
+    if samples.is_empty() {
+        return Err(format!("capture {} is empty", capture_path.display()));
+    }
+    // For multichannel WAVs, keep only the left channel — the rest of
+    // the modem path is mono-only.
+    let mono: Vec<f32> = if spec.channels == 1 {
+        samples
+    } else {
+        samples
+            .chunks(spec.channels as usize)
+            .map(|c| c[0])
+            .collect()
+    };
+
+    // 3. Resolve family.
+    let fam = match family.to_lowercase().as_str() {
+        "fm" => ChannelFamily::Fm,
+        "qo100" | "qo-100" => ChannelFamily::Qo100,
+        "ssb_hf" | "ssb-hf" | "ssbhf" => ChannelFamily::SsbHf,
+        other => {
+            return Err(format!(
+                "unknown family '{other}' (expected fm | qo100 | ssb_hf)"
+            ));
+        }
+    };
+
+    // 4. Run the analyser.
+    let sig = analyze_capture(&mono, &sched, fam, metadata, sync_threshold)
+        .map_err(|e| format!("analyse: {e}"))?;
+
+    // 5. Persist signature.json next to the capture.
+    let sig_path = capture_path.with_file_name(
+        capture_path
+            .file_stem()
+            .map(|s| format!("{}.signature.json", s.to_string_lossy()))
+            .unwrap_or_else(|| "signature.json".to_string()),
+    );
+    let sig_bytes = serde_json::to_vec_pretty(&sig)
+        .map_err(|e| format!("serialize signature: {e}"))?;
+    std::fs::write(&sig_path, &sig_bytes)
+        .map_err(|e| format!("write {}: {e}", sig_path.display()))?;
+
+    Ok(sig)
+}
+
+/// Tiny 16-bit PRNG for the run-id suffix. Avoids pulling in `rand`
+/// just to disambiguate two TX renders inside the same second.
+fn rand_u16() -> u16 {
+    // Mix the nanos field of the current time with the address of a
+    // stack local for extra entropy on platforms where SystemTime has
+    // microsecond granularity.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let probe: u16 = 0xa1b2;
+    let addr = &probe as *const _ as usize as u32;
+    (nanos.wrapping_mul(2654435761) ^ addr ^ probe as u32) as u16
+}
+
 #[tauri::command]
 fn get_save_dir(state: State<'_, AppState>) -> Result<String, String> {
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?;
@@ -1491,6 +1699,8 @@ fn main() {
             list_tx_history,
             list_rx_history,
             delete_history_item,
+            sounding_tx_render,
+            sounding_analyze,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

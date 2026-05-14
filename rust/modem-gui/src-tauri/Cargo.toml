@@ -31,6 +31,8 @@ modem-pluto = { path = "../../modem-pluto", optional = true }
 modem-sdrplay = { path = "../../modem-sdrplay", optional = true }
 modem-worker = { path = "../../modem-worker" }
 modem-worker2x = { path = "../../modem-worker2x" }
+modem-worker-base = { path = "../../modem-worker-base" }
+modem-core-base = { path = "../../modem-core-base" }
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 zstd = "0.13"

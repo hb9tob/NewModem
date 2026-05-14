@@ -14,5 +14,7 @@ modem-core-base = { path = "../modem-core-base" }
 modem-core2x = { path = "../modem-core2x" }
 modem-framing = { path = "../modem-framing" }
 modem-worker2x = { path = "../modem-worker2x" }
+modem-worker-base = { path = "../modem-worker-base" }
 hound = { workspace = true }
 clap = { workspace = true }
+serde_json = "1"

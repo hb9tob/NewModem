@@ -549,13 +549,90 @@
             </p>
           </fieldset>
 
-          <fieldset class="channel-future">
-            <legend>Sondeur de canal — phase B (à venir)</legend>
+          <fieldset class="sounder-tx">
+            <legend>Sondeur — préparer le signal d'émission</legend>
             <p class="tx-hint">
-              Trame de test (chirp + multi-tone + PN + EVM par profil) pour
-              estimer la réponse du canal et choisir le mode optimal. Le rapport
-              (HTML + JSON + WAV brut) sera exportable en ZIP/7Z.
+              Génère <code>probe.wav</code> (chirp + multi-ton + deux-tons + sweep
+              de niveau + AWGN) et <code>schedule.json</code> sous le dossier de
+              sauvegarde. Le WAV se joue via « ▶ Lire WAV » de l'onglet RX, côté
+              récepteur le micro/SDR enregistre puis l'analyse en bas reconstruit
+              la signature.
             </p>
+            <div class="sounder-row">
+              <label>Famille
+                <select id="sounder-tx-family">
+                  <option value="fm" selected>FM (NBFM amateur)</option>
+                  <option value="qo100">QO-100 (réservé)</option>
+                  <option value="ssb_hf">SSB HF (réservé)</option>
+                </select>
+              </label>
+              <label>Mon indicatif
+                <input type="text" id="sounder-tx-call" maxlength="12" placeholder="HB9TOB">
+              </label>
+              <label>Indicatif RX
+                <input type="text" id="sounder-rx-call" maxlength="12" placeholder="HB9XYZ">
+              </label>
+            </div>
+            <div class="sounder-row">
+              <label>Équipement
+                <input type="text" id="sounder-equipment" placeholder="FTX-1 + sound-card">
+              </label>
+              <label>Notes
+                <input type="text" id="sounder-notes" placeholder="Bande 2 m, simplex">
+              </label>
+            </div>
+            <div class="sounder-row sounder-row-actions">
+              <button type="button" id="sounder-tx-render">Générer probe.wav + schedule.json</button>
+              <span class="sounder-status" id="sounder-tx-status">—</span>
+            </div>
+            <div class="sounder-paths" id="sounder-tx-paths" hidden>
+              <div><span class="tx-hint">probe.wav :</span> <code id="sounder-probe-wav-path"></code></div>
+              <div><span class="tx-hint">schedule.json :</span> <code id="sounder-schedule-path"></code></div>
+              <div><span class="tx-hint">Durée :</span> <span id="sounder-duration">—</span> s</div>
+            </div>
+          </fieldset>
+
+          <fieldset class="sounder-rx">
+            <legend>Sondeur — analyser une capture</legend>
+            <p class="tx-hint">
+              Capturez la bande audio (onglet RX → « ⏺ capture brute ») puis
+              indiquez ici le chemin du WAV reçu et du <code>schedule.json</code>
+              correspondant. L'analyseur écrit <code>capture.signature.json</code>
+              à côté du WAV.
+            </p>
+            <div class="sounder-row">
+              <label>Capture WAV
+                <input type="text" id="sounder-an-capture" placeholder="/chemin/vers/capture.wav">
+              </label>
+            </div>
+            <div class="sounder-row">
+              <label>Schedule JSON
+                <input type="text" id="sounder-an-schedule" placeholder="/chemin/vers/schedule.json">
+              </label>
+            </div>
+            <div class="sounder-row">
+              <label>Seuil sync
+                <input type="number" id="sounder-an-threshold" min="2" max="20" step="0.5" value="6">
+              </label>
+              <button type="button" id="sounder-an-run">Analyser</button>
+              <span class="sounder-status" id="sounder-an-status">—</span>
+            </div>
+            <div class="sounder-results" id="sounder-an-results" hidden>
+              <h4>Paramètres dérivés</h4>
+              <table class="sounder-derived">
+                <tbody>
+                  <tr><th>SNR moyen</th><td><span id="sd-snr">—</span> dB</td></tr>
+                  <tr><th>IP3 (sortie)</th><td><span id="sd-ip3">—</span> dBFS</td></tr>
+                  <tr><th>P1dB (entrée)</th><td><span id="sd-p1db">—</span> dBFS</td></tr>
+                  <tr><th>Sweet spot</th><td><span id="sd-sweet">—</span> dBFS</td></tr>
+                  <tr><th>BW −3 dB</th><td><span id="sd-bw">—</span> Hz</td></tr>
+                  <tr><th>Group delay (pic)</th><td><span id="sd-gd">—</span> µs</td></tr>
+                  <tr><th>Plancher de bruit</th><td><span id="sd-noise">—</span> dBFS</td></tr>
+                  <tr><th>Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
+                </tbody>
+              </table>
+              <div class="tx-hint" id="sounder-an-signature-path"></div>
+            </div>
           </fieldset>
         </div>
       </div>

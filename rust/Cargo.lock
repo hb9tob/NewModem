@@ -2912,7 +2912,9 @@ dependencies = [
  "modem-core-base",
  "modem-core2x",
  "modem-framing",
+ "modem-worker-base",
  "modem-worker2x",
+ "serde_json",
 ]
 
 [[package]]
@@ -2973,6 +2975,7 @@ dependencies = [
  "imageproc",
  "kamadak-exif",
  "modem-core",
+ "modem-core-base",
  "modem-core2x",
  "modem-framing",
  "modem-io",
@@ -2980,6 +2983,7 @@ dependencies = [
  "modem-sdr",
  "modem-sdrplay",
  "modem-worker",
+ "modem-worker-base",
  "modem-worker2x",
  "ravif",
  "reqwest 0.12.28",

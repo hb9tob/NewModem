@@ -4550,6 +4550,172 @@ function setupChannelTab() {
   renderCascade();
 }
 
+// ─────────────────────────────────────────── Sondeur (Canal tab, lower half)
+// Two Tauri commands back this UI:
+//   - sounding_tx_render(request) → builds probe.wav + schedule.json
+//     under <save_dir>/sounder/<id>/. The user plays the WAV via the RX
+//     tab's "▶ Lire WAV" feature (loopback test) or an external player.
+//   - sounding_analyze(capture_wav, schedule_json, family, metadata,
+//     sync_threshold) → cross-correlates the chirp anchor, runs each
+//     probe's analyser, writes <capture>.signature.json next to the WAV
+//     and returns the ChannelSignature payload we render below.
+//
+// File-IO uses plain string paths (no plugin-dialog in this build).
+// Defaults: a sane probe sequence covering SNR, IMD3, group delay,
+// noise floor, frequency response, and a 10-step level sweep so the
+// operator gets P1dB + sweet-spot estimates from a single TX render.
+
+function defaultSounderProbes() {
+  return [
+    // 1 — single tone @ 1500 Hz, our wake-up anchor frequency. Confirms
+    //     SNR / amplitude reference under real-world AGC.
+    { kind: "tone", freq_hz: 1500.0, amplitude: 0.6 },
+    // 2 — two-tone 1100/1900 Hz for IMD3 / IP3 measurement.
+    { kind: "two_tone", f1_hz: 1100.0, f2_hz: 1900.0, amp_each: 0.4 },
+    // 3 — linear chirp covering the NBFM audio passband (-3 dB BW,
+    //     group delay deviation).
+    { kind: "chirp_linear", f0_hz: 200.0, f1_hz: 2600.0, amplitude: 0.6 },
+    // 4 — multitone for the frequency response (gain vs freq).
+    {
+      kind: "multitone",
+      freqs_hz: [300, 600, 900, 1200, 1500, 1800, 2100, 2400],
+      amp_each: 0.12,
+    },
+    // 5 — AWGN burst, characterises post-AGC noise behaviour.
+    { kind: "awgn", rms: 0.2, seed: 0xC0FFEE },
+    // 6 — level sweep at 1500 Hz from -30 to 0 dBFS by 3 dB → P1dB +
+    //     sweet spot. 0.6 s/level keeps total airtime reasonable.
+    {
+      kind: "level_sweep",
+      inner_tone_freq_hz: 1500.0,
+      levels_db: [-30, -27, -24, -21, -18, -15, -12, -9, -6, -3, 0],
+      duration_s_per_level: 0.6,
+      gap_s: 0.15,
+    },
+  ];
+}
+
+function setSounderStatus(id, text, level) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.classList.remove("ok", "err");
+  if (level === "ok") el.classList.add("ok");
+  else if (level === "err") el.classList.add("err");
+}
+
+function fmtNumOrDash(v, digits) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(digits ?? 2);
+}
+
+async function runSounderTxRender() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const family = (document.getElementById("sounder-tx-family")?.value || "fm");
+  const txCall = (document.getElementById("sounder-tx-call")?.value || "").trim();
+  const rxCall = (document.getElementById("sounder-rx-call")?.value || "").trim();
+  const equipment = (document.getElementById("sounder-equipment")?.value || "").trim();
+  const notes = (document.getElementById("sounder-notes")?.value || "").trim();
+  const request = {
+    channel_family: family,
+    probes: defaultSounderProbes(),
+    wake_up_amplitude: 0.6,
+    sync_marker_amplitude: 0.7,
+    default_probe_duration_s: 1.0,
+    inter_probe_gap_s: 0.3,
+    metadata: {
+      tx_callsign: txCall,
+      rx_callsign: rxCall,
+      equipment,
+      notes,
+      ts_unix: Math.floor(Date.now() / 1000),
+    },
+  };
+  setSounderStatus("sounder-tx-status", "génération…");
+  try {
+    const res = await invoke("sounding_tx_render", { request });
+    document.getElementById("sounder-probe-wav-path").textContent = res.probe_wav;
+    document.getElementById("sounder-schedule-path").textContent = res.schedule_json;
+    document.getElementById("sounder-duration").textContent = res.duration_s.toFixed(2);
+    const paths = document.getElementById("sounder-tx-paths");
+    if (paths) paths.hidden = false;
+    // Pre-fill the analyse-side schedule path so a same-machine loopback
+    // run is one click away.
+    const sched = document.getElementById("sounder-an-schedule");
+    if (sched && !sched.value) sched.value = res.schedule_json;
+    setSounderStatus("sounder-tx-status", `prêt ${now()}`, "ok");
+  } catch (err) {
+    setSounderStatus("sounder-tx-status", `erreur : ${err}`, "err");
+  }
+}
+
+async function runSounderAnalyze() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const capture = (document.getElementById("sounder-an-capture")?.value || "").trim();
+  const schedule = (document.getElementById("sounder-an-schedule")?.value || "").trim();
+  if (!capture || !schedule) {
+    setSounderStatus("sounder-an-status", "renseigner capture + schedule", "err");
+    return;
+  }
+  const family = document.getElementById("sounder-tx-family")?.value || "fm";
+  const threshold = Number(document.getElementById("sounder-an-threshold")?.value) || 6;
+  const txCall = (document.getElementById("sounder-tx-call")?.value || "").trim();
+  const rxCall = (document.getElementById("sounder-rx-call")?.value || "").trim();
+  const equipment = (document.getElementById("sounder-equipment")?.value || "").trim();
+  const notes = (document.getElementById("sounder-notes")?.value || "").trim();
+  setSounderStatus("sounder-an-status", "analyse en cours…");
+  try {
+    const sig = await invoke("sounding_analyze", {
+      captureWav: capture,
+      scheduleJson: schedule,
+      family,
+      metadata: {
+        tx_callsign: txCall,
+        rx_callsign: rxCall,
+        equipment,
+        notes,
+        ts_unix: Math.floor(Date.now() / 1000),
+      },
+      syncThreshold: threshold,
+    });
+    const d = sig.derived || {};
+    document.getElementById("sd-snr").textContent = fmtNumOrDash(d.snr_est_db, 2);
+    document.getElementById("sd-ip3").textContent = fmtNumOrDash(d.ip3_dbfs, 2);
+    document.getElementById("sd-p1db").textContent = fmtNumOrDash(d.p1db_dbfs, 2);
+    document.getElementById("sd-sweet").textContent = fmtNumOrDash(d.sweet_spot_dbfs, 2);
+    if (d.bw_3db_hz && d.bw_3db_hz[1] > 0) {
+      document.getElementById("sd-bw").textContent =
+        `${Math.round(d.bw_3db_hz[0])}–${Math.round(d.bw_3db_hz[1])}`;
+    } else {
+      document.getElementById("sd-bw").textContent = "—";
+    }
+    document.getElementById("sd-gd").textContent = fmtNumOrDash(d.group_delay_peak_us, 0);
+    document.getElementById("sd-noise").textContent = fmtNumOrDash(d.noise_floor_dbfs, 2);
+    document.getElementById("sd-anchor").textContent =
+      sig.capture_anchor_sample != null ? String(sig.capture_anchor_sample) : "—";
+    document.getElementById("sounder-an-signature-path").textContent =
+      `signature.json écrite à côté du WAV (${sig.measurements?.length ?? 0} mesures)`;
+    const res = document.getElementById("sounder-an-results");
+    if (res) res.hidden = false;
+    setSounderStatus("sounder-an-status", `OK ${now()}`, "ok");
+  } catch (err) {
+    setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
+  }
+}
+
+function setupSounderTab() {
+  document
+    .getElementById("sounder-tx-render")
+    ?.addEventListener("click", runSounderTxRender);
+  document
+    .getElementById("sounder-an-run")
+    ?.addEventListener("click", runSounderAnalyze);
+}
+
 // ─────────────────────────────────────────── History tab
 // Unified TX (files emitted, archived at each tx_start) and RX (decoded
 // sessions) view. "↻ Relay" button on each thumbnail for the emergency-
@@ -4790,6 +4956,7 @@ async function init() {
   await loadSdrBackends();
   applyOverlaysToUI();
   setupChannelTab();
+  setupSounderTab();
   await loadDevices();
   await loadSerialPorts();
   await loadSaveDir();
