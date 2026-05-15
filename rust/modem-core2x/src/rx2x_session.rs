@@ -203,6 +203,14 @@ pub struct Rx2xSession {
     constellation: Constellation,
     interleave_perm: Vec<usize>,
     deinterleave_perm: Vec<usize>,
+    /// Fast LDPC decoder, 15 iterations. Used for the Phase 1 forward
+    /// pass per CW — most CWs converge quickly when the channel is
+    /// reasonable, and we save the heavier iter budget for the turbo
+    /// pass on failed CWs.
+    decoder_fast: LdpcDecoder,
+    /// Full LDPC decoder, 30 iterations. Used for the per-cycle turbo
+    /// re-decode of CWs that didn't converge at 15 iter, after the
+    /// cycle-backward RTS phase smoother has refined the trajectory.
     decoder: LdpcDecoder,
     encoder: LdpcEncoder,
     k_bytes: usize,
@@ -268,6 +276,15 @@ impl Rx2xSession {
             interleave_perm.len(),
             cfg.base.constellation,
         );
+        // Two-tier LDPC decoders for the Phase 3 pipeline. The fast
+        // decoder (15 iter) is used for the per-CW forward pass — most
+        // CWs converge quickly when the channel is reasonable, and we
+        // save the heavy iter budget for the turbo pass. The full
+        // decoder (30 iter) is used for the per-cycle turbo re-decode
+        // of CWs that did NOT converge at 15 iter, after the cycle-
+        // backward RTS phase smoother has refined the phase trajectory.
+        // See docs/modem_2x_loop_validation.html for the architecture.
+        let decoder_fast = LdpcDecoder::new(cfg.base.ldpc_rate, 15);
         let decoder = LdpcDecoder::new(cfg.base.ldpc_rate, 30);
         let encoder = LdpcEncoder::new(cfg.base.ldpc_rate);
         let k_bytes = cfg.base.ldpc_rate.k() / 8;
@@ -291,6 +308,7 @@ impl Rx2xSession {
             constellation,
             interleave_perm,
             deinterleave_perm,
+            decoder_fast,
             decoder,
             encoder,
             k_bytes,
@@ -674,7 +692,11 @@ impl Rx2xSession {
             &self.constellation,
             &self.interleave_perm,
             &self.deinterleave_perm,
-            &self.decoder,
+            // Forward pass uses the 15-iter fast decoder. CWs that
+            // fail here are picked up at cycle end by the turbo
+            // redecode pass using the 30-iter decoder + RTS-smoothed
+            // phase trajectory.
+            &self.decoder_fast,
             &self.encoder,
             self.k_bytes,
             is_meta,
