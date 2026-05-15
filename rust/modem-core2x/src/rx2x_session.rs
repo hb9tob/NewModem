@@ -267,6 +267,25 @@ pub struct Rx2xSession {
     /// then runs `rts_phase_smooth` at cycle end. Reset at each new
     /// cycle and at backward-fix reset.
     cycle_phase_obs: Vec<(u64, modem_core_base::phase_smoother::PhaseObs)>,
+
+    /// Phase 3 — failed CWs of the current cycle. Pushed by
+    /// `drive_locked` after `decode_one_cw` returns without converging,
+    /// drained at cycle end by `refine_cycle_and_turbo_redecode` to
+    /// drive the turbo redecode pass. Reset on backward-fix.
+    cycle_failed_cws: Vec<FailedCwInfo>,
+}
+
+/// Per-failed-CW state captured at cycle end for the turbo redecode.
+/// The chunk itself is re-extracted from `sym_buffer` at refinement
+/// time (cheaper than cloning each failed chunk during forward).
+#[derive(Clone, Copy)]
+struct FailedCwInfo {
+    esi: u32,
+    is_meta: bool,
+    group_idx_offset: usize,
+    /// Absolute symbol index of the CW chunk's start (anchor SOF +
+    /// PLHEADER + warmup + cw_offset).
+    abs_start: u64,
 }
 
 impl Rx2xSession {
@@ -346,6 +365,7 @@ impl Rx2xSession {
             dd_refs_pool: Vec::new(),
             n_drift_resets: 0,
             cycle_phase_obs: Vec::new(),
+            cycle_failed_cws: Vec::new(),
         }
     }
 
@@ -468,6 +488,15 @@ impl Rx2xSession {
         self.sigma2_tangential_sum = 0.0;
         // FFE taps were trained at the old drift — invalidate.
         self.ffe_taps = None;
+        // Phase 3 — drop any pending per-cycle phase + failed-CW state
+        // from the wrong-drift pass; the re-decode after the fix will
+        // rebuild them with corrected sample timing.
+        self.cycle_phase_obs.clear();
+        self.cycle_failed_cws.clear();
+        // Note: total_cws / converged_cws / data_cws_* / cw_bytes /
+        // app_header are NOT cleared. Already-known ESIs are detected
+        // by drive_locked (esi_known_before) and skipped for counter
+        // bumps to avoid double-counting on post-reset re-decode.
         // Note: cw_bytes, app_header, session_id, k_source, n_repair,
         // pls_anchors are NOT cleared. The post-reset re-decode merges
         // its results with whatever was already obtained pre-reset.
@@ -653,7 +682,6 @@ impl Rx2xSession {
         let sigma2_before = self.sigma2_sum;
         let sigma2_rad_before = self.sigma2_radial_sum;
         let sigma2_tan_before = self.sigma2_tangential_sum;
-        let cw_bytes_count_before = self.cw_bytes.len();
         let app_header_was_some = self.result.app_header.is_some();
 
         let pls = self
@@ -668,6 +696,26 @@ impl Rx2xSession {
         } else {
             pls.base_esi + (next_cw_idx as u32 - 1)
         };
+        // True if a PRIOR pass (typically pre-reset wrong-drift Pass 1
+        // that ended up succeeding at the right drift, or just the
+        // first reset's Pass 1 if multiple drift refinements happened)
+        // already decoded this ESI. In that case we don't push it to
+        // the failed-CW retry queue even if cw_bytes.len() doesn't
+        // grow, because the bytes are already known.
+        let esi_known_before = if is_meta {
+            self.app_header.is_some()
+        } else {
+            self.cw_bytes.contains_key(&esi)
+        };
+        // Snapshot the always-incremented counters for the
+        // already-known path. decode_one_cw bumps these every call;
+        // if this CW was already converged in a prior pass we don't
+        // want a duplicate visit to inflate them.
+        let total_cws_before = self.result.total_cws;
+        let data_total_before = self.result.data_cws_total;
+        let converged_cws_before = self.result.converged_cws;
+        let data_conv_before = self.result.data_cws_converged;
+        let bitmap_before_len = self.result.converged_bitmap.len();
         let group_idx_offset = if is_meta {
             0
         } else {
@@ -734,6 +782,21 @@ impl Rx2xSession {
                 .push((cw_chunk_abs_start + local_off as u64, obs));
         }
 
+        // If this ESI / META was already known from a prior pass
+        // (typically a backward-fix re-decode), strip out the
+        // duplicate counter / bitmap mutations decode_one_cw added.
+        // The bytes are unchanged (LDPC decoded the same payload), so
+        // we keep cw_bytes / app_header as-is. σ² accumulators stay —
+        // they reflect the post-reset channel quality and we WANT them
+        // to track this CW's σ² for sigma2_data averaging.
+        if esi_known_before {
+            self.result.total_cws = total_cws_before;
+            self.result.data_cws_total = data_total_before;
+            self.result.converged_cws = converged_cws_before;
+            self.result.data_cws_converged = data_conv_before;
+            self.result.converged_bitmap.truncate(bitmap_before_len);
+        }
+
         let cw_sigma2 = self.sigma2_sum - sigma2_before;
         let cw_sigma2_rad = self.sigma2_radial_sum - sigma2_rad_before;
         let cw_sigma2_tan = self.sigma2_tangential_sum - sigma2_tan_before;
@@ -741,17 +804,32 @@ impl Rx2xSession {
         let converged = if is_meta {
             self.result.app_header.is_some() && !app_header_was_some
         } else {
-            self.cw_bytes.len() > cw_bytes_count_before
+            // Either we got fresh bytes for this ESI (the key was
+            // previously absent), or we had them already from a prior
+            // pass (post-reset re-visit, see esi_known_before).
+            // `cw_bytes.contains_key` is the source of truth — checking
+            // `len()` deltas alone misses re-decodes that overwrite an
+            // existing entry.
+            self.cw_bytes.contains_key(&esi)
         };
+        // First-time-this-burst convergence detection — used to
+        // suppress duplicate CwConverged events for ESIs the operator
+        // has already been notified about.
+        let first_time_converged = converged && !esi_known_before;
 
         if converged {
-            events.push(Rx2xEvent::CwConverged {
-                esi,
-                sigma2: cw_sigma2,
-                sigma2_radial: cw_sigma2_rad,
-                sigma2_tangential: cw_sigma2_tan,
-                is_meta,
-            });
+            // Only emit CwConverged for ESIs not already known from a
+            // prior pass — suppresses duplicate GUI updates and CSV
+            // counter inflation on backward-fix re-decode.
+            if first_time_converged {
+                events.push(Rx2xEvent::CwConverged {
+                    esi,
+                    sigma2: cw_sigma2,
+                    sigma2_radial: cw_sigma2_rad,
+                    sigma2_tangential: cw_sigma2_tan,
+                    is_meta,
+                });
+            }
 
             // First-time AppHeader recovery → emit SessionArmed with
             // k_source / n_repair derived from AppHeader (V3 parity).
@@ -782,11 +860,28 @@ impl Rx2xSession {
             // RaptorQ trigger : only when we have enough source CWs.
             self.try_raptorq_assembly(events);
         } else {
-            events.push(Rx2xEvent::CwFailed {
-                esi,
-                sigma2: cw_sigma2,
-                is_meta,
-            });
+            // Suppress CwFailed + retry-queue for ESIs / META already
+            // converged in a prior pass — the decoder happened to miss
+            // them on this post-reset re-decode but the bytes are
+            // already in cw_bytes / app_header, no rescue needed.
+            if !esi_known_before {
+                events.push(Rx2xEvent::CwFailed {
+                    esi,
+                    sigma2: cw_sigma2,
+                    is_meta,
+                });
+                // Phase 3 étape C — queue this CW for turbo redecode at
+                // cycle end (after the RTS phase smoother has refined
+                // the full-cycle phase trajectory). META is included so
+                // the AppHeader can still be recovered if Pass 1 missed
+                // it.
+                self.cycle_failed_cws.push(FailedCwInfo {
+                    esi,
+                    is_meta,
+                    group_idx_offset,
+                    abs_start: cw_chunk_abs_start,
+                });
+            }
         }
 
         // Advance FSM. cycle = 1 META + cw_per_cycle DATA.
@@ -1000,17 +1095,26 @@ impl Rx2xSession {
     /// refs, re-decode at 30 iter.
     fn refine_cycle_and_turbo_redecode(
         &mut self,
-        _cycle_idx: u32,
-        _anchor_sof_abs: u64,
-        _events: &mut Vec<Rx2xEvent>,
+        cycle_idx: u32,
+        anchor_sof_abs: u64,
+        events: &mut Vec<Rx2xEvent>,
     ) {
-        // Always drain cycle_phase_obs even if we skip everything.
+        // Always drain cycle_phase_obs + cycle_failed_cws even if we
+        // skip everything (no leaks across cycles).
         let obs_with_pos: Vec<(u64, modem_core_base::phase_smoother::PhaseObs)> =
             self.cycle_phase_obs.drain(..).collect();
-        if obs_with_pos.len() < 8 {
-            // Safety guard — too few pilot groups, RTS unreliable.
+        let failed_cws: Vec<FailedCwInfo> =
+            self.cycle_failed_cws.drain(..).collect();
+
+        // Nothing to recover — every CW converged in the forward pass.
+        if failed_cws.is_empty() {
             return;
         }
+        // Too few pilot obs for the RTS to be reliable. Skip.
+        if obs_with_pos.len() < 8 {
+            return;
+        }
+
         let mean_sigma2_tang =
             self.sigma2_tangential_sum / self.sigma2_n.max(1) as f64;
         let params = modem_core_base::phase_smoother::PhaseSmootherParams
@@ -1019,23 +1123,163 @@ impl Rx2xSession {
             obs_with_pos.iter().map(|(_, o)| *o).collect();
         let phi_smooth =
             modem_core_base::phase_smoother::rts_phase_smooth(&obs, &params);
+        let obs_abs_pos: Vec<u64> =
+            obs_with_pos.iter().map(|(p, _)| *p).collect();
 
-        // Diagnostic log gated by env var. Useful to see whether the
-        // smoother is doing anything sensible at runtime.
-        if std::env::var_os("RX2X_LOG_PHASE_SMOOTH").is_some() {
+        let log_smooth = std::env::var_os("RX2X_LOG_PHASE_SMOOTH").is_some();
+        if log_smooth {
             let mean = phi_smooth.iter().sum::<f64>() / phi_smooth.len() as f64;
             let mn = phi_smooth.iter().cloned().fold(f64::INFINITY, f64::min);
             let mx = phi_smooth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             eprintln!(
-                "[rx2x-cycle-smooth] cycle={} n_obs={} mean={:+.3} range=[{:+.3},{:+.3}] rad",
-                _cycle_idx, obs.len(), mean, mn, mx,
+                "[rx2x-cycle-smooth] cycle={} n_obs={} mean={:+.3} range=[{:+.3},{:+.3}] rad failed={}",
+                cycle_idx, obs.len(), mean, mn, mx, failed_cws.len(),
             );
         }
 
-        // Étape C will use phi_smooth + obs_with_pos here to redecode
-        // failed CWs with 30-iter decoder. For Étape B we just stash
-        // the trajectory for future use and exit.
-        let _ = (phi_smooth, obs_with_pos);
+        // Build the cycle PLHEADER reference pair (identical to the
+        // forward-pass cycle_refs) — we need it for the per-CW gain +
+        // σ² estimation in the turbo redecode.
+        let plheader_rel = match self.abs_to_rel(anchor_sof_abs) {
+            Some(r) => r,
+            None => return, // anchor was trimmed — give up
+        };
+        if plheader_rel + PLHEADER_LEN_SYM > self.sym_buffer.len() {
+            return;
+        }
+        let cycle_refs_rx: Vec<Complex64> =
+            self.sym_buffer[plheader_rel..plheader_rel + PLHEADER_LEN_SYM].to_vec();
+        let pls = match self.pls_anchors.last() {
+            Some((_, p)) => *p,
+            None => return,
+        };
+        let cycle_refs_exp =
+            crate::plheader::plheader_reference_symbols(self.cfg.family, &pls);
+
+        let mut recovered = 0u32;
+        for failed in &failed_cws {
+            // Re-extract the failed CW's chunk from the (still-untrimmed)
+            // sym_buffer at its absolute position.
+            let chunk_rel = match self.abs_to_rel(failed.abs_start) {
+                Some(r) => r,
+                None => continue, // trimmed away (shouldn't happen mid-cycle)
+            };
+            if chunk_rel + self.cw_with_pilots > self.sym_buffer.len() {
+                continue;
+            }
+            // Derotate the chunk by the interpolated smoothed phase
+            // trajectory. The trajectory was estimated from this very
+            // cycle's pilots, so it carries the per-symbol phase rotation
+            // induced by sub-detected drift / phase walk.
+            let mut chunk: Vec<Complex64> =
+                self.sym_buffer[chunk_rel..chunk_rel + self.cw_with_pilots]
+                    .to_vec();
+            for (k, sym) in chunk.iter_mut().enumerate() {
+                let pos = failed.abs_start + k as u64;
+                let phi = interp_phi_at(pos, &obs_abs_pos, &phi_smooth);
+                *sym *= Complex64::from_polar(1.0, -phi);
+            }
+
+            // Re-decode with the 30-iter decoder. Track convergence by
+            // sniffing cw_bytes / app_header before & after.
+            // Snapshot the "always-incremented" counters so the retry
+            // doesn't double-bump them — Pass 1 already counted this
+            // CW. We only want the convergence-conditional mutations
+            // (cw_bytes / data_cws_converged / converged_bitmap /
+            // app_header) to propagate.
+            let bytes_before = self.cw_bytes.len();
+            let app_header_before = self.result.app_header.is_some();
+            let total_cws_before = self.result.total_cws;
+            let data_total_before = self.result.data_cws_total;
+            let sigma2_sum_before = self.sigma2_sum;
+            let sigma2_rad_before = self.sigma2_radial_sum;
+            let sigma2_tan_before = self.sigma2_tangential_sum;
+            let sigma2_n_before = self.sigma2_n;
+
+            let cycle_refs: Option<(&[Complex64], &[Complex64])> =
+                Some((&cycle_refs_rx, &cycle_refs_exp));
+            decode_one_cw(
+                &chunk,
+                self.cw_data_syms,
+                &self.cfg.pilot_pattern as &PilotPattern2x,
+                failed.group_idx_offset,
+                &self.constellation,
+                &self.interleave_perm,
+                &self.deinterleave_perm,
+                &self.decoder, // 30 iter
+                &self.encoder,
+                self.k_bytes,
+                failed.is_meta,
+                failed.esi,
+                &mut self.cw_bytes,
+                &mut self.result,
+                &mut self.sigma2_sum,
+                &mut self.sigma2_radial_sum,
+                &mut self.sigma2_tangential_sum,
+                &mut self.sigma2_n,
+                cycle_refs,
+                None, // turbo path — don't re-collect phase obs
+            );
+            // Capture the σ² contribution of this retry before we
+            // restore counters — used by the CwConverged event below.
+            let cw_sigma2 = self.sigma2_sum - sigma2_sum_before;
+            let cw_sigma2_rad = self.sigma2_radial_sum - sigma2_rad_before;
+            let cw_sigma2_tan = self.sigma2_tangential_sum - sigma2_tan_before;
+            // Restore the always-incremented counters so they reflect
+            // Pass 1's view of the channel. Convergence-conditional
+            // mutations (cw_bytes, app_header, data_cws_converged,
+            // converged_cws, converged_bitmap) stay.
+            self.result.total_cws = total_cws_before;
+            self.result.data_cws_total = data_total_before;
+            self.sigma2_sum = sigma2_sum_before;
+            self.sigma2_radial_sum = sigma2_rad_before;
+            self.sigma2_tangential_sum = sigma2_tan_before;
+            self.sigma2_n = sigma2_n_before;
+
+            let converged = if failed.is_meta {
+                self.result.app_header.is_some() && !app_header_before
+            } else {
+                self.cw_bytes.len() > bytes_before
+            };
+            if converged {
+                recovered += 1;
+                events.push(Rx2xEvent::CwConverged {
+                    esi: failed.esi,
+                    sigma2: cw_sigma2,
+                    sigma2_radial: cw_sigma2_rad,
+                    sigma2_tangential: cw_sigma2_tan,
+                    is_meta: failed.is_meta,
+                });
+                if failed.is_meta
+                    && self.app_header.is_none()
+                    && self.result.app_header.is_some()
+                {
+                    let ah = self.result.app_header.clone().unwrap();
+                    let k_src = ah.k_symbols as usize;
+                    let n_rep =
+                        raptorq_codec::n_repair_default(k_src as u32) as usize;
+                    let session_id = ah.session_id;
+                    self.app_header = Some(ah.clone());
+                    self.k_source = Some(k_src);
+                    self.n_repair = Some(n_rep);
+                    self.session_id = Some(session_id);
+                    events.push(Rx2xEvent::SessionArmed {
+                        app_header: ah,
+                        k_source: k_src,
+                        n_repair: n_rep,
+                        session_id,
+                        profile: self.profile_name.clone(),
+                    });
+                }
+                self.try_raptorq_assembly(events);
+            }
+        }
+        if log_smooth {
+            eprintln!(
+                "[rx2x-cycle-turbo] cycle={} recovered={}/{}",
+                cycle_idx, recovered, failed_cws.len(),
+            );
+        }
     }
 
     /// Trim the symbol buffer if it grows past [`RX2X_SYM_BUFFER_CAP`].
@@ -1268,6 +1512,47 @@ fn best_symbol_phase_sof(
         }
     }
     best_phase
+}
+
+/// Phase 3 helper — linear, wrap-aware interpolation of a smoothed
+/// phase trajectory at an arbitrary absolute symbol index.
+///
+/// `obs_pos[i]` are the absolute symbol indices where the smoother
+/// produced `phi[i]` (one entry per pilot group, sorted ascending).
+/// For positions outside the obs range, we clamp to the endpoint
+/// phase rather than extrapolate — extrapolation would amplify any
+/// boundary smoother bias into the leading/trailing data symbols.
+///
+/// The wrap-aware interpolation unwraps the local Δφ to the (-π, π]
+/// branch before scaling. Phase steps between two adjacent pilot
+/// groups are always small in practice (drift ≪ 1 sym/group → Δφ ≪ π),
+/// so unwrapping is straightforward.
+fn interp_phi_at(pos: u64, obs_pos: &[u64], phi: &[f64]) -> f64 {
+    debug_assert_eq!(obs_pos.len(), phi.len());
+    if obs_pos.is_empty() {
+        return 0.0;
+    }
+    if pos <= obs_pos[0] {
+        return phi[0];
+    }
+    if pos >= *obs_pos.last().unwrap() {
+        return *phi.last().unwrap();
+    }
+    let i = obs_pos.partition_point(|&p| p < pos);
+    // i in [1, obs_pos.len()-1]; pos ∈ (obs_pos[i-1], obs_pos[i]].
+    let p_lo = obs_pos[i - 1] as f64;
+    let p_hi = obs_pos[i] as f64;
+    let phi_lo = phi[i - 1];
+    let phi_hi = phi[i];
+    let mut delta = phi_hi - phi_lo;
+    while delta > std::f64::consts::PI {
+        delta -= 2.0 * std::f64::consts::PI;
+    }
+    while delta < -std::f64::consts::PI {
+        delta += 2.0 * std::f64::consts::PI;
+    }
+    let t = (pos as f64 - p_lo) / (p_hi - p_lo).max(1.0);
+    phi_lo + t * delta
 }
 
 #[cfg(test)]

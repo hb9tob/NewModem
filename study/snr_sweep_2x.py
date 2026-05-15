@@ -126,14 +126,15 @@ def write_wav_f32(path: str, samples: np.ndarray, sr: int = AUDIO_RATE) -> None:
 # --- CLI wrappers -----------------------------------------------------------
 
 def run_tx(cli: str, profile: str, payload_path: str, wav_path: str,
-           family: str = "2x") -> float:
+           family: str = "2x", repair_pct: int = 30) -> float:
     """Generate WAV TX for the given profile. Returns wall-clock seconds."""
     t0 = time.time()
     subprocess.run(
         [cli, "tx",
          "-i", payload_path, "-o", wav_path,
          "--family", family, "-p", profile,
-         "--callsign", "HB9TOB", "--vox", "0"],
+         "--callsign", "HB9TOB", "--vox", "0",
+         "--repair-pct", str(repair_pct)],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return time.time() - t0
 
@@ -287,6 +288,10 @@ def main() -> int:
                          "[delay_s, amp_dB, phase_rad]. First = direct path "
                          "(typ. [0,0,0]). Example to model a -10 dBc echo "
                          "at 5 ms: --multipath '[[0,0,0],[5e-3,-10,0.7]]'.")
+    ap.add_argument("--repair-pct", type=int, default=30,
+                    help="RaptorQ repair percentage on top of K (0..200). "
+                         "Pass 0 to measure raw modem performance — every "
+                         "single CW must converge for exact=Y. Default 30.")
     args = ap.parse_args()
 
     if not os.path.exists(args.nbfm_modem):
@@ -349,7 +354,7 @@ def main() -> int:
             safe = profile.replace("+", "p")
             tx_wav = os.path.join(args.out_dir, f"tx_{safe}.wav")
             tx_time = run_tx(args.nbfm_modem, profile, payload_path, tx_wav,
-                             family=args.family)
+                             family=args.family, repair_pct=args.repair_pct)
             tx_audio = read_wav_f32(tx_wav)
             print(f"\n>>> TX {profile}: {len(tx_audio)} samples "
                   f"({len(tx_audio) / AUDIO_RATE:.2f} s, build {tx_time:.1f}s)")

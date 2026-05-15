@@ -335,7 +335,17 @@ pub fn estimate_drift_from_sof_positions(
         return None;
     }
     let slope = sum_xy / sum_xx;
-    Some((slope - cycle) / cycle * 1e6)
+    let ppm = (slope - cycle) / cycle * 1e6;
+    // Sanity bound: real-world clock drift is bounded by the spec of
+    // sound cards and SDRs to ±300 ppm at the extreme. Anything past
+    // that is an LS overfit on a noise correlation that snuck past
+    // PLHEADER CRC + Golay (rare but happens with 2 SOFs and one of
+    // them landing on a false-positive). Reject — caller treats as
+    // "no usable estimate" and keeps the cached value.
+    if !ppm.is_finite() || ppm.abs() > 300.0 {
+        return None;
+    }
+    Some(ppm)
 }
 
 pub(crate) fn find_next_sof(
