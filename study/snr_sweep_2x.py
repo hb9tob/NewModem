@@ -43,7 +43,7 @@ import numpy as np
 # Make nbfm_channel_sim importable from the same study/ directory.
 _here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _here)
-from nbfm_channel_sim import simulate, AUDIO_RATE  # noqa: E402
+from nbfm_channel_sim import simulate, AUDIO_RATE, load_ir_from_signature  # noqa: E402
 
 # --- Defaults ---------------------------------------------------------------
 
@@ -262,6 +262,17 @@ def main() -> int:
                     help="Audio-domain random-walk phase noise levels "
                          "(rad/sqrt(s)). Cartesian-product with --if-noises. "
                          "0.05=FTX-1+soundcard, 0.15=SDRplay LO. Default [0.0].")
+    ap.add_argument("--ota-ir-from-signature", type=str, default=None,
+                    help="Path to a sounder signature.json. Sim convolves "
+                         "the audio output with the OTA-measured channel "
+                         "impulse response (replaces post-LPF model). "
+                         "Calibrates the sim against the actual radio chain "
+                         "as measured by the channel sounder.")
+    ap.add_argument("--multipath", type=str, default=None,
+                    help="IF-level RF multipath JSON list of "
+                         "[delay_s, amp_dB, phase_rad]. First = direct path "
+                         "(typ. [0,0,0]). Example to model a -10 dBc echo "
+                         "at 5 ms: --multipath '[[0,0,0],[5e-3,-10,0.7]]'.")
     args = ap.parse_args()
 
     if not os.path.exists(args.nbfm_modem):
@@ -269,6 +280,22 @@ def main() -> int:
         print(f"  Build with: cd rust && cargo build -p modem-cli --release",
               file=sys.stderr)
         return 1
+
+    ota_ir = None
+    if args.ota_ir_from_signature:
+        ota_ir = load_ir_from_signature(args.ota_ir_from_signature)
+        print(f"OTA IR loaded from {args.ota_ir_from_signature}: "
+              f"{len(ota_ir)} samples ({len(ota_ir)/AUDIO_RATE*1000:.1f} ms)")
+
+    multipath = None
+    if args.multipath:
+        import json as _json
+        try:
+            multipath = [tuple(p) for p in _json.loads(args.multipath)]
+            print(f"Multipath ({len(multipath)} paths): {multipath}")
+        except (ValueError, TypeError) as e:
+            print(f"ERROR: --multipath parse failed: {e}", file=sys.stderr)
+            return 1
 
     os.makedirs(args.out_dir, exist_ok=True)
     rng = np.random.RandomState(args.seed)
@@ -324,6 +351,11 @@ def main() -> int:
                               + int(phase_walk * 10000),
                     verbose=False,
                 )
+                if ota_ir is not None:
+                    sim_kwargs["ota_ir"] = ota_ir
+                    sim_kwargs["post_lpf"] = 0.0
+                if multipath is not None:
+                    sim_kwargs["multipath_paths"] = multipath
                 if args.tx_clip is not None:
                     sim_kwargs["tx_hard_clip"] = args.tx_clip
                 ch_audio = simulate(tx_audio, **sim_kwargs)

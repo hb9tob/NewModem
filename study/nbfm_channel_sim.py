@@ -165,6 +165,38 @@ def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
     return np.interp(t_src, t, audio)
 
 
+def load_ir_from_signature(sig_path, probe_idx=None):
+    """Extract a Golay-measured channel impulse response from a sounder
+    signature.json. Returns a numpy array (float32) of the IR magnitude
+    samples (length ~4800, at AUDIO_RATE). If probe_idx is None, picks
+    the strongest probe by peak_amplitude (best SNR).
+
+    The IR is used as a real FIR filter to convolve with the sim's
+    audio output, reproducing the measured channel response. Normalised
+    so the peak amplitude is 1.0 (preserves audio level).
+    """
+    import json as _json
+    with open(sig_path) as f:
+        sig = _json.load(f)
+    golay = [m for m in sig.get('measurements', [])
+             if m.get('kind') == 'golay_pair']
+    if not golay:
+        raise ValueError(f"{sig_path}: no Golay measurements")
+    if probe_idx is not None:
+        m = [x for x in golay if x.get('idx') == probe_idx]
+        if not m:
+            raise ValueError(f"{sig_path}: no Golay probe idx {probe_idx}")
+        m = m[0]
+    else:
+        # Pick strongest probe by peak_amplitude
+        m = max(golay, key=lambda x: x['result'].get('peak_amplitude', 0))
+    ir = np.array(m['result']['impulse_response'], dtype=np.float32)
+    peak = float(np.max(np.abs(ir)))
+    if peak > 0:
+        ir = ir / peak
+    return ir
+
+
 def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              post_lpf=POST_LPF, post_lpf_transition_hz=POST_LPF_TRANSITION_HZ,
              post_gain_db=POST_GAIN_DB,
@@ -174,6 +206,7 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              audio_noise_rms=AUDIO_NOISE_RMS,
              phase_walk_rad_per_sqrt_s=PHASE_WALK_RAD_PER_SQRT_S,
              multipath_paths=None,
+             ota_ir=None,
              start_delay_s=None, rng_seed=None, verbose=True):
     """Fait passer audio_in par TX -> bruit IF -> RX, retourne audio_out.
 
@@ -289,6 +322,20 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
     tb.run()
     audio_out = np.array(sink.data(), dtype=np.float64)
 
+    # Convolution avec une IR mesuree par le sondeur (calibration OTA
+    # complete : LPF + de-emphasis + AGC + tout le residu de la chaine
+    # transceiver). Applique APRES nbfm_rx — l'IR du sondeur capture
+    # toute la chaine audio post-demod observee OTA. Si le user passe
+    # une IR, le LPF FIR interne reste actif mais son effet est
+    # additionnel ; pour eviter le double filtrage, l'appelant doit
+    # passer post_lpf=0 quand il fournit ota_ir.
+    if ota_ir is not None and len(ota_ir) > 0:
+        if verbose:
+            print(f"[sim] convolution avec IR sondeur "
+                  f"({len(ota_ir)} samples = "
+                  f"{len(ota_ir)/AUDIO_RATE*1000:.1f} ms)")
+        audio_out = scipy.signal.fftconvolve(audio_out, ota_ir, mode='same')
+
     # Bruit audio post-demod (soundcard ADC, phase noise residuel, etc).
     # Calibre sur mesures OTA : +EVM ~10 % vs sim pur.
     if audio_noise_rms and audio_noise_rms > 0:
@@ -367,6 +414,14 @@ def main():
                          "le travail, pas multipath. Ex pour ajouter un "
                          'echo VHF lointain: '
                          '--multipath \'[[0,0,0],[500e-6,-15,0.7]]\'.')
+    ap.add_argument("--ota-ir-from-signature", type=str, default=None,
+                    help='Path to a sounder signature.json. Convolve the '
+                         'sim output with the channel impulse response '
+                         'measured by the OTA sondeur (post-fix complex '
+                         'demod algo). Replaces the post-LPF model with '
+                         'the real measured channel. When set, '
+                         '--post-lpf is auto-disabled to avoid double '
+                         'filtering.')
     args = ap.parse_args()
     multipath = None
     if args.multipath:
@@ -376,13 +431,25 @@ def main():
             print(f"ERROR: --multipath parse failed: {e}", file=sys.stderr)
             return 1
 
+    ota_ir = None
+    if args.ota_ir_from_signature:
+        ota_ir = load_ir_from_signature(args.ota_ir_from_signature)
+        print(f"[sim] OTA IR from {args.ota_ir_from_signature}: "
+              f"{len(ota_ir)} samples ({len(ota_ir)/AUDIO_RATE*1000:.1f} ms)")
+        # Disable internal LPF when using measured OTA channel
+        args.hpf = args.hpf  # leave HPF as is (CTCSS, not the LPF)
+
     audio_in, sr = load_wav(args.input_wav)
     if sr != AUDIO_RATE:
         raise ValueError(f"Sample rate attendu {AUDIO_RATE}, recu {sr}")
     print(f"Entree: {args.input_wav}  ({len(audio_in)/sr:.2f} s)")
 
+    # If using OTA IR, disable internal post-LPF (the measured IR
+    # already represents the full audio chain).
+    post_lpf_value = 0.0 if ota_ir is not None else POST_LPF
     audio_out = simulate(audio_in, if_noise_voltage=args.if_noise,
                          sub_audio_hpf=args.hpf,
+                         post_lpf=post_lpf_value,
                          post_lpf_transition_hz=args.lpf_transition,
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
@@ -391,6 +458,7 @@ def main():
                          audio_noise_rms=args.audio_noise,
                          phase_walk_rad_per_sqrt_s=args.phase_walk,
                          multipath_paths=multipath,
+                         ota_ir=ota_ir,
                          start_delay_s=args.start_delay,
                          rng_seed=args.seed)
 
