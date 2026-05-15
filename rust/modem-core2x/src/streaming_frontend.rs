@@ -50,8 +50,8 @@ use modem_core_base::farrow;
 use modem_core_base::rrc::{self, rrc_taps};
 use modem_core_base::timing_loop::{TedVariant, TimingLoop};
 use modem_core_base::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
-use modem_core2x::frame2x::{cycle_pilot_map, full_cycle_len_syms};
-use modem_core2x::profile2x::ModemConfig2x;
+use crate::frame2x::{cycle_pilot_map, full_cycle_len_syms};
+use crate::profile2x::ModemConfig2x;
 
 /// Stateful audio → symbol front-end. Construct once per RX session,
 /// feed audio chunks via [`process_chunk`].
@@ -409,8 +409,8 @@ fn downmix_with_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modem_core2x::frame2x::build_superframe_v4;
-    use modem_core2x::profile2x::{
+    use crate::frame2x::build_superframe_v4;
+    use crate::profile2x::{
         profile_high_2x, profile_high_plus_2x, profile_high_plus_plus_2x,
         profile_normal_2x, profile_ultra_2x, ProfileIndex2x,
     };
@@ -491,7 +491,7 @@ mod tests {
         let mut sf = StreamingFrontend::new(cfg.clone());
         let symbols = sf.process_chunk(&audio);
         assert!(symbols.len() > 100, "expected real symbols, got {}", symbols.len());
-        let res = modem_core2x::rx_v4::rx_v4_symbols(&symbols, &cfg)
+        let res = crate::rx_v4::rx_v4_symbols(&symbols, &cfg)
             .expect("decode through streaming frontend");
         let h = res.app_header.expect("AppHeader recovered");
         assert_eq!(h.session_id, 0x1234);
@@ -511,7 +511,7 @@ mod tests {
         // Reference: single chunk.
         let mut sf_one = StreamingFrontend::new(cfg.clone());
         let syms_one = sf_one.process_chunk(&audio);
-        let res_one = modem_core2x::rx_v4::rx_v4_symbols(&syms_one, &cfg).unwrap();
+        let res_one = crate::rx_v4::rx_v4_symbols(&syms_one, &cfg).unwrap();
 
         // Streaming: split audio in 24 000-sample pieces.
         let mut sf_chunked = StreamingFrontend::new(cfg.clone());
@@ -529,7 +529,7 @@ mod tests {
         let diff = (syms_one.len() as isize - syms_chunked.len() as isize).abs();
         assert!(diff <= 2, "symbol count drift across chunking: {diff}");
 
-        let res_chunked = modem_core2x::rx_v4::rx_v4_symbols(&syms_chunked, &cfg).unwrap();
+        let res_chunked = crate::rx_v4::rx_v4_symbols(&syms_chunked, &cfg).unwrap();
         let h_one = res_one.app_header.unwrap();
         let h_chunked = res_chunked.app_header.unwrap();
         assert_eq!(h_one.session_id, h_chunked.session_id);
@@ -552,7 +552,7 @@ mod tests {
             let end = (i + CHUNK).min(audio.len());
             syms.extend(sf.process_chunk(&audio[i..end]));
         }
-        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg).expect("decode");
+        let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg).expect("decode");
         assert_eq!(res.data, payload);
     }
 
@@ -568,7 +568,7 @@ mod tests {
             let end = (i + CHUNK).min(audio.len());
             syms.extend(sf.process_chunk(&audio[i..end]));
         }
-        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg).expect("decode");
+        let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg).expect("decode");
         assert_eq!(res.data, payload);
     }
 
@@ -589,7 +589,7 @@ mod tests {
             let end = (i + CHUNK).min(resampled.len());
             syms.extend(sf.process_chunk(&resampled[i..end]));
         }
-        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+        let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg)
             .expect("decode 50 ppm-drifted audio");
         // TimingLoop integ should have converged near 50 ppm × sps —
         // i.e. roughly `sps · 50e-6` extra samples-per-symbol. Sanity-
@@ -633,7 +633,7 @@ mod tests {
                 let end = (i + CHUNK).min(audio.len());
                 syms.extend(sf.process_chunk(&audio[i..end]));
             }
-            let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+            let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg)
                 .unwrap_or_else(|| panic!("{p:?} streaming decode returned None"));
             assert_eq!(res.data, payload, "{p:?} streaming roundtrip");
         }
@@ -720,14 +720,14 @@ mod tests {
         let resampled = resample_linear(&audio, 1.0 + 100e-6);
 
         let (syms_gardner, integ_g) = stream_with_optional_anchor(&cfg, &resampled, None);
-        let res_g = modem_core2x::rx_v4::rx_v4_symbols(&syms_gardner, &cfg)
+        let res_g = crate::rx_v4::rx_v4_symbols(&syms_gardner, &cfg)
             .expect("Gardner-only decode at 100 ppm");
         assert_eq!(res_g.data, payload, "Gardner-only payload mismatch");
         assert!(integ_g > 0.0, "Gardner-only integ for +100ppm should be +, got {integ_g}");
 
         let (syms_pilot, integ_p) =
             stream_with_optional_anchor(&cfg, &resampled, Some(0));
-        let res_p = modem_core2x::rx_v4::rx_v4_symbols(&syms_pilot, &cfg)
+        let res_p = crate::rx_v4::rx_v4_symbols(&syms_pilot, &cfg)
             .expect("pilot-aided decode at 100 ppm");
         assert_eq!(res_p.data, payload, "pilot-aided payload mismatch");
         assert!(integ_p > 0.0, "pilot-aided integ for +100ppm should be +, got {integ_p}");
@@ -743,7 +743,7 @@ mod tests {
         let payload = rng_bytes(500, 0xC0DE);
         let audio = modulate_for(&cfg, &payload, 0x9999);
         let (syms, integ) = stream_with_optional_anchor(&cfg, &audio, Some(0));
-        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+        let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg)
             .expect("noise-free pilot-aided decode");
         assert_eq!(res.data, payload);
         // integ should stay small (no drift to track). The bound is
@@ -771,7 +771,7 @@ mod tests {
         let payload = rng_bytes(400, 0xC0DE);
         let audio = modulate_for(&cfg, &payload, 0x9999);
         let (syms, integ) = stream_with_optional_anchor(&cfg, &audio, Some(0));
-        let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+        let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg)
             .expect("noise-free pilot-aided APSK64 decode");
         assert_eq!(res.data, payload);
         assert!(integ.abs() < 2e-2, "APSK64 integ wandered: {integ}");
@@ -799,7 +799,7 @@ mod tests {
             let resampled = resample_linear(&audio, 1.0 + 50e-6);
             let (syms, _integ) =
                 stream_with_optional_anchor(&cfg, &resampled, Some(0));
-            let res = modem_core2x::rx_v4::rx_v4_symbols(&syms, &cfg)
+            let res = crate::rx_v4::rx_v4_symbols(&syms, &cfg)
                 .unwrap_or_else(|| panic!("{p:?} 50ppm pilot-aided decode None"));
             assert_eq!(res.data, payload, "{p:?} 50ppm pilot-aided payload");
         }

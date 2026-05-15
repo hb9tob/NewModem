@@ -85,3 +85,13 @@ pub mod gate2x;
 // modem-core-base::traits. Stateless wrapper that maps a profile name
 // to its config, calls frame2x + modulator, returns audio samples.
 pub mod modem2x;
+
+// Slice 2x19 — streaming audio→symbol front-end (was in modem-worker2x
+// pre-2x19 but architecturally belongs in core: it's pure DSP and the
+// live session machine that depends on it lives here too).
+pub mod streaming_frontend;
+
+// Slice 2x19 — live streaming RX session. Full state machine + turbo
+// loops integrated. Replaces the worker's batch decode pattern. See
+// plan `ok-alors-le-rms-precious-shannon.md`.
+pub mod rx2x_session;

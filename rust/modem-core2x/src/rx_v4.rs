@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 
+use modem_core_base::ffe::train_ffe_ls;
 use modem_core_base::interleaver;
 use modem_core_base::ldpc::decoder::LdpcDecoder;
 use modem_core_base::phase_smoother::{
@@ -44,8 +45,8 @@ use modem_core_base::types::Complex64;
 use modem_framing::app_header::{self, AppHeader};
 
 use crate::frame2x::{
-    cw_with_pilots_len, data_cw_per_cycle, make_constellation_2x, pilot_groups_per_cw,
-    FLAG2X_EOT, FLAG2X_LAST,
+    cw_with_pilots_len, data_cw_per_cycle, full_cycle_len_syms, make_constellation_2x,
+    make_lms_warmup_2x, pilot_groups_per_cw, FLAG2X_EOT, FLAG2X_LAST,
 };
 use crate::pilot2x_tdm::{self, pilot_symbol_2x, PilotPattern2x};
 use crate::plheader::{
@@ -167,6 +168,13 @@ pub struct RxResult2x {
     /// least 3 entries; the streaming worker uses the cumulative list
     /// to refine `cached_drift_ppm` between scan ticks.
     pub validated_sof_positions: Vec<usize>,
+    /// LS-fitted clock drift in ppm, computed from
+    /// `validated_sof_positions` at finalisation. `None` when fewer
+    /// than 3 SOFs were validated (insufficient for a slope fit).
+    /// Used by the loop-by-loop validation methodology
+    /// (`docs/modem_2x_loop_validation.html`) to compare injected vs
+    /// estimated drift across the sweep harness.
+    pub final_drift_ppm: Option<f64>,
 }
 
 /// Cap on the scatter cloud we forward to the GUI per `rx_v4_symbols`
@@ -175,7 +183,7 @@ pub struct RxResult2x {
 pub const MAX_CONSTELLATION_POINTS: usize = 500;
 
 impl RxResult2x {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             data: Vec::new(),
             app_header: None,
@@ -195,6 +203,7 @@ impl RxResult2x {
             data_cws_converged: 0,
             converged_bitmap: Vec::new(),
             validated_sof_positions: Vec::new(),
+            final_drift_ppm: None,
         }
     }
 }
@@ -329,7 +338,7 @@ pub fn estimate_drift_from_sof_positions(
     Some((slope - cycle) / cycle * 1e6)
 }
 
-fn find_next_sof(
+pub(crate) fn find_next_sof(
     symbols: &[Complex64],
     cursor: usize,
     family: PreambleFamily2x,
@@ -1002,13 +1011,263 @@ fn apply_per_ring_correction(
 
 // --- main entry point -----------------------------------------------------
 
+/// FFE filter length used by the per-cycle equaliser. 64 taps at
+/// symbol rate cover ±32 symbols of delay spread (≈ ±21 ms at 1500 Bd,
+/// 2× the worst-case delay_spread_90 observed on FT-991A → FTX-1
+/// sound-card captures). On a clean (flat) channel, the LS solution
+/// drives every off-center tap toward zero and the convolution
+/// degenerates to a scalar gain — no regression risk on lab WAVs or
+/// QO-100 sat where multipath is negligible.
+const FFE_LEN_2X: usize = 64;
+
+/// Gather the **consecutive** known-reference block at the start of one
+/// PLHEADER cycle :
+/// - PLHEADER 192 sym (SOF Chu + PLS QPSK, recovered from the validated
+///   `pls` payload)
+/// - LMS warmup symbols (`cfg.lms_warmup_syms`: 32 for APSK32/HighPlus,
+///   64 for APSK64/HighPlusPlus, 0 for QPSK/8PSK/16-APSK)
+///
+/// **TDM pilots are NOT included.** `train_ffe_ls` requires every
+/// sample in the convolution window to be known for the LS Gram matrix
+/// to be well-conditioned ; scattered TDM pilots have unknown data
+/// symbols in their windows and would bias the LS toward a near-
+/// identity (but data-perturbed) filter — exactly the failure mode
+/// observed when the first cut included them. The TDM pilots still
+/// drive the per-CW scalar LS gain estimator downstream
+/// (`estimate_cw_gain`), where they don't need consecutive context.
+///
+/// Mirrors V3 which trains its FFE on a 256-sym consecutive preamble
+/// only. 224 sym for APSK profiles here is slightly less but the LS is
+/// still 3.5× over-determined for `n_ff = 64`.
+fn gather_cycle_refs(
+    cfg: &ModemConfig2x,
+    pls: &PlsPayload,
+    sof_at: usize,
+) -> (Vec<usize>, Vec<Complex64>) {
+    let mut positions: Vec<usize> = Vec::new();
+    let mut refs: Vec<Complex64> = Vec::new();
+
+    // PLHEADER refs — 192 consecutive sym.
+    let plheader_refs = plheader::plheader_reference_symbols(cfg.family, pls);
+    for (i, &s) in plheader_refs.iter().enumerate() {
+        positions.push(sof_at + i);
+        refs.push(s);
+    }
+
+    // LMS warmup refs — 0/32/64 consecutive sym right after the PLHEADER.
+    let warmup_refs = make_lms_warmup_2x(cfg);
+    let warmup_start = sof_at + PLHEADER_LEN_SYM;
+    for (i, &s) in warmup_refs.iter().enumerate() {
+        positions.push(warmup_start + i);
+        refs.push(s);
+    }
+
+    (positions, refs)
+}
+
+/// Apply a trained FFE to a contiguous symbol range `[start, end)`,
+/// overwriting `equalized[start..end]`. At each output position k, the
+/// convolution uses `taps[i] * symbols[k - half + i]` over
+/// `i ∈ [0, taps.len())`. Boundary positions where the input window
+/// would underflow / overflow the buffer keep the raw input value (no
+/// equalization at the edges; safer than zero-padding which would
+/// inject artifacts at the burst boundary).
+fn apply_ffe_to_range(
+    symbols: &[Complex64],
+    taps: &[Complex64],
+    start: usize,
+    end: usize,
+    equalized: &mut [Complex64],
+) {
+    let n_ff = taps.len();
+    let half = n_ff / 2;
+    let end = end.min(symbols.len()).min(equalized.len());
+    for k in start..end {
+        if k < half || k + n_ff - half > symbols.len() {
+            // Boundary: leave the raw sample. Keeps SOF correlation
+            // and downstream find_next_sof working on the first/last
+            // ~32 symbols of the burst.
+            equalized[k] = symbols[k];
+            continue;
+        }
+        let mut y = Complex64::new(0.0, 0.0);
+        for i in 0..n_ff {
+            y += taps[i] * symbols[k - half + i];
+        }
+        equalized[k] = y;
+    }
+}
+
+/// Pre-pass equalisation: for every PLHEADER candidate above the SOF
+/// threshold, decode the PLS (Golay+CRC, ≈ zero false positives), then
+/// LS-train an FFE on **all known references in the cycle** (PLHEADER +
+/// LMS warmup + every per-CW TDM pilot). Apply the trained FFE to that
+/// cycle's symbol slice. Returns the equalised stream; cycles where the
+/// PLHEADER fails CRC, or where there's no PLHEADER at all, fall through
+/// to the raw symbols (the main decode loop will handle those with the
+/// per-CW pilot LS-gain estimator alone).
+///
+/// Slice 2x18a — forward-only, per-cycle granularity. Backward RTS +
+/// turbo-feedback come in slices 2x18b / 2x18c (see plan file
+/// `ffe-forward-backward-precious-multipath.md`).
+pub(crate) fn equalize_symbols_per_cycle(
+    symbols: &[Complex64],
+    cfg: &ModemConfig2x,
+    dd_refs: &[(usize, Complex64)],
+) -> Vec<Complex64> {
+    let mut equalized: Vec<Complex64> = symbols.to_vec();
+    let cycle_period = full_cycle_len_syms(cfg);
+    let min_skip = (cycle_period / 2).max(SOF_LEN_SYM);
+
+    // Use find_next_sof in a loop — same threshold (0.2 × SOF_LEN) as
+    // the main decode pipeline so we equalize every cycle the decoder
+    // will see. `find_all_sofs` uses a tighter 0.3 threshold tuned for
+    // the drift LS fit (avoiding false-positive Chu matches in band
+    // noise); for FFE training the looser threshold is correct because
+    // the per-PLS Golay+CRC check below rejects false positives anyway.
+    let mut scan = 0;
+    let log = std::env::var_os("RX_V4_LOG_FFE").is_some();
+    while let Some(sof_at) = find_next_sof(symbols, scan, cfg.family) {
+        if sof_at + PLHEADER_LEN_SYM > symbols.len() {
+            break;
+        }
+        let plheader_slice = &symbols[sof_at..sof_at + PLHEADER_LEN_SYM];
+        let pls = match decode_plheader_at(plheader_slice, cfg.family) {
+            Some((p, _gain)) => p,
+            None => {
+                // PLS CRC failed → noise correlation, not a real PLHEADER.
+                // Advance one symbol and keep searching (`find_next_sof`
+                // skip-one semantics).
+                scan = sof_at + 1;
+                continue;
+            }
+        };
+        let (mut positions, mut refs) = gather_cycle_refs(cfg, &pls, sof_at);
+        // Turbo-FFE feedback (slice 2x18c): append DD references that
+        // fall inside this cycle. Pass 1 calls with empty dd_refs;
+        // pass 2 calls with the data syms recovered from CWs that
+        // converged in pass 1, dramatically expanding the FFE training
+        // set per cycle (from ~224 to several thousand).
+        let cycle_end = (sof_at + cycle_period).min(symbols.len());
+        for &(pos, sym) in dd_refs {
+            if pos >= sof_at && pos < cycle_end {
+                positions.push(pos);
+                refs.push(sym);
+            }
+        }
+        let taps = train_ffe_ls(symbols, &refs, &positions, FFE_LEN_2X);
+        if log {
+            let center = taps.len() / 2;
+            let off_center_norm: f64 = taps
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != center)
+                .map(|(_, t)| t.norm_sqr())
+                .sum();
+            eprintln!(
+                "[ffe] cycle@{} refs={} taps[c]={:.3}+{:.3}i off_norm²={:.4}",
+                sof_at,
+                positions.len(),
+                taps[center].re,
+                taps[center].im,
+                off_center_norm,
+            );
+        }
+        apply_ffe_to_range(symbols, &taps, sof_at, cycle_end, &mut equalized);
+        scan = sof_at + min_skip;
+    }
+
+    equalized
+}
+
+/// Captured state of one decode pass — used by [`rx_v4_symbols_after`]
+/// to feed the turbo-FFE loop (slice 2x18c).
+struct DecodePassExtras {
+    /// ESI → recovered info_bytes for every DATA-CW that converged.
+    cw_bytes: HashMap<u32, Vec<u8>>,
+    /// Per-cycle `(sof_at, pls)` for every PLHEADER that passed
+    /// Golay+CRC. Same length and content as
+    /// `RxResult2x::validated_sof_positions` plus the matching PLS.
+    anchors: Vec<(usize, PlsPayload)>,
+}
+
+/// Build DD references (wire_position, symbol) for the FFE pass 2 by
+/// re-encoding every converged DATA-CW. For each ESI in `extras.cw_bytes`:
+///
+/// 1. Locate the producing cycle via `extras.anchors` (the cycle whose
+///    PLS has `base_esi <= ESI < base_esi + cw_per_cycle`).
+/// 2. Compute the DATA-CW slot's wire start in the symbol stream:
+///    `sof_at + 192 + lms_warmup + (1 + k) * cw_with_pilots` where
+///    `k = ESI - base_esi`.
+/// 3. Re-encode `info_bytes` via `encode_one_codeword` → 461 data syms
+///    (for APSK32).
+/// 4. Interleave with the deterministic TDM pilots → full CW wire
+///    (cw_with_pilots syms, every position known).
+/// 5. Push `(wire_start + i, interleaved[i])` for every i in the wire.
+///
+/// META-CWs aren't re-encoded here (they have a different info source —
+/// the AppHeader replicated 4×) but pass 2's PLHEADER+warmup anchor is
+/// enough to localise META's portion of the cycle anyway.
+fn build_dd_refs_from_pass1(
+    cfg: &ModemConfig2x,
+    extras: &DecodePassExtras,
+) -> Vec<(usize, Complex64)> {
+    let constellation = make_constellation_2x(cfg);
+    let interleave_perm = interleaver::interleave_table(
+        interleaver::padded_cw_bits(cfg.base.ldpc_rate.n(), cfg.base.constellation),
+        cfg.base.constellation,
+    );
+    let encoder = modem_core_base::ldpc::encoder::LdpcEncoder::new(cfg.base.ldpc_rate);
+    let cw_data_syms = cfg.cw_data_syms();
+    let cw_with_pilots = cw_with_pilots_len(cfg);
+    let cw_per_cycle = data_cw_per_cycle(cfg);
+    let groups_per_cw = pilot_groups_per_cw(cfg);
+
+    let mut out: Vec<(usize, Complex64)> = Vec::new();
+    for (sof_at, pls) in &extras.anchors {
+        let base_esi = pls.base_esi;
+        for k in 0..cw_per_cycle {
+            let esi = base_esi + k as u32;
+            let info_bytes = match extras.cw_bytes.get(&esi) {
+                Some(b) => b,
+                None => continue, // didn't converge in pass 1
+            };
+            let data_syms = crate::frame2x::encode_one_codeword(
+                info_bytes,
+                &encoder,
+                &interleave_perm,
+                &constellation,
+            );
+            // Re-create the wire layout (data interleaved with the
+            // deterministic rotating-QPSK pilots) — every position is
+            // now a known reference for the FFE.
+            let group_offset = groups_per_cw * (1 + k);
+            let (interleaved, _) = pilot2x_tdm::interleave_data_pilots_2x(
+                &data_syms,
+                &cfg.pilot_pattern,
+                group_offset,
+            );
+            debug_assert_eq!(interleaved.len(), cw_with_pilots);
+            let wire_start = sof_at + PLHEADER_LEN_SYM
+                + cfg.lms_warmup_syms
+                + (1 + k) * cw_with_pilots;
+            for (i, sym) in interleaved.iter().enumerate() {
+                out.push((wire_start + i, *sym));
+            }
+        }
+    }
+    out
+}
+
 /// Decode every PLHEADER cycle visible in `symbols`, accumulate ESI →
 /// bytes, and try a RaptorQ reassembly using the AppHeader from any
 /// converged META-CW.
 ///
 /// Symbols are assumed already matched-filtered and sampled at the
-/// symbol rate. Phase / amplitude is recovered per-CW from the embedded
-/// pilot blocks; no FFE is run in this stage.
+/// symbol rate. The function first runs a per-cycle LS-FFE
+/// (`equalize_symbols_per_cycle`) to undo any short-delay multipath
+/// before handing the equalised stream to the existing per-CW pilot
+/// LS-gain + turbo Pass 2 EM pipeline.
 pub fn rx_v4_symbols(
     symbols: &[Complex64],
     cfg: &ModemConfig2x,
@@ -1016,13 +1275,80 @@ pub fn rx_v4_symbols(
     rx_v4_symbols_after(symbols, 0, cfg)
 }
 
-/// Same as [`rx_v4_symbols`] but starts scanning at `cursor`. Useful for
-/// the worker to resume decoding after a partial slide.
+/// Same as [`rx_v4_symbols`] but starts scanning at `cursor`. Drives
+/// the turbo-FFE loop (slice 2x18c):
+/// - **Pass 1**: per-cycle LS-FFE trained on PLHEADER + LMS warmup only
+///   → equalise → decode. Some DATA-CWs converge.
+/// - **Pass 2**: re-encode every converged CW from pass 1 → use those
+///   ~5-50× more known symbols to re-train the FFE → equalise → decode.
+///   Marginal CWs that failed pass 1 typically converge here because
+///   the FFE now resolves the multipath channel much more accurately.
+///
+/// On clean channels (lab WAV, QO-100 sat) the LS converges to identity
+/// in pass 1, dd_refs are empty (or near-zero contribution), and pass 2
+/// is a no-op. Opt-out via `RX_V4_NO_FFE=1`; `RX_V4_NO_FFE_TURBO=1`
+/// keeps the pass-1 FFE but skips the pass-2 feedback loop.
 pub fn rx_v4_symbols_after(
     symbols: &[Complex64],
     cursor: usize,
     cfg: &ModemConfig2x,
 ) -> Option<RxResult2x> {
+    let (res1, extras1) = rx_v4_decode_pass(symbols, cursor, cfg, &[]);
+    let res1 = res1?;
+
+    // Turbo-FFE pass 2 — feed the LDPC posterior back into the FFE.
+    // **Opt-in via `RX_V4_FFE_TURBO=1`**. The simple "all-converged-CW-syms
+    // are dd_refs" recipe doesn't improve over slice 2x18a on the
+    // 2026-05-14 captures: same CW count converges (FFE pass 1 already
+    // captures the channel response well enough from PLHEADER+warmup
+    // alone), and the additional refs land in conv windows that may
+    // span non-converged CW regions, biasing the LS slightly. Slice
+    // 2x18d will refine the ref selection (only positions whose full
+    // ±n_ff/2 window is composed of known samples) — landed disabled
+    // here so we don't regress and can iterate on the criterion.
+    if !std::env::var_os("RX_V4_FFE_TURBO").is_some()
+        || std::env::var_os("RX_V4_NO_FFE").is_some()
+        || extras1.cw_bytes.is_empty()
+    {
+        return Some(res1);
+    }
+    let dd_refs = build_dd_refs_from_pass1(cfg, &extras1);
+    if dd_refs.is_empty() {
+        return Some(res1);
+    }
+    if std::env::var_os("RX_V4_LOG_FFE").is_some() {
+        eprintln!(
+            "[ffe] turbo pass 2: {} converged CWs in pass 1 → {} dd_refs",
+            extras1.cw_bytes.len(),
+            dd_refs.len(),
+        );
+    }
+    let (res2, _) = rx_v4_decode_pass(symbols, cursor, cfg, &dd_refs);
+    match res2 {
+        Some(r) if r.data_cws_converged > res1.data_cws_converged => Some(r),
+        _ => Some(res1),
+    }
+}
+
+/// One decode pass: optional FFE pre-pass (with extra DD refs for the
+/// turbo loop), then the symbol-domain SOF scan → PLHEADER decode →
+/// META-CW + DATA-CW LDPC pipeline. Returns the decoded
+/// [`RxResult2x`] plus the captured state needed to drive a second
+/// turbo-FFE pass.
+fn rx_v4_decode_pass(
+    symbols: &[Complex64],
+    cursor: usize,
+    cfg: &ModemConfig2x,
+    dd_refs: &[(usize, Complex64)],
+) -> (Option<RxResult2x>, DecodePassExtras) {
+    let equalized_storage;
+    let symbols: &[Complex64] = if std::env::var_os("RX_V4_NO_FFE").is_some() {
+        symbols
+    } else {
+        equalized_storage = equalize_symbols_per_cycle(symbols, cfg, dd_refs);
+        &equalized_storage
+    };
+
     let constellation = make_constellation_2x(cfg);
     let cw_data_syms = cfg.cw_data_syms();
     let cw_with_pilots = cw_with_pilots_len(cfg);
@@ -1046,6 +1372,7 @@ pub fn rx_v4_symbols_after(
 
     let mut result = RxResult2x::empty();
     let mut cw_bytes: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut anchors: Vec<(usize, PlsPayload)> = Vec::new();
     let mut sigma2_sum = 0.0_f64;
     let mut sigma2_radial_sum = 0.0_f64;
     let mut sigma2_tangential_sum = 0.0_f64;
@@ -1076,6 +1403,7 @@ pub fn rx_v4_symbols_after(
         // `decode_plheader_at`. Record for the drift LS fit. No false
         // positives possible here.
         result.validated_sof_positions.push(sof_at);
+        anchors.push((sof_at, pls));
         if pls.flags & FLAG2X_EOT != 0 {
             result.eot_seen = true;
         }
@@ -1275,16 +1603,18 @@ pub fn rx_v4_symbols_after(
         result.sigma2_tangential = (sigma2_tangential_sum / n).max(SIGMA2_FLOOR / 2.0);
     }
 
-    if result.cycles == 0 {
+    let extras = DecodePassExtras { cw_bytes, anchors };
+    let result_opt = if result.cycles == 0 {
         None
     } else {
         finalize_progress_bitmap(&mut result);
         Some(result)
-    }
+    };
+    (result_opt, extras)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_one_cw(
+pub(crate) fn decode_one_cw(
     chunk: &[Complex64],
     cw_data_syms: usize,
     pattern: &PilotPattern2x,

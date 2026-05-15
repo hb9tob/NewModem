@@ -1180,10 +1180,35 @@ fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
         pi.as_u8()
     );
 
-    let result = rx_worker2x::rx_v4_audio(&samples, &cfg).unwrap_or_else(|e| {
-        eprintln!("RX 2x error: {e}");
-        std::process::exit(1);
-    });
+    // Slice 2x19: drive the new Rx2xSession by chunking the WAV. The
+    // session owns the full DSP state machine ; CLI just pushes
+    // samples and collects events. For a one-shot WAV CLI rx the
+    // chunking is purely cosmetic — we'd get the same result pushing
+    // the whole buffer as a single chunk.
+    let mut session = modem_core2x::rx2x_session::Rx2xSession::new(
+        cfg.clone(),
+        pi.name().to_string(),
+    );
+    let mut events: Vec<modem_core2x::rx2x_session::Rx2xEvent> = Vec::new();
+    const CHUNK: usize = 24_000;
+    for i in (0..samples.len()).step_by(CHUNK) {
+        let end = (i + CHUNK).min(samples.len());
+        events.extend(session.process_audio_chunk(&samples[i..end]));
+    }
+    events.extend(session.finalize());
+
+    // Extract the final RxResult2x summary from the SessionFinalised
+    // event (last one emitted).
+    let result = events
+        .iter()
+        .rev()
+        .find_map(|e| {
+            if let modem_core2x::rx2x_session::Rx2xEvent::SessionFinalised { result } = e {
+                Some(result.clone())
+            } else {
+                None
+            }
+        });
     let Some(result) = result else {
         eprintln!("RX 2x failed: no PLHEADER found or signal too short");
         std::process::exit(1);
@@ -1197,6 +1222,19 @@ fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
         result.cycles,
         result.sigma2_data,
         result.eot_seen,
+    );
+    // Final clock drift estimate (LS slope-fit over CRC-validated
+    // PLHEADER positions; emitted as NaN when fewer than 3 SOFs
+    // were locked). Used by snr_sweep_2x.py's regex to plot injected
+    // vs estimated drift across the validation sweep.
+    let drift_str = result
+        .final_drift_ppm
+        .map(|p| format!("{:.2}", p))
+        .unwrap_or_else(|| "NaN".to_string());
+    eprintln!(
+        "Drift estimate: drift_ppm={} (from {} validated SOFs)",
+        drift_str,
+        result.validated_sof_positions.len(),
     );
     // Channel diagnostic: pilot-residual variance decomposed along the
     // pilot direction P=(1+j)/√2 vs perpendicular. On pure AWGN

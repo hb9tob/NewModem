@@ -11,3 +11,6 @@ modem-core-base = { path = "../modem-core-base" }
 modem-framing = { path = "../modem-framing" }
 realfft = "3"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hound = { workspace = true }

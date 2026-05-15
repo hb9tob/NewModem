@@ -2945,6 +2945,7 @@ dependencies = [
 name = "modem-core2x"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "modem-core-base",
  "modem-framing",
  "num-complex",

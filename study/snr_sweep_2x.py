@@ -147,6 +147,12 @@ _RX_LINE_RE_V3 = re.compile(
 _RX_LINE_RE_SPLIT = re.compile(
     r"Channel σ² split: radial=([\d.eE+\-]+), "
     r"tangential=([\d.eE+\-]+), ratio_R/T=([\d.eE+\-]+)")
+# Captures the V4 2x final drift estimate emitted by modem-cli's rx 2x
+# subcommand (cf rust/modem-cli/src/main.rs ~line 1228). The drift_ppm
+# token is either a signed float or the literal "NaN" when fewer than
+# 3 SOFs were validated.
+_RX_LINE_RE_DRIFT = re.compile(
+    r"Drift estimate: drift_ppm=([\d.eE+\-]+|NaN) \(from (\d+) validated SOFs\)")
 
 
 def run_rx(cli: str, profile: str, wav_path: str, out_path: str,
@@ -164,6 +170,7 @@ def run_rx(cli: str, profile: str, wav_path: str, out_path: str,
         "decoded_bytes": None, "converged": None, "total": None,
         "cycles": None, "sigma2": None, "eot": None,
         "sigma2_radial": None, "sigma2_tangential": None, "ratio_rt": None,
+        "estimated_drift_ppm": None, "validated_sofs": None,
     }
     # Both lines (Decoded + Channel σ² split) appear on V4 RX. V3 RX only
     # emits the Decoded line. Walk every line and absorb whatever matches.
@@ -191,6 +198,13 @@ def run_rx(cli: str, profile: str, wav_path: str, out_path: str,
             info["sigma2_radial"] = float(ms.group(1))
             info["sigma2_tangential"] = float(ms.group(2))
             info["ratio_rt"] = float(ms.group(3))
+            continue
+        md = _RX_LINE_RE_DRIFT.search(line)
+        if md:
+            drift_str = md.group(1)
+            info["estimated_drift_ppm"] = (
+                float("nan") if drift_str == "NaN" else float(drift_str))
+            info["validated_sofs"] = int(md.group(2))
             continue
     return info
 
@@ -314,15 +328,18 @@ def main() -> int:
     csv_path = os.path.join(args.out_dir, "results.csv")
     with open(csv_path, "w") as csv_f:
         csv_f.write(
-            "profile,if_noise,phase_walk,sigma2,snr_est_db,sigma2_radial,"
-            "sigma2_tangential,ratio_rt,converged,total,cycles,"
-            "decoded_bytes,ber_byte,exact,tx_time_s,total_time_s\n")
+            "profile,if_noise,phase_walk,injected_drift_ppm,"
+            "injected_thermal_ppm,sigma2,snr_est_db,sigma2_radial,"
+            "sigma2_tangential,ratio_rt,estimated_drift_ppm,validated_sofs,"
+            "converged,total,cycles,decoded_bytes,ber_byte,exact,"
+            "tx_time_s,total_time_s\n")
 
         # Pretty-printed live table. σ²_R/σ²_T split appended on V4 RX
         # (V3 only emits the scalar σ²; the split columns stay blank
         # there).
         header = (f"{'profile':<10} {'if_n':>5} {'phw':>5} {'σ²':>8} {'SNRdB':>6} "
                   f"{'σ²_R':>7} {'σ²_T':>7} {'R/T':>5} "
+                  f"{'drift':>7} {'sofs':>4} "
                   f"{'conv':>9} {'cyc':>4} {'rx_B':>6} {'BER':>9} "
                   f"{'exact':>5} {'t(s)':>5}")
         print("\n" + header)
@@ -374,13 +391,21 @@ def main() -> int:
                     snr_est = float("nan")
                 t_total = time.time() - t0
 
+                est_drift = info['estimated_drift_ppm']
+                est_drift_str = (
+                    "" if est_drift is None
+                    else ("NaN" if isinstance(est_drift, float)
+                          and np.isnan(est_drift) else f"{est_drift}"))
                 csv_f.write(
                     f"{profile},{if_noise},{phase_walk},"
+                    f"{args.drift_ppm},{args.thermal_ppm},"
                     f"{sigma2 if sigma2 is not None else ''},"
                     f"{snr_est},"
                     f"{info['sigma2_radial'] if info['sigma2_radial'] is not None else ''},"
                     f"{info['sigma2_tangential'] if info['sigma2_tangential'] is not None else ''},"
                     f"{info['ratio_rt'] if info['ratio_rt'] is not None else ''},"
+                    f"{est_drift_str},"
+                    f"{info['validated_sofs'] if info['validated_sofs'] is not None else ''},"
                     f"{info['converged'] if info['converged'] is not None else ''},"
                     f"{info['total'] if info['total'] is not None else ''},"
                     f"{info['cycles'] if info['cycles'] is not None else ''},"
@@ -404,6 +429,8 @@ def main() -> int:
                     f"{fmt(info['sigma2_radial'], 7, 4)} "
                     f"{fmt(info['sigma2_tangential'], 7, 4)} "
                     f"{fmt(info['ratio_rt'], 5, 2)} "
+                    f"{fmt(info['estimated_drift_ppm'], 7, 1)} "
+                    f"{str(info['validated_sofs'] or '-'):>4} "
                     f"{str(info['converged'] or '-'):>4}/"
                     f"{str(info['total'] or '-'):<4} "
                     f"{str(info['cycles'] or '-'):>4} "

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Modem 2x — validation des boucles de tracking</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --warn-soft: #fff4eb;
+        --good: #2b9f5f;
+        --good-soft: #eafbf2;
+        --danger: #c0392b;
+        --danger-soft: #fdecea;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0; padding: 0;
+        background: var(--bg); color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem 6rem; }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem; margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block; font-size: 1rem; font-weight: 400;
+        color: #666; margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 { margin-top: 1.8rem; color: #444; }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em; border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e; color: #dcdcaa;
+        padding: 1rem; border-radius: 5px;
+        overflow-x: auto; font-size: 0.85rem;
+        line-height: 1.35;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table {
+        border-collapse: collapse;
+        width: 100%; margin: 1rem 0; font-size: 0.92rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.45rem 0.6rem; text-align: left; vertical-align: top;
+    }
+    th { background: var(--accent-soft); color: var(--accent); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: var(--warn-soft);
+        margin: 1rem 0; border-radius: 0 4px 4px 0;
+    }
+    .callout.info   { border-left-color: var(--accent); background: var(--accent-soft); }
+    .callout.ok     { border-left-color: var(--good);   background: var(--good-soft); }
+    .callout.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+    .src {
+        font-size: 0.82rem; color: #888;
+        font-family: "Consolas", "Monaco", monospace;
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Modem 2x — validation des boucles de tracking
+    <span class="sub">2026-05-15 — branche <code>feat/modem-2x</code> — méthodologie séquentielle injection → estimation → divergence, stop-at-first-bug.</span>
+</h1>
+
+<p>
+    Le sondeur de canal a été validé (cf <a href="sounder_echo_audit.html">sounder_echo_audit.html</a>) et le simulateur <code>nbfm_channel_sim.py</code> reproduit le σ² post-demod OTA (cf <a href="modem_2x_reference.html">modem_2x_reference.html</a>). On utilise maintenant le sim <strong>déterministe</strong> comme banc de test pour comparer, boucle de tracking par boucle de tracking, la valeur <strong>injectée</strong> à la valeur <strong>estimée</strong> par le RX 2x. Approche stop-at-first-divergence.
+</p>
+
+<!-- ============================================================== -->
+<h2 id="phase-a">Phase A — 2x casse à drift ≥ 10 ppm dans le sim</h2>
+
+<p>
+    Sweep préliminaire 2x avec drift 30 ppm + thermal ±5 ppm (conditions OTA-typiques) :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Profil</th><th>if_n=0.20 / drift=30</th><th>if_n=0.20 / drift=60</th><th>if_n=0.20 / drift=100</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><code>HIGH2X</code></td>
+            <td>✗ 24/61 conv, σ²=1.39</td>
+            <td>✗ 29/63 σ²=0.98</td>
+            <td>✗ 35/52 σ²=0.05</td>
+        </tr>
+        <tr>
+            <td><code>HIGH+2X</code></td>
+            <td>✗ 15/55 σ²=0.49</td>
+            <td>✗ 48/69 σ²=0.011</td>
+            <td>✗ 36/58 σ²=0.017</td>
+        </tr>
+        <tr>
+            <td><code>HIGH++2X</code></td>
+            <td>✗ 13/56 σ²=0.02</td>
+            <td>✗ 6/52 σ²=0.28</td>
+            <td>✗ 11/43 σ²=0.075</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout danger">
+    <strong>2x casse complètement</strong> sur les 3 profils à toute valeur de drift ≥ 30 ppm. À titre de comparaison, V3 décode propre (exact=Y) aux mêmes conditions OTA-équivalentes (drift 30 ppm + thermal ±5 ppm). Le problème est donc dans une boucle de tracking 2x, pas dans le sim.
+</div>
+
+<!-- ============================================================== -->
+<h2 id="phase-b">Phase B — Boucle DRIFT PPM : injecté vs estimé</h2>
+
+<h3>Instrumentation</h3>
+
+<p>
+    Trois modifications minimes pour exposer le drift estimé :
+</p>
+
+<ul>
+    <li><code>rust/modem-core2x/src/rx_v4.rs</code> : ajouté champ <code>pub final_drift_ppm: Option&lt;f64&gt;</code> à <code>RxResult2x</code>.</li>
+    <li><code>rust/modem-core2x/src/rx2x_session.rs</code> : <code>emit_finalised()</code> appelle <code>estimate_drift_from_sof_positions()</code> et stocke le résultat.</li>
+    <li><code>rust/modem-cli/src/main.rs</code> : nouvelle ligne stderr <code>Drift estimate: drift_ppm=X (from N validated SOFs)</code>.</li>
+</ul>
+
+<p>
+    Côté Python : <code>study/snr_sweep_2x.py</code> parse cette ligne (regex <code>_RX_LINE_RE_DRIFT</code>), ajoute les colonnes <code>injected_drift_ppm</code> + <code>estimated_drift_ppm</code> + <code>validated_sofs</code> à la CSV. Nouveau script <code>study/plot_drift_vs_estimate.py</code> trace l'injecté vs l'estimé pour les 3 profils.
+</p>
+
+<h3>Résultats sweep drift</h3>
+
+<p>
+    Conditions : <code>--family 2x --if-noises 0.25 --thermal-ppm 0 --payload-bytes 10000</code> pour isoler le drift statique. Sweep <code>drift_ppm ∈ {0, 5, 10, 20, 30, 50, 75, 100, 150, 200}</code>.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Drift injecté (ppm)</th>
+            <th>Estimé HIGH2X</th>
+            <th>Estimé HIGH+2X</th>
+            <th>Estimé HIGH++2X</th>
+            <th>Décode</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td class="num">0</td>
+            <td class="num">0.0</td><td class="num">0.0</td><td class="num">0.0</td>
+            <td>✓✓✓</td></tr>
+        <tr><td class="num">5</td>
+            <td class="num">0.0</td><td class="num">0.0</td><td class="num">0.0</td>
+            <td>✓✓✓ (σ²=0.002, propre)</td></tr>
+        <tr><td class="num">10</td>
+            <td class="num">8.8</td><td class="num"><strong>0.0</strong></td><td class="num"><strong>0.0</strong></td>
+            <td>✓✓ HIGH++ ✗ (BER 14.5%)</td></tr>
+        <tr><td class="num">20</td>
+            <td class="num">28.9</td><td class="num">35.2</td><td class="num">37.2</td>
+            <td>✗✗✗</td></tr>
+        <tr><td class="num">30</td>
+            <td class="num"><strong>0.0</strong></td><td class="num">38.8</td><td class="num">…</td>
+            <td>✗✗✗</td></tr>
+    </tbody>
+</table>
+
+<div class="callout danger">
+    <strong>Divergence majeure trouvée à drift = 10 ppm.</strong>
+    L'estimateur retourne 0.0 (au lieu de 10) sur HIGH+2X et HIGH++2X. À drift = 20 ppm, il overshoot à 29-37 ppm. À 30 ppm, HIGH2X retourne 0.0 (catastrophic miss) tandis que HIGH+2X estime 38.8. <strong>Le pattern est erratique, non-monotone, et profile-dépendant</strong>.
+</div>
+
+<!-- ============================================================== -->
+<h2 id="diagnostic">Diagnostic — quantification entière des positions SOF</h2>
+
+<p>
+    L'algorithme <code>estimate_drift_from_sof_positions()</code> (<code>rx_v4.rs:302-339</code>) fait un LS slope-fit sur les positions SOF entières dans le flux de symboles. Pour résoudre un drift D ppm, il faut <strong>au moins 1 symbole</strong> de drift cumulé sur la longueur du burst :
+</p>
+
+<pre><code>n_cycles × cycle_period_sym × D × 1e-6 ≥ 1</code></pre>
+
+<p>
+    Pour un burst de 10 ko :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Profil</th><th>cycles</th><th>cycle_period_sym</th><th>Drift seuil (1 sym cumul)</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>HIGH2X</code></td><td class="num">7</td><td class="num">~6000</td><td class="num">≈ 24 ppm</td></tr>
+        <tr><td><code>HIGH+2X</code></td><td class="num">6</td><td class="num">~4500</td><td class="num">≈ 37 ppm</td></tr>
+        <tr><td><code>HIGH++2X</code></td><td class="num">5</td><td class="num">~4300</td><td class="num">≈ 47 ppm</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Sous ce seuil, le drift cumulé est moins d'un symbole entier — l'estimateur ne peut pas le résoudre et retourne 0. C'est exactement ce qu'on observe : à drift = 10 ppm, HIGH+2X et HIGH++2X retournent 0 (sous leur seuil de résolution), tandis que HIGH2X retourne 8.8 (juste au seuil, alignement chanceux).
+</p>
+
+<div class="callout info">
+    <strong>Cause racine du bug drift PPM :</strong> les positions SOF sont entières (samples au taux symbole). L'algorithme LS slope-fit ne peut pas résoudre des drifts inférieurs à <code>1 / (n_cycles × cycle_period)</code> ≈ 25-50 ppm pour un burst de 10 ko. Au-delà, l'estimation est correcte mais arrive trop tard — le Gardner closed-loop en streaming a déjà accumulé une dérive symbole significative.
+</div>
+
+<h3>Pourquoi 2x casse même quand l'estimé matche</h3>
+
+<p>
+    Le drift est appliqué par le sim via cubic resampling au taux audio AVANT le modem. La boucle Gardner closed-loop dans <code>streaming_frontend.rs</code> est censée le suivre symbole par symbole. Avec <code>K_p = 0.05, K_i = 0.005</code> (slow loop DVB-S2X), elle converge en ~200 symboles. Mais pour un drift de 30 ppm, le shift cumulé sur les 200 premiers symboles est 0.006 samples — Gardner converge mais ne corrige presque rien à ce stade.
+</p>
+
+<p>
+    Le problème combiné :
+</p>
+
+<ol>
+    <li><strong>Bootstrap drift insuffisamment précis</strong> — LS-fit retourne 0 ou hop-skip alors qu'on a 10-30 ppm réels.</li>
+    <li><strong>Gardner closed-loop trop lent</strong> — converge en ~200 sym, mais Q_i = 0.005 ⇒ stationary error ≈ 30e-6 × K_i / K_p² ≈ 6e-3 sample par symbole résiduel, large devant la précision de la décision symbole.</li>
+    <li><strong>Pas de boucle thermal-tracking explicite</strong> — la dérive oscillante n'est pas modélisée séparément du drift statique.</li>
+</ol>
+
+<!-- ============================================================== -->
+<h2 id="fix-candidates">Candidats fix</h2>
+
+<table>
+    <thead>
+        <tr><th>Option</th><th>Effort</th><th>Bénéfice attendu</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>A. SOF position sub-sample via interpolation parabolique du pic</strong></td>
+            <td>Faible (~50 lignes dans <code>find_next_sof</code>)</td>
+            <td>Résolution drift × 10-20. Drifts ≥ 1 ppm résolvables sur 5 cycles.</td>
+        </tr>
+        <tr>
+            <td><strong>B. Gardner gain bumped initial + drift bootstrap from PLHEADER 0</strong></td>
+            <td>Moyen</td>
+            <td>Convergence Gardner plus rapide ; mais bootstrap depuis PLHEADER 0 nécessite un anchor exact, pas trivial.</td>
+        </tr>
+        <tr>
+            <td><strong>C. Drift forward Kalman par cycle (vs LS slope-fit final)</strong></td>
+            <td>Moyen</td>
+            <td>Estimation drift à chaque PLHEADER avec lissage temporel → suit aussi le thermal.</td>
+        </tr>
+        <tr>
+            <td><strong>D. Bulk resample audio avec drift estimé par chunk + retry decode</strong></td>
+            <td>Élevé</td>
+            <td>Approche V3 portée sur 2x : robuste mais re-traite l'audio plusieurs fois.</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    Recommandation : <strong>A + C en cascade</strong>. A donne la précision instantanée, C donne le tracking temporel.
+</p>
+
+<!-- ============================================================== -->
+<h2 id="reproduction">Reproduction</h2>
+
+<pre><code># Build CLI
+cd rust && cargo build -p modem-cli --release && cd ..
+
+# Sanity (drift=0 → estimé=0)
+/usr/bin/python3 study/snr_sweep_2x.py \
+    --family 2x --profiles HIGH2X --if-noises 0.20 \
+    --drift-ppm 0 --out-dir results/drift_zero_sanity
+
+# Sweep complet (~15 min sur Pi5)
+for drift in 0 5 10 20 30 50 75 100 150 200; do
+  /usr/bin/python3 study/snr_sweep_2x.py \
+      --family 2x --profiles HIGH2X HIGH+2X HIGH++2X \
+      --if-noises 0.25 --drift-ppm $drift --thermal-ppm 0 \
+      --payload-bytes 10000 \
+      --out-dir results/drift_sweep_d${drift}
+done
+
+# Consolider + plot
+bash /tmp/concat_drift_csvs.sh
+/usr/bin/python3 study/plot_drift_vs_estimate.py \
+    results/drift_sweep_2x/results.csv \
+    --out results/drift_sweep_2x/drift_injected_vs_estimated.png
+</code></pre>
+
+<!-- ============================================================== -->
+<h2 id="next">Prochaines étapes</h2>
+
+<p>
+    <strong>STOP Phases C-F</strong>. Le bug drift PPM explique le breakdown 2x observé en Phase A. Pas la peine d'instrumenter les autres boucles tant que celle-ci n'est pas fixée.
+</p>
+
+<ol>
+    <li>Implémenter fix A (SOF sub-sample interpolation parabolique).</li>
+    <li>Re-runner le sweep drift après fix → vérifier que l'estimé matche l'injecté en dessous de 50 ppm.</li>
+    <li>Implémenter fix C (Kalman par cycle) si A seul ne suffit pas.</li>
+    <li>Quand drift est OK : reprendre le sweep Phase A (2x_breakdown_discovery) — si 2x décode propre, alors les autres boucles n'ont pas besoin d'instrumentation tout de suite. Sinon Phase C (phase porteuse).</li>
+</ol>
+
+</div>
+</body>
+</html>
