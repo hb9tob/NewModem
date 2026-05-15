@@ -856,6 +856,65 @@ fn pass2_em_sigma2_to_per_sym_per_ring(
     out
 }
 
+/// Build a phase-observation stream from the pilot blocks of a CW
+/// chunk. **One PhaseObs per pilot group** — pilots are exact known
+/// refs (rotating QPSK on the unit circle), so the obs are independent
+/// of any decode result. Used by the Phase 3 per-cycle RTS smoother:
+/// the session collects these across all CWs of a cycle and runs
+/// `rts_phase_smooth` at cycle end.
+///
+/// Returns `Vec<(wire_pos_offset, PhaseObs)>` where `wire_pos_offset`
+/// is the offset (in symbols) of the pilot group's first pilot inside
+/// the CW chunk (the caller converts to absolute symbol index by
+/// adding `chunk_rel + buf_start_abs`).
+///
+/// `sigma2_tangential` is the per-CW tangential σ² estimate (already
+/// computed by `estimate_cw_sigma2_split`). R per group ≈
+/// σ²_tang / (p_syms × |gain|²) since we average `p_syms` pilots.
+pub(crate) fn pilot_phase_obs_per_group(
+    chunk: &[Complex64],
+    cw_data_syms: usize,
+    pattern: &PilotPattern2x,
+    group_idx_offset: usize,
+    gain: Complex64,
+    sigma2_tangential: f64,
+) -> Vec<(usize, PhaseObs)> {
+    let positions = pilot2x_tdm::pilot_positions_2x(
+        cw_data_syms, pattern, group_idx_offset,
+    );
+    let gain_norm_sqr = gain.norm_sqr();
+    if gain_norm_sqr < 1e-12 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(positions.len());
+    for (pilot_start, pilot_end, abs_pilot_idx) in positions {
+        if pilot_end > chunk.len() {
+            break;
+        }
+        // Acc = Σ (rx / gain) · conj(pref). On the unit-magnitude
+        // rotating pilots, |pref| = 1 so arg(acc) is the residual
+        // rotation introduced by the channel between this group's
+        // pilots and the gain-anchored reference.
+        let mut acc = Complex64::new(0.0, 0.0);
+        let mut n = 0usize;
+        for (k, sym) in chunk[pilot_start..pilot_end].iter().enumerate() {
+            let pref = pilot2x_tdm::pilot_symbol_2x(abs_pilot_idx + k);
+            acc += (sym / gain) * pref.conj();
+            n += 1;
+        }
+        if n == 0 || acc.norm_sqr() < 1e-18 {
+            out.push((pilot_start, PhaseObs { theta: 0.0, r: 1e9 }));
+            continue;
+        }
+        let theta = acc.arg();
+        // R per group = σ²_tang / (n × |gain|²). With p_syms=2 and a
+        // typical |gain|≈1, R ≈ σ²_tang / 2.
+        let r = (sigma2_tangential / (n as f64 * gain_norm_sqr)).max(1e-9);
+        out.push((pilot_start, PhaseObs { theta, r }));
+    }
+    out
+}
+
 /// Build a phase-observation stream for [`rts_phase_smooth`] from the
 /// (gain-corrected) data and the soft references. Measurement noise R
 /// per symbol = σ²_tang / |s̃_k|² — the standard small-angle approximation
@@ -1457,6 +1516,7 @@ fn rx_v4_decode_pass(
             &mut sigma2_tangential_sum,
             &mut sigma2_n,
             cycle_refs,
+            None,                  // batch path: no per-cycle phase tracker
         );
 
         // DATA-CWs of this cycle. The encoder wrote `cw_per_cycle` (or
@@ -1558,6 +1618,7 @@ fn rx_v4_decode_pass(
                 &mut sigma2_tangential_sum,
                 &mut sigma2_n,
                 cycle_refs,
+                None,                    // batch path: no per-cycle phase tracker
             );
         }
 
@@ -1634,6 +1695,12 @@ pub(crate) fn decode_one_cw(
     sigma2_tangential_sum: &mut f64,
     sigma2_n: &mut usize,
     cycle_refs: Option<(&[Complex64], &[Complex64])>,
+    // Phase 3 — optional out: pilot phase observations per group,
+    // with wire offsets relative to the start of this CW chunk. The
+    // caller (Rx2xSession::drive_locked) accumulates these across all
+    // CWs of a cycle, converts to absolute symbol indices, and runs
+    // rts_phase_smooth + turbo redecode at cycle end.
+    phase_obs_out: Option<&mut Vec<(usize, PhaseObs)>>,
 ) {
     let gain = estimate_cw_gain(chunk, cw_data_syms, pattern, group_idx_offset, cycle_refs);
     let split = estimate_cw_sigma2_split(
@@ -1643,6 +1710,17 @@ pub(crate) fn decode_one_cw(
     *sigma2_radial_sum += split.radial;
     *sigma2_tangential_sum += split.tangential;
     *sigma2_n += 1;
+
+    // Phase 3 — extract pilot phase observations for the per-cycle
+    // RTS smoother. Done EARLY (before decode) so the obs are recorded
+    // regardless of whether this CW converges.
+    if let Some(obs_buf) = phase_obs_out {
+        let obs = pilot_phase_obs_per_group(
+            chunk, cw_data_syms, pattern, group_idx_offset, gain,
+            split.tangential.max(SIGMA2_FLOOR / 2.0),
+        );
+        obs_buf.extend(obs);
+    }
 
     // De-interleave the data symbols, divide by the gain (residual phase
     // / amplitude on top of the SOF reference).

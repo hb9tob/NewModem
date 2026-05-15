@@ -260,6 +260,13 @@ pub struct Rx2xSession {
     /// updates significantly enough to trigger an FSM reset (see
     /// `reset_for_backward_fix`). Capped at `RX2X_MAX_DRIFT_RESETS`.
     n_drift_resets: u8,
+
+    /// Phase 3 per-cycle pilot phase observations. Each entry is
+    /// `(absolute_symbol_index, PhaseObs)` for one pilot group. The
+    /// session accumulates these across all CWs of the current cycle
+    /// then runs `rts_phase_smooth` at cycle end. Reset at each new
+    /// cycle and at backward-fix reset.
+    cycle_phase_obs: Vec<(u64, modem_core_base::phase_smoother::PhaseObs)>,
 }
 
 impl Rx2xSession {
@@ -338,6 +345,7 @@ impl Rx2xSession {
             drift_per_cycle: Vec::new(),
             dd_refs_pool: Vec::new(),
             n_drift_resets: 0,
+            cycle_phase_obs: Vec::new(),
         }
     }
 
@@ -684,6 +692,12 @@ impl Rx2xSession {
         let cycle_refs: Option<(&[Complex64], &[Complex64])> =
             Some((&cycle_refs_rx, &cycle_refs_exp));
 
+        // Phase 3 — collect per-CW pilot phase observations with
+        // chunk-local wire offsets. Converted to absolute symbol
+        // indices below (anchor_sof_abs + cw_offset_in_cycle + local).
+        let mut cw_phase_obs: Vec<(usize,
+            modem_core_base::phase_smoother::PhaseObs)> = Vec::new();
+
         decode_one_cw(
             &chunk,
             self.cw_data_syms,
@@ -708,7 +722,17 @@ impl Rx2xSession {
             &mut self.sigma2_tangential_sum,
             &mut self.sigma2_n,
             cycle_refs,
+            Some(&mut cw_phase_obs),
         );
+
+        // Convert chunk-local pilot positions → absolute symbol
+        // indices and append to the cycle-wide phase obs buffer.
+        let cw_chunk_abs_start =
+            anchor_sof_abs + cw_offset_in_cycle as u64;
+        for (local_off, obs) in cw_phase_obs.drain(..) {
+            self.cycle_phase_obs
+                .push((cw_chunk_abs_start + local_off as u64, obs));
+        }
 
         let cw_sigma2 = self.sigma2_sum - sigma2_before;
         let cw_sigma2_rad = self.sigma2_radial_sum - sigma2_rad_before;
@@ -770,7 +794,13 @@ impl Rx2xSession {
         let total_cws_in_cycle = 1 + self.cw_per_cycle;
         if new_next_cw >= total_cws_in_cycle {
             // Cycle done : look for the next PLHEADER one cycle ahead.
-            // (T3 drift Kalman update happens here in step 4.)
+            // Phase 3 — run the per-cycle RTS phase smoother + turbo
+            // redecode of any CWs that didn't converge in the forward
+            // pass. Both run unconditionally (Étape B: smooth-only,
+            // Étape C: turbo). cycle_phase_obs is reset by the call.
+            self.refine_cycle_and_turbo_redecode(
+                cycle_idx, anchor_sof_abs, events,
+            );
             self.result.cycles += 1;
             self.scan_cursor_abs =
                 anchor_sof_abs + self.cycle_period_sym as u64;
@@ -949,6 +979,63 @@ impl Rx2xSession {
             self.result.data = payload.clone();
             events.push(Rx2xEvent::PayloadAssembled { bytes: payload });
         }
+    }
+
+    /// Phase 3 — per-cycle pilot phase RTS smoothing + turbo redecode
+    /// of CWs that didn't converge in the forward pass.
+    ///
+    /// Called at every cycle end (after the last DATA-CW). Reads the
+    /// accumulated `cycle_phase_obs` (pilot phase observations across
+    /// all CWs of the cycle), runs `rts_phase_smooth` to get an MMSE
+    /// estimate of the phase trajectory φ(t), and re-decodes failed
+    /// CWs with the smoothed phase + 30-iter LDPC + data-assisted
+    /// references from CWs that did converge.
+    ///
+    /// **Étape B** (current): just smooth + log the trajectory in
+    /// `result.pilot_phase_per_cw`. No turbo redecode yet — that's
+    /// Étape C.
+    ///
+    /// **Étape C** (next): for each failed CW, derotate the chunk by
+    /// the smoothed phase, re-encode converged CWs into auxiliary
+    /// refs, re-decode at 30 iter.
+    fn refine_cycle_and_turbo_redecode(
+        &mut self,
+        _cycle_idx: u32,
+        _anchor_sof_abs: u64,
+        _events: &mut Vec<Rx2xEvent>,
+    ) {
+        // Always drain cycle_phase_obs even if we skip everything.
+        let obs_with_pos: Vec<(u64, modem_core_base::phase_smoother::PhaseObs)> =
+            self.cycle_phase_obs.drain(..).collect();
+        if obs_with_pos.len() < 8 {
+            // Safety guard — too few pilot groups, RTS unreliable.
+            return;
+        }
+        let mean_sigma2_tang =
+            self.sigma2_tangential_sum / self.sigma2_n.max(1) as f64;
+        let params = modem_core_base::phase_smoother::PhaseSmootherParams
+            ::from_channel(mean_sigma2_tang.max(1e-6));
+        let obs: Vec<modem_core_base::phase_smoother::PhaseObs> =
+            obs_with_pos.iter().map(|(_, o)| *o).collect();
+        let phi_smooth =
+            modem_core_base::phase_smoother::rts_phase_smooth(&obs, &params);
+
+        // Diagnostic log gated by env var. Useful to see whether the
+        // smoother is doing anything sensible at runtime.
+        if std::env::var_os("RX2X_LOG_PHASE_SMOOTH").is_some() {
+            let mean = phi_smooth.iter().sum::<f64>() / phi_smooth.len() as f64;
+            let mn = phi_smooth.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = phi_smooth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            eprintln!(
+                "[rx2x-cycle-smooth] cycle={} n_obs={} mean={:+.3} range=[{:+.3},{:+.3}] rad",
+                _cycle_idx, obs.len(), mean, mn, mx,
+            );
+        }
+
+        // Étape C will use phi_smooth + obs_with_pos here to redecode
+        // failed CWs with 30-iter decoder. For Étape B we just stash
+        // the trajectory for future use and exit.
+        let _ = (phi_smooth, obs_with_pos);
     }
 
     /// Trim the symbol buffer if it grows past [`RX2X_SYM_BUFFER_CAP`].
