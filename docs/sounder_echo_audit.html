@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Sondeur de canal — Audit de l'artefact -5 dBc</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --warn-soft: #fff4eb;
+        --good: #2b9f5f;
+        --good-soft: #eafbf2;
+        --danger: #c0392b;
+        --danger-soft: #fdecea;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0; padding: 0;
+        background: var(--bg); color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem 6rem; }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem; margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block; font-size: 1rem; font-weight: 400;
+        color: #666; margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 { margin-top: 1.8rem; color: #444; }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em; border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e; color: #dcdcaa;
+        padding: 1rem; border-radius: 5px;
+        overflow-x: auto; font-size: 0.85rem;
+        line-height: 1.35;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table {
+        border-collapse: collapse;
+        width: 100%; margin: 1rem 0; font-size: 0.92rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.45rem 0.6rem; text-align: left; vertical-align: top;
+    }
+    th { background: var(--accent-soft); color: var(--accent); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: var(--warn-soft);
+        margin: 1rem 0; border-radius: 0 4px 4px 0;
+    }
+    .callout.info   { border-left-color: var(--accent); background: var(--accent-soft); }
+    .callout.ok     { border-left-color: var(--good);   background: var(--good-soft); }
+    .callout.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+    .meta { color: #888; font-size: 0.88rem; margin-top: -0.3rem; }
+    .src {
+        font-size: 0.82rem; color: #888;
+        font-family: "Consolas", "Monaco", monospace;
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Sondeur de canal — Audit de l'artefact -5 dBc
+    <span class="sub">2026-05-15 — branche <code>feat/modem-2x</code> HEAD <code>0ac497a</code> — vérification d'un écho rapporté implausible sur chaîne bench FT-991A → FTX-1.</span>
+</h1>
+
+<p class="meta">
+    Doc compagnon à <a href="modem_2x_reference.html"><code>modem_2x_reference.html</code></a>. Cet audit cible spécifiquement la mesure <code>strongest_echo_dbc</code> émise par <code>measure_golay</code> (<code>rust/modem-core-base/src/probe_analyze.rs</code>) et son affichage dans la GUI Canal-tab <code>sd-echo</code>.
+</p>
+
+<!-- ============================================================== -->
+<h2 id="motivation">1. Motivation</h2>
+
+<p>
+    L'opérateur a observé <code>strongest_echo_dbc ≈ -5 dBc</code> sur des captures OTA bench FT-991A → FTX-1. Physiquement aberrant : dans un bench loopback radio (pas d'antenne, pas d'environnement réfléchissant), on n'attend pas d'écho multipath au-dessus du plancher de bruit (-30 à -60 dBc).
+</p>
+
+<div class="callout">
+    Hypothèse de départ : le smearing temporel de la chaîne audio du transceiver (LPF 2 kHz + de-emphasis 75 µs + AGC) étale le main lobe BPSK au-delà du <code>min_guard = 2.5 ms</code> de l'algorithme, et la queue smearée est ensuite classée à tort comme un écho.
+</div>
+
+<!-- ============================================================== -->
+<h2 id="data">2. Données disponibles</h2>
+
+<p>
+    Captures OTA conservées en <code>~/Downloads/nbfm-rx/</code> sur le Pi5 kiosk :
+</p>
+
+<ul>
+    <li><code>capture-NNNN.wav</code> — WAV mono 48 kHz 16-bit, audio post-démod du SDRplay, durée variable (env 50–300 s)</li>
+    <li><code>capture-NNNN.signature[.vN].json</code> — résultat de <code>sounder_analyze</code> avec l'IR complète embarquée dans <code>measurements[].result.impulse_response</code></li>
+    <li><code>~/Downloads/nbfm-rx/sounder/&lt;id&gt;/{probe.wav, schedule.json}</code> — TX-side reference WAV + layout</li>
+</ul>
+
+<p>
+    Paramètres Golay confirmés dans le <code>schedule.json</code> et <code>main.js:4675-4680</code> :
+</p>
+
+<pre><code>length_bits = 256
+chip_rate_hz = 1200.0
+carrier_hz   = 1500.0
+gap_s        = 0.1   (100 ms)
+amplitude TX = balayage 0.022 → 0.700 (11 niveaux par capture)
+</code></pre>
+
+<p>
+    Dérivés :
+</p>
+<ul>
+    <li><code>samples_per_chip = 48000 / 1200 = 40</code> samples = 833 µs</li>
+    <li><code>2·fc = 3000 Hz</code> → période battement xcorr = 16 samples = 333 µs</li>
+    <li><code>min_guard = 3·spc = 120</code> samples = 2.5 ms</li>
+    <li><code>GOLAY_IR_RETAIN_SAMPLES = 4800</code> = 100 ms post-pic</li>
+</ul>
+
+<!-- ============================================================== -->
+<h2 id="findings">3. Résultats — 4 captures OTA sur 5 donnent ~ -5 dBc</h2>
+
+<table>
+    <thead>
+        <tr>
+            <th>Capture</th>
+            <th>echo_dBc</th>
+            <th>echo_µs</th>
+            <th>gd_peak_µs</th>
+            <th>d50_µs</th>
+            <th>d90_µs</th>
+            <th>SNR dB</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td><code>1778764551.v6</code></td>
+            <td class="num"><strong>-5.43</strong></td><td class="num">—</td>
+            <td class="num">5688</td><td class="num">11646</td><td class="num">20062</td>
+            <td class="num">16.9</td></tr>
+        <tr><td><code>1778766433</code></td>
+            <td class="num">-2.01</td><td class="num">—</td>
+            <td class="num">5188</td><td class="num">11604</td><td class="num">24833</td>
+            <td class="num">18.3</td></tr>
+        <tr><td><code>1778771002</code></td>
+            <td class="num"><strong>-5.48</strong></td><td class="num">—</td>
+            <td class="num">5292</td><td class="num">11562</td><td class="num">20312</td>
+            <td class="num">24.3</td></tr>
+        <tr><td><code>1778771574</code></td>
+            <td class="num"><strong>-5.17</strong></td><td class="num">—</td>
+            <td class="num">4958</td><td class="num">11562</td><td class="num">20020</td>
+            <td class="num">23.9</td></tr>
+        <tr><td><code>1778773781</code></td>
+            <td class="num"><strong>-5.03</strong></td><td class="num">—</td>
+            <td class="num">5146</td><td class="num">11625</td><td class="num">20104</td>
+            <td class="num">21.0</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Pattern reproductible d'une capture à l'autre : <strong>gd_peak ≈ 5 ms, d50 ≈ 11.6 ms, d90 ≈ 20 ms</strong>. Sur du multipath RF réel, ces valeurs varieraient selon position d'antenne / orientation / heure du jour. Leur stabilité indique une <strong>signature instrumentale</strong> et non un canal radio.
+</p>
+
+<div class="callout danger">
+    <strong>50 % de l'énergie de la réponse impulsionnelle arrive après 11.6 ms.</strong> Sur un canal radio propre, ce serait &lt; 1 ms. La chaîne FM démod + LPF 2 kHz + de-emphasis 75 µs + AGC du transceiver étale le main lobe BPSK sur 20+ ms.
+</div>
+
+<!-- ============================================================== -->
+<h2 id="ir-shape">4. Structure de la réponse impulsionnelle OTA</h2>
+
+<p>
+    Dump des 40 premiers samples de l'IR de <code>capture-1778773781</code> sonde 9 (idx=54, amp=0.49) qui rapporte <code>strongest_echo_dbc = -5.03</code> @ 13354 µs :
+</p>
+
+<pre><code>i   µs    |h|       |h|_dB
+ 0    0   1.54e-03    0.0   ← MAINLOBE
+ 1   21   1.49e-03   -0.3
+ 2   42   1.38e-03   -1.0
+ 3   63   1.20e-03   -2.2
+ 4   83   9.7e-04    -4.0
+ 5  104   7.1e-04    -6.8
+ 6  125   4.2e-04   -11.4
+ 7  146   1.2e-04   -22.2   ← passage zéro #1 (sinc null à 1·spc/2 sample)
+ 8  167   1.7e-04   -19.3
+ 9  188   4.3e-04   -11.0
+10  208   6.6e-04    -7.3
+11  229   8.5e-04    -5.2
+12  250   9.9e-04    -3.8
+13  271   1.08e-03   -3.1
+14  292   1.12e-03   -2.8   ← REBOND #1  (-2.8 dBc à 292 µs !)
+15  312   1.12e-03   -2.8
+16  333   1.06e-03   -3.2
+17  354   9.7e-04    -4.0
+18  375   8.5e-04    -5.2
+19  396   7.0e-04    -6.8
+20  417   5.4e-04    -9.1
+21  437   3.6e-04   -12.5
+22  458   1.9e-04   -18.2
+23  479   2.6e-05   -35.7   ← passage zéro #2
+24  500   1.2e-04   -21.9
+25  521   2.5e-04   -15.8
+26  542   3.5e-04   -12.9
+27  562   4.2e-04   -11.4
+28  583   4.6e-04   -10.6   ← REBOND #2  (~ -10 dBc)
+29  604   4.7e-04   -10.4
+30  625   4.6e-04   -10.6
+31  646   4.2e-04   -11.2
+[... l'IR continue d'osciller entre -3 et -15 dBc pendant ~ 11 ms ...]
+[... le "echo" reporté est trouvé à sample 641 = 13.3 ms — la queue smearée ...]
+</code></pre>
+
+<p>
+    Analyse de cette structure :
+</p>
+
+<ol>
+    <li><strong>Mainlobe central</strong> (samples 0–7) : décroissance smooth typique de la cross-corrélation d'un chip BPSK rectangulaire.</li>
+    <li><strong>Passages par zéro à ~187 µs et ~479 µs</strong> : nulls du <em>sinc</em> de la xcorr non démodulée. Période ≈ 16 samples = <code>1 / 2·fc = 1 / 3000 Hz</code>. <strong>Diagnostic clé</strong> : confirme que la xcorr porte une composante à 2·fc, donc <strong>l'algo n'a pas démodulé</strong> avant corrélation.</li>
+    <li><strong>Rebonds à -2.8 dBc et -10.6 dBc</strong> à 292 et 583 µs : <strong>sidelobes du sinc</strong>, modulés par l'étalement temporel du LPF transceiver.</li>
+    <li><strong>Décroissance lente jusqu'à 20 ms</strong> : queue smearée du mainlobe + filtres audio. <code>d50 = 11.6 ms, d90 = 20 ms</code>.</li>
+    <li><strong>L'echo "trouvé"</strong> à 13.3 ms est un maximum local de cette queue smearée — pas un écho RF distinct.</li>
+</ol>
+
+<!-- ============================================================== -->
+<h2 id="mechanism">5. Mécanisme du faux écho</h2>
+
+<p>
+    L'algorithme <code>measure_golay</code> (<code>probe_analyze.rs:738-901</code>) suit ces étapes :
+</p>
+
+<ol>
+    <li>Cross-corrèle <strong>l'audio BPSK porté à 1500 Hz</strong> contre <strong>la référence BPSK portée à 1500 Hz</strong>, <strong>dans le domaine réel</strong>. Aucune démodulation préalable.</li>
+    <li>Somme <code>h_sum = (corr_A + corr_B) / 2N</code> — identité Golay.</li>
+    <li>Trouve le pic principal puis garde 4800 samples post-pic en magnitude.</li>
+    <li>Calcule un envelope smoothed (moyenne mobile sur <code>spc = 40</code> samples).</li>
+    <li>Cherche <code>end_of_main</code> = premier sample ≥ <code>min_guard = 120</code> où <code>smoothed &lt; peak / √10</code>.</li>
+    <li>L'echo = <code>max(|h|)</code> dans <code>[end_of_main, retain_end]</code>.</li>
+</ol>
+
+<p>
+    <strong>Deux problèmes combinés sur la chaîne OTA :</strong>
+</p>
+
+<div class="callout danger">
+    <strong>Problème A — battement 2·fc :</strong> sans démodulation, <code>h_sum</code> contient un terme à 2·fc = 3000 Hz. La fonction passe à zéro tous les 16 samples, et a des sidelobes à <strong>-2 à -6 dBc</strong> à 292, 333, 583 µs. Sur une chaîne propre, le <code>min_guard = 2.5 ms</code> masque ces sidelobes. Sur OTA avec smearing, l'envelope smoothed reste au-dessus du seuil pendant tout le <code>min_guard</code>, et l'algo retient l'<em>initialisation</em> <code>end_of_main = 120</code> sans jamais sortir de la queue mainlobe.
+</div>
+
+<div class="callout danger">
+    <strong>Problème B — smearing LPF du transceiver :</strong> la chaîne FM démod + LPF 2 kHz + de-emphasis 75 µs étale la réponse impulsionnelle sur 20+ ms (<code>d90 = 20 ms</code> observé). L'echo search dans <code>[2.5 ms, 100 ms]</code> tombe inévitablement sur la queue smearée, qui plafonne autour de -3 à -10 dBc.
+</div>
+
+<!-- ============================================================== -->
+<h2 id="comparison">6. Comparaison loopback synthétique vs OTA</h2>
+
+<p>
+    Le test <code>measure_golay_clean_channel_peaks_at_zero_delay</code> (<code>probe_analyze.rs:1136-1174</code>) <strong>passe</strong> sur un loopback synthétique pur (channel = identité) avec <code>echo &lt; -15 dBc</code>. Le port Python bit-for-bit donne <strong>-229 dBc</strong> sur le <code>probe.wav</code> TX-side de référence (pas de canal). Le bug n'apparaît que sur la chaîne OTA réelle.
+</p>
+
+<table>
+    <thead>
+        <tr><th>Source</th><th>echo_dbc</th><th>d50_µs</th><th>d90_µs</th><th>Verdict</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Test unit synthétique</td>
+            <td class="num">&lt; -15 (assertion)</td>
+            <td class="num">~ 0</td><td class="num">~ 0</td>
+            <td>OK</td>
+        </tr>
+        <tr>
+            <td>TX-side <code>probe.wav</code> (loopback parfait)</td>
+            <td class="num">-229</td>
+            <td class="num">62</td><td class="num">354</td>
+            <td>OK</td>
+        </tr>
+        <tr>
+            <td>OTA FT-991A → SDRplay</td>
+            <td class="num">-2 à -5.5</td>
+            <td class="num">11 600</td><td class="num">20 000–25 000</td>
+            <td><strong>Faux écho</strong></td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ============================================================== -->
+<h2 id="verdict">7. Verdict</h2>
+
+<div class="callout danger">
+    Le <code>strongest_echo_dbc ≈ -5 dBc</code> rapporté par le sondeur sur chaîne bench FT-991A → SDRplay <strong>n'est pas un écho RF</strong>. C'est la queue smearée de la réponse impulsionnelle de la chaîne audio du transceiver, mis-classée par l'heuristique <code>end_of_main</code> de l'algorithme. Le sondeur mesure correctement la chaîne (d50, d90, gd_peak), mais une partie de cette mesure ressort au mauvais endroit (champ "echo" plutôt que "channel smear").
+</div>
+
+<p>
+    En particulier, les chiffres <strong>d50 ≈ 11 ms et d90 ≈ 20 ms</strong> sont stables d'une capture à l'autre, ce qui est la signature d'une chaîne instrumentale fixe — pas d'un canal radio. Un vrai canal multipath produirait des delays beaucoup plus courts (&lt; 1 ms pour VHF amateur typique) et plus variables.
+</p>
+
+<!-- ============================================================== -->
+<h2 id="fix">8. Fix prévu — démodulation complexe avant xcorr</h2>
+
+<p>
+    Option choisie par l'opérateur (2026-05-15). Trois changements à apporter à <code>measure_golay</code> :
+</p>
+
+<ol>
+    <li><strong>Démodulation complexe</strong> : multiplier l'audio reçu et la référence par <code>exp(-j·2π·fc·t)</code>, low-pass filtrer pour rejeter la composante à 2·fc, puis cross-corréler dans le domaine complexe. La magnitude <code>|h_complex|</code> donne directement l'amplitude de la réponse channel sans le ripple sinc.</li>
+    <li><strong>Re-définir delay_spread_50/90 sur l'IR propre</strong> — sans le ripple à 2·fc, la décomposition cumulative-power donne la vraie largeur du smearing.</li>
+    <li><strong>Critère d'écho durci</strong> : l'echo ne doit être reporté que comme <strong>maximum local séparé du mainlobe par une vallée d'au moins 5 dB</strong>. La queue smearée monotone décroissante ne satisfait pas ce critère.</li>
+</ol>
+
+<p>
+    Test régression à ajouter :
+</p>
+
+<pre><code>fn measure_golay_fm_smeared_channel_rejects_smear_as_echo() {
+    // Build the Golay BPSK probe, pass it through a synthetic FM-channel
+    // simulator (LPF 2 kHz + de-emphasis 75 µs + small AGC ripple) that
+    // matches the FT-991A signature: d50 ≈ 11 ms, d90 ≈ 20 ms.
+    // Run measure_golay → strongest_echo_dbc must be < -15 dBc despite
+    // the smearing (which should be captured in delay_spread_50_us
+    // instead).
+}
+</code></pre>
+
+<!-- ============================================================== -->
+<h2 id="repro">9. Outils de reproduction</h2>
+
+<p>
+    Scripts utilisés pour cet audit, à conserver pour A/B après fix :
+</p>
+
+<ul>
+    <li><code>/tmp/audit_golay_echo.py</code> — port Python bit-for-bit de <code>measure_golay</code>. Charge un <code>capture_dir</code> (probe.wav + schedule.json) et un index de probe, affiche l'IR à chaque chip.</li>
+    <li><code>/tmp/audit_golay_dense.py</code> — sweep sur tous les Golay probes d'une capture + dump dense de l'IR au sample.</li>
+    <li>Lecture directe des <code>signature.json</code> via Python pour extraire <code>strongest_echo_dbc</code>, <code>impulse_response</code>, <code>delay_spread_*</code> et corréler entre captures.</li>
+</ul>
+
+<p>
+    Les <code>signature.json</code> embarquent l'<code>impulse_response</code> complète, donc <strong>pas besoin du WAV brut</strong> pour A/B comparer l'IR avant/après fix.
+</p>
+
+</div>
+</body>
+</html>

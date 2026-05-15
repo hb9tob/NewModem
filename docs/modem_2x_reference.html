@@ -1,0 +1,1651 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Modem NBFM — Référence Modem 2x (slice 2x19)</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --warn-soft: #fff4eb;
+        --good: #2b9f5f;
+        --good-soft: #eafbf2;
+        --danger: #c0392b;
+        --danger-soft: #fdecea;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem 6rem;
+    }
+    h1 {
+        font-size: 2rem;
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.2rem;
+    }
+    h1 .sub {
+        display: block;
+        font-size: 1rem;
+        font-weight: 400;
+        color: #666;
+        margin-top: 0.4rem;
+    }
+    h2 {
+        color: var(--accent);
+        margin-top: 2.5rem;
+        border-left: 4px solid var(--accent);
+        padding-left: 0.6rem;
+    }
+    h3 { margin-top: 1.8rem; color: #444; }
+    h4 { margin-top: 1.2rem; color: #555; font-size: 1.02rem; }
+    figure {
+        margin: 1.5rem 0;
+        padding: 0.8rem;
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    figcaption {
+        font-size: 0.9rem;
+        color: #555;
+        margin-top: 0.6rem;
+        font-style: italic;
+    }
+    code {
+        background: var(--code-bg);
+        padding: 0.15em 0.35em;
+        border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e;
+        color: #dcdcaa;
+        padding: 1rem;
+        border-radius: 5px;
+        overflow-x: auto;
+        font-size: 0.85rem;
+        line-height: 1.35;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+        font-size: 0.92rem;
+    }
+    th, td {
+        border: 1px solid var(--border);
+        padding: 0.45rem 0.6rem;
+        text-align: left;
+        vertical-align: top;
+    }
+    th { background: var(--accent-soft); color: var(--accent); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.center { text-align: center; }
+    .callout {
+        padding: 0.8rem 1rem;
+        border-left: 4px solid var(--warn);
+        background: var(--warn-soft);
+        margin: 1rem 0;
+        border-radius: 0 4px 4px 0;
+    }
+    .callout.info { border-left-color: var(--accent); background: var(--accent-soft); }
+    .callout.ok { border-left-color: var(--good); background: var(--good-soft); }
+    .callout.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+    nav.toc {
+        background: white;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 1rem 1.5rem;
+        margin: 1.5rem 0;
+        font-size: 0.95rem;
+    }
+    nav.toc ol { margin: 0.4rem 0 0 1rem; padding: 0; }
+    nav.toc a { color: var(--accent); text-decoration: none; }
+    nav.toc a:hover { text-decoration: underline; }
+    .meta { color: #888; font-size: 0.88rem; margin-top: -0.3rem; }
+    .tag {
+        display: inline-block;
+        padding: 0.1em 0.5em;
+        background: var(--accent);
+        color: white;
+        border-radius: 3px;
+        font-size: 0.75rem;
+        margin-right: 0.3rem;
+        letter-spacing: 0.5px;
+    }
+    .tag.ok    { background: var(--good); }
+    .tag.warn  { background: var(--warn); }
+    .tag.stub  { background: #888; }
+    .tag.danger{ background: var(--danger); }
+    .src {
+        font-size: 0.82rem;
+        color: #888;
+        font-family: "Consolas", "Monaco", monospace;
+    }
+    .axis-grid {
+        display: grid;
+        grid-template-columns: 12rem 1fr;
+        gap: 0.3rem 1rem;
+        margin: 0.6rem 0 1.2rem;
+        font-size: 0.93rem;
+    }
+    .axis-grid dt {
+        font-weight: 600;
+        color: var(--accent);
+    }
+    .axis-grid dd { margin: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Modem NBFM — Référence Modem 2x
+    <span class="sub">Document technique consolidé — 2026-05-15 — branche <code>feat/modem-2x</code>, HEAD <code>0ac497a</code> (slice 2x19, .deb 0.11.0-2x19).</span>
+</h1>
+
+<p class="meta">
+    <span class="tag">V4 wire</span>
+    <span class="tag">TDM pilots</span>
+    <span class="tag">streaming RX</span>
+    Référence architecturale consolidée du modem 2x à la slice 2x19. Complète et remplace en pratique <a href="v4_architecture.html"><code>v4_architecture.html</code></a> (pré-TDM) et <a href="v4_tdm_architecture.html"><code>v4_tdm_architecture.html</code></a> (post-44271bf, pré-streaming). Le présent document décrit la version courante : Farrow + Gardner closed-loop + <code>Rx2xSession</code> FSM streaming + pilotes TDM V3-style + turbo Pass 1/Pass 2 EM.
+</p>
+
+<nav class="toc">
+    <strong>Table des matières</strong>
+    <ol>
+        <li><a href="#vue-d-ensemble">Vue d'ensemble — objectifs et choix architecturaux</a></li>
+        <li><a href="#crates">Découpage en crates</a></li>
+        <li><a href="#pipeline-rx">Pipeline RX complet — du sample à la payload</a></li>
+        <li><a href="#trame-v4">Trame V4 — spécification wire</a>
+            <ol>
+                <li><a href="#plheader">PLHEADER (SOF + PLS)</a></li>
+                <li><a href="#cycle">Cycle PLHEADER (4 s nominal)</a></li>
+                <li><a href="#pilotes-tdm">Pilotes TDM — pattern et rotation</a></li>
+            </ol>
+        </li>
+        <li><a href="#profils">Catalogue des 8 profils 2x</a></li>
+        <li><a href="#algo-frontend">Algorithmes — front-end audio→symboles</a>
+            <ol>
+                <li><a href="#nco">NCO downmix continu</a></li>
+                <li><a href="#farrow">Interpolation Farrow cubique</a></li>
+                <li><a href="#gardner">TED Gardner / AbsGardner + boucle PI</a></li>
+                <li><a href="#fft-gate">Sonde FFT préambule</a></li>
+            </ol>
+        </li>
+        <li><a href="#algo-symbol">Algorithmes — domaine symbole</a>
+            <ol>
+                <li><a href="#sof-search">Recherche SOF + décode PLHEADER</a></li>
+                <li><a href="#ffe">FFE LS forward (Pass 1)</a></li>
+                <li><a href="#gain">Estimation gain pilote-LS + per-ring DD</a></li>
+                <li><a href="#sigma2">Estimation σ² split radial/tangentiel</a></li>
+                <li><a href="#llr">LLR max-log per-ring (Bayésien APSK)</a></li>
+                <li><a href="#turbo">Turbo Pass 2 EM — RTS phase + gain + log-σ²</a></li>
+                <li><a href="#ldpc-raptorq">LDPC + RaptorQ</a></li>
+            </ol>
+        </li>
+        <li><a href="#session">Session streaming — <code>Rx2xSession</code> FSM</a></li>
+        <li><a href="#constantes">Tableau exhaustif des constantes</a></li>
+        <li><a href="#derive">Analyse des points de dérive</a>
+            <ol>
+                <li><a href="#derive-sps">Horloge symbole (ppm sample clock)</a></li>
+                <li><a href="#derive-phase">Phase porteuse + fréquence résiduelle</a></li>
+                <li><a href="#derive-sigma2">Estimation σ²</a></li>
+                <li><a href="#derive-gain">Gain per-ring</a></li>
+                <li><a href="#derive-ffe">FFE — équalisation canal</a></li>
+                <li><a href="#derive-sof">Détection SOF</a></li>
+                <li><a href="#derive-burst">Continuité multi-burst</a></li>
+            </ol>
+        </li>
+        <li><a href="#stubs">Boucles turbo non câblées (T2/T3/T6/T7)</a></li>
+        <li><a href="#tests-known">Tests connus en échec — HEAD slice 2x19</a></li>
+    </ol>
+</nav>
+
+<!-- ============================================================================ -->
+<h2 id="vue-d-ensemble">1. Vue d'ensemble — objectifs et choix architecturaux</h2>
+
+<p>
+    Le modem 2x est une refonte du modem audio NBFM avec quatre objectifs explicites,
+    chacun assorti d'une décision architecturale :
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Objectif</th>
+            <th>Décision</th>
+            <th>Justification</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Tracking drift horloge robuste (sound-card &gt;50 ppm)</td>
+            <td>Boucle fermée Farrow + Gardner remplace le resampling open-loop V3</td>
+            <td>Le V3 Phase 1d estime un drift global puis resample en bulk ; au-delà
+                de 50 ppm l'erreur résiduelle accumule sur un cycle PLHEADER et fait
+                perdre un CW sur quatre. Closed-loop suit en continu.</td>
+        </tr>
+        <tr>
+            <td>Late-entry rapide (joindre un burst en cours)</td>
+            <td>PLHEADER 192 sym (SOF Chu + PLS Golay) toutes les ~4 s</td>
+            <td>Chaque PLHEADER porte <code>profile_index, base_esi, flags, frame_counter</code> ;
+                aucun état préalable nécessaire côté RX, le décodeur ressort prêt à
+                consommer le cycle suivant.</td>
+        </tr>
+        <tr>
+            <td>Tracking bruit de phase soundcard (0.1–50 Hz)</td>
+            <td>Pilotes TDM V3-style — 32 data + 2 pilotes / groupe (16+2 sur 64-APSK)</td>
+            <td>Ancrage tous les 22 ms à 1500 Bd → BW d'update ~22 Hz, capable de suivre
+                le bruit de phase FTX-1 + ADC. La variante DVB-S2X sparse blocks
+                (36 sym tous les ~180 ms, BW ~3 Hz) avait échoué OTA — voir
+                <a href="v4_tdm_architecture.html"><code>v4_tdm_architecture.html</code></a>.</td>
+        </tr>
+        <tr>
+            <td>Décodage soft optimal sur APSK anisotrope</td>
+            <td>LLR max-log <em>per-ring Bayésien</em> + turbo Pass 2 EM avec RTS smoother</td>
+            <td>σ²(s) varie d'un facteur 17× entre anneau intérieur et extérieur sur
+                HighPlus2x ; un LLR scalaire surestime la confiance des points proches
+                de l'anneau extérieur. Le terme <code>+ log σ²(s)</code> par candidat
+                rétablit la marginale postérieure correcte.</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="callout info">
+    <strong>Quoi reste de V3 ?</strong>
+    LDPC WiMAX 802.16e N=2304 (rates 1/2, 3/4, 5/6) — inchangé.
+    Constellations DVB-S2/S2X (QPSK, 8PSK, 16-APSK, 32-APSK, 64-APSK) — inchangé.
+    RaptorQ fountain code (<code>modem_framing::raptorq_codec</code>) — inchangé.
+    <code>AppHeader</code> meta CW (session_id, file_size, K, T, mime, hash) — inchangé,
+    déplacé du marker control payload V3 au META-CW V4.
+</div>
+
+<!-- ============================================================================ -->
+<h2 id="crates">2. Découpage en crates</h2>
+
+<pre><code>modem-framing/        # Transport-agnostique. PayloadEnvelope, AppHeader,
+                      # RaptorQ codec, CRC. Pas de DSP, pas d'IO.
+        │
+        ▼
+modem-core-base/      # Primitives DSP partagées V3 ↔ 2x.
+                      # Constellations, RRC, LDPC, FFE, soft demod,
+                      # Farrow, TimingLoop, RTS smoother, Golay, types.
+        │
+        ├──────────┬──────────────┐
+        ▼          ▼              ▼
+modem-core/    modem-core2x/   (autres consommateurs)
+   (V3)           (2x = V4)
+                      │
+                      ▼
+                  modem-worker2x/   # Orchestration TX/RX, sessions, PTT.
+                      │
+                      ▼
+                  modem-cli/, modem-gui/
+</code></pre>
+
+<p>
+    Aucun cycle. <code>modem-core2x</code> dépend de <code>modem-core-base</code> et
+    de <code>modem-framing</code> ; il n'a aucune dépendance sur <code>modem-core</code> (V3).
+    Les deux pipelines (V3 / 2x) coexistent côte à côte et sont
+    <strong>mutuellement exclusifs à l'exécution</strong> — le worker choisit l'un ou
+    l'autre via un flag GUI / CLI au démarrage de la session.
+</p>
+
+<h3>Modules de <code>modem-core2x</code></h3>
+
+<table>
+    <thead>
+        <tr><th>Module</th><th>Rôle</th><th>Lignes</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>plheader</code></td><td>SOF Chu + PLS Golay-encodé, encode/decode, redondance profil</td><td class="num">606</td></tr>
+        <tr><td><code>pilot2x_tdm</code></td><td>Pattern TDM, valeur pilote rotative, interleave/deinterleave</td><td class="num">329</td></tr>
+        <tr><td><code>profile2x</code></td><td>Enum 8 profils, <code>ModemConfig2x</code>, training_amplitude</td><td class="num">655</td></tr>
+        <tr><td><code>frame2x</code></td><td>Builder superframe V4, helpers géométrie cycle, flags</td><td class="num">848</td></tr>
+        <tr><td><code>rx_v4</code></td><td>Pipeline RX symbol-domaine : SOF search, FFE, σ², turbo, LDPC, RaptorQ</td><td class="num">2619</td></tr>
+        <tr><td><code>gate2x</code></td><td>Sonde FFT pré-décode (3 templates par <code>(sps, β)</code>)</td><td class="num">535</td></tr>
+        <tr><td><code>modem2x</code></td><td><code>V4Modem</code> impl du trait <code>Modem</code></td><td class="num">309</td></tr>
+        <tr><td><code>streaming_frontend</code></td><td>Audio chunks → symboles ; NCO + RRC + Farrow + Gardner</td><td class="num">807</td></tr>
+        <tr><td><code>rx2x_session</code></td><td>FSM session live, owns turbo loops et buffers</td><td class="num">1352</td></tr>
+    </tbody>
+</table>
+
+<!-- ============================================================================ -->
+<h2 id="pipeline-rx">3. Pipeline RX complet — du sample à la payload</h2>
+
+<pre><code>┌──────────────────────────────────────────────────────────────────────────┐
+│  cpal / ALSA capture (mono f32 @ 48 kHz)                                 │
+│       │  Vec&lt;f32&gt; chunks via mpsc::Receiver                              │
+│       ▼                                                                  │
+│  rx_worker2x::spawn — shim                                               │
+│       │  audio_level RMS/peak/crest                                      │
+│       │  WAV tee (recording sink)                                        │
+│       ▼                                                                  │
+│  Rx2xSession::process_audio_chunk                                        │
+│       │                                                                  │
+│       ├─► audio_buffer.extend  (rolling, trimmed après chaque cycle)     │
+│       │                                                                  │
+│       ├─► estimate_drift_from_raw  (LS fit sur SOFs CRC-validés)         │
+│       │   └─► cached_drift_ppm (forward Kalman, R=1 Q=0.5 ppm/cycle)     │
+│       │                                                                  │
+│       ├─► refresh_symbols                                                │
+│       │   ├─ cubic resample audio si |drift| ≥ 0.5 ppm                   │
+│       │   ├─ NCO downmix (phase continue par compteur absolu)            │
+│       │   ├─ RRC matched filter (mode='same', overlap-save)              │
+│       │   ├─ Farrow cubique + Gardner closed-loop → sym_buffer           │
+│       │   │   (pre-SOF : Gardner classique ; post-SOF : AbsGardner       │
+│       │   │    sur l'intérieur strict des blocs pilotes)                 │
+│       │   └─ sym_buffer ← Vec&lt;Complex64&gt; rebati à chaque chunk           │
+│       │                                                                  │
+│       ├─► equalize_symbols_per_cycle  (FFE LS, optionnel)                │
+│       │   └─ taps trainés sur PLHEADER + LMS warmup ; pilotes TDM        │
+│       │      exclus (positions dispersées → LS mal conditionnée)         │
+│       │                                                                  │
+│       └─► run_state_machine (FSM)                                        │
+│            │                                                             │
+│            Idle ─ find_next_sof ───► Acquiring                           │
+│              │                          │                                │
+│              │                          ├─ decode_plheader_at            │
+│              │                          │   ├─ LS-gain sur SOF Chu       │
+│              │                          │   ├─ démap 128 PLS sym         │
+│              │                          │   ├─ 9 × Golay(24,12)          │
+│              │                          │   └─ CRC16 → PlsPayload OK ?   │
+│              │                          ▼                                │
+│              │                       Locked { cycle_idx, anchor }        │
+│              │                          │                                │
+│              │     ┌────────────────────┘                                │
+│              │     │                                                     │
+│              │     ▼  (pour META-CW puis cw_per_cycle DATA-CWs)          │
+│              │  decode_one_cw                                            │
+│              │     ├─ estimate_cw_gain  (pilotes TDM + cycle refs)       │
+│              │     ├─ estimate_cw_sigma2_split (MAD radial/tangentiel)   │
+│              │     ├─ estimate_per_ring_gain (DD-LS si APSK)             │
+│              │     ├─ Pass 1 :                                           │
+│              │     │     llr_maxlog_per_ring (Bayésien)                  │
+│              │     │     LdpcDecoder.decode_to_bytes_with_posterior      │
+│              │     ├─ Pass 2 EM (toujours, même si Pass 1 OK) :          │
+│              │     │     soft_symbols_from_posterior_llr                 │
+│              │     │     rts_phase_smooth (2-state {φ, ω} Kalman+RTS)    │
+│              │     │     pass2_em_gain_smoother (1-state per-ring)       │
+│              │     │     pass2_em_sigma2_smoother (1-state log-scale)    │
+│              │     │     llr_maxlog_per_sym_per_ring                     │
+│              │     │     LdpcDecoder.decode_to_bytes                     │
+│              │     └─ bytes ← syndrome 0 ? Pass2 : Pass1                 │
+│              │                                                           │
+│              ▼ FLAG2X_LAST seen OU finalize()                            │
+│           Retrying { remaining=2 }  (stubs T1/T2/T3/T6/T7)               │
+│              │                                                           │
+│              ▼                                                           │
+│           Finalising                                                     │
+│              │  RaptorQ.try_decode(k_source, packets...)                 │
+│              │  PayloadEnvelope.decode → filename + bytes                │
+│              ▼                                                           │
+│           Idle (multi-burst rearm)                                       │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<!-- ============================================================================ -->
+<h2 id="trame-v4">4. Trame V4 — spécification wire</h2>
+
+<h3 id="plheader">4.1 PLHEADER (SOF + PLS)</h3>
+
+<p>
+    192 symboles, émis au début de chaque cycle (~4 s nominal). Constants
+    dans <code>modem-core2x/src/plheader.rs:54-63</code>.
+</p>
+
+<pre><code>PLHEADER (192 sym total)
+├─ SOF  (64 sym)   :  Frank-Zadoff-Chu unit-magnitude, racine selon famille
+│                     {A=1, B=3, C=5}, choix selon sps = 48_000 / Rs :
+│                       sps ≥ 1200  → A   (Rs ≤ 40 Bd, jamais atteint en 2x)
+│                       750 ≤ sps &lt; 1200 → B  (jamais atteint en 2x)
+│                       sps &lt; 750   → C  (toutes les configs 2x actuelles)
+│
+│                     Formule :  s[n] = exp(j · π · r · n² / 64),  n ∈ [0,63]
+│                     Autocorrélation parfaite (peak 64), inter-corrélations
+│                     entre racines ≤ √64 ≈ 8 (~18 dB margin).
+│
+└─ PLS  (128 sym)  :  payload 13 octets (11 info + 2 CRC16) → 88+16 = 104 bits
+                      → padding à 108 bits → 9 blocs de 12 bits
+                      → Golay(24,12) → 9 × 24 = 216 bits codés
+                      → 108 symboles QPSK
+                      + redondance 12 sym (re-encode bloc 0 contenant profile_index)
+                      + zero-pad 8 sym
+                      = 128 sym total
+</code></pre>
+
+<p>
+    <strong>Payload PLS (13 octets)</strong> — <span class="src">plheader.rs:101-124</span></p>
+
+<table>
+    <thead>
+        <tr><th>Offset</th><th>Champ</th><th>Taille</th><th>Sémantique</th></tr>
+    </thead>
+    <tbody>
+        <tr><td>0</td><td><code>profile_index</code></td><td>u8</td><td>Octet wire <code>ProfileIndex2x::as_u8()</code>, 0..7 ou 0xFF réservé</td></tr>
+        <tr><td>1–2</td><td><code>seg_id</code></td><td>u16 BE</td><td>Compteur de segment (wrap 65 536)</td></tr>
+        <tr><td>3</td><td><code>session_id_low</code></td><td>u8</td><td>8 bits faibles du session_id (rejet rapide cross-session)</td></tr>
+        <tr><td>4–6</td><td><code>base_esi</code></td><td>u24 BE</td><td>ESI RaptorQ du premier DATA-CW post-META de ce cycle</td></tr>
+        <tr><td>7</td><td><code>flags</code></td><td>u8</td><td>bit 0 = META présent (toujours 1) ; bit 1 = EOT ; bit 2 = LAST ; 3-7 réservés</td></tr>
+        <tr><td>8–9</td><td><code>frame_counter</code></td><td>u16 BE</td><td>Compteur de cycle</td></tr>
+        <tr><td>10</td><td><code>freq_offset</code></td><td>s8</td><td>Offset audio grossier (pas de 50 Hz)</td></tr>
+        <tr><td>11–12</td><td><code>crc16</code></td><td>u16 BE</td><td>CRC16 sur octets 0..10</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Tolérance : Golay(24,12) corrige jusqu'à 3 bits par bloc ; ≤ 27 flips au
+    total tout en gardant CRC valide ≈ 12.5 % BER brut sur 216 bits codés.
+</p>
+
+<h3 id="cycle">4.2 Cycle PLHEADER (4 s nominal)</h3>
+
+<p>
+    Constante <code>V4_PREAMBLE_PERIOD_S = 4.0</code> <span class="src">frame2x.rs:47</span>.
+    Le nombre de DATA-CWs par cycle est calculé pour rester sous 4 s ; minimum 1
+    (un late-entry doit toujours avoir un CW à ancrer).
+</p>
+
+<pre><code>cycle (≈ 4 s) =
+    PLHEADER         (192 sym)                       // SOF Chu + PLS Golay
+    LMS warmup       (0, 32 ou 64 sym selon constel) // APSK32 : 32, APSK64 : 64
+    META-CW          (cw_with_pilots_len sym)        // 1 LDPC CW + pilotes TDM
+    DATA-CW[0]       (cw_with_pilots_len sym)
+    DATA-CW[1]
+    ...
+    DATA-CW[k-1]
+    // k = data_cw_per_cycle, profil-dépendant.
+
+Le dernier cycle d'un burst porte FLAG2X_LAST=1 dans PLS.flags.
+EOT optionnel via FLAG2X_EOT=1.
+</code></pre>
+
+<p>
+    <strong>LMS warmup</strong> — séquence connue de symboles uniques de la
+    constellation, insérée juste après la PLHEADER pour initialiser un éventuel
+    égaliseur LMS sur les anneaux que le SOF QPSK ne touche pas
+    <span class="src">frame2x.rs:78-97</span> :
+</p>
+
+<ul>
+    <li>QPSK / 8PSK / 16-APSK : <strong>0 sym</strong> (le SOF couvre l'enveloppe)</li>
+    <li>32-APSK : <strong>32 sym</strong> (chaque point une fois, ordre canonique Figure 12 DVB-S2X)</li>
+    <li>64-APSK : <strong>64 sym</strong> (chaque point une fois, ordre Table 13e)</li>
+</ul>
+
+<h3 id="pilotes-tdm">4.3 Pilotes TDM — pattern et rotation</h3>
+
+<pre><code>// pilot2x_tdm.rs
+PilotPattern2x { d_syms: 32, p_syms: 2 }    // default — 7 profils sur 8
+PilotPattern2x { d_syms: 16, p_syms: 2 }    // dense  — HighPlusPlus2x (64-APSK)
+
+// Layout par LDPC CW (post-interleaver bits→sym) :
+[d_syms data] [p_syms pilotes] [d_syms data] [p_syms pilotes] ...
+
+// Valeur pilote rotative (cercle unité) :
+pilot_symbol_2x(n) = exp(j · π/2 · (n mod 4))
+                   ∈ { (1, 0), (0, 1), (-1, 0), (0, -1) }
+</code></pre>
+
+<p>
+    Trois propriétés importantes :
+</p>
+
+<ul>
+    <li><strong>Index pilote absolu</strong>. La rotation est continue à travers les
+        groupes <em>et</em> les codewords d'un même cycle. L'encodeur démarre la META-CW
+        avec <code>group_idx_offset = 0</code>, puis la <em>k</em>-ième DATA-CW avec
+        <code>groups_per_cw · (1 + k)</code> <span class="src">frame2x.rs:374</span>.
+        Le RX reconstruit la séquence depuis un seul compteur ancré sur la PLHEADER.</li>
+    <li><strong>Toujours unit-magnitude</strong>. Donc la projection radiale /
+        tangentielle se calcule sans facteur de gain à compenser ; AbsGardner
+        fonctionne directement (TED unbiased sur signal d'amplitude constante).</li>
+    <li><strong>Période d'ancrage = (d+p)/Rs</strong>. À 1500 Bd avec 32/2 :
+        34/1500 ≈ 22.67 ms ⇒ BW d'update phase ≈ 22 Hz, suffisant pour suivre
+        le bruit de phase basse-fréquence FTX-1 + ADC.</li>
+</ul>
+
+<!-- ============================================================================ -->
+<h2 id="profils">5. Catalogue des 8 profils 2x</h2>
+
+<p>
+    <span class="src">profile2x.rs:306-417</span>. Tous à <code>β = 0.20</code> sauf
+    QPSK (0.25) ; <code>τ = 1.0</code> partout ; <code>center_freq_hz = DATA_CENTER_HZ
+    = 1100 Hz</code> ; <code>Fs_audio = 48 kHz</code> ; LDPC N = 2304 bits ; RRC span = 12 sym.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Idx</th><th>Nom wire</th><th>Constellation</th><th>Rs (Bd)</th>
+            <th>sps</th><th>LDPC</th><th>γ₁ / γ₂ / γ₃</th><th>Pattern</th>
+            <th>cw_data</th><th>wire/CW</th><th>net bps*</th><th>warmup</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td class="num">0</td><td><code>ULTRA2X</code></td><td>QPSK</td>
+            <td class="num">500</td><td class="num">96</td><td>1/2</td>
+            <td>—</td><td>32/2</td>
+            <td class="num">1152</td><td class="num">1224</td>
+            <td class="num">≈ 470</td><td class="num">0</td></tr>
+        <tr><td class="num">1</td><td><code>ROBUST2X</code></td><td>QPSK</td>
+            <td class="num">1000</td><td class="num">48</td><td>1/2</td>
+            <td>—</td><td>32/2</td>
+            <td class="num">1152</td><td class="num">1224</td>
+            <td class="num">≈ 941</td><td class="num">0</td></tr>
+        <tr><td class="num">2</td><td><code>NORMAL2X</code></td><td>8PSK</td>
+            <td class="num">1500</td><td class="num">32</td><td>1/2</td>
+            <td>—</td><td>32/2</td>
+            <td class="num">768</td><td class="num">816</td>
+            <td class="num">≈ 2118</td><td class="num">0</td></tr>
+        <tr><td class="num">3</td><td><code>HIGH2X</code></td><td>16-APSK</td>
+            <td class="num">1500</td><td class="num">32</td><td>3/4</td>
+            <td>2.85 / — / —</td><td>32/2</td>
+            <td class="num">576</td><td class="num">612</td>
+            <td class="num">≈ 4235</td><td class="num">0</td></tr>
+        <tr><td class="num">4</td><td><code>HIGH+2X</code></td><td>32-APSK</td>
+            <td class="num">1500</td><td class="num">32</td><td>3/4</td>
+            <td>2.84 / 5.27 / —</td><td>32/2</td>
+            <td class="num">461</td><td class="num">491</td>
+            <td class="num">≈ 5290</td><td class="num">32</td></tr>
+        <tr><td class="num">5</td><td><code>HIGH++2X</code></td><td>64-APSK</td>
+            <td class="num">1500</td><td class="num">32</td><td>3/4</td>
+            <td>2.4 / 4.3 / 7.0</td><td><strong>16/2</strong></td>
+            <td class="num">384</td><td class="num">432</td>
+            <td class="num">≈ 5400</td><td class="num">64</td></tr>
+        <tr><td class="num">6</td><td><code>HIGH56_2X</code></td><td>16-APSK</td>
+            <td class="num">1500</td><td class="num">32</td><td>5/6</td>
+            <td>2.85 / — / —</td><td>32/2</td>
+            <td class="num">576</td><td class="num">612</td>
+            <td class="num">≈ 4779</td><td class="num">0</td></tr>
+        <tr><td class="num">7</td><td><code>HIGH+56_2X</code></td><td>32-APSK</td>
+            <td class="num">1500</td><td class="num">32</td><td>5/6</td>
+            <td>2.84 / 5.27 / —</td><td>32/2</td>
+            <td class="num">461</td><td class="num">491</td>
+            <td class="num">≈ 5987</td><td class="num">32</td></tr>
+    </tbody>
+</table>
+
+<p class="meta">
+    * Débit net = Rs × bits/sym × LDPC_rate × cw_data / wire_per_cw.
+    Le PLHEADER s'amortit sur les ~k CWs d'un cycle 4 s ; le calcul exact
+    inclut l'overhead PLHEADER, voir <code>frame2x::superframe_total_symbols_v4</code>.
+</p>
+
+<p>
+    <strong>Calcul des rayons APSK</strong> <span class="src">profile2x.rs:234-256</span> :
+</p>
+
+<pre><code>// 32-APSK : 4 + 12 + 16 points (rings R₁ &lt; R₂ &lt; R₃)
+r₀² = 8 / (1 + 3·γ₁² + 4·γ₂²)
+R₁ = r₀,  R₂ = γ₁ · r₀,  R₃ = γ₂ · r₀
+training_amplitude = R₃   // SOF amené sur l'anneau extérieur
+
+// 64-APSK : 4 + 12 + 20 + 28 points (rings R₁ &lt; R₂ &lt; R₃ &lt; R₄)
+r₀² = 16 / (1 + 3·γ₁² + 5·γ₂² + 7·γ₃²)
+R₁ = r₀,  R₂ = γ₁ · r₀,  R₃ = γ₂ · r₀,  R₄ = γ₃ · r₀
+training_amplitude = R₄
+</code></pre>
+
+<!-- ============================================================================ -->
+<h2 id="algo-frontend">6. Algorithmes — front-end audio→symboles</h2>
+
+<h3 id="nco">6.1 NCO downmix continu</h3>
+
+<p>
+    Le buffer audio est entièrement downmixé à chaque chunk avec une phase NCO
+    ancrée sur un compteur absolu <code>nco_base_sample</code>
+    <span class="src">streaming_frontend.rs:67-70, 282-286</span>. Reset par chunk
+    interdit : un saut de phase proportionnel à <code>fc · trim_distance</code>
+    apparaîtrait à chaque trimming du buffer.
+</p>
+
+<p>
+    <code>fc = DATA_CENTER_HZ = 1100 Hz</code> ; phase incrémentée de
+    <code>2π · fc / 48 000</code> par sample.
+</p>
+
+<h3 id="farrow">6.2 Interpolation Farrow cubique-Lagrange</h3>
+
+<p>
+    Implémentation <code>modem-core-base/src/farrow.rs</code>. Polynôme de
+    Lagrange ordre 3 sur 4 échantillons consécutifs :
+</p>
+
+<pre><code>// Pour interpoler à position pos = floor(pos) + μ, μ ∈ [0, 1) :
+// x[-1] x[0] x[1] x[2] sont les 4 samples encadrants
+
+c₃ = (-x[-1] + 3·x[0] - 3·x[1] + x[2]) / 6
+c₂ = ( x[-1] - 2·x[0] +    x[1])       / 2
+c₁ = (-2·x[-1] - 3·x[0] + 6·x[1] - x[2]) / 6
+c₀ =   x[0]
+
+y(μ) = ((c₃·μ + c₂)·μ + c₁)·μ + c₀     // Horner
+</code></pre>
+
+<p>
+    Zone safe : <code>1 ≤ floor(pos) ≤ N − 3</code>. Hors zone (lead-in du buffer),
+    fallback sur sampling entier <code>mf[k·sps]</code> ; la boucle PI ne tourne
+    pas (integ reste à 0) le temps que la zone safe soit atteinte
+    <span class="src">streaming_frontend.rs:312-357</span>.
+</p>
+
+<h3 id="gardner">6.3 TED Gardner / AbsGardner + boucle PI</h3>
+
+<p>
+    Deux variantes de Timing-Error Detector, sélectionnées par strobe selon que
+    le symbole est dans l'intérieur d'un bloc pilote ou non
+    <span class="src">timing_loop.rs:40-56, streaming_frontend.rs:334-338</span> :
+</p>
+
+<dl class="axis-grid">
+    <dt>Gardner classique</dt>
+    <dd><code>e = Re((y_late − y_early) · conj(y_on))</code> — robuste sur
+        toutes constellations, biais data-dépendant léger sur APSK multi-ring.
+        Utilisé pré-SOF et sur tous les symboles data post-SOF.</dd>
+    <dt>AbsGardner</dt>
+    <dd><code>e = |y_late|² − |y_early|²</code> — sign-free, unbiased sur signal
+        amplitude-constante. Utilisé uniquement sur l'intérieur strict des blocs
+        pilotes (premier/dernier sym d'un bloc exclus car early/late étraddent
+        une transition data/pilote). Recipe DVB-S2X §9.3.2.</dd>
+</dl>
+
+<p>
+    <strong>Boucle PI</strong> — <span class="src">timing_loop.rs:33-36, 99-102</span> :
+</p>
+
+<pre><code>K_p = 0.05          // proportional gain
+K_i = 0.005         // integral gain
+B_L · T_sym ≈ 0.01  // bande de bruit normalisée (slow loop)
+ζ ≈ 1.0             // critiquement amortie
+
+// Update par strobe :
+integ ← integ + K_i · err
+correction = K_p · err + integ
+strobe_pos ← strobe_pos + sps + correction
+</code></pre>
+
+<p>
+    <strong>Plage de tracking théorique :</strong> ±50 ppm safe, jusqu'à ±100 ppm
+    sur 2x sans data-induced drift (tests <code>streaming_frontend::tests</code>).
+    L'integrateur converge vers le drift per-symbol à régime établi
+    <span class="src">streaming_frontend.rs:31-34</span>.
+</p>
+
+<h3 id="fft-gate">6.4 Sonde FFT préambule (<code>PreambleProbe2x</code>)</h3>
+
+<p>
+    Pré-décode bon marché pour éviter de lancer le SOF correlator symbol-domain
+    quand le buffer ne contient que du bruit. <span class="src">gate2x.rs:60-91</span>.
+</p>
+
+<ul>
+    <li><strong>3 templates</strong>, partagés entre les 8 profils via le bucket
+        <code>(sps, β)</code> :
+        <ul>
+            <li><code>(sps=32, β=0.20)</code> → ancre <code>Normal2x</code>
+                (NORMAL/HIGH/HIGH+/HIGH++/HIGH56/HIGH+56)</li>
+            <li><code>(sps=48, β=0.25)</code> → ancre <code>Robust2x</code></li>
+            <li><code>(sps=96, β=0.25)</code> → ancre <code>Ultra2x</code></li>
+        </ul>
+    </li>
+    <li><strong>FFT length</strong> = <code>next_pow2(buf_len + max_template_len)</code> ;
+        le template le plus long est Ultra (64 × 96 + 12 × 96 = 7296 samples).
+        Pour <code>IDLE_PROBE_BUF_SAMPLES = 96 000</code> (2 s @ 48 kHz),
+        <code>fft_len = 131 072</code>.</li>
+    <li><strong>Threshold</strong> <code>PROBE_THRESHOLD_2X = 120.0</code>
+        (ratio peak² / mean² du résultat IFFT).
+        <ul>
+            <li>Baseline théorique bruit blanc : 2·ln(fft_len) + ln(3) ≈ 25–30</li>
+            <li>Pire cas empirique (16 seeds, white Gaussian -26 dBFS) : ≈ 65</li>
+            <li>Signal propre : centaines à milliers selon profil</li>
+            <li>Marge : ×1.8 sur le pire cas bruit, ×2 minimum sur signal propre</li>
+        </ul>
+    </li>
+    <li>Coût : ~25–30 ms par appel sur Pi5. Cache <code>OnceLock</code> sur le
+        <code>fft_len</code> ; plans FFT réutilisés.</li>
+</ul>
+
+<!-- ============================================================================ -->
+<h2 id="algo-symbol">7. Algorithmes — domaine symbole</h2>
+
+<h3 id="sof-search">7.1 Recherche SOF + décode PLHEADER</h3>
+
+<p>
+    <code>find_next_sof()</code> <span class="src">rx_v4.rs:333</span> :
+    cross-corrélation linéaire du Chu reference contre le flux de symboles.
+    Le pic est validé contre un seuil normalisé :
+</p>
+
+<pre><code>SOF_PEAK_THRESHOLD_FRAC = 0.2     // rx_v4.rs:77
+threshold = 0.2 × SOF_LEN_SYM = 12.8
+</code></pre>
+
+<div class="callout">
+    <strong>Pourquoi 0.2 et pas 0.5 ?</strong> Sur WAV synthétique propre,
+    l'autocorrélation Chu peake à 64. Sur chaîne OTA SDRplay + démod NBFM +
+    LPF audio + de-emphasis + AGC, le pulse SOF est atténué de 70-80 % :
+    les pics réels OTA landent dans 15-20 même à haut SNR. La valeur 0.5 d'avant
+    v0.11.0-2x4 ratait toutes les captures réelles. Bruit de fond à σ=0.06 →
+    peaks de corrélation ~1.5, 8× sous seuil, le ratio reste sain
+    <span class="src">rx_v4.rs:64-76</span>.
+</div>
+
+<p>
+    Le décodeur PLHEADER <code>decode_plheader_at()</code>
+    <span class="src">plheader.rs:244-292</span> :
+</p>
+
+<ol>
+    <li>LS-fit du gain complexe sur les 64 sym SOF (référence connue parfaite)</li>
+    <li>Normalise les 128 sym PLS par ce gain</li>
+    <li>Démappe en bits via QPSK Gray-decode</li>
+    <li>Décode les 9 blocs Golay(24,12)</li>
+    <li>Reconstruit le payload 11 octets + vérifie CRC16 sur octets 0..10</li>
+    <li>Si le bloc 0 (qui porte <code>profile_index</code>) a échoué, fallback sur
+        la redondance 12 sym suivante</li>
+</ol>
+
+<p>
+    Les positions SOF validées CRC sont conservées dans
+    <code>RxResult2x::validated_sof_positions</code>
+    <span class="src">rx_v4.rs:162-170</span> — toute entrée est garantie sans
+    faux positif (PLS Golay + CRC16 deux gates indépendantes). Elles servent ensuite
+    au drift LS fit.
+</p>
+
+<h3 id="ffe">7.2 FFE LS forward (Pass 1)</h3>
+
+<p>
+    <code>equalize_symbols_per_cycle()</code>
+    <span class="src">rx_v4.rs:1105-1173</span>. Implémentation
+    <code>train_ffe_ls()</code> dans <code>modem-core-base/src/ffe.rs</code>.
+</p>
+
+<pre><code>FFE_LEN_2X = 64                       // rx_v4.rs:1013
+half = FFE_LEN_2X / 2 = 32            // delay spread ±32 sym ≈ ±21 ms à 1500 Bd
+
+// Training references (LS overdéterminée) :
+// - 192 sym PLHEADER (SOF Chu + PLS QPSK) — connus une fois PLS décodée
+// - 0/32/64 sym LMS warmup (selon constellation)
+// - Pilotes TDM EXCLUS — positions dispersées brisent le Gram LS
+
+// Total refs ≈ 224 sym pour APSK, 192 pour QPSK/8PSK
+// Surdétermination ≈ 3.5× pour FFE_LEN = 64
+</code></pre>
+
+<p>
+    Activation : par défaut <em>désactivée</em> ; opt-in via env
+    <code>RX_V4_FFE=1</code>. La Pass 2 turbo-FFE (re-entrainement sur DD refs)
+    est un stub dans la slice 2x19 — opt-in via <code>RX_V4_FFE_TURBO=1</code>.
+</p>
+
+<h3 id="gain">7.3 Estimation gain pilote-LS + per-ring DD</h3>
+
+<p>
+    Deux estimateurs combinés :
+</p>
+
+<dl class="axis-grid">
+    <dt>Gain scalaire</dt>
+    <dd><code>estimate_cw_gain</code> <span class="src">rx_v4.rs:372-401</span> —
+        LS sur pilotes TDM + références cycle-level (PLHEADER 192 sym + LMS warmup) :
+        <code>g = Σ y · conj(pref) / Σ |pref|²</code>. Augmente le nombre effectif
+        de pilotes de 36/CW (TDM seul) à ~228/CW.</dd>
+    <dt>Gain per-ring DD</dt>
+    <dd><code>estimate_per_ring_gain</code> <span class="src">rx_v4.rs:928-967</span> —
+        hard-décision de chaque symbole data, puis LS séparée par anneau.
+        Capture les distorsions AM-AM / AM-PM qu'un pilote sur cercle unité
+        manque (gain de l'anneau intérieur ≠ gain de l'anneau extérieur quand
+        l'ampli sature). Référence Meyr/Moeneclaey/Fechtel 1998 §8.4.</dd>
+</dl>
+
+<h3 id="sigma2">7.4 Estimation σ² split radial/tangentiel</h3>
+
+<p>
+    <code>estimate_cw_sigma2_split()</code>
+    <span class="src">rx_v4.rs:450-530</span>. Estimateur MAD-rescalé sur les
+    résidus pilote, décomposé radial / tangentiel :
+</p>
+
+<pre><code>// Résidu post-gain : e_k = y_k / gain - pref_k
+// Projection axiale (pref_k tournant) :
+radial_k     = Re(e_k · conj(pref_k) / |pref_k|)
+tangential_k = Im(e_k · conj(pref_k) / |pref_k|)
+
+// MAD à consistency factor real-axis :
+σ²_radial     = (median |radial_k|     · 1/0.6745)²
+σ²_tangential = (median |tangential_k| · 1/0.6745)²
+
+// Sur AWGN pur, σ²_radial ≈ σ²_tangential ≈ σ²_total / 2.
+// Ratio R/T &lt; 0.5 ⇒ bruit de phase dominant (AM-PM, LO drift, jitter).
+// Ratio R/T &gt; 2   ⇒ distorsion d'amplitude dominante (AM-AM, AGC).
+</code></pre>
+
+<p>
+    <strong>Modèle canal</strong> <span class="src">rx_v4.rs:535-588</span> —
+    décomposition en plancher AWGN + excès AM-AM + excès phase :
+</p>
+
+<pre><code>σ²_awgn_per_dim = min(σ²_radial, σ²_tangential)
+σ²_am  = σ²_radial    - σ²_awgn_per_dim       // AM-AM excess
+σ²_phi = σ²_tangential - σ²_awgn_per_dim       // phase noise excess
+
+// σ² total par anneau de rayon R :
+σ²_total(R) = 2 · σ²_awgn_per_dim + R² · (σ²_am + σ²_phi)
+
+// Sur HighPlus2x (rings ratio 5.27 : 2.84 : 1), σ²_outer / σ²_inner ≈ 17×.
+// Un LLR scalaire mismatché surestime la confiance de l'anneau extérieur.
+</code></pre>
+
+<p>
+    Plancher : <code>SIGMA2_FLOOR = 1e-3</code>
+    <span class="src">rx_v4.rs:62</span> quand aucun pilote n'est encore décodé.
+</p>
+
+<h3 id="llr">7.5 LLR max-log per-ring (Bayésien APSK)</h3>
+
+<p>
+    Pour AWGN anisotrope (σ²(s) dépend du candidat s), la log-vraisemblance correcte est :
+</p>
+
+<pre><code>p(y | s) = 1 / (π · σ²(s)) · exp(-|y - s|² / σ²(s))
+-log p(y | s) = |y - s|² / σ²(s)  +  log σ²(s)  +  const
+
+// LLR max-log per-ring :  modem_core_base/soft_demod.rs:92-140
+for k in 0..n_points {
+    neg_log_p[k] = |y - constellation[k]|² / σ²_per_point[k]
+                   + log_σ²_per_point[k]
+}
+for bit_pos in 0..bps {
+    min_b0 = min over k where bit_map[k][bit_pos] == 0 of neg_log_p[k]
+    min_b1 = min over k where bit_map[k][bit_pos] == 1 of neg_log_p[k]
+    LLR[bit_pos] = (min_b1 - min_b0) as f32
+}
+</code></pre>
+
+<div class="callout info">
+    <strong>Points clé :</strong> la division par σ²(s) se fait <em>par candidat
+    avant le min</em>, et le terme <code>+ log σ²(s)</code> est gardé. Bug initial
+    corrigé dans le commit 7f77248 — une variante naïve qui factorisait σ² hors
+    du min biaisait systématiquement contre les anneaux à σ² élevé (= contre
+    l'anneau extérieur sur HighPlus, donc contre les états les plus utiles à
+    discriminer).
+</div>
+
+<h3 id="turbo">7.6 Turbo Pass 2 EM — RTS phase + gain + log-σ²</h3>
+
+<p>
+    Toujours lancée, même si Pass 1 a convergé
+    <span class="src">rx_v4.rs:1717-1840</span>. Quatre composants en série :
+</p>
+
+<h4>Soft symboles depuis posterior LLR</h4>
+
+<p>
+    <code>soft_symbols_from_posterior_llr</code> dans
+    <code>modem-core-base/src/soft_demod.rs:275-350</code>. Sous l'approximation
+    d'indépendance bit-à-bit :
+    <code>P(s = c) ≈ ∏_k P(b_k)</code>.
+    Sorties : <code>E[s_k | LLR_post]</code>, <code>Var[s_k]</code>,
+    <code>P(z_k = r)</code> par anneau, moyennes conditionnelles per-ring.
+</p>
+
+<h4>Phase RTS smoother 2-state {φ, ω}</h4>
+
+<p>
+    <code>rts_phase_smooth</code> dans
+    <code>modem-core-base/src/phase_smoother.rs:105-219</code>. Modèle constant-velocity :
+</p>
+
+<pre><code>x_k = [φ_k, ω_k]ᵀ                   // phase, drift angulaire / symbole
+F = [[1, 1], [0, 1]]                 // constant velocity
+H = [1, 0]                           // mesure de phase seule
+Q = diag(q_φ, q_ω)
+R_k = σ²_tang / |s̃_k|²              // bruit de mesure adaptatif
+
+// Tuning depuis canal :    phase_smoother.rs:80-92
+q_φ = max(σ²_phi, 1e-8)
+q_ω = max(q_φ · 0.01, 1e-10)         // ratio 1:100 entre {φ, ω}
+P₀_φ = 10.0,   P₀_ω = 0.01
+
+// Forward Kalman puis backward RTS smoothing :
+// y_k_corr = y_k · exp(-j · φ̂_k)
+</code></pre>
+
+<h4>Per-ring gain smoothers — 1-state random walk</h4>
+
+<p>
+    <code>pass2_em_gain_smoother</code> <span class="src">rx_v4.rs:660-716</span>.
+    Un smoother par anneau × {real, imag} :
+</p>
+
+<pre><code>// Mesure : z = y_k / μ_kr,  Var(z) = σ²_total(R_r) / (w_kr · |μ_kr|²)
+// où w_kr = P(z_k = r | LLR_post), μ_kr = E[s_k | z_k=r, LLR_post]
+
+EM_GAIN_Q_FLOOR = 1e-7       // rx_v4.rs:639
+q = max(σ²_am + EM_GAIN_Q_FLOOR, EM_GAIN_Q_FLOOR)
+
+EM_MIN_RING_PROB = 1e-3       // rx_v4.rs:633
+// Si w_kr &lt; 1e-3 : pas de mesure, état propage seul.
+</code></pre>
+
+<h4>Per-ring log-σ² smoother — random walk log-scale</h4>
+
+<p>
+    <code>pass2_em_sigma2_smoother</code> <span class="src">rx_v4.rs:762-817</span>.
+    Mesure log de résidu carré :
+</p>
+
+<pre><code>// Pour X ~ Exp(1) :  E[log X] = -γ,  Var(log X) = π² / 6
+// (γ = Euler-Mascheroni constant)
+
+z_k = log |y_k - g_r(k) · μ_kr|²  +  γ        // bias-corrected
+R   = π² / 6      ≈ 1.6449                    // rx_v4.rs:654
+
+EULER_MASCHERONI = 0.577_215_664_901_532_9    // rx_v4.rs:649
+EM_LOG_SIGMA2_Q  = 1e-3                       // rx_v4.rs:643
+
+// Sanity blend DD vs model :
+SIGMA2_DD_RATIO_MIN = 0.2     // rx_v4.rs:597
+SIGMA2_DD_RATIO_MAX = 5.0     // rx_v4.rs:598
+// Hors plage : fallback sur σ²_model du modèle canal.
+</code></pre>
+
+<h4>Re-LLR + LDPC Pass 2</h4>
+
+<p>
+    <code>llr_maxlog_per_sym_per_ring</code> consomme un tableau 2D σ²[sym, ring].
+    Deuxième passage du décodeur LDPC sur les LLR raffinés ; si syndrome=0,
+    Pass 2 wins ; sinon fallback sur Pass 1.
+</p>
+
+<h3 id="ldpc-raptorq">7.7 LDPC + RaptorQ</h3>
+
+<p>
+    LDPC WiMAX 802.16e, N = 2304 bits, 3 rates :
+</p>
+
+<table>
+    <thead><tr><th>Rate</th><th>K (bits)</th><th>K (octets)</th><th>Usage</th></tr></thead>
+    <tbody>
+        <tr><td>1/2</td><td class="num">1152</td><td class="num">144</td><td>ULTRA, ROBUST, NORMAL</td></tr>
+        <tr><td>3/4</td><td class="num">1728</td><td class="num">216</td><td>HIGH, HIGH+, HIGH++</td></tr>
+        <tr><td>5/6</td><td class="num">1920</td><td class="num">240</td><td>HIGH56, HIGH+56</td></tr>
+    </tbody>
+</table>
+
+<p>
+    <code>LDPC_MAX_ITER = 30</code> <span class="src">rx_v4.rs:59</span>.
+    Décodeur soft posterior (sum-product belief propagation).
+</p>
+
+<p>
+    <strong>RaptorQ</strong> — RFC 6330 fountain code dans
+    <code>modem_framing::raptorq_codec</code>. K source packets + ~30 % repair
+    par défaut. Reassemblage <code>try_decode(k_source, packets)</code> dès
+    que ≥ K LDPC CWs ont convergé. Fallback : concat ESI-trié zéro-padded.
+</p>
+
+<!-- ============================================================================ -->
+<h2 id="session">8. Session streaming — <code>Rx2xSession</code> FSM</h2>
+
+<p>
+    Slice 2x19 a déplacé tout l'état RX de <code>rx_worker2x</code> vers
+    <code>Rx2xSession</code> en <code>modem-core2x</code> : le worker n'est plus
+    qu'un shim audio-channel → session-events <span class="src">rx2x_session.rs:1-115</span>.
+</p>
+
+<h3>États</h3>
+
+<table>
+    <thead><tr><th>État</th><th>Champs</th><th>Trigger d'entrée</th></tr></thead>
+    <tbody>
+        <tr><td><code>Idle</code></td><td>—</td><td>Démarrage, ou fin de cycle (cw_per_cycle décodés)</td></tr>
+        <tr><td><code>Acquiring</code></td><td><code>sof_at_abs: u64</code></td><td>SOF correlator a déclenché, PLS pas encore validée</td></tr>
+        <tr><td><code>Locked</code></td><td><code>cycle_idx, anchor_sof_abs, next_cw_idx</code></td><td>PLS Golay + CRC OK</td></tr>
+        <tr><td><code>Retrying</code></td><td><code>remaining: u8, drift_smoothed, ffe_refreshed</code></td><td><code>finalize()</code> appelé avant assez de CWs convergées</td></tr>
+        <tr><td><code>Finalising</code></td><td>—</td><td><code>run_retry()</code> terminé (stub vide en 2x19)</td></tr>
+    </tbody>
+</table>
+
+<h3>Buffers</h3>
+
+<dl class="axis-grid">
+    <dt><code>audio_buffer</code></dt>
+    <dd>Rolling f32 @ 48 kHz, grandit par <code>process_audio_chunk</code>. Pas
+        de cap — trimmé en fin de cycle.</dd>
+    <dt><code>sym_buffer</code></dt>
+    <dd>Recalculé entièrement à chaque chunk depuis <code>audio_buffer</code>
+        après resampling cubique. Cap soft <code>RX2X_SYM_BUFFER_CAP = 64 000</code>
+        sym ≈ 43 s à 1500 Bd. Trim quand dépassé, en gardant une période de cycle
+        de marge avant <code>scan_cursor_abs</code>.</dd>
+    <dt><code>scan_cursor_abs</code></dt>
+    <dd>Position absolue (en symboles) du prochain scan SOF. Avance d'une période
+        de cycle après chaque cycle décodé.</dd>
+</dl>
+
+<h3>Multi-burst rearm</h3>
+
+<p>
+    Après le dernier cycle (FLAG2X_LAST), l'état revient à <code>Idle</code>
+    sans détruire la session. Tous les accumulateurs persistent :
+    <code>cw_bytes</code>, <code>pls_anchors</code>, <code>drift_ppm</code>,
+    <code>drift_var</code>, <code>dd_refs_pool</code>. Le SOF suivant relance
+    le FSM avec l'état précédent intact.
+</p>
+
+<!-- ============================================================================ -->
+<h2 id="constantes">9. Tableau exhaustif des constantes</h2>
+
+<p>
+    Toutes les valeurs numériques avec source <code>file:line</code> et justification.
+</p>
+
+<h3>9.1 Trame V4 (PLHEADER + cycle)</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>SOF_LEN_SYM</code></td><td class="num">64</td>
+            <td class="src">plheader.rs:54</td>
+            <td>Frank-Zadoff-Chu — autocorrélation peak 64, inter-racines ≤ √64 ≈ 8 (~18 dB margin)</td></tr>
+        <tr><td><code>PLS_LEN_SYM</code></td><td class="num">128</td>
+            <td class="src">plheader.rs:57</td>
+            <td>9×Golay(24,12) = 108 sym QPSK + redondance 12 sym + zero-pad 8 sym</td></tr>
+        <tr><td><code>PLHEADER_LEN_SYM</code></td><td class="num">192</td>
+            <td class="src">plheader.rs:60</td>
+            <td>SOF + PLS</td></tr>
+        <tr><td><code>PLS_PAYLOAD_BYTES</code></td><td class="num">13</td>
+            <td class="src">plheader.rs:63</td>
+            <td>11 octets info + CRC16</td></tr>
+        <tr><td><code>V4_PREAMBLE_PERIOD_S</code></td><td class="num">4.0</td>
+            <td class="src">frame2x.rs:47</td>
+            <td>Cycle = PLHEADER period, mirroir V3</td></tr>
+        <tr><td><code>FLAG2X_META</code></td><td>bit 0</td>
+            <td class="src">frame2x.rs:52</td>
+            <td>META CW présent dans ce cycle (toujours 1 actuellement)</td></tr>
+        <tr><td><code>FLAG2X_EOT</code></td><td>bit 1</td>
+            <td class="src">frame2x.rs:54</td>
+            <td>End-of-transmission, dernier cycle d'un message</td></tr>
+        <tr><td><code>FLAG2X_LAST</code></td><td>bit 2</td>
+            <td class="src">frame2x.rs:56</td>
+            <td>Dernier paquet RaptorQ d'une session multi-burst</td></tr>
+    </tbody>
+</table>
+
+<h3>9.2 Pilotes TDM</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>default_2x()</code></td><td>d_syms=32, p_syms=2</td>
+            <td class="src">pilot2x_tdm.rs:40</td>
+            <td>~5.88 % overhead, ancrage 22.7 ms à 1500 Bd, BW update ≈ 22 Hz</td></tr>
+        <tr><td><code>dense_2x()</code></td><td>d_syms=16, p_syms=2</td>
+            <td class="src">pilot2x_tdm.rs:47</td>
+            <td>~11.1 % overhead, ancrage 12 ms ; réservé 64-APSK (min-distance carré faible)</td></tr>
+        <tr><td>Valeur pilote</td><td>exp(j·π/2·(n mod 4))</td>
+            <td class="src">pilot2x_tdm.rs:67-73</td>
+            <td>Rotation QPSK identique à V3 ; cercle unité pour AbsGardner unbiased</td></tr>
+    </tbody>
+</table>
+
+<h3>9.3 Audio / DSP base</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>AUDIO_RATE</code></td><td class="num">48 000</td>
+            <td class="src">modem-core-base/types.rs:5</td>
+            <td>Standard sound-card pro audio</td></tr>
+        <tr><td><code>DATA_CENTER_HZ</code></td><td class="num">1100</td>
+            <td class="src">modem-core-base/types.rs:6</td>
+            <td>Centré dans la bande NBFM utile mesurée (100–2600 Hz @ -3 dB)</td></tr>
+        <tr><td><code>RRC_SPAN_SYM</code></td><td class="num">12</td>
+            <td class="src">modem-core-base/types.rs:17</td>
+            <td>Filtre RRC à 12 sym de chaque côté</td></tr>
+        <tr><td>β QPSK (Ultra, Robust)</td><td class="num">0.25</td>
+            <td class="src">profile2x.rs:312, 326</td>
+            <td>Rolloff plus généreux pour profils slow-rate</td></tr>
+        <tr><td>β 8PSK + APSK</td><td class="num">0.20</td>
+            <td class="src">profile2x.rs:340, 354, ...</td>
+            <td>Compression d'occupation spectrale pour 1500 Bd</td></tr>
+    </tbody>
+</table>
+
+<h3>9.4 Boucle Gardner / Farrow</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>DEFAULT_KP</code></td><td class="num">0.05</td>
+            <td class="src">timing_loop.rs:33</td>
+            <td>Gain proportionnel — slow loop DVB-S2 reference</td></tr>
+        <tr><td><code>DEFAULT_KI</code></td><td class="num">0.005</td>
+            <td class="src">timing_loop.rs:36</td>
+            <td>Gain intégral, ratio Ki:Kp = 1:10, ζ ≈ 1 (critique)</td></tr>
+        <tr><td>BL · T_sym</td><td class="num">≈ 0.01</td>
+            <td class="src">streaming_frontend.rs:22-24</td>
+            <td>Bande de bruit normalisée, slow loop</td></tr>
+        <tr><td>Farrow safe zone</td><td>1 ≤ floor(pos) ≤ N − 3</td>
+            <td class="src">farrow.rs:38</td>
+            <td>Cubic Lagrange a besoin de samples[n-1..n+2]</td></tr>
+        <tr><td>Trim margin</td><td>taps_half + sps + 4</td>
+            <td class="src">streaming_frontend.rs:366</td>
+            <td>FIR warmup + Farrow 4-tap context du prochain strobe</td></tr>
+    </tbody>
+</table>
+
+<h3>9.5 RX symbol-domain</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>LDPC_MAX_ITER</code></td><td class="num">30</td>
+            <td class="src">rx_v4.rs:59</td>
+            <td>Même choix que V3</td></tr>
+        <tr><td><code>SIGMA2_FLOOR</code></td><td class="num">1e-3</td>
+            <td class="src">rx_v4.rs:62</td>
+            <td>Plancher conservateur quand pas de pilote</td></tr>
+        <tr><td><code>SOF_PEAK_THRESHOLD_FRAC</code></td><td class="num">0.2</td>
+            <td class="src">rx_v4.rs:77</td>
+            <td>Threshold = 12.8 sur SOF_LEN_SYM=64 ; admet pics OTA 15-20 attenués par NBFM + AGC</td></tr>
+        <tr><td><code>FFE_LEN_2X</code></td><td class="num">64</td>
+            <td class="src">rx_v4.rs:1013</td>
+            <td>±32 sym ≈ ±21 ms delay spread à 1500 Bd (2× worst-case FT-991A → FTX-1)</td></tr>
+        <tr><td><code>MAX_CONSTELLATION_POINTS</code></td><td class="num">500</td>
+            <td class="src">rx_v4.rs:176</td>
+            <td>Cap scatter cloud GUI</td></tr>
+        <tr><td><code>EM_MIN_RING_PROB</code></td><td class="num">1e-3</td>
+            <td class="src">rx_v4.rs:633</td>
+            <td>Posterior support gate — sous ce seuil, pas de mesure EM</td></tr>
+        <tr><td><code>EM_GAIN_Q_FLOOR</code></td><td class="num">1e-7</td>
+            <td class="src">rx_v4.rs:639</td>
+            <td>Process noise floor sur gain per-ring random walk</td></tr>
+        <tr><td><code>EM_LOG_SIGMA2_Q</code></td><td class="num">1e-3</td>
+            <td class="src">rx_v4.rs:643</td>
+            <td>Process noise log-scale ; absorbe quelques dB de drift σ² par CW</td></tr>
+        <tr><td><code>EULER_MASCHERONI</code></td><td class="num">0.5772156649…</td>
+            <td class="src">rx_v4.rs:649</td>
+            <td>Bias E[log X] pour X ~ Exp(1)</td></tr>
+        <tr><td><code>LOG_EXP_VAR</code></td><td class="num">π²/6</td>
+            <td class="src">rx_v4.rs:654</td>
+            <td>Var(log X) pour X ~ Exp(1) — mesure noise du log-σ² smoother</td></tr>
+        <tr><td><code>SIGMA2_DD_RATIO_MIN</code></td><td class="num">0.2</td>
+            <td class="src">rx_v4.rs:597</td>
+            <td>Sanity blend — si DD/model &lt; 0.2, fallback model</td></tr>
+        <tr><td><code>SIGMA2_DD_RATIO_MAX</code></td><td class="num">5.0</td>
+            <td class="src">rx_v4.rs:598</td>
+            <td>Sanity blend — si DD/model &gt; 5.0, fallback model</td></tr>
+    </tbody>
+</table>
+
+<h3>9.6 Session streaming</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>RX2X_SYM_BUFFER_CAP</code></td><td class="num">64 000</td>
+            <td class="src">rx2x_session.rs:71</td>
+            <td>~43 s à HighPlus2x ; ≥ burst 25 s + contexte retry</td></tr>
+        <tr><td><code>RX2X_RETRY_BUDGET</code></td><td class="num">2</td>
+            <td class="src">rx2x_session.rs</td>
+            <td>Tentatives de retry après finalize()</td></tr>
+        <tr><td><code>RX2X_DRIFT_Q_PPM_PER_CYCLE</code></td><td class="num">0.5</td>
+            <td class="src">rx2x_session.rs:79-84</td>
+            <td>Process noise Kalman drift forward</td></tr>
+        <tr><td><code>RX2X_DRIFT_R_PPM</code></td><td class="num">1.0</td>
+            <td class="src">rx2x_session.rs:79-84</td>
+            <td>Bruit d'observation drift</td></tr>
+    </tbody>
+</table>
+
+<h3>9.7 Sonde FFT préambule</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td><code>PROBE_THRESHOLD_2X</code></td><td class="num">120.0</td>
+            <td class="src">gate2x.rs:91</td>
+            <td>Peak²/mean² — baseline théorique 25-30, empirique pire 65, signal propre 100s-1000s, marge 1.8× sur worst-case</td></tr>
+        <tr><td><code>IDLE_PROBE_BUF_SAMPLES</code></td><td class="num">96 000</td>
+            <td class="src">gate2x.rs:295</td>
+            <td>2 s à 48 kHz, ≥ 1 PLHEADER (0.38 s à Ultra)</td></tr>
+        <tr><td>FFT length</td><td>131 072</td>
+            <td class="src">gate2x.rs:149-150</td>
+            <td>next_pow2(96 000 + 7 296), Ultra template = 64×96 + 12×96</td></tr>
+    </tbody>
+</table>
+
+<h3>9.8 Phase smoother RTS (modem-core-base)</h3>
+
+<table>
+    <thead><tr><th>Constante</th><th>Valeur</th><th>Source</th><th>Justification</th></tr></thead>
+    <tbody>
+        <tr><td>q_φ (floor)</td><td class="num">1e-8</td>
+            <td class="src">phase_smoother.rs:80-92</td>
+            <td>Process noise phase ; bumped par σ²_phi du modèle canal</td></tr>
+        <tr><td>q_ω</td><td>max(q_φ · 0.01, 1e-10)</td>
+            <td class="src">phase_smoother.rs:80-92</td>
+            <td>Ratio drift:phase = 1:100, slow second-order tracking</td></tr>
+        <tr><td>P₀_φ</td><td class="num">10.0</td>
+            <td class="src">phase_smoother.rs:80-92</td>
+            <td>Variance initiale phase (large — pas d'info préalable)</td></tr>
+        <tr><td>P₀_ω</td><td class="num">0.01</td>
+            <td class="src">phase_smoother.rs:80-92</td>
+            <td>Variance initiale drift</td></tr>
+    </tbody>
+</table>
+
+<!-- ============================================================================ -->
+<h2 id="derive">10. Analyse des points de dérive</h2>
+
+<p>
+    Pour chaque paramètre tracké, on documente : <strong>quel mécanisme le suit</strong>,
+    <strong>quelle plage il peut absorber</strong>, et <strong>où la boucle peut casser</strong>.
+    C'est la liste des paramètres dont la dérive non-tracé peut faire chuter
+    les performances du modem 2x.
+</p>
+
+<h3 id="derive-sps">10.1 Horloge symbole (ppm sample clock)</h3>
+
+<p>
+    <strong>Tracking :</strong> Gardner closed-loop sur chaque strobe symbole
+    (front-end audio) + bootstrap LS-fit sur les positions SOF CRC-validées
+    (resampling audio cubique avant downmix).
+</p>
+
+<dl class="axis-grid">
+    <dt>Plage théorique</dt>
+    <dd>Gardner seul : ±50 ppm safe, ±100 ppm marginal. AbsGardner sur l'intérieur
+        des pilotes : &gt;100 ppm sur APSK (recipe DVB-S2X §9.3.2).</dd>
+    <dt>Bootstrap</dt>
+    <dd>≥ 3 PLHEADERs validés → LS slope-fit position vs. cycle index.
+        Outlier filter ±10 % du cycle period. Résultat stocké
+        <code>cached_drift_ppm</code> appliqué au cubic resample du chunk suivant
+        <span class="src">rx_v4.rs:294-331, rx2x_session.rs:695-744</span>.</dd>
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>Burst &lt; 3 cycles (~12 s)</strong> : pas d'estimation drift,
+                cubic resampling skip, Gardner doit seul absorber le mismatch initial.
+                Limite ≈ ±50 ppm pour décode propre.</li>
+            <li><strong>Lead-in du buffer</strong> : Farrow safe zone violée
+                (<code>floor(pos) &lt; 1</code>), TED ne tourne pas, integ reste à 0.
+                Si la première PLHEADER tombe pile dans cette zone (~1-2 sym), elle
+                est ratée — mais le scan retrouve la suivante.</li>
+            <li><strong>Drift &gt; 100 ppm</strong> : biais Gardner data-dépendant trop
+                large sur APSK multi-ring, boucle instable. Mode dégradé : seul
+                AbsGardner sur pilote tracke, mais densité limitée (~30/CW).
+                Tests <code>pilot_aided_at_100_ppm_apsk32_matches_gardner_only</code>
+                échouent actuellement en HEAD slice 2x19.</li>
+            <li><strong>Reset à chaque cycle</strong> : le sym_buffer est <em>rebati</em>
+                depuis l'audio à chaque chunk (<code>refresh_symbols</code>). La phase
+                Farrow et l'intégrateur Gardner sont conservés via la <code>StreamingFrontend</code>
+                instance ; mais si le worker bypass le streaming (mode batch
+                <code>audio_to_symbols</code> historique), la boucle redémarre à integ=0
+                à chaque chunk.</li>
+            <li><strong>Kalman drift forward seulement</strong> : pas de RTS backward
+                (stub T3 en 2x19). Le dernier cycle d'un burst hérite de
+                <code>drift_ppm</code> obsolète si le clock a dérivé pendant le burst
+                — pas un problème sur sound-card stable, problème potentiel sur clock
+                SDR thermique.</li>
+        </ul>
+    </dd>
+</dl>
+
+<h3 id="derive-phase">10.2 Phase porteuse + fréquence résiduelle</h3>
+
+<p>
+    <strong>Tracking :</strong> deux niveaux en cascade.
+</p>
+
+<ol>
+    <li><strong>Pass 1 — gain pilote LS scalaire par CW</strong>. Estime
+        <code>g = Σ y·conj(pref) / Σ |pref|²</code> sur tous les pilotes du CW
+        + références cycle-level. Phase moyenne du CW = <code>arg(g)</code>.</li>
+    <li><strong>Pass 2 EM — RTS smoother 2-state {φ, ω}</strong>. Lissage
+        Kalman forward + backward sur les soft symbols dérotés.
+        Mesure <code>θ_k = arg(y_k · conj(s̃_k))</code> avec
+        <code>R_k = σ²_tang / |s̃_k|²</code>.</li>
+</ol>
+
+<dl class="axis-grid">
+    <dt>Plage théorique</dt>
+    <dd>Aucune limite hard sur la phase (wrapping géré). En fréquence résiduelle,
+        la PLS porte un coarse <code>freq_offset</code> 50 Hz step ; le reste est
+        absorbé par l'état ω du Kalman (drift / symbole).</dd>
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>Pass 1 utilise un gain CW scalaire</strong> : sur des CWs
+                longs (1224 sym Ultra, 491 sym HighPlus, ~800 ms), une dérive phase
+                significative est moyenné et le résidu va dans σ²_tang. Cas pathologique :
+                bruit de phase fort + CW long → σ² gonflé alors que le signal est
+                récupérable avec un meilleur smoother.</li>
+            <li><strong>RTS Pass 2 ne tourne que si Pass 1 a produit un posterior</strong>.
+                Si Pass 1 sort un LLR aplati (decode hard-failure), le soft symbol
+                <code>E[s_k]</code> est mal défini, et le RTS dérive sur le bruit pur.</li>
+            <li><strong>q_φ = max(σ²_phi, 1e-8)</strong> — process noise tiré du
+                modèle canal lui-même. Boucle : σ²_phi mal estimé (peu de pilotes) →
+                q_φ mal choisi → smoother trop rigide ou trop souple → posterior
+                biaisé.</li>
+            <li><strong>Pas de portage phase entre cycles</strong> : la PLHEADER de
+                chaque cycle réinitialise l'estimation. Une vraie continuité (Kalman
+                "outer loop" cross-cycle) n'existe pas en 2x19 ; la dérive cumulée
+                est resynchronisée toutes les 4 s, ce qui peut introduire un saut
+                visible si le bruit de phase basse-fréquence a "marché" entre temps.</li>
+            <li><strong>Wraparound</strong> : <code>arg()</code> wrap à ±π. Le RTS
+                fait unwrap interne, mais sur burst boundary ou gap de mesures
+                (P(z_k=r) &lt; 1e-3 sur plusieurs symboles d'affilée), l'unwrap peut
+                être déraillé. Aucune protection explicite en 2x19.</li>
+        </ul>
+    </dd>
+</dl>
+
+<h3 id="derive-sigma2">10.3 Estimation σ²</h3>
+
+<p>
+    <strong>Tracking :</strong>
+</p>
+
+<ol>
+    <li>Per-CW MAD sur pilotes (radial + tangential split) → modèle canal.</li>
+    <li>Per-ring log-σ² random-walk smoother en Pass 2 EM.</li>
+</ol>
+
+<dl class="axis-grid">
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>Faible nombre de pilotes</strong> : HighPlus2x a ~30
+                pilotes/CW + 192 cycle-level. MAD sur 30 valeurs est bruité ;
+                résultat sensible aux outliers (despite MAD = robust). Sur cycles
+                courts (1 CW only sur Ultra), σ² very noisy.</li>
+            <li><strong>Heavy-tailed assumption</strong> : MAD suppose Gaussien
+                via consistency factor (·1/0.6745). Bruit de phase laisse des
+                tails plus lourdes → σ² sous-estimé → LLR overconfident → mauvais
+                LDPC.</li>
+            <li><strong>Sanity blend [0.2, 5.0]</strong> : si σ²_DD / σ²_model
+                déborde, fallback model. Mais le model lui-même peut être faux
+                (split radial/tangential erroné) ; fallback peut masquer une
+                meilleure estimation EM.</li>
+            <li><strong>SIGMA2_FLOOR = 1e-3 hard-coded</strong> : sur signal très
+                propre (lab WAV), σ² réel peut être &lt; 1e-3, le plancher cap
+                la confiance LLR. Pas de problème pratique (LDPC converge bien
+                au-delà) mais empêche de mesurer le vrai SNR-floor du décodeur.</li>
+        </ul>
+    </dd>
+</dl>
+
+<h3 id="derive-gain">10.4 Gain per-ring</h3>
+
+<p>
+    <strong>Tracking :</strong>
+</p>
+
+<ol>
+    <li>Pass 1 DD-LS : <code>estimate_per_ring_gain</code> sur les symboles
+        data hard-décidés.</li>
+    <li>Pass 2 EM : random-walk Kalman per-ring × {real, imag}.</li>
+</ol>
+
+<dl class="axis-grid">
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>Misclassification d'anneau</strong> : sur ring boundary,
+                hard-decision se trompe d'anneau, et la mesure pollue le LS de
+                deux anneaux à la fois. Pass 2 EM utilise soft posteriors, donc
+                moins fragile, mais la première itération dépend de Pass 1.</li>
+            <li><strong>Posterior support gate 1e-3</strong> : symboles peu
+                informatifs ne contribuent pas, l'état propage. Si un anneau est
+                rarement vu (extérieur sur QPSK-like APSK ?), son smoother
+                conserve son état initial — peut diverger silencieusement.</li>
+            <li><strong>Q = σ²_am + 1e-7</strong> : process noise tiré de l'AM-AM
+                excess. Si σ²_am est mal estimé (mauvais split radial), Q est
+                mal choisi.</li>
+            <li><strong>Pas de tracking inter-CW</strong> : chaque CW redémarre
+                avec g_r(0) initialisé scalairement (gain CW pilote). Dérive
+                gain inter-CW (saturation ampli qui chauffe sur burst long) non
+                tracée.</li>
+        </ul>
+    </dd>
+</dl>
+
+<h3 id="derive-ffe">10.5 FFE — équalisation canal</h3>
+
+<p>
+    <strong>Tracking :</strong> LS forward train sur PLHEADER + LMS warmup,
+    appliqué wholesale à un cycle. Pass 2 turbo-FFE (re-entrainement sur DD
+    refs des CWs convergés) stub seulement.
+</p>
+
+<dl class="axis-grid">
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>Training set limité</strong> : ~224 refs sur APSK, ~192 sur
+                QPSK/8PSK. Pour <code>FFE_LEN_2X = 64</code>, ratio 3.5×.
+                Marginal — la matrice Gram peut être mal conditionnée sur certaines
+                réalisations bruit/canal, et le LS bruite les taps.</li>
+            <li><strong>Pilotes TDM exclus</strong> : positions dispersées brisent
+                la cohérence LS. Les ~30 pilotes/CW × N_cw d'un cycle (potentiellement
+                ~270 sur HighPlus) sont perdus comme training data.</li>
+            <li><strong>Pas de tracking canal in-burst</strong> : taps figés sur
+                un cycle (~4 s). Multipath fading rapide non capturé.</li>
+            <li><strong>Pass 2 turbo-FFE stub</strong> : <code>dd_refs_pool</code>
+                existe dans <code>Rx2xSession</code> mais n'est pas peuplé en
+                slice 2x19. Opt-in via <code>RX_V4_FFE_TURBO=1</code>, version
+                actuelle "simple all-converged-CW-syms" n'améliore pas sur le
+                baseline.</li>
+            <li><strong>Désactivé par défaut</strong> : <code>RX_V4_NO_FFE</code>
+                est l'état par défaut (FFE skipped). On dépend entièrement de la
+                réponse plate du canal NBFM audio.</li>
+        </ul>
+    </dd>
+</dl>
+
+<h3 id="derive-sof">10.6 Détection SOF</h3>
+
+<p>
+    <strong>Tracking :</strong> cross-corrélation linéaire Chu reference contre
+    sym_buffer, threshold <code>0.2 × SOF_LEN_SYM = 12.8</code>.
+</p>
+
+<dl class="axis-grid">
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>OTA attenuation</strong> : NBFM demod + LPF + de-emphasis
+                + AGC atténuent le pulse SOF de 70-80 %. Pics OTA réels landent
+                15-20 sur SDRplay. Threshold 12.8 admet ces pics mais la marge
+                est faible : un trou de fading 3 dB de plus, on rate la SOF.</li>
+            <li><strong>Faux positifs</strong> : threshold 12.8 sur 64 sym permet
+                des pics bruit corrélé (pas blanc) à passer. PLS Golay + CRC16
+                rattrapent (taux faux positif négligeable côté PLS), mais on
+                gâche du CPU sur des correlations qui échouent au décode.</li>
+            <li><strong>Cross-family Chu sidelobes ≤ 8</strong> : marge ~4× sous
+                threshold. OK en théorie, OK en pratique mais à surveiller si on
+                ajoute une famille D.</li>
+            <li><strong>Drift &gt; 1-2 % dans un cycle</strong> : le pic Chu se
+                smear sur plusieurs sample shifts, magnitude divisée par √N_smear.
+                À 50 ppm × 4 s × 1500 Bd = 0.3 sym de drift par cycle, négligeable.
+                À 5000 ppm (très improbable, mais possible sur SDR mal référencé) :
+                pic divisé par 2-3, on rate la SOF.</li>
+            <li><strong>EOT over-read</strong> : sur le dernier cycle
+                (<code>FLAG2X_LAST</code>), un sub-threshold tighter <code>0.7 ×
+                SOF_LEN_SYM = 45</code> détecte si on est en train de lire dans le
+                silence post-burst <span class="src">rx_v4.rs:1478</span>. Peut
+                rater un cycle légitime si le SNR chute brutalement à la fin.</li>
+        </ul>
+    </dd>
+</dl>
+
+<h3 id="derive-burst">10.7 Continuité multi-burst</h3>
+
+<p>
+    <strong>Tracking :</strong> état session persistant à travers les bursts
+    (<code>cw_bytes</code>, <code>drift_ppm</code>, <code>pls_anchors</code>,
+    <code>dd_refs_pool</code>).
+</p>
+
+<dl class="axis-grid">
+    <dt>Failure modes</dt>
+    <dd>
+        <ul>
+            <li><strong>Pas de gestion explicite de changement de session_id</strong> :
+                la PLS porte <code>session_id_low</code> (8 bits faibles) mais le
+                worker ne vérifie pas activement la cohérence entre bursts. Un
+                changement de TX vers un autre opérateur avec ESIs qui se
+                chevauchent corromprait <code>cw_bytes</code>.</li>
+            <li><strong>Drift cached entre bursts</strong> : <code>drift_ppm</code>
+                d'un burst précédent est appliqué au cubic resampling du nouveau
+                burst, même si l'horloge TX a changé entre temps (nouveau radio
+                amateur émet). Reset implicite seulement quand 3 nouvelles SOFs
+                font un fit divergent.</li>
+            <li><strong>Pas de timeout de session</strong> : un burst orphelin
+                en mémoire indéfiniment. Pas critique côté correctness mais peut
+                gonfler les buffers.</li>
+            <li><strong>RaptorQ pool</strong> : <code>cw_bytes</code> persiste, donc
+                un CW orphelin de burst n-1 peut être combiné avec ceux de burst n
+                si les ESIs alignent par hasard. Garde : <code>k_source</code> et
+                <code>n_repair</code> viennent de l'AppHeader du META-CW, qui change
+                par session.</li>
+        </ul>
+    </dd>
+</dl>
+
+<!-- ============================================================================ -->
+<h2 id="stubs">11. Boucles turbo non câblées (T2/T3/T6/T7)</h2>
+
+<p>
+    La slice 2x19 a livré l'architecture FSM <code>Rx2xSession</code> et les
+    decoders, mais quatre boucles turbo planifiées sont des <strong>stubs</strong>
+    dans <code>run_retry()</code> <span class="src">rx2x_session.rs:868</span>.
+    Liste exhaustive pour la prochaine slice :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Boucle</th><th>Statut</th><th>Description</th><th>Impact dérive</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>T1 — LDPC soft retry</strong></td>
+            <td><span class="tag ok">intégré</span></td>
+            <td>Pass 1 puis Pass 2 EM, déjà actif dans <code>decode_one_cw</code></td>
+            <td>—</td>
+        </tr>
+        <tr>
+            <td><strong>T2 — FFE feedback / re-train DD</strong></td>
+            <td><span class="tag stub">stub</span></td>
+            <td>Re-entraîner FFE sur dd_refs des CWs convergés ; re-décoder CWs failed.
+                Pool <code>dd_refs_pool</code> existe mais n'est pas peuplé.</td>
+            <td>FFE limitée aux 224 refs cycle-level, sous-déterminée sur canal
+                multipath</td>
+        </tr>
+        <tr>
+            <td><strong>T3 — Drift PPM Kalman RTS backward</strong></td>
+            <td><span class="tag stub">stub</span></td>
+            <td>Smoother backward sur drift ; <code>drift_smoothed: bool</code> dans
+                l'état Retrying réservé.</td>
+            <td>Drift forward only ; dernier cycle d'un long burst peut hériter
+                d'un drift désuet</td>
+        </tr>
+        <tr>
+            <td><strong>T6 — LDPC iter relax on retry</strong></td>
+            <td><span class="tag stub">stub</span></td>
+            <td>Réduire max_iter sur retry pass pour économiser CPU</td>
+            <td>Performance, pas correctness</td>
+        </tr>
+        <tr>
+            <td><strong>T7 — RaptorQ +1 repair</strong></td>
+            <td><span class="tag stub">stub</span></td>
+            <td>Demander +1 repair packet en dernier ressort si k_source presque
+                atteint mais 1-2 CWs manquants</td>
+            <td>Bursts en limite couverture perdus alors qu'un CW supplémentaire
+                aurait sauvé la session</td>
+        </tr>
+        <tr>
+            <td><strong>Turbo SYNC sample-domain</strong></td>
+            <td><span class="tag stub">non démarré</span></td>
+            <td>Feedback DD LDPC → timing / CFO / phase via Δ-Farrow, Gardner-DD,
+                Schmidl-Cox. Plan détaillé dans
+                <code>~/.claude/plans/turbo-sync-next-session</code> (mémoire utilisateur).</td>
+            <td>Tracking continu in-CW, pas seulement par-pilote</td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ============================================================================ -->
+<h2 id="tests-known">12. Tests connus en échec — HEAD slice 2x19</h2>
+
+<p>
+    Mémoire <code>modem-2x-branch-state</code> note : tests <code>streaming_frontend::*_50ppm/100ppm</code>
+    échouent sur HEAD slice 2x19, bug pré-existant Farrow/Gardner sous drift.
+    Liste précise (voir <code>cargo test --lib streaming_frontend</code>) :
+</p>
+
+<table>
+    <thead><tr><th>Test</th><th>Symptôme</th><th>Hypothèse</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><code>timing_loop_tracks_resampled_audio_50ppm</code></td>
+            <td>Payload décodée tout zéros (taille OK, contenu corrompu)</td>
+            <td>Boucle Gardner diverge sous resampling stress ou erreur initial
+                phase trop large pour pull-in</td>
+        </tr>
+        <tr>
+            <td><code>pilot_aided_at_100_ppm_apsk32_matches_gardner_only</code></td>
+            <td>Path Gardner-only à 100 ppm APSK32 fail decode (zeros)</td>
+            <td>100 ppm dépasse plage robuste sur 32-APSK ; pilot-aided non testé
+                (pré-condition fail)</td>
+        </tr>
+        <tr>
+            <td><code>pilot_aided_all_apsk_profiles_decode_at_50_ppm</code></td>
+            <td>High2x (16-APSK) payload mismatch (199 premiers octets OK, fin
+                corrompue)</td>
+            <td>APSK symbol-domain TED variant issue post-SOF ; possible scaling
+                Farrow vs. integer-step inconsistant</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    Ces tests passent sur les profils QPSK / 8PSK / HighPlus++ ; le mode d'échec
+    est spécifique au couple <strong>APSK + drift &gt; 50 ppm</strong>. Premier
+    suspect : la combinaison "AbsGardner sur intérieur pilote + multi-ring data
+    interspersé" laisse passer un biais dans la transition.
+</p>
+
+<div class="callout">
+    <strong>Prochaine étape recommandée :</strong> instrumenter
+    <code>StreamingFrontend</code> pour logger <code>(strobe_pos, integ, abs_idx,
+    is_pilot_interior, err)</code> par strobe sur un test pathologique, identifier
+    le strobe où l'erreur diverge, puis comparer aux symbol times attendus
+    pour distinguer biais TED vs. acquisition phase trop lente.
+</div>
+
+</div>
+</body>
+</html>
