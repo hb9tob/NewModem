@@ -34,7 +34,7 @@ use modem_core::sync as rx_sync;
 use modem_sdr_dsp::emphasis::DeemphasisFilter;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -522,6 +522,44 @@ const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 /// sending an EOT.
 const PREAMBLE_SILENCE_TIMEOUT_S: u64 = 6;
 
+/// Late-entry recovery (lowpower path only, `!allow_legacy_grid`).
+///
+/// When a CLOSED SF's Gardner-pass produces a one-off outlier estimate
+/// (e.g., marker false-positive on a noisy edge), the per-window resample
+/// at the bogus ppm shifts the next SF's expected marker positions out of
+/// the search window. Gardner then sees only 2 of the 3 required markers
+/// and returns None tick after tick — the decoder loops on contaminated
+/// audio instead of giving up and re-acquiring on the next preamble.
+///
+/// After `LATE_ENTRY_FAIL_THRESHOLD` consecutive ticks with no codeword
+/// extracted while session_active, we use the V3_PREAMBLE_PERIOD_S
+/// cadence to predict where the next clean preamble should sit, drain
+/// the buffer to `predicted_preamble - LATE_ENTRY_MARGIN_MS`, and clear
+/// `session_drift_ppm` so a fresh pre-decode Gardner runs. This matches
+/// the 0.9-era behaviour where each preamble was a clean re-sync point.
+const LATE_ENTRY_FAIL_THRESHOLD: u32 = 3;
+const LATE_ENTRY_MARGIN_MS: u64 = 200;
+
+/// Lowpower (`!allow_legacy_grid`) safety-grid quota.
+///
+/// When the user has turned off `rx_allow_legacy_grid` (default on
+/// aarch64 / Pi), the ±15 ppm grid in `rx_v2_with_options` is skipped
+/// to save CPU. From 0.10.34 the worker re-enables the grid AS A LAST
+/// RESORT when both Gardner and the 0-ppm fast-path fail to produce a
+/// clean SF -- recovering marginal CWs that the 0.9-era grid was
+/// catching. To bound the CPU spike, only `LOWPOWER_GRID_QUOTA` grid
+/// invocations are allowed within any rolling
+/// `LOWPOWER_GRID_WINDOW_S`-second wall-clock window. Above quota the
+/// grid stays skipped for the current tick ; the late-entry recovery
+/// then jumps to the next preamble and decoding resumes cleanly.
+///
+/// Window = one V3 preamble period (the cadence at which fresh
+/// decoding budget is renewed), quota = 2 lets a small burst of
+/// marginal SFs use the grid without committing the worker to a
+/// sustained ~225 ms/s = 22.5 % CPU overhead. Tune empirically.
+const LOWPOWER_GRID_QUOTA: usize = 2;
+const LOWPOWER_GRID_WINDOW_S: u64 = 4;
+
 // ---------------------------------------------------------------------------
 // Worker state
 // ---------------------------------------------------------------------------
@@ -607,6 +645,24 @@ struct WorkerState {
     perf_acc: rx_v2::PerfBreakdown,
     perf_max: rx_v2::PerfBreakdown,
     perf_sf_count: u32,
+    /// Absolute audio-sample position (= cumulative total_samples) of the
+    /// preamble that anchored the last codeword-producing decode. Anchor
+    /// for late-entry recovery: predicted-next-preamble offsets are
+    /// computed from here using the fixed V3 cadence. `None` until the
+    /// first successful CW decode of the current session.
+    last_decoded_preamble_audio_pos: Option<u64>,
+    /// Consecutive `scan_and_route` ticks during an active session that
+    /// produced no codewords. Reset to 0 on any successful decode.
+    /// Triggers `LATE_ENTRY_FAIL_THRESHOLD` when crossed (lowpower only).
+    n_consecutive_undecoded_ticks: u32,
+    /// Wall-clock timestamps of recent `rx_v2_with_options` calls that
+    /// actually entered the ±15 ppm safety grid (detected via
+    /// `perf_this_tick.n_passes > 2`). Maintained as a rolling window
+    /// of `LOWPOWER_GRID_WINDOW_S` seconds and used to gate the next
+    /// tick's effective `allow_legacy_grid` in lowpower mode. Empty in
+    /// desktop mode (the user setting is already `true` so the gate
+    /// never consults this).
+    lowpower_grid_recent: VecDeque<Instant>,
 }
 
 /// Residual drift (ppm) above which we re-run the Gardner estimator on
@@ -630,7 +686,11 @@ const REESTIMATE_RESIDUAL_PPM: f64 = 2.0;
 /// live OTA traffic on V3, enough samples for stable averages without
 /// drowning the log. The accumulator and max counter reset after every
 /// emission.
-const PERF_LOG_INTERVAL_SF: u32 = 10;
+///
+/// **Diag mode** (Pi 4 RT slip investigation, 2026-05): set to 1 to emit
+/// one `[perf]` line per decoded SF. Higher log volume but tmpfs absorbs
+/// it without I/O penalty. Revert to 10 before release.
+const PERF_LOG_INTERVAL_SF: u32 = 1;
 
 impl WorkerState {
     fn new(
@@ -663,6 +723,9 @@ impl WorkerState {
             perf_acc: rx_v2::PerfBreakdown::default(),
             perf_max: rx_v2::PerfBreakdown::default(),
             perf_sf_count: 0,
+            last_decoded_preamble_audio_pos: None,
+            n_consecutive_undecoded_ticks: 0,
+            lowpower_grid_recent: VecDeque::new(),
         }
     }
 
@@ -675,6 +738,9 @@ impl WorkerState {
         // we'd locked onto is tied to the audio just dropped, so the
         // next preamble triggers a fresh Gardner on a clean buffer.
         self.session_drift_ppm = None;
+        self.last_decoded_preamble_audio_pos = None;
+        self.n_consecutive_undecoded_ticks = 0;
+        self.lowpower_grid_recent.clear();
     }
 
     /// Keep only the last `PREROLL_SECONDS` of audio in the in-memory buffer.
@@ -691,6 +757,9 @@ impl WorkerState {
         self.header = None;
         self.session_active = false;
         self.announced_sessions.clear();
+        self.last_decoded_preamble_audio_pos = None;
+        self.n_consecutive_undecoded_ticks = 0;
+        self.lowpower_grid_recent.clear();
     }
 }
 
@@ -900,7 +969,28 @@ fn run_worker(
             max_batch_processing_ms = last_batch_processing_ms;
         }
 
-        // 2 s realtime-margin tick.
+        // [diag] Per-batch trace (every audio batch ≈ 500 ms). Pairs the
+        // wall-clock processing time with the running lag and session
+        // buffer fill so a slip can be located to within one batch on the
+        // post-mortem trace. Cheap (one printf) and tmpfs-bound, so it
+        // does not perturb the timing it reports. Disable by reverting
+        // PERF_LOG_INTERVAL_SF to 10 (diag-mode marker).
+        {
+            let wall_s = started.elapsed().as_secs_f64();
+            let audio_s = state.total_samples as f64 / AUDIO_RATE as f64;
+            let lag_ms = (wall_s - audio_s) * 1000.0;
+            let session_buf_ms =
+                state.session_buffer.len() as f64 * 1000.0 / AUDIO_RATE as f64;
+            worker_log(&format!(
+                "[batch] t={wall_s:6.2}s n={:5} dt_proc={last_batch_processing_ms:6.1}ms \
+                 lag={lag_ms:+6.0}ms session_buf={session_buf_ms:5.0}ms \
+                 active={}",
+                batch.len(),
+                state.session_active,
+            ));
+        }
+
+        // 500 ms realtime-margin tick (was 2 s — diag granularity).
         //   wall_s : seconds of wall clock since worker started
         //   audio_s: seconds of audio that have actually been
         //            consumed by this loop (= total_samples / 48 kHz)
@@ -908,7 +998,7 @@ fn run_worker(
         //            positive growing value means the decoder can't
         //            keep up with the capture and the session_buffer
         //            trim is silently dropping audio under us.
-        if last_telemetry_tick.elapsed() >= Duration::from_secs(2) {
+        if last_telemetry_tick.elapsed() >= Duration::from_millis(500) {
             let wall_s = started.elapsed().as_secs_f64();
             let audio_s = state.total_samples as f64 / AUDIO_RATE as f64;
             let lag_ms = (wall_s - audio_s) * 1000.0;
@@ -1158,13 +1248,33 @@ fn scan_and_route(
     // if a CLOSED window of this same buffer carries an EOT marker,
     // so end-of-burst recovery doesn't need a second scan.
     let finalize = !state.session_active;
+
+    // Effective `allow_legacy_grid` for this tick. Desktop (user setting
+    // `true`) always allows the grid as the rare safety-net pass it
+    // already was. Lowpower (`false`) re-enables the grid AS A LAST
+    // RESORT subject to a sliding-window quota of LOWPOWER_GRID_QUOTA
+    // invocations per LOWPOWER_GRID_WINDOW_S seconds. Prune the rolling
+    // window first so the test below sees only currently-counting
+    // invocations.
+    let grid_window = Duration::from_secs(LOWPOWER_GRID_WINDOW_S);
+    let now_grid_gate = Instant::now();
+    while let Some(&front) = state.lowpower_grid_recent.front() {
+        if now_grid_gate.duration_since(front) >= grid_window {
+            state.lowpower_grid_recent.pop_front();
+        } else {
+            break;
+        }
+    }
+    let effective_allow_grid = state.allow_legacy_grid
+        || state.lowpower_grid_recent.len() < LOWPOWER_GRID_QUOTA;
+
     let rx_v3_opt = rx_v2::rx_v3_after(
         &state.session_buffer,
         &config,
         0,
         finalize,
         state.session_drift_ppm,
-        state.allow_legacy_grid,
+        effective_allow_grid,
     );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     // Harvest the per-stage breakdown the rx_v2 thread-local accumulated
@@ -1172,6 +1282,23 @@ fn scan_and_route(
     // estimator, hint-resampled decode, fast-path single-shot, optional
     // ±15 ppm grid). Resets the accumulator -- next tick gets a fresh one.
     let perf_this_tick = rx_v2::take_perf();
+    // Lowpower grid-quota accounting. `n_passes` accumulates one entry
+    // per internal pass : 1 = Gardner-only, 2 = +fast-path fallback,
+    // > 2 = the ±15 ppm grid was entered (it adds up to 6 more passes).
+    // Recording a single Instant per grid-using tick is sufficient ; the
+    // grid itself is bounded inside `rx_v2_with_options`, we just need
+    // to know "did we pay the grid cost on this tick" so the next ticks
+    // can back off if too many recent ones did.
+    if perf_this_tick.n_passes > 2 && !state.allow_legacy_grid {
+        state.lowpower_grid_recent.push_back(Instant::now());
+        worker_log(&format!(
+            "[grid-quota] grid entered this tick (n_passes={}, recent={}/{} in last {}s)",
+            perf_this_tick.n_passes,
+            state.lowpower_grid_recent.len(),
+            LOWPOWER_GRID_QUOTA,
+            LOWPOWER_GRID_WINDOW_S,
+        ));
+    }
     perf_log_accumulate(state, perf_this_tick);
     let Some(mut result) = rx_v3_opt else {
         worker_log(&format!(
@@ -1224,7 +1351,7 @@ fn scan_and_route(
                         0,
                         finalize,
                         state.session_drift_ppm,
-                        state.allow_legacy_grid,
+                        effective_allow_grid,
                     );
                     // Auto-profile re-decode is real work; fold it into
                     // the same per-tick perf accumulator as the primary
@@ -1665,6 +1792,18 @@ fn scan_and_route(
         return;
     }
 
+    // Absolute audio-sample position (cumulative since worker start) of
+    // the last preamble seen this tick, COMPUTED BEFORE the truncation
+    // below mutates session_buffer. Used by the late-entry recovery
+    // block below to anchor predicted-next-preamble offsets, and stable
+    // against buffer drains because it is expressed in absolute samples.
+    let p_last_abs: Option<u64> = result.last_preamble_offset.map(|p_last| {
+        let buf_start = state
+            .total_samples
+            .saturating_sub(state.session_buffer.len() as u64);
+        buf_start + p_last as u64
+    });
+
     // Self-purging queue : drain everything before the LAST preamble
     // found in this scan, minus a small MF pre-roll margin. P_last
     // itself is preserved so that the next tick sees it again — once
@@ -1680,6 +1819,62 @@ fn scan_and_route(
             .min(state.session_buffer.len());
         if drain_end > 0 {
             state.session_buffer.drain(..drain_end);
+        }
+    }
+
+    // Late-entry recovery (lowpower only). On a tick that produced any
+    // codewords, anchor the recovery state on this scan's last preamble
+    // and reset the stalled-tick counter. On a stalled tick (active
+    // session, no codewords extracted), bump the counter; once it
+    // crosses LATE_ENTRY_FAIL_THRESHOLD, predict the next preamble
+    // position from the V3 cadence relative to the anchor, drain the
+    // buffer to `predicted - LATE_ENTRY_MARGIN_MS`, and clear
+    // `session_drift_ppm` so a fresh pre-decode Gardner runs on the
+    // assainised buffer. Matches the 0.9-era behaviour where each
+    // preamble was a clean re-sync point — a one-off Gardner outlier
+    // can no longer poison subsequent SFs for minutes on end.
+    if !result.cw_bytes_map.is_empty() {
+        if let Some(abs) = p_last_abs {
+            state.last_decoded_preamble_audio_pos = Some(abs);
+        }
+        state.n_consecutive_undecoded_ticks = 0;
+    } else if state.session_active && !state.allow_legacy_grid {
+        state.n_consecutive_undecoded_ticks += 1;
+        if state.n_consecutive_undecoded_ticks >= LATE_ENTRY_FAIL_THRESHOLD {
+            if let Some(anchor) = state.last_decoded_preamble_audio_pos {
+                let period_samples =
+                    (V3_PREAMBLE_PERIOD_S * AUDIO_RATE as f64) as u64;
+                let current_end = state.total_samples;
+                // Require at least one full period of audio past the
+                // anchor — otherwise there is no fresh preamble to jump
+                // to and the recovery would just truncate without
+                // benefit.
+                if current_end > anchor + period_samples {
+                    let n_periods = (current_end - anchor) / period_samples;
+                    let predicted = anchor + n_periods * period_samples;
+                    let buf_start = state
+                        .total_samples
+                        .saturating_sub(state.session_buffer.len() as u64);
+                    let margin = AUDIO_RATE as u64 * LATE_ENTRY_MARGIN_MS / 1000;
+                    let target = predicted.saturating_sub(margin);
+                    if target > buf_start {
+                        let drain_to = (target - buf_start) as usize;
+                        if drain_to <= state.session_buffer.len() {
+                            let drained_ms = drain_to * 1000 / AUDIO_RATE as usize;
+                            state.session_buffer.drain(..drain_to);
+                            state.session_drift_ppm = None;
+                            worker_log(&format!(
+                                "[late-entry] {} stalled ticks, skipping {} period(s) past anchor → drained {} ms (predicted preamble @ abs sample {})",
+                                state.n_consecutive_undecoded_ticks,
+                                n_periods,
+                                drained_ms,
+                                predicted,
+                            ));
+                            state.n_consecutive_undecoded_ticks = 0;
+                        }
+                    }
+                }
+            }
         }
     }
 

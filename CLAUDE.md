@@ -34,6 +34,24 @@ Conception d'un modem audio pour transmission d'images sur canal radio amateur N
 /c/Users/tous/radioconda/Scripts/gnuradio-companion.exe study/nbfm_channel_response.grc
 ```
 
+## Rust toolchain on the Pi 4 (aarch64 dev box)
+
+The Debian package `rustc` (`/usr/bin/rustc`, 1.85.0) is too old for the
+`raptorq 2.0.1` dependency, which uses `unsigned_is_multiple_of` (stabilised
+in Rust 1.87). A rustup-managed toolchain is installed at
+`~/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/` (rustc 1.95+),
+but `~/.cargo/bin` is **not** in `PATH` by default — `which cargo` returns
+`/usr/bin/cargo` and builds fail with `E0658: unstable library feature
+unsigned_is_multiple_of`.
+
+Always invoke cargo via the absolute rustup path for builds on this box:
+
+```bash
+/home/hb3xek/.cargo/bin/cargo build --release -p modem-worker
+```
+
+Or source the env once per shell: `. "$HOME/.cargo/env"`.
+
 ## Architecture
 
 ```
