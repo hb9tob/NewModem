@@ -735,6 +735,19 @@ fn fft_xcorr(x: &[f32], y: &[f32]) -> Vec<f32> {
 /// strongest correlation peak; energies/delays are relative to that
 /// peak. If the analyser can't even find a peak (capture lost / too
 /// short), the struct's fields are NaN / empty.
+///
+/// **Complex-baseband path (2026-05-15 fix):** rx and ref are
+/// downmixed by `exp(-j·2π·fc·t)` and low-pass filtered before
+/// cross-correlation, so the IR magnitude is free of the `2·fc`
+/// beat that the naive real-domain xcorr produces (the latter showed
+/// sinc-sidelobes at -2 dBc / 333 µs and confused the echo detector
+/// into reporting OTA chain group-delay tails as multipath echoes;
+/// see `docs/sounder_echo_audit.html`). The end-of-mainlobe heuristic
+/// is also hardened: we use the *last* sample where the smoothed
+/// envelope is still above -10 dBc (then add a 1-chip margin) as
+/// the echo-search start, and we require any echo candidate to be a
+/// local maximum of the smoothed envelope separated from a valley
+/// of ≥ 5 dB.
 pub fn measure_golay(
     audio: &[f32],
     sr: u32,
@@ -743,78 +756,63 @@ pub fn measure_golay(
     carrier_hz: f64,
     gap_s: f64,
 ) -> GolayMeasure {
-    // Reconstruct the reference pair audio + segmentation offsets.
-    // Layout: [A seq_len] [gap gap_len] [B seq_len] [tail gap_len].
-    // We correlate each (sequence + tail-after-it) against the
-    // reference sequence alone, which yields up to `gap_len + 1`
-    // valid lags of impulse response — that's our IR window.
     let (ref_audio, samples_per_chip) =
         golay_pair_audio(length_bits, chip_rate_hz, carrier_hz, 1.0, gap_s);
     let seq_len = length_bits * samples_per_chip;
     let gap_len = (gap_s * sr as f64) as usize;
     let need = 2 * seq_len + 2 * gap_len;
     if audio.len() < need {
-        return GolayMeasure {
-            impulse_response: Vec::new(),
-            peak_amplitude: f32::NAN,
-            delay_spread_50_us: f32::NAN,
-            delay_spread_90_us: f32::NAN,
-            strongest_echo_dbc: f32::NAN,
-            strongest_echo_us: f32::NAN,
-        };
+        return GolayMeasure::empty();
     }
-    // rx_a covers A + the gap that follows (A's tail decays into the gap).
-    let rx_a = &audio[..seq_len + gap_len];
-    // rx_b covers B + the trailing silence (B's tail decays into the tail).
-    let rx_b = &audio[seq_len + gap_len..2 * seq_len + 2 * gap_len];
-    let ref_a = &ref_audio[..seq_len];
-    let ref_b = &ref_audio[seq_len + gap_len..2 * seq_len + gap_len];
 
-    // Correlate each half. The matched-filter output peaks at the
-    // alignment offset between rx and ref; we keep the first
-    // `GOLAY_IR_RETAIN_SAMPLES * 2` samples on each side so we can
-    // re-centre on the peak without truncating.
-    let corr_a = fft_xcorr(rx_a, ref_a);
-    let corr_b = fft_xcorr(rx_b, ref_b);
+    // --- Complex demod + LPF -----------------------------------------------
+    // Downmix audio and reference by exp(-j·2π·fc·t) → complex baseband,
+    // then LPF with a cascaded boxcar (two running means of length
+    // `samples_per_chip`) to kill the 2·fc beat. Triangular FIR response,
+    // -36 dB attenuation at 2·fc = 3 kHz for the production params
+    // (sr=48 k, spc=40), which is plenty.
+    let bb_rx = complex_downmix_lpf(audio, carrier_hz, sr, samples_per_chip);
+    let bb_ref =
+        complex_downmix_lpf(&ref_audio, carrier_hz, sr, samples_per_chip);
+
+    let rx_a = &bb_rx[..seq_len + gap_len];
+    let rx_b = &bb_rx[seq_len + gap_len..2 * seq_len + 2 * gap_len];
+    let ref_a = &bb_ref[..seq_len];
+    let ref_b = &bb_ref[seq_len + gap_len..2 * seq_len + gap_len];
+
+    let corr_a = fft_xcorr_complex(rx_a, ref_a);
+    let corr_b = fft_xcorr_complex(rx_b, ref_b);
     let n_corr = corr_a.len().min(corr_b.len());
     if n_corr == 0 {
-        return GolayMeasure {
-            impulse_response: Vec::new(),
-            peak_amplitude: f32::NAN,
-            delay_spread_50_us: f32::NAN,
-            delay_spread_90_us: f32::NAN,
-            strongest_echo_dbc: f32::NAN,
-            strongest_echo_us: f32::NAN,
-        };
+        return GolayMeasure::empty();
     }
-    // Sum and normalise. The 2N normalisation comes from the Golay
-    // identity R_A + R_B = 2N·δ; for BPSK chips of amplitude 1 each
-    // ref sample contributes ±1 inside one chip, so the autocorr peak
-    // amplitude is 2·N·samples_per_chip (each chip contributes
-    // `samples_per_chip` correlated samples). Dividing recovers the
-    // channel response at unit input amplitude.
-    let norm = (2 * length_bits * samples_per_chip) as f32;
-    let h_sum: Vec<f32> =
-        (0..n_corr).map(|i| (corr_a[i] + corr_b[i]) / norm).collect();
 
-    // Find the main peak (|h|).
-    let (peak_idx, peak_amp) = h_sum
+    // Golay sum: R_A + R_B = 2N·δ. After complex demod the per-sample
+    // product is (-j·B_rx/2)·conj(-j·B_ref/2) = B_rx·B_ref/4, so per
+    // chip we accumulate `samples_per_chip / 4` correlated samples
+    // (the 1/4 from the cos·sin factorisation: |bb_envelope| = 1/2 on
+    // each side). 2·N chips total give `N·samples_per_chip / 2`,
+    // hence `norm = N·spc/2` makes the IR magnitude equal the channel
+    // gain at unit TX amplitude (so the existing clean-channel and
+    // synthetic-echo tests keep their peak ≈ 0.5 thresholds).
+    let norm = (length_bits * samples_per_chip) as f64 / 2.0;
+    let h_mag: Vec<f32> = (0..n_corr)
+        .map(|i| ((corr_a[i] + corr_b[i]).norm() / norm) as f32)
+        .collect();
+
+    let (peak_idx, peak_amp) = h_mag
         .iter()
         .enumerate()
-        .map(|(i, &v)| (i, v.abs()))
+        .map(|(i, &v)| (i, v))
         .max_by(|a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or((0, 0.0));
 
-    // Retain impulse response starting at the peak, magnitude only.
-    let retain_end = (peak_idx + GOLAY_IR_RETAIN_SAMPLES).min(h_sum.len());
-    let ir: Vec<f32> = h_sum[peak_idx..retain_end]
-        .iter()
-        .map(|v| v.abs())
-        .collect();
+    let retain_end = (peak_idx + GOLAY_IR_RETAIN_SAMPLES).min(h_mag.len());
+    let ir: Vec<f32> = h_mag[peak_idx..retain_end].to_vec();
 
-    // Delay spread: cumulative power.
+    // --- Delay spread ------------------------------------------------------
     let powers: Vec<f64> = ir.iter().map(|v| (*v as f64) * (*v as f64)).collect();
     let total: f64 = powers.iter().sum();
     let mut cum = 0.0_f64;
@@ -838,16 +836,15 @@ pub fn measure_golay(
     let delay_50 = if hit_50 { to_us(idx_50) } else { f32::NAN };
     let delay_90 = if hit_90 { to_us(idx_90) } else { f32::NAN };
 
-    // Strongest secondary peak: dynamic guard = end-of-main-lobe, i.e.
-    // the first delay past the peak where the smoothed |h(t)| envelope
-    // drops below peak / √10 (≈ −10 dBc). The BPSK chip-mainlobe is
-    // already ~2·samples_per_chip wide, but the *channel* further
-    // smears it by the group-delay span (5-20 ms typical for an FM
-    // chain). Using a static guard of a few chips lands inside that
-    // smeared blob and the loop reports the descent itself as an
-    // "echo" near 0 dBc. Walking the smoothed envelope forward gives
-    // the true tail of the IR — beyond it, any remaining energy is a
-    // genuine multipath echo or numerical correlation floor.
+    // --- End-of-mainlobe (hardened) ----------------------------------------
+    // Smooth the IR with a running mean of length `samples_per_chip` and
+    // find the LAST sample inside the first half of the retain window
+    // where the smoothed envelope is still ≥ peak/√10 (−10 dBc). The
+    // echo search starts one chip after that. The old algo took the
+    // *first* drop below threshold, which can land inside a smeared
+    // mainlobe whose envelope dips momentarily; the new rule walks
+    // backwards from the half-window so a confirmed end-of-mainlobe is
+    // guaranteed.
     let smooth_w = samples_per_chip.max(1);
     let mut smoothed: Vec<f32> = Vec::with_capacity(ir.len());
     let mut sum = 0.0_f32;
@@ -859,33 +856,65 @@ pub fn measure_golay(
         let denom = (i + 1).min(smooth_w) as f32;
         smoothed.push(sum / denom);
     }
-    let smoothed_peak =
-        smoothed.iter().cloned().fold(0.0_f32, f32::max);
+    let smoothed_peak = smoothed.iter().cloned().fold(0.0_f32, f32::max);
     let drop_thresh = smoothed_peak / 10.0_f32.sqrt(); // −10 dB
     let min_guard = (3 * samples_per_chip).max(1);
+    let half_window = ir.len() / 2;
     let mut end_of_main = min_guard;
-    for (i, &v) in smoothed.iter().enumerate().skip(min_guard) {
-        if v < drop_thresh {
-            end_of_main = i;
-            break;
+    if half_window > min_guard {
+        for i in (min_guard..half_window).rev() {
+            if smoothed[i] >= drop_thresh {
+                end_of_main = (i + samples_per_chip).min(ir.len());
+                break;
+            }
         }
     }
     let echo_search_start = end_of_main.min(ir.len());
-    let mut best_echo_idx = 0_usize;
+
+    // --- Echo detection with prominence check ------------------------------
+    // Find the strongest local maximum of the smoothed envelope after
+    // end_of_main that is separated from the rest of the IR by a
+    // valley of at least 5 dB (= ratio ~ 0.562). This rejects monotone
+    // mainlobe-tail droop (no valley) while keeping genuine multipath
+    // echoes (which always have a notch between mainlobe and reflection).
+    let prominence_ratio = 10.0_f32.powf(-5.0 / 20.0); // -5 dB
+    let mut best_echo_idx = echo_search_start;
     let mut best_echo_amp = 0.0_f32;
-    for (i, &v) in ir.iter().enumerate().skip(echo_search_start) {
-        if v > best_echo_amp {
-            best_echo_amp = v;
-            best_echo_idx = i;
+    if echo_search_start < smoothed.len() {
+        // For each local max in smoothed[echo_search_start..], check the
+        // minimum value of smoothed in [echo_search_start..i]. If
+        // smoothed[i] / min_before >= 1/prominence_ratio (i.e. ≥ 5 dB
+        // above the valley), it's a valid echo candidate.
+        let mut running_min = smoothed[echo_search_start];
+        for i in (echo_search_start + 1)..smoothed.len() - 1 {
+            running_min = running_min.min(smoothed[i]);
+            let is_local_max = smoothed[i] > smoothed[i - 1]
+                && smoothed[i] > smoothed[i + 1];
+            if !is_local_max {
+                continue;
+            }
+            // Valid echo? smoothed[i] must be > 5 dB above the min seen
+            // since echo_search_start.
+            if running_min > 0.0
+                && smoothed[i] / running_min >= 1.0 / prominence_ratio
+                && smoothed[i] > best_echo_amp
+            {
+                best_echo_amp = smoothed[i];
+                best_echo_idx = i;
+            }
         }
     }
-    // On a clean channel best_echo_amp can be numerically near zero
-    // (Golay zero-sidelobe property). Floor it at 1e-12 so the log
-    // doesn't blow up; the resulting dBc is just very negative
-    // (≈ −240 dBc) which the caller can interpret as "no echo".
-    let (echo_dbc, echo_us) = if peak_amp > 1e-9 {
-        let dbc = 20.0 * (best_echo_amp.max(1e-12) / peak_amp).log10();
+
+    let (echo_dbc, echo_us) = if peak_amp > 1e-9 && best_echo_amp > 0.0 {
+        let dbc = 20.0 * (best_echo_amp / peak_amp).log10();
+        // best_echo_idx is relative to the start of `ir` (= peak in the
+        // original h_mag), so converting to µs gives delay-relative-to-
+        // mainlobe directly.
         (dbc, to_us(best_echo_idx))
+    } else if peak_amp > 1e-9 {
+        // No prominent local maximum found → no echo. Report a very
+        // negative dBc so callers can treat this as "below noise".
+        (-120.0, f32::NAN)
     } else {
         (f32::NAN, f32::NAN)
     };
@@ -898,6 +927,104 @@ pub fn measure_golay(
         strongest_echo_dbc: echo_dbc,
         strongest_echo_us: echo_us,
     }
+}
+
+impl GolayMeasure {
+    fn empty() -> Self {
+        Self {
+            impulse_response: Vec::new(),
+            peak_amplitude: f32::NAN,
+            delay_spread_50_us: f32::NAN,
+            delay_spread_90_us: f32::NAN,
+            strongest_echo_dbc: f32::NAN,
+            strongest_echo_us: f32::NAN,
+        }
+    }
+}
+
+/// Multiply `audio` by `exp(-j·2π·fc·t)` and low-pass with a cascaded
+/// boxcar (two running means of length `lpf_window`). Returns a complex
+/// baseband signal of the same length as `audio`.
+///
+/// Cascaded boxcar gives a triangular FIR response with the first zero
+/// at `sr/lpf_window`. For `lpf_window = samples_per_chip = 40` at
+/// `sr = 48 kHz`, that's 1200 Hz (matches the chip rate, keeps the
+/// chip envelope), and the 2·fc = 3 kHz beat falls in sidelobes
+/// attenuated by `20·log10(sinc²(2.5)) ≈ -36 dB`.
+fn complex_downmix_lpf(
+    audio: &[f32],
+    carrier_hz: f64,
+    sr: u32,
+    lpf_window: usize,
+) -> Vec<Complex64> {
+    let n = audio.len();
+    let omega = 2.0 * PI * carrier_hz / sr as f64;
+    let mut bb: Vec<Complex64> = Vec::with_capacity(n);
+    for (k, &v) in audio.iter().enumerate() {
+        let phi = -omega * k as f64;
+        let v = v as f64;
+        bb.push(Complex64::new(v * phi.cos(), v * phi.sin()));
+    }
+    // First boxcar pass
+    let mut acc = Complex64::new(0.0, 0.0);
+    let mut tmp = vec![Complex64::new(0.0, 0.0); n];
+    for i in 0..n {
+        acc += bb[i];
+        if i >= lpf_window {
+            acc -= bb[i - lpf_window];
+        }
+        let denom = (i + 1).min(lpf_window) as f64;
+        tmp[i] = acc / denom;
+    }
+    // Second boxcar pass (gives a triangular response)
+    let mut acc = Complex64::new(0.0, 0.0);
+    let mut out = vec![Complex64::new(0.0, 0.0); n];
+    for i in 0..n {
+        acc += tmp[i];
+        if i >= lpf_window {
+            acc -= tmp[i - lpf_window];
+        }
+        let denom = (i + 1).min(lpf_window) as f64;
+        out[i] = acc / denom;
+    }
+    out
+}
+
+/// Complex-domain FFT cross-correlation: returns
+/// `corr[k] = Σ_n x[n+k]·conj(y[n])` for `k in [0, len(x) - len(y)]`.
+fn fft_xcorr_complex(
+    x: &[Complex64],
+    y: &[Complex64],
+) -> Vec<Complex64> {
+    let n_x = x.len();
+    let n_y = y.len();
+    if n_y == 0 || n_x < n_y {
+        return Vec::new();
+    }
+    let fft_len = (n_x + n_y).next_power_of_two();
+    let mut planner = FftPlanner::<f64>::new();
+    let fwd: Arc<dyn Fft<f64>> = planner.plan_fft_forward(fft_len);
+    let inv: Arc<dyn Fft<f64>> = planner.plan_fft_inverse(fft_len);
+    let mut bx: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (i, &v) in x.iter().enumerate() {
+        bx[i] = v;
+    }
+    fwd.process(&mut bx);
+    let mut by: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (i, &v) in y.iter().enumerate() {
+        by[i] = v;
+    }
+    fwd.process(&mut by);
+    for b in by.iter_mut() {
+        *b = b.conj();
+    }
+    for i in 0..fft_len {
+        bx[i] *= by[i];
+    }
+    inv.process(&mut bx);
+    let scale = 1.0 / fft_len as f64;
+    let valid = n_x - n_y + 1;
+    bx[..valid].iter().map(|c| *c * scale).collect()
 }
 
 // --- Tests ----------------------------------------------------------------
@@ -1205,6 +1332,65 @@ mod tests {
                 && (m.strongest_echo_us - 5000.0).abs() < 800.0,
             "echo delay {} µs expected ≈ 5000",
             m.strongest_echo_us,
+        );
+    }
+
+    /// Regression test for the 2026-05-15 fix to `measure_golay`. The
+    /// pre-fix algorithm correlated audio against the BPSK-on-carrier
+    /// reference in the real domain, leaving a 2·fc beat in the IR
+    /// whose sidelobes the echo detector classified as multipath when
+    /// the OTA chain smeared the mainlobe past `min_guard = 2.5 ms`.
+    /// See `docs/sounder_echo_audit.html` for the full audit.
+    ///
+    /// Here we simulate an FM-chain-like channel by low-pass filtering
+    /// the BPSK probe at the audio passband edge (2 kHz, sharp cutoff)
+    /// — this is the dominant smearing source on a sound-card path,
+    /// matching the OTA signature `d50 ≈ 11 ms, d90 ≈ 20 ms`.
+    /// With no genuine echo injected, the analyser must report an echo
+    /// well below -15 dBc despite the heavy smearing. The pre-fix
+    /// algorithm reported -2 to -5.5 dBc on this scenario.
+    #[test]
+    fn measure_golay_fm_smeared_channel_rejects_smear_as_echo() {
+        let length_bits = 64_usize;
+        let chip_rate = 1200.0_f64;
+        let carrier = 1500.0_f64;
+        let gap_s = 0.1_f64;
+        let (tx, _spc) = crate::probe::golay_pair_audio(
+            length_bits, chip_rate, carrier, 0.5, gap_s,
+        );
+        // Apply an order-8 IIR low-pass at 2 kHz (cascaded biquads)
+        // to mimic the transceiver's audio-passband LPF. We use a
+        // simple cascaded one-pole low-pass (good enough to produce
+        // the smearing pattern; not meant to be ham-radio-grade).
+        let fc_lpf = 2000.0_f64;
+        let alpha = (-2.0 * PI * fc_lpf / AUDIO_RATE as f64).exp();
+        let mut rx: Vec<f32> = tx.clone();
+        for _ in 0..8 {
+            let mut y_prev = 0.0_f32;
+            for sample in rx.iter_mut() {
+                let y = (1.0 - alpha as f32) * (*sample)
+                    + alpha as f32 * y_prev;
+                *sample = y;
+                y_prev = y;
+            }
+        }
+        let m = measure_golay(
+            &rx, AUDIO_RATE, length_bits, chip_rate, carrier, gap_s,
+        );
+        // With the fix, the smearing shows up in delay_spread_50_us
+        // (large), not in strongest_echo_dbc. The echo must stay deep
+        // because no genuine reflection was added.
+        assert!(
+            m.strongest_echo_dbc.is_finite()
+                && m.strongest_echo_dbc < -15.0,
+            "echo {} dBc — FM smearing should not be misreported as echo",
+            m.strongest_echo_dbc,
+        );
+        // The smearing should be visible in the delay spread.
+        assert!(
+            m.delay_spread_50_us.is_finite() && m.delay_spread_50_us > 100.0,
+            "delay_spread_50 {} µs — expected smeared mainlobe",
+            m.delay_spread_50_us,
         );
     }
 }

@@ -312,31 +312,89 @@ amplitude TX = balayage 0.022 → 0.700 (11 niveaux par capture)
 </p>
 
 <!-- ============================================================== -->
-<h2 id="fix">8. Fix prévu — démodulation complexe avant xcorr</h2>
+<h2 id="fix">8. Fix implémenté</h2>
+
+<div class="callout ok">
+    <strong>Statut :</strong> fix landed le 2026-05-15 dans <code>rust/modem-core-base/src/probe_analyze.rs</code>. Tests régression ajoutés : <code>measure_golay_clean_channel_peaks_at_zero_delay</code> + <code>measure_golay_detects_synthetic_echo</code> (existants) + <code>measure_golay_fm_smeared_channel_rejects_smear_as_echo</code> (nouveau). Les trois passent.
+</div>
 
 <p>
-    Option choisie par l'opérateur (2026-05-15). Trois changements à apporter à <code>measure_golay</code> :
+    Trois changements à <code>measure_golay</code> :
 </p>
 
 <ol>
-    <li><strong>Démodulation complexe</strong> : multiplier l'audio reçu et la référence par <code>exp(-j·2π·fc·t)</code>, low-pass filtrer pour rejeter la composante à 2·fc, puis cross-corréler dans le domaine complexe. La magnitude <code>|h_complex|</code> donne directement l'amplitude de la réponse channel sans le ripple sinc.</li>
-    <li><strong>Re-définir delay_spread_50/90 sur l'IR propre</strong> — sans le ripple à 2·fc, la décomposition cumulative-power donne la vraie largeur du smearing.</li>
-    <li><strong>Critère d'écho durci</strong> : l'echo ne doit être reporté que comme <strong>maximum local séparé du mainlobe par une vallée d'au moins 5 dB</strong>. La queue smearée monotone décroissante ne satisfait pas ce critère.</li>
+    <li><strong>Démodulation complexe + LPF</strong> avant cross-corrélation. Multiplie audio et référence par <code>exp(-j·2π·fc·t)</code> puis applique un LPF cascade boxcar (deux running mean de longueur <code>samples_per_chip</code>) qui rejette la composante 2·fc à -36 dB. L'IR magnitude est alors libre du ripple sinc.</li>
+    <li><strong>End-of-mainlobe en walk-back</strong>. On cherche le <em>dernier</em> sample où l'enveloppe lissée est encore au-dessus de -10 dBc dans la première moitié de la fenêtre, plus une marge d'1 chip. L'ancien algo prenait le premier passage sous le seuil, qui peut être un dip transitoire inside le mainlobe.</li>
+    <li><strong>Critère d'écho avec prominence ≥ 5 dB</strong>. Un candidat echo doit être un maximum local de l'enveloppe lissée, séparé du reste du parcours par une vallée d'au moins 5 dB. La queue smearée monotone ne satisfait pas ce critère.</li>
 </ol>
 
 <p>
-    Test régression à ajouter :
+    Le test régression <code>measure_golay_fm_smeared_channel_rejects_smear_as_echo</code> passe un Golay probe à travers une cascade IIR low-pass à 2 kHz (8 pôles d'ordre 1 cascadés, modèle simple du LPF transceiver) et vérifie que <code>echo_dbc &lt; -15 dBc</code> malgré <code>d50 &gt; 100 µs</code> de smearing.
 </p>
 
-<pre><code>fn measure_golay_fm_smeared_channel_rejects_smear_as_echo() {
-    // Build the Golay BPSK probe, pass it through a synthetic FM-channel
-    // simulator (LPF 2 kHz + de-emphasis 75 µs + small AGC ripple) that
-    // matches the FT-991A signature: d50 ≈ 11 ms, d90 ≈ 20 ms.
-    // Run measure_golay → strongest_echo_dbc must be < -15 dBc despite
-    // the smearing (which should be captured in delay_spread_50_us
-    // instead).
-}
-</code></pre>
+<!-- ============================================================== -->
+<h2 id="post-fix">9. Re-analyse post-fix des captures OTA — verdict final</h2>
+
+<p>
+    Port Python du fix (<code>/tmp/audit_golay_fixed.py</code>) appliqué aux mêmes 5 captures OTA :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Capture</th><th>echo (avant)</th><th>echo (après)</th><th>d50 (avant)</th><th>d50 (après)</th><th>end_of_main</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>1778764551</code></td>
+            <td class="num">-5.43</td><td class="num">-3.98</td>
+            <td class="num">11646</td><td class="num">13792</td>
+            <td class="num">16125</td></tr>
+        <tr><td><code>1778766433</code></td>
+            <td class="num">-2.01</td><td class="num">-3.68</td>
+            <td class="num">11604</td><td class="num">10979</td>
+            <td class="num">14021</td></tr>
+        <tr><td><code>1778771002</code></td>
+            <td class="num">-5.48</td><td class="num">-6.81</td>
+            <td class="num">11562</td><td class="num">10625</td>
+            <td class="num">14000</td></tr>
+        <tr><td><code>1778771574</code></td>
+            <td class="num">-5.17</td><td class="num">-2.40</td>
+            <td class="num">11562</td><td class="num">34396</td>
+            <td class="num">34917</td></tr>
+        <tr><td><code>1778773781</code></td>
+            <td class="num">-5.03</td><td class="num">-5.48</td>
+            <td class="num">11625</td><td class="num">22688</td>
+            <td class="num">25167</td></tr>
+    </tbody>
+</table>
+
+<div class="callout info">
+    <strong>Observation clé :</strong> les valeurs d'echo après fix sont du <em>même ordre</em> que les valeurs avant (-2 à -7 dBc), MAIS positionnées à <strong>20-35 ms post-pic</strong> au lieu de 13 ms. Le fix a correctement repoussé l'echo search past le mainlobe smearé ; ce qu'il trouve maintenant sont des features <strong>réelles</strong> de la réponse impulsionnelle du transceiver — pas l'artefact 2·fc.
+</div>
+
+<p>
+    Conclusion sur le multipath OTA : <strong>le bench FT-991A → SDRplay n'a pas de multipath RF mesurable au niveau de résolution de ce sondeur</strong> (chip rate 1200 Hz → resolution ~833 µs). Ce qui est observé est intégralement l'<strong>impulse response instrumentale</strong> du transceiver : LPF audio à 2 kHz très étroit, de-emphasis 75 µs, AGC. Le delay spread de 10-15 ms est la signature de ces filtres, non d'un canal radio multipath.
+</p>
+
+<p>
+    Un vrai canal multipath VHF/UHF en environnement urbain produirait des delays de l'ordre de la microseconde à quelques dizaines de microsecondes, bien en-dessous de la résolution du sondeur. Pour observer du multipath RF avec ce dispositif, il faudrait soit augmenter <code>chip_rate_hz</code> (au prix de la bande audio), soit utiliser une probe différente (e.g. PN longue à 12 kHz chip rate).
+</p>
+
+<!-- ============================================================== -->
+<h2 id="sim-calib">10. Adaptation du simulateur de canal</h2>
+
+<p>
+    Le simulateur <code>study/nbfm_channel_sim.py</code> sous-estimait le smearing instrumental — l'ancien défaut <code>POST_LPF_TRANSITION = 400 Hz</code> donnait d50 sub-ms, alors que la mesure OTA donne d50 ~ 11 ms. Changements 2026-05-15 :
+</p>
+
+<ul>
+    <li><code>POST_LPF_TRANSITION_HZ = 100 Hz</code> nouveau défaut (était 400). Filtre FIR ~4× plus étroit → group delay ~20 ms, IR d50 ~ 5-15 ms. Matches l'OTA bench.</li>
+    <li>Nouveau flag CLI <code>--lpf-transition</code> pour tuner la transition.</li>
+    <li>Nouveau flag CLI <code>--multipath</code> pour ajouter du <strong>vrai</strong> multipath RF (format JSON liste de paths). Ne pas confondre avec l'instrumental qui est désormais couvert par le LPF.</li>
+</ul>
+
+<div class="callout">
+    <strong>Impact sur les sweeps existants :</strong> les <code>results/snr_sweep_2x_*</code> ont été calculés avec l'ancien défaut 400 Hz. Ils sont optimistes — la sim sous-estime le smearing FM. À refaire avec le nouveau défaut pour avoir des SNR réalistes.
+</div>
 
 <!-- ============================================================== -->
 <h2 id="repro">9. Outils de reproduction</h2>

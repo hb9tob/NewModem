@@ -22,8 +22,10 @@ Usage :
 """
 
 import argparse
+import json
 import math
 import os
+import sys
 import numpy as np
 import scipy.signal
 import wave
@@ -37,6 +39,13 @@ SUB_AUDIO_HPF = 300.0   # filtre CTCSS du transceiver (Hz)
 POST_LPF = 2000.0       # LPF audio du transceiver. Mesures OTA montrent
                         # degradation forte des que BW signal > 1500 Hz
                         # (Rs > 1200 Bd). Ancienne valeur 2400 Hz trop large.
+POST_LPF_TRANSITION_HZ = 100.0  # Bande de transition du LPF audio post-demod.
+                                # 2026-05-15: ramene de 400 a 100 Hz pour
+                                # matcher le delay-spread d50 ~ 11 ms observe
+                                # sur sondeur Golay FT-991A -> SDRplay
+                                # (cf docs/sounder_echo_audit.html). Filtre
+                                # plus etroit = plus de group delay = plus
+                                # de ringing instrumental.
 POST_GAIN_DB = -6.5     # gain audio fixe (chaine acquisition reelle)
 TX_HARD_CLIP = 0.55     # hard-clip audio avant FM (limiteur d'excursion).
                         # Calibre OTA : 32QAM 750 Bd a BER 5e-5 a -6 dB (peak
@@ -157,7 +166,8 @@ def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
 
 
 def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
-             post_lpf=POST_LPF, post_gain_db=POST_GAIN_DB,
+             post_lpf=POST_LPF, post_lpf_transition_hz=POST_LPF_TRANSITION_HZ,
+             post_gain_db=POST_GAIN_DB,
              drift_ppm=DRIFT_PPM, thermal_ppm=DRIFT_THERMAL_PPM,
              thermal_period_s=DRIFT_THERMAL_PERIOD_S,
              tx_hard_clip=TX_HARD_CLIP,
@@ -235,11 +245,16 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
             mp_delays.append(blocks.delay(gr.sizeof_gr_complex, n_delay))
             mp_gains.append(blocks.multiply_const_cc(complex(complex_gain)))
 
-    # Post-demod audio LPF pour emuler le filtre audio du RX reel
+    # Post-demod audio LPF pour emuler le filtre audio du RX reel.
+    # La transition band determine la pente du filtre et donc le group
+    # delay = le ringing instrumental. Mesures OTA Golay 2026-05-15:
+    # transition=100 Hz produit d50 ~ 10-15 ms (matche FT-991A/SDRplay);
+    # transition=400 Hz (ancien defaut) produit d50 < 1 ms (sim trop
+    # optimiste).
     use_post_lpf = post_lpf and post_lpf > 0
     if use_post_lpf:
         lpf_taps = gr_filter.firdes.low_pass(
-            1.0, AUDIO_RATE, post_lpf, 400.0)
+            1.0, AUDIO_RATE, post_lpf, post_lpf_transition_hz)
         post_lpf_blk = gr_filter.fir_filter_fff(1, lpf_taps)
 
     # Gain audio fixe (calibration chaine)
@@ -336,7 +351,30 @@ def main():
                     help="Random-walk phase noise std (rad/sqrt(s)). "
                          "0.05=FTX-1+soundcard, 0.15=SDRplay LO. "
                          f"Defaut {PHASE_WALK_RAD_PER_SQRT_S}")
+    ap.add_argument("--lpf-transition", type=float,
+                    default=POST_LPF_TRANSITION_HZ,
+                    help=f"Bande transition LPF audio post-demod (Hz). "
+                         f"Defaut {POST_LPF_TRANSITION_HZ:.0f} Hz (calibre "
+                         f"FT-991A/SDRplay, donne d50 ~ 11 ms). 400 Hz = "
+                         f"ancien defaut sim, d50 sub-ms (trop optimiste).")
+    ap.add_argument("--multipath", type=str, default=None,
+                    help='Multipath RF au format JSON: list of '
+                         '[delay_s, amp_dB, phase_rad]. Premier = trajet '
+                         'direct (typ. [0,0,0]). Modelise du multipath '
+                         'reel (echos RF). NB: pour simuler le ringing '
+                         "instrumental audio (d50 ~ 11 ms FT-991A), c'est "
+                         '--lpf-transition (100 Hz par defaut) qui fait '
+                         "le travail, pas multipath. Ex pour ajouter un "
+                         'echo VHF lointain: '
+                         '--multipath \'[[0,0,0],[500e-6,-15,0.7]]\'.')
     args = ap.parse_args()
+    multipath = None
+    if args.multipath:
+        try:
+            multipath = [tuple(p) for p in json.loads(args.multipath)]
+        except (ValueError, TypeError) as e:
+            print(f"ERROR: --multipath parse failed: {e}", file=sys.stderr)
+            return 1
 
     audio_in, sr = load_wav(args.input_wav)
     if sr != AUDIO_RATE:
@@ -345,12 +383,14 @@ def main():
 
     audio_out = simulate(audio_in, if_noise_voltage=args.if_noise,
                          sub_audio_hpf=args.hpf,
+                         post_lpf_transition_hz=args.lpf_transition,
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,
                          tx_hard_clip=args.tx_clip,
                          audio_noise_rms=args.audio_noise,
                          phase_walk_rad_per_sqrt_s=args.phase_walk,
+                         multipath_paths=multipath,
                          start_delay_s=args.start_delay,
                          rng_seed=args.seed)
 
