@@ -274,6 +274,16 @@ pub struct Rx2xSession {
     /// drained at cycle end by `refine_cycle_and_turbo_redecode` to
     /// drive the turbo redecode pass. Reset on backward-fix.
     cycle_failed_cws: Vec<FailedCwInfo>,
+
+    /// Diagnostic: PLHEADER LS-gain phase at each validated PLHEADER
+    /// (`(sof_at_abs, arg(gain))`). After the audio_buffer cubic resample
+    /// at `cached_drift_ppm`, the carrier should be stationary so this
+    /// trajectory should be flat. Its OLS slope versus
+    /// `sof_at_abs / symbol_rate` reports the residual drift the per-CW
+    /// pilots have to absorb — the gap between `cached_drift_ppm` and
+    /// the true clock offset. Logged in `emit_finalised` under
+    /// `RX2X_LOG_PILOT_TRACK=1`.
+    plheader_phases: Vec<(u64, f64)>,
 }
 
 /// Per-failed-CW state captured at cycle end for the turbo redecode.
@@ -367,6 +377,7 @@ impl Rx2xSession {
             n_drift_resets: 0,
             cycle_phase_obs: Vec::new(),
             cycle_failed_cws: Vec::new(),
+            plheader_phases: Vec::new(),
         }
     }
 
@@ -494,6 +505,8 @@ impl Rx2xSession {
         // rebuild them with corrected sample timing.
         self.cycle_phase_obs.clear();
         self.cycle_failed_cws.clear();
+        // Diagnostic: drop stale PLHEADER-phase entries; new pass refills.
+        self.plheader_phases.clear();
         // Note: total_cws / converged_cws / data_cws_* / cw_bytes /
         // app_header are NOT cleared. Already-known ESIs are detected
         // by drive_locked (esi_known_before) and skipped for counter
@@ -622,11 +635,28 @@ impl Rx2xSession {
         }
         let plheader_slice = &self.sym_buffer[rel..rel + PLHEADER_LEN_SYM];
         match decode_plheader_at(plheader_slice, self.cfg.family) {
-            Some((pls, _gain)) => {
+            Some((pls, gain)) => {
                 self.pls_anchors.push((sof_at_abs, pls));
                 if pls.flags & FLAG2X_EOT != 0 {
                     self.eot_seen = true;
                 }
+                // Diagnostic: track post-resample residual drift via PLHEADER
+                // gain phase. After the cubic resample at cached_drift_ppm,
+                // the carrier should be stationary; any remaining slope of
+                // arg(gain) vs sof_at_abs is the residual drift the pilots
+                // would need to absorb. Emit one line per validated cycle.
+                if std::env::var_os("RX2X_LOG_PILOT_TRACK").is_some() {
+                    eprintln!(
+                        "[rx2x-track] cycle={} sof_abs={} arg(gain)={:+.4} rad \
+                         |gain|={:.3} cached_drift={:+.3} ppm",
+                        self.pls_anchors.len() - 1,
+                        sof_at_abs,
+                        gain.arg(),
+                        gain.norm(),
+                        self.cached_drift_ppm,
+                    );
+                }
+                self.plheader_phases.push((sof_at_abs, gain.arg()));
                 self.state = Rx2xState::Locked {
                     cycle_idx: 0,
                     anchor_sof_abs: sof_at_abs,
@@ -1442,6 +1472,81 @@ impl Rx2xSession {
         } else {
             None
         };
+
+        // Diagnostic — residual drift from PLHEADER LS-gain phase
+        // trajectory. After the audio cubic resample at cached_drift_ppm,
+        // the carrier should be stationary; any remaining slope of
+        // arg(gain) vs t (seconds) gives ω_residual = 2π·fc·ε_residual,
+        // so ε_residual_ppm = slope / (2π·fc) × 1e6. The order of
+        // magnitude of this residual tells us how much fine timing
+        // tracking the per-CW pilots are silently absorbing — that's
+        // the gap the user noticed between cached_drift_ppm and the
+        // true clock offset.
+        if std::env::var_os("RX2X_LOG_PILOT_TRACK").is_some()
+            && self.plheader_phases.len() >= 3
+        {
+            // Unwrap the phase trajectory in time order.
+            let mut unwrapped: Vec<f64> =
+                Vec::with_capacity(self.plheader_phases.len());
+            let mut last = self.plheader_phases[0].1;
+            unwrapped.push(last);
+            for &(_, p) in self.plheader_phases.iter().skip(1) {
+                let mut dp = p - last;
+                while dp > std::f64::consts::PI {
+                    dp -= 2.0 * std::f64::consts::PI;
+                }
+                while dp < -std::f64::consts::PI {
+                    dp += 2.0 * std::f64::consts::PI;
+                }
+                last += dp;
+                unwrapped.push(last);
+            }
+            let sr = self.cfg.base.symbol_rate;
+            let fc = self.cfg.base.center_freq_hz;
+            let t0 = self.plheader_phases[0].0 as f64 / sr;
+            let n = unwrapped.len() as f64;
+            let mean_t = self
+                .plheader_phases
+                .iter()
+                .map(|&(a, _)| a as f64 / sr - t0)
+                .sum::<f64>()
+                / n;
+            let mean_y = unwrapped.iter().sum::<f64>() / n;
+            let (mut num, mut den) = (0.0_f64, 0.0_f64);
+            for (i, &(a, _)) in self.plheader_phases.iter().enumerate() {
+                let dx = (a as f64 / sr - t0) - mean_t;
+                let dy = unwrapped[i] - mean_y;
+                num += dx * dy;
+                den += dx * dx;
+            }
+            let total_span = (self.plheader_phases.last().unwrap().0 as f64
+                - self.plheader_phases[0].0 as f64)
+                / sr;
+            if den > 1e-9 {
+                let slope_rad_per_s = num / den;
+                let eps_residual_ppm =
+                    slope_rad_per_s / (2.0 * std::f64::consts::PI * fc) * 1e6;
+                eprintln!(
+                    "[rx2x-track-final] {} PLHEADERs over {:.2} s, \
+                     phase walk [{:+.3}, {:+.3}] rad (Δ={:+.3} rad), \
+                     LS slope={:+.5} rad/s → residual_drift={:+.3} ppm \
+                     (cached_drift={:+.3} ppm)",
+                    self.plheader_phases.len(),
+                    total_span,
+                    unwrapped[0],
+                    unwrapped.last().unwrap(),
+                    unwrapped.last().unwrap() - unwrapped[0],
+                    slope_rad_per_s,
+                    eps_residual_ppm,
+                    self.cached_drift_ppm,
+                );
+            } else {
+                eprintln!(
+                    "[rx2x-track-final] {} PLHEADERs, span too short for LS",
+                    self.plheader_phases.len(),
+                );
+            }
+        }
         // RaptorQ assembly if app_header recovered.
         if let Some(ref h) = self.app_header {
             if !self.payload_assembled {
