@@ -383,17 +383,94 @@ amplitude TX = balayage 0.022 → 0.700 (11 niveaux par capture)
 <h2 id="sim-calib">10. Adaptation du simulateur de canal</h2>
 
 <p>
-    Le simulateur <code>study/nbfm_channel_sim.py</code> sous-estimait le smearing instrumental — l'ancien défaut <code>POST_LPF_TRANSITION = 400 Hz</code> donnait d50 sub-ms, alors que la mesure OTA donne d50 ~ 11 ms. Changements 2026-05-15 :
+    Le simulateur <code>study/nbfm_channel_sim.py</code> a été étendu pour permettre la calibration contre les mesures OTA. Changements 2026-05-15 :
 </p>
 
 <ul>
-    <li><code>POST_LPF_TRANSITION_HZ = 100 Hz</code> nouveau défaut (était 400). Filtre FIR ~4× plus étroit → group delay ~20 ms, IR d50 ~ 5-15 ms. Matches l'OTA bench.</li>
-    <li>Nouveau flag CLI <code>--lpf-transition</code> pour tuner la transition.</li>
-    <li>Nouveau flag CLI <code>--multipath</code> pour ajouter du <strong>vrai</strong> multipath RF (format JSON liste de paths). Ne pas confondre avec l'instrumental qui est désormais couvert par le LPF.</li>
+    <li>Nouveau flag CLI <code>--lpf-transition</code> pour tuner la transition du LPF post-demod (défaut maintenu à <code>400 Hz</code> car la transition seule ne reproduit pas le d50 observé OTA — voir §10.1).</li>
+    <li>Nouveau flag CLI <code>--multipath</code> au format JSON pour injecter du vrai multipath RF (au niveau IF).</li>
+    <li>Nouveau flag CLI <code>--ota-ir-from-signature</code> qui charge l'IR mesurée par le sondeur depuis un <code>signature.json</code> et la convolue avec la sortie audio du sim (avec post-LPF interne désactivé).</li>
+    <li>Helper Python <code>load_ir_from_signature()</code> exposé depuis <code>nbfm_channel_sim</code>.</li>
+    <li>Snr_sweep_2x.py expose maintenant <code>--thermal-ppm</code>, <code>--thermal-period</code>, <code>--multipath</code>, <code>--ota-ir-from-signature</code>.</li>
 </ul>
 
+<h3 id="calib-attempts">10.1 Tentatives de calibration et leurs limites</h3>
+
+<p>
+    Trois approches testées pour aligner la sim avec le d50 ≈ 11 ms observé OTA :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Approche</th><th>d50 sim résultant</th><th>Verdict</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>FIR LPF transition 40-400 Hz</td>
+            <td class="num">~300 µs</td>
+            <td>Insuffisant. Le FIR est symétrique → moitié smearing avant peak, moitié après. measure_golay ne voit que le post-peak.</td>
+        </tr>
+        <tr>
+            <td>IIR Butterworth causal (ordre 4-12) à 1800-2400 Hz</td>
+            <td class="num">~300 µs</td>
+            <td>Aussi insuffisant. Le group delay IIR à 2 kHz reste sub-ms.</td>
+        </tr>
+        <tr>
+            <td>Convolution avec IR magnitude du sondeur (<code>--ota-ir-from-signature</code>)</td>
+            <td class="num">~19 ms</td>
+            <td>Trop long (overshoot) ET signal totalement détruit. L'IR magnitude utilisée comme FIR réel est dégénérée (filtre passe-bas extrême avec interférences destructives). V3 ne décode plus du tout.</td>
+        </tr>
+    </tbody>
+</table>
+
 <div class="callout">
-    <strong>Impact sur les sweeps existants :</strong> les <code>results/snr_sweep_2x_*</code> ont été calculés avec l'ancien défaut 400 Hz. Ils sont optimistes — la sim sous-estime le smearing FM. À refaire avec le nouveau défaut pour avoir des SNR réalistes.
+    <strong>Pour reconstruire un FIR utilisable depuis l'IR mesurée</strong>, il faut soit (a) sauver la full IR complexe côté Rust (modifier <code>probe_analyze.rs</code> pour conserver le résultat de la cross-corrélation complexe en plus du magnitude), soit (b) faire une reconstruction minimum-phase depuis le magnitude (<code>scipy.signal.minimum_phase</code>). Travail séparé non fait dans cette passe.
+</div>
+
+<h3 id="real-validation">10.2 Le vrai critère de validation : σ² post-demod</h3>
+
+<div class="callout ok">
+    <strong>Conclusion :</strong> tenter de matcher le d50 du sondeur est un faux problème, parce qu'une grosse partie du d50 OTA vient du <em>ringing audio de la chaîne RX</em>, pas d'un canal RF qu'on devrait modéliser au niveau IF dans le sim. Le critère qui détermine si V3 peut décoder est le <strong>σ² post-démodulation</strong>, pas la forme exacte de l'IR.
+</div>
+
+<p>
+    Le sim baseline (sans <code>--multipath</code> ni <code>--ota-ir-from-signature</code>, juste avec drift + thermal calibrés) reproduit le σ² OTA :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Profil V3</th><th>σ² sim (if_noise=0.20)</th><th>σ² OTA mémoire</th><th>Décode</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>HIGH</code> (16-APSK 3/4)</td><td class="num">0.010</td><td class="num">~0.010</td><td>✓</td></tr>
+        <tr><td><code>HIGH+</code> (32-APSK 3/4)</td><td class="num">0.012</td><td class="num">~0.011</td><td>✓</td></tr>
+        <tr><td><code>HIGH++</code> (64-APSK 3/4)</td><td class="num">0.009</td><td class="num">~0.011</td><td>✓</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Conditions du test : <code>--family legacy --drift-ppm 30 --thermal-ppm 5 --thermal-period 120 --payload-bytes 10000</code>. Cf <code>results/v3_validation_30ppm_thermal/</code>.
+</p>
+
+<h3 id="anti-pattern">10.3 Anti-pattern : injecter l'echo sondeur comme multipath IF</h3>
+
+<p>
+    Test : <code>--multipath '[[0,0,0],[17e-3,-5,0.7]]'</code> avec drift 30 ppm + thermal :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Profil V3</th><th>σ² sim</th><th>Décode</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>HIGH</code></td><td class="num">0.032</td><td>✓ (marginal)</td></tr>
+        <tr><td><code>HIGH+</code></td><td class="num">0.048</td><td><strong>✗ FAIL</strong></td></tr>
+        <tr><td><code>HIGH++</code></td><td class="num">0.062</td><td><strong>✗ FAIL</strong></td></tr>
+    </tbody>
+</table>
+
+<div class="callout danger">
+    Or, V3 HIGH+ et HIGH++ <strong>décodent OTA</strong> dans ces conditions. Donc soit le -5 dBc echo est inexact (= l'artefact qu'on a identifié), soit il représente un phénomène non-RF qu'on ne peut pas modéliser au niveau IF. Conclusion : ne pas utiliser <code>strongest_echo_dbc</code> comme entrée du flag <code>--multipath</code> pour des chaînes en bench loopback ou indoor. Pour du vrai multipath VHF/UHF (lointain, longue propagation), le flag est utile.
 </div>
 
 <!-- ============================================================== -->
