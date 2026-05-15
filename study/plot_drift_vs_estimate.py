@@ -62,7 +62,7 @@ def main():
     colors = {p: c for p, c in zip(
         profiles, ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"])}
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    fig, ax = plt.subplots(figsize=(9, 7))
     # Ideal y=x reference
     inj_all = sorted(set(r["injected"] for r in rows))
     if inj_all:
@@ -70,27 +70,46 @@ def main():
         hi = max(inj_all) + 5
         ax.plot([lo, hi], [lo, hi], "k--", alpha=0.5, label="y = x (idéal)")
 
+    # Treat NaN estimated as "below detection threshold" — plot as
+    # zero (since cached_drift_ppm stays at 0 in that case, which IS
+    # what the decoder uses for resampling).
+    def est_for_plot(r):
+        e = r["estimated"]
+        if isinstance(e, float) and np.isnan(e):
+            return 0.0
+        return e
+
     # Scatter per profile, distinguish exact-decode (filled) vs failed (hollow)
     for p in profiles:
         ok = [r for r in rows if r["profile"] == p and r["exact"]]
         ko = [r for r in rows if r["profile"] == p and not r["exact"]]
         if ok:
             ax.scatter([r["injected"] for r in ok],
-                       [r["estimated"] for r in ok],
+                       [est_for_plot(r) for r in ok],
                        c=colors[p], marker="o", s=70, label=f"{p} ✓",
                        edgecolors="black", linewidth=0.5)
         if ko:
             ax.scatter([r["injected"] for r in ko],
-                       [r["estimated"] for r in ko],
+                       [est_for_plot(r) for r in ko],
                        c="none", marker="o", s=70,
                        edgecolors=colors[p], linewidth=2.0,
                        label=f"{p} ✗ (decode failed)")
 
+    # Annotate detection threshold zone
+    if inj_all:
+        ax.axhspan(-0.5, 0.5, color="orange", alpha=0.15)
+        ax.text(0.98, 0.02, "estimated=0 → below detection threshold\n"
+                            "(integer-quantization limit ≈ 25-50 ppm)",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=8, color="#bf5f2b",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff4eb",
+                          edgecolor="#bf5f2b", alpha=0.8))
+
     ax.set_xlabel("Drift injecté par sim (ppm)")
-    ax.set_ylabel("Drift estimé par 2x RX (ppm)")
+    ax.set_ylabel("Drift estimé par 2x RX (cached_drift_ppm, ppm)")
     ax.set_title(args.title)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=9)
+    ax.legend(loc="upper left", fontsize=9)
     ax.axhline(0, color="gray", lw=0.5)
     ax.axvline(0, color="gray", lw=0.5)
     plt.tight_layout()
