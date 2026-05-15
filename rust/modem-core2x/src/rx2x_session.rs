@@ -64,8 +64,7 @@ use crate::plheader::{
 };
 use crate::profile2x::ModemConfig2x;
 use crate::rx_v4::{
-    decode_one_cw, equalize_symbols_per_cycle, estimate_drift_from_sof_positions,
-    find_all_sofs, find_next_sof, RxResult2x,
+    decode_one_cw, equalize_symbols_per_cycle, find_next_sof, RxResult2x,
 };
 
 /// Soft cap on the symbol buffer the session retains. ≈ 43 s @ HIGH+2X
@@ -194,8 +193,10 @@ pub struct Rx2xSession {
     /// Next absolute symbol index to scan for SOF in Idle / Locked
     /// (between cycles).
     scan_cursor_abs: u64,
-    /// Symbol-rate drift in ppm, bootstrapped from ≥ 2 SOF positions
-    /// via `estimate_drift_from_sof_positions`. Applied as a cubic
+    /// Symbol-rate drift in ppm, bootstrapped from ≥ 2 PLS-validated SOF
+    /// positions refined to sub-audio-sample precision via parabolic peak
+    /// fit on the matched-filter Chu correlation (see
+    /// [`Rx2xSession::estimate_drift_from_raw`]). Applied as a cubic
     /// resample of `audio_buffer` before `audio_to_symbols`.
     cached_drift_ppm: f64,
 
@@ -919,21 +920,53 @@ impl Rx2xSession {
     /// oscillation : the corrected stream's SOFs are already at the
     /// expected cycle period, so estimate would return ~0 ppm and the
     /// cache would flip back to 0 every chunk.
-    /// Re-estimate the clock drift from the RAW audio and update
-    /// `cached_drift_ppm` if the new value differs by ≥ 0.5 ppm from
-    /// the cache. Returns `true` if the cache was updated, `false`
-    /// otherwise (insufficient SOFs, LS-fit degenerate, or below
-    /// threshold). The caller uses the boolean to decide whether to
-    /// invalidate the FSM state (`reset_for_backward_fix`).
+    ///
+    /// **Audio-rate parabolic refinement** (mirrors V3 `estimate_drift_gardner`).
+    /// PLHEADERs are 4 s apart so a typical 25-s burst gives only 3-7 SOFs.
+    /// Integer-symbol LS on so few points has resolution
+    /// `1 / (n × cycle_period_sym) ≈ 25-50 ppm` — useless for the
+    /// audio_buffer's cubic resample. Audio-rate parabolic peak refinement
+    /// on the matched-filter output gives ~0.1 audio-sample precision on
+    /// each SOF, which over the burst's audio span (≈ 5 × cycle_period_sym ×
+    /// sps audio samples) yields ~0.5-1 ppm — enough for the cubic
+    /// resample to actually cancel the symbol-clock drift cleanly.
+    ///
+    /// Re-estimate the clock drift and update `cached_drift_ppm` if the
+    /// new value differs by ≥ 0.5 ppm from the cache. Returns `true` if
+    /// the cache was updated, `false` otherwise (insufficient SOFs, LS
+    /// degenerate, or below threshold). Caller uses the boolean to decide
+    /// whether to invalidate the FSM state (`reset_for_backward_fix`).
     fn estimate_drift_from_raw(&mut self) -> bool {
-        // Build a one-shot RAW symbol stream (no drift correction) and
-        // estimate drift from its CRC-validated SOF positions.
-        let raw_syms = match audio_to_symbols(&self.audio_buffer, &self.cfg) {
-            Ok(s) => s,
+        // Step 1: compute the audio-rate matched-filter output once and
+        // share it between the symbol-rate SOF scan and the audio-rate
+        // parabolic refinement that follows. (audio_to_symbols computes
+        // mf internally but discards it.)
+        let (sps, _pitch) = match rrc::check_integer_constraints(
+            AUDIO_RATE,
+            self.cfg.base.symbol_rate,
+            self.cfg.base.tau,
+        ) {
+            Ok(v) => v,
             Err(_) => return false,
         };
+        let taps = rrc_taps(self.cfg.base.beta, RRC_SPAN_SYM, sps);
+        let bb = demodulator::downmix(&self.audio_buffer, self.cfg.base.center_freq_hz);
+        let mf = demodulator::matched_filter(&bb, &taps);
+        let phase = best_symbol_phase_sof(&mf, sps, &self.cfg);
+        let n_syms = mf.len().saturating_sub(phase) / sps;
+        if n_syms < SOF_LEN_SYM {
+            return false;
+        }
+
+        // Step 2: integer-symbol stream + PLS-validated SOF detection
+        // (same logic as the legacy path; needed to filter false-positive
+        // Chu peaks before we trust them for sub-sample refinement).
+        let mut raw_syms: Vec<Complex64> = Vec::with_capacity(n_syms);
+        for k in 0..n_syms {
+            raw_syms.push(mf[phase + k * sps]);
+        }
         let min_skip = (self.cycle_period_sym / 2).max(SOF_LEN_SYM);
-        let mut sof_positions: Vec<usize> = Vec::new();
+        let mut sym_positions: Vec<usize> = Vec::new();
         let mut scan = 0;
         while let Some(pos) = find_next_sof(&raw_syms, scan, self.cfg.family) {
             if pos + PLHEADER_LEN_SYM > raw_syms.len() {
@@ -941,23 +974,102 @@ impl Rx2xSession {
             }
             let plheader_slice = &raw_syms[pos..pos + PLHEADER_LEN_SYM];
             if decode_plheader_at(plheader_slice, self.cfg.family).is_some() {
-                sof_positions.push(pos);
+                sym_positions.push(pos);
                 scan = pos + min_skip;
             } else {
                 scan = pos + 1;
             }
         }
-        if sof_positions.len() < 2 {
+        if sym_positions.len() < 2 {
             return false;
         }
-        let new_drift = match estimate_drift_from_sof_positions(
-            &sof_positions,
-            self.cycle_period_sym,
-        ) {
-            Some(p) => p,
-            None => return false,
+
+        // Step 3: refine each PLS-validated SOF position to sub-audio-
+        // sample precision via parabolic peak fit on the audio-rate Chu
+        // correlation magnitude. Search window is ±sps audio samples
+        // around the integer-symbol expected position (the audio peak
+        // lies within ±1 symbol of that integer position by construction).
+        let sof = sof_for_family(self.cfg.family);
+        let n_sof_audio = SOF_LEN_SYM * sps;
+        let max_pos = mf.len().saturating_sub(n_sof_audio);
+        let corr_at = |pos: usize| -> f64 {
+            if pos > max_pos {
+                return 0.0;
+            }
+            let mut acc = Complex64::new(0.0, 0.0);
+            for (k, &s) in sof.iter().enumerate() {
+                acc += mf[pos + k * sps] * s.conj();
+            }
+            acc.norm()
         };
-        // Update cache absolutely (replace with raw-estimated value).
+        let win = sps as i64;
+        let mut audio_positions: Vec<f64> = Vec::with_capacity(sym_positions.len());
+        for &sp in &sym_positions {
+            let expected_audio = phase as i64 + (sp as i64) * (sps as i64);
+            let lo = (expected_audio - win).max(0) as usize;
+            let hi = ((expected_audio + win).max(0) as usize).min(max_pos);
+            if hi <= lo {
+                continue;
+            }
+            let mut best = lo;
+            let mut best_mag = 0.0_f64;
+            for p in lo..=hi {
+                let m = corr_at(p);
+                if m > best_mag {
+                    best_mag = m;
+                    best = p;
+                }
+            }
+            let refined = if best == 0 || best + 1 > max_pos {
+                best as f64
+            } else {
+                let m0 = corr_at(best - 1);
+                let m1 = corr_at(best);
+                let m2 = corr_at(best + 1);
+                let denom = m0 - 2.0 * m1 + m2;
+                if denom >= -1e-12 {
+                    best as f64
+                } else {
+                    let delta = 0.5 * (m0 - m2) / denom;
+                    best as f64 + delta.clamp(-1.0, 1.0)
+                }
+            };
+            audio_positions.push(refined);
+        }
+        if audio_positions.len() < 2 {
+            return false;
+        }
+
+        // Step 4: LS slope of refined audio positions vs cycle index.
+        // Each SOF should sit at p0 + k · cycle_audio at zero drift, so
+        // the slope of (y vs k) gives the measured audio-cycle period;
+        // ppm = (slope / cycle_audio − 1) × 1e6. Same outlier-rejection
+        // tolerance as `estimate_drift_from_sof_positions` (10 % of a
+        // cycle) but applied in audio space.
+        let p0 = audio_positions[0];
+        let cycle_audio = (self.cycle_period_sym * sps) as f64;
+        let tolerance = cycle_audio * 0.10;
+        let mut sum_xy = 0.0_f64;
+        let mut sum_xx = 0.0_f64;
+        let mut n_used = 0_usize;
+        for &p in &audio_positions {
+            let y = p - p0;
+            let k = (y / cycle_audio).round();
+            if (y - k * cycle_audio).abs() > tolerance {
+                continue;
+            }
+            sum_xy += k * y;
+            sum_xx += k * k;
+            n_used += 1;
+        }
+        if n_used < 2 || sum_xx < 1.0 {
+            return false;
+        }
+        let slope = sum_xy / sum_xx;
+        let new_drift = (slope - cycle_audio) / cycle_audio * 1e6;
+        if !new_drift.is_finite() || new_drift.abs() > 300.0 {
+            return false;
+        }
         // Threshold guards against jitter when the same set of SOFs
         // gives slightly different LS fits between chunks.
         if (new_drift - self.cached_drift_ppm).abs() < 0.5 {
@@ -965,8 +1077,8 @@ impl Rx2xSession {
         }
         if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
             eprintln!(
-                "[rx2x-drift] sofs={} cached={:+.2} → new={:+.2} ppm",
-                sof_positions.len(),
+                "[rx2x-drift] sofs={} (audio-rate refined) cached={:+.2} → new={:+.2} ppm",
+                audio_positions.len(),
                 self.cached_drift_ppm,
                 new_drift,
             );
