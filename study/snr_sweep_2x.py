@@ -245,6 +245,14 @@ def main() -> int:
                     help="Clock drift applied by the channel sim (default 0 "
                          "to isolate the SNR variable; pass -16 to reproduce "
                          "the calibrated sound-card drift)")
+    ap.add_argument("--thermal-ppm", type=float, default=0.0,
+                    help="Amplitude (peak) of thermal drift oscillation in "
+                         "ppm. Drift becomes drift_ppm + thermal_ppm * "
+                         "sin(2π·t/period). Default 0 (disabled).")
+    ap.add_argument("--thermal-period", type=float, default=120.0,
+                    help="Period of thermal drift oscillation in seconds. "
+                         "Default 120 s (matches typical sound-card "
+                         "thermal time constant).")
     ap.add_argument("--tx-clip", type=float, default=None,
                     help="Override the channel sim's TX hard-clip threshold "
                          "(default from nbfm_channel_sim = 0.55). Pass 0 to "
@@ -270,7 +278,11 @@ def main() -> int:
         f.write(payload)
     print(f"Payload: {args.payload_bytes} bytes, seed=0x{args.seed:X} → {payload_path}")
     print(f"Profiles: {args.profiles}")
-    print(f"IF noises: {args.if_noises}  (drift={args.drift_ppm:+.1f} ppm)")
+    drift_desc = f"drift={args.drift_ppm:+.1f} ppm"
+    if args.thermal_ppm > 0:
+        drift_desc += (f" + thermal ±{args.thermal_ppm:.1f} ppm "
+                       f"/ {args.thermal_period:.0f} s")
+    print(f"IF noises: {args.if_noises}  ({drift_desc})")
 
     csv_path = os.path.join(args.out_dir, "results.csv")
     with open(csv_path, "w") as csv_f:
@@ -304,6 +316,8 @@ def main() -> int:
                 sim_kwargs = dict(
                     if_noise_voltage=if_noise,
                     drift_ppm=args.drift_ppm,
+                    thermal_ppm=args.thermal_ppm,
+                    thermal_period_s=args.thermal_period,
                     phase_walk_rad_per_sqrt_s=phase_walk,
                     start_delay_s=0.5,
                     rng_seed=args.seed + int(if_noise * 1000)
