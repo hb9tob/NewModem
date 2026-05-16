@@ -536,15 +536,45 @@ pub fn rx_v2(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
 /// Gardner is sub-ppm accurate) to skip it. OPEN windows on cold start
 /// still benefit from the fast-path so its caller should keep
 /// `allow_fast_path = true` there.
-/// "Clean enough to stop trying alternative drift hypotheses" predicate.
-/// True when at least one segment was decoded AND ≥99 % of LDPC codewords
-/// converged. Promoted from a closure to a free function so that worker
-/// threads in the parallel safety grid (aarch64) can call it without
-/// capturing across thread boundaries.
+/// LOOSE convergence check — at least one segment decoded AND ≥99 %
+/// of LDPC codewords converged. Used to gate the Axis-1 fast-path skip
+/// (rx_v2_with_options : when Gardner's hint-decoded result clears
+/// this bar, the 0-ppm fast-path is redundant and the lowpower CLOSED
+/// path drops it). Promoted from a closure to a free function so
+/// worker threads in the parallel safety grid (aarch64) can call it
+/// without capturing across thread boundaries.
 fn is_clean(r: &RxV2Result) -> bool {
     r.total_blocks > 0
         && r.converged_blocks * 100 >= r.total_blocks * 99
         && r.segments_decoded > 0
+}
+
+/// STRICT convergence check for the parallel grid early-exit. Requires :
+///   - 100 % of attempted LDPC codewords converged (NOT 99 %) — a
+///     single CW failure means the cell didn't perfectly equalise the
+///     drifted samples and we should keep trying the other cells.
+///   - no segment marker was lost (`segments_lost == 0`) — if a
+///     marker slid out of position, the cell's drift hypothesis is
+///     mis-aligned even though the survivor segments may have decoded
+///     cleanly.
+///   - at least one **DATA** CW was recovered (`data_blocks_recovered
+///     > 0`) — guards against the meta-only-converged edge case where
+///     `total=converged=1` because the META marker passed CRC but every
+///     DATA marker failed (or because the decode window was cut short
+///     right after the meta segment). The loose [`is_clean`] would
+///     return true in that case ; here we explicitly require some
+///     PAYLOAD to have decoded before we stop trying alternative drifts.
+///
+/// Kept distinct from [`is_clean`] so the Axis-1 fast-path gate keeps
+/// its original 99 % tolerance (preserves the perf gain measured in
+/// `rx_v2_with_options_skips_fast_path_when_gardner_clean`) while the
+/// grid only short-circuits on a payload-complete decode.
+fn is_fully_clean(r: &RxV2Result) -> bool {
+    r.segments_decoded > 0
+        && r.segments_lost == 0
+        && r.data_blocks_recovered > 0
+        && r.total_blocks > 0
+        && r.converged_blocks == r.total_blocks
 }
 
 pub fn rx_v2_with_options(
@@ -629,9 +659,14 @@ pub fn rx_v2_with_options(
     //    aarch64 (Pi 4 quad-core): execute the 6 candidates in two
     //    parallel batches of 4 + 2 via `std::thread::scope` ; an
     //    `AtomicBool` cancel flag lets the first batch-mate that
-    //    converges cleanly bail out the other workers at their next
-    //    checkpoint inside `rx_v2_single_cancellable` (post-FFE +
-    //    per-codeword). Batch 1 lists the small-delta cells first to
+    //    PAYLOAD-cleanly converges bail out the other workers at their
+    //    next checkpoint inside `rx_v2_single_cancellable` (post-FFE +
+    //    per-codeword). Early-exit uses the STRICT [`is_fully_clean`]
+    //    predicate (100 % CW convergence + no segment lost + ≥1 data
+    //    CW recovered) -- the loose [`is_clean`] would falsely fire on
+    //    meta-only decodes (total=converged=1 because only the META
+    //    marker passed CRC) and kill siblings before any data was
+    //    recovered. Batch 1 lists the small-delta cells first to
     //    maximise the chance of an early exit before batch 2 spawns.
     //
     //    Other arches keep the sequential loop verbatim ; the historical
@@ -663,7 +698,14 @@ pub fn rx_v2_with_options(
                                         &cfg,
                                         Some(cancel_ref),
                                     )?;
-                                    if is_clean(&r) {
+                                    // Use the STRICT predicate here, not
+                                    // the loose `is_clean` : we only kill
+                                    // sibling workers when a cell produced
+                                    // a payload-complete decode (all CWs
+                                    // converged, no segment lost, at least
+                                    // one data CW recovered). See
+                                    // `is_fully_clean` rationale.
+                                    if is_fully_clean(&r) {
                                         cancel_ref.store(true, Ordering::Relaxed);
                                     }
                                     Some((score_result(&r), r, ppm))
@@ -677,7 +719,7 @@ pub fn rx_v2_with_options(
                     });
                 let mut found_clean = false;
                 for (s, r, ppm) in entries {
-                    if is_clean(&r) {
+                    if is_fully_clean(&r) {
                         found_clean = true;
                     }
                     if s > best_score {
@@ -3253,6 +3295,107 @@ mod tests {
         // hostile channel. Decode success is not required ; some grid
         // cells may all fail, that's by design.
         let _ = rx_v2_with_options(&noisy, &config, true, true);
+    }
+
+    /// Regression test for the 0.10.36 fix : `is_fully_clean` must
+    /// REJECT a meta-only decode (`total=converged=1` because only the
+    /// META marker passed CRC and its CW converged). Under the loose
+    /// `is_clean` predicate this would early-exit the parallel grid
+    /// before any DATA was recovered. Constructed via mock
+    /// `RxV2Result` values rather than a synthesised audio buffer
+    /// because the bug surfaces on specific marker-CRC patterns that
+    /// are hard to deterministically reproduce from TX → channel → RX.
+    #[test]
+    fn is_fully_clean_rejects_meta_only_decode() {
+        fn mock(
+            segments_decoded: usize,
+            segments_lost: usize,
+            total: usize,
+            converged: usize,
+            data_recovered: usize,
+        ) -> RxV2Result {
+            RxV2Result {
+                data: Vec::new(),
+                header: None,
+                app_header: None,
+                converged_blocks: converged,
+                total_blocks: total,
+                segments_decoded,
+                segments_lost,
+                sigma2: 0.0,
+                sigma2_data: 0.0,
+                data_blocks_recovered: data_recovered,
+                cw_bytes_map: HashMap::new(),
+                eot_seen: false,
+                constellation_sample: Vec::new(),
+                pilot_phase_segments: Vec::new(),
+                pilot_phase_is_meta: Vec::new(),
+                pilot_sigma2_per_segment: Vec::new(),
+                pilot_skew_per_segment: Vec::new(),
+                pilot_kurt_per_segment: Vec::new(),
+                last_preamble_offset: None,
+                drift_ppm: 0.0,
+                ffe_centroid_initial: 0.0,
+                ffe_centroid_final: 0.0,
+            }
+        }
+
+        // Full-clean SF : 4 segments, 22 CWs total, all converged, 21
+        // data CWs recovered (1 meta + 21 data).
+        let full = mock(4, 0, 22, 22, 21);
+        assert!(is_clean(&full), "full-clean must pass loose is_clean");
+        assert!(
+            is_fully_clean(&full),
+            "full-clean must pass strict is_fully_clean"
+        );
+
+        // META-only : the bug scenario. Loose is_clean accepts it
+        // (100>=99), strict is_fully_clean rejects it.
+        let meta_only_marker_loss = mock(1, 3, 1, 1, 0);
+        assert!(
+            is_clean(&meta_only_marker_loss),
+            "loose is_clean accepts meta-only (this is the bug it has)"
+        );
+        assert!(
+            !is_fully_clean(&meta_only_marker_loss),
+            "is_fully_clean MUST reject meta-only decode (segments_lost > 0)"
+        );
+
+        // Window cut short right after meta : no markers lost, but
+        // only the meta segment was processed. data_blocks_recovered=0
+        // catches it.
+        let meta_only_window_cut = mock(1, 0, 1, 1, 0);
+        assert!(
+            is_clean(&meta_only_window_cut),
+            "loose is_clean accepts window-cut meta-only (this is the bug it has)"
+        );
+        assert!(
+            !is_fully_clean(&meta_only_window_cut),
+            "is_fully_clean MUST reject meta-only when data_blocks_recovered == 0"
+        );
+
+        // Partial CW failure : 1 CW out of 22 didn't converge. Loose
+        // is_clean accepts it (>=99% would only be 21.78 needed, but
+        // ours is 22*99=2178 vs 21*100=2100, so 2100<2178 → also
+        // rejects). Strict is_fully_clean rejects via != check.
+        let partial_cw = mock(4, 0, 22, 21, 20);
+        assert!(
+            !is_clean(&partial_cw),
+            "loose is_clean already rejects 21/22 (the >=99% threshold rounds up)"
+        );
+        assert!(
+            !is_fully_clean(&partial_cw),
+            "is_fully_clean MUST reject any CW failure"
+        );
+
+        // Lost segment with otherwise-clean decode : strict rejects
+        // because segments_lost > 0 means the cell's drift hypothesis
+        // mis-aligned a marker.
+        let one_seg_lost = mock(3, 1, 18, 18, 17);
+        assert!(
+            !is_fully_clean(&one_seg_lost),
+            "is_fully_clean MUST reject any lost segment"
+        );
     }
 
     /// 30 sequential invocations on the same clean input. Smoke-tests
