@@ -1267,6 +1267,16 @@ fn scan_and_route(
     }
     let effective_allow_grid = state.allow_legacy_grid
         || state.lowpower_grid_recent.len() < LOWPOWER_GRID_QUOTA;
+    // 0.10.37 : cap the per-tick preamble search to 2 (= 1 SF + 1
+    // boundary) whenever the USER toggle is off, independent of
+    // whether the safety grid is currently allowed as a fallback via
+    // `effective_allow_grid`. Previously the cap rode on
+    // `effective_allow_grid`, so an in-quota fallback tick lifted the
+    // cap and dumped the whole 3-4 SF backlog through the grid in one
+    // tick — exactly what saturates one core on a Pi 4 after lag
+    // accumulates. Now the cap is fixed by the user toggle ; grid
+    // permission is decoupled.
+    let lowpower_position_cap = !state.allow_legacy_grid;
 
     let rx_v3_opt = rx_v2::rx_v3_after(
         &state.session_buffer,
@@ -1275,6 +1285,7 @@ fn scan_and_route(
         finalize,
         state.session_drift_ppm,
         effective_allow_grid,
+        lowpower_position_cap,
     );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     // Harvest the per-stage breakdown the rx_v2 thread-local accumulated
@@ -1352,6 +1363,7 @@ fn scan_and_route(
                         finalize,
                         state.session_drift_ppm,
                         effective_allow_grid,
+                        lowpower_position_cap,
                     );
                     // Auto-profile re-decode is real work; fold it into
                     // the same per-tick perf accumulator as the primary

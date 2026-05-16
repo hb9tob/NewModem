@@ -1624,7 +1624,7 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
     // decode the trailing OPEN window — there is no "next tick" to wait
     // for a closing preamble. The live worker uses `rx_v3_after` directly
     // with `finalize=false` for normal ticks.
-    rx_v3_after(samples, config, 0, true, None, true)
+    rx_v3_after(samples, config, 0, true, None, true, false)
 }
 
 /// Same as `rx_v3` but skip every preamble whose detected offset is strictly
@@ -1675,6 +1675,19 @@ pub fn rx_v3(samples: &[f32], config: &ModemConfig) -> Option<RxV2Result> {
 /// disable it from the GUI Settings tab. Has no effect on the
 /// `session_hint_ppm = Some(_)` path since that already bypasses
 /// the grid.
+///
+/// `lowpower_position_cap` controls the per-tick preamble cap
+/// independently of `allow_legacy_grid` (= Axis-2 cap, decoupled from
+/// the grid permission since 0.10.37). `true` → `find_all_preambles`
+/// is capped at 2 positions = 1 CLOSED + 1 boundary, so only one SF
+/// is processed per tick and the worker drains past the boundary
+/// preamble regardless of decode success ; the next tick re-detects
+/// that boundary as the new CLOSED. `false` → uncapped (desktop /
+/// CLI / tests). Distinct from `allow_legacy_grid` because in
+/// lowpower-with-fallback-quota mode (0.10.34) the worker may set
+/// `allow_legacy_grid = true` opportunistically (quota window open)
+/// while still wanting the position cap to bound the per-tick CPU
+/// spike to a single SF.
 pub fn rx_v3_after(
     samples: &[f32],
     config: &ModemConfig,
@@ -1682,6 +1695,7 @@ pub fn rx_v3_after(
     finalize: bool,
     session_hint_ppm: Option<f64>,
     allow_legacy_grid: bool,
+    lowpower_position_cap: bool,
 ) -> Option<RxV2Result> {
     let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
         .ok()?;
@@ -1699,13 +1713,23 @@ pub fn rx_v3_after(
     let preamble_syms = preamble::make_preamble_for_config(config);
     let mut positions = {
         let _t = StageTimer::new(PerfStage::FindPreamble);
-        // Low-power live worker (`allow_legacy_grid = false` AND
+        // Low-power live worker (`lowpower_position_cap = true` AND
         // `finalize = false`) caps the per-tick search at 2 preambles :
         // one CLOSED to decode + one boundary that stays in the buffer
         // for next tick's re-scan with a fresh Gardner. Desktop / CLI /
-        // tests (`finalize = true` or grid allowed) keep the uncapped
-        // behaviour so multi-SF buffers fully decode in one call.
-        let max_positions = if !allow_legacy_grid && !finalize {
+        // tests (`finalize = true` or `lowpower_position_cap = false`)
+        // keep the uncapped behaviour so multi-SF buffers fully decode
+        // in one call.
+        //
+        // 0.10.37 : decoupled from `allow_legacy_grid` so that the
+        // worker's quota-fallback grid (LOWPOWER_GRID_QUOTA at 0.10.34)
+        // doesn't accidentally uncap the position search. Previously
+        // `effective_allow_grid = state.allow_legacy_grid || quota_room`
+        // was passed to both this gate AND the safety-grid permission,
+        // so a single in-quota tick on a slow channel would lift the
+        // per-tick cap and dump the entire backlog (3-4 SFs) through
+        // the grid in one tick.
+        let max_positions = if lowpower_position_cap && !finalize {
             Some(2)
         } else {
             None
@@ -3033,11 +3057,13 @@ mod tests {
         let samples = tx_v3(&data, &config, 0xC0DE_BEEFu32);
 
         // Uncapped: finalize=true => no cap, decodes every SF.
-        let uncapped = rx_v3_after(&samples, &config, 0, true, None, true)
+        let uncapped = rx_v3_after(&samples, &config, 0, true, None, true, false)
             .expect("uncapped rx_v3_after returned None");
 
-        // Capped: live-worker pattern (finalize=false, allow_legacy_grid=false).
-        let capped = rx_v3_after(&samples, &config, 0, false, None, false)
+        // Capped: live-worker pattern (finalize=false, lowpower_position_cap=true).
+        // allow_legacy_grid=false too so the cap is the only thing that
+        // limits the per-tick decode.
+        let capped = rx_v3_after(&samples, &config, 0, false, None, false, true)
             .expect("capped rx_v3_after returned None");
 
         eprintln!(
@@ -3080,7 +3106,7 @@ mod tests {
         let drain_end = cap_off.saturating_sub(TRUNCATE_MARGIN_SAMPLES);
         assert!(drain_end > 0, "drain_end must advance past head");
         let tail = &samples[drain_end..];
-        let capped2 = rx_v3_after(tail, &config, 0, false, None, false)
+        let capped2 = rx_v3_after(tail, &config, 0, false, None, false, true)
             .expect("second-tick rx_v3_after returned None");
         let cap_off2 = capped2.last_preamble_offset.expect("second-tick watermark");
 
