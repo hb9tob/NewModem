@@ -422,6 +422,25 @@ struct GridUsedPayload {
     quota: usize,
 }
 
+/// Worker requests a full capture stop+start cycle. Emitted on every
+/// transition back to Idle (preamble-absence timeout, EOT, brickwall).
+/// In-state resets (`soft_reset_buffer` / `trim_buffer_to_preroll` +
+/// `drain_mpsc`) proved insufficient to re-arm RX on a fresh signal —
+/// stop/start at the GUI level is the only reliable recovery. The GUI
+/// listens for this event and invokes the `restart_capture` Tauri
+/// command, which drops the current cpal/SDR capture + worker thread
+/// and re-spawns with the SAME `device_name + profile + forced` the
+/// user originally picked. Brutal but matches the observed working
+/// behaviour ; surgical fix can come later once the actual stale
+/// state is identified.
+#[derive(Debug, Clone, Serialize)]
+struct WorkerRequestsRestartPayload {
+    /// "preamble-absence" | "eot" | "capture-brickwall" | "worker-brickwall".
+    /// Surfaced for diagnostics so the operator sees what triggered the
+    /// auto-restart in the GUI event log.
+    reason: &'static str,
+}
+
 /// Real-time margin telemetry. Emitted every ~2 s so the GUI can show a
 /// "RX surcharge CPU" badge when the worker can't keep up with the
 /// capture (= classic Pi4 / old-PC sound-card symptom). Healthy systems
@@ -978,6 +997,12 @@ fn run_worker(
                         "[worker] flushed {flushed} mpsc samples on brickwall"
                     ));
                 }
+                sink.emit(
+                    "worker_requests_restart",
+                    WorkerRequestsRestartPayload {
+                        reason: "capture-brickwall",
+                    },
+                );
                 // Skip the rest of this iteration — the batch we just
                 // pulled is itself part of the corrupted stream.
                 continue;
@@ -1062,6 +1087,12 @@ fn run_worker(
                         "[worker] flushed {flushed} mpsc samples on brickwall"
                     ));
                 }
+                sink.emit(
+                    "worker_requests_restart",
+                    WorkerRequestsRestartPayload {
+                        reason: "worker-brickwall",
+                    },
+                );
                 continue;
             }
         } else {
@@ -1235,6 +1266,12 @@ fn maintenance_tick(
                     "[worker] silence-timeout: flushed {flushed} mpsc samples backlog",
                 ));
             }
+            sink.emit(
+                "worker_requests_restart",
+                WorkerRequestsRestartPayload {
+                    reason: "preamble-absence",
+                },
+            );
         }
     }
 
@@ -1843,6 +1880,10 @@ fn scan_and_route(
     let Some(ref ah) = result.app_header else {
         if eot_seen {
             state.trim_buffer_to_preroll();
+            sink.emit(
+                "worker_requests_restart",
+                WorkerRequestsRestartPayload { reason: "eot" },
+            );
         }
         return;
     };
@@ -1969,6 +2010,10 @@ fn scan_and_route(
     // small without dropping in-flight repair packets.
     if eot_seen {
         state.trim_buffer_to_preroll();
+        sink.emit(
+            "worker_requests_restart",
+            WorkerRequestsRestartPayload { reason: "eot" },
+        );
         let _ = session_store::BLOB_WARN_RATIO;
         return;
     }

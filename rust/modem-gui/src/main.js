@@ -3024,6 +3024,22 @@ function wireEvents() {
     noteRxRealtime(event.payload);
   });
 
+  // 0.10.43 : worker-requested capture restart. The worker emits this
+  // whenever it transitions back to Idle (preamble-absence, EOT,
+  // brickwall) -- in-process resets proved insufficient to re-arm RX
+  // on a fresh signal. We mirror what a manual stop/start does : the
+  // backend `restart_capture` command drops the cpal/SDR stream +
+  // worker thread, and re-spawns with the same device + profile +
+  // forced the operator originally picked. Log the event for
+  // traceability.
+  listen("worker_requests_restart", (event) => {
+    const reason = (event.payload && event.payload.reason) || "?";
+    logEvent("worker_requests_restart", { reason });
+    invoke("restart_capture").catch((err) => {
+      logEvent("worker_requests_restart_error", { reason, error: String(err) });
+    });
+  });
+
   // 0.10.38 : worker capture-state changes. Drives the status-bar chip
   // (`#v2-state-chip`) so the chip reflects the actual modem state
   // instead of staying permanently "idle". Also surfaced in the Info

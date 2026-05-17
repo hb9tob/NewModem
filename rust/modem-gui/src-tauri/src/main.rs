@@ -73,6 +73,14 @@ struct CaptureSession {
     capture: CaptureKind,
     worker: WorkerHandle,
     device_name: String,
+    /// Stored so `restart_capture` (0.10.43) can re-spawn with the same
+    /// profile the operator originally picked. The worker emits a
+    /// `worker_requests_restart` event on every transition back to Idle
+    /// (preamble-absence, EOT, brickwall) ; the GUI listens and invokes
+    /// `restart_capture`, which builds a fresh capture + worker pair
+    /// here.
+    profile: Option<String>,
+    forced: bool,
 }
 
 struct AppState {
@@ -336,6 +344,56 @@ fn start_capture(
         return Err("capture already running".into());
     }
     let forced = forced.unwrap_or(false);
+    let session = build_capture_session(
+        &device_name,
+        profile.clone(),
+        forced,
+        &app,
+        &state,
+    )?;
+    *guard = Some(session);
+    Ok(())
+}
+
+/// Drop the current capture session and re-spawn an identical one
+/// (same `device_name + profile + forced`). Triggered by the worker
+/// emitting `worker_requests_restart` after a transition back to Idle
+/// (preamble-absence, EOT, brickwall). Empirically observed in 0.10.42
+/// that in-process resets (`soft_reset_buffer` + mpsc drain) didn't
+/// re-arm RX on a fresh signal ; a full stop+start does. This command
+/// is the programmatic equivalent of the operator clicking
+/// "Stop" then "Start" in the GUI.
+#[tauri::command]
+fn restart_capture(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let old = match guard.take() {
+        Some(s) => s,
+        None => return Err("no capture session to restart".into()),
+    };
+    let device_name = old.device_name.clone();
+    let profile = old.profile.clone();
+    let forced = old.forced;
+    // Drop the old session : stops the cpal/SDR stream, closes the
+    // mpsc, and joins the worker thread. Mirrors what `stop_capture`
+    // does end-to-end.
+    old.capture.stop();
+    old.worker.stop();
+    let session = build_capture_session(&device_name, profile, forced, &app, &state)?;
+    *guard = Some(session);
+    Ok(())
+}
+
+/// Build a fresh `CaptureSession` (cpal/SDR stream + rx_worker thread)
+/// for the given device + profile. Shared by `start_capture` (initial
+/// user-triggered start) and `restart_capture` (worker-driven auto
+/// restart on Idle transitions).
+fn build_capture_session(
+    device_name: &str,
+    profile: Option<String>,
+    forced: bool,
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<CaptureSession, String> {
     let profile_idx = resolve_profile(profile.as_deref().unwrap_or("HIGH"), forced)?;
     let cfg = settings::load();
     // Route on the composite device name. SDR devices arrive as
@@ -352,7 +410,7 @@ fn start_capture(
     // signature uniform; the SDR-side counter just stays at zero and
     // the GUI chip never lights up for that reason.
     let (capture, samples, dropped_samples) =
-        if let Some((backend, device_id)) = sdr_registry::parse_composite_name(&device_name) {
+        if let Some((backend, device_id)) = sdr_registry::parse_composite_name(device_name) {
             let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
             let descriptor = DeviceDescriptor::new(
                 backend.id(),
@@ -371,7 +429,7 @@ fn start_capture(
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             )
         } else {
-            let (h, rx) = cpal_capture::start(&device_name)?;
+            let (h, rx) = cpal_capture::start(device_name)?;
             let dropped = h.dropped_samples.clone();
             (CaptureKind::Cpal(h), rx, dropped)
         };
@@ -387,12 +445,13 @@ fn start_capture(
         cfg.rx_allow_legacy_grid,
         dropped_samples,
     );
-    *guard = Some(CaptureSession {
+    Ok(CaptureSession {
         capture,
         worker,
-        device_name,
-    });
-    Ok(())
+        device_name: device_name.to_string(),
+        profile,
+        forced,
+    })
 }
 
 /// Resolve a profile name (case-insensitive, accepts both
@@ -555,6 +614,11 @@ fn start_capture_from_wav(
         },
         worker,
         device_name: "wav-file".to_string(),
+        // WAV-file capture has no meaningful restart path (the file
+        // is one-shot) ; record the params anyway so the GUI's stored
+        // session state is uniform.
+        profile: args.profile.clone(),
+        forced,
     });
     Ok(())
 }
@@ -1354,6 +1418,7 @@ fn main() {
             start_capture,
             start_capture_from_wav,
             stop_capture,
+            restart_capture,
             get_save_dir,
             set_save_dir,
             start_raw_recording,
