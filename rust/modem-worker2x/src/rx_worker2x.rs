@@ -27,7 +27,7 @@ use modem_worker_base::{EventSink, EventSinkExt, SharedWavSink, WorkerHandle};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -140,6 +140,33 @@ pub fn spawn(
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+
+    // Slice 2x22 — WAV-tee thread sits between the capture mpsc and the
+    // worker mpsc. Its only job is to write every chunk to the wav_sink
+    // (if armed) and forward to the worker. **Independent of the DSP
+    // pump**: if the worker stalls on heavy DSP, the worker mpsc fills
+    // (unbounded, no drops) but the tee keeps writing the WAV in real
+    // time. Without this split the WAV write was inline in the worker
+    // loop and a stalled decode froze the file too — the operator
+    // couldn't replay the OTA capture that broke the modem. The tee
+    // exits when the upstream sender is dropped (capture stop).
+    let (worker_tx, worker_rx) = mpsc::channel::<Vec<f32>>();
+    let wav_sink_tee = wav_sink.clone();
+    let _tee_thread = thread::spawn(move || {
+        while let Ok(chunk) = samples.recv() {
+            if let Ok(mut g) = wav_sink_tee.lock() {
+                if let Some(ws) = g.as_mut() {
+                    ws.write_chunk(&chunk);
+                }
+            }
+            if worker_tx.send(chunk).is_err() {
+                break; // worker dropped → tee can exit too.
+            }
+        }
+        // Upstream closed. Dropping `worker_tx` signals the worker to
+        // run its finalize path.
+    });
+
     let thread = thread::spawn(move || {
         eprintln!("[worker] start NBFM-2x profile={profile_name}");
         let cfg = match config_by_name_2x(&profile_name) {
@@ -168,19 +195,12 @@ pub fn spawn(
         let mut max_batch_processing_ms: f64 = 0.0;
 
         loop {
-            let chunk = match samples.recv() {
+            let chunk = match worker_rx.recv() {
                 Ok(c) => c,
-                Err(_) => break, // sender dropped → exit and run finalize.
+                Err(_) => break, // tee dropped → exit and run finalize.
             };
             let batch_start = Instant::now();
             total_samples += chunk.len() as u64;
-
-            // WAV recording tee.
-            if let Ok(mut g) = wav_sink.lock() {
-                if let Some(ws) = g.as_mut() {
-                    ws.write_chunk(&chunk);
-                }
-            }
 
             // V3-parity VU meter — RMS / peak / crest factor + overdrive flag.
             let (peak, rms, crest_db) = compute_audio_stats(&chunk);
@@ -311,6 +331,13 @@ fn translate_events(
                         .iter()
                         .map(|&p| vec![p as f32])
                         .collect();
+                    // Data-scatter SNR — honest metric computed from
+                    // hard-decoded post-Pass-2 DATA symbols (see
+                    // `RxResult2x::sigma2_data_scatter` doc-comment for
+                    // why pilot-fitted σ² understates the noise). The
+                    // GUI gauge uses this in preference to `sigma2_data`
+                    // when `data_scatter_n > 0`; the σ² fields stay for
+                    // legacy consumers.
                     sink.emit(
                         "v2_progress",
                         serde_json::json!({
@@ -320,6 +347,9 @@ fn translate_events(
                             "converged_bitmap": snap.converged_bitmap,
                             "sigma2": snap.sigma2_data,
                             "sigma2_data": snap.sigma2_data,
+                            "sigma2_data_scatter": snap.sigma2_data_scatter,
+                            "es_data_scatter": snap.es_data_scatter,
+                            "data_scatter_n": snap.data_scatter_n,
                             "constellation_sample": snap.constellation_sample,
                             "pilot_phase_segments": pilot_phase_segments,
                             "pilot_phase_is_meta": snap.pilot_phase_is_meta,

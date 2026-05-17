@@ -112,6 +112,38 @@ pub struct RxResult2x {
     /// jitter. Same interpretation rules as
     /// [`sigma2_radial`](Self::sigma2_radial).
     pub sigma2_tangential: f64,
+    /// **Data-scatter σ²** — running mean of `|y − s_hat|²` over every
+    /// post-Pass-2 DATA symbol seen across the burst (pilots + PLHEADER
+    /// excluded, META CWs excluded). `s_hat` is the nearest constellation
+    /// point in Euclidean distance. This is the *honest* noise metric:
+    /// `sigma2_data` / `sigma2_radial` / `sigma2_tangential` are
+    /// MAD-style estimates from **pilot residuals after the Pass 2 RTS
+    /// phase smoother + per-ring gain estimator have been fitted to the
+    /// pilot points**, so they understate the noise that actually hits
+    /// the data symbols (ICI from RRC pulse leakage, intra-CW phase
+    /// noise the smoother doesn't fully track, AM-AM/AM-PM the per-ring
+    /// gain absorbs at the pilot rate but not at the data rate). The
+    /// data-scatter σ² sees all of those because the hard decision is
+    /// independent of every channel estimator. Pair with
+    /// [`es_data_scatter`](Self::es_data_scatter) for the per-burst SNR
+    /// estimate `10·log10(es_data_scatter / sigma2_data_scatter)`.
+    pub sigma2_data_scatter: f64,
+    /// Running mean signal power `|s_hat|²` over the same DATA symbols
+    /// fed into [`sigma2_data_scatter`](Self::sigma2_data_scatter).
+    /// For mid-power-normalised constellations (QPSK / 8-PSK / 16-APSK
+    /// at unit mean Es) this should land near 1.0; APSK with multi-ring
+    /// designs can sit above 1 if the outer ring dominates the chosen
+    /// hard decisions. Used as the SNR denominator alongside
+    /// `sigma2_data_scatter`: `snr_db = 10·log10(es_data_scatter /
+    /// sigma2_data_scatter)`.
+    pub es_data_scatter: f64,
+    /// Total count of post-Pass-2 DATA symbols accumulated into
+    /// [`sigma2_data_scatter`](Self::sigma2_data_scatter) and
+    /// [`es_data_scatter`](Self::es_data_scatter). Zero ⇒ no DATA CW
+    /// has been visited yet (SNR estimate is meaningless). The CLI /
+    /// GUI suppress the SNR readout while this is zero so the operator
+    /// doesn't see −∞ dB during the bootstrap.
+    pub data_scatter_n: usize,
     /// Symbol-buffer index of the first SOF the decoder locked onto in
     /// the input symbol stream (relative to the buffer passed in), or
     /// None if no SOF passed the PLHEADER CRC. The streaming worker
@@ -182,6 +214,14 @@ pub struct RxResult2x {
 /// frontend renders a comparable density across families.
 pub const MAX_CONSTELLATION_POINTS: usize = 500;
 
+/// Slice 2x21 — sliding-window cap on `pilot_phase_per_cw` /
+/// `pilot_phase_is_meta`. The streaming GUI shows the "last N" CWs'
+/// pilot-phase trace, not the cumulative session history. User intent
+/// per the OTA bring-up of 0.11.0-2x20: *"affiche les 4-5 derniers
+/// CW"*. The drain happens at the push site so the snapshot the worker
+/// forwards to the GUI never carries more than N entries.
+pub const PILOT_PHASE_RECENT_N: usize = 5;
+
 impl RxResult2x {
     pub(crate) fn empty() -> Self {
         Self {
@@ -195,6 +235,9 @@ impl RxResult2x {
             sigma2_data: SIGMA2_FLOOR,
             sigma2_radial: SIGMA2_FLOOR / 2.0,
             sigma2_tangential: SIGMA2_FLOOR / 2.0,
+            sigma2_data_scatter: 0.0,
+            es_data_scatter: 0.0,
+            data_scatter_n: 0,
             first_sof_at: None,
             constellation_sample: Vec::new(),
             pilot_phase_per_cw: Vec::new(),
@@ -1179,10 +1222,20 @@ fn apply_ffe_to_range(
 /// Slice 2x18a — forward-only, per-cycle granularity. Backward RTS +
 /// turbo-feedback come in slices 2x18b / 2x18c (see plan file
 /// `ffe-forward-backward-precious-multipath.md`).
-pub(crate) fn equalize_symbols_per_cycle(
+/// Per-cycle FFE equaliser. `scan_from` is the symbol index from which
+/// to start scanning for PLHEADERs — cycles whose SOF falls before
+/// `scan_from` are NOT re-equalised (the caller has already done so
+/// in a previous call and the equalised content is preserved in
+/// `symbols`). Slice 2x23+ incremental: per chunk on the Pi5 we now
+/// pay the FFE train + apply cost only for the **newly completed
+/// cycle** instead of every cycle in the buffer, cutting per-chunk
+/// CPU by O(retained_cycles) — critical for live OTA on the Pi where
+/// the previous pre-2x23 reprocess was the dominant audio-rate cost.
+pub(crate) fn equalize_symbols_per_cycle_from(
     symbols: &[Complex64],
     cfg: &ModemConfig2x,
     dd_refs: &[(usize, Complex64)],
+    scan_from: usize,
 ) -> Vec<Complex64> {
     let mut equalized: Vec<Complex64> = symbols.to_vec();
     let cycle_period = full_cycle_len_syms(cfg);
@@ -1194,7 +1247,7 @@ pub(crate) fn equalize_symbols_per_cycle(
     // the drift LS fit (avoiding false-positive Chu matches in band
     // noise); for FFE training the looser threshold is correct because
     // the per-PLS Golay+CRC check below rejects false positives anyway.
-    let mut scan = 0;
+    let mut scan = scan_from;
     let log = std::env::var_os("RX_V4_LOG_FFE").is_some();
     while let Some(sof_at) = find_next_sof(symbols, scan, cfg.family) {
         if sof_at + PLHEADER_LEN_SYM > symbols.len() {
@@ -1247,6 +1300,18 @@ pub(crate) fn equalize_symbols_per_cycle(
     }
 
     equalized
+}
+
+/// Legacy alias — full-buffer equalise (`scan_from = 0`). Used by tests
+/// and callers that don't track equalisation cursor state. Slice 2x23+
+/// streaming callers should use `equalize_symbols_per_cycle_from` with
+/// the symbol index past which they've already equalised.
+pub(crate) fn equalize_symbols_per_cycle(
+    symbols: &[Complex64],
+    cfg: &ModemConfig2x,
+    dd_refs: &[(usize, Complex64)],
+) -> Vec<Complex64> {
+    equalize_symbols_per_cycle_from(symbols, cfg, dd_refs, 0)
 }
 
 /// Captured state of one decode pass — used by [`rx_v4_symbols_after`]
@@ -1868,6 +1933,36 @@ pub(crate) fn decode_one_cw(
             }
         }
 
+        // **Data-scatter σ²** (honest SNR metric, see `RxResult2x::
+        // sigma2_data_scatter` docstring). Hard-decode every post-Pass-2
+        // DATA symbol to the nearest constellation point and accumulate
+        // |y − s_hat|² and |s_hat|². DATA only — META CWs are skipped so
+        // the metric reflects the payload channel statistics the GUI
+        // operator cares about. The accumulation is over the burst's
+        // **entire** DATA history, weighted by symbol count (a running
+        // mean update on the existing means in `result`). The denomin-
+        // ator `data_scatter_n` doubles as the "metric valid" flag —
+        // zero means no DATA CW has been visited yet.
+        if !is_meta {
+            let mut err_sq = 0.0_f64;
+            let mut ref_sq = 0.0_f64;
+            for &y in data_p2.iter() {
+                let s_hat = constellation.hard_decision(y);
+                err_sq += (y - s_hat).norm_sqr();
+                ref_sq += s_hat.norm_sqr();
+            }
+            let n_new = data_p2.len();
+            if n_new > 0 {
+                let prev_n = result.data_scatter_n as f64;
+                let new_n = prev_n + n_new as f64;
+                result.sigma2_data_scatter =
+                    (result.sigma2_data_scatter * prev_n + err_sq) / new_n;
+                result.es_data_scatter =
+                    (result.es_data_scatter * prev_n + ref_sq) / new_n;
+                result.data_scatter_n += n_new;
+            }
+        }
+
         // GUI diagnostic snapshot — recorded AFTER Pass 2 phase + gain
         // correction so the constellation panel shows the modem's best
         // estimate, not the raw Pass 1 cloud. Likewise the pilot phase
@@ -1879,6 +1974,14 @@ pub(crate) fn decode_one_cw(
             .pilot_phase_per_cw
             .push(mean_phase(&phi_smooth));
         result.pilot_phase_is_meta.push(is_meta);
+        // Slice 2x21 sliding-window: keep only the most recent
+        // `PILOT_PHASE_RECENT_N` entries. The two arrays are parallel
+        // and must drain in lockstep.
+        if result.pilot_phase_per_cw.len() > PILOT_PHASE_RECENT_N {
+            let drop_n = result.pilot_phase_per_cw.len() - PILOT_PHASE_RECENT_N;
+            result.pilot_phase_per_cw.drain(..drop_n);
+            result.pilot_phase_is_meta.drain(..drop_n);
+        }
         if !is_meta
             && result.constellation_sample.len() < MAX_CONSTELLATION_POINTS
         {
@@ -2333,25 +2436,28 @@ mod tests {
             &payload, &cfg, 0x123, mime::BINARY, 0);
         let result = rx_v4_symbols(&symbols, &cfg).expect("decode");
 
-        // pilot_phase_per_cw and pilot_phase_is_meta are parallel and
-        // span every CW the decoder visited (META included).
+        // pilot_phase_per_cw and pilot_phase_is_meta are parallel.
+        // Slice 2x21: both are sliding windows capped at
+        // `PILOT_PHASE_RECENT_N` (sliding semantics make the GUI's
+        // pilot-phase canvas show the most recent CWs, not the
+        // cumulative trace).
         assert_eq!(
             result.pilot_phase_per_cw.len(),
             result.pilot_phase_is_meta.len(),
             "phase / is_meta arrays must stay aligned",
         );
-        assert_eq!(
-            result.pilot_phase_per_cw.len(),
-            result.total_cws,
-            "one phase entry per CW the decoder walked",
-        );
-        // META cycles are emitted once per cycle, DATA cycles ≥ once,
-        // so at least one of each must appear in a multi-cycle burst.
-        assert!(result.cycles >= 1);
         assert!(
-            result.pilot_phase_is_meta.iter().any(|&m| m),
-            "expected at least one META CW flag",
+            result.pilot_phase_per_cw.len() <= PILOT_PHASE_RECENT_N,
+            "pilot_phase_per_cw must respect the sliding-window cap",
         );
+        assert!(
+            !result.pilot_phase_per_cw.is_empty(),
+            "at least one phase entry on any successful decode",
+        );
+        // META cycles are emitted once per cycle. With the sliding
+        // window of N=5 and ~4 DATA CWs per cycle, the last META can
+        // get pushed out — assert only the DATA flag presence.
+        assert!(result.cycles >= 1);
         assert!(
             result.pilot_phase_is_meta.iter().any(|&m| !m),
             "expected at least one DATA CW flag",

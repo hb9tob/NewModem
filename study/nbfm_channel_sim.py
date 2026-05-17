@@ -140,29 +140,86 @@ def apply_audio_phase_noise(audio, sr, walk_std_per_sqrt_s, rng_seed=0):
 
 
 def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
-                      thermal_period_s=120.0, thermal_phase=0.0):
+                      thermal_period_s=120.0, thermal_phase=0.0,
+                      drift_ramp_ppm_per_s=0.0,
+                      drift_trace_path=None):
     """
     Applique une derive d'horloge soundcard sur un signal audio.
     Modele : le clock effectif est sr * (1 + d(t)*1e-6) ou
-      d(t) = drift_ppm + thermal_ppm * sin(2*pi*t/thermal_period_s + phase)
+      d(t) = drift_ppm + drift_ramp_ppm_per_s * t
+             + thermal_ppm * sin(2*pi*t/thermal_period_s + phase)
 
     Implementation : interpolation aux instants distordus par la derive
     cumulee (integrale du taux). Cela compresse/etire le temps de facon
     coherente avec un desaccord d'horloge TX vs RX.
+
+    When `drift_trace_path` is provided, a JSON file is written with the
+    *injected* drift trajectory sampled every 0.1 s — used by
+    drift-estimator validation harness to compare against the modem's
+    on-line LS estimate.
     """
-    if drift_ppm == 0.0 and thermal_ppm == 0.0:
+    if (drift_ppm == 0.0 and thermal_ppm == 0.0
+            and drift_ramp_ppm_per_s == 0.0):
+        # No drift to inject — still dump an all-zero trace when asked
+        # so the validation harness can plot baseline runs alongside
+        # drifted ones without a special-case "no JSON" branch.
+        if drift_trace_path is not None:
+            n = len(audio)
+            t = np.arange(n) / sr
+            tick = max(int(round(0.1 * sr)), 1)
+            trace = {
+                "t_s": t[::tick].tolist(),
+                "ppm_injected": [0.0] * len(t[::tick]),
+                "static_ppm": 0.0,
+                "ramp_ppm_per_s": 0.0,
+                "thermal_ppm": 0.0,
+                "thermal_period_s": thermal_period_s,
+            }
+            with open(drift_trace_path, "w") as f:
+                json.dump(trace, f)
         return audio
     n = len(audio)
     t = np.arange(n) / sr
-    # Taux d'ecart instantane (sans unite, ~1e-6)
-    rate = drift_ppm * 1e-6 + thermal_ppm * 1e-6 * np.sin(
-        2 * np.pi * t / thermal_period_s + thermal_phase)
+    # Taux d'ecart instantane (sans unite, ~1e-6). ppm = drift + ramp*t + thermal*sin
+    ppm_inst = (drift_ppm + drift_ramp_ppm_per_s * t
+                + thermal_ppm * np.sin(
+                    2 * np.pi * t / thermal_period_s + thermal_phase))
+    rate = ppm_inst * 1e-6
     # Decalage temporel cumule (s)
     cum_shift = np.cumsum(rate) / sr
     # Instant d'echantillonnage dans le signal d'origine
     t_src = t - cum_shift
     t_src = np.clip(t_src, 0.0, (n - 1) / sr)
-    return np.interp(t_src, t, audio)
+
+    if drift_trace_path is not None:
+        # Sample injected drift every 100 ms — enough for the validation
+        # plot, tiny JSON file. The full ppm_inst array is way too large.
+        tick = max(int(round(0.1 * sr)), 1)
+        trace = {
+            "t_s": t[::tick].tolist(),
+            "ppm_injected": ppm_inst[::tick].tolist(),
+            "static_ppm": drift_ppm,
+            "ramp_ppm_per_s": drift_ramp_ppm_per_s,
+            "thermal_ppm": thermal_ppm,
+            "thermal_period_s": thermal_period_s,
+        }
+        with open(drift_trace_path, "w") as f:
+            json.dump(trace, f)
+
+    # Cubic-spline interpolation (vs linear np.interp pre-2026-05-17).
+    # At 130 ppm static the linear-interp output had band-aliasing that
+    # the RX-side cubic-Lagrange resampler couldn't fully invert
+    # (interpolation operators don't commute), capping the post-drift
+    # σ² at ~14 even on a clean AWGN channel. Cubic-spline here matches
+    # the RX kernel order — the two now cancel within a fraction of a
+    # dB of the AWGN floor.
+    from scipy.interpolate import CubicSpline
+    spline = CubicSpline(t, audio, bc_type='natural', extrapolate=False)
+    out = spline(t_src)
+    # Replace any NaN (extrapolation beyond t range) with zero — clipping
+    # of t_src above already bounds it, this is defensive.
+    out = np.nan_to_num(out, nan=0.0)
+    return out.astype(np.float32)
 
 
 def load_ir_from_signature(sig_path, probe_idx=None):
@@ -202,6 +259,8 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              post_gain_db=POST_GAIN_DB,
              drift_ppm=DRIFT_PPM, thermal_ppm=DRIFT_THERMAL_PPM,
              thermal_period_s=DRIFT_THERMAL_PERIOD_S,
+             drift_ramp_ppm_per_s=0.0,
+             drift_trace_path=None,
              tx_hard_clip=TX_HARD_CLIP,
              audio_noise_rms=AUDIO_NOISE_RMS,
              phase_walk_rad_per_sqrt_s=PHASE_WALK_RAD_PER_SQRT_S,
@@ -357,14 +416,17 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
             rng_seed=ph_seed)
 
     # Derive d'horloge (post-traitement)
-    if drift_ppm != 0.0 or thermal_ppm != 0.0:
+    if drift_ppm != 0.0 or thermal_ppm != 0.0 or drift_ramp_ppm_per_s != 0.0:
         if verbose:
             print(f"[sim] clock drift: static {drift_ppm:+.1f} ppm, "
+                  f"ramp {drift_ramp_ppm_per_s:+.3f} ppm/s, "
                   f"thermal +/-{thermal_ppm:.1f} ppm / {thermal_period_s:.0f} s")
         audio_out = apply_clock_drift(
             audio_out, AUDIO_RATE,
             drift_ppm=drift_ppm, thermal_ppm=thermal_ppm,
-            thermal_period_s=thermal_period_s)
+            thermal_period_s=thermal_period_s,
+            drift_ramp_ppm_per_s=drift_ramp_ppm_per_s,
+            drift_trace_path=drift_trace_path)
 
     return audio_out
 
@@ -383,6 +445,16 @@ def main():
                     help="Amplitude variation thermique (ppm crete)")
     ap.add_argument("--thermal-period", type=float, default=DRIFT_THERMAL_PERIOD_S,
                     help="Periode variation thermique (s)")
+    ap.add_argument("--drift-ramp-ppm-per-s", type=float, default=0.0,
+                    help="Linear drift ramp (ppm/s). Models a clock whose "
+                         "ppm offset evolves linearly across the burst — "
+                         "e.g. a soundcard warming up. The injected drift "
+                         "is `drift_ppm + drift_ramp_ppm_per_s * t`.")
+    ap.add_argument("--drift-trace", type=str, default=None,
+                    help="Optional JSON path to dump the per-100ms injected "
+                         "drift trajectory (ppm vs time). Used by "
+                         "drift-estimator validation harness to compare "
+                         "against the modem's on-line LS estimate.")
     ap.add_argument("--start-delay", type=float, default=None,
                     help=f"Delai initial TX->RX (s). Defaut: aleatoire "
                          f"[{START_DELAY_MIN_S},{START_DELAY_MAX_S}]. "
@@ -454,6 +526,8 @@ def main():
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,
+                         drift_ramp_ppm_per_s=args.drift_ramp_ppm_per_s,
+                         drift_trace_path=args.drift_trace,
                          tx_hard_clip=args.tx_clip,
                          audio_noise_rms=args.audio_noise,
                          phase_walk_rad_per_sqrt_s=args.phase_walk,

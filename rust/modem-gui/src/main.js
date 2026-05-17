@@ -2666,17 +2666,39 @@ function updateV2Progress(payload) {
   const bitmap = bm
     ? new Uint8Array(bm)
     : new Uint8Array(Math.ceil((payload.blocks_expected || 0) / 8));
-  // Prefer `sigma2_data` (frame-only, hard-decision residuals) when the
-  // worker provides it. Fall back to `sigma2` (pilot-residual) for
-  // older payloads so a partial rebuild doesn't blank the indicator.
-  const sigmaInst = Number.isFinite(payload.sigma2_data)
-    ? payload.sigma2_data
-    : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null);
+  // Prefer the honest **data-scatter** σ² (hard-decoded DATA symbol
+  // residuals, see `RxResult2x::sigma2_data_scatter` in Rust). Falls
+  // back to `sigma2_data` (pilot-residual) for old/2x20 payloads. The
+  // pilot σ² is biased low because the Pass 2 estimators fit the pilots
+  // themselves — the data scatter sees ICI, intra-CW phase noise, and
+  // AM-AM/AM-PM the pilot fit absorbs. Pair with `es_data_scatter` so
+  // the SNR is `10·log10(Es/σ²)`, not the legacy `−10·log10(σ²)` (which
+  // implicitly assumes Es = 1).
+  const scatterN = payload.data_scatter_n || 0;
+  const sigmaScatter = scatterN > 0
+    && Number.isFinite(payload.sigma2_data_scatter)
+    && payload.sigma2_data_scatter > 0
+    ? payload.sigma2_data_scatter
+    : null;
+  const esScatter = scatterN > 0
+    && Number.isFinite(payload.es_data_scatter)
+    && payload.es_data_scatter > 0
+    ? payload.es_data_scatter
+    : null;
+  const sigmaInst = sigmaScatter != null
+    ? sigmaScatter
+    : (Number.isFinite(payload.sigma2_data)
+      ? payload.sigma2_data
+      : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null));
   lastProgress = {
     bitmap,
     expected: payload.blocks_expected || 0,
     converged: payload.blocks_converged || 0,
     sigma2: sigmaInst,
+    // `esScatter != null` ⇒ honest data-scatter mode; the SNR readout
+    // uses `10·log10(es/σ²)`. Null ⇒ legacy fallback with implicit Es=1.
+    esScatter,
+    scatterN,
   };
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
@@ -2691,11 +2713,18 @@ function updateV2Progress(payload) {
   const sigmaStr = lastProgress.sigma2 != null
     ? lastProgress.sigma2.toFixed(3).padStart(6, " ")
     : "     ?";
+  // SNR readout uses the data-scatter Es/σ² ratio when the worker
+  // surfaced it; falls back to −10·log10(σ²) for legacy payloads.
+  const snrStr = lastProgress.sigma2 != null && lastProgress.sigma2 > 0
+    ? (lastProgress.esScatter != null && lastProgress.esScatter > 0
+      ? `${(10 * Math.log10(lastProgress.esScatter / lastProgress.sigma2)).toFixed(1)}dB`
+      : `${(-10 * Math.log10(lastProgress.sigma2)).toFixed(1)}dB`)
+    : "  ?dB";
   const mini = document.getElementById("v2-progress-text");
   if (mini) {
     const c = String(lastProgress.converged).padStart(3, " ");
     const e = String(lastProgress.expected).padStart(3, " ");
-    mini.textContent = `${c}/${e} σ²=${sigmaStr}`;
+    mini.textContent = `${c}/${e} σ²=${sigmaStr} SNR=${snrStr}`;
   }
   drawProgressBlocks();
   drawConstellation();
@@ -2973,12 +3002,18 @@ function drawPilotPhase() {
   }
 
   // Header overlay : range, segments count, σ² (if available), implied SNR.
+  // `esScatter != null` ⇒ data-scatter mode, SNR = 10·log10(Es/σ²).
+  // `esScatter == null` ⇒ legacy pilot σ² with implicit Es = 1.
   const rangeMrad = (yRange * 1000).toFixed(0);
   const sigma2 = lastProgress.sigma2;
+  const es = lastProgress.esScatter;
   let header = `±${(rangeMrad / 2).toFixed(0)} mrad · ${segments.length} seg`;
   if (sigma2 != null && sigma2 > 0) {
-    const snrDb = (-10 * Math.log10(sigma2)).toFixed(1);
-    header += ` · σ²=${sigma2.toFixed(3)} (${snrDb} dB)`;
+    const snrDb = es != null && es > 0
+      ? (10 * Math.log10(es / sigma2)).toFixed(1)
+      : (-10 * Math.log10(sigma2)).toFixed(1);
+    const tag = es != null ? "data" : "pilot";
+    header += ` · σ²(${tag})=${sigma2.toFixed(3)} (${snrDb} dB)`;
   }
   ctx.fillStyle = "rgba(0,0,0,0.55)";
   ctx.fillRect(plotX0, 0, plotW, 22 * dpr);

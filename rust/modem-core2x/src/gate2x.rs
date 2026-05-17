@@ -288,11 +288,18 @@ fn next_pow2(n: usize) -> usize {
     p
 }
 
-/// Default audio buffer length the worker keeps for the probe — 2 s at
-/// 48 kHz. Long enough to contain at least one PLHEADER (192 sym × max
-/// 96 sps = 18432 samples ≈ 0.38 s) with margin for the late-entry
-/// case (the SOF might land anywhere inside the window).
-pub const IDLE_PROBE_BUF_SAMPLES: usize = 2 * AUDIO_RATE as usize;
+/// Rolling-buffer length the session keeps in Idle for the probe —
+/// **400 ms** at 48 kHz. Just enough to hold one worst-case PLHEADER
+/// (192 sym × 96 sps = 18432 samples ≈ 384 ms) with a sliver of margin.
+///
+/// Sized tight on purpose: the FFT length is `next_pow2(buf_len +
+/// max_template_len) = 32768` instead of `131072` at the previous 2 s
+/// setting, so the per-tick probe cost drops ~5× and the session can
+/// afford to run it on every audio chunk. While `gate_armed == false`
+/// in `Rx2xSession`, anything older than this window is dropped before
+/// the probe runs — no downmix, no matched filter, no resample on
+/// stale samples.
+pub const IDLE_PROBE_BUF_SAMPLES: usize = (AUDIO_RATE as usize) * 2 / 5;
 
 #[cfg(test)]
 mod tests {

@@ -91,6 +91,16 @@ pub mod modem2x;
 // live session machine that depends on it lives here too).
 pub mod streaming_frontend;
 
+// Slice 2x23 — streaming DSP pipeline (polyphase FIR resampler + NCO
+// downmix + overlap-save matched filter + decimation). Each stage
+// keeps its own state across `feed_audio` calls so chunk boundaries
+// leave NO residual edge effect; every audio sample is processed
+// exactly once and symbols emerge from a single continuous stream.
+// Replaces the per-chunk `refresh_symbols` rebuild that was causing
+// MF-edge "clicks" and a σ² blow-up of ~38 dB on static drift in the
+// channel-sim validation 2026-05-17.
+pub mod streaming_dsp;
+
 // Slice 2x19 — live streaming RX session. Full state machine + turbo
 // loops integrated. Replaces the worker's batch decode pattern. See
 // plan `ok-alors-le-rms-precious-shannon.md`.

@@ -1191,9 +1191,29 @@ fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
     );
     let mut events: Vec<modem_core2x::rx2x_session::Rx2xEvent> = Vec::new();
     const CHUNK: usize = 24_000;
+    // `RX2X_LOG_DRIFT_TICK=1` (drift validation harness) prints
+    //   `[rx2x-drift-tick] t=<wav_s> drift_ppm=<x>`
+    // one line per chunk. The wav-relative time tracks the *injected*
+    // drift trajectory from `nbfm_channel_sim.py --drift-trace`, so the
+    // two can be aligned 1:1 in the plot.
+    let log_tick = std::env::var_os("RX2X_LOG_DRIFT_TICK").is_some();
+    let mut audio_processed: usize = 0;
     for i in (0..samples.len()).step_by(CHUNK) {
         let end = (i + CHUNK).min(samples.len());
         events.extend(session.process_audio_chunk(&samples[i..end]));
+        audio_processed += end - i;
+        if log_tick {
+            // cached_drift_ppm is the live LS estimate the session
+            // applies to the next refresh_symbols. validated_sof_count
+            // is the SOF accumulator behind the LS fit (≥ 3 = usable).
+            let t = audio_processed as f64 / AUDIO_RATE as f64;
+            eprintln!(
+                "[rx2x-drift-tick] t={:.3} drift_ppm={:+.4} sofs={}",
+                t,
+                session.cached_drift_ppm(),
+                session.validated_sof_count(),
+            );
+        }
     }
     events.extend(session.finalize());
 
@@ -1246,6 +1266,27 @@ fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
         result.sigma2_tangential,
         result.sigma2_radial / result.sigma2_tangential.max(1e-12),
     );
+    // Honest SNR from data-symbol scatter (hard-decoded to constellation).
+    // Independent of every pilot-fitted estimator above — see the
+    // `RxResult2x::sigma2_data_scatter` doc-comment for why this matters.
+    if result.data_scatter_n > 0 {
+        let snr_db = 10.0
+            * (result.es_data_scatter
+                / result.sigma2_data_scatter.max(1e-12))
+                .log10();
+        let evm_pct = (result.sigma2_data_scatter
+            / result.es_data_scatter.max(1e-12))
+            .sqrt()
+            * 100.0;
+        eprintln!(
+            "Data-scatter SNR: {:.2} dB (σ²={:.5}, Es={:.4}, EVM={:.2}%, n={} syms)",
+            snr_db,
+            result.sigma2_data_scatter,
+            result.es_data_scatter,
+            evm_pct,
+            result.data_scatter_n,
+        );
+    }
     if let Some(ref ah) = result.app_header {
         eprintln!(
             "App header: session_id=0x{:08X}, file_size={}, K={}, T={}, mime=0x{:02X}, hash=0x{:04X}",
