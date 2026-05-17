@@ -1205,8 +1205,19 @@ fn maintenance_tick(
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
         if since_preamble >= Duration::from_secs(PREAMBLE_SILENCE_TIMEOUT_S) {
-            worker_log("[worker] preamble silence timeout, returning to Idle");
-            state.trim_buffer_to_preroll();
+            worker_log("[worker] preamble silence timeout, full reset to Idle");
+            // 0.10.40 : full reset (= what stop/start does) rather than
+            // the soft preroll trim. Observed bug : after the silence
+            // timeout, the 2-second preroll left by `trim_buffer_to_preroll`
+            // contains the trailing AGC-noise transient that followed
+            // the previous TX. The next preamble that lands often fails
+            // to lock (find_all_preambles' dynamic threshold is saturated
+            // by the noise residue, OR the matched filter sees garbage
+            // upstream of the new preamble). Operator's empirical
+            // observation : a manual stop/start always recovers ; mirror
+            // that with `soft_reset_buffer()` so the silence timeout is
+            // an actual cold-start equivalent.
+            state.soft_reset_buffer();
         }
     }
 
