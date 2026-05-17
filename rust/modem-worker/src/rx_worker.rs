@@ -855,6 +855,18 @@ impl WorkerState {
         self.last_decoded_preamble_audio_pos = None;
         self.n_consecutive_undecoded_ticks = 0;
         self.lowpower_grid_recent.clear();
+        // 0.10.39 : also drop the session-level drift hint. Without this,
+        // the next preamble after a silence timeout (= end-of-burst from
+        // the worker's POV) inherits the previous session's ppm via
+        // `rx_v2_with_hint`. If the operator re-tunes or the TX clock
+        // changed, that hint is stale and the CLOSED decode silently
+        // fails — leaving the worker stuck in Idle, never re-arming on
+        // the new signal until the user does a manual stop/start (which
+        // hits `soft_reset_buffer` and already cleared the field).
+        // Same rationale as the brickwall path : an end-of-session
+        // transition invalidates any drift estimate tied to the audio
+        // we just trimmed away.
+        self.session_drift_ppm = None;
     }
 }
 
