@@ -923,7 +923,7 @@ fn run_worker(
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle : still pulse the maintenance checks (silence trigger)
-                maintenance_tick(&*sink, &save_dir, &mut state);
+                maintenance_tick(&*sink, &save_dir, &mut state, &samples);
                 state.check_and_emit_modem_state(&*sink);
                 continue;
             }
@@ -1067,7 +1067,7 @@ fn run_worker(
             }
         }
 
-        maintenance_tick(&*sink, &save_dir, &mut state);
+        maintenance_tick(&*sink, &save_dir, &mut state, &samples);
         state.check_and_emit_modem_state(&*sink);
 
         // Per-batch wall time, tracked so the 2 s telemetry tick can
@@ -1189,6 +1189,7 @@ fn maintenance_tick(
     sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     state: &mut WorkerState,
+    samples: &Receiver<Vec<f32>>,
 ) {
     let now = Instant::now();
 
@@ -1199,25 +1200,29 @@ fn maintenance_tick(
 
     // Preamble-silence fallback : if we're Capturing but haven't seen a
     // confirmed preamble for PREAMBLE_SILENCE_TIMEOUT_S, the sender likely
-    // vanished mid-burst (no EOT received). Drop back to Idle so the next
-    // salve starts cleanly on a 2-s pre-roll rather than accumulating
-    // staleness.
+    // vanished mid-burst (no EOT received). Full reset back to Idle so the
+    // next salve starts on a truly cold worker.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
         if since_preamble >= Duration::from_secs(PREAMBLE_SILENCE_TIMEOUT_S) {
             worker_log("[worker] preamble silence timeout, full reset to Idle");
-            // 0.10.40 : full reset (= what stop/start does) rather than
-            // the soft preroll trim. Observed bug : after the silence
-            // timeout, the 2-second preroll left by `trim_buffer_to_preroll`
-            // contains the trailing AGC-noise transient that followed
-            // the previous TX. The next preamble that lands often fails
-            // to lock (find_all_preambles' dynamic threshold is saturated
-            // by the noise residue, OR the matched filter sees garbage
-            // upstream of the new preamble). Operator's empirical
-            // observation : a manual stop/start always recovers ; mirror
-            // that with `soft_reset_buffer()` so the silence timeout is
-            // an actual cold-start equivalent.
+            // 0.10.41 : on top of the in-state `soft_reset_buffer()` we
+            // also drain the cpal mpsc backlog -- same recipe as the
+            // brickwall paths (rx_worker.rs:966, 1050). Without the drain,
+            // chunks of pre-silence audio still in flight in the mpsc
+            // queue land in the freshly-cleared `session_buffer` over the
+            // next few ticks, polluting it with correlation residue from
+            // the previous burst's tail + AGC transient. Manual stop/start
+            // works around this because it drops the entire cpal stream
+            // (mpsc sender side closes) ; here we replicate the same end
+            // state by emptying the receiver side.
             state.soft_reset_buffer();
+            let flushed = drain_mpsc(samples, &mut state.total_samples);
+            if flushed > 0 {
+                worker_log(&format!(
+                    "[worker] silence-timeout: flushed {flushed} mpsc samples backlog",
+                ));
+            }
         }
     }
 
