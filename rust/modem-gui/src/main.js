@@ -3024,6 +3024,53 @@ function wireEvents() {
     noteRxRealtime(event.payload);
   });
 
+  // 0.10.38 : worker capture-state changes. Drives the status-bar chip
+  // (`#v2-state-chip`) so the chip reflects the actual modem state
+  // instead of staying permanently "idle". Also surfaced in the Info
+  // event log so the operator sees the timestamped Idle ↔ Streaming
+  // transitions alongside the rest of the per-tick telemetry.
+  listen("modem_state", (event) => {
+    const p = event.payload || {};
+    updateV2State(p.active ? "streaming" : "idle");
+    logEvent("modem_state", {
+      active: p.active,
+      profile: p.profile,
+      t_ms: p.t_ms,
+    });
+  });
+
+  // 0.10.38 : ±15 ppm safety-grid invocation. Emitted by the worker
+  // every tick where Gardner + fast-path both failed and the grid
+  // fired (lowpower fallback OR user-toggled high-power). Logs entry /
+  // exit timestamps + duration + ppm estimate + quota counter so the
+  // operator can audit grid usage from the GUI without tail-ing
+  // /tmp/nbfm-worker.log.
+  listen("grid_used", (event) => {
+    const p = event.payload || {};
+    const fmtTime = (ms) => {
+      if (!ms) return "?";
+      const d = new Date(ms);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      const fff = String(d.getMilliseconds()).padStart(3, "0");
+      return `${hh}:${mm}:${ss}.${fff}`;
+    };
+    const ppm =
+      p.drift_ppm === null || p.drift_ppm === undefined
+        ? "?"
+        : `${p.drift_ppm.toFixed(2)} ppm`;
+    logEvent("grid_used", {
+      in: fmtTime(p.t_start_ms),
+      out: fmtTime(p.t_end_ms),
+      duration_ms: p.duration_ms,
+      n_passes: p.n_passes,
+      ppm,
+      fallback: p.fallback,
+      quota: `${p.recent}/${p.quota}`,
+    });
+  });
+
   listen("tx_plan", (ev) => {
     logEvent("tx_plan", ev.payload);
   });

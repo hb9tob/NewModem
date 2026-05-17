@@ -358,6 +358,70 @@ struct AudioLevelPayload {
     crest_db: f32,
 }
 
+/// Modem capture state change. Emitted whenever `state.session_active`
+/// flips relative to the previous value the worker pushed to the GUI.
+/// The GUI uses it to drive the status-bar chip (`#v2-state-chip`) so
+/// the chip reflects the actual worker state instead of staying
+/// permanently "idle". Also appended to the GUI event log.
+#[derive(Debug, Clone, Serialize)]
+struct ModemStatePayload {
+    /// `true` = Capturing (preamble seen, session_buffer accumulating
+    /// up to SESSION_HARD_CAP_SECONDS) ; `false` = Idle (preroll trim,
+    /// only the rolling PREROLL_SECONDS of audio kept).
+    active: bool,
+    /// Currently configured profile name, e.g. "HIGH" / "HIGH+" / "MEGA".
+    /// Surfaced so the GUI chip can show "HIGH+ streaming" rather than
+    /// just "streaming".
+    profile: String,
+    /// UNIX epoch milliseconds at emission time. Lets the GUI compute
+    /// duration since last transition and surfaces it in the log.
+    t_ms: u64,
+}
+
+/// Safety-grid usage telemetry. Emitted once per scan tick where the
+/// ±15 ppm safety grid was actually entered (i.e. Gardner one-shot +
+/// fast-path 0-ppm both failed to produce an [`is_clean`] decode).
+/// Drives the "grid usage" lines in the GUI Events tab so the operator
+/// can audit when the grid fired, how long it took, and what drift
+/// estimate it landed on. Distinct from the existing `[grid-quota]`
+/// stderr log (which only fires in lowpower mode for quota accounting).
+#[derive(Debug, Clone, Serialize)]
+struct GridUsedPayload {
+    /// UNIX epoch milliseconds when the rx_v3_after call started.
+    /// Lets the GUI render "entrée HH:MM:SS.fff".
+    t_start_ms: u64,
+    /// UNIX epoch milliseconds when the rx_v3_after call finished.
+    /// Lets the GUI render "sortie HH:MM:SS.fff".
+    t_end_ms: u64,
+    /// Wall-clock duration of the tick (= `t_end_ms - t_start_ms`).
+    /// Includes Gardner + fast-path + the grid itself ; the grid alone
+    /// is the dominant cost when n_passes > 2 since each cell is a
+    /// full `rx_v2_single`.
+    duration_ms: u64,
+    /// Internal pass counter from `PerfBreakdown::n_passes` :
+    ///   1 = Gardner-only ; 2 = + fast-path fallback ;
+    ///   > 2 = ±15 ppm safety grid invoked (always >= 3 here since
+    ///         this event only fires when `n_passes > 2`).
+    n_passes: u32,
+    /// Final drift estimate that the best-scoring grid cell landed on.
+    /// `None` when the grid produced no decodable result this tick
+    /// (rx_v3_after returned None). The GUI shows "ppm=?" in that case.
+    drift_ppm: Option<f64>,
+    /// Whether the safety grid was permitted in lowpower fallback mode
+    /// (= `!state.allow_legacy_grid`). On Pi 4 the user toggle is off
+    /// and the grid only fires via the LOWPOWER_GRID_QUOTA mechanism ;
+    /// recording this flag lets the operator distinguish "user wanted
+    /// full grid" from "lowpower fallback".
+    fallback: bool,
+    /// Recent grid-entry count over the last `LOWPOWER_GRID_WINDOW_S`
+    /// seconds, after THIS tick is accounted. Surfaced so the GUI can
+    /// indicate when the quota is approaching saturation.
+    recent: usize,
+    /// Quota max (= [`LOWPOWER_GRID_QUOTA`]). Static, but emitted so
+    /// the GUI doesn't need to hardcode it.
+    quota: usize,
+}
+
 /// Real-time margin telemetry. Emitted every ~2 s so the GUI can show a
 /// "RX surcharge CPU" badge when the worker can't keep up with the
 /// capture (= classic Pi4 / old-PC sound-card symptom). Healthy systems
@@ -592,6 +656,12 @@ struct WorkerState {
     last_audio_above_silence_at: Instant,
     /// True once we've seen a valid preamble — Idle vs Capturing phase flag.
     session_active: bool,
+    /// Last value of `session_active` published to the GUI via the
+    /// `modem_state` event. Held separately so we can detect transitions
+    /// and emit only on change. Initialised to `false` to match the
+    /// initial `session_active = false` ; the first transition to
+    /// `true` (preamble decoded) fires the first event.
+    prev_emitted_session_active: bool,
     session_started_at: Instant,
     /// Last time a preamble was confirmed via rx_v3 (== last tick that
     /// produced an app_header). Used to fall back to Idle when the sender
@@ -714,6 +784,7 @@ impl WorkerState {
             last_scan_at: now,
             last_audio_above_silence_at: now,
             session_active: false,
+            prev_emitted_session_active: false,
             session_started_at: now,
             last_preamble_seen_at: now,
             total_samples: 0,
@@ -727,6 +798,30 @@ impl WorkerState {
             n_consecutive_undecoded_ticks: 0,
             lowpower_grid_recent: VecDeque::new(),
         }
+    }
+
+    /// Emit a `modem_state` Tauri event if `session_active` flipped since
+    /// the last emission. Called once per main-loop iteration so every
+    /// transition (preamble decoded → active=true ; silence timeout / EOT
+    /// / brickwall / preroll trim → active=false) reaches the GUI exactly
+    /// once. The GUI uses it to drive the status-bar chip.
+    fn check_and_emit_modem_state(&mut self, sink: &dyn EventSink) {
+        if self.session_active == self.prev_emitted_session_active {
+            return;
+        }
+        self.prev_emitted_session_active = self.session_active;
+        let t_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        sink.emit(
+            "modem_state",
+            ModemStatePayload {
+                active: self.session_active,
+                profile: profile_name(self.profile),
+                t_ms,
+            },
+        );
     }
 
     fn soft_reset_buffer(&mut self) {
@@ -817,6 +912,7 @@ fn run_worker(
             Err(RecvTimeoutError::Timeout) => {
                 // Idle : still pulse the maintenance checks (silence trigger)
                 maintenance_tick(&*sink, &save_dir, &mut state);
+                state.check_and_emit_modem_state(&*sink);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -960,6 +1056,7 @@ fn run_worker(
         }
 
         maintenance_tick(&*sink, &save_dir, &mut state);
+        state.check_and_emit_modem_state(&*sink);
 
         // Per-batch wall time, tracked so the 2 s telemetry tick can
         // surface peak processing cost. A batch ≈ 500 ms of audio,
@@ -1300,15 +1397,47 @@ fn scan_and_route(
     // grid itself is bounded inside `rx_v2_with_options`, we just need
     // to know "did we pay the grid cost on this tick" so the next ticks
     // can back off if too many recent ones did.
-    if perf_this_tick.n_passes > 2 && !state.allow_legacy_grid {
-        state.lowpower_grid_recent.push_back(Instant::now());
-        worker_log(&format!(
-            "[grid-quota] grid entered this tick (n_passes={}, recent={}/{} in last {}s)",
-            perf_this_tick.n_passes,
-            state.lowpower_grid_recent.len(),
-            LOWPOWER_GRID_QUOTA,
-            LOWPOWER_GRID_WINDOW_S,
-        ));
+    if perf_this_tick.n_passes > 2 {
+        // Quota accounting stays lowpower-only (it gates the next tick's
+        // grid permission). The Tauri event below fires in BOTH modes so
+        // the GUI Events tab surfaces every grid invocation, not just
+        // the lowpower-fallback ones.
+        if !state.allow_legacy_grid {
+            state.lowpower_grid_recent.push_back(Instant::now());
+            worker_log(&format!(
+                "[grid-quota] grid entered this tick (n_passes={}, recent={}/{} in last {}s)",
+                perf_this_tick.n_passes,
+                state.lowpower_grid_recent.len(),
+                LOWPOWER_GRID_QUOTA,
+                LOWPOWER_GRID_WINDOW_S,
+            ));
+        }
+        // Surface the entry/exit/duration/ppm of the grid pass to the
+        // GUI Events tab. `t_end_ms` is taken from the same Instant as
+        // `t_rx_v3_us` so the two are consistent. `drift_ppm` comes
+        // from the rx_v3_opt result while it's still borrowable (the
+        // `let Some(mut result) = rx_v3_opt else` move-out happens
+        // below).
+        let duration_ms = (t_rx_v3_us / 1000) as u64;
+        let t_end_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let t_start_ms = t_end_ms.saturating_sub(duration_ms);
+        let drift_ppm = rx_v3_opt.as_ref().map(|r| r.drift_ppm);
+        sink.emit(
+            "grid_used",
+            GridUsedPayload {
+                t_start_ms,
+                t_end_ms,
+                duration_ms,
+                n_passes: perf_this_tick.n_passes as u32,
+                drift_ppm,
+                fallback: !state.allow_legacy_grid,
+                recent: state.lowpower_grid_recent.len(),
+                quota: LOWPOWER_GRID_QUOTA,
+            },
+        );
     }
     perf_log_accumulate(state, perf_this_tick);
     let Some(mut result) = rx_v3_opt else {
