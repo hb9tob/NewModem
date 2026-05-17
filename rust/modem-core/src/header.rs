@@ -18,7 +18,7 @@ pub const FLAG_HAS_FILENAME: u8 = 0x02;
 /// End-of-transmission marker : the burst ending with this flag is the last
 /// of its session. RX uses it to free the in-memory audio buffer immediately
 /// (keeping only 2 s of pre-roll for the next salve) instead of waiting on a
-/// silence timeout.
+/// preamble-absence timeout.
 pub const FLAG_EOT: u8 = 0x04;
 
 /// Parsed header information.

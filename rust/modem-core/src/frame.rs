@@ -411,7 +411,7 @@ pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
 ///
 /// The RX sees this as a normal V3 window whose header carries `FLAG_EOT` and
 /// whose data segment count is zero. It can trim its in-memory buffer without
-/// waiting on the silence timeout, and the already-persistent packet store on
+/// waiting on the preamble-absence timeout, and the already-persistent packet store on
 /// disk is untouched (session_id is the same as the main burst).
 pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> {
     let encoder = LdpcEncoder::new(config.ldpc_rate);

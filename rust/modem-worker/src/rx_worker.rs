@@ -582,9 +582,16 @@ const TRUNCATE_MARGIN_MS: usize = 100;
 const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 
 /// Fall back to Idle if no preamble has been seen for this long while
-/// Capturing — covers the case where the sender disappears mid-burst without
-/// sending an EOT.
-const PREAMBLE_SILENCE_TIMEOUT_S: u64 = 6;
+/// Capturing — covers the case where the sender disappears mid-burst
+/// without sending an EOT.
+///
+/// **Not** an audio-silence timer : in radio there is no silence once
+/// the TX un-keys, the RX AGC ramps up to noise floor and the demod
+/// produces FM-tinted noise. What we are detecting is the **absence
+/// of a decoded preamble** — the only signature that a real signal
+/// is on-air. Renamed in 0.10.42 from the historical
+/// `PREAMBLE_SILENCE_TIMEOUT_S` to make the semantics explicit.
+const PREAMBLE_ABSENCE_TIMEOUT_S: u64 = 6;
 
 /// Late-entry recovery (lowpower path only, `!allow_legacy_grid`).
 ///
@@ -802,8 +809,9 @@ impl WorkerState {
 
     /// Emit a `modem_state` Tauri event if `session_active` flipped since
     /// the last emission. Called once per main-loop iteration so every
-    /// transition (preamble decoded → active=true ; silence timeout / EOT
-    /// / brickwall / preroll trim → active=false) reaches the GUI exactly
+    /// transition (preamble decoded → active=true ; preamble-absence
+    /// timeout / EOT / brickwall / preroll trim → active=false) reaches
+    /// the GUI exactly
     /// once. The GUI uses it to drive the status-bar chip.
     fn check_and_emit_modem_state(&mut self, sink: &dyn EventSink) {
         if self.session_active == self.prev_emitted_session_active {
@@ -856,7 +864,7 @@ impl WorkerState {
         self.n_consecutive_undecoded_ticks = 0;
         self.lowpower_grid_recent.clear();
         // 0.10.39 : also drop the session-level drift hint. Without this,
-        // the next preamble after a silence timeout (= end-of-burst from
+        // the next preamble after a preamble-absence timeout (= end-of-burst from
         // the worker's POV) inherits the previous session's ppm via
         // `rx_v2_with_hint`. If the operator re-tunes or the TX clock
         // changed, that hint is stale and the CLOSED decode silently
@@ -1198,14 +1206,18 @@ fn maintenance_tick(
         scan_and_route(sink, save_dir, state);
     }
 
-    // Preamble-silence fallback : if we're Capturing but haven't seen a
-    // confirmed preamble for PREAMBLE_SILENCE_TIMEOUT_S, the sender likely
+    // Preamble-absence fallback : if we're Capturing but haven't seen a
+    // confirmed preamble for PREAMBLE_ABSENCE_TIMEOUT_S, the sender likely
     // vanished mid-burst (no EOT received). Full reset back to Idle so the
-    // next salve starts on a truly cold worker.
+    // next salve starts on a truly cold worker. NB : "absence" not
+    // "silence" -- post-TX the RX AGC produces FM-tinted noise well
+    // above any audio silence threshold ; what we detect here is the
+    // lack of a decoded V3 preamble, which is the real signal-presence
+    // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        if since_preamble >= Duration::from_secs(PREAMBLE_SILENCE_TIMEOUT_S) {
-            worker_log("[worker] preamble silence timeout, full reset to Idle");
+        if since_preamble >= Duration::from_secs(PREAMBLE_ABSENCE_TIMEOUT_S) {
+            worker_log("[worker] preamble-absence timeout, full reset to Idle");
             // 0.10.41 : on top of the in-state `soft_reset_buffer()` we
             // also drain the cpal mpsc backlog -- same recipe as the
             // brickwall paths (rx_worker.rs:966, 1050). Without the drain,
@@ -1835,7 +1847,7 @@ fn scan_and_route(
         return;
     };
     // A valid AppHeader decoded → a preamble is confirmed on-air. Reset the
-    // preamble-silence timer.
+    // preamble-absence timer.
     state.last_preamble_seen_at = Instant::now();
 
     // Announce the session once per session_id seen. If the session is
