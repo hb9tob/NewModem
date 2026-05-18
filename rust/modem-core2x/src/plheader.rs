@@ -1,13 +1,13 @@
-//! PLHEADER — Physical Layer header for the 2x wire format V4.
+//! PLHEADER — Physical Layer header for the 2x wire format.
 //!
-//! 192 symbols total:
+//! 256 symbols total:
 //!
 //! ```text
-//! [   64 sym SOF   ][      128 sym PLS       ]
-//!   ↑ Frank-Zadoff-     ↑ 9 Golay(24,12) blocks
-//!   ↑ Chu, root         ↑ + 12 sym redundancy
-//!   ↑ depends on        ↑   on profile_index
-//!   ↑ family            ↑ + 8 sym zero pad
+//! [  64 sym SOF  ][  64 sym SOF  ][     128 sym PLS      ]
+//!   ↑ Chu root r    ↑ Chu root r    ↑ 9 Golay(24,12) blocks
+//!   └── PREAMBLE 128 sym ──────┘   ↑ + 12 sym redundancy on
+//!   ↑ identical repetition         ↑   block 0 (profile_index)
+//!   ↑ → Schmidl-Cox auto-corr      ↑ + 8 sym zero pad
 //! ```
 //!
 //! Inspired by the DVB-S2 PLHEADER but **not bit-for-bit compatible** —
@@ -15,20 +15,31 @@
 //! rather than the DVB-S2X biorthogonal (64,7) PLSCODE. See the
 //! migration plan section "PLHEADER «inspired only»".
 //!
-//! # SOF (64 sym)
+//! # Preamble (128 sym = 2 × Chu_64)
 //!
-//! A Frank-Zadoff-Chu sequence of length 64, root `r`, mapped to
-//! constant-magnitude complex symbols. Three families share the same
-//! length but use different roots so RX can tell them apart by FFT
-//! correlation BEFORE decoding the PLS:
+//! Two identical Frank-Zadoff-Chu sequences of length 64, root `r`,
+//! mapped to constant-magnitude complex symbols, emitted back-to-back.
+//! The repetition is what makes the preamble Schmidl-Cox-detectable on
+//! RX: a sliding auto-correlation `M(k)/P(k) ∈ [0, 1]` over a 64-sample
+//! delay window peaks at the preamble position regardless of AGC drift,
+//! audio LPF, slow phase noise, or carrier-frequency offset (all
+//! affect both halves of the preamble identically, so cancel in the
+//! conjugate product). The current FT-991A → FTX-1 sound-card chain
+//! has a slow AGC + audio LPF that historically attenuated single-Chu
+//! cross-correlation peaks to ~20-30 % of the autocorr maximum;
+//! Schmidl-Cox detection is invariant to those.
+//!
+//! Three families share the same length but use different Chu roots so
+//! RX can tell them apart by post-detection cross-correlation BEFORE
+//! decoding the PLS:
 //!
 //! - Family A — root 1 — sps ≥ 1200 (NORMAL/HIGH/HIGH+/HIGH++ class).
 //! - Family B — root 3 — 750 ≤ sps < 1200 (ROBUST class).
 //! - Family C — root 5 — sps < 750 (ULTRA class).
 //!
-//! The Chu sequence has perfect cyclic autocorrelation, and the three
-//! roots have sidelobes ≤ √64 ≈ 8 against each other (≥ 18 dB peak-to-
-//! cross margin).
+//! Single-Chu autocorrelation peak = 64, sidelobes ≤ √64 ≈ 8 within a
+//! family. Doubling the preamble doubles the cross-correlation peak to
+//! 128 (+3 dB processing gain at fine-timing post-Schmidl-Cox).
 //!
 //! # PLS (128 sym)
 //!
@@ -50,14 +61,26 @@ use modem_core_base::golay::{golay_decode, golay_encode};
 use modem_core_base::types::Complex64;
 use modem_framing::crc::crc16;
 
-/// SOF length in QPSK symbols.
+/// Single-Chu SOF length in QPSK symbols. One Chu sequence stays 64
+/// symbols — what changed in the double-Chu wire format is that the
+/// preamble carries TWO of these, not one.
 pub const SOF_LEN_SYM: usize = 64;
+
+/// Preamble length in QPSK symbols — two identical Chu sequences
+/// back-to-back. The repetition lets RX detect the preamble via a
+/// sliding Schmidl-Cox auto-correlation `M(k)/P(k) ∈ [0, 1]`, invariant
+/// to AGC drift, audio LPF distortion, slow phase noise, and CFO
+/// (each affects both halves identically and cancels in the conjugate
+/// product). The unified preamble also doubles the post-detection
+/// cross-correlation peak (64 → 128) for +3 dB processing gain at
+/// fine timing refinement.
+pub const PREAMBLE_LEN_SYM: usize = 2 * SOF_LEN_SYM;
 
 /// PLS length in QPSK symbols.
 pub const PLS_LEN_SYM: usize = 128;
 
-/// Total PLHEADER length in symbols.
-pub const PLHEADER_LEN_SYM: usize = SOF_LEN_SYM + PLS_LEN_SYM;
+/// Total PLHEADER length in symbols (preamble + PLS).
+pub const PLHEADER_LEN_SYM: usize = PREAMBLE_LEN_SYM + PLS_LEN_SYM;
 
 /// PLS payload size on the wire (octets), including CRC16.
 pub const PLS_PAYLOAD_BYTES: usize = 13;
@@ -191,6 +214,19 @@ pub fn sof_for_family(family: PreambleFamily2x) -> &'static [Complex64; SOF_LEN_
     }
 }
 
+/// Return the double-Chu PREAMBLE template (128 unit-magnitude
+/// symbols = two identical Chu sequences back-to-back). Used by RX as
+/// the fine-timing matched-filter reference once Schmidl-Cox
+/// auto-correlation has flagged the preamble position.
+pub fn preamble_for_family(family: PreambleFamily2x) -> Vec<Complex64> {
+    let sof = sof_for_family(family);
+    let mut out = Vec::with_capacity(PREAMBLE_LEN_SYM);
+    out.extend_from_slice(sof);
+    out.extend_from_slice(sof);
+    debug_assert_eq!(out.len(), PREAMBLE_LEN_SYM);
+    out
+}
+
 // --- Bit helpers (mirrors header.rs style) --------------------------------
 
 fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
@@ -237,17 +273,18 @@ pub fn pls_symbols(payload: &PlsPayload) -> Vec<Complex64> {
     make_pls(payload)
 }
 
-/// Concatenation `[SOF (64) | PLS (128)]` = 192 unit-magnitude
-/// reference symbols. Use as the cycle-level pilot for the channel
-/// estimators in [`crate::rx_v4`]: they're at fully-known patterns so
-/// every received sample contributes to gain and σ² estimation
-/// without any decoding ambiguity.
+/// Concatenation `[SOF (64) | SOF (64) | PLS (128)]` = 256
+/// unit-magnitude reference symbols. Use as the cycle-level pilot for
+/// the channel estimators in [`crate::rx_v4`]: they're at
+/// fully-known patterns so every received sample contributes to gain
+/// and σ² estimation without any decoding ambiguity.
 pub fn plheader_reference_symbols(
     family: PreambleFamily2x,
     pls: &PlsPayload,
 ) -> Vec<Complex64> {
     let sof = sof_for_family(family);
     let mut out = Vec::with_capacity(PLHEADER_LEN_SYM);
+    out.extend_from_slice(sof);
     out.extend_from_slice(sof);
     out.extend(make_pls(pls));
     debug_assert_eq!(out.len(), PLHEADER_LEN_SYM);
@@ -343,10 +380,13 @@ fn try_decode_pls_from_coded(coded_bits: &[u8]) -> Option<PlsPayload> {
 
 // --- Public API -----------------------------------------------------------
 
-/// Build a 192-symbol PLHEADER for the given payload + family.
+/// Build a 256-symbol PLHEADER for the given payload + family:
+/// `[Chu_64 | Chu_64 | PLS_128]`. The two identical Chu copies form a
+/// Schmidl-Cox preamble for AGC/CFO-invariant RX detection.
 pub fn make_plheader(payload: &PlsPayload, family: PreambleFamily2x) -> Vec<Complex64> {
     let sof = sof_for_family(family);
     let mut out = Vec::with_capacity(PLHEADER_LEN_SYM);
+    out.extend_from_slice(sof);
     out.extend_from_slice(sof);
     out.extend(make_pls(payload));
     debug_assert_eq!(out.len(), PLHEADER_LEN_SYM);
@@ -355,9 +395,15 @@ pub fn make_plheader(payload: &PlsPayload, family: PreambleFamily2x) -> Vec<Comp
 
 /// Decode a PLHEADER from a slice of received symbols.
 ///
-/// `symbols` must start at the SOF; `symbols.len() ≥ 192`. The 64 SOF
-/// references are used to least-squares-fit a complex channel gain,
-/// the PLS is normalised by that gain, then demapped + Golay-decoded.
+/// `symbols` must start at the preamble (= first Chu of the
+/// double-Chu pair); `symbols.len() ≥ 256`. The 128 preamble symbols
+/// (two identical Chu copies) are used to least-squares-fit a complex
+/// channel gain, the PLS is normalised by that gain, then demapped +
+/// Golay-decoded. Averaging over the 128-sym preamble (vs 64-sym SOF
+/// in the legacy V4 format) halves the LS gain variance — the two
+/// Chu copies share the same start-of-PLHEADER reference clock, so a
+/// modest CFO across the 128-sym span rotates both copies in the
+/// same direction and cancels in the LS estimator.
 ///
 /// Returns `(payload, gain)` on success — `gain` is the LS-estimated
 /// complex channel gain (caller can use it as the initial AGC/phase
@@ -371,13 +417,18 @@ pub fn decode_plheader_at(
     }
     let sof = sof_for_family(family);
 
-    // LS gain: g = <y, s> / <s, s>. For unit-magnitude Chu reference,
-    // <s, s> = 64 exactly; we keep the explicit denominator for clarity.
+    // LS gain over the full 128-sym preamble (two identical Chu
+    // copies). For unit-magnitude Chu reference, <s, s> = 128 exactly
+    // after averaging over both copies; we keep the explicit
+    // denominator for clarity.
     let mut num = Complex64::new(0.0, 0.0);
     let mut den = 0.0_f64;
-    for k in 0..SOF_LEN_SYM {
-        num += symbols[k] * sof[k].conj();
-        den += sof[k].norm_sqr();
+    for half in 0..2 {
+        let base = half * SOF_LEN_SYM;
+        for k in 0..SOF_LEN_SYM {
+            num += symbols[base + k] * sof[k].conj();
+            den += sof[k].norm_sqr();
+        }
     }
     if den < 1e-12 {
         return None;
@@ -387,8 +438,9 @@ pub fn decode_plheader_at(
         return None;
     }
 
-    // Normalise PLS by the estimated gain.
-    let pls_norm: Vec<Complex64> = symbols[SOF_LEN_SYM..PLHEADER_LEN_SYM]
+    // Normalise PLS by the estimated gain. PLS sits AFTER the
+    // 128-sym preamble.
+    let pls_norm: Vec<Complex64> = symbols[PREAMBLE_LEN_SYM..PLHEADER_LEN_SYM]
         .iter()
         .map(|&s| s / gain)
         .collect();
@@ -584,6 +636,58 @@ mod tests {
         // Too few symbols → None.
         let v = vec![Complex64::new(0.0, 0.0); PLHEADER_LEN_SYM - 1];
         assert!(decode_plheader_at(&v, PreambleFamily2x::A).is_none());
+    }
+
+    #[test]
+    fn preamble_double_chu_identical_halves() {
+        // The PREAMBLE (128 sym) is two identical Chu_64 copies. The
+        // Schmidl-Cox RX detector relies on this: cross-correlating
+        // the two halves should give peak = SOF_LEN_SYM exactly (no
+        // sidelobes, perfect autocorrelation at lag = SOF_LEN_SYM).
+        for &family in &[PreambleFamily2x::A, PreambleFamily2x::B, PreambleFamily2x::C] {
+            let preamble = preamble_for_family(family);
+            assert_eq!(preamble.len(), PREAMBLE_LEN_SYM);
+            // Two halves must be element-wise identical.
+            for k in 0..SOF_LEN_SYM {
+                assert_eq!(
+                    preamble[k], preamble[SOF_LEN_SYM + k],
+                    "family={family:?} k={k}: halves differ"
+                );
+            }
+            // Sum_{n=0..63} preamble[n+64].conj() * preamble[n] = 64
+            // (the Schmidl-Cox auto-correlation peak; unit
+            // magnitude × 64 sym).
+            let r: Complex64 = (0..SOF_LEN_SYM)
+                .map(|n| preamble[SOF_LEN_SYM + n].conj() * preamble[n])
+                .sum();
+            assert!(
+                (r.norm() - SOF_LEN_SYM as f64).abs() < 1e-9,
+                "family={family:?} |R(lag=64)|={} expected={}",
+                r.norm(),
+                SOF_LEN_SYM
+            );
+        }
+    }
+
+    #[test]
+    fn plheader_layout_is_preamble_then_pls() {
+        // Layout invariant: [preamble (128) | PLS (128)]. The first
+        // 128 sym must equal preamble_for_family(); the next 128 sym
+        // must equal make_pls(payload).
+        let p = sample_payload();
+        let plheader = make_plheader(&p, PreambleFamily2x::A);
+        assert_eq!(plheader.len(), PLHEADER_LEN_SYM);
+        let expected_preamble = preamble_for_family(PreambleFamily2x::A);
+        for k in 0..PREAMBLE_LEN_SYM {
+            assert_eq!(plheader[k], expected_preamble[k], "preamble[{k}] mismatch");
+        }
+        let expected_pls = make_pls(&p);
+        for k in 0..PLS_LEN_SYM {
+            assert_eq!(
+                plheader[PREAMBLE_LEN_SYM + k], expected_pls[k],
+                "pls[{k}] mismatch"
+            );
+        }
     }
 
     #[test]

@@ -61,8 +61,8 @@ use crate::gate2x::{PreambleProbe2x, IDLE_PROBE_BUF_SAMPLES, PROBE_THRESHOLD_2X}
 use crate::pilot2x_tdm::PilotPattern2x;
 use crate::streaming_dsp::StreamingDsp;
 use crate::plheader::{
-    decode_plheader_at, sof_for_family, PlsPayload, PreambleFamily2x, PLHEADER_LEN_SYM,
-    SOF_LEN_SYM,
+    decode_plheader_at, preamble_for_family, sof_for_family, PlsPayload,
+    PreambleFamily2x, PLHEADER_LEN_SYM, PREAMBLE_LEN_SYM, SOF_LEN_SYM,
 };
 use crate::profile2x::ModemConfig2x;
 use crate::rx_v4::{
@@ -302,15 +302,16 @@ pub struct Rx2xSession {
     /// `RX2X_LOG_PILOT_TRACK=1`.
     plheader_phases: Vec<(u64, f64)>,
 
-    /// Cheap FFT preamble gate. While `false`, `process_audio_chunk`
+    /// Schmidl-Cox preamble gate. While `false`, `process_audio_chunk`
     /// keeps `audio_buffer` trimmed to the last `IDLE_PROBE_BUF_SAMPLES`
-    /// (400 ms) and runs `PreambleProbe2x` on that tail — no downmix,
-    /// no matched filter, no resample, no FSM. The flag flips to `true`
-    /// the first time a SOF correlation peak crosses
-    /// `PROBE_THRESHOLD_2X`; from that point the full DSP pipeline runs
-    /// every chunk. Rearmed back to `false` if no PLS Golay validates
-    /// within `false_positive_budget_audio_samples` after firing — see
-    /// the post-FSM rearm check at the end of `process_audio_chunk`.
+    /// (400 ms) and runs `PreambleProbe2x` on that tail — downmix
+    /// + LPF + sliding auto-correlation, no symbol-domain DSP. The
+    /// flag flips to `true` the first time the metric `M(k) ∈ [0, 1]`
+    /// crosses `PROBE_THRESHOLD_2X` (= 0.5); from that point the full
+    /// DSP pipeline runs every chunk. Rearmed back to `false` if no
+    /// PLS Golay validates within `false_positive_budget_audio_samples`
+    /// after firing — see the post-FSM rearm check at the end of
+    /// `process_audio_chunk`.
     gate_armed: bool,
 
     /// `audio_buffer.len()` snapshot at the moment `gate_armed` flipped
@@ -640,6 +641,19 @@ impl Rx2xSession {
     /// validation is GONE — that loop was the source of the Pi
     /// CPU saturation OTA bring-up exposed.
     fn try_bootstrap_pair(&mut self) -> bool {
+        // RX2X_PROBE_EVERY_CHUNK=1 — diagnostic mode. Runs the probe on the
+        // last 400 ms of audio every chunk regardless of gate state, just
+        // for the dump; doesn't disturb the FSM. Use with
+        // RX2X_DUMP_PROBE_DIR to harvest a CSV summary that covers the
+        // full burst (not just the 1-2 calls the FSM naturally makes
+        // before going into "waiting for enough audio" mode).
+        if std::env::var_os("RX2X_PROBE_EVERY_CHUNK").is_some()
+            && self.audio_buffer.len() >= IDLE_PROBE_BUF_SAMPLES
+        {
+            let tail_start = self.audio_buffer.len() - IDLE_PROBE_BUF_SAMPLES;
+            let probe = PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
+            let _ = probe.check(&self.audio_buffer[tail_start..]);
+        }
         // Step 1: cheap FFT gate on the 400 ms tail. While !gate_armed
         // we never touch downmix / MF / resample.
         if !self.gate_armed {
@@ -653,12 +667,25 @@ impl Rx2xSession {
             }
             let probe = PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
             let r = probe.check(&self.audio_buffer);
-            if !r.passes(PROBE_THRESHOLD_2X) {
+            let bypass = std::env::var_os("RX2X_GATE_BYPASS").is_some();
+            if !r.passes(PROBE_THRESHOLD_2X) && !bypass {
+                if std::env::var_os("RX2X_LOG_GATE_VERBOSE").is_some() {
+                    eprintln!(
+                        "[rx2x-gate] probe BELOW metric={:.3} threshold={:.3} anchor={:?}",
+                        r.max_ratio, PROBE_THRESHOLD_2X, r.best_anchor,
+                    );
+                }
                 return false;
+            }
+            if bypass && !r.passes(PROBE_THRESHOLD_2X) && std::env::var_os("RX2X_LOG_GATE").is_some() {
+                eprintln!(
+                    "[rx2x-gate] BYPASS metric={:.3} threshold={:.3} anchor={:?}",
+                    r.max_ratio, PROBE_THRESHOLD_2X, r.best_anchor,
+                );
             }
             if std::env::var_os("RX2X_LOG_GATE").is_some() {
                 eprintln!(
-                    "[rx2x-gate] probe positive ratio={:.1} anchor={:?}",
+                    "[rx2x-gate] probe positive metric={:.3} anchor={:?}",
                     r.max_ratio, r.best_anchor,
                 );
             }
@@ -682,12 +709,12 @@ impl Rx2xSession {
         };
         let cycle_sym = self.cycle_period_sym;
         // (cycle_sym + PLHEADER_LEN_SYM) gives just enough symbols to hold
-        // s1 = 0 and s2 = cycle_sym; SOF_LEN_SYM extra leaves room for the
-        // correlation peak's 64-sym window past s2; 2 × RRC_SPAN_SYM × sps
-        // covers the matched-filter ramp-up/down so the symbol stream is
-        // dense from the buffer start.
+        // s1 = 0 and s2 = cycle_sym; PREAMBLE_LEN_SYM extra leaves room
+        // for the 128-sym double-Chu correlation window past s2;
+        // 2 × RRC_SPAN_SYM × sps covers the matched-filter ramp-up/down
+        // so the symbol stream is dense from the buffer start.
         let needed_audio =
-            (cycle_sym + PLHEADER_LEN_SYM + SOF_LEN_SYM) * sps
+            (cycle_sym + PLHEADER_LEN_SYM + PREAMBLE_LEN_SYM) * sps
                 + 2 * RRC_SPAN_SYM * sps;
         if self.audio_buffer.len() < needed_audio {
             // Cap how long we accumulate without firing the search. If
@@ -724,12 +751,16 @@ impl Rx2xSession {
         // weak to plausibly be a real PLHEADER and skips by
         // min_cycle_skip_syms after each detection (avoids re-counting
         // the same peak under symbol-grid quantisation).
-        let min_skip = (cycle_sym / 2).max(SOF_LEN_SYM);
+        let min_skip = (cycle_sym / 2).max(PREAMBLE_LEN_SYM);
         let peaks = find_all_sofs(&symbols, self.cfg.family, min_skip);
         if std::env::var_os("RX2X_LOG_GATE").is_some() {
+            let valid_flags: Vec<bool> = peaks.iter().map(|&p| {
+                if p + PLHEADER_LEN_SYM > symbols.len() { return false; }
+                decode_plheader_at(&symbols[p..p + PLHEADER_LEN_SYM], self.cfg.family).is_some()
+            }).collect();
             eprintln!(
-                "[rx2x-bootstrap] {} peaks in {} syms (cycle_sym={})",
-                peaks.len(), symbols.len(), cycle_sym,
+                "[rx2x-bootstrap] {} peaks in {} syms (cycle_sym={}) peaks={:?} valid_pls={:?}",
+                peaks.len(), symbols.len(), cycle_sym, peaks, valid_flags,
             );
         }
 
@@ -759,19 +790,23 @@ impl Rx2xSession {
                     // cryptographic proof of a real burst) — NOT the
                     // drift estimator. `find_all_sofs` returns the
                     // first threshold-crossing, not the correlation
-                    // peak, so `(s2 − s1)` is offset by O(SOF_LEN_SYM/2)
-                    // symbols and yields a wildly wrong drift (several
-                    // kppm on clean WAVs). Set drift = 0 at commit; the
-                    // per-cycle FFE absorbs the residual sound-card /
-                    // OTA drift the same way the pre-2x21 code did.
+                    // peak; with the 128-sym double-Chu preamble the
+                    // peak is sharper than the legacy single-Chu so
+                    // the offset is bounded by O(PREAMBLE_LEN_SYM/2),
+                    // but it's still not a clean drift estimator. Set
+                    // drift = 0 at commit; the per-cycle FFE absorbs
+                    // the residual sound-card / OTA drift and the
+                    // audio-rate parabolic refinement in
+                    // `estimate_drift_from_raw` tightens it to
+                    // ~0.5 ppm once the first cycle decodes.
                     // TODO: bolt on a parabolic-refined LS drift fit
                     // (see `estimate_drift_from_raw`) after first
                     // cycle decodes if measured drift > ~5 ppm matters
                     // for long-burst σ² floors.
                     if std::env::var_os("RX2X_LOG_GATE").is_some() {
                         eprintln!(
-                            "[rx2x-bootstrap] COMMIT s1={} s2={} delta={} cycle={} pls.flags={:#x}",
-                            s1, s2, s2 - s1, cycle_sym, pls.flags,
+                            "[rx2x-bootstrap] COMMIT s1={} s2={} delta={} cycle={} pls.flags={:#x} pls.base_esi={} pls.seg_id={}",
+                            s1, s2, s2 - s1, cycle_sym, pls.flags, pls.base_esi, pls.seg_id,
                         );
                     }
                     self.cached_drift_ppm = 0.0;
@@ -782,36 +817,81 @@ impl Rx2xSession {
             }
         }
 
-        // Step 6: no valid pair. Drop audio per the agreed policy and
-        // rearm the gate.
-        //   ≥2 peaks: drop up to (excluded) peaks[1] — if peaks[1] is
-        //             real but mis-paired with peaks[0], it'll re-fire
-        //             the gate on the next probe;
-        //   1 peak:   Golay tried (PLHEADER fit), failed → drop past it;
-        //   0 peaks:  probe false-fired on band noise → drop most of buf.
-        let drop_sym = if peaks.len() >= 2 {
-            peaks[1]
-        } else if peaks.len() == 1 && peaks[0] + PLHEADER_LEN_SYM <= symbols.len() {
-            peaks[0] + 1
-        } else {
-            // One peak but PLHEADER overruns, or zero peaks. Drop most
-            // of the buffer so the next chunk fits cleanly into the
-            // gate window.
-            symbols.len().saturating_sub(SOF_LEN_SYM)
-        };
-        let drop_samples = (drop_sym * sps).min(self.audio_buffer.len());
-        if drop_samples > 0 {
-            self.audio_drained_samples += drop_samples as u64;
-            self.audio_buffer.drain(..drop_samples);
+        // Step 6: no valid pair. Drop audio per the policy:
+        //
+        // **Validity-aware** to avoid throwing away a real PLHEADER
+        // that just hasn't found its cycle partner yet (the failure
+        // mode the pre-burst path exposed: a false-positive Chu peak
+        // in the PRBS pre-burst + the real PLHEADER1 = 2 peaks, but
+        // PLHEADER2 hasn't arrived → naive `drop_sym = peaks[1]` would
+        // delete the real PLHEADER1 and the next commit would land on
+        // PLHEADER2, losing cycle 1's data CWs irrecoverably).
+        //
+        // Policy:
+        //   1. Walk peaks, decode_plheader_at each. Keep track of the
+        //      LAST INVALID index (Golay+CRC fail).
+        //   2. Drop past the last invalid peak only. Everything from
+        //      the next valid peak onwards stays alive for the next
+        //      bootstrap attempt (which will see more audio and may
+        //      find the missing cycle partner).
+        //   3. No invalid peaks but no valid pair: drop a single
+        //      symbol to make progress without throwing away the
+        //      valid PLHEADER.
+        //   4. No peaks at all: drop most of buf so the next chunk
+        //      fits cleanly into the gate window.
+        let mut last_invalid_idx: Option<usize> = None;
+        let mut any_valid = false;
+        for (i, &p) in peaks.iter().enumerate() {
+            if p + PLHEADER_LEN_SYM > symbols.len() {
+                // Overruns the buffer — treat as invalid for drop
+                // purposes (we can't decode it; let the audio extend
+                // and reconsider next round).
+                last_invalid_idx = Some(i);
+                continue;
+            }
+            let plheader_slice = &symbols[p..p + PLHEADER_LEN_SYM];
+            if decode_plheader_at(plheader_slice, self.cfg.family).is_some() {
+                any_valid = true;
+            } else {
+                last_invalid_idx = Some(i);
+            }
         }
-        self.gate_armed = false;
-        self.gate_arm_buf_len = 0;
+        // **VOX false-positive / preamble-waiting guard**: when the
+        // bootstrap fails to find a valid pair, two situations are
+        // possible and need different handling:
+        //
+        // (1) AT LEAST ONE valid PLS peak in `peaks`. The SC fired on
+        //     a real PLHEADER but the cycle partner isn't visible yet
+        //     (typically because the buffer doesn't extend a full
+        //     cycle past the first PLHEADER). DO NOT drop audio. DO
+        //     NOT disarm the gate. Keep accumulating until more
+        //     audio arrives and find_all_sofs sees the partner.
+        //
+        // (2) ZERO valid PLS peaks. The SC false-fired on band-noise
+        //     / VOX-tone / preburst content (= correlation peaks
+        //     above the Chu threshold by chance, all failing
+        //     Golay+CRC). DO NOT drop the valid PLHEADER but if no
+        //     valid peak appears for many chunks, we'd loop forever.
+        //     Solution: keep buffer + gate armed for now. Step 2's
+        //     `max_wait_samples` is the safety belt: once buffer
+        //     exceeds `needed_audio + IDLE_PROBE_BUF_SAMPLES`, step 2
+        //     drops the bulk and disarms.
+        //
+        // The pre-2x24 policy (drop past `peaks[1]`) lost cycle 0 on
+        // the pre-burst path because PRBS chance correlations
+        // produced 2 false peaks and the drop swept past the real
+        // PLHEADER. The new policy is conservative on dropping —
+        // step 2's max_wait protects against runaway buffer growth.
         if std::env::var_os("RX2X_LOG_GATE").is_some() {
+            let valid_count = peaks.iter().enumerate().filter(|(i, _)| {
+                Some(*i) != last_invalid_idx || any_valid
+            }).count();
             eprintln!(
-                "[rx2x-bootstrap] reject — dropped {} samples (drop_sym={}, {} peaks), re-gating",
-                drop_samples, drop_sym, peaks.len(),
+                "[rx2x-bootstrap] reject — keeping buffer ({} peaks, any_valid={}, {} valid-ish, awaiting partner)",
+                peaks.len(), any_valid, valid_count,
             );
         }
+        let _ = (last_invalid_idx, any_valid); // suppress unused warnings
         false
     }
 
@@ -983,7 +1063,7 @@ impl Rx2xSession {
     fn try_acquire(&mut self, events: &mut Vec<Rx2xEvent>) -> bool {
         let cursor_rel =
             self.scan_cursor_abs.saturating_sub(self.buf_start_abs) as usize;
-        if cursor_rel + SOF_LEN_SYM >= self.sym_buffer.len() {
+        if cursor_rel + PREAMBLE_LEN_SYM >= self.sym_buffer.len() {
             return false;
         }
         if let Some(rel) =
@@ -1379,7 +1459,7 @@ impl Rx2xSession {
         let mf = demodulator::matched_filter(&bb, &taps);
         let phase = best_symbol_phase_sof(&mf, sps, &self.cfg);
         let n_syms = mf.len().saturating_sub(phase) / sps;
-        if n_syms < SOF_LEN_SYM {
+        if n_syms < PREAMBLE_LEN_SYM {
             return false;
         }
 
@@ -1390,7 +1470,7 @@ impl Rx2xSession {
         for k in 0..n_syms {
             raw_syms.push(mf[phase + k * sps]);
         }
-        let min_skip = (self.cycle_period_sym / 2).max(SOF_LEN_SYM);
+        let min_skip = (self.cycle_period_sym / 2).max(PREAMBLE_LEN_SYM);
         let mut sym_positions: Vec<usize> = Vec::new();
         let mut scan = 0;
         while let Some(pos) = find_next_sof(&raw_syms, scan, self.cfg.family) {
@@ -1409,20 +1489,23 @@ impl Rx2xSession {
             return false;
         }
 
-        // Step 3: refine each PLS-validated SOF position to sub-audio-
-        // sample precision via parabolic peak fit on the audio-rate Chu
-        // correlation magnitude. Search window is ±sps audio samples
+        // Step 3: refine each PLS-validated preamble position to
+        // sub-audio-sample precision via parabolic peak fit on the
+        // audio-rate matched-filter magnitude. The template is the
+        // full 128-sym double-Chu preamble (+3 dB processing gain vs
+        // legacy single-Chu). Search window is ±sps audio samples
         // around the integer-symbol expected position (the audio peak
-        // lies within ±1 symbol of that integer position by construction).
-        let sof = sof_for_family(self.cfg.family);
-        let n_sof_audio = SOF_LEN_SYM * sps;
+        // lies within ±1 symbol of that integer position by
+        // construction).
+        let preamble_template = preamble_for_family(self.cfg.family);
+        let n_sof_audio = PREAMBLE_LEN_SYM * sps;
         let max_pos = mf.len().saturating_sub(n_sof_audio);
         let corr_at = |pos: usize| -> f64 {
             if pos > max_pos {
                 return 0.0;
             }
             let mut acc = Complex64::new(0.0, 0.0);
-            for (k, &s) in sof.iter().enumerate() {
+            for (k, &s) in preamble_template.iter().enumerate() {
                 acc += mf[pos + k * sps] * s.conj();
             }
             acc.norm()
@@ -2366,6 +2449,66 @@ mod tests {
         }
         events.extend(session.finalize());
         (session, events)
+    }
+
+    /// Modulate the same payload but via `V4Modem::encode_to_samples`
+    /// with `vox_seconds > 0` — this exercises the full TX wire layout
+    /// including the PRBS pre-burst (`vox_seconds == 0` short-circuits
+    /// the pre-burst, see `modem2x.rs`).
+    fn modulate_with_vox_for(
+        profile_name: &str,
+        payload: &[u8],
+        session_id: u32,
+        vox_seconds: f64,
+    ) -> Vec<f32> {
+        use modem_core_base::traits::Modem;
+        use modem_framing::raptorq_codec;
+        let cfg = ProfileIndex2x::from_name(profile_name)
+            .expect("profile")
+            .to_config();
+        let k_bytes = cfg.base.ldpc_rate.k() / 8;
+        let k_source = raptorq_codec::k_from_payload(payload.len(), k_bytes) as u32;
+        let n_packets = k_source + raptorq_codec::n_repair_default(k_source);
+        let req = EncodeRequest {
+            profile: profile_name,
+            wire_payload: payload,
+            session_id,
+            mime_type: mime::BINARY,
+            hash_short: 0xAA55,
+            esi_start: 0,
+            n_packets,
+            vox_seconds,
+        };
+        V4Modem
+            .encode_to_samples(&req)
+            .expect("encode ok")
+    }
+
+    #[test]
+    fn session_decodes_burst_with_preburst_high_2x() {
+        // End-to-end test of the PRBS pre-burst path: encode with
+        // `vox_seconds = 0.5` which prepends 2 s of PRBS audio before
+        // the data superframe, then verify the session still decodes
+        // byte-exact. This catches regressions where the pre-burst
+        // is mis-detected as a SOF (false-positive Schmidl-Cox) and
+        // also regressions where the pre-burst FFE training breaks
+        // the per-cycle equaliser (e.g., positions out of bounds).
+        let cfg = profile_high_2x();
+        let payload = rng_bytes(3000, 0xFEED);
+        let audio = modulate_with_vox_for("HIGH2X", &payload, 0xBEEF, 0.5);
+        let (_session, events) = collect_events_chunked(cfg, "HIGH2X", &audio);
+
+        let final_event = events
+            .iter()
+            .find(|e| matches!(e, Rx2xEvent::SessionFinalised { .. }))
+            .expect("SessionFinalised emitted (with-preburst path)");
+        if let Rx2xEvent::SessionFinalised { result } = final_event {
+            assert!(result.app_header.is_some(), "AppHeader recovered");
+            assert_eq!(
+                result.data, payload,
+                "byte-exact payload after preburst path"
+            );
+        }
     }
 
     #[test]

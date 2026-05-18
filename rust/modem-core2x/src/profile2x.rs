@@ -2,9 +2,10 @@
 //!
 //! Mirrors the V3 profile catalogue (see `modem_core::profile`). The
 //! original 2x design dropped TDM pilots in favour of sparse pilot
-//! blocks (DVB-S2X §5.5.3), but OTA bring-up on FTX-1 + SDRplay showed
-//! the block pattern could not track sound-card phase noise on
-//! HIGH+/HIGH++ (see memory `v4-pilot-tdm-refactor-todo`). The TDM
+//! blocks (DVB-S2X §5.5.3), but OTA bring-up on the reference
+//! sound-card chain FT-991A (TX) → FTX-1 (RX) showed the block
+//! pattern could not track sound-card phase noise on HIGH+/HIGH++
+//! (see memory `v4-pilot-tdm-refactor-todo`). The TDM
 //! pattern is now back as the standard pilot scheme for all 2x
 //! profiles, exposed as a per-profile [`PilotPattern2x`] so density
 //! and update-bandwidth axes can be tuned independently of the

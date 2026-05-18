@@ -50,7 +50,8 @@ use crate::frame2x::{
 };
 use crate::pilot2x_tdm::{self, pilot_symbol_2x, PilotPattern2x};
 use crate::plheader::{
-    self, decode_plheader_at, PlsPayload, PreambleFamily2x, PLHEADER_LEN_SYM, SOF_LEN_SYM,
+    self, decode_plheader_at, PlsPayload, PreambleFamily2x, PLHEADER_LEN_SYM,
+    PREAMBLE_LEN_SYM, SOF_LEN_SYM,
 };
 use crate::profile2x::ModemConfig2x;
 
@@ -61,19 +62,24 @@ const LDPC_MAX_ITER: usize = 30;
 /// Conservative σ² floor when no pilot residual is available yet.
 const SIGMA2_FLOOR: f64 = 1e-3;
 
-/// SOF correlation peak threshold (fraction of `SOF_LEN_SYM`). For unit-
-/// magnitude Chu, autocorrelation peaks at 64 on a clean roundtrip.
+/// Preamble correlation peak threshold (fraction of `PREAMBLE_LEN_SYM`).
+/// For the double-Chu preamble (128 unit-magnitude symbols),
+/// autocorrelation peaks at 128 on a clean roundtrip.
 ///
-/// Real OTA paths (SDRplay + radio NBFM demod chain with audio-band
-/// LPF + de-emphasis + AGC) attenuate the SOF pulse magnitude by 70-80%
-/// — observed correlation peaks land in the 15-20 range on a FTX-1 →
-/// SDRplay capture even at high SNR. Threshold 0.2 × 64 = 12.8 admits
-/// those while staying well above the noise correlation level
-/// (random Chu match peaks ≈ √(64·2·ln(L))·σ ≈ 25·σ for L=5000 syms,
-/// so at σ=0.06 a noise peak is ~1.5 — 8× under threshold).
+/// Real OTA paths (NBFM transceiver chain with audio-band LPF +
+/// de-emphasis + AGC) attenuate the preamble pulse magnitude by
+/// 70-80% — observed cross-correlation peaks land in the 30-40 range
+/// on the reference sound-card chain FT-991A (TX) → FTX-1 (RX) even
+/// at high SNR (= +3 dB above the legacy single-Chu 15-20 range).
+/// Threshold 0.2 × 128 = 25.6 admits those while staying well above
+/// the noise correlation level (random Chu match peaks
+/// ≈ √(128·2·ln(L))·σ for L=5000 syms, so at σ=0.06 a noise peak is
+/// ~2 — well under threshold).
 ///
-/// Was 0.5 pre-v0.11.0-2x4 (correct for synthetic WAV roundtrip, blew
-/// past every real OTA capture).
+/// Was 0.5 pre-v0.11.0-2x4 (single-Chu, correct for synthetic WAV
+/// roundtrip, blew past every real OTA capture). Migration to
+/// double-Chu in the Schmidl-Cox refactor doubles the SNR floor while
+/// keeping the same 0.2 fraction (= ×2 more noise rejection).
 const SOF_PEAK_THRESHOLD_FRAC: f64 = 0.2;
 
 /// One decoded V4 burst.
@@ -279,44 +285,104 @@ fn mean_phase(phis: &[f64]) -> f64 {
     sy.atan2(sx)
 }
 
-/// Find every SOF position above the threshold in a symbol stream.
+/// Find every preamble position above the threshold in a symbol stream.
 ///
+/// Correlates against the 128-sym double-Chu preamble (= two identical
+/// Chu sequences back-to-back). Peak position is the start of the
+/// FIRST Chu copy, matching `make_plheader`'s emission convention.
 /// Each detected peak advances the scan cursor by one cycle's worth of
 /// symbols (≈ `4 s × symbol_rate`) so a fat correlation peak doesn't
-/// register twice. Used by the worker's drift bootstrap: multiple SOF
-/// positions on the same buffer let us LS-fit the symbol-rate clock
-/// offset between TX and RX (see [`estimate_drift_from_sof_positions`]).
+/// register twice. Used by the worker's drift bootstrap: multiple
+/// preamble positions on the same buffer let us LS-fit the symbol-rate
+/// clock offset between TX and RX (see
+/// [`estimate_drift_from_sof_positions`]).
 pub fn find_all_sofs(
     symbols: &[Complex64],
     family: PreambleFamily2x,
     min_cycle_skip_syms: usize,
 ) -> Vec<usize> {
     let mut out = Vec::new();
-    if symbols.len() < SOF_LEN_SYM {
+    if symbols.len() < PREAMBLE_LEN_SYM {
         return out;
     }
-    let sof = plheader::sof_for_family(family);
-    // Tighter threshold than `SOF_PEAK_THRESHOLD_FRAC` (0.2) — that
-    // threshold accepts a real PLHEADER attenuated by 70-80 % through
-    // the SDR + radio chain, but on a long buffer at threshold 0.2
-    // we'd also catch false-positive Chu correlations in band noise
-    // and PLS QPSK data, which pollute the drift LS fit. 0.3 × 64 =
-    // 19.2 rejects most of those while still passing a real PLHEADER
-    // with peak ≥ 20 (empirical floor on FTX-1 + SDRplay captures).
-    let threshold = 0.3 * SOF_LEN_SYM as f64;
-    let end = symbols.len() - SOF_LEN_SYM;
-    let mut k = 0;
-    while k <= end {
+    let preamble = plheader::preamble_for_family(family);
+    debug_assert_eq!(preamble.len(), PREAMBLE_LEN_SYM);
+    // Double-Chu preamble: clean autocorr peak = PREAMBLE_LEN_SYM
+    // = 128. The 0.2 fractional threshold (= 25.6) admits OTA peaks
+    // attenuated by ~70-80 % on the FT-991A → FTX-1 sound-card
+    // reference chain, while staying well above the noise correlation
+    // level. False-positive Chu hits in band noise are filtered
+    // downstream by per-PLS Golay+CRC validation at the
+    // bootstrap-commit gate AND by the Schmidl-Cox auto-correlation
+    // gate upstream.
+    let threshold = SOF_PEAK_THRESHOLD_FRAC * PREAMBLE_LEN_SYM as f64;
+    let end = symbols.len() - PREAMBLE_LEN_SYM;
+    let log_chu = std::env::var_os("RX2X_LOG_CHU").is_some();
+    let skip = min_cycle_skip_syms.max(PREAMBLE_LEN_SYM);
+    // Two-pass: first pass computes correlation magnitude at every
+    // position above threshold. Second pass walks in `skip`-sized
+    // windows and emits the LOCAL MAXIMUM per window (not the first
+    // crossing). The first-crossing strategy used historically
+    // suppressed real PLHEADERs (correlation ≈ 128) when a chance
+    // false-positive (correlation ≈ 25.6 = exactly threshold) sat
+    // earlier in the same `skip` window — find_all_sofs would report
+    // the false-positive and skip past the real one. Common failure
+    // mode with the PRBS pre-burst path: PRBS chance correlations at
+    // ~2 % of positions exceeded threshold and masked the cycle 0
+    // PLHEADER deeper in the buffer.
+    let mut mags: Vec<f64> = Vec::with_capacity(end + 1);
+    let mut best_k_log: usize = 0;
+    let mut best_peak_log: f64 = 0.0;
+    for k in 0..=end {
         let mut acc = Complex64::new(0.0, 0.0);
-        for n in 0..SOF_LEN_SYM {
-            acc += symbols[k + n] * sof[n].conj();
+        for n in 0..PREAMBLE_LEN_SYM {
+            acc += symbols[k + n] * preamble[n].conj();
         }
-        if acc.norm() >= threshold {
-            out.push(k);
-            k += min_cycle_skip_syms.max(SOF_LEN_SYM);
+        let mag = acc.norm();
+        mags.push(mag);
+        if log_chu && mag > best_peak_log {
+            best_peak_log = mag;
+            best_k_log = k;
+        }
+    }
+    let mut window_start = 0usize;
+    while window_start <= end {
+        let window_end = (window_start + skip).min(end + 1);
+        let mut local_best_k = window_start;
+        let mut local_best_mag = 0.0_f64;
+        for k in window_start..window_end {
+            if mags[k] > local_best_mag {
+                local_best_mag = mags[k];
+                local_best_k = k;
+            }
+        }
+        if local_best_mag >= threshold {
+            out.push(local_best_k);
+            if log_chu {
+                eprintln!(
+                    "[rx2x-chu] src=find_all_sofs status=accept k={} peak={:.4} \
+                     ratio={:.4} threshold={:.4} preamble_len={} family={:?} win_len={}",
+                    local_best_k, local_best_mag, local_best_mag / PREAMBLE_LEN_SYM as f64,
+                    threshold, PREAMBLE_LEN_SYM, family, symbols.len(),
+                );
+            }
+            // Skip past the window we just selected the peak from.
+            // The next window starts AFTER local_best_k + skip so we
+            // don't re-detect the same peak under quantisation noise.
+            window_start = local_best_k + skip;
         } else {
-            k += 1;
+            window_start = window_end;
         }
+    }
+    let best_k = best_k_log;
+    let best_peak = best_peak_log;
+    if log_chu {
+        eprintln!(
+            "[rx2x-chu] src=find_all_sofs summary win_len={} k_best={} peak_best={:.4} \
+             ratio_best={:.4} threshold={:.4} accepted={} family={:?}",
+            symbols.len(), best_k, best_peak, best_peak / PREAMBLE_LEN_SYM as f64,
+            threshold, out.len(), family,
+        );
     }
     out
 }
@@ -396,20 +462,45 @@ pub(crate) fn find_next_sof(
     cursor: usize,
     family: PreambleFamily2x,
 ) -> Option<usize> {
-    if symbols.len() < cursor + SOF_LEN_SYM {
+    if symbols.len() < cursor + PREAMBLE_LEN_SYM {
         return None;
     }
-    let sof = plheader::sof_for_family(family);
-    let threshold = SOF_PEAK_THRESHOLD_FRAC * SOF_LEN_SYM as f64;
-    let end = symbols.len() - SOF_LEN_SYM;
+    let preamble = plheader::preamble_for_family(family);
+    debug_assert_eq!(preamble.len(), PREAMBLE_LEN_SYM);
+    let threshold = SOF_PEAK_THRESHOLD_FRAC * PREAMBLE_LEN_SYM as f64;
+    let end = symbols.len() - PREAMBLE_LEN_SYM;
+    let log_chu = std::env::var_os("RX2X_LOG_CHU").is_some();
+    let mut best_k: usize = cursor;
+    let mut best_peak: f64 = 0.0;
     for k in cursor..=end {
         let mut acc = Complex64::new(0.0, 0.0);
-        for n in 0..SOF_LEN_SYM {
-            acc += symbols[k + n] * sof[n].conj();
+        for n in 0..PREAMBLE_LEN_SYM {
+            acc += symbols[k + n] * preamble[n].conj();
         }
-        if acc.norm() >= threshold {
+        let mag = acc.norm();
+        if log_chu && mag > best_peak {
+            best_peak = mag;
+            best_k = k;
+        }
+        if mag >= threshold {
+            if log_chu {
+                eprintln!(
+                    "[rx2x-chu] src=find_next_sof status=accept cursor={} end={} \
+                     k={} peak={:.4} ratio={:.4} threshold={:.4} preamble_len={} family={:?}",
+                    cursor, end, k, mag, mag / PREAMBLE_LEN_SYM as f64,
+                    threshold, PREAMBLE_LEN_SYM, family,
+                );
+            }
             return Some(k);
         }
+    }
+    if log_chu {
+        eprintln!(
+            "[rx2x-chu] src=find_next_sof status=noaccept cursor={} end={} \
+             k_best={} peak_best={:.4} ratio_best={:.4} threshold={:.4} preamble_len={} family={:?}",
+            cursor, end, best_k, best_peak, best_peak / PREAMBLE_LEN_SYM as f64,
+            threshold, PREAMBLE_LEN_SYM, family,
+        );
     }
     None
 }
@@ -1134,8 +1225,15 @@ const FFE_LEN_2X: usize = 64;
 
 /// Gather the **consecutive** known-reference block at the start of one
 /// PLHEADER cycle :
-/// - PLHEADER 192 sym (SOF Chu + PLS QPSK, recovered from the validated
-///   `pls` payload)
+/// - **PRBS pre-burst** (3000 sym) — OPTIONAL, only when the symbols
+///   immediately before `sof_at` correlate above 0.5 with the known
+///   LFSR-15 sequence in [`crate::preburst`]. Adds ~13× more training
+///   samples than the per-cycle refs alone, dramatically over-
+///   determining the LS for the 64-tap FFE and absorbing the
+///   transceiver-chain group delay + amplitude tilt that the
+///   PLHEADER-only training couldn't see.
+/// - PLHEADER 256 sym (double-Chu preamble + PLS QPSK, recovered from
+///   the validated `pls` payload)
 /// - LMS warmup symbols (`cfg.lms_warmup_syms`: 32 for APSK32/HighPlus,
 ///   64 for APSK64/HighPlusPlus, 0 for QPSK/8PSK/16-APSK)
 ///
@@ -1148,18 +1246,29 @@ const FFE_LEN_2X: usize = 64;
 /// drive the per-CW scalar LS gain estimator downstream
 /// (`estimate_cw_gain`), where they don't need consecutive context.
 ///
-/// Mirrors V3 which trains its FFE on a 256-sym consecutive preamble
-/// only. 224 sym for APSK profiles here is slightly less but the LS is
-/// still 3.5× over-determined for `n_ff = 64`.
+/// Without the pre-burst (late entry, or VOX-off synthetic test path)
+/// the training set is just PLHEADER + warmup = 288 sym (4.5× over-
+/// determined for `n_ff = 64`) — same fallback the legacy V3 FFE used.
 fn gather_cycle_refs(
     cfg: &ModemConfig2x,
     pls: &PlsPayload,
     sof_at: usize,
+    symbols: &[Complex64],
 ) -> (Vec<usize>, Vec<Complex64>) {
     let mut positions: Vec<usize> = Vec::new();
     let mut refs: Vec<Complex64> = Vec::new();
 
-    // PLHEADER refs — 192 consecutive sym.
+    // Opportunistic pre-burst refs — only when actually present AND
+    // when env `RX2X_DISABLE_PREBURST_FFE` is NOT set (diagnostic
+    // escape hatch for OTA bring-up).
+    if std::env::var_os("RX2X_DISABLE_PREBURST_FFE").is_none() {
+        if let Some((pb_pos, pb_refs)) = try_gather_preburst_refs(symbols, sof_at) {
+            positions.extend(pb_pos);
+            refs.extend(pb_refs);
+        }
+    }
+
+    // PLHEADER refs — 256 consecutive sym (preamble + PLS).
     let plheader_refs = plheader::plheader_reference_symbols(cfg.family, pls);
     for (i, &s) in plheader_refs.iter().enumerate() {
         positions.push(sof_at + i);
@@ -1175,6 +1284,60 @@ fn gather_cycle_refs(
     }
 
     (positions, refs)
+}
+
+/// Attempt to detect the PRBS pre-burst in the `PREBURST_LEN_SYM`
+/// symbols immediately before `sof_at` and return `(positions, refs)`
+/// suitable for [`train_ffe_ls`] if it's present.
+///
+/// Detection uses the **squared complex correlation coefficient**
+/// `|⟨y, p⟩|² / (‖y‖² · ‖p‖²)` between the received symbols and the
+/// known LFSR-15 QPSK sequence. The metric is `∈ [0, 1]`, Cauchy-
+/// Schwarz-bounded: 1 iff the received block is a complex scalar
+/// multiple of the reference (channel = pure complex gain), and `≈
+/// 1 / PREBURST_LEN_SYM` (≈ 3·10⁻⁴) on independent random data. A
+/// 0.5 threshold rejects late-entry / VOX-off / data-only windows
+/// while admitting OTA-attenuated genuine pre-bursts. Streaming-
+/// compatible: this just scans the existing `sym_buffer` at the
+/// first detected SOF; no per-chunk batch reprocessing.
+fn try_gather_preburst_refs(
+    symbols: &[Complex64],
+    sof_at: usize,
+) -> Option<(Vec<usize>, Vec<Complex64>)> {
+    if sof_at < crate::preburst::PREBURST_LEN_SYM {
+        return None;
+    }
+    let start = sof_at - crate::preburst::PREBURST_LEN_SYM;
+    let refs = crate::preburst::reference_symbols();
+    if start + refs.len() > symbols.len() {
+        return None;
+    }
+    // Correlation coefficient between symbols[start..start+L] and refs.
+    let mut r = Complex64::new(0.0, 0.0);
+    let mut p_sym = 0.0_f64;
+    let mut p_ref = 0.0_f64;
+    for (k, &ref_sym) in refs.iter().enumerate() {
+        let y = symbols[start + k];
+        r += y.conj() * ref_sym;
+        p_sym += y.norm_sqr();
+        p_ref += ref_sym.norm_sqr();
+    }
+    let denom = p_sym * p_ref;
+    if denom < 1e-12 {
+        return None;
+    }
+    let metric = r.norm_sqr() / denom;
+    if std::env::var_os("RX2X_LOG_PREBURST").is_some() {
+        eprintln!(
+            "[rx2x-preburst] sof_at={} corr_metric={:.4} threshold=0.5",
+            sof_at, metric,
+        );
+    }
+    if metric < 0.5 {
+        return None;
+    }
+    let positions: Vec<usize> = (start..start + refs.len()).collect();
+    Some((positions, refs.to_vec()))
 }
 
 /// Apply a trained FFE to a contiguous symbol range `[start, end)`,
@@ -1239,14 +1402,13 @@ pub(crate) fn equalize_symbols_per_cycle_from(
 ) -> Vec<Complex64> {
     let mut equalized: Vec<Complex64> = symbols.to_vec();
     let cycle_period = full_cycle_len_syms(cfg);
-    let min_skip = (cycle_period / 2).max(SOF_LEN_SYM);
+    let min_skip = (cycle_period / 2).max(PREAMBLE_LEN_SYM);
 
-    // Use find_next_sof in a loop — same threshold (0.2 × SOF_LEN) as
-    // the main decode pipeline so we equalize every cycle the decoder
-    // will see. `find_all_sofs` uses a tighter 0.3 threshold tuned for
-    // the drift LS fit (avoiding false-positive Chu matches in band
-    // noise); for FFE training the looser threshold is correct because
-    // the per-PLS Golay+CRC check below rejects false positives anyway.
+    // Use find_next_sof in a loop — same threshold (0.2 × PREAMBLE_LEN)
+    // as the main decode pipeline so we equalize every cycle the
+    // decoder will see. False-positive preamble matches in band noise
+    // are filtered downstream by the per-PLS Golay+CRC check below, so
+    // the looser threshold is correct here.
     let mut scan = scan_from;
     let log = std::env::var_os("RX_V4_LOG_FFE").is_some();
     while let Some(sof_at) = find_next_sof(symbols, scan, cfg.family) {
@@ -1264,7 +1426,7 @@ pub(crate) fn equalize_symbols_per_cycle_from(
                 continue;
             }
         };
-        let (mut positions, mut refs) = gather_cycle_refs(cfg, &pls, sof_at);
+        let (mut positions, mut refs) = gather_cycle_refs(cfg, &pls, sof_at, symbols);
         // Turbo-FFE feedback (slice 2x18c): append DD references that
         // fall inside this cycle. Pass 1 calls with empty dd_refs;
         // pass 2 calls with the data syms recovered from CWs that

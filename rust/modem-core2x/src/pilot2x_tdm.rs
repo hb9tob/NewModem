@@ -5,11 +5,12 @@
 //! density and update-bandwidth axes independently without touching the
 //! encoder/decoder. The pilot value is the **rotating QPSK sequence**
 //! shared with V3 (phases `{0, π/2, π, 3π/2}` cycling on the absolute
-//! pilot index) — that pattern is what lets V3 HIGH+ track FTX-1 + SDR
-//! phase noise at σ² ≤ 0.02 on a sound-card link; the V4 sparse-block
-//! variant (`pilot_block.rs`, deprecated by this module) drops a factor
-//! ×8 of update bandwidth and could not match V3 on the same OTA capture
-//! (see memory note `v4-pilot-tdm-refactor-todo`).
+//! pilot index) — that pattern is what lets V3 HIGH+ track the
+//! reference sound-card chain (FT-991A TX → FTX-1 RX) phase noise at
+//! σ² ≤ 0.02; the V4 sparse-block variant (`pilot_block.rs`,
+//! deprecated by this module) drops a factor ×8 of update bandwidth
+//! and could not match V3 on the same OTA capture (see memory note
+//! `v4-pilot-tdm-refactor-todo`).
 //!
 //! Layout per LDPC codeword (post-interleave):
 //!

@@ -23,6 +23,7 @@ use modem_core_base::traits::{EncodeRequest, Modem, ModemError, ProfileDescripto
 use modem_core_base::types::{AUDIO_RATE, RRC_SPAN_SYM};
 
 use crate::frame2x;
+use crate::preburst;
 use crate::profile2x::{ModemConfig2x, ProfileIndex2x};
 
 const FAMILY: &str = "NBFM-2x";
@@ -88,9 +89,22 @@ impl Modem for V4Modem {
         let mut eot_modulated =
             modulator::modulate(&eot_symbols, sps, pitch, &taps, cfg.base.center_freq_hz);
 
-        // Same VOX layout as V3 (see `v3_modem::encode_to_samples`):
-        // - vox > 0:  tone(vox) + 50ms silence + data + 200ms silence + EOT + 100ms silence
-        // - vox == 0: data + 200ms silence + EOT
+        // Wire layout (`vox > 0` = real OTA TX path):
+        //   tone(vox) + VOX-tail silence + PRBS pre-burst + data
+        //     + inter-frame silence + EOT + post-EOT silence
+        //
+        // The PRBS pre-burst is 3000 LFSR-15 QPSK symbols modulated
+        // through the SAME RRC + audio carrier as the data, so the
+        // FT-991A → FTX-1 sound-card chain's slow AGC sees the
+        // operating RMS for ≥ 2 s before any decoded content starts.
+        // It also provides 3000 known symbols for one-shot LS FFE
+        // training on RX (cf. `preburst.rs`). Activated only when
+        // `vox_seconds > 0.0` so synthetic unit-test paths that drive
+        // `encode_to_samples` without VOX keep their byte budget.
+        //
+        // When `vox == 0` (legacy / loopback tests): data + EOT only,
+        // no pre-burst — the test harness pumps the audio directly
+        // into the RX session without an AGC stage.
         let out = if req.vox_seconds > 0.0 {
             let mut out = Vec::new();
             out.extend_from_slice(&modulator::tone(
@@ -99,6 +113,14 @@ impl Modem for V4Modem {
                 VOX_AMPLITUDE,
             ));
             out.extend_from_slice(&modulator::silence(VOX_TAIL_SILENCE_S));
+            let preburst_audio = modulator::modulate(
+                preburst::reference_symbols(),
+                sps,
+                pitch,
+                &taps,
+                cfg.base.center_freq_hz,
+            );
+            out.extend_from_slice(&preburst_audio);
             out.append(&mut data_modulated);
             out.extend_from_slice(&modulator::silence(INTER_FRAME_SILENCE_S));
             out.append(&mut eot_modulated);
@@ -283,14 +305,32 @@ mod tests {
         let vox_len = (0.5 * AUDIO_RATE as f64) as usize;
         // First samples should be the tone — non-zero (amplitude 0.5).
         assert!(audio[100].abs() > 0.1, "VOX tone region appears silent");
-        // Audio length must exceed the no-VOX version by ~vox_len + 0.05·48k.
+        // The VOX path now also emits the PRBS pre-burst between VOX
+        // tail-silence and the data superframe. Compute its exact
+        // sample count by reproducing the modulator call.
+        let cfg = ProfileIndex2x::from_name("ULTRA2X").unwrap().to_config();
+        let (sps, pitch) = rrc::check_integer_constraints(
+            AUDIO_RATE,
+            cfg.base.symbol_rate,
+            cfg.base.tau,
+        ).unwrap();
+        let taps = rrc::rrc_taps(cfg.base.beta, RRC_SPAN_SYM, sps);
+        let preburst_audio = modulator::modulate(
+            preburst::reference_symbols(),
+            sps,
+            pitch,
+            &taps,
+            cfg.base.center_freq_hz,
+        );
         let req_no_vox = EncodeRequest {
             vox_seconds: 0.0,
             ..req.clone()
         };
         let audio_no_vox = V4Modem.encode_to_samples(&req_no_vox).expect("encode ok");
         let extra = audio.len() - audio_no_vox.len();
-        let expected_extra = vox_len + (VOX_TAIL_SILENCE_S * AUDIO_RATE as f64) as usize
+        let expected_extra = vox_len
+            + (VOX_TAIL_SILENCE_S * AUDIO_RATE as f64) as usize
+            + preburst_audio.len()
             + (POST_EOT_SILENCE_S * AUDIO_RATE as f64) as usize;
         assert_eq!(
             extra, expected_extra,

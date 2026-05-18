@@ -8,8 +8,10 @@
 //!
 //! # What changes vs V3
 //!
-//! - **PLHEADER** (192 sym) replaces preamble + LMS warmup + header
-//!   + per-segment marker triplet.
+//! - **PLHEADER** (256 sym = 128-sym Schmidl-Cox preamble + 128-sym
+//!   PLS) replaces preamble + LMS warmup + header + per-segment
+//!   marker triplet. Preamble is two identical Chu_64 back-to-back
+//!   for AGC/CFO-invariant sliding auto-correlation detection.
 //! - **Sparse pilot blocks** (36 sym, value `P = (1+j)/√2`, one block
 //!   after every LDPC codeword; densified to 2 blocks/CW for the
 //!   APSK-32 and APSK-64 profiles only) replace the V3 TDM pilots
@@ -51,12 +53,14 @@
 //! - `gate2x` + `detect2x` — FFT-gate + auto-detect 2x.
 //! - `modem2x` — `V4Modem` impl of the `Modem` trait.
 
-// Phase C-1 — PLHEADER (192 sym SOF+PLS) and TDM pilots (V3-style
-// rotating-QPSK groups of `d_syms` data + `p_syms` pilots).
+// Phase C-1 — PLHEADER (256 sym: 128-sym double-Chu preamble + 128-sym
+// PLS) and TDM pilots (V3-style rotating-QPSK groups of `d_syms` data
+// + `p_syms` pilots).
 // Both are isolated frame primitives: no profile or frame-builder
 // dependency.
 pub mod pilot2x_tdm;
 pub mod plheader;
+pub mod preburst;
 
 // Phase C-2 — `ProfileIndex2x` enum (8 profiles, HighPlusPlus2x
 // promoted) and `ModemConfig2x` struct used by the encoder/decoder.

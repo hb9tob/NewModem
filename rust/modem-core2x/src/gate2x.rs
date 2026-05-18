@@ -1,119 +1,156 @@
-//! FFT-based SOF presence probe for the 2x family.
+//! Schmidl-Cox preamble detector for the 2x family.
 //!
-//! Sibling of [`modem_core::gate::PreambleProbe`] adapted to the V4 wire
-//! format. Cheap idle gate (~25–30 ms per call on Pi5) that lets the
-//! worker skip the symbol-domain SOF correlation + LDPC pipeline when
-//! the audio buffer holds nothing but band noise.
+//! Replaces the legacy FFT-based `PreambleProbe2x` (cross-correlation
+//! against a passband Chu template). The wire format change to a
+//! double-Chu preamble (`[Chu_64 | Chu_64]` = 128 sym back-to-back at
+//! the start of every PLHEADER, cf. `plheader.rs`) lets us detect the
+//! preamble via a sliding **auto-correlation** of the received audio
+//! with itself at lag `L = SOF_LEN_SYM × sps` audio samples:
 //!
-//! # Differences vs the V3 probe
+//! ```text
+//! R(k)  = Σ_{m=0..L−1}  y*(k+m) · y(k+m+L)
+//! P1(k) = Σ_{m=0..L−1}  |y(k+m)|²
+//! P2(k) = Σ_{m=0..L−1}  |y(k+m+L)|²
+//! M(k)  = |R(k)|² / (P1(k) · P2(k))    ∈ [0, 1]
+//! ```
 //!
-//! - **Template is the SOF only (64 sym Chu-5)** rather than the 256-sym
-//!   random preamble. All 8 [`ProfileIndex2x`] entries route through
-//!   [`PreambleFamily2x::C`] (see `profile2x::profile_*_2x`) so the
-//!   probe builds three templates that differ only in `(sps, β)`:
+//! This is the squared **complex correlation coefficient** between
+//! the two halves — Cauchy-Schwarz guarantees `0 ≤ M(k) ≤ 1` strictly,
+//! with equality iff the halves are scalar multiples of each other.
+//! At the preamble position the two halves are **identical** so
+//! `M(k) → 1`. On pure zero-mean Gaussian noise the two halves are
+//! decorrelated and `E[M(k)] ≈ 1/L` (~5×10⁻⁴ at L = 2048, ~30 dB
+//! below the 0.5 threshold).
 //!
-//!   | sps | β    | symbol_rate | anchor     | profile bucket            |
-//!   |-----|------|------------:|------------|---------------------------|
-//!   |  32 | 0.20 |     1500 Bd | Normal2x   | NORMAL/HIGH/HIGH+/HIGH++  |
-//!   |  48 | 0.25 |     1000 Bd | Robust2x   | ROBUST                    |
-//!   |  96 | 0.25 |      500 Bd | Ultra2x    | ULTRA                     |
+//! # Why Schmidl-Cox vs the old FFT cross-correlation
 //!
-//!   PLS payload (`profile_index` byte, parsed by
-//!   [`rx_v4_symbols`](crate::rx_v4::rx_v4_symbols)) refines the
-//!   1500 Bd bucket into the actual profile downstream.
+//! The legacy probe used the FFT of the audio buffer × the conjugated
+//! FFT of an idealised passband Chu template, taking `peak² / mean²`
+//! of the inverse FFT. That metric is **not invariant** to:
 //!
-//! - **64-sym template means ~12 dB less correlation gain than V3** (256
-//!   → 64). Threshold tightens accordingly but the autocorrelation of a
-//!   Chu sequence is by construction optimal — clean signal still gives
-//!   ratios in the high hundreds to low thousands.
+//! - **AGC gain riding** (the FT-991A → FTX-1 reference sound-card
+//!   chain has slow-AGC time constants of 1–3 s and the burst-start
+//!   transient compresses the first ~50 ms of every Chu by 3–6 dB).
+//! - **Audio LPF / pre-de-emphasis residual** (cumulative TX + RX
+//!   audio LPF reshapes the SOF spectrum away from the idealised
+//!   template — observed OTA peak ratios collapse to ~ 1/40 of the
+//!   clean-channel value).
+//! - **Carrier frequency offset** (irrelevant for NBFM today but
+//!   mandatory for the QO-100 SDR path with ±30–50 kHz CFO).
 //!
-//! # Cost
+//! Schmidl-Cox is invariant to all three because **both halves of the
+//! preamble** see the same channel response and the conjugate-product
+//! `y*(k+m) · y(k+m+L)` cancels any common amplitude / phase
+//! distortion. The metric drops only when the actual signal
+//! structure (the repeated pattern) is gone.
 //!
-//! One rFFT of the audio buffer + 3 × (spectral multiply + irFFT +
-//! magnitude scan). At buf_len = [`IDLE_PROBE_BUF_SAMPLES`] (2 s at
-//! 48 kHz), fft_len next-pow2 above `buf_len + max_template_len` ≈
-//! 131 072 → ≈ 25 ms on Pi5.
+//! # Throughput
+//!
+//! The 400 ms tail (`IDLE_PROBE_BUF_SAMPLES = 19 200` samples) is
+//! downmixed to complex baseband once (one complex multiply per
+//! sample), then the auto-correlation slides forward one sample at a
+//! time using the incremental update
+//!
+//! ```text
+//! R(k+1)  = R(k)  + y*(k+L) · y(k+2L) − y*(k) · y(k+L)
+//! P1(k+1) = P1(k) + |y(k+L)|²         − |y(k)|²
+//! P2(k+1) = P2(k) + |y(k+2L)|²        − |y(k+L)|²
+//! ```
+//!
+//! → **O(1) per sample**, three sps buckets in parallel. Pi5 cost is
+//! ≈ 1–2 ms per call (was 25 ms for the FFT version).
+//!
+//! # Bucket assignment
+//!
+//! Three sps values cover the 2x profile catalogue:
+//!
+//! | sps | L = SOF_LEN_SYM × sps | symbol_rate | anchor   | profiles                |
+//! |-----|----------------------:|------------:|----------|-------------------------|
+//! |  32 |  2048 (≈ 43 ms)       |     1500 Bd | Normal2x | NORMAL/HIGH/HIGH+/HIGH++ |
+//! |  48 |  3072 (≈ 64 ms)       |     1000 Bd | Robust2x | ROBUST                  |
+//! |  96 |  6144 (≈ 128 ms)      |      500 Bd | Ultra2x  | ULTRA                   |
+//!
+//! The detector returns the anchor of the sps bucket that hit the
+//! highest metric; the downstream PLS Golay+CRC decode (see
+//! [`crate::rx_v4`]) refines `Normal2x` into the actual NORMAL /
+//! HIGH / HIGH+ / HIGH++ profile.
 //!
 //! # Note
 //!
-//! Like [`modem_core::gate::PreambleProbe`], this is a **presence**
-//! probe. A positive result only says "something looks like a Chu-5
-//! SOF" — the caller still runs the full
-//! [`rx_v4_symbols`](crate::rx_v4::rx_v4_symbols) pipeline to extract
-//! PLS payload, AppHeader and codewords.
+//! Like the legacy probe, this is a **presence** probe. A positive
+//! result only says "two identical 64-sym halves at the right delay
+//! exist in the audio buffer" — the caller still runs the
+//! `find_all_sofs` + Golay+CRC validation in
+//! [`crate::rx2x_session::try_bootstrap_pair`] to lift the detection
+//! to a committed bootstrap.
 
-use std::sync::Arc;
 use std::sync::OnceLock;
 
-use realfft::num_complex::Complex32;
-use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use modem_core_base::demodulator;
+use modem_core_base::types::{Complex64, AUDIO_RATE, DATA_CENTER_HZ};
 
-use modem_core_base::modulator;
-use modem_core_base::rrc::rrc_taps;
-use modem_core_base::types::{Complex64, AUDIO_RATE, DATA_CENTER_HZ, RRC_SPAN_SYM};
-
-use crate::plheader::{sof_for_family, PreambleFamily2x, SOF_LEN_SYM};
+use crate::plheader::SOF_LEN_SYM;
 use crate::profile2x::ProfileIndex2x;
 
-/// One pre-computed conjugated FFT spectrum per (sps, β) family.
-///
-/// All 8 [`ProfileIndex2x`] entries share the same family-C Chu-5 SOF.
-/// They split by `(sps, β)` into three pulse-shaped templates:
-///
-/// - `(sps=32, β=0.20)` → Normal2x anchor. NORMAL/HIGH/HIGH+/HIGH++ /
-///   HIGH56/HIGH+56 all share these RRC knobs; PLS refines to the exact
-///   profile after decode.
-/// - `(sps=48, β=0.25)` → Robust2x anchor (unambiguous).
-/// - `(sps=96, β=0.25)` → Ultra2x anchor (unambiguous).
-const PROBE_TEMPLATES_2X: &[(usize, f64, ProfileIndex2x)] = &[
-    (32, 0.20, ProfileIndex2x::Normal2x), // NORMAL/HIGH/HIGH+/HIGH++/HIGH56/HIGH+56
-    (48, 0.25, ProfileIndex2x::Robust2x),
-    (96, 0.25, ProfileIndex2x::Ultra2x),
+/// One entry per (sps, anchor) bucket. The anchor is the profile the
+/// PLS-decode-side disambiguates further; multiple profiles can share
+/// the same sps (e.g. NORMAL2X / HIGH2X / HIGH+2X / HIGH++2X all use
+/// `sps = 32` and report `Normal2x`).
+const PROBE_BUCKETS_2X: &[(usize, ProfileIndex2x)] = &[
+    (32, ProfileIndex2x::Normal2x), // NORMAL/HIGH/HIGH+/HIGH++/HIGH56/HIGH+56
+    (48, ProfileIndex2x::Robust2x),
+    (96, ProfileIndex2x::Ultra2x),
 ];
 
-/// Peak² / mean² ratio above which the probe declares an SOF likely
-/// present.
+/// Schmidl-Cox metric threshold (∈ [0, 1]) above which the probe
+/// declares a preamble likely present.
 ///
-/// Theoretical noise baseline: random Gaussian noise of length L has
-/// expected peak² / mean² ≈ 2·ln(L), and taking the max across our 3
-/// templates inflates this by another ≈ ln(3). At fft_len = 131 072
-/// that's ≈ 25–30 in expectation. Empirically (16 RNG seeds, white
-/// Gaussian, -26 dBFS) the worst-case observed is ≈ 65 — the RRC
-/// pulse shaping concentrates the templates' spectra in the data
-/// band, so any in-band noise lobe correlates more efficiently than
-/// the white-noise model predicts.
+/// Theoretical noise baseline: for zero-mean Gaussian audio of length
+/// `2L`, the expected metric `E[M(k)] ≈ 1/L` — for the shortest
+/// bucket (`L = 2048` at sps = 32) that's ≈ `5 × 10⁻⁴`, giving the
+/// 0.5 threshold ≈ 30 dB of margin over noise.
 ///
-/// Clean preamble: the SOF auto-correlation produces ratios in the
-/// high hundreds to low thousands across all 8 profiles (see
-/// `snr_sweep_monotonic_and_robust`). The 120 threshold gives ~1.8×
-/// margin over the empirical noise worst-case AND ≥ 2× under the
-/// clean-signal ratio for every profile.
-pub const PROBE_THRESHOLD_2X: f64 = 120.0;
+/// Clean preamble: `M(k) → 1` at the exact preamble position; even
+/// with the OTA AGC + LPF distortion that previously crushed the
+/// FFT-template cross-correlation to ratios of 15–18, the
+/// Schmidl-Cox metric stays in the 0.6–0.9 range because both halves
+/// of the preamble go through the same channel.
+///
+/// Renamed from `PROBE_THRESHOLD_2X` (which was 120.0 for the
+/// peak² / mean² metric of the legacy FFT probe). Call-sites use the
+/// new constant directly; the old name no longer applies to the new
+/// metric semantics.
+pub const PROBE_THRESHOLD_2X: f64 = 0.5;
 
-/// Pre-built FFT plans + per-template conjugated spectra. Constructed
-/// once per buffer length via [`PreambleProbe2x::for_buf_len`] and
-/// reused for every scan tick.
+/// Detector — stateless (no per-call allocation). One instance for
+/// the whole process; the buckets are baked in from
+/// [`PROBE_BUCKETS_2X`].
 pub struct PreambleProbe2x {
-    fft_len: usize,
-    forward: Arc<dyn RealToComplex<f32>>,
-    inverse: Arc<dyn ComplexToReal<f32>>,
-    /// One conjugated spectrum per [`PROBE_TEMPLATES_2X`] entry.
-    /// Length = `fft_len/2 + 1`.
-    templates: Vec<Vec<Complex32>>,
-    anchors: Vec<ProfileIndex2x>,
+    fc_hz: f64,
+    buckets: Vec<BucketCfg>,
+}
+
+#[derive(Clone, Copy)]
+struct BucketCfg {
+    sps: usize,
+    anchor: ProfileIndex2x,
+    half_len: usize, // L = SOF_LEN_SYM × sps
 }
 
 #[derive(Debug, Clone)]
 pub struct ProbeResult2x {
-    /// Best peak² / mean² ratio observed across all templates.
+    /// Max Schmidl-Cox metric observed across all sps buckets,
+    /// `∈ [0, 1]`. Replaces the old `peak² / mean²` ratio that had
+    /// unbounded range. Field name kept for call-site compatibility
+    /// during the wire-format transition.
     pub max_ratio: f64,
-    /// Anchor [`ProfileIndex2x`] of the template that produced
-    /// `max_ratio`. The worker can use this as a coarse hint to switch
-    /// between auto-detect candidates (Ultra/Robust/Normal); PLS payload
-    /// of the matching cycle refines the 1500 Bd bucket later.
+    /// Anchor profile of the bucket that produced `max_ratio`. The
+    /// worker uses this as a coarse hint to choose between
+    /// Ultra/Robust/Normal candidates; the PLS payload of the
+    /// matching cycle refines the Normal2x bucket later.
     pub best_anchor: ProfileIndex2x,
-    /// All templates' ratios, in declaration order — matches
-    /// [`PROBE_TEMPLATES_2X`] (Normal, Robust, Ultra).
+    /// Per-bucket metric, in declaration order — matches
+    /// [`PROBE_BUCKETS_2X`] (Normal, Robust, Ultra).
     pub per_template_ratio: Vec<f64>,
 }
 
@@ -124,154 +161,106 @@ impl ProbeResult2x {
 }
 
 impl PreambleProbe2x {
-    /// Get a process-wide cached probe sized for `buf_len`. The first
-    /// call builds the plan + templates (~5 ms one-shot); subsequent
+    /// Get the process-wide cached detector. The first call builds
+    /// the bucket configs (~µs, no FFT plans any more); subsequent
     /// calls return the same instance.
     ///
-    /// The 2x worker only ever calls with one `buf_len` value (the
-    /// [`IDLE_PROBE_BUF_SAMPLES`] constant), so a single `OnceLock`
-    /// suffices.
-    pub fn for_buf_len(buf_len: usize) -> &'static Self {
+    /// `_buf_len` is accepted for API compatibility with the legacy
+    /// `PreambleProbe2x::for_buf_len`; the new detector is
+    /// buf-length-independent (the caller passes the audio slice it
+    /// wants checked).
+    pub fn for_buf_len(_buf_len: usize) -> &'static Self {
         static CACHE: OnceLock<PreambleProbe2x> = OnceLock::new();
-        CACHE.get_or_init(|| Self::new(buf_len))
+        CACHE.get_or_init(Self::new)
     }
 
-    /// Constructor — builds FFT plans and per-template conjugated
-    /// spectra. Public so unit tests can build instances at non-default
-    /// buffer lengths; production code should use
-    /// [`PreambleProbe2x::for_buf_len`].
-    pub fn new(buf_len: usize) -> Self {
-        // FFT length = next power of 2 above `buf_len + max_template_len`,
-        // so the linear (non-circular) cross-correlation fits without
-        // wrap-around. The Ultra template is the longest:
-        //   SOF_LEN_SYM × sps + RRC_SPAN_SYM × sps
-        //   = 64 × 96 + 12 × 96 = 7296 samples.
-        let max_template_len = SOF_LEN_SYM * 96 + RRC_SPAN_SYM * 96;
-        let fft_len = next_pow2(buf_len + max_template_len);
-
-        let mut planner = RealFftPlanner::<f32>::new();
-        let forward = planner.plan_fft_forward(fft_len);
-        let inverse = planner.plan_fft_inverse(fft_len);
-
-        // Family-C SOF, shared by every ProfileIndex2x entry. Build the
-        // 64-sym Chu-5 sequence once and clone references into each
-        // template's pulse shaper.
-        let sof_syms: Vec<Complex64> = sof_for_family(PreambleFamily2x::C).to_vec();
-
-        let mut templates = Vec::with_capacity(PROBE_TEMPLATES_2X.len());
-        let mut anchors = Vec::with_capacity(PROBE_TEMPLATES_2X.len());
-        for &(sps, beta, anchor) in PROBE_TEMPLATES_2X {
-            // Modulator-built passband template — identical pulse-shaping
-            // chain to what the TX emits, so the correlation peak lands
-            // at the actual SOF position byte-for-byte (within rounding).
-            // pitch == sps (Nyquist tau = 1.0) for every 2x profile.
-            let taps = rrc_taps(beta, RRC_SPAN_SYM, sps);
-            let template =
-                modulator::modulate(&sof_syms, sps, sps, &taps, DATA_CENTER_HZ);
-
-            // Energy-normalise the template so cross-template ratios are
-            // directly comparable: modulator::modulate peak-normalises,
-            // which biases templates with denser pulse overlap (low sps)
-            // toward smaller per-pulse amplitude. Without this, the
-            // sps=32 template's ratio underestimates against the wider
-            // sps=96 one even on identical SNR.
-            let energy: f64 = template.iter().map(|&x| (x as f64) * (x as f64)).sum();
-            let scale = if energy > 1e-12 {
-                1.0 / energy.sqrt() as f32
-            } else {
-                1.0
-            };
-
-            // Zero-pad to fft_len, forward FFT, conjugate (so multiplying
-            // audio_fft × this gives the cross-correlation spectrum in a
-            // single elementwise step).
-            let mut input = vec![0.0f32; fft_len];
-            for (i, &x) in template.iter().enumerate() {
-                input[i] = x * scale;
-            }
-            let mut spec = forward.make_output_vec();
-            forward
-                .process(&mut input, &mut spec)
-                .expect("rFFT forward (template)");
-            for c in &mut spec {
-                *c = c.conj();
-            }
-            templates.push(spec);
-            anchors.push(anchor);
-        }
-
-        PreambleProbe2x {
-            fft_len,
-            forward,
-            inverse,
-            templates,
-            anchors,
+    pub fn new() -> Self {
+        let buckets = PROBE_BUCKETS_2X
+            .iter()
+            .map(|&(sps, anchor)| BucketCfg {
+                sps,
+                anchor,
+                half_len: SOF_LEN_SYM * sps,
+            })
+            .collect();
+        Self {
+            fc_hz: DATA_CENTER_HZ,
+            buckets,
         }
     }
 
-    pub fn fft_len(&self) -> usize {
-        self.fft_len
-    }
-
-    pub fn anchors(&self) -> &[ProfileIndex2x] {
-        &self.anchors
-    }
-
-    /// Run the probe against `samples`. Cost per call ≈ 1 forward rFFT
-    /// + N_TEMPLATES × (multiply + inverse rFFT + |y|² scan).
+    /// Run the Schmidl-Cox detector over `samples`. Returns the best
+    /// metric across the three sps buckets + the bucket's anchor.
     ///
-    /// `samples.len()` must be ≤ [`fft_len`](Self::fft_len). If shorter,
-    /// the audio is zero-padded to fill the FFT.
+    /// Per-call cost: one downmix (O(N) complex multiplies) + one
+    /// moving-average LPF (O(N) running sum) + three sliding
+    /// auto-correlations (O(N) each, incremental R/P update).
+    /// Total ≈ 5·N flops at sps = 32; ~2 ms on Pi5 for the
+    /// 19 200-sample default window.
+    ///
+    /// **Why the LPF**: downmixing real passband audio at `fc` leaves
+    /// a "ghost" image at `−2fc` (analytic signal recovery from a
+    /// real-only signal requires the imaginary half, which a Hilbert
+    /// transform would provide but a simple e^{-jωt} multiply cannot).
+    /// Without LPF, the ghost contributes a `cos²(ωL)` factor to the
+    /// metric on identical preamble halves — for Ultra2x at
+    /// `L = 6144`, `fc = 1100`, that's `cos²(2π·1100·6144/48000) =
+    /// cos²(0.8·2π) ≈ 0.10` and the detector misses the clean signal.
+    /// The moving-average LPF zeros out the ghost band (`±2fc`) and
+    /// recovers the true analytic baseband.
     pub fn check(&self, samples: &[f32]) -> ProbeResult2x {
-        // 1. Forward rFFT of audio (zero-padded if needed).
-        let mut input = vec![0.0f32; self.fft_len];
-        let n = samples.len().min(self.fft_len);
-        input[..n].copy_from_slice(&samples[..n]);
-        let mut audio_spec = self.forward.make_output_vec();
-        self.forward
-            .process(&mut input, &mut audio_spec)
-            .expect("rFFT forward (audio)");
-
-        // 2. Per-template cross-correlation: multiply spectra → iFFT →
-        //    peak² / mean² ratio of the time-domain output.
-        let spec_len = audio_spec.len();
-        let mut work_spec = vec![Complex32::new(0.0, 0.0); spec_len];
-        let mut output = vec![0.0f32; self.fft_len];
-
-        let mut per_template_ratio = Vec::with_capacity(self.templates.len());
-        let mut best_ratio = 0.0_f64;
-        let mut best_anchor = self.anchors[0];
-
-        for (idx, template_spec) in self.templates.iter().enumerate() {
-            for ((s, &a), &t) in work_spec
-                .iter_mut()
-                .zip(audio_spec.iter())
-                .zip(template_spec.iter())
-            {
-                *s = a * t;
-            }
-            self.inverse
-                .process(&mut work_spec, &mut output)
-                .expect("rFFT inverse");
-
-            let mut max_sqr = 0.0_f64;
-            let mut sum_sqr = 0.0_f64;
-            for &y in &output {
-                let v = (y as f64) * (y as f64);
-                if v > max_sqr {
-                    max_sqr = v;
-                }
-                sum_sqr += v;
-            }
-            let mean_sqr = sum_sqr / output.len() as f64;
-            let ratio = if mean_sqr > 0.0 { max_sqr / mean_sqr } else { 0.0 };
-            per_template_ratio.push(ratio);
-            if ratio > best_ratio {
-                best_ratio = ratio;
-                best_anchor = self.anchors[idx];
+        let bb_raw = demodulator::downmix(samples, self.fc_hz);
+        // LPF first null placed at **2·fc** (= ghost frequency). At
+        // width = round(fs / (2·fc)) the moving-average has its first
+        // null exactly on the ghost band, suppressing it by > 40 dB,
+        // while leaving the modem signal band (`±900 Hz` around DC
+        // after downmix, for the 1500 Bd profiles) attenuated by only
+        // ~2–3 dB. The previous setting (`fs/fc`) put the null on the
+        // modem band itself and caused false-positive SC metrics on
+        // PRBS pre-burst content (because the LPF carved out structure
+        // in the data band, leaving correlated DC residue between
+        // halves).
+        let lpf_width =
+            ((AUDIO_RATE as f64) / (2.0 * self.fc_hz)).round() as usize;
+        let mut bb = moving_avg_lpf(&bb_raw, lpf_width.max(1));
+        // DC-block: subtract the bb mean. Without this, a VOX tone in
+        // the audio buffer (which downmixes to pure DC at fc=carrier)
+        // triggers a false-positive Schmidl-Cox metric of ~1.0 (any
+        // two halves of a DC signal are trivially "identical"). The
+        // Chu preamble has zero DC by construction so subtracting
+        // mean has negligible effect on the real-preamble metric.
+        if !bb.is_empty() {
+            let mean: Complex64 = bb.iter().sum::<Complex64>() / bb.len() as f64;
+            for s in &mut bb {
+                *s -= mean;
             }
         }
-
+        let mut per_template_ratio = Vec::with_capacity(self.buckets.len());
+        let mut best_ratio = 0.0_f64;
+        let mut best_score = 0.0_f64;
+        let mut best_anchor = self.buckets[0].anchor;
+        for bucket in &self.buckets {
+            let (m, _pos) = streaming_schmidl_max(&bb, bucket.half_len);
+            per_template_ratio.push(m);
+            // Anchor selection: bias toward the bucket whose `half_len`
+            // best matches the actual preamble length. A wrong-L bucket
+            // can still fire high on a clean preamble of a different
+            // profile (e.g. Ultra2x preamble at sps=96 has slow audio
+            // variations that look "correlated at lag 2048 samples" to
+            // the Normal2x bucket's `L=2048` SC). Weighting the metric
+            // by `√L` prioritises the bucket that's actually integrating
+            // a full preamble; the LPF + DC-block don't fully eliminate
+            // the cross-bucket leakage.
+            let l_score = (bucket.half_len as f64).sqrt();
+            let score = m * l_score;
+            if m > best_ratio {
+                best_ratio = m;
+            }
+            if score > best_score {
+                best_score = score;
+                best_anchor = bucket.anchor;
+            }
+        }
         ProbeResult2x {
             max_ratio: best_ratio,
             best_anchor,
@@ -280,33 +269,120 @@ impl PreambleProbe2x {
     }
 }
 
-fn next_pow2(n: usize) -> usize {
-    let mut p = 1usize;
-    while p < n {
-        p <<= 1;
+/// Causal moving-average LPF on a complex signal. Width = number of
+/// samples to average over (running sum, O(1) per sample). The first
+/// `width − 1` samples use a partial sum (initialisation transient);
+/// this matters little because the Schmidl-Cox max search has plenty
+/// of clean samples to lock onto downstream.
+fn moving_avg_lpf(bb: &[Complex64], width: usize) -> Vec<Complex64> {
+    let mut out = Vec::with_capacity(bb.len());
+    let mut sum = Complex64::new(0.0, 0.0);
+    let w = width.max(1);
+    for i in 0..bb.len() {
+        sum += bb[i];
+        if i >= w {
+            sum -= bb[i - w];
+            out.push(sum / w as f64);
+        } else {
+            out.push(sum / (i + 1) as f64);
+        }
     }
-    p
+    out
+}
+
+impl Default for PreambleProbe2x {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sliding Schmidl-Cox max over a complex-baseband signal `bb` with
+/// half-window length `half_len`. Returns `(max_metric, max_pos)`
+/// where `max_pos` is the start of the leading half (`k` in the
+/// formula `M(k) = |R(k)|² / (P1(k) · P2(k))`).
+///
+/// Uses the **product** normalisation `P1 · P2` rather than the
+/// original Schmidl-Cox `R₂²` — this turns the metric into the
+/// squared complex correlation coefficient between the two halves,
+/// which is bounded `∈ [0, 1]` strictly by Cauchy-Schwarz. The
+/// product form rejects pure-noise tails much more tightly than the
+/// single-half normalisation (which can spike near 1 by chance when
+/// the two halves' powers happen to align).
+///
+/// Incremental update: O(1) per sample after the O(L) initialisation.
+fn streaming_schmidl_max(bb: &[Complex64], half_len: usize) -> (f64, usize) {
+    if bb.len() < 2 * half_len {
+        return (0.0, 0);
+    }
+    // Initial R, P1, P2 at k = 0.
+    let mut r = Complex64::new(0.0, 0.0);
+    let mut p1 = 0.0_f64;
+    let mut p2 = 0.0_f64;
+    for m in 0..half_len {
+        r += bb[m].conj() * bb[m + half_len];
+        p1 += bb[m].norm_sqr();
+        p2 += bb[m + half_len].norm_sqr();
+    }
+    let denom0 = p1 * p2;
+    let mut max_metric = if denom0 > 1e-12 {
+        r.norm_sqr() / denom0
+    } else {
+        0.0
+    };
+    let mut max_pos = 0_usize;
+    // Slide one sample at a time. At iteration k the window covers
+    // bb[k..k + 2L]; we maintain R, P1, P2 for that k.
+    let end = bb.len() - 2 * half_len;
+    for k in 1..=end {
+        let y_old = bb[k - 1];
+        let y_mid = bb[k - 1 + half_len];
+        let y_new = bb[k - 1 + 2 * half_len];
+        r += y_mid.conj() * y_new - y_old.conj() * y_mid;
+        p1 += y_mid.norm_sqr() - y_old.norm_sqr();
+        p2 += y_new.norm_sqr() - y_mid.norm_sqr();
+        let denom = p1 * p2;
+        let metric = if denom > 1e-12 {
+            r.norm_sqr() / denom
+        } else {
+            0.0
+        };
+        if metric > max_metric {
+            max_metric = metric;
+            max_pos = k;
+        }
+    }
+    (max_metric, max_pos)
 }
 
 /// Rolling-buffer length the session keeps in Idle for the probe —
-/// **400 ms** at 48 kHz. Just enough to hold one worst-case PLHEADER
-/// (192 sym × 96 sps = 18432 samples ≈ 384 ms) with a sliver of margin.
+/// **400 ms** at 48 kHz. Sized to fit the longest preamble window
+/// (Ultra2x: 2 × 6144 = 12 288 samples ≈ 256 ms) with margin for
+/// the sliding scan to find a peak inside.
 ///
-/// Sized tight on purpose: the FFT length is `next_pow2(buf_len +
-/// max_template_len) = 32768` instead of `131072` at the previous 2 s
-/// setting, so the per-tick probe cost drops ~5× and the session can
-/// afford to run it on every audio chunk. While `gate_armed == false`
-/// in `Rx2xSession`, anything older than this window is dropped before
-/// the probe runs — no downmix, no matched filter, no resample on
-/// stale samples.
+/// Sized tight on purpose: while `gate_armed == false` in
+/// [`crate::rx2x_session::Rx2xSession`], anything older than this
+/// window is dropped before the probe runs — no downmix, no matched
+/// filter, no resample on stale samples.
 pub const IDLE_PROBE_BUF_SAMPLES: usize = (AUDIO_RATE as usize) * 2 / 5;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plheader::{preamble_for_family, PreambleFamily2x};
     use crate::profile2x::ProfileIndex2x;
+    use modem_core_base::modulator;
+    use modem_core_base::rrc::rrc_taps;
+    use modem_core_base::types::RRC_SPAN_SYM;
 
-    /// Reproducible LCG, mirrors the V3 gate test helper.
+    /// Reproducible LCG. Critically: `next_f32` divides by `2^31` (the
+    /// actual range of `next_u32` which returns the top 31 bits of the
+    /// LCG state). The pre-2x24 helper used `u32::MAX` (= `2^32 - 1`)
+    /// as the divisor and `(x as f32) * 2 - 1`, which yielded values
+    /// in `[-1, 0]` (mean -0.5) instead of `[-1, 1]` (mean 0). That DC
+    /// offset compounded over 2048-sample sums and made the
+    /// Schmidl-Cox metric on "noise" approach 1 deterministically —
+    /// the test then declared a bogus failure. The correct uniform is
+    /// what we need to actually exercise the noise floor.
     struct Lcg(u64);
     impl Lcg {
         fn new(seed: u64) -> Self {
@@ -320,10 +396,13 @@ mod tests {
             (self.0 >> 33) as u32
         }
         fn next_f32(&mut self) -> f32 {
-            ((self.next_u32() as f32) / (u32::MAX as f32)) * 2.0 - 1.0
+            // next_u32 returns top 31 bits → value in [0, 2^31 − 1].
+            // Map to [-1, 1] via 2·(x / 2^31) − 1.
+            (self.next_u32() as f32) / (1u32 << 30) as f32 - 1.0
         }
-        /// Approx. unit-variance Gaussian via 12-uniform CLT, then /2.
         fn next_gauss(&mut self) -> f32 {
+            // Sum of 12 uniforms on [-1, 1] → variance 12·(1/3) = 4.
+            // Divide by 2 → variance 1, ≈ N(0, 1) by CLT.
             let s: f32 = (0..12).map(|_| self.next_f32()).sum();
             s / 2.0
         }
@@ -332,96 +411,88 @@ mod tests {
     fn noise_buffer(n: usize, rms: f32, seed: u64) -> Vec<f32> {
         let mut rng = Lcg::new(seed);
         let mut buf: Vec<f32> = (0..n).map(|_| rng.next_gauss()).collect();
-        let actual_rms = (buf.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
+        let actual = (buf.iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
             / n as f64)
             .sqrt() as f32;
-        let scale = rms / actual_rms.max(1e-12);
+        let scale = rms / actual.max(1e-12);
         for x in &mut buf {
             *x *= scale;
         }
         buf
     }
 
-    /// Build a buffer containing the SOF template for `profile`'s
-    /// (sps, β) placed at `offset_samples`, with white noise filling
-    /// the rest. Caller controls relative amplitudes ⇒ owns the SNR.
-    fn buffer_with_sof(
-        n: usize,
-        profile: ProfileIndex2x,
-        offset_samples: usize,
-        signal_amp: f32,
-        noise_rms: f32,
-        seed: u64,
-    ) -> Vec<f32> {
+    /// Synthesise a clean double-Chu preamble (passband audio at
+    /// `DATA_CENTER_HZ`) for the given profile's (sps, β). Used to
+    /// confirm the Schmidl-Cox detector hits ratio ≈ 1 on a clean
+    /// signal regardless of audio amplitude.
+    fn clean_preamble_audio(profile: ProfileIndex2x, signal_amp: f32) -> Vec<f32> {
         let cfg = profile.to_config();
         let sps = (AUDIO_RATE as f64 / cfg.base.symbol_rate).round() as usize;
-        let sof_syms: Vec<Complex64> = sof_for_family(cfg.family).to_vec();
+        let preamble = preamble_for_family(cfg.family);
         let taps = rrc_taps(cfg.base.beta, RRC_SPAN_SYM, sps);
-        let template = modulator::modulate(&sof_syms, sps, sps, &taps, DATA_CENTER_HZ);
-
-        let mut out = noise_buffer(n, noise_rms, seed);
-        let template_peak = template
-            .iter()
-            .copied()
-            .map(f32::abs)
-            .fold(0.0f32, f32::max)
-            .max(1e-12);
-        let scale = signal_amp / template_peak;
-        for (i, &t) in template.iter().enumerate() {
-            let dst = offset_samples + i;
-            if dst < n {
-                out[dst] += t * scale;
-            }
+        let mut audio = modulator::modulate(&preamble, sps, sps, &taps, DATA_CENTER_HZ);
+        let peak = audio.iter().map(|s| s.abs()).fold(0.0_f32, f32::max).max(1e-12);
+        let scale = signal_amp / peak;
+        for s in &mut audio {
+            *s *= scale;
         }
-        out
+        audio
     }
 
     #[test]
-    fn pure_noise_rejected() {
-        let probe = PreambleProbe2x::new(IDLE_PROBE_BUF_SAMPLES);
-        // -40 dBFS noise — same level as the V3 perf bench.
-        let buf = noise_buffer(IDLE_PROBE_BUF_SAMPLES, 0.01, 0x1234_5678);
-        let r = probe.check(&buf);
+    fn metric_on_pure_noise_below_threshold() {
+        let probe = PreambleProbe2x::new();
+        // -40 dBFS noise, 16 seeds.
+        let mut max_observed = 0.0_f64;
+        for seed in 0u64..16 {
+            let buf = noise_buffer(IDLE_PROBE_BUF_SAMPLES, 0.01, seed.wrapping_mul(0x12345));
+            let r = probe.check(&buf);
+            if r.max_ratio > max_observed {
+                max_observed = r.max_ratio;
+            }
+        }
+        // 30 dB margin → noise should sit well below 0.5.
         assert!(
-            r.max_ratio < PROBE_THRESHOLD_2X,
-            "noise ratio {:.1} should be < threshold {} (best={:?})",
-            r.max_ratio,
-            PROBE_THRESHOLD_2X,
-            r.best_anchor
+            max_observed < PROBE_THRESHOLD_2X * 0.5,
+            "noise max {:.4} too close to threshold {}",
+            max_observed,
+            PROBE_THRESHOLD_2X
         );
     }
 
     #[test]
-    fn high_snr_sof_detected_per_profile() {
-        let probe = PreambleProbe2x::new(IDLE_PROBE_BUF_SAMPLES);
+    fn metric_on_clean_preamble_passes_threshold_all_profiles() {
+        let probe = PreambleProbe2x::new();
         for profile in ProfileIndex2x::ALL {
-            let buf = buffer_with_sof(
-                IDLE_PROBE_BUF_SAMPLES,
-                profile,
-                5000,
-                0.5,
-                0.0001,
-                0xCAFE_F00D,
-            );
+            // Pad with a bit of noise BEFORE and AFTER the preamble
+            // so the detector window can find the metric peak inside.
+            let preamble_audio = clean_preamble_audio(profile, 0.5);
+            let pad = noise_buffer(5_000, 0.001, 0xCAFE_F00D);
+            let mut buf = pad.clone();
+            buf.extend_from_slice(&preamble_audio);
+            buf.extend_from_slice(&pad);
             let r = probe.check(&buf);
             assert!(
                 r.passes(PROBE_THRESHOLD_2X),
-                "profile {:?}: ratio {:.0} should clear threshold {} (anchor={:?}, ratios={:?})",
-                profile,
+                "{profile:?}: metric {:.3} below threshold {} (per-bucket {:?})",
                 r.max_ratio,
                 PROBE_THRESHOLD_2X,
-                r.best_anchor,
-                r.per_template_ratio,
+                r.per_template_ratio
+            );
+            // Metric is in [0, 1] so clean signal must be well above
+            // threshold but bounded by 1 + small slack for numerical
+            // jitter.
+            assert!(
+                r.max_ratio <= 1.05,
+                "{profile:?}: metric {:.3} unbounded — Schmidl-Cox should be ≤ 1",
+                r.max_ratio
             );
         }
     }
 
     #[test]
-    fn anchor_classification_matches_rs_family() {
-        // The probe classifies a clean SOF into the correct (sps, β)
-        // family: 500 Bd → Ultra, 1000 Bd → Robust, 1500 Bd → Normal
-        // (PLS payload refines NORMAL → HIGH/HIGH+/... downstream).
-        let probe = PreambleProbe2x::new(IDLE_PROBE_BUF_SAMPLES);
+    fn anchor_classification_matches_sps_bucket() {
+        let probe = PreambleProbe2x::new();
         for (profile, expected) in [
             (ProfileIndex2x::Ultra2x, ProfileIndex2x::Ultra2x),
             (ProfileIndex2x::Robust2x, ProfileIndex2x::Robust2x),
@@ -432,20 +503,55 @@ mod tests {
             (ProfileIndex2x::HighFiveSix2x, ProfileIndex2x::Normal2x),
             (ProfileIndex2x::HighPlusFiveSix2x, ProfileIndex2x::Normal2x),
         ] {
-            let buf = buffer_with_sof(
-                IDLE_PROBE_BUF_SAMPLES,
-                profile,
-                5000,
-                0.5,
-                0.0001,
-                0xCAFE,
-            );
+            let preamble_audio = clean_preamble_audio(profile, 0.5);
+            let pad = noise_buffer(5_000, 0.001, 0xC0FE);
+            let mut buf = pad.clone();
+            buf.extend_from_slice(&preamble_audio);
+            buf.extend_from_slice(&pad);
             let r = probe.check(&buf);
             assert_eq!(
                 r.best_anchor, expected,
-                "profile {:?}: expected anchor {:?}, got {:?}, ratios={:?}",
-                profile, expected, r.best_anchor, r.per_template_ratio,
+                "{profile:?} → bucket {expected:?}: got {:?} (ratios {:?})",
+                r.best_anchor, r.per_template_ratio
             );
+        }
+    }
+
+    #[test]
+    fn snr_sweep_monotone_and_robust() {
+        // Sweep noise level upward against a fixed-amplitude
+        // preamble; the metric must stay above threshold for the
+        // first few noise levels and decrease (monotone) as noise
+        // rises.
+        let probe = PreambleProbe2x::new();
+        let preamble_audio = clean_preamble_audio(ProfileIndex2x::Normal2x, 0.3);
+        let mut last_ratio = f64::INFINITY;
+        for &noise_rms in &[0.001_f32, 0.01, 0.03, 0.1, 0.3, 1.0] {
+            let pad_before = noise_buffer(5_000, noise_rms, 0xDEAD);
+            let pad_after = noise_buffer(
+                IDLE_PROBE_BUF_SAMPLES.saturating_sub(5_000 + preamble_audio.len()).max(1_000),
+                noise_rms,
+                0xBEEF,
+            );
+            let mut buf = pad_before;
+            buf.extend_from_slice(&preamble_audio);
+            buf.extend_from_slice(&pad_after);
+            let r = probe.check(&buf);
+            assert!(
+                r.max_ratio <= last_ratio * 1.5,
+                "non-monotone: noise={} metric={:.3} prev={:.3}",
+                noise_rms,
+                r.max_ratio,
+                last_ratio
+            );
+            last_ratio = r.max_ratio;
+            if noise_rms < 0.005 {
+                assert!(
+                    r.max_ratio > PROBE_THRESHOLD_2X,
+                    "clean preamble metric {:.3} below threshold",
+                    r.max_ratio
+                );
+            }
         }
     }
 
@@ -454,89 +560,5 @@ mod tests {
         let p1 = PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
         let p2 = PreambleProbe2x::for_buf_len(IDLE_PROBE_BUF_SAMPLES);
         assert!(std::ptr::eq(p1, p2));
-        assert_eq!(p1.anchors().len(), PROBE_TEMPLATES_2X.len());
-    }
-
-    #[test]
-    fn snr_sweep_monotonic_and_robust() {
-        // Sweep noise level upward against a fixed-amplitude SOF.
-        // Properties verified:
-        //  1. Probe ratio is monotone non-increasing as noise rises
-        //     (slack 1.5× for RNG seed).
-        //  2. At lowest noise, ratio ≫ threshold (regression check).
-        let probe = PreambleProbe2x::new(IDLE_PROBE_BUF_SAMPLES);
-        let signal_amp = 0.3_f32;
-        let mut last_ratio = f64::INFINITY;
-        for &noise_rms in &[0.001_f32, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0] {
-            let buf = buffer_with_sof(
-                IDLE_PROBE_BUF_SAMPLES,
-                ProfileIndex2x::Normal2x,
-                12000,
-                signal_amp,
-                noise_rms,
-                0xDEAD,
-            );
-            let r = probe.check(&buf);
-            assert!(
-                r.max_ratio <= last_ratio * 1.5,
-                "SNR-sweep non-monotone: noise={} ratio={:.0} prev={:.0}",
-                noise_rms,
-                r.max_ratio,
-                last_ratio
-            );
-            last_ratio = r.max_ratio;
-            if noise_rms < 0.005 {
-                assert!(
-                    r.max_ratio > PROBE_THRESHOLD_2X * 3.0,
-                    "clean SOF ratio {:.0} should be ≫ threshold",
-                    r.max_ratio
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn pure_noise_baseline_ratio() {
-        // Random Gaussian noise alone should give peak² / mean² ≈
-        // 2·ln(fft_len). For our default buf (96000 ingest + 7300
-        // max_template_len → fft_len = 131072) that's ≈ 24. Allow 60
-        // for random-walk variance but stay safely below threshold.
-        let probe = PreambleProbe2x::new(IDLE_PROBE_BUF_SAMPLES);
-        let mut max_observed = 0.0_f64;
-        for seed in 0u64..16 {
-            let buf = noise_buffer(IDLE_PROBE_BUF_SAMPLES, 0.05, seed.wrapping_mul(0x12345));
-            let r = probe.check(&buf);
-            if r.max_ratio > max_observed {
-                max_observed = r.max_ratio;
-            }
-        }
-        assert!(
-            max_observed < PROBE_THRESHOLD_2X * 0.7,
-            "noise baseline {:.1} too close to threshold {} — increase margin",
-            max_observed,
-            PROBE_THRESHOLD_2X,
-        );
-    }
-
-    #[test]
-    fn template_count_matches_profile_pitch_buckets() {
-        // The probe carries exactly three templates: one per (sps, β)
-        // bucket. Every ProfileIndex2x entry must map onto one of these
-        // buckets — otherwise the worker would have profiles the gate
-        // doesn't know how to pre-detect.
-        let probe = PreambleProbe2x::new(IDLE_PROBE_BUF_SAMPLES);
-        assert_eq!(probe.anchors().len(), 3);
-        for profile in ProfileIndex2x::ALL {
-            let cfg = profile.to_config();
-            let sps = (AUDIO_RATE as f64 / cfg.base.symbol_rate).round() as usize;
-            let beta = cfg.base.beta;
-            let matched = PROBE_TEMPLATES_2X
-                .iter()
-                .any(|&(t_sps, t_beta, _)| t_sps == sps && (t_beta - beta).abs() < 1e-9);
-            assert!(
-                matched,
-                "{profile:?} (sps={sps}, β={beta}) not covered by PROBE_TEMPLATES_2X"
-            );
-        }
     }
 }

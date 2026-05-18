@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8" />
-<title>Modem NBFM — Référence Modem 2x (slice 2x19)</title>
+<title>Modem NBFM — Référence Modem 2x (post-Phase 3, Schmidl-Cox + preburst PRBS)</title>
 <style>
     :root {
         --bg: #fafafa;
@@ -158,14 +158,16 @@
 <div class="wrap">
 
 <h1>Modem NBFM — Référence Modem 2x
-    <span class="sub">Document technique consolidé — 2026-05-15 — branche <code>feat/modem-2x</code>, HEAD <code>0ac497a</code> (slice 2x19, .deb 0.11.0-2x19).</span>
+    <span class="sub">Document technique consolidé — 2026-05-18 — branche <code>feat/modem-2x</code> post-Phase 3 (Schmidl-Cox + preburst PRBS, double-Chu PLHEADER 256 sym, non commité).</span>
 </h1>
 
 <p class="meta">
-    <span class="tag">V4 wire</span>
+    <span class="tag">V4 wire double-Chu</span>
     <span class="tag">TDM pilots</span>
     <span class="tag">streaming RX</span>
-    Référence architecturale consolidée du modem 2x à la slice 2x19. Complète et remplace en pratique <a href="v4_architecture.html"><code>v4_architecture.html</code></a> (pré-TDM) et <a href="v4_tdm_architecture.html"><code>v4_tdm_architecture.html</code></a> (post-44271bf, pré-streaming). Le présent document décrit la version courante : Farrow + Gardner closed-loop + <code>Rx2xSession</code> FSM streaming + pilotes TDM V3-style + turbo Pass 1/Pass 2 EM.
+    <span class="tag">Schmidl-Cox gate</span>
+    <span class="tag">preburst PRBS</span>
+    Référence architecturale consolidée du modem 2x. Mise à jour 2026-05-18 pour intégrer le plan <code>~/.claude/plans/pseudo-al-atoire-2s-poue-swirling-lemon.md</code> : <strong>(1) PLHEADER 192→256 sym</strong> avec préambule double-Chu (deux Chu-64 identiques back-to-back) pour détection Schmidl-Cox sample-domain, <strong>(2) pré-burst PRBS 2 s LFSR-15</strong> avant chaque burst pour stabilisation AGC FT-991A et entraînement FFE long-tap one-shot, <strong>(3) bootstrap drop policy validity-aware</strong> qui ne jette plus cycle 0 sur faux-positif. Complète et remplace en pratique <a href="v4_architecture.html"><code>v4_architecture.html</code></a> (pré-TDM) et <a href="v4_tdm_architecture.html"><code>v4_tdm_architecture.html</code></a> (post-44271bf, pré-streaming).
 </p>
 
 <nav class="toc">
@@ -176,9 +178,10 @@
         <li><a href="#pipeline-rx">Pipeline RX complet — du sample à la payload</a></li>
         <li><a href="#trame-v4">Trame V4 — spécification wire</a>
             <ol>
-                <li><a href="#plheader">PLHEADER (SOF + PLS)</a></li>
+                <li><a href="#plheader">PLHEADER (préambule double-Chu + PLS)</a></li>
                 <li><a href="#cycle">Cycle PLHEADER (4 s nominal)</a></li>
                 <li><a href="#pilotes-tdm">Pilotes TDM — pattern et rotation</a></li>
+                <li><a href="#preburst">Pré-burst PRBS 2 s (Phase 2)</a></li>
             </ol>
         </li>
         <li><a href="#profils">Catalogue des 8 profils 2x</a></li>
@@ -187,7 +190,7 @@
                 <li><a href="#nco">NCO downmix continu</a></li>
                 <li><a href="#farrow">Interpolation Farrow cubique</a></li>
                 <li><a href="#gardner">TED Gardner / AbsGardner + boucle PI</a></li>
-                <li><a href="#fft-gate">Sonde FFT préambule</a></li>
+                <li><a href="#fft-gate">Détecteur Schmidl-Cox préambule (Phase 3)</a></li>
             </ol>
         </li>
         <li><a href="#algo-symbol">Algorithmes — domaine symbole</a>
@@ -201,7 +204,13 @@
                 <li><a href="#ldpc-raptorq">LDPC + RaptorQ</a></li>
             </ol>
         </li>
-        <li><a href="#session">Session streaming — <code>Rx2xSession</code> FSM</a></li>
+        <li><a href="#session">Session streaming — <code>Rx2xSession</code> FSM</a>
+            <ol>
+                <li><a href="#bootstrap-policy">Bootstrap drop policy validity-aware (Phase 3)</a></li>
+                <li><a href="#entry-strategy">Stratégie early vs late entry</a></li>
+                <li><a href="#turbo-integration">Intégration de la boucle turbo dans le streaming</a></li>
+            </ol>
+        </li>
         <li><a href="#constantes">Tableau exhaustif des constantes</a></li>
         <li><a href="#derive">Analyse des points de dérive</a>
             <ol>
@@ -215,7 +224,13 @@
             </ol>
         </li>
         <li><a href="#stubs">Boucles turbo non câblées (T2/T3/T6/T7)</a></li>
-        <li><a href="#tests-known">Tests connus en échec — HEAD slice 2x19</a></li>
+        <li><a href="#tests-known">État des tests post-Phase 3 + lacunes identifiées</a>
+            <ol>
+                <li>Synthèse cargo test</li>
+                <li>Tests pré-existants Farrow/Gardner</li>
+                <li><a href="#lacunes">Lacunes identifiées</a> (L1-L7)</li>
+            </ol>
+        </li>
     </ol>
 </nav>
 
@@ -405,23 +420,32 @@ modem-core/    modem-core2x/   (autres consommateurs)
 <!-- ============================================================================ -->
 <h2 id="trame-v4">4. Trame V4 — spécification wire</h2>
 
-<h3 id="plheader">4.1 PLHEADER (SOF + PLS)</h3>
+<h3 id="plheader">4.1 PLHEADER — préambule double-Chu + PLS (256 sym, post-Phase 1)</h3>
 
 <p>
-    192 symboles, émis au début de chaque cycle (~4 s nominal). Constants
-    dans <code>modem-core2x/src/plheader.rs:54-63</code>.
+    <strong>256 symboles</strong> (était 192 avant Phase 1), émis au début de chaque
+    cycle (~4 s nominal). Constants dans <code>modem-core2x/src/plheader.rs:53-74</code>.
 </p>
 
-<pre><code>PLHEADER (192 sym total)
-├─ SOF  (64 sym)   :  Frank-Zadoff-Chu unit-magnitude, racine selon famille
-│                     {A=1, B=3, C=5}, choix selon sps = 48_000 / Rs :
-│                       sps ≥ 1200  → A   (Rs ≤ 40 Bd, jamais atteint en 2x)
-│                       750 ≤ sps &lt; 1200 → B  (jamais atteint en 2x)
-│                       sps &lt; 750   → C  (toutes les configs 2x actuelles)
+<pre><code>PLHEADER (256 sym total = 128 preamble + 128 PLS)
+├─ PREAMBLE (128 sym = 2 × Chu_64) :
+│       Deux séquences Frank-Zadoff-Chu IDENTIQUES, racine selon famille
+│       {A=1, B=3, C=5}, choix selon sps = 48_000 / Rs :
+│         sps ≥ 1200  → A   (Rs ≤ 40 Bd, jamais atteint en 2x)
+│         750 ≤ sps &lt; 1200 → B  (jamais atteint en 2x)
+│         sps &lt; 750   → C  (toutes les configs 2x actuelles)
 │
-│                     Formule :  s[n] = exp(j · π · r · n² / 64),  n ∈ [0,63]
-│                     Autocorrélation parfaite (peak 64), inter-corrélations
-│                     entre racines ≤ √64 ≈ 8 (~18 dB margin).
+│       Formule :  s[n] = exp(j · π · r · n² / 64),  n ∈ [0,63]
+│                 preamble[n]    = s[n]
+│                 preamble[64+n] = s[n]    // RÉPÉTITION exacte
+│
+│       Pourquoi 2 Chu :
+│       (a) Détection RX par AUTO-CORRÉLATION Schmidl-Cox (= les deux
+│           moitiés sont identiques → métrique |R|²/(P1·P2) ∈ [0,1] = 1
+│           au préambule), invariante aux distortions AGC / LPF / CFO
+│           qui affectent les deux moitiés identiquement.
+│       (b) Cross-corrélation post-détection sur 128 sym au lieu de 64 :
+│           gain de processing +3 dB (peak 128 vs 64).
 │
 └─ PLS  (128 sym)  :  payload 13 octets (11 info + 2 CRC16) → 88+16 = 104 bits
                       → padding à 108 bits → 9 blocs de 12 bits
@@ -430,7 +454,20 @@ modem-core/    modem-core2x/   (autres consommateurs)
                       + redondance 12 sym (re-encode bloc 0 contenant profile_index)
                       + zero-pad 8 sym
                       = 128 sym total
+
+LS gain estimation au décode : moyenné sur les 128 sym de préambule
+(au lieu de 64), σ²(gain) divisée par 2 vs l'ancienne version 192-sym.
 </code></pre>
+
+<p>
+    <strong>Constantes</strong> <span class="src">plheader.rs:53-74</span> :
+</p>
+<ul>
+    <li><code>SOF_LEN_SYM = 64</code> (longueur d'un seul Chu, inchangé)</li>
+    <li><code>PREAMBLE_LEN_SYM = 128</code> (= 2 × SOF_LEN_SYM, ajouté Phase 1)</li>
+    <li><code>PLS_LEN_SYM = 128</code></li>
+    <li><code>PLHEADER_LEN_SYM = 256</code> (= preamble + PLS)</li>
+</ul>
 
 <p>
     <strong>Payload PLS (13 octets)</strong> — <span class="src">plheader.rs:101-124</span></p>
@@ -465,7 +502,7 @@ modem-core/    modem-core2x/   (autres consommateurs)
 </p>
 
 <pre><code>cycle (≈ 4 s) =
-    PLHEADER         (192 sym)                       // SOF Chu + PLS Golay
+    PLHEADER         (256 sym)                       // 2×Chu + PLS Golay (Phase 1)
     LMS warmup       (0, 32 ou 64 sym selon constel) // APSK32 : 32, APSK64 : 64
     META-CW          (cw_with_pilots_len sym)        // 1 LDPC CW + pilotes TDM
     DATA-CW[0]       (cw_with_pilots_len sym)
@@ -522,6 +559,62 @@ pilot_symbol_2x(n) = exp(j · π/2 · (n mod 4))
         34/1500 ≈ 22.67 ms ⇒ BW d'update phase ≈ 22 Hz, suffisant pour suivre
         le bruit de phase basse-fréquence FTX-1 + ADC.</li>
 </ul>
+
+<h3 id="preburst">4.4 Pré-burst PRBS 2 s — AGC + FFE training (Phase 2)</h3>
+
+<p>
+    <span class="src">preburst.rs</span>. Émis par le TX au DÉBUT de chaque
+    burst (avant la 1ère PLHEADER) quand <code>vox_seconds &gt; 0</code>. Sert
+    deux fonctions complémentaires :
+</p>
+
+<ol>
+    <li><strong>Stabilisation AGC du transceiver RX</strong>. Le FTX-1 (chaîne
+        de référence, cf. <code>feedback-reference-chain-991a-ftx1</code>) a un
+        slow-AGC à τ ≈ 1-3 s. Sans pré-burst, l'AGC compresse dynamiquement
+        les premières dizaines de ms du PLHEADER, atténuant le pic Chu à ~20 %
+        de sa valeur lab. 2 s de pré-burst (modulé identique à la data) laissent
+        l'AGC converger à l'opérating-point cible avant que le PLHEADER1 arrive.</li>
+    <li><strong>One-shot LS-training du FFE</strong>. 3000 symboles connus
+        (= 50× plus que les 224 sym des refs cycle-local PLHEADER+warmup) donnent
+        un Gram matrix très over-determined pour FFE à 64 taps. Le FFE capture
+        l'integral du group delay IF + multipath + non-flatness audio
+        post-pre/de-emphasis, plus précis que le PLHEADER-only training.</li>
+</ol>
+
+<pre><code>// preburst.rs
+PREBURST_LEN_SYM = 3000          // = 2.0 s à 1500 Bd, 3 s à 1000 Bd, 6 s à 500 Bd
+LFSR_SEED        = 0x7FFF
+LFSR polynôme    = x^15 + x + 1  // Galois right-shift, période 2^15-1 = 32767 bits
+
+lfsr15_bits(6000)              // 6000 bits = 2 × PREBURST_LEN_SYM bits/sym (QPSK)
+qpsk_gray().map_bits(bits)     // 3000 symboles QPSK Gray
+reference_symbols()            // OnceLock-cached, partagé TX/RX
+</code></pre>
+
+<p>
+    Au TX (<code>modem2x.rs::encode_to_samples</code>), le pré-burst s'insère
+    entre VOX-tail silence et le data superframe :
+</p>
+
+<pre><code>if vox_seconds &gt; 0 {
+    [VOX tone] + [VOX_TAIL_SILENCE 50 ms]
+    + [PRBS preburst 3000 sym, modulé RRC + carrier identique à la data]
+    + [data superframe]
+    + [INTER_FRAME_SILENCE 200 ms] + [EOT] + [POST_EOT_SILENCE 100 ms]
+}
+// vox_seconds == 0 : data + silence + EOT seulement (tests synthétiques)
+</code></pre>
+
+<p>
+    Au RX, le pré-burst est <strong>opportuniste</strong> :
+    <code>rx_v4.rs::try_gather_preburst_refs</code> à chaque SOF détecté regarde
+    les <code>sof_at − PREBURST_LEN_SYM .. sof_at</code> symboles du
+    <code>sym_buffer</code> streamé. Si la cross-corrélation contre le PRBS de
+    référence dépasse 0.5 (correlation coefficient bornée [0,1]), les 3000 sym
+    connus sont ajoutés aux refs FFE LS pour ce cycle. Si pas détecté
+    (late entry, ou vox_seconds=0), fallback per-cycle PLHEADER+warmup.
+</p>
 
 <!-- ============================================================================ -->
 <h2 id="profils">5. Catalogue des 8 profils 2x</h2>
@@ -690,73 +783,176 @@ strobe_pos ← strobe_pos + sps + correction
     <span class="src">streaming_frontend.rs:31-34</span>.
 </p>
 
-<h3 id="fft-gate">6.4 Sonde FFT préambule (<code>PreambleProbe2x</code>)</h3>
+<h3 id="fft-gate">6.4 Détecteur Schmidl-Cox préambule (<code>PreambleProbe2x</code>, Phase 3)</h3>
 
 <p>
-    Pré-décode bon marché pour éviter de lancer le SOF correlator symbol-domain
-    quand le buffer ne contient que du bruit. <span class="src">gate2x.rs:60-91</span>.
+    <strong>Remplace</strong> la sonde FFT-template legacy par une auto-corrélation
+    glissante sample-domain qui exploite la structure répétée du préambule
+    double-Chu (4.1). <span class="src">gate2x.rs:60-230</span>. La métrique est
+    un <strong>coefficient de corrélation complexe au carré</strong>, bornée
+    strictement <code>∈ [0, 1]</code> par Cauchy-Schwarz :
 </p>
 
-<ul>
-    <li><strong>3 templates</strong>, partagés entre les 8 profils via le bucket
-        <code>(sps, β)</code> :
-        <ul>
-            <li><code>(sps=32, β=0.20)</code> → ancre <code>Normal2x</code>
-                (NORMAL/HIGH/HIGH+/HIGH++/HIGH56/HIGH+56)</li>
-            <li><code>(sps=48, β=0.25)</code> → ancre <code>Robust2x</code></li>
-            <li><code>(sps=96, β=0.25)</code> → ancre <code>Ultra2x</code></li>
-        </ul>
-    </li>
-    <li><strong>FFT length</strong> = <code>next_pow2(buf_len + max_template_len)</code> ;
-        le template le plus long est Ultra (64 × 96 + 12 × 96 = 7296 samples).
-        Pour <code>IDLE_PROBE_BUF_SAMPLES = 96 000</code> (2 s @ 48 kHz),
-        <code>fft_len = 131 072</code>.</li>
-    <li><strong>Threshold</strong> <code>PROBE_THRESHOLD_2X = 120.0</code>
-        (ratio peak² / mean² du résultat IFFT).
-        <ul>
-            <li>Baseline théorique bruit blanc : 2·ln(fft_len) + ln(3) ≈ 25–30</li>
-            <li>Pire cas empirique (16 seeds, white Gaussian -26 dBFS) : ≈ 65</li>
-            <li>Signal propre : centaines à milliers selon profil</li>
-            <li>Marge : ×1.8 sur le pire cas bruit, ×2 minimum sur signal propre</li>
-        </ul>
-    </li>
-    <li>Coût : ~25–30 ms par appel sur Pi5. Cache <code>OnceLock</code> sur le
-        <code>fft_len</code> ; plans FFT réutilisés.</li>
-</ul>
+<pre><code>// Pipeline (par appel check())
+1. Downmix à fc = DATA_CENTER_HZ = 1100 Hz :
+   bb_raw[i] = audio[i] · exp(-j 2π fc i / fs)
+
+2. LPF moving-average de largeur w = round(fs / (2·fc)) = 22 samples :
+   bb[i] = (1/w) · Σ_{m=i-w+1..i} bb_raw[m]
+   - Premier null à 2·fc = 2200 Hz (= bande ghost après downmix réel)
+   - Suppresse l'image conjuguée du downmix de signal passband réel
+   - Modem band ±900 Hz : passé avec ~−2.6 dB seulement
+
+3. DC-block : soustraire mean(bb) de chaque sample
+   - Annule les faux-positifs sur tons purs (VOX tone → DC après downmix)
+
+4. Pour chaque (sps, anchor) bucket dans { (32,Normal2x), (48,Robust2x), (96,Ultra2x) } :
+     L = SOF_LEN_SYM × sps      // longueur d'un Chu en audio samples
+     R(k)  = Σ_{m=0..L-1}  bb*(k+m) · bb(k+m+L)         // auto-corrélation
+     P1(k) = Σ_{m=0..L-1}  |bb(k+m)|²                    // power half 1
+     P2(k) = Σ_{m=0..L-1}  |bb(k+m+L)|²                  // power half 2
+     M(k)  = |R(k)|² / (P1(k) · P2(k))    ∈ [0, 1]      // Cauchy-Schwarz bound
+
+5. Sliding update O(1) par sample :
+     R(k+1)  = R(k)  + bb*(k+L)·bb(k+2L) − bb*(k)·bb(k+L)
+     P1(k+1) = P1(k) + |bb(k+L)|²        − |bb(k)|²
+     P2(k+1) = P2(k) + |bb(k+2L)|²       − |bb(k+L)|²
+
+6. Anchor classification : pick bucket avec score = M · √L max
+   (biais long-L pour résoudre l'ambiguïté Ultra preamble → Normal bucket
+   = SC fire intra-symbol smoothness de l'Ultra preamble dans Normal-bucket L)
+
+7. Threshold universel : PROBE_THRESHOLD_2X = 0.5
+   - Noise baseline théorique (random complex Gaussian) : E[M] ≈ 1/L ≈ 5e-4 à L=2048
+   - Signal propre : M → 1 au préambule (deux moitiés exactement identiques)
+   - OTA réel : M ∈ [0.6, 0.95] selon SNR/canal
+   - Marge ~30 dB sur le noise floor
+</code></pre>
+
+<p>
+    <strong>Pourquoi Schmidl-Cox vs FFT cross-corr legacy</strong> :
+</p>
+<table>
+    <thead>
+        <tr><th>Perturbation OTA</th><th>FFT cross-corr (legacy)</th><th>Schmidl-Cox</th></tr>
+    </thead>
+    <tbody>
+        <tr><td>AGC gain riding (FTX-1 slow τ ≈ 1-3 s)</td><td>Module l'amplitude pendant le SOF → peak réduit (15-20 vs 64 OTA)</td><td>Les 2 moitiés sont multipliées par le MÊME gain → cancel dans <code>|R|²/(P1·P2)</code></td></tr>
+        <tr><td>Audio LPF + pre/de-emph mismatch</td><td>Réshape la SOF, template idéal ne match plus → peak baisse</td><td>Idem applique pareil aux 2 moitiés → invariant</td></tr>
+        <tr><td>CFO (±30-50 kHz QO-100 futur)</td><td>Rotation phase intra-SOF → peak destructif</td><td>Les 2 moitiés rotent pareil → produit conjugué cancel le CFO</td></tr>
+        <tr><td>Bande noise stationnaire</td><td>Peak²/mean² bondit avec sidelobes</td><td>M sur noise ≈ 1/L, marge 30 dB par construction</td></tr>
+    </tbody>
+</table>
+
+<p>
+    <strong>Coût</strong> : 1 downmix O(N) + 1 LPF moving-avg O(N) + 3 buckets ×
+    O(N) sliding sum. Total ≈ 5·N flops à N=19 200, soit ~1-2 ms sur Pi5
+    (vs ~25 ms pour le FFT legacy).
+</p>
+<p>
+    <strong>Connu — false-positives résiduels</strong> : la métrique peut
+    crosser 0.5 sur des fenêtres de PRBS quand par hasard deux blocs de 64 sym
+    sont quasi-orthogonaux à la moyenne (probabilité ~chi²-tail). Le bootstrap
+    en aval filtre ça via la validation Golay+CRC du PLS, et la drop policy
+    Phase 3 (validity-aware, voir §8) préserve les vrais PLHEADERs contre
+    ce bruit.
+</p>
 
 <!-- ============================================================================ -->
 <h2 id="algo-symbol">7. Algorithmes — domaine symbole</h2>
 
-<h3 id="sof-search">7.1 Recherche SOF + décode PLHEADER</h3>
+<h3 id="sof-search">7.1 Recherche SOF + décode PLHEADER — local-max (Phase 3)</h3>
 
 <p>
-    <code>find_next_sof()</code> <span class="src">rx_v4.rs:333</span> :
-    cross-corrélation linéaire du Chu reference contre le flux de symboles.
-    Le pic est validé contre un seuil normalisé :
+    Deux primitives symbol-domain dans <code>rx_v4.rs</code> :
 </p>
 
-<pre><code>SOF_PEAK_THRESHOLD_FRAC = 0.2     // rx_v4.rs:77
-threshold = 0.2 × SOF_LEN_SYM = 12.8
+<ul>
+    <li><strong><code>find_all_sofs()</code></strong>
+        <span class="src">rx_v4.rs:289-359</span> : scan EXHAUSTIF sur tout
+        l'historique de symboles passé en argument, retourne TOUTES les
+        positions du préambule au-dessus du seuil. Utilisé au <strong>bootstrap</strong>
+        (acquisition initiale, besoin de plusieurs SOFs pour pairing).</li>
+    <li><strong><code>find_next_sof()</code></strong>
+        <span class="src">rx_v4.rs:421-475</span> : scan à partir d'un curseur,
+        retourne la PREMIÈRE position au-dessus du seuil. Utilisé en
+        <strong>steady-state</strong> (FSM Locked → Acquiring → Locked).</li>
+</ul>
+
+<p>
+    Les deux corrèlent contre le préambule <strong>double-Chu 128 sym</strong>
+    (= <code>preamble_for_family(family) = [Chu_64 | Chu_64]</code>) au lieu
+    d'un seul Chu pré-Phase 1 :
+</p>
+
+<pre><code>// La cross-corrélation contre le préambule complet :
+acc(k) = Σ_{n=0..PREAMBLE_LEN_SYM-1}  symbols[k+n] · preamble[n].conj()
+
+// Seuil normalisé :
+SOF_PEAK_THRESHOLD_FRAC = 0.2     // rx_v4.rs:77 (inchangé)
+threshold = 0.2 × PREAMBLE_LEN_SYM = 0.2 × 128 = 25.6    // x2 vs legacy
+
+// Autocorrélation parfaite du double-Chu au préambule = 128
+// (+3 dB de processing gain vs legacy single-Chu peak 64)
+</code></pre>
+
+<p>
+    <strong>Algorithme local-max (Phase 3)</strong> — <code>find_all_sofs</code>
+    ne reporte plus la PREMIÈRE crossing du seuil dans chaque
+    <code>min_cycle_skip_syms</code> window (= politique legacy, jusqu'à
+    Phase 2). Elle reporte maintenant le <strong>LOCAL MAXIMUM</strong> par
+    window :
+</p>
+
+<pre><code>// Deux passes (la 1ère O(N·L), la 2nde O(N)) :
+// Pass 1 — magnitude à chaque position
+mags[k] = |Σ_{n=0..PREAMBLE_LEN_SYM-1}  symbols[k+n] · preamble[n].conj()|
+
+// Pass 2 — walk en min_skip windows, emit local-max
+skip = max(min_cycle_skip_syms, PREAMBLE_LEN_SYM)    // typiquement cycle/2
+window_start = 0
+while window_start &lt;= end:
+    window_end = min(window_start + skip, end+1)
+    local_best_k, local_best_mag = argmax(mags[window_start..window_end])
+    if local_best_mag &gt;= threshold:
+        out.push(local_best_k)
+        window_start = local_best_k + skip
+    else:
+        window_start = window_end
 </code></pre>
 
 <div class="callout">
-    <strong>Pourquoi 0.2 et pas 0.5 ?</strong> Sur WAV synthétique propre,
-    l'autocorrélation Chu peake à 64. Sur chaîne OTA SDRplay + démod NBFM +
-    LPF audio + de-emphasis + AGC, le pulse SOF est atténué de 70-80 % :
-    les pics réels OTA landent dans 15-20 même à haut SNR. La valeur 0.5 d'avant
-    v0.11.0-2x4 ratait toutes les captures réelles. Bruit de fond à σ=0.06 →
-    peaks de corrélation ~1.5, 8× sous seuil, le ratio reste sain
-    <span class="src">rx_v4.rs:64-76</span>.
+    <strong>Pourquoi local-max et pas first-crossing ?</strong> Sur le pré-burst
+    PRBS, ~2 % des positions ont par hasard une cross-corrélation contre le
+    préambule supérieure à 25.6 (= juste au seuil). Le first-crossing scheme
+    legacy reportait ces false-positives en PREMIER dans leur window et sautait
+    par-dessus les VRAIS PLHEADERs (correlation = 128) plus loin dans la même
+    window. Cycle 0 systématiquement masqué. Le local-max scheme garantit que
+    le vrai PLHEADER (corr 128) éclipse toujours les faux (corr ~25.6) dans la
+    même window.
 </div>
 
 <p>
-    Le décodeur PLHEADER <code>decode_plheader_at()</code>
-    <span class="src">plheader.rs:244-292</span> :
+    <strong>Pourquoi seuil 0.2 et pas 0.5 ?</strong> Sur WAV synthétique propre,
+    l'autocorrélation du double-Chu peake à 128. Sur la chaîne OTA de référence
+    (FT-991A → FTX-1 sound-card, cf.
+    <code>feedback-reference-chain-991a-ftx1</code>), le pulse SOF est atténué
+    de 70-80 % par AGC + LPF + de-emphasis : les pics réels OTA landent autour
+    de 30-40 (+3 dB vs legacy single-Chu 15-20). Le seuil 0.2 × 128 = 25.6 admet
+    ces pics tout en restant ~30 dB au-dessus du bruit
+    <span class="src">rx_v4.rs:64-83</span>.
+</p>
+
+<p>
+    <strong>Le décodeur PLHEADER</strong> <code>decode_plheader_at()</code>
+    <span class="src">plheader.rs:365-409</span> :
 </p>
 
 <ol>
-    <li>LS-fit du gain complexe sur les 64 sym SOF (référence connue parfaite)</li>
-    <li>Normalise les 128 sym PLS par ce gain</li>
+    <li>LS-fit du gain complexe sur les <strong>128 sym de préambule</strong>
+        (= deux Chu copies, gain estimate σ² divisé par 2 vs legacy 64-sym)</li>
+    <li>Normalise les 128 sym PLS par ce gain (PLS slice à
+        <code>[PREAMBLE_LEN_SYM..PLHEADER_LEN_SYM]</code>)</li>
     <li>Démappe en bits via QPSK Gray-decode</li>
     <li>Décode les 9 blocs Golay(24,12)</li>
     <li>Reconstruit le payload 11 octets + vérifie CRC16 sur octets 0..10</li>
@@ -1051,6 +1247,121 @@ SIGMA2_DD_RATIO_MAX = 5.0     // rx_v4.rs:598
     <code>cw_bytes</code>, <code>pls_anchors</code>, <code>drift_ppm</code>,
     <code>drift_var</code>, <code>dd_refs_pool</code>. Le SOF suivant relance
     le FSM avec l'état précédent intact.
+</p>
+
+<h3 id="bootstrap-policy">Bootstrap drop policy — validity-aware (Phase 3)</h3>
+
+<p>
+    <code>try_bootstrap_pair()</code> <span class="src">rx2x_session.rs:643-905</span>
+    pilote l'acquisition initiale : gate Schmidl-Cox armé → accumule
+    <code>needed_audio</code> → <code>find_all_sofs</code> → trouve une paire
+    de PLHEADERs à distance <code>cycle_period_sym</code> dont la première a
+    PLS Golay+CRC valide → COMMIT.
+</p>
+<p>
+    Quand aucune paire valide n'est trouvée (= peaks invalid, ou paire à
+    mauvaise distance), la <strong>politique de drop post-Phase 3</strong>
+    est <strong>conservative</strong> :
+</p>
+<ul>
+    <li><strong>Aucun peak du tout</strong> (probe false-fired sur bande bruit
+        nue) → drop most of buffer, disarme le gate, retry depuis Idle.</li>
+    <li><strong>1+ peak mais aucune paire valide</strong> → <strong>ne drop
+        RIEN, ne disarme PAS</strong>. Garde le gate armé pour que le step 1
+        drain ne tue pas le buffer accumulé. Attend les chunks suivants.
+        Step 2's <code>max_wait_samples</code> est la safety belt
+        anti-runaway si le buffer grossit sans jamais commettre.</li>
+</ul>
+<div class="callout">
+    <strong>Pourquoi cette politique</strong> : le pré-burst PRBS (Phase 2)
+    avait exposé un bug FSM. Sur ~2 % des positions PRBS, la cross-corrélation
+    contre le préambule dépasse le seuil par chance (correlation ≈ seuil 25.6
+    vs vrais PLHEADERs à 128). L'ancien drop policy (drop past <code>peaks[1]+1</code>)
+    jetait cycle 0 quand <code>peaks[1]</code> tombait juste avant la vraie
+    PLHEADER1. Le commit suivait sur cycle 1 (PLS.base_esi=8, seg_id=1),
+    le RaptorQ remplissait packets 8+ → packets 0..7 manquants → bytes 0..1500
+    = zéros dans la sortie. Conservatif = pas de drop = pas de perte de cycle.
+</div>
+
+<h3 id="entry-strategy">Stratégie early vs late entry</h3>
+
+<p>
+    Le modem 2x est conçu pour accepter une entrée RX à n'importe quel moment
+    du burst — pas seulement au début. Trois cas distincts :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Cas</th><th>Visible côté RX</th><th>Bootstrap behaviour</th><th>Performance</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Early entry</strong> (RX démarre avant ou pendant le pré-burst)</td>
+            <td>VOX tone → silence → 2 s PRBS → PLHEADER1 → data...</td>
+            <td>Schmidl-Cox attend que PLHEADER1 entre dans la 400 ms tail. Bootstrap commit sur (PLHEADER1, PLHEADER2). Preburst FFE training opportuniste réussit si les 3000 sym précédant PLHEADER1 sont dans sym_buffer → FFE long-tap déjà convergé pour cycle 0.</td>
+            <td><strong>Optimum</strong> : +5 à +8 dB AGC stabilisé + +2 à +4 dB FFE long-tap = pic Chu OTA ~30-40 (vs ~15 pré-Phase 1-2-3). Cycle 0 décodé en plein.</td>
+        </tr>
+        <tr>
+            <td><strong>Mid-preburst entry</strong> (RX démarre quelque part dans le pré-burst)</td>
+            <td>Fin de PRBS → PLHEADER1 → data...</td>
+            <td>Bootstrap commit sur (PLHEADER1, PLHEADER2) comme early entry. Preburst FFE training partiel — si N &lt; 3000 sym précédant PLHEADER1 sont dans sym_buffer, le LS uses ce qu'il y a (peut être suffisant si N &gt; ~1000).</td>
+            <td><strong>Intermédiaire</strong> : AGC partiellement stabilisé, FFE training réduit. Cycle 0 décode quand même.</td>
+        </tr>
+        <tr>
+            <td><strong>Late entry</strong> (RX démarre en plein milieu du burst, pré-burst manqué)</td>
+            <td>data du cycle K → PLHEADER_{K+1} → data du cycle K+1 → ...</td>
+            <td>Schmidl-Cox arme quand PLHEADER_{K+1} entre dans la tail. Bootstrap commit sur (PLHEADER_{K+1}, PLHEADER_{K+2}). Preburst FFE training échoue (corrélation PRBS contre data &lt; 0.5) → fallback per-cycle FFE training (PLHEADER + LMS warmup, 224 sym, idem comportement legacy).</td>
+            <td><strong>Identique au modem pré-Phase-1-2-3</strong> sur la robustesse, à la différence près que la 1ère PLHEADER décodée donne <code>pls.base_esi</code> &gt; 0 et <code>pls.seg_id</code> &gt; 0, donc le RaptorQ sait combien de packets manquent au début. Si suffisamment de packets sont reçus pendant la suite du burst, RaptorQ peut quand même reconstruire (overhead 30 % par défaut).</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <strong>Mécanisme RX qui rend ça gratuit</strong> : aucun mode FSM
+    dédié à "preamble-training". À chaque SOF détecté par <code>find_all_sofs</code>,
+    la fonction <code>try_gather_preburst_refs(symbols, sof_at)</code>
+    <span class="src">rx_v4.rs:1262-1310</span> regarde les
+    <code>sof_at − PREBURST_LEN_SYM .. sof_at</code> symboles du sym_buffer
+    streamé. Si la corrélation avec le PRBS de référence (LFSR-15) dépasse 0.5,
+    les 3000 sym connus sont ajoutés aux refs <code>train_ffe_ls</code> pour
+    ce cycle. Sinon, fallback per-cycle. <strong>Opportuniste, jamais bloquant</strong>.
+</p>
+
+<h3 id="turbo-integration">Intégration de la boucle turbo dans le streaming</h3>
+
+<p>
+    Le turbo Pass 2 EM (§7.6, RTS phase smoother + per-ring gain + log-σ²)
+    s'insère dans la FSM <strong>au sein du même chunk-call</strong> après le
+    décode LDPC Pass 1 du cycle courant. Cela garde la propriété streaming
+    (O(audio_in) par chunk, état persistant entre chunks) :
+</p>
+
+<pre><code>process_audio_chunk(samples):
+    audio_buffer.extend(samples)
+    if !bootstrap_committed:
+        try_bootstrap_pair()                            // §8 Bootstrap
+        return
+    estimate_drift_from_raw()                           // raw PPM update
+    streaming_dsp.feed(samples)                         // §3 Pipeline RX
+    sym_buffer = streaming_dsp.sym_buffer().to_vec()
+    equalize_symbols_per_cycle_from(sym_buffer, ...)    // §7.2 FFE Pass 1
+    run_state_machine():
+        Idle → try_acquire()    : find_next_sof + decode PLHEADER
+        Acquiring → try_lock()  : commit & enter Locked
+        Locked → drive_locked() : decode N CWs avec turbo Pass 2 EM par CW
+            ├─ per_cycle_ffe_refresh    // gather_cycle_refs (incl. preburst si dispo)
+            ├─ extract chunks → decode_one_cw (Pass 1 LDPC)
+            ├─ turbo_refine_pass2(failed_cw_list)        // §7.6 RTS smoother + DD refs
+            └─ emit CwConverged / SessionDecoded events
+        Locked → Idle (à la fin du cycle, scan_cursor_abs += cycle_period_sym)
+</code></pre>
+
+<p>
+    <strong>Pas de re-process batch</strong> : le sym_buffer est streamé
+    incrémentalement, pas reconstruit à chaque chunk depuis l'audio_buffer
+    growing (cf. <code>feedback-full-streaming</code>). Le turbo Pass 2 opère
+    sur les chunks d'un cycle qui ont déjà été produits par le streaming
+    pipeline — pas de re-MF, pas de re-decimate.
 </p>
 
 <!-- ============================================================================ -->
@@ -1598,12 +1909,33 @@ SIGMA2_DD_RATIO_MAX = 5.0     // rx_v4.rs:598
 </table>
 
 <!-- ============================================================================ -->
-<h2 id="tests-known">12. Tests connus en échec — HEAD slice 2x19</h2>
+<h2 id="tests-known">12. État des tests — post-Phase 3 + lacunes identifiées</h2>
+
+<h3>12.1 Synthèse cargo test (post-Phase 3, 2026-05-18)</h3>
 
 <p>
-    Mémoire <code>modem-2x-branch-state</code> note : tests <code>streaming_frontend::*_50ppm/100ppm</code>
-    échouent sur HEAD slice 2x19, bug pré-existant Farrow/Gardner sous drift.
-    Liste précise (voir <code>cargo test --lib streaming_frontend</code>) :
+    <code>cargo test -p modem-core2x --release</code> : <strong>123 passed,
+    3 failed, 3 ignored</strong>.
+</p>
+
+<table>
+    <thead><tr><th>Suite</th><th>Statut</th><th>Note</th></tr></thead>
+    <tbody>
+        <tr><td><code>plheader::*</code></td><td>15/15 ✓</td><td>Double-Chu (Phase 1) + autocorr identique-halves test</td></tr>
+        <tr><td><code>preburst::*</code></td><td>5/5 ✓</td><td>LFSR-15 PRBS + QPSK mapping (Phase 2)</td></tr>
+        <tr><td><code>gate2x::*</code></td><td>5/5 ✓</td><td>Schmidl-Cox: noise reject, clean preamble all 8 profils, anchor classification, SNR sweep monotone, cache (Phase 3)</td></tr>
+        <tr><td><code>modem2x::*</code></td><td>8/8 ✓</td><td>Preburst wire-in (Phase 2)</td></tr>
+        <tr><td><code>rx_v4::*</code></td><td>roundtrip noise-free 8/8 ✓</td><td>+turbo Pass 2, σ² split, LLR per-ring</td></tr>
+        <tr><td><code>rx2x_session::*</code> incl. preburst</td><td>n/n ✓</td><td><strong>session_decodes_burst_with_preburst_high_2x</strong> passe maintenant (Phase 3 bootstrap fix)</td></tr>
+        <tr><td><code>streaming_frontend::*_50ppm</code></td><td><strong>3 ✗ pré-existants</strong></td><td>Bug Farrow/Gardner sous drift, non régressif Phase 1+2+3</td></tr>
+    </tbody>
+</table>
+
+<h3>12.2 Tests pré-existants en échec — Farrow/Gardner 50/100 ppm</h3>
+
+<p>
+    Tests <code>streaming_frontend::*_50ppm/100ppm</code> échouent depuis bien
+    avant Phase 1+2+3. Mémoire <code>modem-2x-branch-state</code>.
 </p>
 
 <table>
@@ -1631,20 +1963,83 @@ SIGMA2_DD_RATIO_MAX = 5.0     // rx_v4.rs:598
     </tbody>
 </table>
 
+<h3 id="lacunes">12.3 Lacunes identifiées post-Phase 3</h3>
+
 <p>
-    Ces tests passent sur les profils QPSK / 8PSK / HighPlus++ ; le mode d'échec
-    est spécifique au couple <strong>APSK + drift &gt; 50 ppm</strong>. Premier
-    suspect : la combinaison "AbsGardner sur intérieur pilote + multi-ring data
-    interspersé" laisse passer un biais dans la transition.
+    Implémentation complète du plan
+    <code>~/.claude/plans/pseudo-al-atoire-2s-poue-swirling-lemon.md</code>,
+    tous tests verts hors pré-existants. Les zones à creuser pour la suite :
 </p>
 
-<div class="callout">
-    <strong>Prochaine étape recommandée :</strong> instrumenter
-    <code>StreamingFrontend</code> pour logger <code>(strobe_pos, integ, abs_idx,
-    is_pilot_interior, err)</code> par strobe sur un test pathologique, identifier
-    le strobe où l'erreur diverge, puis comparer aux symbol times attendus
-    pour distinguer biais TED vs. acquisition phase trop lente.
-</div>
+<h4>(L1) Validation OTA pas encore faite</h4>
+<p>
+    Le code Phase 1+2+3 n'a JAMAIS tourné OTA. Tout est validé sur sim audio
+    synthétique. Premier OTA test prévu :
+</p>
+<ul>
+    <li>Build <code>.deb 0.11.0-2x21</code> avec les changements Phase 1+2+3.</li>
+    <li>Deploy Pi5 kiosk, faire un TX OTA via FT-991A → FTX-1 sound-card
+        (chaîne référence, cf. <code>feedback-reference-chain-991a-ftx1</code>).</li>
+    <li>Hypothèse : les pics Chu OTA doivent ~doubler (15-20 → 30-40,
+        +3 dB processing gain du double-Chu) + l'AGC stabilizer pendant
+        le 2 s de pré-burst doit éliminer la compression dynamique du
+        SOF. Probe Schmidl-Cox metric attendu &gt; 0.6 sur OTA propre.</li>
+    <li>Inspecter <code>RX2X_LOG_PREBURST</code> pour confirmer que le
+        preburst-FFE training fire en early-entry.</li>
+</ul>
+
+<h4>(L2) Streaming Schmidl-Cox state pas persistant entre chunks</h4>
+<p>
+    Le SC detector recompute les sommes <code>R, P1, P2</code> from scratch
+    à chaque appel sur les 400 ms de tail audio. Pas O(1)/sample
+    cross-chunk. Pour HIGH+2X chunk=2400 samples, le SC re-process
+    19 200 samples × 3 buckets ≈ 60 K flops à chaque chunk, ~1-2 ms Pi5.
+    Acceptable mais pas optimal. Future optimization : maintenir
+    <code>R, P1, P2</code> incrementally across chunks pour vrai O(1)/sample.
+    Pas blocking. Cf. <code>feedback-full-streaming</code>.
+</p>
+
+<h4>(L3) `find_all_sofs` recompute correlations à chaque appel</h4>
+<p>
+    L'algo local-max two-pass recompute toutes les magnitudes mags[k] à
+    chaque <code>try_bootstrap_pair</code>. Sur bootstrap qui peut tourner
+    plusieurs fois (= chunk-by-chunk en attendant valid pair), ça refait
+    le même travail. Future optimization : cache mags[k] partiel et n'ajouter
+    que les nouvelles positions. Pas blocking.
+</p>
+
+<h4>(L4) Turbo boucles T2/T3/T6/T7 toujours stubs</h4>
+<p>
+    Section §11 inchangée par Phase 1-2-3. Voir aussi
+    <code>turbo-sync-next-session</code> en mémoire pour le plan de
+    fermeture turbo SYNC sample-domain.
+</p>
+
+<h4>(L5) RaptorQ recovery sur late entry (PLHEADER1 perdu)</h4>
+<p>
+    En late entry, le burst commence à PLHEADER_{K} pour K &gt; 0. Le
+    RaptorQ <code>base_esi</code> &gt; 0 → packets [0..K·cw_per_cycle) sont
+    absents. Si le burst est assez long et l'overhead 30 % suffisant,
+    RaptorQ reconstruct quand même. Sinon décode partiel. Future work :
+    négocier le base_esi à 0 même late entry via wrapping ESI, ou bumper
+    le repair overhead. Pas critique tant que OTA bursts sont assez longs.
+</p>
+
+<h4>(L6) Pas de test end-to-end via worker</h4>
+<p>
+    Le test <code>session_decodes_burst_with_preburst_high_2x</code> drive
+    <code>Rx2xSession</code> direct, pas via <code>rx_worker2x::spawn</code>.
+    Cf. <code>feedback-rx-tests-via-worker-chunks</code> qui exige tous tests
+    RX via worker en cpal-sized chunks. À faire : reformuler le test pour
+    passer par le worker.
+</p>
+
+<h4>(L7) `try_gather_preburst_refs` correlation threshold magic 0.5</h4>
+<p>
+    Le seuil 0.5 sur le coefficient de corrélation au carré
+    <code>|⟨y, p⟩|² / (‖y‖²·‖p‖²)</code> est arbitraire. Pour OTA dégradé
+    le préburst pourrait ne plus correler à 0.5. Future tuning post-OTA.
+</p>
 
 </div>
 </body>
