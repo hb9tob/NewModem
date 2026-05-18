@@ -1515,13 +1515,23 @@ impl Rx2xSession {
         let min_skip = (self.cycle_period_sym / 2).max(PREAMBLE_LEN_SYM);
         let mut scan = cursor_rel;
         let mut new_validated: Vec<u64> = Vec::new();
+        let trace = std::env::var_os("RX2X_LOG_DRIFT_TRACE").is_some();
+        let mut n_candidates = 0usize;
+        let mut n_pls_fail = 0usize;
+        // Track where the scan effectively stopped: the cursor advances
+        // up to (but not past) the first candidate that needed more
+        // symbols to validate, so subsequent chunks re-find it once
+        // the PLHEADER lands in `sym_buffer`.
+        let mut effective_scan_end = self.sym_buffer.len();
         while let Some(pos_rel) =
             find_next_sof(&self.sym_buffer, scan, self.cfg.family)
         {
+            n_candidates += 1;
             if pos_rel + PLHEADER_LEN_SYM > self.sym_buffer.len() {
-                // Not enough symbols yet — leave cursor here so the
-                // next chunk picks up the same candidate once more
-                // audio arrives.
+                // Not enough symbols yet — leave cursor at pos_rel so
+                // the next chunk re-finds this same candidate once
+                // more audio arrives.
+                effective_scan_end = pos_rel;
                 break;
             }
             let sym_abs = self.buf_start_abs + pos_rel as u64;
@@ -1540,13 +1550,41 @@ impl Rx2xSession {
                 new_validated.push(sym_abs);
                 scan = pos_rel + min_skip;
             } else {
+                n_pls_fail += 1;
                 scan = pos_rel + 1;
             }
         }
-        // Advance cursor to the end of the buffer; any candidates needing
-        // more symbols stay re-discoverable since we filter dup'd sym_abs.
-        self.drift_scan_cursor_sym =
-            self.buf_start_abs + self.sym_buffer.len() as u64;
+        if trace {
+            eprintln!(
+                "[drift-trace] sym_buf={} buf_start_abs={} cursor_rel={} \
+                 candidates={} pls_fail={} new_validated={} refined_total={} \
+                 audio_drained={} audio_buf={}",
+                self.sym_buffer.len(),
+                self.buf_start_abs,
+                cursor_rel,
+                n_candidates,
+                n_pls_fail,
+                new_validated.len(),
+                self.drift_refined_sofs.len(),
+                self.audio_drained_samples,
+                self.audio_buffer.len(),
+            );
+        }
+        // Advance cursor up to the end of the effective scan region,
+        // but never past the last position where a full PLHEADER could
+        // possibly fit. `find_next_sof` itself bails at
+        // `sym_buffer.len() - PREAMBLE_LEN_SYM`, AND we need the full
+        // PLHEADER (256 sym) for PLS validation, so any cursor past
+        // `sym_buffer.len() - PLHEADER_LEN_SYM` would skip over
+        // candidates that simply haven't arrived in full yet.
+        // Already-refined SOFs are filtered by the dup check on sym_abs,
+        // so re-scanning the tail across chunks is cheap.
+        let cursor_advance_cap = self
+            .sym_buffer
+            .len()
+            .saturating_sub(PLHEADER_LEN_SYM);
+        self.drift_scan_cursor_sym = self.buf_start_abs
+            + effective_scan_end.min(cursor_advance_cap) as u64;
 
         // Step 2: refine each new SOF's audio-rate position via a local
         // downmix+MF+parabolic peak fit on a small window. Bounded work
@@ -1560,13 +1598,42 @@ impl Rx2xSession {
         let taps = rrc_taps(self.cfg.base.beta, RRC_SPAN_SYM, sps);
         let resample_factor = 1.0 + self.cached_drift_ppm * 1e-6;
         for sym_abs in new_validated {
-            let pos_rel = (sym_abs - self.buf_start_abs) as i64;
-            // Project audio position (relative to audio_buffer[0]).
-            // streaming_dsp's resampler stretched/shrunk the audio by
-            // resample_factor to produce sym_buffer — so the raw-audio
-            // sample for sym i is at `i * sps * resample_factor`.
+            // Project audio position to `audio_buffer` RELATIVE coords.
+            //
+            // Two-step :
+            //   1. Absolute raw-audio index of sym i ≈ i · sps ·
+            //      resample_factor (streaming_dsp resampled the raw
+            //      audio so output sym i was decimated from raw audio
+            //      around sample i·sps·ratio).
+            //   2. Subtract `audio_drained_samples` to land in
+            //      audio_buffer-relative coords (audio_buffer[0] sits
+            //      at absolute index audio_drained_samples after
+            //      `trim_audio_for_streaming` has fired). `buf_start_abs`
+            //      is NOT a meaningful offset here: streaming_dsp's
+            //      sym_buffer-index 0 corresponds to TX-time sample 0
+            //      which corresponds to raw-audio sample 0 (the
+            //      session's audio origin), not to audio_buffer[0].
+            let audio_abs_predicted =
+                (sym_abs as f64) * (sps as f64) * resample_factor;
             let audio_rel_predicted =
-                (pos_rel as f64 * sps as f64 * resample_factor) as i64;
+                audio_abs_predicted as i64
+                    - self.audio_drained_samples as i64;
+            // If the projected position falls before the rolling audio
+            // window, the SOF's raw audio is already trimmed — skip.
+            // The dup check (drift_refined_sofs lookup) prevents us
+            // from re-attempting on later chunks.
+            if audio_rel_predicted < win + rrc_margin {
+                if trace {
+                    eprintln!(
+                        "[drift-trace]   skip sym_abs={} pred_rel={} \
+                         (audio already trimmed; audio_drained={})",
+                        sym_abs,
+                        audio_rel_predicted,
+                        self.audio_drained_samples,
+                    );
+                }
+                continue;
+            }
             // Slice window with enough margin for FIR convergence.
             let slice_lo = (audio_rel_predicted - win - rrc_margin).max(0)
                 as usize;
@@ -1581,6 +1648,17 @@ impl Rx2xSession {
                 // if a SOF is too far back. Skip; next chunk may have
                 // it covered, or it's permanently lost (which is fine —
                 // we don't gain from one missed SOF).
+                if trace {
+                    eprintln!(
+                        "[drift-trace]   skip sym_abs={} pred_rel={} lo={} hi={} \
+                         audio_buf={} (window doesn't fit)",
+                        sym_abs,
+                        audio_rel_predicted,
+                        slice_lo,
+                        slice_hi_excl,
+                        self.audio_buffer.len(),
+                    );
+                }
                 continue;
             }
             let audio_slice = &self.audio_buffer[slice_lo..slice_hi_excl];
@@ -1674,16 +1752,31 @@ impl Rx2xSession {
         }
         if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
             eprintln!(
-                "[rx2x-drift] sofs={} (streaming refined) cached={:+.2} → new={:+.2} ppm",
+                "[rx2x-drift] sofs={} (streaming refined, diag only) cached={:+.2} \
+                 → measured={:+.2} ppm enabled={}",
                 self.drift_refined_sofs.len(),
                 self.cached_drift_ppm,
                 new_drift,
+                std::env::var_os("RX2X_SOF_DRIFT").is_some(),
             );
         }
-        self.cached_drift_ppm = new_drift;
-        // FFE taps trained at previous drift are stale.
-        self.ffe_taps = None;
-        true
+        // **DISABLED in streaming worker** — applying the measured drift
+        // mid-session breaks streaming_dsp coherence: symbols already
+        // emitted at the old ratio mix with symbols at the new ratio in
+        // `sym_buffer`, the FSM stops finding cycle SOFs at expected
+        // positions, and decoding collapses after the first 1-2 cycles
+        // (empirical OTA 2026-05-18 : 4/30 CW @ cached=0 vs 0/N CW once
+        // updates kick in). The estimator stays computed for
+        // **diagnostic only** (logged under `RX2X_LOG_DRIFT=1`, used by
+        // the validation harness). Gated by `RX2X_SOF_DRIFT=1` for
+        // future A/B once streaming_dsp learns to handle ratio jumps
+        // gracefully (cf [[rx2x-non-streaming-leak]] follow-up).
+        if std::env::var_os("RX2X_SOF_DRIFT").is_some() {
+            self.cached_drift_ppm = new_drift;
+            self.ffe_taps = None;
+            return true;
+        }
+        false
     }
 
     /// Train the per-cycle FFE on PLHEADER + LMS warmup references.
@@ -1815,12 +1908,18 @@ impl Rx2xSession {
         let failed_cws: Vec<FailedCwInfo> =
             self.cycle_failed_cws.drain(..).collect();
 
-        // Nothing to recover — every CW converged in the forward pass.
-        if failed_cws.is_empty() {
-            return;
-        }
-        // Too few pilot obs for the RTS to be reliable. Skip.
+        // Run the RTS smoother unconditionally (was previously gated on
+        // failed_cws.is_empty() == false). The smoother output is now
+        // used for TWO purposes:
+        //   1. Continuous drift pursuit via the OLS slope of the
+        //      smoothed phase trajectory (forward-only update to
+        //      `cached_drift_ppm`, gated by `RX2X_PILOT_DRIFT=1`).
+        //   2. Per-cycle turbo redecode of failed CWs (existing path).
+        // Either purpose alone justifies the smoother — gating it on
+        // failed CWs was a leftover from when (2) was the only consumer.
         if obs_with_pos.len() < 8 {
+            // Too few pilot obs for the RTS to be reliable. Skip BOTH
+            // drift refinement and turbo redecode.
             return;
         }
 
@@ -1844,6 +1943,92 @@ impl Rx2xSession {
                 "[rx2x-cycle-smooth] cycle={} n_obs={} mean={:+.3} range=[{:+.3},{:+.3}] rad failed={}",
                 cycle_idx, obs.len(), mean, mn, mx, failed_cws.len(),
             );
+        }
+
+        // --- Continuous drift pursuit via pilot-slope (streaming) ---
+        //
+        // The smoothed phi trajectory φ̂_k vs absolute symbol index gives
+        // a per-cycle estimate of the residual drift the streaming
+        // resampler hasn't yet absorbed. Slope conversion :
+        //   φ̂(t) = 2π · fc · ε·1e-6 · t, with t = sym_idx / symbol_rate
+        //   ⇒ dφ̂/d(sym_idx) = 2π · fc · ε·1e-6 / Rs
+        //   ⇒ ε_residual_ppm = (slope · Rs) / (2π · fc) · 1e6
+        // OLS on the smoothed (unwrapped) phase is robust to pilot noise
+        // because the smoother has already pooled the cycle's obs into
+        // a coherent trajectory.
+        //
+        // Update is **forward-only** and uses **only the freshly-
+        // completed cycle's pilots** — no retro-process. Damping α=0.5
+        // bounds per-update step + caps |Δ| ≤ 10 ppm per cycle as a
+        // sanity belt against false-alarm pilot pools (e.g. a cycle
+        // where many CWs failed and the obs are dominated by noise).
+        // Gated by `RX2X_PILOT_DRIFT=1` so we can A/B vs the SOF-only
+        // baseline. Logged unconditionally under
+        // `RX2X_LOG_PILOT_DRIFT=1`.
+        let pilot_drift_enabled =
+            std::env::var_os("RX2X_PILOT_DRIFT").is_some();
+        let pilot_drift_log =
+            std::env::var_os("RX2X_LOG_PILOT_DRIFT").is_some();
+        if pilot_drift_enabled || pilot_drift_log {
+            let n = phi_smooth.len() as f64;
+            let xbar = obs_abs_pos.iter().map(|&p| p as f64).sum::<f64>() / n;
+            let ybar = phi_smooth.iter().sum::<f64>() / n;
+            let mut sxy = 0.0_f64;
+            let mut sxx = 0.0_f64;
+            for (&p, &y) in obs_abs_pos.iter().zip(phi_smooth.iter()) {
+                let dx = p as f64 - xbar;
+                sxy += dx * (y - ybar);
+                sxx += dx * dx;
+            }
+            if sxx > 1.0 {
+                let slope_rad_per_sym = sxy / sxx;
+                let fc = self.cfg.base.center_freq_hz;
+                let rs = self.cfg.base.symbol_rate as f64;
+                let residual_ppm =
+                    slope_rad_per_sym * rs / (2.0 * std::f64::consts::PI * fc) * 1e6;
+                if pilot_drift_log {
+                    eprintln!(
+                        "[rx2x-pilot-drift] cycle={} n_obs={} slope={:.6e} rad/sym \
+                         residual={:+.3} ppm cached={:+.3} ppm enabled={}",
+                        cycle_idx,
+                        obs.len(),
+                        slope_rad_per_sym,
+                        residual_ppm,
+                        self.cached_drift_ppm,
+                        pilot_drift_enabled,
+                    );
+                }
+                // Sanity caps :
+                //  - Reject |residual| > 100 ppm per update (the smoother
+                //    can produce wrapped slopes on cycles with few obs
+                //    or large phase walk; in those cases the OLS slope
+                //    is no longer trustworthy — e.g. cycle=0 of the OTA
+                //    WAV produced 4456 ppm after a backward-fix replay,
+                //    obvious wrap artefact).
+                //  - Require obs.len() ≥ 16 so the LS has decent
+                //    statistical support over the cycle.
+                //  - Final |new_drift| ≤ 300 ppm absolute (matches the
+                //    SOF-based estimator's cap).
+                if pilot_drift_enabled
+                    && obs.len() >= 16
+                    && residual_ppm.is_finite()
+                    && residual_ppm.abs() <= 100.0
+                {
+                    let damping = 0.5_f64;
+                    let new_drift =
+                        self.cached_drift_ppm + damping * residual_ppm;
+                    if new_drift.abs() <= 300.0 {
+                        self.cached_drift_ppm = new_drift;
+                        // FFE taps trained at previous drift are stale.
+                        self.ffe_taps = None;
+                    }
+                }
+            }
+        }
+
+        // Skip the turbo redecode pass when every CW already converged.
+        if failed_cws.is_empty() {
+            return;
         }
 
         // Build the cycle PLHEADER reference pair (identical to the
