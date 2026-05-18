@@ -144,13 +144,24 @@ pub struct StreamingDsp {
     // === Resampler ===
     bank: Vec<[f64; N_TAPS]>,
     /// Index of the next TX-time output sample the resampler will emit
-    /// (cumulative across the whole session). Multiplied by `ratio` to
-    /// get the RX-time input sample to interpolate at.
+    /// (cumulative across the whole session). Tracked alongside
+    /// `target_abs_state` (the fractional RX-time input position) for
+    /// diagnostic and downstream cursors.
     resampler_next_tx: u64,
-    /// Cached `cached_drift_ppm` last time the resampler ran. Allows
-    /// the caller to update drift between chunks without breaking
-    /// continuity: the resampler keeps emitting at the new ratio from
-    /// `resampler_next_tx` onward.
+    /// Fractional RX-time input position the resampler will read at
+    /// **next** to produce the next TX output sample. Initialized to
+    /// 0.0 at session start, advanced by `ratio_now` (= 1 + drift_ppm
+    /// · 1e-6) after each output emit. This is a STATE-FUL integrator:
+    /// changing `drift_ppm` between `feed_audio` calls smoothly
+    /// transitions the mapping from the current `target_abs_state`
+    /// onward — no abrupt jump, no retroactive remapping of
+    /// already-emitted output. Equivalent to the pre-2026-05-18
+    /// stateless `next_tx * ratio` mapping when `drift_ppm` is held
+    /// constant for the whole session; only diverges when the caller
+    /// updates drift mid-session.
+    target_abs_state: f64,
+    /// Cached `drift_ppm` last time the resampler ran. Diagnostic only
+    /// (the integrator above is the source of truth for the mapping).
     last_drift_ppm: f64,
 
     // === Resampled audio (TX-time) ===
@@ -211,6 +222,7 @@ impl StreamingDsp {
             fc: cfg.base.center_freq_hz,
             bank: build_polyphase_bank(),
             resampler_next_tx: 0,
+            target_abs_state: 0.0,
             last_drift_ppm: 0.0,
             resampled_start_abs: 0,
             resampled: Vec::new(),
@@ -324,12 +336,19 @@ impl StreamingDsp {
         let drained = audio_drained_samples as i64;
         loop {
             // Target RX-time sample (fractional) to interpolate at.
-            // Absolute RX-side index inside the conceptual infinite
-            // input stream (samples before `audio_drained_samples`
-            // are treated as zero — the session's "pre-start" silence,
-            // identical to the model "imagine the audio starts with
-            // an infinite stream of zeros").
-            let target_abs = (self.resampler_next_tx as f64) * ratio;
+            // **Integrator state** (2026-05-18 fix): `target_abs_state`
+            // advances by the CURRENT `ratio` per output sample, so a
+            // mid-session `drift_ppm` change transitions smoothly from
+            // the current input position onward instead of causing a
+            // discontinuous jump `K · (r_new − r_old)` in input space.
+            // The stateless legacy `next_tx · ratio` mapping was
+            // mathematically clean for a fixed ratio but desynchronized
+            // already-emitted symbols against newly-emitted ones every
+            // time the caller updated `drift_ppm` — breaking the FSM's
+            // cycle_period_sym expectation. With the integrator, the
+            // change is bounded by `r_new` (≈ 1.00006 for 60 ppm)
+            // per output sample.
+            let target_abs = self.target_abs_state;
             let centre_abs = target_abs.floor() as i64;
             let frac = target_abs - centre_abs as f64;
             let phase = (frac * N_PHASES as f64).round() as i64;
@@ -369,6 +388,9 @@ impl StreamingDsp {
             }
             self.resampled.push(acc as f32);
             self.resampler_next_tx += 1;
+            // Advance the integrator AFTER consuming the current target.
+            // The new ratio applies from the NEXT output sample onward.
+            self.target_abs_state += ratio;
         }
     }
 
