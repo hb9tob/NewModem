@@ -188,10 +188,15 @@ pub struct Rx2xSession {
 
     // --- Audio → symbols ---
     /// Rolling audio buffer (mono f32 @ 48 kHz). Grown by
-    /// `process_audio_chunk`, used to re-derive `sym_buffer` via
-    /// `audio_to_symbols` after each chunk. Future improvement
-    /// (slice 2x20+): replace with `StreamingFrontend` (Farrow +
-    /// Gardner closed-loop) once a proper acquisition phase exists.
+    /// `process_audio_chunk`, fed to the streaming pipeline below.
+    /// TODO: drive a continuous-drift tracker that updates the
+    /// polyphase resampler ratio on a per-cycle or finer cadence —
+    /// today the resampler runs purely open-loop on
+    /// `cached_drift_ppm` LS-fitted from PLHEADER positions
+    /// (sufficient for ±30 ppm sound-card OTA but not for high-
+    /// drift SDR / QO-100 paths). The historical Farrow + Gardner
+    /// closed-loop TED stub was removed 2026-05-18 ; see `lib.rs`
+    /// for the rationale.
     audio_buffer: Vec<f32>,
     /// Streaming RX-side DSP pipeline (polyphase FIR resampler + NCO
     /// downmix + overlap-save MF + decimation). Stateful — each new

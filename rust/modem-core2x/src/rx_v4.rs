@@ -1,12 +1,12 @@
 //! V4 receive pipeline (symbol domain).
 //!
 //! `rx_v4_symbols` ingests a stream of complex symbols already synced and
-//! matched-filtered (the worker, in [`modem-worker2x`], handles the
-//! audio-domain pieces — Farrow interpolation, Gardner closed-loop
-//! timing, then samples into one Complex64 per symbol). This split keeps
-//! `modem-core2x` self-contained and unit-testable without an audio
-//! dependency, and lets the worker reuse the same primitives for
-//! sound-card and SDR captures.
+//! matched-filtered (`streaming_dsp::StreamingDsp` in this crate handles
+//! the audio-domain pieces — polyphase FIR resampler + NCO downmix +
+//! overlap-save matched filter + decimation — driven open-loop by
+//! `cached_drift_ppm`). This split keeps `modem-core2x` self-contained
+//! and unit-testable without an audio dependency, and lets the worker
+//! reuse the same primitives for sound-card and SDR captures.
 //!
 //! Pipeline (one PLHEADER cycle):
 //!
@@ -152,13 +152,11 @@ pub struct RxResult2x {
     pub data_scatter_n: usize,
     /// Symbol-buffer index of the first SOF the decoder locked onto in
     /// the input symbol stream (relative to the buffer passed in), or
-    /// None if no SOF passed the PLHEADER CRC. The streaming worker
-    /// uses this to pin its [`StreamingFrontend`]'s pilot-aided TED
-    /// anchor — `frontend.align_to_sof(first_sof_at)` enables the
-    /// AbsGardner-on-pilot-interior gate (D-1c-ii), which keeps the
-    /// timing loop unbiased on multi-ring APSK profiles.
-    ///
-    /// [`StreamingFrontend`]: `modem_worker2x::streaming_frontend::StreamingFrontend`
+    /// None if no SOF passed the PLHEADER CRC. Retained for diagnostics
+    /// (logs / GUI debug panels) ; the closed-loop pilot-aided TED that
+    /// would have consumed it (StreamingFrontend / TimingLoop) was
+    /// removed 2026-05-18 — see `lib.rs` and
+    /// `docs/modem_2x_reference.html` §6.2 for the rationale.
     pub first_sof_at: Option<usize>,
     /// Scatter sample of post-correction DATA symbols (META excluded).
     /// Capped at [`MAX_CONSTELLATION_POINTS`]; the worker forwards this

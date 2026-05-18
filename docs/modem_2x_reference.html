@@ -188,8 +188,7 @@
         <li><a href="#algo-frontend">Algorithmes — front-end audio→symboles</a>
             <ol>
                 <li><a href="#nco">NCO downmix continu</a></li>
-                <li><a href="#farrow">Interpolation Farrow cubique</a></li>
-                <li><a href="#gardner">TED Gardner / AbsGardner + boucle PI</a></li>
+                <li><a href="#farrow">Suivi de la dérive — open-loop polyphase + TODO continuous tracking</a></li>
                 <li><a href="#fft-gate">Détecteur Schmidl-Cox préambule (Phase 3)</a></li>
             </ol>
         </li>
@@ -762,128 +761,103 @@ training_amplitude = R₄
     <code>2π · fc / 48 000</code> par sample.
 </p>
 
-<h3 id="farrow">6.2 Interpolation Farrow / Gardner closed-loop — <strong>NON CÂBLÉ EN PRODUCTION</strong></h3>
+<h3 id="farrow">6.2 Suivi de la dérive — open-loop polyphase (post-2026-05-18)</h3>
 
-<div class="callout" style="background: var(--warn-soft); border-left-color: var(--warn);">
-    <strong>État actuel (post-Phase 3)</strong> : la <code>StreamingFrontend</code>
-    (Farrow + Gardner closed-loop, <code>streaming_frontend.rs</code>) <strong>n'est
-    pas câblée</strong> dans <code>Rx2xSession</code>. Le commentaire à
-    <code>rx2x_session.rs:193-194</code> est explicite :
-    <pre style="margin: 0.5em 0;"><code>/// (slice 2x20+): replace with `StreamingFrontend` (Farrow +
-/// Gardner closed-loop) once a proper acquisition phase exists.
-streaming: StreamingDsp,</code></pre>
-    La production utilise <strong><code>StreamingDsp</code></strong>
-    (<code>streaming_dsp.rs</code>) = PolyphaseResampler + NCO downmix + MF
-    overlap-save + decimation à phase 0 par construction. <strong>Pas de
-    TED, pas de boucle PI.</strong> Le ratio du resampler est piloté en
-    <strong>open-loop</strong> par <code>cached_drift_ppm</code>, calculé
+<div class="callout" style="background: var(--good-soft); border-left-color: var(--good);">
+    <strong>État courant</strong> : la trajectoire timing du modem 2x
+    est <strong>open-loop</strong>. Le <code>PolyphaseResampler</code>
+    (32 taps × 1024 phases, <code>streaming_dsp.rs</code>) interpole
+    l'audio à un ratio fixé par <code>cached_drift_ppm</code>, estimé
     par LS sur les positions de SOFs CRC-validés (cf §10.1).
+    <strong>Pas de TED, pas de boucle PI sur chaque sample.</strong>
 </div>
 
+<h4>Pourquoi pas de TED closed-loop</h4>
+
 <p>
-    Le contenu ci-dessous décrit le code <code>streaming_frontend.rs</code>
-    qui <strong>existe</strong> mais n'est pas câblé. Conservé pour référence ;
-    le câblage est sur la roadmap (cf §11 stubs et tests
-    <code>streaming_frontend::*_50ppm/100ppm</code> qui exercent cette voie).
+    Le plan V4 originel (slice 2x18-2x20) prévoyait une chaîne
+    <strong>Farrow + Gardner closed-loop</strong>
+    (<code>streaming_frontend.rs</code> + <code>modem_core_base::timing_loop</code>).
+    Le câblage de ce chemin exigeait une phase d'acquisition propre (lock
+    initial du strobe à la phase du 1er SOF). Sans elle la boucle Gardner
+    démarre avec un offset arbitraire et soit converge lentement, soit
+    diverge sur APSK multi-ring (bug montré par les tests
+    <code>pilot_aided_*_50ppm/100ppm</code>).
 </p>
 
-<h4>Farrow cubique-Lagrange (modem-core-base/src/farrow.rs)</h4>
-
-<p>Polynôme de Lagrange ordre 3 sur 4 échantillons consécutifs :</p>
-
-<pre><code>// Pour interpoler à position pos = floor(pos) + μ, μ ∈ [0, 1) :
-// x[-1] x[0] x[1] x[2] sont les 4 samples encadrants
-
-c₃ = (-x[-1] + 3·x[0] - 3·x[1] + x[2]) / 6
-c₂ = ( x[-1] - 2·x[0] +    x[1])       / 2
-c₁ = (-2·x[-1] - 3·x[0] + 6·x[1] - x[2]) / 6
-c₀ =   x[0]
-
-y(μ) = ((c₃·μ + c₂)·μ + c₁)·μ + c₀     // Horner
-</code></pre>
-
 <p>
-    Zone safe : <code>1 ≤ floor(pos) ≤ N − 3</code>. Hors zone (lead-in du buffer),
-    fallback sur sampling entier <code>mf[k·sps]</code> ; la boucle PI ne tourne
-    pas (integ reste à 0) le temps que la zone safe soit atteinte
-    <span class="src">streaming_frontend.rs:312-357</span>.
+    Slice 2x23 a apporté le <code>PolyphaseResampler</code> open-loop qui
+    décode proprement pour drift ≤ ±30 ppm (= cas sound-card FT-991A → FTX-1
+    typique). Suffisant pour la production immédiate, donc le câblage Farrow
+    + Gardner est resté à l'état de stub. Phase 1+2+3 (Schmidl-Cox + preburst
+    PRBS + bootstrap fix) n'a rien changé à cette donne.
 </p>
 
-<h4>StreamingDsp PolyphaseResampler (actuellement en prod, voir §10.1)</h4>
-
 <p>
-    Le <strong>PolyphaseResampler</strong> dans <code>streaming_dsp.rs</code>
-    fait le job de Farrow dans le chemin de production : interpolation
-    sub-sample par banc 32 taps × 1024 phases, ratio fixé par
-    <code>cached_drift_ppm</code> open-loop. Pas de tracking par échantillon
-    via TED ; le drift est estimé à l'échelle du cycle (≥ 3 PLHEADERs CRC-validés)
-    par <code>estimate_drift_from_raw</code> avec parabolic refinement
-    audio-rate. Détail complet en §10.1.
+    Le module <code>streaming_frontend.rs</code> + sa suite de tests
+    Farrow/Gardner ont été <strong>supprimés du codebase le 2026-05-18</strong> :
+    807 lignes de code mort + 3 tests pré-existants en échec sur HEAD.
+    <code>modem_core_base::farrow</code> et
+    <code>modem_core_base::timing_loop</code> restent dans le crate
+    primitives mais n'ont plus de consommateur en production.
 </p>
 
-<h3 id="gardner">6.3 Gardner closed-loop TED — <strong>STUB NON CÂBLÉ</strong></h3>
-
-<div class="callout" style="background: var(--warn-soft); border-left-color: var(--warn);">
-    Tout comme §6.2, le TED Gardner / AbsGardner et la boucle PI décrits
-    ci-dessous sont implémentés dans <code>streaming_frontend.rs</code> +
-    <code>timing_loop.rs</code> mais <strong>ne sont pas dans le chemin
-    de production</strong>. La trajectoire timing dans <code>Rx2xSession</code>
-    est purement open-loop pilotée par <code>cached_drift_ppm</code>.
-</div>
+<h4 id="continuous-drift-todo">TODO : tracking continu de la dérive sur le polyphase</h4>
 
 <p>
-    Deux variantes de Timing-Error Detector (code existant), sélectionnées
-    par strobe selon que le symbole est dans l'intérieur d'un bloc pilote
-    ou non <span class="src">timing_loop.rs:40-56, streaming_frontend.rs:334-338</span> :
+    L'open-loop courant ne fait qu'<strong>une mise à jour par chunk</strong>
+    de <code>cached_drift_ppm</code> via <code>estimate_drift_from_raw</code>,
+    et cette estimation a besoin de ≥ 3 PLHEADERs CRC-validés (= 12 s burst
+    minimum) avant de converger sous 1 ppm. Pendant ces 12 premières secondes,
+    le polyphase tourne avec son estimation initiale (= 0 ppm au bootstrap
+    commit) et n'absorbe pas une dérive en cours d'établissement.
 </p>
 
-<dl class="axis-grid">
-    <dt>Gardner classique</dt>
-    <dd><code>e = Re((y_late − y_early) · conj(y_on))</code> — robuste sur
-        toutes constellations, biais data-dépendant léger sur APSK multi-ring.
-        Utilisé pré-SOF et sur tous les symboles data post-SOF.</dd>
-    <dt>AbsGardner</dt>
-    <dd><code>e = |y_late|² − |y_early|²</code> — sign-free, unbiased sur signal
-        amplitude-constante. Utilisé uniquement sur l'intérieur strict des blocs
-        pilotes (premier/dernier sym d'un bloc exclus car early/late étraddent
-        une transition data/pilote). Recipe DVB-S2X §9.3.2.</dd>
-</dl>
+<p>
+    Conséquence pratique :
+</p>
+<ul>
+    <li>Sur sound-card stable (FT-991A + soundcard USB Pi5), drift
+        sous 30 ppm typique, le décodeur tient.</li>
+    <li>Sur SDR (Pluto / SDRplay, dérive thermique) ou QO-100 (CFO
+        ±50 kHz), il faudra un suivi plus fin que "1 LS-fit par chunk".</li>
+</ul>
 
 <p>
-    <strong>Boucle PI</strong> — <span class="src">timing_loop.rs:33-36, 99-102</span> :
+    <strong>Approches candidates</strong> pour un tracking continu sans
+    revenir à un TED closed-loop :
+</p>
+<ul>
+    <li><strong>Pilot-aided phase tracker</strong> : exploiter la rotation
+        de phase des pilotes TDM (qui sont déjà connus et présents toutes
+        les 34 syms à 1500 Bd) pour extraire un Δφ symbol-par-symbol →
+        intégrer → estimation ppm symbol-rate. Update du polyphase ratio
+        à chaque cycle ou plus fin.</li>
+    <li><strong>Per-cycle LS sur les CRC-validés cumulés</strong> :
+        élargir <code>estimate_drift_from_raw</code> de "tout le buffer"
+        à un Kalman state {drift, drift_rate} mis à jour à chaque nouveau
+        SOF anchor validé. Permet de suivre une ramp linéaire.</li>
+    <li><strong>Schmidl-Cox post-détection au sample</strong> : le détecteur
+        de §6.4 sait déjà mesurer la métrique M(k) ∈ [0,1]. La position
+        sub-sample du peak (parabolic fit sur 3 valeurs autour du max) est
+        un indicateur de phase aussi précis qu'un TED, avec l'avantage
+        d'être insensible aux données.</li>
+</ul>
+
+<p>
+    Aucune des trois n'est implémentée. Premier candidat à explorer :
+    <strong>pilot-aided phase tracker</strong>, parce que les pilotes TDM
+    sont déjà câblés et fournissent un strobe toutes les ~22 ms — plus
+    rapide que le LS-fit per-chunk actuel.
 </p>
 
-<pre><code>K_p = 0.05          // proportional gain
-K_i = 0.005         // integral gain
-B_L · T_sym ≈ 0.01  // bande de bruit normalisée (slow loop)
-ζ ≈ 1.0             // critiquement amortie
-
-// Update par strobe :
-integ ← integ + K_i · err
-correction = K_p · err + integ
-strobe_pos ← strobe_pos + sps + correction
-</code></pre>
+<h3 id="gardner">6.3 (réservé)</h3>
 
 <p>
-    <strong>Plage de tracking théorique :</strong> ±50 ppm safe, jusqu'à ±100 ppm
-    sur 2x sans data-induced drift (tests <code>streaming_frontend::tests</code>).
-    L'integrateur converge vers le drift per-symbol à régime établi
-    <span class="src">streaming_frontend.rs:31-34</span>. Mais les tests
-    <code>pilot_aided_*_50ppm/100ppm</code> échouent toujours sur HEAD ⇒ cf §12.
-</p>
-
-<h4>Pourquoi pas câblé en production aujourd'hui</h4>
-
-<p>
-    Le câblage <code>StreamingFrontend</code> exigeait une phase d'acquisition
-    propre (lock initial du strobe à la phase du 1er SOF). Sans elle, la boucle
-    Gardner part avec un offset arbitraire et soit converge lentement, soit
-    diverge sur APSK multi-ring. Le commentaire de slice 2x20 prévoyait le
-    swap quand l'acquisition serait robuste ; entre temps slice 2x23 a apporté
-    le PolyphaseResampler open-loop qui décode bien pour drift &lt; ±30 ppm
-    (le cas sound-card FT-991A → FTX-1 typique), donc le câblage Farrow+Gardner
-    est resté en attente. Cf <code>streaming_frontend::*_50ppm/100ppm</code>
-    failing tests qui valideraient le câblage si remis en prod (§12).
+    Section retirée : §6.3 décrivait précédemment le TED Gardner / AbsGardner
+    et la boucle PI. Ces composants vivaient dans le stub
+    <code>streaming_frontend.rs</code> supprimé. Voir §6.2 pour le contexte
+    et le TODO de suivi continu de la dérive.
 </p>
 
 <h3 id="fft-gate">6.4 Détecteur Schmidl-Cox préambule (<code>PreambleProbe2x</code>, Phase 3)</h3>

@@ -10,13 +10,12 @@
 //! - [`tx_worker2x`] — encode an in-process payload to `Vec<f32>` audio
 //!   via [`modem_core2x::modem2x::V4Modem`]. Optionally drives a
 //!   [`SampleSink`](modem_io::SampleSink) for live transmission.
-//! - [`rx_worker2x`] — convert audio f32 samples (mono, 48 kHz) into
-//!   complex symbols via downmix + matched filter, then call
-//!   [`modem_core2x::rx_v4::rx_v4_symbols`]. The TimingLoop / Farrow
-//!   integration is a future enhancement; this first cut uses naive
-//!   integer-step sampling at the symbol rate which is sufficient for
-//!   noise-free WAV roundtrips and OTA captures with negligible clock
-//!   skew (Pi5 + sound card baseline).
+//! - [`rx_worker2x`] — thin shim around
+//!   [`modem_core2x::rx2x_session::Rx2xSession`] (slice 2x19+). All
+//!   audio-domain DSP (polyphase resampler + NCO downmix + MF +
+//!   decimation) lives in
+//!   [`modem_core2x::streaming_dsp::StreamingDsp`]; the worker just
+//!   bridges cpal chunks → session → events.
 //! - [`session_store2x`] — accumulates decoded payloads keyed by
 //!   `session_id`. Emits the recovered file once an [`AppHeader`] is
 //!   seen and enough RaptorQ packets have converged.

@@ -2,9 +2,9 @@
 //!
 //! Parallel to [`modem_core`] (V3). Both crates depend on
 //! [`modem_core_base`] for the shared DSP primitives (constellations,
-//! LDPC, RRC, Golay, FFE, PLL, soft demodulation, Farrow interpolator,
-//! Gardner closed-loop timing recovery). 2x adds a fresh frame layout
-//! and RX pipeline on top, NOT a re-implementation of the lower layers.
+//! LDPC, RRC, Golay, FFE, PLL, soft demodulation). 2x adds a fresh
+//! frame layout and RX pipeline on top, NOT a re-implementation of
+//! the lower layers.
 //!
 //! # What changes vs V3
 //!
@@ -16,10 +16,16 @@
 //!   after every LDPC codeword; densified to 2 blocks/CW for the
 //!   APSK-32 and APSK-64 profiles only) replace the V3 TDM pilots
 //!   interleaved inside each segment.
-//! - **Closed-loop timing recovery** via
-//!   `modem_core_base::timing_loop::TimingLoop` + Farrow interpolation
-//!   replaces the V3 open-loop Phase 1d marker-correlation drift
-//!   estimator + bulk `resample_audio`.
+//! - **Open-loop timing recovery via `streaming_dsp::StreamingDsp`**
+//!   (slice 2x23) — a polyphase FIR resampler whose `ratio = 1 + ppm
+//!   × 1e-6` is driven by `cached_drift_ppm`, estimated by LS-fit on
+//!   the SOF positions (audio-rate parabolic refinement of the
+//!   double-Chu cross-correlation peaks). Replaces the V3 open-loop
+//!   Phase 1d marker-correlation drift estimator + bulk
+//!   `resample_audio` AND the V4 plan's earlier idea of a Farrow +
+//!   Gardner closed-loop (the closed-loop path was never wired in
+//!   production — open-loop polyphase is sufficient for the sound-
+//!   card use case ±30 ppm typical).
 //!
 //! # What stays
 //!
@@ -49,7 +55,9 @@
 //! - `pilot_block` — 36-sym `(1+j)/√2` blocks + interleaver.
 //! - `profile2x` — 8 profiles `*2x` incl. `HighPlusPlus2x`.
 //! - `frame2x` — `build_superframe_v4`.
-//! - `rx_v4` — full RX pipeline, integrates Farrow + TimingLoop.
+//! - `rx_v4` — symbol-domain RX pipeline (decode, FFE, turbo).
+//! - `streaming_dsp` — sample-domain RX pipeline (polyphase resampler
+//!   + NCO + MF + decimator), driven open-loop by `cached_drift_ppm`.
 //! - `gate2x` + `detect2x` — FFT-gate + auto-detect 2x.
 //! - `modem2x` — `V4Modem` impl of the `Modem` trait.
 
@@ -61,6 +69,12 @@
 pub mod pilot2x_tdm;
 pub mod plheader;
 pub mod preburst;
+// streaming_frontend.rs (Farrow + Gardner closed-loop TED) removed
+// 2026-05-18: never wired into Rx2xSession in production, slice 2x23
+// brought StreamingDsp (open-loop polyphase resampler driven by
+// cached_drift_ppm) which handles the sound-card use case. See
+// docs/modem_2x_reference.html §6.2 for the historical context and
+// the to-do for continuous drift tracking on the polyphase resampler.
 
 // Phase C-2 — `ProfileIndex2x` enum (8 profiles, HighPlusPlus2x
 // promoted) and `ModemConfig2x` struct used by the encoder/decoder.
@@ -89,11 +103,6 @@ pub mod gate2x;
 // modem-core-base::traits. Stateless wrapper that maps a profile name
 // to its config, calls frame2x + modulator, returns audio samples.
 pub mod modem2x;
-
-// Slice 2x19 — streaming audio→symbol front-end (was in modem-worker2x
-// pre-2x19 but architecturally belongs in core: it's pure DSP and the
-// live session machine that depends on it lives here too).
-pub mod streaming_frontend;
 
 // Slice 2x23 — streaming DSP pipeline (polyphase FIR resampler + NCO
 // downmix + overlap-save matched filter + decimation). Each stage

@@ -746,7 +746,7 @@ mod tests {
         .expect("PLHEADER decodes");
     }
 
-    // --- pilot-position layout helpers (used by StreamingFrontend) -------
+    // --- pilot-position layout helpers (used by RX pipelines) -------
 
     #[test]
     fn chunk_offset_is_pilot_default_pattern() {
