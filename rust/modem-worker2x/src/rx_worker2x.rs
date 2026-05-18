@@ -359,6 +359,27 @@ fn translate_events(
                 }
             }
             Rx2xEvent::SessionFinalised { result } => {
+                // Always-on summary event for harness consumers
+                // (sweep_rx_via_worker, sigma2 plots). Carries the final
+                // CW totals + σ² regardless of whether finalize_session
+                // succeeds — `file_complete` only fires on a non-empty
+                // payload, but we still want to know "0 / N CW converged"
+                // in the low-SNR / hard-drift case.
+                sink.emit(
+                    "rx2x_session_finalized",
+                    serde_json::json!({
+                        "data_cws_converged": result.data_cws_converged,
+                        "data_cws_total": result.data_cws_total,
+                        "converged_cws": result.converged_cws,
+                        "total_cws": result.total_cws,
+                        "sigma2_data": result.sigma2_data,
+                        "sigma2_data_scatter": result.sigma2_data_scatter,
+                        "es_data_scatter": result.es_data_scatter,
+                        "data_scatter_n": result.data_scatter_n,
+                        "cycles": result.cycles,
+                        "app_header_seen": result.app_header.is_some(),
+                    }),
+                );
                 if let Some(ref app_header) = result.app_header {
                     if !result.data.is_empty() {
                         let dir = save_dir
