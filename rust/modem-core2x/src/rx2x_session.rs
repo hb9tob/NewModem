@@ -379,6 +379,31 @@ pub struct Rx2xSession {
     /// per-chunk CPU). Advanced after every successful `equalize_*_from`
     /// call to the symbol index right after the last equalised cycle.
     equalized_up_to_abs: u64,
+
+    // --- Drift estimator streaming state (post-2x24 streaming-only rewrite) ---
+    /// PLS-validated SOFs whose audio position has already been refined
+    /// to sub-sample precision via local parabolic peak fit. Append-only
+    /// (each new SOF appears in at most one chunk's scan). Trimmed by
+    /// `trim_audio_for_streaming` when entries fall behind the rolling
+    /// audio retention window.
+    drift_refined_sofs: Vec<RefinedSofRecord>,
+    /// Next absolute symbol index to scan in `sym_buffer` for new SOFs
+    /// in `estimate_drift_from_raw`. Bumped each call past the symbols
+    /// scanned. Streaming forward-only — never decreases without an
+    /// explicit reset event.
+    drift_scan_cursor_sym: u64,
+}
+
+/// One PLS-validated SOF whose audio-rate position has been refined via
+/// parabolic peak fit. Stored across chunks so the LS drift fit can run
+/// incrementally as new SOFs arrive.
+#[derive(Clone, Copy, Debug)]
+struct RefinedSofRecord {
+    /// Absolute symbol index of this PLHEADER's first symbol.
+    sym_abs: u64,
+    /// Sub-sample absolute audio index (= `audio_drained_samples + refined_relative`)
+    /// of the SOF's MF-correlation peak.
+    audio_abs_refined: f64,
 }
 
 /// Per-failed-CW state captured at cycle end for the turbo redecode.
@@ -486,6 +511,8 @@ impl Rx2xSession {
             bootstrap_committed: false,
             ldpc_turbo_retain_sym,
             equalized_up_to_abs: 0,
+            drift_refined_sofs: Vec::new(),
+            drift_scan_cursor_sym: 0,
         }
     }
 
@@ -547,44 +574,45 @@ impl Rx2xSession {
     pub fn process_audio_chunk(&mut self, samples: &[f32]) -> Vec<Rx2xEvent> {
         self.audio_buffer.extend_from_slice(samples);
 
+        // Streaming pipeline first: extend `sym_buffer` with the symbols
+        // produced from the new audio. `streaming_dsp::feed_audio` is
+        // append-only and O(new audio) per call — it tracks its own
+        // resampler cursor by absolute audio index, so even when
+        // `try_bootstrap_pair` subsequently drains the audio_buffer
+        // prefix (gate sweeps) the streaming pipeline keeps a coherent
+        // view of the symbol stream produced so far. Both the bootstrap
+        // and the LS drift estimator read from this same `sym_buffer`
+        // — no parallel pipeline that re-processes the audio.
+        self.refresh_symbols();
+
         // Two-phase pipeline.
         //
         // **Phase 1 — bootstrap.** While `bootstrap_committed == false`,
         // the only DSP that runs is the cheap FFT gate (against a 400 ms
-        // rolling tail) plus a single `audio_to_symbols` + `find_all_sofs`
-        // + Golay validation pass on the gate window when the gate fires.
-        // We commit only if two SOF correlation peaks sit at the expected
+        // rolling tail) plus a single `find_all_sofs` + Golay validation
+        // pass on the streaming `sym_buffer` when the gate fires. We
+        // commit only if two SOF correlation peaks sit at the expected
         // cycle distance AND Golay+CRC validates on the PLHEADER at the
-        // first peak — geometric + cryptographic proof, no heavy DSP loop
-        // on band noise. On failure we drop audio up to the second peak
-        // (exclusive) and rearm the gate; no growing-buffer reprocess.
+        // first peak — geometric + cryptographic proof.
         //
         // **Phase 2 — steady state.** After commit, `cached_drift_ppm`
         // starts at 0 (bootstrap's integer-symbol (s2 − s1) only
         // resolves ~180 ppm; useless past the first cycle). The
-        // audio-rate parabolic-refined LS estimator (commit 840474c,
-        // *V4 drift fix*) runs every chunk to sharpen drift to ≈ 0.5–1
-        // ppm from validated PLHEADER positions, and when it updates
-        // by ≥ 0.5 ppm the FSM rewinds via `reset_for_backward_fix`
-        // (capped by `RX2X_MAX_DRIFT_RESETS` so an oscillating LS
-        // can't pathologically reset forever). Without this re-wire
-        // the OTA burst decodes cycle 1 cleanly then drifts off
-        // through every subsequent cycle as the symbol clock walks
-        // past the integer grid the FSM assumes.
+        // streaming audio-rate parabolic-refined LS estimator (post-2x24
+        // rewrite of commit 840474c, *V4 drift fix*) runs every chunk
+        // to sharpen drift to ≈ 0.5–1 ppm from validated PLHEADER
+        // positions, scanning ONLY new symbols past
+        // `drift_scan_cursor_sym`. The streaming pipeline picks up the
+        // updated ppm at its next-emit boundary — no rewind, no rebuild.
         if !self.bootstrap_committed {
             if !self.try_bootstrap_pair() {
                 return Vec::new();
             }
         }
 
-        // LS drift estimator (re-enabled after slice 2x23 streaming
-        // refactor). Updates `cached_drift_ppm` when LS jumps ≥ 0.5
-        // ppm. The streaming pipeline picks up the new ppm at its
-        // next-emit boundary — no rewind, no rebuild.
         let _ = self.estimate_drift_from_raw();
 
         self.trim_audio_for_streaming();
-        self.refresh_symbols();
 
         // Incremental per-cycle FFE (slice 2x23+). Only scan the
         // un-equalised tail of sym_buffer — cycles whose SOF was
@@ -698,12 +726,14 @@ impl Rx2xSession {
             self.gate_arm_buf_len = self.audio_buffer.len();
         }
 
-        // Step 2: bail out BEFORE the heavy MF pass if the buffer doesn't
-        // yet hold two cycles' worth of audio. Without this guard,
-        // `audio_to_symbols` would run on a growing buffer on every chunk
-        // between gate-fire and commit — exactly the loop that saturated
-        // the Pi in 2x20 OTA bring-up. For HIGH+2X (cycle ≈ 4 s) this
-        // means ~40 chunks of doing nothing instead of 40 full MF passes.
+        // Step 2: bail out BEFORE the heavy SOF scan if the streaming
+        // pipeline hasn't yet produced two cycles' worth of symbols.
+        // **Streaming-only post-2x24**: the bootstrap reads directly
+        // from `self.sym_buffer` (already maintained by
+        // `streaming_dsp::feed_audio` in `refresh_symbols`) — no
+        // parallel `audio_to_symbols(&audio_buffer)` pass that grew
+        // O(audio_buffer.len()) every chunk between gate-fire and
+        // commit.
         let sps = match rrc::check_integer_constraints(
             AUDIO_RATE,
             self.cfg.base.symbol_rate,
@@ -716,12 +746,18 @@ impl Rx2xSession {
         // (cycle_sym + PLHEADER_LEN_SYM) gives just enough symbols to hold
         // s1 = 0 and s2 = cycle_sym; PREAMBLE_LEN_SYM extra leaves room
         // for the 128-sym double-Chu correlation window past s2;
-        // 2 × RRC_SPAN_SYM × sps covers the matched-filter ramp-up/down
-        // so the symbol stream is dense from the buffer start.
+        // 2 × RRC_SPAN_SYM gives margin for streaming-pipeline edge
+        // effects at the very start of the burst.
+        let needed_sym =
+            cycle_sym + PLHEADER_LEN_SYM + PREAMBLE_LEN_SYM + 2 * RRC_SPAN_SYM;
+        // Also bound the raw audio_buffer growth (gate may have kept
+        // accumulating audio without firing). max_wait_samples acts as
+        // a safety belt — if no SOF pair is found and audio grows past
+        // it, drop most of the buffer and re-gate.
         let needed_audio =
             (cycle_sym + PLHEADER_LEN_SYM + PREAMBLE_LEN_SYM) * sps
                 + 2 * RRC_SPAN_SYM * sps;
-        if self.audio_buffer.len() < needed_audio {
+        if self.sym_buffer.len() < needed_sym {
             // Cap how long we accumulate without firing the search. If
             // the burst ends before we ever hit `needed_audio`, drop the
             // tail and re-gate so the next burst can try.
@@ -742,22 +778,15 @@ impl Rx2xSession {
             return false;
         }
 
-        // Step 3: now run the heavy DSP — exactly once per gate-fire
-        // event. drift=0 hypothesis (cached_drift_ppm is still 0 here, so
-        // refresh_symbols's |drift| ≥ 0.5 ppm branch wouldn't fire) → no
-        // cubic resample, just downmix + RRC MF + decimate.
-        let symbols = match audio_to_symbols(&self.audio_buffer, &self.cfg) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        // Step 4: enumerate every SOF correlation peak above threshold
-        // in the gate window. `find_all_sofs` already rejects peaks too
-        // weak to plausibly be a real PLHEADER and skips by
-        // min_cycle_skip_syms after each detection (avoids re-counting
-        // the same peak under symbol-grid quantisation).
+        // Step 3: enumerate every SOF correlation peak above threshold
+        // in the streaming symbol buffer. `find_all_sofs` is sliding-
+        // window O(K × PREAMBLE_LEN_SYM) with K = symbols scanned, and
+        // self.sym_buffer is bounded by streaming_dsp's trim policy.
+        // `find_all_sofs` skips by min_cycle_skip_syms after each
+        // detection (avoids re-counting under symbol-grid quantisation).
+        let symbols: &[Complex64] = &self.sym_buffer;
         let min_skip = (cycle_sym / 2).max(PREAMBLE_LEN_SYM);
-        let peaks = find_all_sofs(&symbols, self.cfg.family, min_skip);
+        let peaks = find_all_sofs(symbols, self.cfg.family, min_skip);
         if std::env::var_os("RX2X_LOG_GATE").is_some() {
             let valid_flags: Vec<bool> = peaks.iter().map(|&p| {
                 if p + PLHEADER_LEN_SYM > symbols.len() { return false; }
@@ -1447,10 +1476,28 @@ impl Rx2xSession {
     /// degenerate, or below threshold). Caller uses the boolean to decide
     /// whether to invalidate the FSM state (`reset_for_backward_fix`).
     fn estimate_drift_from_raw(&mut self) -> bool {
-        // Step 1: compute the audio-rate matched-filter output once and
-        // share it between the symbol-rate SOF scan and the audio-rate
-        // parabolic refinement that follows. (audio_to_symbols computes
-        // mf internally but discards it.)
+        // **Streaming forward-only rewrite (post-2x24).**
+        //
+        // The pre-2x24 implementation re-ran `downmix(&self.audio_buffer)`
+        // + `matched_filter` + `find_next_sof` on the FULL audio buffer
+        // every chunk — O(N) per chunk, O(N²) total over a burst. That
+        // saturated the Pi5 (>4× slower than realtime on a 102 s OTA
+        // capture in HIGH+2X, ring decoupled but worker never caught up).
+        //
+        // The streaming version scans NEW symbols past
+        // `drift_scan_cursor_sym` in the streaming `sym_buffer` (already
+        // computed once by `streaming_dsp::feed_audio`). For each newly
+        // PLS-validated SOF, it refines the audio-rate position via
+        // parabolic peak fit on a small ±sps + RRC-margin audio window
+        // around the projected position — bounded work per SOF, and
+        // SOFs are rare (1 per cycle ≈ 1 every 2-4 s). The LS fit
+        // recomputes from the persistent `drift_refined_sofs` vec each
+        // call (small ≤ 10 entries; negligible). Old entries are
+        // trimmed by `trim_audio_for_streaming`.
+        //
+        // Preserves the [[v4-drift-audio-rate-refinement-landed]] fix
+        // (sub-audio-sample precision for 0.5-1 ppm resolution on a
+        // 25-s burst) without the O(N²) leak.
         let (sps, _pitch) = match rrc::check_integer_constraints(
             AUDIO_RATE,
             self.cfg.base.symbol_rate,
@@ -1459,81 +1506,120 @@ impl Rx2xSession {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let taps = rrc_taps(self.cfg.base.beta, RRC_SPAN_SYM, sps);
-        let bb = demodulator::downmix(&self.audio_buffer, self.cfg.base.center_freq_hz);
-        let mf = demodulator::matched_filter(&bb, &taps);
-        let phase = best_symbol_phase_sof(&mf, sps, &self.cfg);
-        let n_syms = mf.len().saturating_sub(phase) / sps;
-        if n_syms < PREAMBLE_LEN_SYM {
-            return false;
-        }
 
-        // Step 2: integer-symbol stream + PLS-validated SOF detection
-        // (same logic as the legacy path; needed to filter false-positive
-        // Chu peaks before we trust them for sub-sample refinement).
-        let mut raw_syms: Vec<Complex64> = Vec::with_capacity(n_syms);
-        for k in 0..n_syms {
-            raw_syms.push(mf[phase + k * sps]);
-        }
+        // Step 1: scan NEW symbols past the persistent cursor for SOFs.
+        let cursor_rel = self
+            .drift_scan_cursor_sym
+            .saturating_sub(self.buf_start_abs) as usize;
+        let cursor_rel = cursor_rel.min(self.sym_buffer.len());
         let min_skip = (self.cycle_period_sym / 2).max(PREAMBLE_LEN_SYM);
-        let mut sym_positions: Vec<usize> = Vec::new();
-        let mut scan = 0;
-        while let Some(pos) = find_next_sof(&raw_syms, scan, self.cfg.family) {
-            if pos + PLHEADER_LEN_SYM > raw_syms.len() {
+        let mut scan = cursor_rel;
+        let mut new_validated: Vec<u64> = Vec::new();
+        while let Some(pos_rel) =
+            find_next_sof(&self.sym_buffer, scan, self.cfg.family)
+        {
+            if pos_rel + PLHEADER_LEN_SYM > self.sym_buffer.len() {
+                // Not enough symbols yet — leave cursor here so the
+                // next chunk picks up the same candidate once more
+                // audio arrives.
                 break;
             }
-            let plheader_slice = &raw_syms[pos..pos + PLHEADER_LEN_SYM];
-            if decode_plheader_at(plheader_slice, self.cfg.family).is_some() {
-                sym_positions.push(pos);
-                scan = pos + min_skip;
-            } else {
-                scan = pos + 1;
-            }
-        }
-        if sym_positions.len() < 2 {
-            return false;
-        }
-
-        // Step 3: refine each PLS-validated preamble position to
-        // sub-audio-sample precision via parabolic peak fit on the
-        // audio-rate matched-filter magnitude. The template is the
-        // full 128-sym double-Chu preamble (+3 dB processing gain vs
-        // legacy single-Chu). Search window is ±sps audio samples
-        // around the integer-symbol expected position (the audio peak
-        // lies within ±1 symbol of that integer position by
-        // construction).
-        let preamble_template = preamble_for_family(self.cfg.family);
-        let n_sof_audio = PREAMBLE_LEN_SYM * sps;
-        let max_pos = mf.len().saturating_sub(n_sof_audio);
-        let corr_at = |pos: usize| -> f64 {
-            if pos > max_pos {
-                return 0.0;
-            }
-            let mut acc = Complex64::new(0.0, 0.0);
-            for (k, &s) in preamble_template.iter().enumerate() {
-                acc += mf[pos + k * sps] * s.conj();
-            }
-            acc.norm()
-        };
-        let win = sps as i64;
-        let mut audio_positions: Vec<f64> = Vec::with_capacity(sym_positions.len());
-        for &sp in &sym_positions {
-            let expected_audio = phase as i64 + (sp as i64) * (sps as i64);
-            let lo = (expected_audio - win).max(0) as usize;
-            let hi = ((expected_audio + win).max(0) as usize).min(max_pos);
-            if hi <= lo {
+            let sym_abs = self.buf_start_abs + pos_rel as u64;
+            // Skip if we already refined this SOF on a previous chunk.
+            if self
+                .drift_refined_sofs
+                .iter()
+                .any(|r| r.sym_abs == sym_abs)
+            {
+                scan = pos_rel + min_skip;
                 continue;
             }
-            let mut best = lo;
+            let plheader_slice =
+                &self.sym_buffer[pos_rel..pos_rel + PLHEADER_LEN_SYM];
+            if decode_plheader_at(plheader_slice, self.cfg.family).is_some() {
+                new_validated.push(sym_abs);
+                scan = pos_rel + min_skip;
+            } else {
+                scan = pos_rel + 1;
+            }
+        }
+        // Advance cursor to the end of the buffer; any candidates needing
+        // more symbols stay re-discoverable since we filter dup'd sym_abs.
+        self.drift_scan_cursor_sym =
+            self.buf_start_abs + self.sym_buffer.len() as u64;
+
+        // Step 2: refine each new SOF's audio-rate position via a local
+        // downmix+MF+parabolic peak fit on a small window. Bounded work
+        // per SOF: window size ≈ PREAMBLE_LEN_SYM*sps + 2·sps + 2·RRC*sps
+        // audio samples (≈ 6 kSamples for HIGH+2X, ≈ 0.1× audio_buffer
+        // pre-fix), one FFT-MF per refinement.
+        let preamble_template = preamble_for_family(self.cfg.family);
+        let n_sof_audio = PREAMBLE_LEN_SYM * sps;
+        let win = sps as i64;
+        let rrc_margin = (RRC_SPAN_SYM * sps) as i64;
+        let taps = rrc_taps(self.cfg.base.beta, RRC_SPAN_SYM, sps);
+        let resample_factor = 1.0 + self.cached_drift_ppm * 1e-6;
+        for sym_abs in new_validated {
+            let pos_rel = (sym_abs - self.buf_start_abs) as i64;
+            // Project audio position (relative to audio_buffer[0]).
+            // streaming_dsp's resampler stretched/shrunk the audio by
+            // resample_factor to produce sym_buffer — so the raw-audio
+            // sample for sym i is at `i * sps * resample_factor`.
+            let audio_rel_predicted =
+                (pos_rel as f64 * sps as f64 * resample_factor) as i64;
+            // Slice window with enough margin for FIR convergence.
+            let slice_lo = (audio_rel_predicted - win - rrc_margin).max(0)
+                as usize;
+            let slice_hi_excl = ((audio_rel_predicted
+                + n_sof_audio as i64
+                + win
+                + rrc_margin) as usize)
+                .min(self.audio_buffer.len());
+            if slice_hi_excl <= slice_lo + n_sof_audio {
+                // Window doesn't fit in the rolling buffer — common at
+                // session start before audio_buffer fills, or post-trim
+                // if a SOF is too far back. Skip; next chunk may have
+                // it covered, or it's permanently lost (which is fine —
+                // we don't gain from one missed SOF).
+                continue;
+            }
+            let audio_slice = &self.audio_buffer[slice_lo..slice_hi_excl];
+            // Local downmix uses NCO phase starting at audio slice index
+            // 0; the magnitude of the preamble-template cross-correlation
+            // is invariant under a uniform phase rotation across `mf`,
+            // so we don't need to absolute-align the NCO phase.
+            let bb = demodulator::downmix(
+                audio_slice, self.cfg.base.center_freq_hz);
+            let mf = demodulator::matched_filter(&bb, &taps);
+            let max_pos_mf = mf.len().saturating_sub(n_sof_audio);
+            if max_pos_mf == 0 {
+                continue;
+            }
+            let corr_at = |pos: usize| -> f64 {
+                let mut acc = Complex64::new(0.0, 0.0);
+                for (k, &s) in preamble_template.iter().enumerate() {
+                    acc += mf[pos + k * sps] * s.conj();
+                }
+                acc.norm()
+            };
+            // Search ±win mf samples around the projected center.
+            let mf_center = (audio_rel_predicted as usize)
+                .saturating_sub(slice_lo);
+            let mf_lo = mf_center.saturating_sub(win as usize);
+            let mf_hi = (mf_center + win as usize).min(max_pos_mf);
+            if mf_hi <= mf_lo {
+                continue;
+            }
+            let mut best = mf_lo;
             let mut best_mag = 0.0_f64;
-            for p in lo..=hi {
+            for p in mf_lo..=mf_hi {
                 let m = corr_at(p);
                 if m > best_mag {
                     best_mag = m;
                     best = p;
                 }
             }
-            let refined = if best == 0 || best + 1 > max_pos {
+            let refined_mf = if best == 0 || best + 1 > max_pos_mf {
                 best as f64
             } else {
                 let m0 = corr_at(best - 1);
@@ -1547,26 +1633,26 @@ impl Rx2xSession {
                     best as f64 + delta.clamp(-1.0, 1.0)
                 }
             };
-            audio_positions.push(refined);
-        }
-        if audio_positions.len() < 2 {
-            return false;
+            let audio_abs_refined = self.audio_drained_samples as f64
+                + slice_lo as f64
+                + refined_mf;
+            self.drift_refined_sofs
+                .push(RefinedSofRecord { sym_abs, audio_abs_refined });
         }
 
-        // Step 4: LS slope of refined audio positions vs cycle index.
-        // Each SOF should sit at p0 + k · cycle_audio at zero drift, so
-        // the slope of (y vs k) gives the measured audio-cycle period;
-        // ppm = (slope / cycle_audio − 1) × 1e6. Same outlier-rejection
-        // tolerance as `estimate_drift_from_sof_positions` (10 % of a
-        // cycle) but applied in audio space.
-        let p0 = audio_positions[0];
+        // Step 3: LS slope on persistent refined-SOF list. List is small
+        // (≤ ~10 entries after trim), recompute cleanly each call.
+        if self.drift_refined_sofs.len() < 2 {
+            return false;
+        }
+        let p0 = self.drift_refined_sofs[0].audio_abs_refined;
         let cycle_audio = (self.cycle_period_sym * sps) as f64;
         let tolerance = cycle_audio * 0.10;
         let mut sum_xy = 0.0_f64;
         let mut sum_xx = 0.0_f64;
         let mut n_used = 0_usize;
-        for &p in &audio_positions {
-            let y = p - p0;
+        for rec in &self.drift_refined_sofs {
+            let y = rec.audio_abs_refined - p0;
             let k = (y / cycle_audio).round();
             if (y - k * cycle_audio).abs() > tolerance {
                 continue;
@@ -1583,15 +1669,13 @@ impl Rx2xSession {
         if !new_drift.is_finite() || new_drift.abs() > 300.0 {
             return false;
         }
-        // Threshold guards against jitter when the same set of SOFs
-        // gives slightly different LS fits between chunks.
         if (new_drift - self.cached_drift_ppm).abs() < 0.5 {
             return false;
         }
         if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
             eprintln!(
-                "[rx2x-drift] sofs={} (audio-rate refined) cached={:+.2} → new={:+.2} ppm",
-                audio_positions.len(),
+                "[rx2x-drift] sofs={} (streaming refined) cached={:+.2} → new={:+.2} ppm",
+                self.drift_refined_sofs.len(),
                 self.cached_drift_ppm,
                 new_drift,
             );
@@ -1951,13 +2035,24 @@ impl Rx2xSession {
         }
         self.audio_buffer.drain(..drop_n);
         self.audio_drained_samples += drop_n as u64;
+        // Trim drift_refined_sofs to bound the Vec on long multi-burst
+        // sessions. Keep a generous cap (LS benefits from a long
+        // baseline) but evict the oldest entries beyond the cap so
+        // memory stays bounded indefinitely. Cap chosen so a ~100-cycle
+        // burst (~400 s at HIGH+2X) is fully retained.
+        const DRIFT_SOF_CAP: usize = 128;
+        if self.drift_refined_sofs.len() > DRIFT_SOF_CAP {
+            let drop = self.drift_refined_sofs.len() - DRIFT_SOF_CAP;
+            self.drift_refined_sofs.drain(..drop);
+        }
         if std::env::var_os("RX2X_LOG_STREAM").is_some() {
             eprintln!(
-                "[rx2x-stream] trim drop={} drained_total={} audio_buf={} scan_cursor={}",
+                "[rx2x-stream] trim drop={} drained_total={} audio_buf={} scan_cursor={} drift_sofs={}",
                 drop_n,
                 self.audio_drained_samples,
                 self.audio_buffer.len(),
                 self.scan_cursor_abs,
+                self.drift_refined_sofs.len(),
             );
         }
     }
