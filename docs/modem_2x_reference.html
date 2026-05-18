@@ -344,42 +344,81 @@ modem-core/    modem-core2x/   (autres consommateurs)
 </table>
 
 <!-- ============================================================================ -->
-<h2 id="pipeline-rx">3. Pipeline RX complet — du sample à la payload</h2>
+<h2 id="pipeline-rx">3. Pipeline RX complet — du sample à la payload (post-Phase 3, streaming)</h2>
+
+<p>
+    Le pipeline est <strong>full streaming</strong> depuis slice 2x23 :
+    chaque étage maintient son propre état (delay line FIR, NCO phase,
+    decimation cursor, etc.) et ne re-traite jamais un sample déjà émis.
+    Cf. <code>streaming_dsp.rs:1-49</code> pour la doc module détaillée et
+    <code>feedback-full-streaming</code> pour la règle de design.
+</p>
 
 <pre><code>┌──────────────────────────────────────────────────────────────────────────┐
 │  cpal / ALSA capture (mono f32 @ 48 kHz)                                 │
-│       │  Vec&lt;f32&gt; chunks via mpsc::Receiver                              │
+│       │  Vec&lt;f32&gt; chunks via mpsc::Receiver (typ. 2400 sam = 50 ms)      │
 │       ▼                                                                  │
 │  rx_worker2x::spawn — shim                                               │
-│       │  audio_level RMS/peak/crest                                      │
-│       │  WAV tee (recording sink)                                        │
+│       │  audio_level RMS/peak/crest, WAV tee (recording sink)            │
 │       ▼                                                                  │
 │  Rx2xSession::process_audio_chunk                                        │
 │       │                                                                  │
-│       ├─► audio_buffer.extend  (rolling, trimmed après chaque cycle)     │
+│       ├─► audio_buffer.extend  (rolling RX-time audio history)           │
+│       │                                                                  │
+│       ├─► [bootstrap path, !bootstrap_committed]                         │
+│       │     try_bootstrap_pair                                           │
+│       │       ├─ STEP 1 — gate Schmidl-Cox (gate2x.rs, Phase 3)          │
+│       │       │   = sliding M=|R|²/(P1·P2) sur 400 ms tail (LPF+DC-block)│
+│       │       │   threshold 0.5, anchor classification √L weighted       │
+│       │       │   → arme gate quand préambule double-Chu détecté         │
+│       │       │                                                          │
+│       │       ├─ STEP 2 — attend needed_audio (cycle + plheader + preamble) │
+│       │       │   max_wait = needed_audio + IDLE_PROBE_BUF_SAMPLES       │
+│       │       │   (safety belt anti-runaway si gate firme sans cycle)    │
+│       │       │                                                          │
+│       │       ├─ STEP 3-5 — audio_to_symbols + find_all_sofs LOCAL-MAX   │
+│       │       │   pair (s1, s2) avec |s2−s1−cycle_sym| ≤ 10 %            │
+│       │       │   decode_plheader_at(s1) valide Golay+CRC                │
+│       │       │   → COMMIT bootstrap_committed = true                    │
+│       │       │                                                          │
+│       │       └─ STEP 6 — reject validity-aware (Phase 3)                │
+│       │           si any_valid PLS : keep buffer + gate (await partner)  │
+│       │           si none valid    : keep aussi (max_wait safety)        │
 │       │                                                                  │
 │       ├─► estimate_drift_from_raw  (LS fit sur SOFs CRC-validés)         │
-│       │   └─► cached_drift_ppm (forward Kalman, R=1 Q=0.5 ppm/cycle)     │
+│       │   parabolic audio-rate refinement on double-Chu peak             │
+│       │   → cached_drift_ppm (forward, update si Δ ≥ 0.5 ppm)            │
 │       │                                                                  │
-│       ├─► refresh_symbols                                                │
-│       │   ├─ cubic resample audio si |drift| ≥ 0.5 ppm                   │
-│       │   ├─ NCO downmix (phase continue par compteur absolu)            │
-│       │   ├─ RRC matched filter (mode='same', overlap-save)              │
-│       │   ├─ Farrow cubique + Gardner closed-loop → sym_buffer           │
-│       │   │   (pre-SOF : Gardner classique ; post-SOF : AbsGardner       │
-│       │   │    sur l'intérieur strict des blocs pilotes)                 │
-│       │   └─ sym_buffer ← Vec&lt;Complex64&gt; rebati à chaque chunk           │
+│       ├─► streaming.feed_audio(audio_buffer, drained, cached_drift_ppm)  │
+│       │   = StreamingDsp (streaming_dsp.rs) — true streaming :           │
+│       │   ┌──────────────────────────────────────────────────────┐      │
+│       │   │  PolyphaseResampler (32 taps × 1024 phases, sinc·Kaiser)  │      │
+│       │   │     ratio = 1 + drift_ppm·1e-6                       │      │
+│       │   │     state = resampler_next_tx (TX-time output cursor)│      │
+│       │   │  ▼ resampled (TX-time f32, append-only)               │      │
+│       │   │  StreamingDownmix — NCO phase = -2π·fc·idx/sr        │      │
+│       │   │     state = downmix_next_abs                          │      │
+│       │   │  ▼ baseband (complex)                                  │      │
+│       │   │  StreamingMF — RRC overlap-save, state = mf_state    │      │
+│       │   │  ▼ mf_output                                           │      │
+│       │   │  StreamingDecimator — phase 0 par construction TX     │      │
+│       │   │     state = decimation_cursor_abs                     │      │
+│       │   │  ▼ sym_buffer (append-only, ABS positions stables)    │      │
+│       │   └──────────────────────────────────────────────────────┘      │
+│       │   → self.sym_buffer = streaming.sym_buffer().to_vec()            │
 │       │                                                                  │
-│       ├─► equalize_symbols_per_cycle  (FFE LS, optionnel)                │
-│       │   └─ taps trainés sur PLHEADER + LMS warmup ; pilotes TDM        │
-│       │      exclus (positions dispersées → LS mal conditionnée)         │
+│       ├─► equalize_symbols_per_cycle_from  (FFE LS incrémental)          │
+│       │   ├─ gather_cycle_refs : PLHEADER (256) + LMS warmup             │
+│       │   │  + PRBS preburst (3000 sym) si try_gather_preburst_refs OK   │
+│       │   ├─ train_ffe_ls (n_ff=64) → taps complexes                     │
+│       │   └─ apply_ffe_to_range sur le cycle courant                     │
 │       │                                                                  │
 │       └─► run_state_machine (FSM)                                        │
 │            │                                                             │
-│            Idle ─ find_next_sof ───► Acquiring                           │
+│            Idle ─ find_next_sof (preamble 128 sym, local-max) ─►Acquiring│
 │              │                          │                                │
 │              │                          ├─ decode_plheader_at            │
-│              │                          │   ├─ LS-gain sur SOF Chu       │
+│              │                          │   ├─ LS-gain sur 128 sym       │
 │              │                          │   ├─ démap 128 PLS sym         │
 │              │                          │   ├─ 9 × Golay(24,12)          │
 │              │                          │   └─ CRC16 → PlsPayload OK ?   │
@@ -393,29 +432,36 @@ modem-core/    modem-core2x/   (autres consommateurs)
 │              │     ├─ estimate_cw_gain  (pilotes TDM + cycle refs)       │
 │              │     ├─ estimate_cw_sigma2_split (MAD radial/tangentiel)   │
 │              │     ├─ estimate_per_ring_gain (DD-LS si APSK)             │
-│              │     ├─ Pass 1 :                                           │
-│              │     │     llr_maxlog_per_ring (Bayésien)                  │
-│              │     │     LdpcDecoder.decode_to_bytes_with_posterior      │
+│              │     ├─ Pass 1 : llr_maxlog_per_ring → LDPC fast (15 iter) │
 │              │     ├─ Pass 2 EM (toujours, même si Pass 1 OK) :          │
-│              │     │     soft_symbols_from_posterior_llr                 │
 │              │     │     rts_phase_smooth (2-state {φ, ω} Kalman+RTS)    │
-│              │     │     pass2_em_gain_smoother (1-state per-ring)       │
-│              │     │     pass2_em_sigma2_smoother (1-state log-scale)    │
-│              │     │     llr_maxlog_per_sym_per_ring                     │
-│              │     │     LdpcDecoder.decode_to_bytes                     │
+│              │     │     pass2_em_gain/sigma2 smoothers (1-state)        │
+│              │     │     LDPC full (30 iter) sur LLR re-cleanés          │
 │              │     └─ bytes ← syndrome 0 ? Pass2 : Pass1                 │
 │              │                                                           │
 │              ▼ FLAG2X_LAST seen OU finalize()                            │
 │           Retrying { remaining=2 }  (stubs T1/T2/T3/T6/T7)               │
+│              │  RaptorQ.try_decode(k_source, packets...)                 │
+│              ▼                                                           │
+│           Finalising  →  PayloadEnvelope.decode → filename + bytes       │
 │              │                                                           │
 │              ▼                                                           │
-│           Finalising                                                     │
-│              │  RaptorQ.try_decode(k_source, packets...)                 │
-│              │  PayloadEnvelope.decode → filename + bytes                │
-│              ▼                                                           │
-│           Idle (multi-burst rearm)                                       │
+│           Idle (multi-burst rearm, état persistant)                      │
 │                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<p>
+    <strong>Différence vs pré-Phase 3</strong> :
+    (1) le gate sample-domain est désormais Schmidl-Cox (§6.4) au lieu d'un
+    FFT cross-corr template ;
+    (2) find_all_sofs / find_next_sof corrèlent contre le préambule double-Chu
+    128 sym et reportent un local-max au lieu d'une first-crossing (§7.1) ;
+    (3) le FFE training inclut optionnellement les 3000 sym du PRBS pré-burst
+    quand détecté (§4.4) ;
+    (4) la drop policy du bootstrap est validity-aware (§8). Le reste de la
+    chaîne — streaming DSP, FSM Locked decode_one_cw, turbo Pass 2 — reste
+    identique au slice 2x23.
+</p>
 
 <!-- ============================================================================ -->
 <h2 id="trame-v4">4. Trame V4 — spécification wire</h2>
@@ -1577,51 +1623,187 @@ SIGMA2_DD_RATIO_MAX = 5.0     // rx_v4.rs:598
     les performances du modem 2x.
 </p>
 
-<h3 id="derive-sps">10.1 Horloge symbole (ppm sample clock)</h3>
+<h3 id="derive-sps">10.1 Horloge symbole (ppm sample clock) et raw resampler</h3>
 
 <p>
-    <strong>Tracking :</strong> Gardner closed-loop sur chaque strobe symbole
-    (front-end audio) + bootstrap LS-fit sur les positions SOF CRC-validées
-    (resampling audio cubique avant downmix).
+    <strong>Tracking</strong> : LS slope-fit sur les positions SOF
+    CRC-validées (estimate_drift_from_raw avec parabolic audio-rate
+    refinement sur la double-Chu) → <code>cached_drift_ppm</code>
+    forward-updated → ratio appliqué au <strong>raw resampler polyphase
+    streaming</strong> en première étape du pipeline RX. Pas de Gardner
+    closed-loop dans le chemin de production (streaming_dsp.rs n'a qu'un
+    PolyphaseResampler + downmix + MF + decimate, pas de TED) — le
+    streaming est piloté par <code>cached_drift_ppm</code> uniquement.
 </p>
 
+<h4>Raw resampler — architecture</h4>
+
+<p>
+    <code>PolyphaseResampler</code> dans <code>streaming_dsp.rs:55-128</code> :
+    banc de filtres <strong>32 taps × 1024 phases</strong>, sinc · Kaiser
+    β = 8. Le banc est précalculé statiquement à la construction
+    (<code>build_polyphase_bank</code>) :
+</p>
+
+<ul>
+    <li><strong>32 taps</strong> → ~80 dB stop-band, ~0.05 passband ripple,
+        transition band ≈ 4·fs/N_TAPS = 6 kHz. Largement assez pour
+        préserver la forme RRC sans tailler la bande modem.</li>
+    <li><strong>1024 sous-phases</strong> → résolution sub-sample ≈
+        1/1024 sample (= 20 ns à 48 kHz). L'erreur de snapping de l'offset
+        fractionnel requis vers la phase la plus proche est bien sous le
+        noise floor du design FIR.</li>
+    <li>Coût steady-state : <strong>32 multiplies-add par sample TX</strong>
+        de sortie. À 48 kHz × 32 = 1.5 M flops/sec → ~1 % du budget Pi5.</li>
+</ul>
+
+<h4>Comment le raw resampler est piloté (réactivité à la dérive)</h4>
+
+<p>
+    L'API est <code>StreamingDsp::feed_audio(audio_buffer, audio_drained,
+    drift_ppm)</code>. À chaque appel — c'est-à-dire à chaque chunk audio
+    qui arrive — le caller (Rx2xSession::refresh_symbols) passe le
+    <code>cached_drift_ppm</code> courant. Le resampler calcule
+    <code>ratio = 1 + drift_ppm × 1e-6</code> et continue à émettre des
+    samples TX-time à partir de son curseur <code>resampler_next_tx</code> :
+</p>
+
+<pre><code>// Pour chaque sample TX à émettre :
+let j      = resampler_next_tx               // cumul output index
+let rx_pos = j as f64 * ratio                // = position RX-time requise (cumul)
+let rel    = rx_pos − audio_drained_samples  // → indice dans audio_buffer
+let i_int  = rel.floor() as usize            // sample audio entier le plus proche
+let phase  = round((rel − i_int) × N_PHASES) // sous-phase polyphase
+
+resampled[j] = Σ_{n=0..32}  filter_bank[phase][n] · audio_buffer[i_int − 16 + n]
+
+resampler_next_tx += 1
+</code></pre>
+
+<p>
+    <strong>Quand <code>cached_drift_ppm</code> change entre deux chunks</strong>,
+    le resampler n'est <strong>PAS</strong> reset ni rewindé. Il continue à
+    partir de <code>resampler_next_tx</code> avec la NOUVELLE ratio.
+    Conséquence : les samples déjà émis gardent la ratio qu'ils avaient
+    à leur émission, les nouveaux samples utilisent la nouvelle ratio.
+    Pas de sauts de phase sub-sample, pas de jitter discontinu.
+    L'erreur résiduelle est intégrée par les estimators de phase aval
+    (per-CW pilot LS + Pass 2 RTS smoother). Cf <code>streaming_dsp.rs:260-280</code>.
+</p>
+
+<p>
+    <strong>Updates de <code>cached_drift_ppm</code></strong> :
+</p>
 <dl class="axis-grid">
-    <dt>Plage théorique</dt>
-    <dd>Gardner seul : ±50 ppm safe, ±100 ppm marginal. AbsGardner sur l'intérieur
-        des pilotes : &gt;100 ppm sur APSK (recipe DVB-S2X §9.3.2).</dd>
-    <dt>Bootstrap</dt>
-    <dd>≥ 3 PLHEADERs validés → LS slope-fit position vs. cycle index.
-        Outlier filter ±10 % du cycle period. Résultat stocké
-        <code>cached_drift_ppm</code> appliqué au cubic resample du chunk suivant
-        <span class="src">rx_v4.rs:294-331, rx2x_session.rs:695-744</span>.</dd>
-    <dt>Failure modes</dt>
-    <dd>
-        <ul>
-            <li><strong>Burst &lt; 3 cycles (~12 s)</strong> : pas d'estimation drift,
-                cubic resampling skip, Gardner doit seul absorber le mismatch initial.
-                Limite ≈ ±50 ppm pour décode propre.</li>
-            <li><strong>Lead-in du buffer</strong> : Farrow safe zone violée
-                (<code>floor(pos) &lt; 1</code>), TED ne tourne pas, integ reste à 0.
-                Si la première PLHEADER tombe pile dans cette zone (~1-2 sym), elle
-                est ratée — mais le scan retrouve la suivante.</li>
-            <li><strong>Drift &gt; 100 ppm</strong> : biais Gardner data-dépendant trop
-                large sur APSK multi-ring, boucle instable. Mode dégradé : seul
-                AbsGardner sur pilote tracke, mais densité limitée (~30/CW).
-                Tests <code>pilot_aided_at_100_ppm_apsk32_matches_gardner_only</code>
-                échouent actuellement en HEAD slice 2x19.</li>
-            <li><strong>Reset à chaque cycle</strong> : le sym_buffer est <em>rebati</em>
-                depuis l'audio à chaque chunk (<code>refresh_symbols</code>). La phase
-                Farrow et l'intégrateur Gardner sont conservés via la <code>StreamingFrontend</code>
-                instance ; mais si le worker bypass le streaming (mode batch
-                <code>audio_to_symbols</code> historique), la boucle redémarre à integ=0
-                à chaque chunk.</li>
-            <li><strong>Kalman drift forward seulement</strong> : pas de RTS backward
-                (stub T3 en 2x19). Le dernier cycle d'un burst hérite de
-                <code>drift_ppm</code> obsolète si le clock a dérivé pendant le burst
-                — pas un problème sur sound-card stable, problème potentiel sur clock
-                SDR thermique.</li>
-        </ul>
-    </dd>
+    <dt>Bootstrap commit</dt>
+    <dd><code>cached_drift_ppm = 0.0</code>. La distance entre 2 SOFs
+        (s2 − s1 vs cycle_sym) a une résolution de O(PREAMBLE_LEN_SYM/2) ≈
+        ±64 sym donnant une erreur ±2 % ppm si on l'utilisait directement ;
+        on préfère démarrer à 0 et laisser la suite refiner.
+        <span class="src">rx2x_session.rs:802-811</span></dd>
+    <dt>Steady-state, chaque chunk</dt>
+    <dd><code>estimate_drift_from_raw</code> sur les SOF positions
+        CRC-validées accumulées. Audio-rate parabolic refinement du peak
+        Chu (commit 840ίac7 réutilisé pour double-Chu) → précision
+        ~0.5 ppm sur ≥ 3 SOFs. Si l'estimate jump ≥
+        <code>DRIFT_UPDATE_THRESHOLD_PPM = 0.5</code> ppm, le ratio change.
+        Sinon, le ratio reste verrouillé.
+        <span class="src">rx2x_session.rs:1408-1525</span></dd>
+    <dt>Plage acceptée</dt>
+    <dd><code>cached_drift_ppm.abs() ≤ 300 ppm</code>. Au-dessus = LS
+        overfit sur faux-positifs, rejet (caller garde l'ancienne valeur).
+        <span class="src">rx_v4.rs:415-417</span></dd>
+    <dt>Forward only</dt>
+    <dd>Pas de RTS backward sur la trajectoire drift (stub T3 toujours
+        non câblé post-Phase 3 — cf §11). Le dernier cycle d'un burst
+        hérite de la valeur drift_ppm la plus récente, donc obsolète si
+        l'horloge a dérivé pendant le burst. Pas un problème sur
+        sound-card stable (drift &lt; 30 ppm), problème potentiel sur
+        clock SDR thermique avec drift ramps importants.</dd>
+</dl>
+
+<h4>Initialisation en early entry vs late entry</h4>
+
+<p>
+    L'initialisation du raw resampler est <strong>identique dans les deux
+    cas</strong>. À <code>StreamingDsp::new(cfg)</code> :
+</p>
+<ul>
+    <li><code>resampler_next_tx = 0</code></li>
+    <li><code>last_drift_ppm = 0.0</code></li>
+    <li><code>resampled = []</code>, <code>resampled_start_abs = 0</code></li>
+    <li>Tous les buffers downstream (baseband, mf_output, sym_buffer)
+        vides ; les delay lines (mf_state) à zéros.</li>
+</ul>
+
+<p>
+    La <strong>différence</strong> entre early et late entry est uniquement
+    où tombe le 1er SOF dans le flux sym_buffer du resampler :
+</p>
+
+<table>
+    <thead>
+        <tr><th>Cas</th><th>1er audio sample vu par le resampler</th><th>Position du 1er SOF dans sym_buffer</th><th>Conséquence drift</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Early entry</strong></td>
+            <td>= 1er sample du burst TX (ou très proche)</td>
+            <td>≈ <code>VOX·48000 + tail·48000 + PREBURST_LEN_SYM·sps + offset</code>
+                divisé par sps. Pour vox=0.5 : ~3849 sym.</td>
+            <td>cached_drift_ppm démarre à 0, l'estimator a tout le burst pour
+                converger. Drift bootstrap = 0 ppm (proche réalité si TX/RX
+                horloges &lt; 10 ppm). Steady-state LS le rafine.</td>
+        </tr>
+        <tr>
+            <td><strong>Late entry</strong></td>
+            <td>= sample mid-burst arbitraire</td>
+            <td>≈ 6 sym (= début du buffer, où le SC a déclenché)</td>
+            <td>cached_drift_ppm démarre à 0 mais le clock TX a déjà dérivé
+                de Δ × T_late ppm·s au moment du late entry. L'estimator
+                converge dès qu'il a ≥ 3 SOFs CRC-validés (= 3 cycles ×
+                4 s = 12 s minimum). Pendant ce transient, Pass 2 RTS
+                phase smoother absorbe le résiduel.</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <strong>Pourquoi le resampler ne se soucie pas du late entry</strong> :
+    il opère sur sa <em>propre origine</em> = le moment où la session RX
+    a démarré. <code>resampler_next_tx = 0</code> émet « TX-time index 0 »
+    qui correspond à RX-time sample 0 = premier sample lu. Si le late entry
+    survient T secondes après le début du burst TX, l'origin du resampler
+    est décalée de T secondes par rapport à l'origine TX. Mais c'est
+    transparent pour le downstream : le <code>find_all_sofs</code> /
+    <code>find_next_sof</code> localise le 1er SOF où qu'il soit dans
+    sym_buffer, et la FSM ancre tout le timing à partir de cette anchor
+    SOF position.
+</p>
+
+<h4>Failure modes restants</h4>
+
+<dl class="axis-grid">
+    <dt>Burst &lt; 3 cycles (~12 s)</dt>
+    <dd>Pas assez de SOFs pour estimate_drift_from_raw → cached_drift_ppm
+        reste à 0. Sur sound-card avec horloges typiques 10-30 ppm,
+        ça passe. Sur OTA forte drift &gt; 50 ppm, échec.</dd>
+    <dt>Drift &gt; 300 ppm</dt>
+    <dd>L'estimator rejette (rx_v4.rs:415). cached_drift_ppm bloqué à
+        la dernière valeur valide. Sur SDR clock thermique pas vu en
+        pratique sur la chaîne FT-991A → FTX-1 référence.</dd>
+    <dt>Drift ramp rapide pendant le burst</dt>
+    <dd>L'estimator est forward-only ; le dernier cycle voit un drift
+        obsolète. Mitigation Pass 2 RTS smoother sur la phase (absorbe
+        jusqu'à ~1 ppm de drift résiduel par cycle). Limite : ramps
+        &gt; 2 ppm/cycle ne sont pas suivis. Stub T3 (RTS backward sur
+        drift) résoudrait, non câblé post-Phase 3.</dd>
+    <dt>Bootstrap commit drift estimation</dt>
+    <dd><code>cached_drift_ppm = 0</code> au commit, pas la valeur dérivée
+        de s2−s1. Le PREAMBLE_LEN_SYM/2 ≈ 64 sym de résolution sur
+        s2−s1 donne ±64/5764 ≈ 1.1 % d'erreur, soit ±11 000 ppm
+        d'incertitude — inutilisable. La parabolic-refined estimation
+        post-commit converge sous 12 s.</dd>
 </dl>
 
 <h3 id="derive-phase">10.2 Phase porteuse + fréquence résiduelle</h3>
