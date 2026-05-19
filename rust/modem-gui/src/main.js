@@ -3030,14 +3030,23 @@ function wireEvents() {
   // on a fresh signal. We mirror what a manual stop/start does : the
   // backend `restart_capture` command drops the cpal/SDR stream +
   // worker thread, and re-spawns with the same device + profile +
-  // forced the operator originally picked. Log the event for
-  // traceability.
-  listen("worker_requests_restart", (event) => {
+  // forced the operator originally picked.
+  //
+  // 0.10.45 : added auto_stop / auto_start `logEvent` markers around
+  // the invoke so the operator can SEE in the GUI event log whether
+  // the restart cycle actually ran (or where it got stuck). Manual
+  // stop/start already logs "stop" + "start" entries from the
+  // button handlers ; this gives the auto path the same visibility.
+  listen("worker_requests_restart", async (event) => {
     const reason = (event.payload && event.payload.reason) || "?";
     logEvent("worker_requests_restart", { reason });
-    invoke("restart_capture").catch((err) => {
+    logEvent("auto_stop", { reason });
+    try {
+      await invoke("restart_capture");
+      logEvent("auto_start", { reason });
+    } catch (err) {
       logEvent("worker_requests_restart_error", { reason, error: String(err) });
-    });
+    }
   });
 
   // 0.10.38 : worker capture-state changes. Drives the status-bar chip

@@ -368,17 +368,26 @@ fn restart_capture(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let old = match guard.take() {
         Some(s) => s,
-        None => return Err("no capture session to restart".into()),
+        None => {
+            eprintln!("[restart_capture] no active session to restart");
+            return Err("no capture session to restart".into());
+        }
     };
     let device_name = old.device_name.clone();
     let profile = old.profile.clone();
     let forced = old.forced;
+    eprintln!(
+        "[restart_capture] stopping current session device={} profile={:?} forced={}",
+        device_name, profile, forced
+    );
     // Drop the old session : stops the cpal/SDR stream, closes the
     // mpsc, and joins the worker thread. Mirrors what `stop_capture`
     // does end-to-end.
     old.capture.stop();
     old.worker.stop();
+    eprintln!("[restart_capture] old session dropped, building new");
     let session = build_capture_session(&device_name, profile, forced, &app, &state)?;
+    eprintln!("[restart_capture] new session ready");
     *guard = Some(session);
     Ok(())
 }
