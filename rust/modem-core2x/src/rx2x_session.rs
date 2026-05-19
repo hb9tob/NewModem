@@ -2037,28 +2037,22 @@ impl Rx2xSession {
         if !new_drift.is_finite() || new_drift.abs() > 300.0 {
             return false;
         }
-        // Two-level change threshold:
-        //   - `0.5 ppm` for **diagnostic logging** — fine-grained, lets
-        //     the validation harness see every LS step.
-        //   - `RX2X_SOF_DRIFT_APPLY_PPM` (default `10`) for the **apply
-        //     path** — each apply triggers a streaming_dsp rewind +
-        //     FSM reset that costs ~22 symbols of decimation transient
-        //     + one cycle of FFE re-train. Re-firing it at every 1-2 ppm
-        //     LS refinement starves the FSM (empirical 2026-05-18 OTA 1
-        //     v2: drift converged cleanly from −52 → −57 ppm across 10
-        //     refinements, but 0/10 CW converged because the FSM never
-        //     got past Acquiring → Locked between resets). The wider
-        //     apply threshold catches only the big jumps (initial 0 →
-        //     true_drift, or coarse-to-fine sofs=2 → sofs≥3 transitions)
-        //     and lets the FFE absorb the rest as per-cycle phase noise.
+        // Apply threshold: any LS estimate ≥ 0.5 ppm away from cached
+        // fires the one-shot rewind. Validated 2026-05-19: at +10 ppm
+        // uncorrected the symbol grid slips ~0.4 sym over a 25 s burst,
+        // which made the FSM lose 2/7 cycles (50/70 CW). Below the old
+        // 10-ppm threshold the LS measured +9.97 ppm but never applied,
+        // hence the small-drift dead zone. The earlier worry about
+        // "refire starves FSM" is moot under `RX2X_MAX_DRIFT_RESETS=1`
+        // — the one-shot commit is hit at most once per session, so a
+        // lower threshold cannot loop. Residual sub-0.5 ppm drift +
+        // phase noise are still left to the continuous phase tracker /
+        // future Farrow path.
         let diff = (new_drift - self.cached_drift_ppm).abs();
-        if diff < 0.5 {
-            return false;
-        }
         let apply_threshold: f64 = std::env::var("RX2X_SOF_DRIFT_APPLY_PPM")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10.0);
+            .unwrap_or(0.5);
         let would_apply = diff >= apply_threshold
             && self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
             && self.drift_refined_sofs.len() >= 2;
