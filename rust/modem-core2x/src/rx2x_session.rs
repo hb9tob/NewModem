@@ -1579,9 +1579,16 @@ impl Rx2xSession {
                 // tail-fill (when `n_total % cw_per_cycle == 1`).
                 let n_rep_default =
                     raptorq_codec::n_repair_default(k_src as u32) as usize;
-                let cw_per_cycle = crate::frame2x::data_cw_per_cycle(
-                    &crate::profile2x::config_by_name_2x(&self.profile_name).unwrap(),
-                );
+                // Tail-fill upper bound : `config_by_name_2x` returns
+                // None for non-canonical profile names (e.g. test
+                // harness passing the Debug form). Fall back to the
+                // legacy n_repair_default so the GUI hint is still
+                // sane in that case.
+                let cw_per_cycle = crate::profile2x::config_by_name_2x(
+                    &self.profile_name,
+                )
+                .map(|cfg| crate::frame2x::data_cw_per_cycle(&cfg))
+                .unwrap_or(0);
                 let n_rep = n_rep_default + cw_per_cycle;
                 let session_id = ah.session_id;
                 self.app_header = Some(ah.clone());
@@ -2443,13 +2450,15 @@ impl Rx2xSession {
                 {
                     let ah = self.result.app_header.clone().unwrap();
                     let k_src = ah.k_symbols as usize;
-                    // Same tail-fill upper bound as the SOF-METAL
+                    // Same tail-fill upper bound as the SOF-META
                     // path above. See comment around line 1574.
                     let n_rep_default =
                         raptorq_codec::n_repair_default(k_src as u32) as usize;
-                    let cw_per_cycle = crate::frame2x::data_cw_per_cycle(
-                        &crate::profile2x::config_by_name_2x(&self.profile_name).unwrap(),
-                    );
+                    let cw_per_cycle = crate::profile2x::config_by_name_2x(
+                        &self.profile_name,
+                    )
+                    .map(|cfg| crate::frame2x::data_cw_per_cycle(&cfg))
+                    .unwrap_or(0);
                     let n_rep = n_rep_default + cw_per_cycle;
                     let session_id = ah.session_id;
                     self.app_header = Some(ah.clone());
@@ -3333,8 +3342,12 @@ mod tests {
             // (single-cycle bursts) no longer decode by design.
             let payload = rng_bytes(2000, p.as_u8() as u64);
             let audio = modulate_for(&cfg, &payload, 0x42);
+            // Use the canonical profile name ("HIGH+2X" etc.) so the
+            // tail-fill `n_repair` widening can look up cw_per_cycle
+            // via `config_by_name_2x`. The Debug form (`{p:?}`) is
+            // not a valid lookup key.
             let (_session, events) =
-                collect_events_chunked(cfg, &format!("{p:?}"), &audio);
+                collect_events_chunked(cfg, p.name(), &audio);
             let assembled = events
                 .iter()
                 .find_map(|e| {
