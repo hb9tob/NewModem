@@ -44,42 +44,94 @@ pub const PREBURST_LEN_SYM: usize = 3000;
 
 /// LFSR-15 seed. Spec-fixed: TX and RX both initialise the LFSR with
 /// this value at bit-position 0.
-const LFSR_SEED: u16 = 0x7FFF;
+pub const LFSR_SEED: u16 = 0x7FFF;
 
 /// LFSR-15 polynomial `x^15 + x + 1`. Galois feedback: when bit 0 is
 /// shifted out, XOR the state with `LFSR_FEEDBACK` iff the shifted
-/// bit was 1. Period = 2^15 − 1 = 32767 bits, more than enough for
-/// the 6000-bit pre-burst.
-const LFSR_FEEDBACK: u16 = 0x6000;
+/// bit was 1. Period = 2^15 − 1 = 32767 bits.
+pub const LFSR_FEEDBACK: u16 = 0x6000;
 
 /// Number of bits per QPSK symbol.
 const BITS_PER_SYM: usize = 2;
 
+/// Stateful LFSR-15 generator. Use this when consecutive sections of
+/// the wire need to draw from the **same** continuous PRBS sequence
+/// (e.g. pre-burst symbols followed by inter-frame PRBS symbols share
+/// the audio-level PRBS stream — the inter-frame state picks up where
+/// the pre-burst left off, so a future RX could match against either
+/// section by advancing the same generator the right number of bits).
+///
+/// Independent streams (e.g. the byte-level PRBS padding of the
+/// RaptorQ source residue) just construct a fresh `Lfsr15::new()` —
+/// each fresh instance restarts at `LFSR_SEED`.
+pub struct Lfsr15 {
+    state: u16,
+}
+
+impl Lfsr15 {
+    /// Construct a fresh generator with state = `LFSR_SEED` (0x7FFF).
+    pub fn new() -> Self {
+        Self { state: LFSR_SEED }
+    }
+
+    /// Emit one bit and advance the state (canonical Galois step :
+    /// shift right, XOR feedback when the emitted bit was 1).
+    pub fn next_bit(&mut self) -> u8 {
+        let bit = (self.state & 1) as u8;
+        self.state >>= 1;
+        if bit == 1 {
+            self.state ^= LFSR_FEEDBACK;
+        }
+        bit
+    }
+
+    /// Read `n` consecutive bits (MSB-first ordering convention :
+    /// matches `plheader::bytes_to_bits`).
+    pub fn next_bits(&mut self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.next_bit());
+        }
+        out
+    }
+
+    /// Read `n_sym` Gray-mapped QPSK symbols (each consumes 2 bits).
+    pub fn next_qpsk_symbols(&mut self, n_sym: usize) -> Vec<Complex64> {
+        let bits = self.next_bits(n_sym * BITS_PER_SYM);
+        qpsk_gray().map_bits(&bits)
+    }
+}
+
+impl Default for Lfsr15 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Generate `n_bits` from the LFSR-15. Output is one bit per element
 /// (0 or 1), MSB-first ordering matches the rest of the codebase
-/// (`bytes_to_bits` style).
-fn lfsr15_bits(n_bits: usize) -> Vec<u8> {
-    let mut state: u16 = LFSR_SEED;
-    let mut out = Vec::with_capacity(n_bits);
-    for _ in 0..n_bits {
-        // Emit the LSB as the output bit, then shift right and XOR
-        // the feedback mask into the upper bits if the emitted bit
-        // was 1. This is the canonical Galois LFSR step.
-        let bit = (state & 1) as u8;
-        state >>= 1;
-        if bit == 1 {
-            state ^= LFSR_FEEDBACK;
-        }
-        out.push(bit);
-    }
-    out
+/// (`bytes_to_bits` style). One-shot helper — restarts at `LFSR_SEED`
+/// every call. For continuation across sections use [`Lfsr15`].
+pub fn lfsr15_bits(n_bits: usize) -> Vec<u8> {
+    Lfsr15::new().next_bits(n_bits)
+}
+
+/// Generate `n_bytes` of LFSR-15 PRBS, MSB-first packing
+/// (`bits_to_bytes` convention). One-shot — restarts at `LFSR_SEED`
+/// every call. Used to PRBS-pad the residue inside the last RaptorQ
+/// source packet so the wire never carries zero-padding.
+pub fn lfsr15_bytes(n_bytes: usize) -> Vec<u8> {
+    let bits = lfsr15_bits(n_bytes * 8);
+    bits.chunks_exact(8)
+        .map(|chunk| chunk.iter().fold(0u8, |acc, &b| (acc << 1) | (b & 1)))
+        .collect()
 }
 
 /// Generate `n_sym` Gray-mapped QPSK symbols from the LFSR-15 bit
-/// stream. Each symbol consumes 2 bits.
+/// stream. Each symbol consumes 2 bits. One-shot — restarts at
+/// `LFSR_SEED` every call.
 pub fn lfsr15_qpsk_symbols(n_sym: usize) -> Vec<Complex64> {
-    let bits = lfsr15_bits(n_sym * BITS_PER_SYM);
-    qpsk_gray().map_bits(&bits)
+    Lfsr15::new().next_qpsk_symbols(n_sym)
 }
 
 /// Cached reference vector — TX uses this to emit the pre-burst, RX
@@ -171,5 +223,61 @@ mod tests {
         for k in 0..PREBURST_LEN_SYM {
             assert_eq!(cached[k], fresh[k]);
         }
+    }
+
+    #[test]
+    fn lfsr15_bytes_packs_msb_first() {
+        // First 16 bits are [1;14, 0, 0] per EXPECTED_FIRST_BITS.
+        // Packed MSB-first: 0b11111111 = 0xFF then 0b11111100 = 0xFC.
+        let b = lfsr15_bytes(2);
+        assert_eq!(b, vec![0xFF, 0xFC]);
+    }
+
+    #[test]
+    fn lfsr15_state_continuation_preburst_then_inter_frame() {
+        // Continuation invariant : an Lfsr15 reading PREBURST_LEN_SYM
+        // symbols then another `extra` symbols must produce the same
+        // overall sequence as a fresh Lfsr15 reading
+        // `(PREBURST_LEN_SYM + extra) * 2` bits packed into QPSK.
+        let extra = 300;
+        let mut gen = Lfsr15::new();
+        let preburst_syms = gen.next_qpsk_symbols(PREBURST_LEN_SYM);
+        let inter_frame_syms = gen.next_qpsk_symbols(extra);
+
+        // Reference path : single fresh Lfsr15 that pulls everything.
+        let mut ref_gen = Lfsr15::new();
+        let all_syms = ref_gen.next_qpsk_symbols(PREBURST_LEN_SYM + extra);
+
+        for k in 0..PREBURST_LEN_SYM {
+            assert_eq!(preburst_syms[k], all_syms[k]);
+        }
+        for k in 0..extra {
+            assert_eq!(inter_frame_syms[k], all_syms[PREBURST_LEN_SYM + k]);
+        }
+    }
+
+    #[test]
+    fn lfsr15_struct_matches_one_shot_helpers() {
+        let mut gen = Lfsr15::new();
+        let s = gen.next_qpsk_symbols(PREBURST_LEN_SYM);
+        let r = reference_symbols();
+        assert_eq!(s.len(), r.len());
+        for k in 0..PREBURST_LEN_SYM {
+            assert_eq!(s[k], r[k]);
+        }
+
+        let bits_struct = Lfsr15::new().next_bits(32);
+        let bits_oneshot = lfsr15_bits(32);
+        assert_eq!(bits_struct, bits_oneshot);
+    }
+
+    #[test]
+    fn lfsr15_bytes_independent_stream_restarts_at_seed() {
+        // Two consecutive calls to lfsr15_bytes() must return the same
+        // bytes — the helper is documented as one-shot independent.
+        let a = lfsr15_bytes(64);
+        let b = lfsr15_bytes(64);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
     }
 }
