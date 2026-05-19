@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8">
+<title>Modem 2x tail-fill — validation 2026-05-19</title>
+<style>
+body{font:14px/1.5 -apple-system,system-ui,sans-serif;max-width:850px;margin:2em auto;padding:0 1em;color:#222}
+h1,h2,h3{font-weight:600}
+h1{border-bottom:2px solid #ccc;padding-bottom:.3em}
+table{border-collapse:collapse;margin:.5em 0 1em}
+th,td{border:1px solid #ccc;padding:.3em .6em;text-align:left}
+th{background:#f4f4f4}
+code,pre{font-family:ui-monospace,Menlo,monospace;background:#f5f5f5;padding:.05em .35em;border-radius:3px}
+pre{padding:.6em .8em;overflow-x:auto}
+.ok{color:#0a7}.bad{color:#c33}.muted{color:#888}
+hr{border:none;border-top:1px solid #ddd;margin:1.5em 0}
+</style>
+
+<h1>Modem 2x — tail-fill validation</h1>
+<p class="muted">Branch <code>feat/modem-2x</code>, HEAD <code>603a80e</code>. Validated 2026-05-19 on Pi5.</p>
+
+<h2>1. Context</h2>
+<p>Before this change, a HIGH+2X 10&nbsp;kB burst at 30&nbsp;% RaptorQ
+repair emitted <strong>61 data CWs</strong> across 7 PLHEADER cycles,
+truncating the last cycle when <code>n_total % cw_per_cycle != 0</code>.
+The TX inserted <code>INTER_FRAME_SILENCE_S = 0.2&nbsp;s</code> of
+audio silence between the data and the EOT PLHEADER. The RX
+(<code>rx_v4.rs:1808-1828</code>) detected the silence via an
+energy-gate and exited the cycle decode loop early, leaving CW 61
+and 62 unconverged. The payload was still recovered byte-exact via
+RaptorQ repair margin, but 2 CW of bandwidth were wasted every burst.</p>
+
+<p>Per <a href="https://duckduckgo.com/?q=feedback-tail-pad-useful-content">[[feedback-tail-pad-useful-content]]</a>,
+the wire must carry useful content end-to-end : no silence in
+mid-burst, no zero-padding inside RaptorQ source packets. Three
+commits land the change end-to-end.</p>
+
+<h2>2. Commits</h2>
+<table>
+<tr><th>Commit</th><th>Scope</th></tr>
+<tr><td><code>a7b8e11</code></td><td>diag : <code>RX2X_LOCK_DRIFT_PPM</code> env hook + <code>sweep_rx_via_worker</code> bitmap dump</td></tr>
+<tr><td><code>f61e3a7</code></td><td><code>preburst</code> : expose <code>Lfsr15</code> struct + <code>lfsr15_bytes</code> + <code>lfsr15_bits</code></td></tr>
+<tr><td><code>9e1fc5e</code></td><td><code>frame2x</code> : PRBS-pad source residue + tail-fill last cycle (round to <code>cw_per_cycle</code>)</td></tr>
+<tr><td><code>fd334aa</code></td><td><code>rx2x</code> : silence-gate removed, inter-frame PRBS continuous, <code>SessionArmed.n_repair</code> widened</td></tr>
+<tr><td><code>603a80e</code></td><td>fix : tolerate non-canonical profile name in n_repair widening</td></tr>
+</table>
+
+<h2>3. Sweep configuration</h2>
+<ul>
+<li>Profile : HIGH+2X (32-APSK 3/4, sps&nbsp;10, Rs&nbsp;3000&nbsp;Bd, audio&nbsp;48&nbsp;kHz)</li>
+<li>Payload : 10&nbsp;000 bytes random</li>
+<li>RaptorQ repair : <code>--repair-pct 30</code> (default)</li>
+<li>Channel : <code>nbfm_channel_sim</code> static drift + <code>if_noise=0.10</code> (~32&nbsp;dB IF SNR)</li>
+<li>RX path : <code>sweep_rx_via_worker</code> → <code>rx_worker2x::spawn</code>, CPAL chunks of 2400 samples</li>
+<li>Drift estimator : <strong>locked en dur</strong> via <code>RX2X_LOCK_DRIFT_PPM=&lt;value&gt;</code> (commit a7b8e11)
+  to isolate the resampler from the open estimator bug
+  ([[rx2x-non-streaming-leak]]).</li>
+</ul>
+
+<h2>4. Results — drift-locked sweep</h2>
+<p>Each drift value injected statically by the channel sim, RX locked
+to the same value via env var :</p>
+
+<table>
+<tr><th>Variante</th><th>drift</th><th>σ²(pilot)</th><th>σ²(data)</th><th>SNR_data</th><th>CW conv</th><th>exact</th><th>burst t</th></tr>
+<tr><td>Polyphase pre-tail-fill (<code>b6b70ff</code>)</td><td>+130&nbsp;ppm</td><td>0.00154</td><td>0.00219</td><td>28.1&nbsp;dB</td><td class="bad">61/63</td><td>Y</td><td>26.99&nbsp;s</td></tr>
+<tr><td><strong>Tail-fill</strong> (HEAD)</td><td><strong>−300&nbsp;ppm</strong></td><td>0.00100</td><td>0.00167</td><td>30.0&nbsp;dB</td><td class="ok"><strong>70/70</strong></td><td>Y</td><td>29.95&nbsp;s</td></tr>
+<tr><td><strong>Tail-fill</strong> (HEAD)</td><td><strong>+130&nbsp;ppm</strong></td><td>0.00100</td><td>0.00183</td><td>30.0&nbsp;dB</td><td class="ok"><strong>70/70</strong></td><td>Y</td><td>29.95&nbsp;s</td></tr>
+<tr><td><strong>Tail-fill</strong> (HEAD)</td><td><strong>+300&nbsp;ppm</strong></td><td>0.00100</td><td>0.00177</td><td>30.0&nbsp;dB</td><td class="ok"><strong>70/70</strong></td><td>Y</td><td>29.95&nbsp;s</td></tr>
+</table>
+
+<p>Triple confirmation : with the drift estimator locked, the polyphase
+resampler + worker cpal-chunks chain holds at ±300&nbsp;ppm without
+degradation. Tail-fill brings <strong>all 70 emitted CWs</strong> to
+convergence — the 2&nbsp;CW deficit was structural (silence-gate),
+not a noise floor.</p>
+
+<h3>4.1 Numerical breakdown</h3>
+<ul>
+<li>Pre-tail-fill : k_src=47 + n_repair=14 = <strong>61 packets</strong> on the wire, 2 silence slots.</li>
+<li>Tail-fill : n_emit = round_up(61, cw_per_cycle=10) = <strong>70 packets</strong>, 0 silence in-cycle.</li>
+<li>Burst duration : +1 cycle = +2.96&nbsp;s (~11&nbsp;% longer wire time, 9 extra repair CWs).</li>
+<li>σ²(pilot) improvement : 0.00154 → 0.00100 (+1.9&nbsp;dB). Plausibly the
+inter-frame PRBS (continuous LFSR-15, replacing the 200&nbsp;ms
+silence) keeps the FFE adapted longer ; or just a sample-count
+artifact from the longer burst.</li>
+</ul>
+
+<h2>5. Results — estimator NOT locked (orthogonal bug)</h2>
+<p>Same TX (tail-fill HEAD) with <code>RX2X_LOCK_DRIFT_PPM</code> unset
+@ static +130&nbsp;ppm :</p>
+<pre>HIGH+2X     0.10  0.00   0.04556   13.4    0.03447      -/30  10020     N  10.2</pre>
+<p>σ²=0.046, 0/30 CW converged, decode non-exact. The drift estimator's
+non-streaming bootstrap ([[rx2x-non-streaming-leak]]) commits an
+incoherent ratio that wrecks the symbol stream. Tail-fill is
+<strong>orthogonal</strong> to this bug — both must be fixed for the
+end-to-end pipeline to be production-ready.</p>
+
+<h2>6. Tests added</h2>
+<table>
+<tr><th>Test</th><th>File</th></tr>
+<tr><td><code>lfsr15_bytes_packs_msb_first</code></td><td><code>preburst.rs</code></td></tr>
+<tr><td><code>lfsr15_state_continuation_preburst_then_inter_frame</code></td><td><code>preburst.rs</code></td></tr>
+<tr><td><code>lfsr15_struct_matches_one_shot_helpers</code></td><td><code>preburst.rs</code></td></tr>
+<tr><td><code>lfsr15_bytes_independent_stream_restarts_at_seed</code></td><td><code>preburst.rs</code></td></tr>
+<tr><td><code>unaligned_payload_uses_prbs_residue_not_zeros</code></td><td><code>frame2x.rs</code></td></tr>
+<tr><td><code>last_cycle_tail_fill_extra_repair_emitted</code></td><td><code>frame2x.rs</code></td></tr>
+<tr><td><code>tail_filled_data_cw_count_round_up_invariants</code></td><td><code>frame2x.rs</code></td></tr>
+<tr><td><code>inter_frame_region_carries_prbs_not_silence</code></td><td><code>modem2x.rs</code></td></tr>
+<tr><td><code>converged_bitmap_all_ones_through_tail_filled_last_cycle</code></td><td><code>rx2x_session.rs</code></td></tr>
+</table>
+
+<h2>7. Next steps</h2>
+<ol>
+<li><strong>Estimator fix</strong> — port <code>estimate_drift_from_raw</code>
+and <code>try_bootstrap_pair</code> onto the streaming sym_buffer instead
+of the legacy <code>audio_buffer</code> full-rebuild path
+([[rx2x-non-streaming-leak]]).</li>
+<li><strong>OTA validation</strong> — FT-991A → FTX-1 loopback. Bump
+<code>tauri.conf.json</code> version (cf. [[tauri-deb-version-bump]]),
+bundle <code>.deb</code>, install on Pi5 kiosk-pi-sdrplay, capture
+loopback. Cible : converged/total = N/N (no gap), exact ✓.</li>
+<li><strong>SNR-margin sweep</strong> — re-run
+<code>study/snr_sweep_2x_worker.py --drift-ppm 130 --if-noises 0.10 0.20 0.30 0.40 0.50</code>
+post-estimator-fix to confirm the courbe SNR-vs-converged moves +1-2&nbsp;dB
+left thanks to the extra RaptorQ margin.</li>
+</ol>
