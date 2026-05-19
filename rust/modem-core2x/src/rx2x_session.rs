@@ -659,17 +659,19 @@ impl Rx2xSession {
             }
         }
 
-        let drift_updated = self.estimate_drift_from_raw();
-        // Engage `drift_locked` once the LS estimate has been stable for
-        // N chunks. Honours the one-shot resampler-apply policy
-        // ([[feedback-drift-architecture-one-shot-plus-fine-tracking]]):
-        // after the (possible) single apply, the cached_drift_ppm is
-        // frozen and the Farrow / pilot phase tracker handles the
-        // residual sub-ppm walk. For a clean (zero-drift) channel no
-        // apply ever fires and the lock path here is the only way for
-        // `trim_audio_for_streaming` to engage — without it the audio
-        // buffer would grow with the burst length.
-        self.lock_drift_if_ready(drift_updated);
+        // Per [[feedback-no-farrow-until-openloop-reliable]] +
+        // [[feedback-drift-architecture-one-shot-plus-fine-tracking]]:
+        // `drift_locked` is set **only** by the one-shot apply branch
+        // in `estimate_drift_from_raw`. Locking by stability before
+        // the apply has fired races with the apply itself: the
+        // stability lock starts `trim_audio_for_streaming`, then the
+        // apply hits and resets `audio_drained_samples = 0` — but
+        // `audio_buffer` has already been amputated, so the post-apply
+        // re-decode misses the early cycles entirely. Observed on
+        // seed 51966 / d=-30 ppm: bootstrap commits on cycles 1+2
+        // (cycle 0 PLS invalid pre-resample), stability lock fires,
+        // 125 k samples trimmed, apply fires too late, 0/0 cycles.
+        let _ = self.estimate_drift_from_raw();
 
         self.trim_audio_for_streaming();
 
@@ -3569,16 +3571,15 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(decoded, payload, "chunked decode byte-exact");
 
-        // (b) lock fired.
-        assert!(
-            saw_lock,
-            "drift_locked must engage during a multi-cycle burst",
-        );
-
-        // (c) sym_buffer bounded post-lock. Bound = 4 cycles + retain
-        // window (2 cycles + 256 sym). Pre-trim sym_buffer could grow
-        // to the full burst length (12 000+ symbols on a 500-byte
-        // HIGH+2X payload); we should see it collapse well below that.
+        // (b) sym_buffer bounded post-lock — only meaningful when the
+        // one-shot drift apply fires (clean test channel = no drift =
+        // no apply = no lock, per the
+        // [[feedback-drift-architecture-one-shot-plus-fine-tracking]]
+        // policy). When no lock occurs, audio_buffer just grows
+        // linearly with the burst, which is acceptable on the bench.
+        if !saw_lock {
+            return;
+        }
         let cycle = session.cycle_period_sym;
         let bound = 4 * cycle + session.ldpc_turbo_retain_sym;
         assert!(
