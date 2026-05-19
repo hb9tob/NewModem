@@ -188,7 +188,8 @@ def main():
             "profile,if_noise,phase_walk,injected_drift_ppm,"
             "injected_thermal_ppm,sigma2,snr_est_db,sigma2_data_scatter,"
             "es_data_scatter,data_scatter_n,converged,total,"
-            "decoded_bytes,exact,file_complete_seen,error,total_time_s\n")
+            "decoded_bytes,exact,file_complete_seen,error,total_time_s,"
+            "estimated_drift_ppm,cycles\n")
 
         header = (f"{'profile':<10} {'if_n':>5} {'phw':>5} {'σ²':>9} "
                   f"{'SNRdB':>6} {'σ²scatter':>10} {'conv':>9} "
@@ -256,6 +257,8 @@ def main():
                             return "1" if v else "0"
                         return str(v)
 
+                    est_drift = info.get("final_drift_ppm")
+                    cycles = info.get("cycles")
                     csv_f.write(",".join([
                         profile, str(if_noise), str(phase_walk),
                         str(args.drift_ppm), str(args.thermal_ppm),
@@ -267,6 +270,7 @@ def main():
                         csv_cell(fc_seen),
                         (err or "").replace(",", ";"),
                         f"{t_total:.2f}",
+                        csv_cell(est_drift), csv_cell(cycles),
                     ]) + "\n")
                     csv_f.flush()
 

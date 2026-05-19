@@ -140,6 +140,12 @@ fn main() -> ExitCode {
         .as_ref()
         .and_then(|p| p.get("app_header_seen").and_then(Value::as_bool))
         .unwrap_or(false);
+    let final_drift_ppm: Option<f64> = final_summary
+        .as_ref()
+        .and_then(|p| p.get("final_drift_ppm").and_then(Value::as_f64));
+    let cycles: Option<u64> = final_summary
+        .as_ref()
+        .and_then(|p| p.get("cycles").and_then(Value::as_u64));
     let (converged, total, sigma2, sigma2_scatter, es_scatter, scatter_n) =
         if let Some(p) = final_summary.as_ref() {
             (
@@ -199,6 +205,8 @@ fn main() -> ExitCode {
         "saved_path": saved_path,
         "file_complete_seen": file_complete.is_some(),
         "app_header_seen": app_header_seen,
+        "final_drift_ppm": final_drift_ppm,
+        "cycles": cycles,
         "exact": exact,
         "error": error,
     });

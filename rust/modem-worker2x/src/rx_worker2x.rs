@@ -378,6 +378,7 @@ fn translate_events(
                         "data_scatter_n": result.data_scatter_n,
                         "cycles": result.cycles,
                         "app_header_seen": result.app_header.is_some(),
+                        "final_drift_ppm": result.final_drift_ppm,
                     }),
                 );
                 if let Some(ref app_header) = result.app_header {
