@@ -2091,19 +2091,28 @@ impl Rx2xSession {
         if self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
             && self.drift_refined_sofs.len() >= 2
         {
-            // **One-shot resampler commit.** Treat the current
-            // `audio_buffer` as the start of a "virtual session" at the
-            // new ratio :
+            // **One-shot resampler commit.** Restart the streaming DSP
+            // at the new ratio while keeping the absolute RX-time origin
+            // intact:
             //   1. Replace `streaming_dsp` with a fresh instance →
             //      resampler_next_tx, downmix_next_abs, decimation
             //      cursor, mf_state all start at zero.
-            //   2. Reset `audio_drained_samples = 0` so audio_buffer[0]
-            //      is treated as session-time origin in the new frame.
+            //   2. Keep `audio_drained_samples` as-is. The pre-apply
+            //      idle / bootstrap paths (see lines ~756, ~834) may
+            //      have already drained the silent pre-burst by
+            //      bumping `audio_drained_samples` and trimming
+            //      `audio_buffer` accordingly. Resetting it to 0 here
+            //      would make the new pipeline mis-map `audio_buffer[0]`
+            //      as RX-time 0, shifting every recovered TX symbol by
+            //      `audio_drained_samples / sps` positions — at
+            //      d=-300 ppm this surfaced as a 225-sym (~0.15 s)
+            //      offset that landed real preambles at the wrong
+            //      sym_buffer index, derailing the FSM.
             //   3. Clear `drift_refined_sofs` — the absolute audio
-            //      positions stored there were in the OLD frame
-            //      (shifted by the previous drained value). Subsequent
-            //      SOFs in the new frame will be re-refined and feed
-            //      the fine tracker.
+            //      positions stored there were in the OLD ratio's
+            //      frame (TX-time mapping). Subsequent SOFs in the
+            //      new frame will be re-refined and feed the fine
+            //      tracker.
             //   4. Reset CW counters + bitmap. Any decode attempts
             //      pre-apply happened at the wrong ratio — they failed
             //      to converge (so didn't pollute `cw_bytes`) but DID
@@ -2114,7 +2123,6 @@ impl Rx2xSession {
             //      `decode_one_cw` bumps `data_cws_total` again).
             //      Symptom : `total=80` instead of `70` at HIGH+2X.
             self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
-            self.audio_drained_samples = 0;
             self.drift_refined_sofs.clear();
             self.result.data_cws_total = 0;
             self.result.data_cws_converged = 0;
