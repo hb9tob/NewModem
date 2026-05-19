@@ -113,6 +113,25 @@ fn main() -> ExitCode {
             _ => {}
         }
     }
+    if let Some(p) = last_progress.as_ref() {
+        if let Some(bm) = p.get("converged_bitmap").and_then(Value::as_array) {
+            let bits: Vec<u8> = bm
+                .iter()
+                .filter_map(|v| v.as_u64().map(|b| b as u8))
+                .collect();
+            eprintln!("[harness] converged_bitmap bytes ({}): {:?}", bits.len(), bits);
+            let mut fail: Vec<usize> = Vec::new();
+            for (byte_idx, &byte) in bits.iter().enumerate() {
+                for bit in 0..8 {
+                    let cw = byte_idx * 8 + bit;
+                    if (byte >> bit) & 1 == 0 {
+                        fail.push(cw);
+                    }
+                }
+            }
+            eprintln!("[harness] CW indices NOT converged (any 0 bit): {:?}", fail);
+        }
+    }
 
     // Prefer rx2x_session_finalized for totals (always emitted post-finalize,
     // even when zero DATA CWs converged). Fall back to last v2_progress for

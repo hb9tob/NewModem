@@ -1061,6 +1061,16 @@ impl Rx2xSession {
     /// preserved across chunks (no "rebuild" — symbol at abs index `K`
     /// has the same value on every chunk that retains it).
     fn refresh_symbols(&mut self) {
+        // RX2X_LOCK_DRIFT_PPM=<float> forces the resampler ratio used by
+        // streaming.feed_audio, bypassing every cached_drift_ppm write
+        // (bootstrap commit, pilot-phase residual, SOF-LS estimator).
+        // Diagnostic — isolates the resampler under known drift.
+        if let Some(v) = std::env::var("RX2X_LOCK_DRIFT_PPM")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            self.cached_drift_ppm = v;
+        }
         self.streaming.feed_audio(
             &self.audio_buffer,
             self.audio_drained_samples,
