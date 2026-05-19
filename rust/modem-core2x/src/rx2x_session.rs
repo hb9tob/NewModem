@@ -2010,7 +2010,9 @@ impl Rx2xSession {
         {
             self.cached_drift_ppm = new_drift;
             self.n_drift_resets = self.n_drift_resets.saturating_add(1);
-            self.streaming.rewind_for_drift_change(new_drift);
+            // Polyphase resampler is stateless w.r.t. the ratio: the
+            // next `feed_audio` call will use `new_drift` directly.
+            // No rewind needed — the per-chunk ratio is passed in.
             // Phase tracker references TX-time absolute positions that
             // just shifted under the new drift mapping — reset its
             // [φ, ω] state. The next PLHEADER will re-anchor it

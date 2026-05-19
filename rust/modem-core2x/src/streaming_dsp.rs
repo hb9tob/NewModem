@@ -144,24 +144,13 @@ pub struct StreamingDsp {
     // === Resampler ===
     bank: Vec<[f64; N_TAPS]>,
     /// Index of the next TX-time output sample the resampler will emit
-    /// (cumulative across the whole session). Tracked alongside
-    /// `target_abs_state` (the fractional RX-time input position) for
-    /// diagnostic and downstream cursors.
+    /// (cumulative across the whole session). Multiplied by `ratio` to
+    /// get the RX-time input sample to interpolate at.
     resampler_next_tx: u64,
-    /// Fractional RX-time input position the resampler will read at
-    /// **next** to produce the next TX output sample. Initialized to
-    /// 0.0 at session start, advanced by `ratio_now` (= 1 + drift_ppm
-    /// · 1e-6) after each output emit. This is a STATE-FUL integrator:
-    /// changing `drift_ppm` between `feed_audio` calls smoothly
-    /// transitions the mapping from the current `target_abs_state`
-    /// onward — no abrupt jump, no retroactive remapping of
-    /// already-emitted output. Equivalent to the pre-2026-05-18
-    /// stateless `next_tx * ratio` mapping when `drift_ppm` is held
-    /// constant for the whole session; only diverges when the caller
-    /// updates drift mid-session.
-    target_abs_state: f64,
-    /// Cached `drift_ppm` last time the resampler ran. Diagnostic only
-    /// (the integrator above is the source of truth for the mapping).
+    /// Cached `cached_drift_ppm` last time the resampler ran. Allows
+    /// the caller to update drift between chunks without breaking
+    /// continuity: the resampler keeps emitting at the new ratio from
+    /// `resampler_next_tx` onward.
     last_drift_ppm: f64,
 
     // === Resampled audio (TX-time) ===
@@ -222,7 +211,6 @@ impl StreamingDsp {
             fc: cfg.base.center_freq_hz,
             bank: build_polyphase_bank(),
             resampler_next_tx: 0,
-            target_abs_state: 0.0,
             last_drift_ppm: 0.0,
             resampled_start_abs: 0,
             resampled: Vec::new(),
@@ -291,109 +279,6 @@ impl StreamingDsp {
         self.sym_buffer.len() - sym_count_before
     }
 
-    /// Diagnostic accessor: current value of the resampler's next-output
-    /// absolute TX-time index. Used by callers that need to know where
-    /// the pipeline frontier is sitting (e.g. for a coherent rewind).
-    pub fn resampler_next_tx(&self) -> u64 {
-        self.resampler_next_tx
-    }
-
-    /// Re-anchor the resampler integrator to the **stateless** mapping
-    /// `K · (1 + new_drift_ppm·1e-6)` from the current output frontier
-    /// onward, and discard everything downstream that was produced at
-    /// the previous ratio.
-    ///
-    /// **Why a rewind exists at all.** The integrator landed in 9093a4a
-    /// solves one half of the mid-session drift problem: it keeps the
-    /// resampler output value continuous when the caller updates
-    /// `drift_ppm` between `feed_audio` calls (no "click" in the
-    /// resampled stream). But the OTHER half — the FSM's expectation
-    /// that symbol `K` lives at TX-time-audio index `K · sps · ratio`
-    /// in RX-time — is violated by the integrator: post-switch symbols
-    /// are shifted in RX-time by `N · Δratio` where `N` is the output
-    /// index at the switch point. For 60 ppm at `N = 50_000` that's
-    /// ~3 audio samples = roughly 0.3 symbols at sps=10. For larger
-    /// drifts or later switches the offset grows linearly and the FSM
-    /// stops finding SOFs at their cycle-period-spaced positions.
-    ///
-    /// `rewind_for_drift_change` snaps the integrator to the stateless
-    /// mapping `target = K · ratio_new` so all FUTURE output emits land
-    /// at the correct RX-time read positions for `ratio_new`. This
-    /// introduces a one-time discontinuity in the resampler's read
-    /// pointer (jump of `N · Δratio` RX-time samples) which the caller
-    /// masks by:
-    ///
-    ///   1. Discarding the pre-switch symbols already in `sym_buffer`
-    ///      (they'd carry wrong-drift content past the FSM anyway).
-    ///   2. Skipping the next `mf_state.len() + N_TAPS/2` output
-    ///      samples worth of decimation — that's the combined FIR
-    ///      kernel ramp-up + MF startup transient after the boundary.
-    ///
-    /// Both happen here so the caller just needs to clear FSM scan
-    /// state and let the next chunks rebuild the symbol stream cleanly.
-    ///
-    /// Sym-buffer absolute indexing is preserved: the dropped symbols
-    /// advance `sym_buffer_start_abs` so future symbols still carry
-    /// their TX-time absolute index. Callers that track `buf_start_abs`
-    /// from `sym_buffer_start_abs()` re-read it after the rewind.
-    pub fn rewind_for_drift_change(&mut self, new_drift_ppm: f64) {
-        let ratio_new = 1.0 + new_drift_ppm * 1e-6;
-        self.last_drift_ppm = new_drift_ppm;
-
-        // Re-anchor: future emits behave as if `ratio_new` had been
-        // applied from output index 0. The integrator advances by
-        // `ratio_new` per emit going forward (set by the next
-        // `feed_audio` call's local `ratio`), so post-rewind output K
-        // reads at `K · ratio_new` in RX-time — the same mapping the
-        // pre-9093a4a stateless code used.
-        self.target_abs_state = self.resampler_next_tx as f64 * ratio_new;
-
-        // Drop pre-switch symbols. `sym_buffer_start_abs` advances so
-        // the next push lands at the correct TX-symbol absolute index.
-        let dropped_syms = self.sym_buffer.len() as u64;
-        self.sym_buffer.clear();
-        self.sym_buffer_start_abs += dropped_syms;
-
-        // Drop intermediate stage buffers. We rebuild them from the
-        // resampler frontier going forward — no pre-switch sample is
-        // allowed to leak through the MF state delay line or land in
-        // the next sym_buffer slice.
-        self.resampled.clear();
-        self.resampled_start_abs = self.resampler_next_tx;
-        self.baseband.clear();
-        self.baseband_start_abs = self.resampler_next_tx;
-        self.downmix_next_abs = self.resampler_next_tx;
-        self.mf_output.clear();
-        self.mf_output_start_abs = self.resampler_next_tx;
-        // MF delay line: zero so the first mf_taps.len()-1 BB samples
-        // post-rewind produce a clean startup transient (same model
-        // as session start at `StreamingDsp::new`).
-        for s in self.mf_state.iter_mut() {
-            *s = Complex64::new(0.0, 0.0);
-        }
-
-        // Skip the combined transient: N_TAPS/2 resampler-output
-        // samples where the FIR kernel still straddles the rewind
-        // boundary (left taps may read past the audio's drained edge),
-        // plus mf_state.len() BB samples for the overlap-save MF
-        // startup. Round UP to the next `sps` multiple so the
-        // decimation phase stays locked to `decimation_cursor_abs %
-        // sps` (the TX-time grid hasn't moved).
-        let transient_outputs =
-            (N_TAPS / 2) as u64 + self.mf_state.len() as u64;
-        let target_min = self.resampler_next_tx + transient_outputs;
-        if self.decimation_cursor_abs < target_min {
-            let gap = target_min - self.decimation_cursor_abs;
-            let advance =
-                gap.div_ceil(self.sps as u64) * self.sps as u64;
-            self.decimation_cursor_abs += advance;
-            // Sym-buffer absolute index also advances by the same
-            // number of symbols so the next push has consistent
-            // indexing (sym_buffer[0] ↔ sym_buffer_start_abs).
-            self.sym_buffer_start_abs += advance / self.sps as u64;
-        }
-    }
-
     /// Trim `sym_buffer` so its first entry is at absolute symbol
     /// index `keep_from_abs`. No-op if already that far in. Also
     /// trims the upstream resampled/baseband/mf_output buffers to
@@ -439,19 +324,12 @@ impl StreamingDsp {
         let drained = audio_drained_samples as i64;
         loop {
             // Target RX-time sample (fractional) to interpolate at.
-            // **Integrator state** (2026-05-18 fix): `target_abs_state`
-            // advances by the CURRENT `ratio` per output sample, so a
-            // mid-session `drift_ppm` change transitions smoothly from
-            // the current input position onward instead of causing a
-            // discontinuous jump `K · (r_new − r_old)` in input space.
-            // The stateless legacy `next_tx · ratio` mapping was
-            // mathematically clean for a fixed ratio but desynchronized
-            // already-emitted symbols against newly-emitted ones every
-            // time the caller updated `drift_ppm` — breaking the FSM's
-            // cycle_period_sym expectation. With the integrator, the
-            // change is bounded by `r_new` (≈ 1.00006 for 60 ppm)
-            // per output sample.
-            let target_abs = self.target_abs_state;
+            // Absolute RX-side index inside the conceptual infinite
+            // input stream (samples before `audio_drained_samples`
+            // are treated as zero — the session's "pre-start" silence,
+            // identical to the model "imagine the audio starts with
+            // an infinite stream of zeros").
+            let target_abs = (self.resampler_next_tx as f64) * ratio;
             let centre_abs = target_abs.floor() as i64;
             let frac = target_abs - centre_abs as f64;
             let phase = (frac * N_PHASES as f64).round() as i64;
@@ -491,9 +369,6 @@ impl StreamingDsp {
             }
             self.resampled.push(acc as f32);
             self.resampler_next_tx += 1;
-            // Advance the integrator AFTER consuming the current target.
-            // The new ratio applies from the NEXT output sample onward.
-            self.target_abs_state += ratio;
         }
     }
 
@@ -624,82 +499,6 @@ mod tests {
                 "phase {i} DC gain = {sum} ≠ 1",
             );
         }
-    }
-
-    #[test]
-    fn rewind_for_drift_change_reanchors_and_clears() {
-        // Run the pipeline at drift=0 for a few seconds, then rewind to
-        // -60 ppm and verify all post-conditions:
-        //   1. target_abs_state := resampler_next_tx · ratio_new
-        //   2. sym_buffer cleared, sym_buffer_start_abs advanced
-        //   3. decimation_cursor advanced past the transient skip
-        //   4. intermediate buffers (resampled/baseband/mf_output) empty
-        //   5. MF state zeroed
-        //   6. New audio fed at -60 ppm produces fresh symbols past the
-        //      transient, with sym_buffer_start_abs reflecting the skip.
-        let cfg = crate::profile2x::config_by_name_2x("HIGH+2X").unwrap();
-        let mut dsp = StreamingDsp::new(&cfg);
-        // 1 s of audio at drift=0.
-        let buf = vec![0.1_f32; AUDIO_RATE as usize];
-        let pre_syms = dsp.feed_audio(&buf, 0, 0.0);
-        assert!(pre_syms > 0, "expected pre-rewind symbols, got {pre_syms}");
-        let r_at_rewind = dsp.resampler_next_tx();
-        let dropped_syms_expected = dsp.sym_buffer.len() as u64;
-        let dec_cursor_before = dsp.decimation_cursor_abs;
-
-        let new_drift = -60.0;
-        let ratio_new = 1.0 + new_drift * 1e-6;
-        dsp.rewind_for_drift_change(new_drift);
-
-        // 1. integrator re-anchored to stateless K · ratio_new.
-        let target_expected = r_at_rewind as f64 * ratio_new;
-        assert!(
-            (dsp.target_abs_state - target_expected).abs() < 1e-9,
-            "target_abs_state = {} expected {target_expected}",
-            dsp.target_abs_state,
-        );
-
-        // 2. sym_buffer empty, start_abs advanced by dropped + transient.
-        assert_eq!(dsp.sym_buffer.len(), 0);
-        // 3. decimation_cursor advanced; the skip is sps-aligned.
-        assert!(
-            dsp.decimation_cursor_abs > dec_cursor_before,
-            "decimation_cursor did not advance (was {dec_cursor_before}, now {})",
-            dsp.decimation_cursor_abs,
-        );
-        let advance_bb = dsp.decimation_cursor_abs - dec_cursor_before;
-        assert_eq!(advance_bb % dsp.sps as u64, 0,
-            "decimation advance {advance_bb} not sps-aligned");
-        // sym_buffer_start_abs advance must match dropped_syms + advance / sps.
-        let expected_sba_advance =
-            dropped_syms_expected + advance_bb / dsp.sps as u64;
-        // Initial sym_buffer_start_abs was 0; after rewind it's the
-        // total advance.
-        assert_eq!(dsp.sym_buffer_start_abs, expected_sba_advance);
-
-        // 4. intermediate buffers empty.
-        assert!(dsp.resampled.is_empty());
-        assert!(dsp.baseband.is_empty());
-        assert!(dsp.mf_output.is_empty());
-        assert_eq!(dsp.resampled_start_abs, r_at_rewind);
-        assert_eq!(dsp.baseband_start_abs, r_at_rewind);
-        assert_eq!(dsp.mf_output_start_abs, r_at_rewind);
-        assert_eq!(dsp.downmix_next_abs, r_at_rewind);
-
-        // 5. MF state zeroed.
-        for (i, c) in dsp.mf_state.iter().enumerate() {
-            assert_eq!(c.re, 0.0, "mf_state[{i}].re != 0");
-            assert_eq!(c.im, 0.0, "mf_state[{i}].im != 0");
-        }
-
-        // 6. Push more audio at the new drift; the pipeline should
-        // continue emitting symbols past the transient skip.
-        let buf2 = vec![0.1_f32; AUDIO_RATE as usize];
-        let _ = dsp.feed_audio(&buf2, AUDIO_RATE as u64, new_drift);
-        assert!(
-            dsp.resampler_next_tx() > r_at_rewind,
-            "resampler did not advance after rewind+feed",
-        );
     }
 
     #[test]
