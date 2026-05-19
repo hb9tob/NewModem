@@ -630,25 +630,11 @@ const PREAMBLE_ABSENCE_TIMEOUT_S: u64 = 6;
 const LATE_ENTRY_FAIL_THRESHOLD: u32 = 3;
 const LATE_ENTRY_MARGIN_MS: u64 = 200;
 
-/// Lowpower (`!allow_legacy_grid`) safety-grid quota.
-///
-/// When the user has turned off `rx_allow_legacy_grid` (default on
-/// aarch64 / Pi), the ±15 ppm grid in `rx_v2_with_options` is skipped
-/// to save CPU. From 0.10.34 the worker re-enables the grid AS A LAST
-/// RESORT when both Gardner and the 0-ppm fast-path fail to produce a
-/// clean SF -- recovering marginal CWs that the 0.9-era grid was
-/// catching. To bound the CPU spike, only `LOWPOWER_GRID_QUOTA` grid
-/// invocations are allowed within any rolling
-/// `LOWPOWER_GRID_WINDOW_S`-second wall-clock window. Above quota the
-/// grid stays skipped for the current tick ; the late-entry recovery
-/// then jumps to the next preamble and decoding resumes cleanly.
-///
-/// Window = one V3 preamble period (the cadence at which fresh
-/// decoding budget is renewed), quota = 2 lets a small burst of
-/// marginal SFs use the grid without committing the worker to a
-/// sustained ~225 ms/s = 22.5 % CPU overhead. Tune empirically.
-const LOWPOWER_GRID_QUOTA: usize = 2;
-const LOWPOWER_GRID_WINDOW_S: u64 = 4;
+// 0.10.47 : LOWPOWER_GRID_QUOTA / LOWPOWER_GRID_WINDOW_S constants
+// removed. Quota was throttling the safety grid to 2 invocations per
+// 4 s, sacrificing recoverable SFs for a CPU saving rendered moot by
+// the parallel grid 4-by-4 (0.10.35). Grid now fires whenever
+// Gardner + fast-path don't reach is_clean -- its design intent.
 
 // ---------------------------------------------------------------------------
 // Worker state
@@ -751,14 +737,12 @@ struct WorkerState {
     /// produced no codewords. Reset to 0 on any successful decode.
     /// Triggers `LATE_ENTRY_FAIL_THRESHOLD` when crossed (lowpower only).
     n_consecutive_undecoded_ticks: u32,
-    /// Wall-clock timestamps of recent `rx_v2_with_options` calls that
-    /// actually entered the ±15 ppm safety grid (detected via
-    /// `perf_this_tick.n_passes > 2`). Maintained as a rolling window
-    /// of `LOWPOWER_GRID_WINDOW_S` seconds and used to gate the next
-    /// tick's effective `allow_legacy_grid` in lowpower mode. Empty in
-    /// desktop mode (the user setting is already `true` so the gate
-    /// never consults this).
-    lowpower_grid_recent: VecDeque<Instant>,
+    // 0.10.47 : lowpower_grid_recent VecDeque + LOWPOWER_GRID_QUOTA
+    // (2 invocations per LOWPOWER_GRID_WINDOW_S = 4 s) removed. The
+    // quota mechanism was stripping data-recovery opportunities for
+    // a CPU saving we no longer need (parallel grid 4-by-4 on
+    // aarch64 makes a grid pass cheap enough to fire on every tick
+    // that needs it).
 }
 
 /// Residual drift (ppm) above which we re-run the Gardner estimator on
@@ -822,7 +806,6 @@ impl WorkerState {
             perf_sf_count: 0,
             last_decoded_preamble_audio_pos: None,
             n_consecutive_undecoded_ticks: 0,
-            lowpower_grid_recent: VecDeque::new(),
         }
     }
 
@@ -862,7 +845,6 @@ impl WorkerState {
         self.session_drift_ppm = None;
         self.last_decoded_preamble_audio_pos = None;
         self.n_consecutive_undecoded_ticks = 0;
-        self.lowpower_grid_recent.clear();
     }
 
     /// Keep only the last `PREROLL_SECONDS` of audio in the in-memory buffer.
@@ -881,7 +863,6 @@ impl WorkerState {
         self.announced_sessions.clear();
         self.last_decoded_preamble_audio_pos = None;
         self.n_consecutive_undecoded_ticks = 0;
-        self.lowpower_grid_recent.clear();
         // 0.10.39 : also drop the session-level drift hint. Without this,
         // the next preamble after a preamble-absence timeout (= end-of-burst from
         // the worker's POV) inherits the previous session's ppm via
@@ -1423,33 +1404,18 @@ fn scan_and_route(
     // so end-of-burst recovery doesn't need a second scan.
     let finalize = !state.session_active;
 
-    // Effective `allow_legacy_grid` for this tick. Desktop (user setting
-    // `true`) always allows the grid as the rare safety-net pass it
-    // already was. Lowpower (`false`) re-enables the grid AS A LAST
-    // RESORT subject to a sliding-window quota of LOWPOWER_GRID_QUOTA
-    // invocations per LOWPOWER_GRID_WINDOW_S seconds. Prune the rolling
-    // window first so the test below sees only currently-counting
-    // invocations.
-    let grid_window = Duration::from_secs(LOWPOWER_GRID_WINDOW_S);
-    let now_grid_gate = Instant::now();
-    while let Some(&front) = state.lowpower_grid_recent.front() {
-        if now_grid_gate.duration_since(front) >= grid_window {
-            state.lowpower_grid_recent.pop_front();
-        } else {
-            break;
-        }
-    }
-    let effective_allow_grid = state.allow_legacy_grid
-        || state.lowpower_grid_recent.len() < LOWPOWER_GRID_QUOTA;
-    // 0.10.37 : cap the per-tick preamble search to 2 (= 1 SF + 1
-    // boundary) whenever the USER toggle is off, independent of
-    // whether the safety grid is currently allowed as a fallback via
-    // `effective_allow_grid`. Previously the cap rode on
-    // `effective_allow_grid`, so an in-quota fallback tick lifted the
-    // cap and dumped the whole 3-4 SF backlog through the grid in one
-    // tick — exactly what saturates one core on a Pi 4 after lag
-    // accumulates. Now the cap is fixed by the user toggle ; grid
-    // permission is decoupled.
+    // 0.10.47 : the `LOWPOWER_GRID_QUOTA` mechanism (2 grid invocations
+    // per 4-second window) was removed. With the parallel 4-by-4 grid
+    // on aarch64 (0.10.35) each invocation costs ~500 ms wall-clock
+    // instead of ~1100 ms ; throttling it at 2/4 s was sacrificing
+    // recoverable SFs for a CPU saving we no longer need. The grid
+    // now fires on every tick where Gardner + fast-path didn't reach
+    // is_clean -- exactly its design intent.
+    //
+    // 0.10.37 cap : per-tick preamble search still capped at 2 (=
+    // 1 SF + 1 boundary) when the user toggle is OFF, independent
+    // of grid permission. Bounded per-tick CPU spike.
+    let effective_allow_grid = true;
     let lowpower_position_cap = !state.allow_legacy_grid;
 
     let rx_v3_opt = rx_v2::rx_v3_after(
@@ -1475,20 +1441,13 @@ fn scan_and_route(
     // to know "did we pay the grid cost on this tick" so the next ticks
     // can back off if too many recent ones did.
     if perf_this_tick.n_passes > 2 {
-        // Quota accounting stays lowpower-only (it gates the next tick's
-        // grid permission). The Tauri event below fires in BOTH modes so
-        // the GUI Events tab surfaces every grid invocation, not just
-        // the lowpower-fallback ones.
-        if !state.allow_legacy_grid {
-            state.lowpower_grid_recent.push_back(Instant::now());
-            worker_log(&format!(
-                "[grid-quota] grid entered this tick (n_passes={}, recent={}/{} in last {}s)",
-                perf_this_tick.n_passes,
-                state.lowpower_grid_recent.len(),
-                LOWPOWER_GRID_QUOTA,
-                LOWPOWER_GRID_WINDOW_S,
-            ));
-        }
+        // 0.10.47 : quota accounting stripped. Just keep the worker_log
+        // line for tracability without the recent/{}/{} suffix.
+        worker_log(&format!(
+            "[grid] entered this tick (n_passes={}, lowpower={})",
+            perf_this_tick.n_passes,
+            !state.allow_legacy_grid,
+        ));
         // Surface the entry/exit/duration/ppm of the grid pass to the
         // GUI Events tab. `t_end_ms` is taken from the same Instant as
         // `t_rx_v3_us` so the two are consistent. `drift_ppm` comes
@@ -1511,8 +1470,12 @@ fn scan_and_route(
                 n_passes: perf_this_tick.n_passes as u32,
                 drift_ppm,
                 fallback: !state.allow_legacy_grid,
-                recent: state.lowpower_grid_recent.len(),
-                quota: LOWPOWER_GRID_QUOTA,
+                // 0.10.47 : quota disabled. Fields kept for backward
+                // compat with the GUI listener but always 0/0 — the
+                // GUI shows "0/0" which the operator reads as "no
+                // throttling, grid fires whenever needed".
+                recent: 0,
+                quota: 0,
             },
         );
     }
@@ -1878,6 +1841,30 @@ fn scan_and_route(
     // We still honour the EOT flag if it was set — it tells us the TX ended
     // this burst, so we can free the in-memory audio buffer right away.
     let Some(ref ah) = result.app_header else {
+        // 0.10.47 CRITICAL FIX : drain the buffer past `last_preamble_offset
+        // - margin` BEFORE returning. Without this, when `find_all_preambles`
+        // found preambles but the decode produced no AppHeader (meta CW
+        // LDPC failed, or the window was too partial), we returned early
+        // with the buffer untouched -- next tick re-found the SAME
+        // preambles, re-attempted the SAME windows, re-failed identically,
+        // forever. Observed on OTA 2026-05-19 at 20:16:29 onwards :
+        // identical sf_detail emitted every 2-3 s for 88 s straight
+        // (kurt=1.29, sigma2=0.04, ppm=0, total=5, converged=0) until
+        // the operator manually clicked Stop. The buffer advance must
+        // happen on EVERY tick that found at least one preamble,
+        // regardless of decode success -- otherwise a single hostile
+        // window stalls the worker indefinitely.
+        //
+        // Mirrors the drain logic at line ~2050 (the success path).
+        if let Some(p_last) = result.last_preamble_offset {
+            let margin = AUDIO_RATE as usize * TRUNCATE_MARGIN_MS / 1000;
+            let drain_end = p_last
+                .saturating_sub(margin)
+                .min(state.session_buffer.len());
+            if drain_end > 0 {
+                state.session_buffer.drain(..drain_end);
+            }
+        }
         if eot_seen {
             state.trim_buffer_to_preroll();
             sink.emit(
