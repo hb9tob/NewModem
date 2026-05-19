@@ -62,8 +62,8 @@ use crate::pilot2x_tdm::PilotPattern2x;
 use crate::streaming_dsp::StreamingDsp;
 use crate::streaming_phase::{StreamObs, StreamingPhaseTracker};
 use crate::plheader::{
-    decode_plheader_at, preamble_for_family, sof_for_family, PlsPayload,
-    PreambleFamily2x, PLHEADER_LEN_SYM, PREAMBLE_LEN_SYM, SOF_LEN_SYM,
+    decode_plheader_at, sof_for_family, PlsPayload,
+    PLHEADER_LEN_SYM, PREAMBLE_LEN_SYM, SOF_LEN_SYM,
 };
 use crate::profile2x::ModemConfig2x;
 use crate::rx_v4::{
@@ -92,10 +92,16 @@ pub const RX2X_RETRY_BUDGET: u8 = 2;
 /// Cap on backward-fix resets triggered by `cached_drift_ppm` updates.
 /// Each reset re-scans the symbol stream from sample 0 — necessary
 /// when the drift estimate changes mid-session so the FSM can re-lock
-/// on PLHEADER positions in the freshly-resampled sym_buffer. Capping
-/// guards against pathological oscillation where each new chunk's
-/// drift estimate keeps moving more than 0.5 ppm.
-pub const RX2X_MAX_DRIFT_RESETS: u8 = 50;
+/// Maximum number of times the drift estimator may commit a new
+/// `cached_drift_ppm` value to the resampler. **One-shot architecture**
+/// (see [[feedback-drift-architecture-one-shot-plus-fine-tracking]]) :
+/// once the second-Chu LS (`estimate_drift_from_raw`) produces a
+/// reliable estimate (≥ 2 SOFs at HIGH+2X gives ~0.5 ppm precision),
+/// the value is committed **once** and frozen for the rest of the
+/// session. The continuous `streaming_phase::StreamingPhaseTracker`
+/// + turbo data-assist (`5d78ae7`) absorb fine residual drift on
+/// pilots and decoded data. Catastrophe trigger TBD.
+pub const RX2X_MAX_DRIFT_RESETS: u8 = 1;
 
 /// Number of consecutive chunks with no significant drift update
 /// (< 0.5 ppm) before `drift_locked` flips to true on the early path
@@ -1794,41 +1800,52 @@ impl Rx2xSession {
             + effective_scan_end.min(cursor_advance_cap) as u64;
 
         // Step 2: refine each new SOF's audio-rate position via a local
-        // downmix+MF+parabolic peak fit on a small window. Bounded work
-        // per SOF: window size ≈ PREAMBLE_LEN_SYM*sps + 2·sps + 2·RRC*sps
-        // audio samples (≈ 6 kSamples for HIGH+2X, ≈ 0.1× audio_buffer
-        // pre-fix), one FFT-MF per refinement.
-        let preamble_template = preamble_for_family(self.cfg.family);
-        let n_sof_audio = PREAMBLE_LEN_SYM * sps;
-        let win = sps as i64;
+        // downmix+MF+parabolic peak fit. Two changes vs the legacy
+        // double-Chu refinement (2026-05-19) :
+        //
+        //   a) The refinement targets the **second-Chu** start (offset
+        //      SOF_LEN_SYM·sps after the preamble start). Why second
+        //      and not first: the first Chu sits on the preburst →
+        //      preamble RRC transition (gain step, AGC settling on real
+        //      hardware), so the matched-filter peak there is biased.
+        //      The second Chu is fully steady-state and gives a clean
+        //      peak.
+        //
+        //   b) Correlation uses the **single-Chu** template (SOF_LEN_SYM
+        //      symbols, peak magnitude = SOF_LEN_SYM = 64) — locked on
+        //      the second Chu only. With template length 64, the only
+        //      peak in a ± SOF_LEN_SYM·sps/2 window around the
+        //      predicted second-Chu start is the second-Chu peak itself
+        //      (first-Chu peak is at −SOF_LEN_SYM·sps, outside the
+        //      window).
+        //
+        // The search window is widened to ± SOF_LEN_SYM·sps/2 (= ± half
+        // a Chu) to tolerate up to ± SOF_LEN_SYM·sps/2 audio samples
+        // of cumulative projection error per cycle. At HIGH+2X
+        // (sps=32) that's ± 1024 samples = ± ~5300 ppm of accumulated
+        // drift over a 5689-sym cycle — far more than any realistic
+        // soundcard or QO-100 SDR offset.
+        let chu_template = sof_for_family(self.cfg.family);
+        let n_chu_audio = SOF_LEN_SYM * sps;
+        let half_chu_audio = (SOF_LEN_SYM * sps / 2) as i64;
+        let win = half_chu_audio;
         let rrc_margin = (RRC_SPAN_SYM * sps) as i64;
         let taps = rrc_taps(self.cfg.base.beta, RRC_SPAN_SYM, sps);
         let resample_factor = 1.0 + self.cached_drift_ppm * 1e-6;
         for sym_abs in new_validated {
-            // Project audio position to `audio_buffer` RELATIVE coords.
-            //
-            // Two-step :
-            //   1. Absolute raw-audio index of sym i ≈ i · sps ·
-            //      resample_factor (streaming_dsp resampled the raw
-            //      audio so output sym i was decimated from raw audio
-            //      around sample i·sps·ratio).
-            //   2. Subtract `audio_drained_samples` to land in
-            //      audio_buffer-relative coords (audio_buffer[0] sits
-            //      at absolute index audio_drained_samples after
-            //      `trim_audio_for_streaming` has fired). `buf_start_abs`
-            //      is NOT a meaningful offset here: streaming_dsp's
-            //      sym_buffer-index 0 corresponds to TX-time sample 0
-            //      which corresponds to raw-audio sample 0 (the
-            //      session's audio origin), not to audio_buffer[0].
+            // Project the SECOND-CHU start to raw-audio coords. The
+            // preamble starts at `sym_abs` (sym_buffer index = TX
+            // symbol). The second Chu starts SOF_LEN_SYM symbols
+            // later. resample_factor converts TX-time samples back to
+            // raw-audio samples.
+            let second_chu_sym_abs = sym_abs + SOF_LEN_SYM as u64;
             let audio_abs_predicted =
-                (sym_abs as f64) * (sps as f64) * resample_factor;
+                (second_chu_sym_abs as f64) * (sps as f64) * resample_factor;
             let audio_rel_predicted =
                 audio_abs_predicted as i64
                     - self.audio_drained_samples as i64;
             // If the projected position falls before the rolling audio
             // window, the SOF's raw audio is already trimmed — skip.
-            // The dup check (drift_refined_sofs lookup) prevents us
-            // from re-attempting on later chunks.
             if audio_rel_predicted < win + rrc_margin {
                 if trace {
                     eprintln!(
@@ -1841,20 +1858,16 @@ impl Rx2xSession {
                 }
                 continue;
             }
-            // Slice window with enough margin for FIR convergence.
+            // Slice window: leave ± half_chu_audio + RRC margin on each
+            // side of the predicted second-Chu start.
             let slice_lo = (audio_rel_predicted - win - rrc_margin).max(0)
                 as usize;
             let slice_hi_excl = ((audio_rel_predicted
-                + n_sof_audio as i64
+                + n_chu_audio as i64
                 + win
                 + rrc_margin) as usize)
                 .min(self.audio_buffer.len());
-            if slice_hi_excl <= slice_lo + n_sof_audio {
-                // Window doesn't fit in the rolling buffer — common at
-                // session start before audio_buffer fills, or post-trim
-                // if a SOF is too far back. Skip; next chunk may have
-                // it covered, or it's permanently lost (which is fine —
-                // we don't gain from one missed SOF).
+            if slice_hi_excl <= slice_lo + n_chu_audio {
                 if trace {
                     eprintln!(
                         "[drift-trace]   skip sym_abs={} pred_rel={} lo={} hi={} \
@@ -1869,25 +1882,23 @@ impl Rx2xSession {
                 continue;
             }
             let audio_slice = &self.audio_buffer[slice_lo..slice_hi_excl];
-            // Local downmix uses NCO phase starting at audio slice index
-            // 0; the magnitude of the preamble-template cross-correlation
-            // is invariant under a uniform phase rotation across `mf`,
-            // so we don't need to absolute-align the NCO phase.
             let bb = demodulator::downmix(
                 audio_slice, self.cfg.base.center_freq_hz);
             let mf = demodulator::matched_filter(&bb, &taps);
-            let max_pos_mf = mf.len().saturating_sub(n_sof_audio);
+            let max_pos_mf = mf.len().saturating_sub(n_chu_audio);
             if max_pos_mf == 0 {
                 continue;
             }
+            // Single-Chu correlation (64 sym).
             let corr_at = |pos: usize| -> f64 {
                 let mut acc = Complex64::new(0.0, 0.0);
-                for (k, &s) in preamble_template.iter().enumerate() {
+                for (k, &s) in chu_template.iter().enumerate() {
                     acc += mf[pos + k * sps] * s.conj();
                 }
                 acc.norm()
             };
-            // Search ±win mf samples around the projected center.
+            // Search ±half_chu_audio mf samples around the predicted
+            // second-Chu start.
             let mf_center = (audio_rel_predicted as usize)
                 .saturating_sub(slice_lo);
             let mf_lo = mf_center.saturating_sub(win as usize);
@@ -1951,6 +1962,23 @@ impl Rx2xSession {
         }
         let slope = sum_xy / sum_xx;
         let new_drift = (slope - cycle_audio) / cycle_audio * 1e6;
+        if std::env::var_os("RX2X_LOG_DRIFT_LS").is_some() {
+            eprintln!(
+                "[drift-ls] cycle_audio={:.1} n_used={} slope={:.1} \
+                 new_drift={:+.2} ppm",
+                cycle_audio, n_used, slope, new_drift,
+            );
+            for (i, rec) in self.drift_refined_sofs.iter().enumerate() {
+                let y = rec.audio_abs_refined - p0;
+                let k = (y / cycle_audio).round();
+                let resid = y - k * cycle_audio;
+                eprintln!(
+                    "[drift-ls]   sof[{i}] sym_abs={} audio_abs={:.2} y={:.2} k={} resid={:+.2}",
+                    rec.sym_abs, rec.audio_abs_refined, y, k as i64, resid,
+                );
+            }
+        }
+        // Kept the debug log behind `RX2X_LOG_DRIFT_LS` for future bisection.
         if !new_drift.is_finite() || new_drift.abs() > 300.0 {
             return false;
         }
@@ -1976,6 +2004,9 @@ impl Rx2xSession {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10.0);
+        let would_apply = diff >= apply_threshold
+            && self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
+            && self.drift_refined_sofs.len() >= 2;
         if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
             eprintln!(
                 "[rx2x-drift] sofs={} (streaming refined) cached={:+.2} \
@@ -1985,57 +2016,48 @@ impl Rx2xSession {
                 new_drift,
                 new_drift - self.cached_drift_ppm,
                 apply_threshold,
-                diff >= apply_threshold
-                    && std::env::var_os("RX2X_SOF_DRIFT").is_some(),
+                would_apply,
             );
         }
         if diff < apply_threshold {
             return false;
         }
-        // Apply the new drift estimate. Gated by `RX2X_SOF_DRIFT=1`
-        // (default off until the worker-level A/B has run on OTA
-        // baselines). Returns `true` so the caller logs the reset.
+        // **One-shot apply** (2026-05-19, [[feedback-drift-architecture-one-shot-plus-fine-tracking]]).
+        // The second-Chu single-Chu refinement (`estimate_drift_from_raw`
+        // step 2 post-2026-05-19) gives ±0.5 ppm precision with just 2
+        // SOFs — sub-sample peak fit on the steady-state second Chu
+        // sequence, no transition artefacts. Validated empirically :
+        // injected +130 ppm → measured +129.99 ppm.
         //
-        // The "streaming coherence" problem that previously blocked
-        // mid-session drift updates (cf the pre-rewind comment) is
-        // handled in two steps here:
+        // Once committed, `RX2X_MAX_DRIFT_RESETS = 1` freezes the
+        // resampler ratio for the rest of the session. Fine residual
+        // drift + phase noise + sub-ppm thermal are absorbed by the
+        // continuous `streaming_phase::StreamingPhaseTracker` (Kalman
+        // on `[φ, ω]` over pilots + DD data, persistent across cycles)
+        // and the turbo EM loop. **Catastrophe** trigger TBD.
         //
-        //   1. `streaming.rewind_for_drift_change` re-anchors the
-        //      resampler integrator to the stateless mapping
-        //      `K · (1 + new_drift · 1e-6)` going forward, AND drops
-        //      every downstream byproduct produced at the old ratio
-        //      (pre-switch `sym_buffer`, MF delay line, intermediate
-        //      stages). Future emits land at the correct TX-time
-        //      positions for `new_drift`.
-        //
-        //   2. `reset_for_backward_fix` clears the FSM scan state,
-        //      σ² accumulators, and FFE taps so the post-rewind
-        //      symbols are re-scanned from scratch as soon as the
-        //      next chunk's `refresh_symbols` populates them. Already-
-        //      decoded CWs from the wrong-drift period STAY in
-        //      `cw_bytes` (preserved by reset_for_backward_fix), so
-        //      META + early-cycle decoding pays no penalty.
-        //
-        // Budget: the apply path bumps `n_drift_resets`. When the
-        // counter reaches `RX2X_MAX_DRIFT_RESETS`, `lock_drift_if_ready`
-        // freezes the drift estimate (rest of the burst runs on cached
-        // value). Subsequent `estimate_drift_from_raw` calls still
-        // compute the LS estimate for diagnostics but don't apply.
-        // Sofs gate: LS through 2 points has ±50 ppm noise floor on
-        // OTA captures (empirical 2026-05-18: OTA 2 wildly oscillated
-        // +87 → −171 → −82 → −161 → −115 ppm with sofs=2 estimates
-        // applied at every rewind). 3 points is the minimum for the
-        // slope to be robust against per-point parabolic-fit noise.
-        // Override with `RX2X_SOF_DRIFT_MIN_SOFS=<n>` (default 3) for
-        // A/B tuning.
-        let min_sofs: usize = std::env::var("RX2X_SOF_DRIFT_MIN_SOFS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
-        if std::env::var_os("RX2X_SOF_DRIFT").is_some()
-            && self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
-            && self.drift_refined_sofs.len() >= min_sofs
+        // The `RX2X_LOCK_DRIFT_PPM` env hook (commit `a7b8e11`) remains
+        // a diagnostic — when set, overrides cached_drift_ppm every
+        // chunk in `refresh_symbols`, defeating this one-shot commit.
+        if self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
+            && self.drift_refined_sofs.len() >= 2
         {
+            // **One-shot resampler commit.** Treat the current
+            // `audio_buffer` as the start of a "virtual session" at the
+            // new ratio :
+            //   1. Replace `streaming_dsp` with a fresh instance →
+            //      resampler_next_tx, downmix_next_abs, decimation
+            //      cursor, mf_state all start at zero.
+            //   2. Reset `audio_drained_samples = 0` so audio_buffer[0]
+            //      is treated as session-time origin in the new frame.
+            //   3. Clear `drift_refined_sofs` — the absolute audio
+            //      positions stored there were in the OLD frame
+            //      (shifted by the previous drained value). Subsequent
+            //      SOFs in the new frame will be re-refined and feed
+            //      the fine tracker.
+            self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
+            self.audio_drained_samples = 0;
+            self.drift_refined_sofs.clear();
             self.cached_drift_ppm = new_drift;
             self.n_drift_resets = self.n_drift_resets.saturating_add(1);
             // Polyphase resampler is stateless w.r.t. the ratio: the
