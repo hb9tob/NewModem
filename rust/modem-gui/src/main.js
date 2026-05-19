@@ -3042,6 +3042,15 @@ function wireEvents() {
     logEvent("worker_requests_restart", { reason });
     logEvent("auto_stop", { reason });
     try {
+      // 0.10.46 fix : `invoke` is not in scope inside wireEvents()
+      // listener closures by default — must be destructured from
+      // `window.__TAURI__.core` like every other usage in this file
+      // (see e.g. main.js:133, 183, 711). Without this destructure
+      // the listener threw `ReferenceError: Can't find variable:
+      // invoke` and `worker_requests_restart_error` fired every
+      // single Idle transition since 0.10.43, meaning the auto
+      // stop/start NEVER actually ran.
+      const { invoke } = window.__TAURI__.core;
       await invoke("restart_capture");
       logEvent("auto_start", { reason });
     } catch (err) {
