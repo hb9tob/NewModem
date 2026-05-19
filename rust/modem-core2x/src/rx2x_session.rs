@@ -884,7 +884,17 @@ impl Rx2xSession {
                     }
                     self.cached_drift_ppm = 0.0;
                     self.bootstrap_committed = true;
-                    self.drift_locked = true;
+                    // `drift_locked` stays FALSE until the one-shot
+                    // drift estimator commits (see
+                    // `maybe_apply_drift_estimate`). Keeping it false
+                    // here means `trim_audio_for_streaming` is a no-op
+                    // → audio_buffer accumulates from session start so
+                    // that when the one-shot apply fires later, the
+                    // streaming_dsp can be rebuilt and replay the
+                    // FULL captured audio at the new ratio. Without
+                    // this, early audio is trimmed before the
+                    // estimator commits and the first few ESIs are
+                    // unrecoverable post-apply.
                     return true;
                 }
             }
@@ -2087,6 +2097,11 @@ impl Rx2xSession {
             self.result.total_cws = 0;
             self.result.converged_cws = 0;
             self.result.converged_bitmap.clear();
+            // Now that the resampler ratio is committed, enable
+            // `trim_audio_for_streaming` (gated on `drift_locked`).
+            // From this point onward the audio_buffer is allowed to
+            // forget the early prefix once it's been processed.
+            self.drift_locked = true;
             self.cached_drift_ppm = new_drift;
             self.n_drift_resets = self.n_drift_resets.saturating_add(1);
             // Polyphase resampler is stateless w.r.t. the ratio: the

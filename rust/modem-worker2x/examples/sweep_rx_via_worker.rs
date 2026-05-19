@@ -136,6 +136,10 @@ fn main() -> ExitCode {
     // Prefer rx2x_session_finalized for totals (always emitted post-finalize,
     // even when zero DATA CWs converged). Fall back to last v2_progress for
     // older builds.
+    let app_header_seen: bool = final_summary
+        .as_ref()
+        .and_then(|p| p.get("app_header_seen").and_then(Value::as_bool))
+        .unwrap_or(false);
     let (converged, total, sigma2, sigma2_scatter, es_scatter, scatter_n) =
         if let Some(p) = final_summary.as_ref() {
             (
@@ -194,6 +198,7 @@ fn main() -> ExitCode {
         "decoded_bytes": decoded_bytes,
         "saved_path": saved_path,
         "file_complete_seen": file_complete.is_some(),
+        "app_header_seen": app_header_seen,
         "exact": exact,
         "error": error,
     });
