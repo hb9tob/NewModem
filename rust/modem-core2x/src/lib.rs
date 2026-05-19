@@ -114,6 +114,12 @@ pub mod modem2x;
 // channel-sim validation 2026-05-17.
 pub mod streaming_dsp;
 
+// 2-state Kalman tracker on [φ, ω] with persistent state across the
+// session. Fed by pilots (always) + DD on converged-CW data symbols.
+// Replaces the per-CW Pass-1 single-gain phase correction and the
+// cycle-end batch RTS.
+pub mod streaming_phase;
+
 // Slice 2x19 — live streaming RX session. Full state machine + turbo
 // loops integrated. Replaces the worker's batch decode pattern. See
 // plan `ok-alors-le-rms-precious-shannon.md`.

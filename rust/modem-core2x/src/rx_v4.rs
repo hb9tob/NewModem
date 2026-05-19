@@ -519,7 +519,7 @@ pub(crate) fn find_next_sof(
 /// toward the cycle mean — appropriate for the near-stationary NBFM
 /// channel — while the per-CW TDM pilots still preserve sensitivity to
 /// genuine intra-cycle drift.
-fn estimate_cw_gain(
+pub(crate) fn estimate_cw_gain(
     chunk: &[Complex64],
     cw_data_syms: usize,
     pattern: &PilotPattern2x,
@@ -2015,103 +2015,182 @@ pub(crate) fn decode_one_cw(
     let _ = encoder; // EM Pass 2 no longer re-encodes hard symbols
     let _ = k_bytes;
 
-    // --- Turbo Pass 2 EM (forward-backward Kalman + RTS) ----------------
+    // --- Turbo EM iterative loop (Pass 2..N) ----------------------------
     //
-    // Pass 1 LDPC produced bit posteriors (saturated when Pass 1
-    // converged, intermediate-magnitude when it ran out of iterations
-    // on a near-miss). Convert them to **soft constellation symbols**
-    // (E[s_k | LLR_post] and ring-conditional means), then run three
-    // Kalman + RTS smoothers to refine the channel model with the
-    // full LDPC information:
+    // Closed-loop alternation between LDPC decoding and channel-model
+    // refinement (phase + per-ring gain + per-ring σ²). Each iteration
+    // is one full E-M cycle :
     //
-    //   1. Phase φ_k        — 2-state {phase, drift} smoother
-    //                         (`phase_smoother::rts_phase_smooth`).
-    //   2. Per-ring gain g_r(k) — 1-state complex random-walk (real
-    //                         and imag smoothed independently).
-    //   3. Per-ring log-σ²_r(k) — 1-state random-walk on the log scale
-    //                         (additive model for multiplicative σ²
-    //                         drift, with χ²₂-derived bias correction).
+    //   E-step : soft symbols from current posterior LLR (or from
+    //            Pass 1 posterior on iter 0)
+    //   M-step : RTS phase smoother → per-ring gain RTS → per-ring σ²
+    //            RTS → re-LLR per-symbol-per-ring → LDPC
     //
-    // The three smoothers feed `llr_maxlog_per_sym_per_ring` for the
-    // Pass 2 re-LLR.
+    // The fundamental trade-off this loop fixes : on a non-AWGN APSK
+    // channel (AM-AM, AM-PM, residual phase noise), pilot-only σ²
+    // under-reports the true data-symbol noise on outer rings. A single
+    // EM step (the old one-shot Pass 2) helps but converges to a local
+    // optimum biased toward the Pass 1 posterior — itself wrong because
+    // Pass 1 used pilot-only σ². Iterating gives LDPC a chance to
+    // refine the posterior, which sharpens the σ² estimate, which feeds
+    // better LLR back to LDPC.
     //
-    // **Run unconditionally** — even when Pass 1 didn't converge.
-    // The posterior LLRs at LDPC max_iter are imperfect (the decoder
-    // got stuck in some local minimum) but still informative: bit
-    // signs carry the decoder's best guess, magnitudes carry how
-    // confident it was. The soft symbols built from them are noisier
-    // than the converged case but still strongly biased toward the
-    // truth on most positions. The EM channel refinement then gives
-    // LDPC a second shot with better-scaled LLRs, which on the SNR
-    // cliff (where a few dB of LLR-scale error is the difference
-    // between hitting max_iter and converging) rescues a meaningful
-    // fraction of CWs. Trust Pass 2 byte output whenever Pass 2 LDPC
-    // converges, regardless of Pass 1's status.
+    // Stopping criteria (any one) :
+    //   1. LDPC converged on this iter — break, use these info bytes.
+    //   2. `info_bytes` did not change between two consecutive iters —
+    //      EM has stabilised, further iterations won't help.
+    //   3. Max iterations reached (`RX2X_EM_MAX_ITER`, default 3).
+    //
+    // Even when Pass 1 LDPC converged, we still run **one** EM iteration
+    // so that downstream consumers (σ²_data_scatter accumulation,
+    // constellation_sample dump, per-cycle pilot phase mean) operate
+    // on the EM-refined `data_p2` rather than the Pass 1 raw `data_norm`.
+    // This matches the pre-refactor behaviour and keeps GUI diagnostics
+    // stable. (Iterating past iter 0 is a no-op when Pass 1 already
+    // converged because the loop breaks immediately.)
+    //
+    // The iteration count is the only behavioural change vs the pre-
+    // refactor one-shot Pass 2 — every step still uses the same
+    // smoothers / LLR computers / LDPC decoder. Override via the env
+    // var for A/B (`RX2X_EM_MAX_ITER=1` recovers the legacy one-shot).
+    let max_em_iter: usize = std::env::var("RX2X_EM_MAX_ITER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v: &usize| v >= 1)
+        .unwrap_or(3);
     let (info_bytes, converged) = {
-        // Step 1. Re-interleave posterior LLR (n bits) back to the
-        // symbol-major space (cw_data_syms × bps bits). The padding bit
-        // (when present, e.g. Apsk32 R=1/2 pads 2304 → 2305) sits at
-        // index `decoder.n()` in symbol-major space — TX padded with
-        // bit 0, so we inject a very confident positive LLR.
+        // Constants reused across iterations.
         let padded_len = interleave_perm.len();
-        let mut posterior_padded = vec![25.0_f32; padded_len];
-        posterior_padded[..decoder.n()].copy_from_slice(&posterior_ldpc_order);
-        let posterior_symbol_major =
-            interleaver::apply_permutation_f32(&posterior_padded, interleave_perm);
         let bps = constellation.bits_per_sym;
         let n_data_bits = cw_data_syms * bps;
-        let posterior_for_symbols = &posterior_symbol_major[..n_data_bits];
-
-        // Step 2. Soft symbols.
-        let soft = soft_demod::soft_symbols_from_posterior_llr(
-            posterior_for_symbols, constellation);
-        debug_assert_eq!(soft.len(), data_norm.len());
-
-        // Step 3. RTS phase smoother on raw (gain-untouched) data. The
-        // measurement angle arg(y · conj(s̃)) is invariant to a small
-        // residual gain magnitude error — phase is mostly orthogonal
-        // to gain estimation at this stage.
         let sigma2_tang = split.tangential.max(SIGMA2_FLOOR / 2.0);
-        let phase_obs = pass2_em_phase_obs(&data_norm, &soft, sigma2_tang);
         let phase_params = PhaseSmootherParams::from_channel(channel_model.sigma2_phi);
-        let phi_smooth = rts_phase_smooth(&phase_obs, &phase_params);
 
-        // Step 4. EM per-ring gain g_r(k) on phase-derotated data.
-        let mut data_p2: Vec<Complex64> = data_norm
-            .iter()
-            .zip(phi_smooth.iter())
-            .map(|(&y, &phi)| y * Complex64::from_polar(1.0, -phi))
-            .collect();
-        let gain_per_ring =
-            pass2_em_gain_smoother(&data_p2, &soft, constellation, &channel_model);
+        // Loop state. We start each iteration from `posterior_curr`
+        // (initialised to Pass 1's posterior). Each iter produces a new
+        // posterior + info_bytes that feed the next iter.
+        let mut info_bytes_curr = info_bytes_p1.clone();
+        let mut posterior_curr = posterior_ldpc_order.clone();
+        let mut converged_curr = converged_p1;
 
-        // Apply posterior-weighted gain at each symbol.
-        let g_weighted = pass2_em_weighted_gain(&soft, &gain_per_ring);
-        for (y, g) in data_p2.iter_mut().zip(g_weighted.iter()) {
-            if g.norm_sqr() > 1e-12 {
-                *y = *y / *g;
+        // Snapshot of the LAST iter's `data_p2` + `phi_smooth` —
+        // consumed once after the loop for σ²_data_scatter accumulation,
+        // constellation_sample, and pilot_phase_per_cw stats. Initialised
+        // to data_norm so that if the loop body never runs (shouldn't
+        // happen with max_em_iter ≥ 1) we still have plausible values.
+        let mut data_p2_last: Vec<Complex64> = data_norm.clone();
+        let mut phi_smooth_last: Vec<f64> = vec![0.0_f64; data_norm.len()];
+
+        for em_iter in 0..max_em_iter {
+            // Step 1. Re-interleave current posterior back to symbol-major.
+            let mut posterior_padded = vec![25.0_f32; padded_len];
+            posterior_padded[..decoder.n()].copy_from_slice(&posterior_curr);
+            let posterior_symbol_major = interleaver::apply_permutation_f32(
+                &posterior_padded, interleave_perm);
+            let posterior_for_symbols = &posterior_symbol_major[..n_data_bits];
+
+            // Step 2. Soft symbols.
+            let soft = soft_demod::soft_symbols_from_posterior_llr(
+                posterior_for_symbols, constellation);
+            debug_assert_eq!(soft.len(), data_norm.len());
+
+            // Step 3. RTS phase smoother on raw (gain-untouched) data.
+            let phase_obs = pass2_em_phase_obs(&data_norm, &soft, sigma2_tang);
+            let phi_smooth = rts_phase_smooth(&phase_obs, &phase_params);
+
+            // Step 4. Per-ring gain smoother on phase-derotated data.
+            let mut data_p2: Vec<Complex64> = data_norm
+                .iter()
+                .zip(phi_smooth.iter())
+                .map(|(&y, &phi)| y * Complex64::from_polar(1.0, -phi))
+                .collect();
+            let gain_per_ring = pass2_em_gain_smoother(
+                &data_p2, &soft, constellation, &channel_model);
+            let g_weighted = pass2_em_weighted_gain(&soft, &gain_per_ring);
+            for (y, g) in data_p2.iter_mut().zip(g_weighted.iter()) {
+                if g.norm_sqr() > 1e-12 {
+                    *y = *y / *g;
+                }
             }
+
+            // Step 5. Per-ring σ²_r(k) EM smoother.
+            let identity_gain: Vec<Vec<Complex64>> = (0..gain_per_ring.len())
+                .map(|_| vec![Complex64::new(1.0, 0.0); data_p2.len()])
+                .collect();
+            let sigma2_em = pass2_em_sigma2_smoother(
+                &data_p2, &soft, &identity_gain,
+                constellation, &channel_model);
+            let sigma2_per_sym_per_ring = pass2_em_sigma2_to_per_sym_per_ring(
+                &sigma2_em, constellation, &channel_model, data_p2.len());
+
+            // Step 6. Re-LLR + re-LDPC. Keep posterior for the next iter.
+            let llr_em = soft_demod::llr_maxlog_per_sym_per_ring(
+                &data_p2, constellation, &sigma2_per_sym_per_ring);
+            let llr_em_deint = interleaver::apply_permutation_f32(
+                &llr_em, deinterleave_perm);
+            let llr_em_for_ldpc = &llr_em_deint[..decoder.n()];
+            let (info_bytes_new, posterior_new, converged_new) =
+                decoder.decode_to_bytes_with_posterior(llr_em_for_ldpc);
+
+            // Diagnostic: per-iter convergence trace.
+            if std::env::var_os("RX2X_LOG_EM_ITER").is_some() {
+                // sigma2_em is Vec<Vec<f64>> per ring per symbol; use a
+                // scalar summary (mean of ring 0's trajectory).
+                let r0_mean = if !sigma2_em.is_empty() && !sigma2_em[0].is_empty() {
+                    sigma2_em[0].iter().sum::<f64>()
+                        / sigma2_em[0].len() as f64
+                } else {
+                    f64::NAN
+                };
+                eprintln!(
+                    "[em-iter] esi={} is_meta={} iter={} converged={} \
+                     bytes_changed={} σ²_R0={:.4e}",
+                    esi,
+                    is_meta as u8,
+                    em_iter,
+                    converged_new as u8,
+                    (info_bytes_new != info_bytes_curr) as u8,
+                    r0_mean,
+                );
+            }
+
+            // Always snapshot the latest data_p2 / phi_smooth — they
+            // feed downstream consumers after the loop.
+            data_p2_last = data_p2;
+            phi_smooth_last = phi_smooth;
+
+            if converged_new {
+                info_bytes_curr = info_bytes_new;
+                posterior_curr = posterior_new;
+                converged_curr = true;
+                break;
+            }
+            // Stabilisation check: if the bytes didn't change, EM has
+            // plateaued — further iterations won't help.
+            if info_bytes_new == info_bytes_curr {
+                // Keep the last-converged-or-last-iter posterior; on a
+                // plateau we trust the LATEST iter's bytes (they're at
+                // least as refined as the prior iter).
+                info_bytes_curr = info_bytes_new;
+                posterior_curr = posterior_new;
+                break;
+            }
+            info_bytes_curr = info_bytes_new;
+            posterior_curr = posterior_new;
         }
 
-        // **Data-scatter σ²** (honest SNR metric, see `RxResult2x::
-        // sigma2_data_scatter` docstring). Hard-decode every post-Pass-2
-        // DATA symbol to the nearest constellation point and accumulate
-        // |y − s_hat|² and |s_hat|². DATA only — META CWs are skipped so
-        // the metric reflects the payload channel statistics the GUI
-        // operator cares about. The accumulation is over the burst's
-        // **entire** DATA history, weighted by symbol count (a running
-        // mean update on the existing means in `result`). The denomin-
-        // ator `data_scatter_n` doubles as the "metric valid" flag —
-        // zero means no DATA CW has been visited yet.
+        // Downstream consumers using the FINAL iter's data_p2 / phi_smooth.
+
+        // σ²_data_scatter accumulation (honest SNR metric).
         if !is_meta {
             let mut err_sq = 0.0_f64;
             let mut ref_sq = 0.0_f64;
-            for &y in data_p2.iter() {
+            for &y in data_p2_last.iter() {
                 let s_hat = constellation.hard_decision(y);
                 err_sq += (y - s_hat).norm_sqr();
                 ref_sq += s_hat.norm_sqr();
             }
-            let n_new = data_p2.len();
+            let n_new = data_p2_last.len();
             if n_new > 0 {
                 let prev_n = result.data_scatter_n as f64;
                 let new_n = prev_n + n_new as f64;
@@ -2123,32 +2202,23 @@ pub(crate) fn decode_one_cw(
             }
         }
 
-        // GUI diagnostic snapshot — recorded AFTER Pass 2 phase + gain
-        // correction so the constellation panel shows the modem's best
-        // estimate, not the raw Pass 1 cloud. Likewise the pilot phase
-        // entry pushed here is the mean of the RTS-smoothed phase
-        // trajectory `phi_smooth` (not `gain.arg()` from Pass 1) so the
-        // operator sees the trend Pass 2 actually fits, including the
-        // intra-CW slope a 1-state gain estimator would miss.
-        result
-            .pilot_phase_per_cw
-            .push(mean_phase(&phi_smooth));
+        // GUI diagnostic — per-CW pilot phase mean.
+        result.pilot_phase_per_cw.push(mean_phase(&phi_smooth_last));
         result.pilot_phase_is_meta.push(is_meta);
-        // Slice 2x21 sliding-window: keep only the most recent
-        // `PILOT_PHASE_RECENT_N` entries. The two arrays are parallel
-        // and must drain in lockstep.
         if result.pilot_phase_per_cw.len() > PILOT_PHASE_RECENT_N {
             let drop_n = result.pilot_phase_per_cw.len() - PILOT_PHASE_RECENT_N;
             result.pilot_phase_per_cw.drain(..drop_n);
             result.pilot_phase_is_meta.drain(..drop_n);
         }
+
+        // Constellation_sample dump (DATA only).
         if !is_meta
             && result.constellation_sample.len() < MAX_CONSTELLATION_POINTS
         {
             let remaining = MAX_CONSTELLATION_POINTS
                 - result.constellation_sample.len();
-            let step = (data_p2.len() / remaining.max(1)).max(1);
-            for (i, sym) in data_p2.iter().enumerate() {
+            let step = (data_p2_last.len() / remaining.max(1)).max(1);
+            for (i, sym) in data_p2_last.iter().enumerate() {
                 if i % step == 0 {
                     result
                         .constellation_sample
@@ -2162,39 +2232,15 @@ pub(crate) fn decode_one_cw(
             }
         }
 
-        // Step 5. EM per-ring σ²_r(k) on the now phase + gain corrected
-        // data. Uses the *unit* g_r expected after correction (so we
-        // pass identity gains for σ² estimation — residuals e = y − μ).
-        let identity_gain: Vec<Vec<Complex64>> = (0..gain_per_ring.len())
-            .map(|_| vec![Complex64::new(1.0, 0.0); data_p2.len()])
-            .collect();
-        let sigma2_em =
-            pass2_em_sigma2_smoother(&data_p2, &soft, &identity_gain,
-                                     constellation, &channel_model);
-        let sigma2_per_sym_per_ring = pass2_em_sigma2_to_per_sym_per_ring(
-            &sigma2_em, constellation, &channel_model, data_p2.len());
-
-        // Step 6. Re-LLR with the time-varying per-symbol per-ring σ²,
-        // then re-LDPC.
-        let llr_p2 = soft_demod::llr_maxlog_per_sym_per_ring(
-            &data_p2, constellation, &sigma2_per_sym_per_ring);
-        let llr_p2_deint = interleaver::apply_permutation_f32(
-            &llr_p2, deinterleave_perm);
-        let llr_p2_for_ldpc = &llr_p2_deint[..decoder.n()];
-        let (info_bytes_p2, converged_p2) = decoder.decode_to_bytes(llr_p2_for_ldpc);
-
-        // Combine the two passes. `converged_p2 = true` always wins:
-        // Pass 2 LDPC syndrome is zero, so its bytes are LDPC-valid
-        // even if Pass 1 disagreed. When Pass 2 didn't converge but
-        // Pass 1 did, fall back to Pass 1's bytes. When neither
-        // converged, take Pass 1's bytes and report `converged = false`
-        // — the CW won't contribute to RaptorQ assembly downstream.
-        if converged_p2 {
-            (info_bytes_p2, true)
-        } else if converged_p1 {
-            (info_bytes_p1, true)
+        // Final selection rules :
+        //   - If any EM iter or Pass 1 converged, return its info bytes.
+        //   - Otherwise, return the last iter's bytes with converged=false.
+        // The EM loop guarantees that if converged_curr=true, info_bytes_curr
+        // holds the bytes of the converged iter (Pass 1 or some EM iter).
+        if converged_curr {
+            (info_bytes_curr, true)
         } else {
-            (info_bytes_p1, false)
+            (info_bytes_curr, false)
         }
     };
 

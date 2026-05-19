@@ -60,6 +60,7 @@ use crate::frame2x::{
 use crate::gate2x::{PreambleProbe2x, IDLE_PROBE_BUF_SAMPLES, PROBE_THRESHOLD_2X};
 use crate::pilot2x_tdm::PilotPattern2x;
 use crate::streaming_dsp::StreamingDsp;
+use crate::streaming_phase::{StreamObs, StreamingPhaseTracker};
 use crate::plheader::{
     decode_plheader_at, preamble_for_family, sof_for_family, PlsPayload,
     PreambleFamily2x, PLHEADER_LEN_SYM, PREAMBLE_LEN_SYM, SOF_LEN_SYM,
@@ -203,6 +204,18 @@ pub struct Rx2xSession {
     /// audio chunk just advances the pipeline; sym_buffer below is
     /// kept in sync with `streaming.sym_buffer()` for FSM consumption.
     streaming: StreamingDsp,
+    /// Streaming 2-state Kalman tracker `[φ, ω]` for residual phase
+    /// + drift across the entire session. Fed by pilot phase
+    /// observations from `drive_locked` (CW by CW, as the FSM walks
+    /// forward) and by DD on converged CWs (re-encoded data symbols
+    /// become high-confidence references for future CWs in the same
+    /// or subsequent cycles). Replaces the per-CW static gain rotation
+    /// of Pass 1 + the batch RTS smoother of `refine_cycle_and_turbo_
+    /// redecode`. Gated by `RX2X_PHASE_TRACKER=1` for A/B against the
+    /// pre-tracker behaviour. State persists across CWs / cycles;
+    /// only `rewind_for_drift_change` resets it (the rewind invalidates
+    /// the TX-time symbol grid, so past obs are no longer coherent).
+    phase_tracker: StreamingPhaseTracker,
     /// Symbol buffer. Position `i` in this vec corresponds to absolute
     /// symbol index `buf_start_abs + i`. Mirror of
     /// `streaming.sym_buffer()` — kept as an owned `Vec` so the
@@ -456,12 +469,32 @@ impl Rx2xSession {
             2 * cycle_period_sym + PLHEADER_LEN_SYM + 256;
 
         let streaming = StreamingDsp::new(&cfg);
+        // Streaming phase tracker. Tuning :
+        // - q_phi / q_omega: 1e-4 / 1e-7 (per-symbol random-walk) →
+        //   handles up to ~5 ppm/s ramp + ~10°/s phase noise typical of
+        //   sound-card OTA chains. Will be retuned from channel stats
+        //   on the first cycle's σ²_tang.
+        // - lag_len: PLHEADER_LEN_SYM (192) — one PLHEADER's worth of
+        //   backward correction is the natural unit (the PLHEADER
+        //   injects 192 strong obs, so retaining at least one PLHEADER
+        //   of history gives the smoother enough anchor for stable
+        //   backward smoothing).
+        let phase_params =
+            modem_core_base::phase_smoother::PhaseSmootherParams {
+                q_phi: 1e-4,
+                q_omega: 1e-7,
+                p0_phi: 10.0,
+                p0_omega: 1e-2,
+            };
+        let phase_tracker =
+            StreamingPhaseTracker::new(phase_params, PLHEADER_LEN_SYM);
         Rx2xSession {
             cfg,
             state: Rx2xState::Idle,
             profile_name,
             audio_buffer: Vec::new(),
             streaming,
+            phase_tracker,
             sym_buffer: Vec::new(),
             buf_start_abs: 0,
             scan_cursor_abs: 0,
@@ -1269,14 +1302,160 @@ impl Rx2xSession {
         let chunk: Vec<Complex64> =
             self.sym_buffer[chunk_rel..chunk_rel + self.cw_with_pilots].to_vec();
 
+        // Diagnostic constellation dump. Set
+        // `RX2X_DUMP_CW_CONST=<path>` to write JSON lines for the first
+        // 10 CWs (META + DATA). Each line carries the equalised
+        // post-FFE symbol coordinates, cycle/cw indices, ESI, and the
+        // is_meta flag — enough for an offline Python harness to plot
+        // the scatter cloud per CW and visually diagnose σ² locality
+        // (e.g., distinguish "first cycle OK, then drift blows up"
+        // from "uniform smear across all cycles").
+        if let Ok(path) = std::env::var("RX2X_DUMP_CW_CONST") {
+            // Open in append mode, write one JSON line, close.
+            // Bounded by an external file-line count check at the
+            // Python side — capping in Rust would require yet another
+            // session field. The probe is cheap (10 KB per CW max).
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let mut sym_buf = String::with_capacity(chunk.len() * 32);
+                sym_buf.push('[');
+                for (i, c) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        sym_buf.push(',');
+                    }
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut sym_buf,
+                        format_args!("[{:.6},{:.6}]", c.re, c.im),
+                    );
+                }
+                sym_buf.push(']');
+                let _ = writeln!(
+                    f,
+                    "{{\"cycle\":{},\"cw_idx\":{},\"esi\":{},\"is_meta\":{},\
+                     \"profile\":\"{}\",\"symbols\":{}}}",
+                    cycle_idx,
+                    next_cw_idx,
+                    esi,
+                    is_meta,
+                    self.profile_name,
+                    sym_buf,
+                );
+            }
+        }
+
         // Build the cycle-level PLHEADER reference pair for decode_one_cw.
         let plheader_rel = self
             .abs_to_rel(anchor_sof_abs)
             .expect("PLHEADER must still be in buffer when decoding cycle");
-        let cycle_refs_rx: Vec<Complex64> =
+        let mut cycle_refs_rx: Vec<Complex64> =
             self.sym_buffer[plheader_rel..plheader_rel + PLHEADER_LEN_SYM].to_vec();
         let cycle_refs_exp =
             crate::plheader::plheader_reference_symbols(self.cfg.family, &pls);
+        let cw_chunk_abs_start_early =
+            anchor_sof_abs + cw_offset_in_cycle as u64;
+
+        // --- Streaming phase tracker integration ----------------------
+        //
+        // Gated by `RX2X_PHASE_TRACKER=1`. When enabled :
+        //
+        //   1. Feed the tracker with the PLHEADER refs (only on the
+        //      cycle's first CW = META, cw_idx==0) — 192 strong obs
+        //      that anchor the [φ, ω] state at cycle start.
+        //   2. Feed it with this CW's pilot residuals (using a quick
+        //      `estimate_cw_gain` to remove the static gain).
+        //   3. Run a fixed-lag backward RTS over the recent window so
+        //      `phi_at` queries inside the CW span return smoothed
+        //      values, not just forward-filtered ones.
+        //   4. Derotate `chunk` (and the `cycle_refs_rx` copy) by
+        //      `tracker.phi_at(abs_pos)` per symbol, so the downstream
+        //      `decode_one_cw` sees phase-corrected data. Its own gain
+        //      estimator captures only the residual magnitude offset.
+        let use_phase_tracker =
+            std::env::var_os("RX2X_PHASE_TRACKER").is_some();
+        let mut chunk = chunk; // shadow as mutable for derotation
+        if use_phase_tracker {
+            let init_gain = crate::rx_v4::estimate_cw_gain(
+                &chunk,
+                self.cw_data_syms,
+                &self.cfg.pilot_pattern as &PilotPattern2x,
+                group_idx_offset,
+                Some((&cycle_refs_rx, &cycle_refs_exp)),
+            );
+            let sigma2_tang_running = if self.sigma2_n > 0 {
+                (self.sigma2_tangential_sum
+                    / self.sigma2_n as f64)
+                    .max(1e-5)
+            } else {
+                1e-3
+            };
+            let gain_norm_sqr = init_gain.norm_sqr().max(1e-9);
+            let r_pilot = (sigma2_tang_running / (2.0 * gain_norm_sqr))
+                .max(1e-6);
+            let r_plheader = (sigma2_tang_running / gain_norm_sqr)
+                .max(1e-6);
+
+            // (1) PLHEADER refs on the cycle's first CW (META).
+            if next_cw_idx == 0 {
+                for (i, (&rx_k, &exp_k)) in cycle_refs_rx
+                    .iter()
+                    .zip(cycle_refs_exp.iter())
+                    .enumerate()
+                {
+                    let theta = ((rx_k / init_gain) * exp_k.conj()).arg();
+                    let abs_pos = anchor_sof_abs + i as u64;
+                    self.phase_tracker.feed_obs(StreamObs {
+                        abs_pos,
+                        theta,
+                        r: r_plheader,
+                    });
+                }
+            }
+
+            // (2) Per-CW pilot residuals.
+            let pilot_positions =
+                crate::pilot2x_tdm::pilot_positions_2x(
+                    self.cw_data_syms,
+                    &self.cfg.pilot_pattern,
+                    group_idx_offset,
+                );
+            for (p_start, p_end, abs_pilot_idx) in pilot_positions {
+                for (k, sym_k) in (p_start..p_end).enumerate() {
+                    if sym_k >= chunk.len() {
+                        break;
+                    }
+                    let pref = crate::pilot2x_tdm::pilot_symbol_2x(
+                        abs_pilot_idx + k,
+                    );
+                    let theta = ((chunk[sym_k] / init_gain) * pref.conj())
+                        .arg();
+                    let abs_pos = cw_chunk_abs_start_early + sym_k as u64;
+                    self.phase_tracker.feed_obs(StreamObs {
+                        abs_pos,
+                        theta,
+                        r: r_pilot,
+                    });
+                }
+            }
+
+            // (3) Fixed-lag backward RTS over the recent buffer.
+            self.phase_tracker.run_backward();
+
+            // (4) Derotate chunk + cycle_refs_rx in place.
+            for (k, sym) in chunk.iter_mut().enumerate() {
+                let abs_pos = cw_chunk_abs_start_early + k as u64;
+                let phi = self.phase_tracker.phi_at(abs_pos);
+                *sym *= Complex64::from_polar(1.0, -phi);
+            }
+            for (k, sym) in cycle_refs_rx.iter_mut().enumerate() {
+                let abs_pos = anchor_sof_abs + k as u64;
+                let phi = self.phase_tracker.phi_at(abs_pos);
+                *sym *= Complex64::from_polar(1.0, -phi);
+            }
+        }
         let cycle_refs: Option<(&[Complex64], &[Complex64])> =
             Some((&cycle_refs_rx, &cycle_refs_exp));
 
@@ -1747,33 +1926,124 @@ impl Rx2xSession {
         if !new_drift.is_finite() || new_drift.abs() > 300.0 {
             return false;
         }
-        if (new_drift - self.cached_drift_ppm).abs() < 0.5 {
+        // Two-level change threshold:
+        //   - `0.5 ppm` for **diagnostic logging** — fine-grained, lets
+        //     the validation harness see every LS step.
+        //   - `RX2X_SOF_DRIFT_APPLY_PPM` (default `10`) for the **apply
+        //     path** — each apply triggers a streaming_dsp rewind +
+        //     FSM reset that costs ~22 symbols of decimation transient
+        //     + one cycle of FFE re-train. Re-firing it at every 1-2 ppm
+        //     LS refinement starves the FSM (empirical 2026-05-18 OTA 1
+        //     v2: drift converged cleanly from −52 → −57 ppm across 10
+        //     refinements, but 0/10 CW converged because the FSM never
+        //     got past Acquiring → Locked between resets). The wider
+        //     apply threshold catches only the big jumps (initial 0 →
+        //     true_drift, or coarse-to-fine sofs=2 → sofs≥3 transitions)
+        //     and lets the FFE absorb the rest as per-cycle phase noise.
+        let diff = (new_drift - self.cached_drift_ppm).abs();
+        if diff < 0.5 {
             return false;
         }
+        let apply_threshold: f64 = std::env::var("RX2X_SOF_DRIFT_APPLY_PPM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10.0);
         if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
             eprintln!(
-                "[rx2x-drift] sofs={} (streaming refined, diag only) cached={:+.2} \
-                 → measured={:+.2} ppm enabled={}",
+                "[rx2x-drift] sofs={} (streaming refined) cached={:+.2} \
+                 → measured={:+.2} ppm diff={:+.2} apply_thr={} apply={}",
                 self.drift_refined_sofs.len(),
                 self.cached_drift_ppm,
                 new_drift,
-                std::env::var_os("RX2X_SOF_DRIFT").is_some(),
+                new_drift - self.cached_drift_ppm,
+                apply_threshold,
+                diff >= apply_threshold
+                    && std::env::var_os("RX2X_SOF_DRIFT").is_some(),
             );
         }
-        // **DISABLED in streaming worker** — applying the measured drift
-        // mid-session breaks streaming_dsp coherence: symbols already
-        // emitted at the old ratio mix with symbols at the new ratio in
-        // `sym_buffer`, the FSM stops finding cycle SOFs at expected
-        // positions, and decoding collapses after the first 1-2 cycles
-        // (empirical OTA 2026-05-18 : 4/30 CW @ cached=0 vs 0/N CW once
-        // updates kick in). The estimator stays computed for
-        // **diagnostic only** (logged under `RX2X_LOG_DRIFT=1`, used by
-        // the validation harness). Gated by `RX2X_SOF_DRIFT=1` for
-        // future A/B once streaming_dsp learns to handle ratio jumps
-        // gracefully (cf [[rx2x-non-streaming-leak]] follow-up).
-        if std::env::var_os("RX2X_SOF_DRIFT").is_some() {
+        if diff < apply_threshold {
+            return false;
+        }
+        // Apply the new drift estimate. Gated by `RX2X_SOF_DRIFT=1`
+        // (default off until the worker-level A/B has run on OTA
+        // baselines). Returns `true` so the caller logs the reset.
+        //
+        // The "streaming coherence" problem that previously blocked
+        // mid-session drift updates (cf the pre-rewind comment) is
+        // handled in two steps here:
+        //
+        //   1. `streaming.rewind_for_drift_change` re-anchors the
+        //      resampler integrator to the stateless mapping
+        //      `K · (1 + new_drift · 1e-6)` going forward, AND drops
+        //      every downstream byproduct produced at the old ratio
+        //      (pre-switch `sym_buffer`, MF delay line, intermediate
+        //      stages). Future emits land at the correct TX-time
+        //      positions for `new_drift`.
+        //
+        //   2. `reset_for_backward_fix` clears the FSM scan state,
+        //      σ² accumulators, and FFE taps so the post-rewind
+        //      symbols are re-scanned from scratch as soon as the
+        //      next chunk's `refresh_symbols` populates them. Already-
+        //      decoded CWs from the wrong-drift period STAY in
+        //      `cw_bytes` (preserved by reset_for_backward_fix), so
+        //      META + early-cycle decoding pays no penalty.
+        //
+        // Budget: the apply path bumps `n_drift_resets`. When the
+        // counter reaches `RX2X_MAX_DRIFT_RESETS`, `lock_drift_if_ready`
+        // freezes the drift estimate (rest of the burst runs on cached
+        // value). Subsequent `estimate_drift_from_raw` calls still
+        // compute the LS estimate for diagnostics but don't apply.
+        // Sofs gate: LS through 2 points has ±50 ppm noise floor on
+        // OTA captures (empirical 2026-05-18: OTA 2 wildly oscillated
+        // +87 → −171 → −82 → −161 → −115 ppm with sofs=2 estimates
+        // applied at every rewind). 3 points is the minimum for the
+        // slope to be robust against per-point parabolic-fit noise.
+        // Override with `RX2X_SOF_DRIFT_MIN_SOFS=<n>` (default 3) for
+        // A/B tuning.
+        let min_sofs: usize = std::env::var("RX2X_SOF_DRIFT_MIN_SOFS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        if std::env::var_os("RX2X_SOF_DRIFT").is_some()
+            && self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
+            && self.drift_refined_sofs.len() >= min_sofs
+        {
             self.cached_drift_ppm = new_drift;
-            self.ffe_taps = None;
+            self.n_drift_resets = self.n_drift_resets.saturating_add(1);
+            self.streaming.rewind_for_drift_change(new_drift);
+            // Phase tracker references TX-time absolute positions that
+            // just shifted under the new drift mapping — reset its
+            // [φ, ω] state. The next PLHEADER will re-anchor it
+            // quickly via its strong pilot obs.
+            self.phase_tracker.reset();
+            // **KEEP** drift_refined_sofs across the rewind. The
+            // `audio_abs_refined` values are physical RX-time absolute
+            // positions of the SOFs in the captured audio — invariant
+            // under any drift correction we choose to apply (only the
+            // symbol-grid alignment derived from them changes). Clearing
+            // them on each rewind starves the LS back to 2 points,
+            // causing the estimate to oscillate by ±50 ppm and the
+            // apply path to re-fire indefinitely (empirical 2026-05-18
+            // OTA 2: 6 rewinds, sofs stuck at 2 every time, drift
+            // bouncing through 250 ppm range). Carrying the SOFs across
+            // rewinds lets the LS converge as cycles accumulate.
+            //
+            // The drift_scan_cursor restarts at the new sym_buffer
+            // frontier so the next FSM scan picks up post-rewind SOFs;
+            // already-refined pre-rewind SOFs stay in the Vec and
+            // contribute to the LS as a longer baseline.
+            self.drift_scan_cursor_sym = self.streaming.sym_buffer_start_abs();
+            // Mirror the now-empty streaming sym_buffer into the
+            // session-owned vec + advance buf_start_abs so subsequent
+            // equalize/FSM logic sees a coherent (empty, new start)
+            // view. The next chunk's refresh_symbols repopulates it.
+            self.sym_buffer = self.streaming.sym_buffer().to_vec();
+            self.buf_start_abs = self.streaming.sym_buffer_start_abs();
+            self.equalized_up_to_abs = self.buf_start_abs;
+            // Backward-fix reset: FSM → Idle, scan_cursor → 0, FFE
+            // taps dropped, σ² accumulators cleared. Decoded CW
+            // dictionary is preserved.
+            self.reset_for_backward_fix();
             return true;
         }
         false
@@ -2429,6 +2699,37 @@ impl Rx2xSession {
                     self.result.data = acc;
                 }
             }
+        }
+        // Counter sanity check: `cw_bytes.len()` is the ground-truth
+        // count of distinct DATA ESIs that decoded successfully (it's
+        // a HashMap<esi, payload> so only successful unique ESIs land
+        // there). `result.data_cws_converged` is a +=1 counter that
+        // decode_one_cw bumps and the esi_known_before path restores —
+        // they should match. Any mismatch points to a counter-restore
+        // bug (typically a backward-fix path that bumps but doesn't
+        // restore, or vice versa).
+        if std::env::var_os("RX2X_LOG_CW_COUNTS").is_some()
+            || self.cw_bytes.len() != self.result.data_cws_converged
+        {
+            let esis: Vec<u32> = {
+                let mut v: Vec<u32> = self.cw_bytes.keys().copied().collect();
+                v.sort();
+                v
+            };
+            eprintln!(
+                "[rx2x-cw-counts] cw_bytes.len={} result.data_cws_converged={} \
+                 result.data_cws_total={} cycles={} app_header={} \
+                 k_source={:?} n_repair={:?} cw_per_cycle={} esi_set={:?}",
+                self.cw_bytes.len(),
+                self.result.data_cws_converged,
+                self.result.data_cws_total,
+                self.result.cycles,
+                self.app_header.is_some(),
+                self.k_source,
+                self.n_repair,
+                self.cw_per_cycle,
+                esis,
+            );
         }
         events.push(Rx2xEvent::SessionFinalised {
             result: self.result.clone(),
