@@ -1755,12 +1755,27 @@ fn rx_v4_decode_pass(
         );
 
         // DATA-CWs of this cycle. With the V4 tail-fill (see
-        // `frame2x::tail_filled_data_cw_count`) every cycle —
-        // including the FLAG2X_LAST cycle — carries exactly
-        // `cw_per_cycle` DATA-CWs. There is no truncated last cycle
-        // and no silence between data and EOT in-cycle, so we walk
-        // every slot unconditionally. The `chunk_end > symbols.len()`
-        // bound below remains as a buffer-overrun guard.
+        // `frame2x::tail_filled_data_cw_count`) every DATA cycle —
+        // including the FLAG2X_LAST data cycle — carries exactly
+        // `cw_per_cycle` DATA-CWs.
+        //
+        // The EOT frame (PLS flags include FLAG2X_EOT) carries only a
+        // META-CW and **no DATA-CWs by construction** (cf.
+        // `frame2x::build_eot_frame_v4`). Without this gate, the
+        // post-silence-gate-removal loop would attempt to decode
+        // `cw_per_cycle` ghost slots in the EOT cycle — they only
+        // contain the post-EOT silence, never real CW data. The ghost
+        // attempts inflate `data_cws_total` by `cw_per_cycle` (e.g.
+        // 70 → 80 on HIGH+2X 10 kB), make the converged_bitmap report
+        // cw_per_cycle false negatives at the tail, and waste decoder
+        // cycles. Skip the data CW loop ; advance `scan` past the
+        // META so the next find_next_sof picks up the post-EOT region
+        // (which is silence for a clean burst).
+        if pls.flags & FLAG2X_EOT != 0 {
+            result.cycles += 1;
+            scan = wire_cursor;
+            continue;
+        }
         for k in 0..cw_per_cycle {
             let chunk_end = wire_cursor + cw_with_pilots;
             if chunk_end > symbols.len() {

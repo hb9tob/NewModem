@@ -1187,6 +1187,7 @@ impl Rx2xSession {
                 if pls.flags & FLAG2X_EOT != 0 {
                     self.eot_seen = true;
                 }
+                let is_eot = pls.flags & FLAG2X_EOT != 0;
                 // Diagnostic: track post-resample residual drift via PLHEADER
                 // gain phase. After the cubic resample at cached_drift_ppm,
                 // the carrier should be stationary; any remaining slope of
@@ -1204,14 +1205,28 @@ impl Rx2xSession {
                     );
                 }
                 self.plheader_phases.push((sof_at_abs, gain.arg()));
-                self.state = Rx2xState::Locked {
-                    cycle_idx: 0,
-                    anchor_sof_abs: sof_at_abs,
-                    next_cw_idx: 0,
-                };
                 self.result.first_pls.get_or_insert(pls);
                 self.result.first_sof_at.get_or_insert(rel);
                 self.result.validated_sof_positions.push(rel);
+                if is_eot {
+                    // EOT marker = end of burst. The EOT frame carries
+                    // only a META-CW (`frame2x::build_eot_frame_v4`) —
+                    // no DATA-CWs to decode. Transition straight to
+                    // Finalising so `process_audio_chunk` flushes the
+                    // assembled payload + emits SessionFinalised, then
+                    // returns to Idle ready for the next burst. Without
+                    // this, the FSM goes Locked and the data CW loop
+                    // attempts `cw_per_cycle` ghost slots after the
+                    // EOT META, inflating `data_cws_total` and the
+                    // converged_bitmap by cw_per_cycle false negatives.
+                    self.state = Rx2xState::Finalising;
+                } else {
+                    self.state = Rx2xState::Locked {
+                        cycle_idx: 0,
+                        anchor_sof_abs: sof_at_abs,
+                        next_cw_idx: 0,
+                    };
+                }
                 true
             }
             None => {
@@ -2055,9 +2070,23 @@ impl Rx2xSession {
             //      (shifted by the previous drained value). Subsequent
             //      SOFs in the new frame will be re-refined and feed
             //      the fine tracker.
+            //   4. Reset CW counters + bitmap. Any decode attempts
+            //      pre-apply happened at the wrong ratio — they failed
+            //      to converge (so didn't pollute `cw_bytes`) but DID
+            //      bump `data_cws_total`. Without this reset, the
+            //      post-apply re-decode of the same ESIs would
+            //      double-count (esi_known_before=false because the
+            //      pre-apply failed CWs aren't in `cw_bytes`, so
+            //      `decode_one_cw` bumps `data_cws_total` again).
+            //      Symptom : `total=80` instead of `70` at HIGH+2X.
             self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
             self.audio_drained_samples = 0;
             self.drift_refined_sofs.clear();
+            self.result.data_cws_total = 0;
+            self.result.data_cws_converged = 0;
+            self.result.total_cws = 0;
+            self.result.converged_cws = 0;
+            self.result.converged_bitmap.clear();
             self.cached_drift_ppm = new_drift;
             self.n_drift_resets = self.n_drift_resets.saturating_add(1);
             // Polyphase resampler is stateless w.r.t. the ratio: the
