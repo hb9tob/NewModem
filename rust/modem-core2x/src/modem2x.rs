@@ -38,6 +38,18 @@ const VOX_TAIL_SILENCE_S: f64 = 0.05;
 const VOX_AMPLITUDE: f32 = 0.5;
 /// Trailing silence after the EOT frame when VOX is on.
 const POST_EOT_SILENCE_S: f64 = 0.1;
+/// PRBS leadout between the EOT frame and the trailing silence. Drains
+/// the RX matched filter (RRC_SPAN_SYM × sps audio samples of memory)
+/// AND absorbs the channel sim's tail-clipping artifact at negative
+/// drift (`apply_clock_drift` clips `t_src > (n-1)/sr` to the last
+/// audio sample → step discontinuity if that boundary lands on the
+/// EOT META). PRBS continues the same Lfsr15 stream as the pre-burst
+/// and inter-frame fill so a future RX correlator can lock the trailing
+/// bits if it ever needs them ([[feedback-tail-pad-useful-content]] —
+/// padding is always PRBS, never zeros). 0.1 s @ 48 kHz = 4800 samples
+/// covers RRC drain + ±300 ppm × 30 s drift slip + AGC steady-state
+/// margin without bloating the wire.
+const POST_EOT_LEADOUT_S: f64 = 0.1;
 
 /// Stateless `Modem` implementation for the V4 ("2x") wire format.
 #[derive(Default, Clone, Copy, Debug)]
@@ -113,6 +125,8 @@ impl Modem for V4Modem {
         // before).
         let inter_frame_syms_n =
             (INTER_FRAME_SILENCE_S * cfg.base.symbol_rate) as usize;
+        let leadout_syms_n =
+            (POST_EOT_LEADOUT_S * cfg.base.symbol_rate) as usize;
         let out = if req.vox_seconds > 0.0 {
             let mut prbs = preburst::Lfsr15::new();
             let preburst_syms = prbs.next_qpsk_symbols(preburst::PREBURST_LEN_SYM);
@@ -132,6 +146,15 @@ impl Modem for V4Modem {
                 &taps,
                 cfg.base.center_freq_hz,
             );
+            // Post-EOT PRBS leadout (drains RRC + absorbs sim clip).
+            let leadout_syms = prbs.next_qpsk_symbols(leadout_syms_n);
+            let leadout_audio = modulator::modulate(
+                &leadout_syms,
+                sps,
+                pitch,
+                &taps,
+                cfg.base.center_freq_hz,
+            );
             let mut out = Vec::new();
             out.extend_from_slice(&modulator::tone(
                 cfg.base.center_freq_hz,
@@ -143,6 +166,7 @@ impl Modem for V4Modem {
             out.append(&mut data_modulated);
             out.extend_from_slice(&inter_frame_audio);
             out.append(&mut eot_modulated);
+            out.extend_from_slice(&leadout_audio);
             out.extend_from_slice(&modulator::silence(POST_EOT_SILENCE_S));
             out
         } else {
@@ -359,9 +383,25 @@ mod tests {
         };
         let audio_no_vox = V4Modem.encode_to_samples(&req_no_vox).expect("encode ok");
         let extra = audio.len() - audio_no_vox.len();
+        // The vox>0 path also appends a PRBS leadout of
+        // `POST_EOT_LEADOUT_S` worth of QPSK symbols between the EOT
+        // and the trailing silence. Reproduce the modulator call to
+        // count its audio samples exactly.
+        let leadout_syms_n =
+            (POST_EOT_LEADOUT_S * cfg.base.symbol_rate) as usize;
+        let leadout_syms: Vec<num_complex::Complex<f64>> =
+            (0..leadout_syms_n).map(|_| num_complex::Complex::new(1.0, 0.0)).collect();
+        let leadout_audio = modulator::modulate(
+            &leadout_syms,
+            sps,
+            pitch,
+            &taps,
+            cfg.base.center_freq_hz,
+        );
         let expected_extra = vox_len
             + (VOX_TAIL_SILENCE_S * AUDIO_RATE as f64) as usize
             + preburst_audio.len()
+            + leadout_audio.len()
             + (POST_EOT_SILENCE_S * AUDIO_RATE as f64) as usize;
         assert_eq!(
             extra, expected_extra,

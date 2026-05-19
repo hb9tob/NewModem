@@ -411,6 +411,15 @@ pub struct Rx2xSession {
     /// scanned. Streaming forward-only — never decreases without an
     /// explicit reset event.
     drift_scan_cursor_sym: u64,
+    /// `true` once `emit_finalised` has pushed the `SessionFinalised`
+    /// event. Lets `finalize()` early-return as idempotent only when the
+    /// finalisation has actually been emitted — the EOT path in
+    /// `drive_acquiring` flips `state=Finalising` then calls
+    /// `emit_finalised` directly, so the worker's end-of-stream
+    /// `finalize()` no-ops cleanly. Without this flag a session that
+    /// reached `Finalising` via EOT but had `emit_finalised` skipped
+    /// would never produce the summary event.
+    finalised_emitted: bool,
 }
 
 /// One PLS-validated SOF whose audio-rate position has been refined via
@@ -552,6 +561,7 @@ impl Rx2xSession {
             equalized_up_to_abs: 0,
             drift_refined_sofs: Vec::new(),
             drift_scan_cursor_sym: 0,
+            finalised_emitted: false,
         }
     }
 
@@ -649,7 +659,17 @@ impl Rx2xSession {
             }
         }
 
-        let _ = self.estimate_drift_from_raw();
+        let drift_updated = self.estimate_drift_from_raw();
+        // Engage `drift_locked` once the LS estimate has been stable for
+        // N chunks. Honours the one-shot resampler-apply policy
+        // ([[feedback-drift-architecture-one-shot-plus-fine-tracking]]):
+        // after the (possible) single apply, the cached_drift_ppm is
+        // frozen and the Farrow / pilot phase tracker handles the
+        // residual sub-ppm walk. For a clean (zero-drift) channel no
+        // apply ever fires and the lock path here is the only way for
+        // `trim_audio_for_streaming` to engage — without it the audio
+        // buffer would grow with the burst length.
+        self.lock_drift_if_ready(drift_updated);
 
         self.trim_audio_for_streaming();
 
@@ -1104,11 +1124,13 @@ impl Rx2xSession {
     /// across multiple calls.
     pub fn finalize(&mut self) -> Vec<Rx2xEvent> {
         let mut events = Vec::new();
-        // A session is "armed" once a META-CW recovers the AppHeader.
-        // We finalise iff armed, regardless of which sub-state the FSM
-        // ended in (Locked mid-cycle, Acquiring between cycles, etc.).
-        if matches!(self.state, Rx2xState::Finalising) {
-            return events; // idempotent
+        // Idempotent — the EOT path in `drive_acquiring` may have
+        // already pushed `SessionFinalised`; `finalised_emitted` tells
+        // us so. The plain `state == Finalising` check alone is
+        // insufficient because the EOT branch flips state but the worker
+        // still calls `finalize()` at end-of-stream.
+        if self.finalised_emitted {
+            return events;
         }
         if self.app_header.is_none() {
             // No session was ever armed — nothing to finalise.
@@ -1127,6 +1149,7 @@ impl Rx2xSession {
         }
         self.state = Rx2xState::Finalising;
         self.emit_finalised(&mut events);
+        self.finalised_emitted = true;
         events
     }
 
@@ -1176,7 +1199,7 @@ impl Rx2xSession {
     }
 
     /// Acquiring → Locked OR back to Idle.
-    fn try_lock(&mut self, sof_at_abs: u64, _events: &mut Vec<Rx2xEvent>) -> bool {
+    fn try_lock(&mut self, sof_at_abs: u64, events: &mut Vec<Rx2xEvent>) -> bool {
         let rel = match self.abs_to_rel(sof_at_abs) {
             Some(r) => r,
             None => {
@@ -1222,14 +1245,19 @@ impl Rx2xSession {
                     // EOT marker = end of burst. The EOT frame carries
                     // only a META-CW (`frame2x::build_eot_frame_v4`) —
                     // no DATA-CWs to decode. Transition straight to
-                    // Finalising so `process_audio_chunk` flushes the
-                    // assembled payload + emits SessionFinalised, then
-                    // returns to Idle ready for the next burst. Without
-                    // this, the FSM goes Locked and the data CW loop
-                    // attempts `cw_per_cycle` ghost slots after the
-                    // EOT META, inflating `data_cws_total` and the
-                    // converged_bitmap by cw_per_cycle false negatives.
+                    // Finalising AND emit the `SessionFinalised` summary
+                    // immediately so the worker's end-of-stream
+                    // `finalize()` can be a clean no-op. Without the
+                    // direct `emit_finalised` call here the summary was
+                    // dropped on EOT-terminated bursts (the worker's
+                    // `finalize()` early-returns on `state=Finalising`),
+                    // which surfaced as `app_header_seen=false` in the
+                    // sweep harness even when every CW had converged.
                     self.state = Rx2xState::Finalising;
+                    if self.app_header.is_some() && !self.finalised_emitted {
+                        self.emit_finalised(events);
+                        self.finalised_emitted = true;
+                    }
                 } else {
                     self.state = Rx2xState::Locked {
                         cycle_idx: 0,
@@ -2097,6 +2125,18 @@ impl Rx2xSession {
             self.result.total_cws = 0;
             self.result.converged_cws = 0;
             self.result.converged_bitmap.clear();
+            // Clear the per-ESI byte cache too. Otherwise any ESI that
+            // had converged in a pre-apply turbo retry stays in
+            // `cw_bytes`, and the post-apply Pass 1 re-visit sees
+            // `esi_known_before = true` → the unconditional rollback in
+            // `drive_locked` (line ~1572) reverts the `data_cws_total +=
+            // 1` bump for THAT ESI. Net: one missing count per
+            // pre-apply turbo-converged ESI — observed as `total=69`
+            // instead of 70 on a 7-cycle burst where cycle 0's turbo
+            // happened to rescue exactly one CW. Post-apply at the
+            // correct ratio every ESI re-decodes anyway, so flushing
+            // here costs nothing.
+            self.cw_bytes.clear();
             // Now that the resampler ratio is committed, enable
             // `trim_audio_for_streaming` (gated on `drift_locked`).
             // From this point onward the audio_buffer is allowed to
