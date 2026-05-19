@@ -1288,6 +1288,14 @@ impl EventSink for TauriEventSink {
 }
 
 fn main() {
+    // Work around a WebKitGTK + Mesa V3D bug on Raspberry Pi 4/5 where the
+    // DMA-BUF renderer leaves the toplevel surface corrupted ("scrambled
+    // Canal+" bands) after a fullscreen transition, tab switch, or image
+    // upload. Forcing the legacy renderer makes the issue disappear. Must
+    // be set before any webview is created, hence at the very top of main.
+    #[cfg(target_os = "linux")]
+    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+
     let save_dir = default_save_dir();
     let _ = std::fs::create_dir_all(&save_dir);
 
