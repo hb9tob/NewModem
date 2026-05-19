@@ -91,21 +91,47 @@ impl Modem for V4Modem {
 
         // Wire layout (`vox > 0` = real OTA TX path):
         //   tone(vox) + VOX-tail silence + PRBS pre-burst + data
-        //     + inter-frame silence + EOT + post-EOT silence
+        //     + PRBS inter-frame + EOT + post-EOT silence
         //
-        // The PRBS pre-burst is 3000 LFSR-15 QPSK symbols modulated
-        // through the SAME RRC + audio carrier as the data, so the
-        // FT-991A → FTX-1 sound-card chain's slow AGC sees the
-        // operating RMS for ≥ 2 s before any decoded content starts.
-        // It also provides 3000 known symbols for one-shot LS FFE
-        // training on RX (cf. `preburst.rs`). Activated only when
-        // `vox_seconds > 0.0` so synthetic unit-test paths that drive
-        // `encode_to_samples` without VOX keep their byte budget.
+        // The PRBS pre-burst is `PREBURST_LEN_SYM` LFSR-15 QPSK
+        // symbols modulated through the SAME RRC + audio carrier as
+        // the data, so the FT-991A → FTX-1 sound-card chain's slow
+        // AGC sees the operating RMS for ≥ 2 s before any decoded
+        // content starts. It also provides 3000 known symbols for
+        // one-shot LS FFE training on RX (cf. `preburst.rs`).
         //
-        // When `vox == 0` (legacy / loopback tests): data + EOT only,
-        // no pre-burst — the test harness pumps the audio directly
-        // into the RX session without an AGC stage.
+        // The pre-burst and inter-frame PRBS share **one Lfsr15
+        // stream** : the inter-frame state picks up exactly where the
+        // pre-burst left off (offset `PREBURST_LEN_SYM * 2` bits from
+        // `LFSR_SEED`). Lets a future RX correlate either section
+        // against the same generator advanced the right amount —
+        // no silence on the wire between data and EOT.
+        //
+        // When `vox == 0` (legacy / loopback tests): no pre-burst, no
+        // VOX tone. Inter-frame PRBS still emitted with a fresh
+        // Lfsr15 (continuation has no meaning when nothing came
+        // before).
+        let inter_frame_syms_n =
+            (INTER_FRAME_SILENCE_S * cfg.base.symbol_rate) as usize;
         let out = if req.vox_seconds > 0.0 {
+            let mut prbs = preburst::Lfsr15::new();
+            let preburst_syms = prbs.next_qpsk_symbols(preburst::PREBURST_LEN_SYM);
+            let preburst_audio = modulator::modulate(
+                &preburst_syms,
+                sps,
+                pitch,
+                &taps,
+                cfg.base.center_freq_hz,
+            );
+            // Inter-frame PRBS continues the same LFSR-15 state.
+            let inter_frame_syms = prbs.next_qpsk_symbols(inter_frame_syms_n);
+            let inter_frame_audio = modulator::modulate(
+                &inter_frame_syms,
+                sps,
+                pitch,
+                &taps,
+                cfg.base.center_freq_hz,
+            );
             let mut out = Vec::new();
             out.extend_from_slice(&modulator::tone(
                 cfg.base.center_freq_hz,
@@ -113,21 +139,26 @@ impl Modem for V4Modem {
                 VOX_AMPLITUDE,
             ));
             out.extend_from_slice(&modulator::silence(VOX_TAIL_SILENCE_S));
-            let preburst_audio = modulator::modulate(
-                preburst::reference_symbols(),
+            out.extend_from_slice(&preburst_audio);
+            out.append(&mut data_modulated);
+            out.extend_from_slice(&inter_frame_audio);
+            out.append(&mut eot_modulated);
+            out.extend_from_slice(&modulator::silence(POST_EOT_SILENCE_S));
+            out
+        } else {
+            // No pre-burst : inter-frame PRBS starts a fresh stream
+            // from `LFSR_SEED`. Same length as the vox>0 path so the
+            // RX silence-gate-free decoder reads consistent data.
+            let mut prbs = preburst::Lfsr15::new();
+            let inter_frame_syms = prbs.next_qpsk_symbols(inter_frame_syms_n);
+            let inter_frame_audio = modulator::modulate(
+                &inter_frame_syms,
                 sps,
                 pitch,
                 &taps,
                 cfg.base.center_freq_hz,
             );
-            out.extend_from_slice(&preburst_audio);
-            out.append(&mut data_modulated);
-            out.extend_from_slice(&modulator::silence(INTER_FRAME_SILENCE_S));
-            out.append(&mut eot_modulated);
-            out.extend_from_slice(&modulator::silence(POST_EOT_SILENCE_S));
-            out
-        } else {
-            data_modulated.extend_from_slice(&modulator::silence(INTER_FRAME_SILENCE_S));
+            data_modulated.extend_from_slice(&inter_frame_audio);
             data_modulated.append(&mut eot_modulated);
             data_modulated
         };
@@ -345,5 +376,61 @@ mod tests {
         let desc = V4Modem.profile_by_name("HIGH2X").unwrap();
         assert!(desc.label.starts_with("HIGH2X — 16-APSK 3/4"));
         assert!(desc.label.ends_with("bps"));
+    }
+
+    #[test]
+    fn inter_frame_region_carries_prbs_not_silence() {
+        // Build a HIGH+2X burst with vox > 0 and verify the audio
+        // region between the data superframe and the EOT frame is
+        // non-silent — it must carry the inter-frame PRBS.
+        let payload = vec![0xA5u8; 2_000];
+        let cfg = ProfileIndex2x::from_name("HIGH+2X").unwrap().to_config();
+        let k_bytes = cfg.base.ldpc_rate.k() / 8;
+        let k_src = modem_framing::raptorq_codec::k_from_payload(
+            payload.len(), k_bytes,
+        ) as u32;
+        let n_total = k_src
+            + modem_framing::raptorq_codec::n_repair_default(k_src);
+        let req = EncodeRequest {
+            profile: "HIGH+2X",
+            wire_payload: &payload,
+            session_id: 0x1234_5678,
+            mime_type: mime::BINARY,
+            hash_short: 0xABCD,
+            esi_start: 0,
+            n_packets: n_total,
+            vox_seconds: 0.5,
+        };
+        let audio = V4Modem.encode_to_samples(&req).expect("encode ok");
+
+        // Compute the inter-frame region precisely. The pre-EOT
+        // sample range starts at end-of-data-superframe and ends at
+        // start-of-EOT-frame. Easiest : count back from the end.
+        let (sps, _pitch) = rrc::check_integer_constraints(
+            AUDIO_RATE, cfg.base.symbol_rate, cfg.base.tau,
+        ).unwrap();
+        let inter_frame_sym_count =
+            (INTER_FRAME_SILENCE_S * cfg.base.symbol_rate) as usize;
+        let inter_frame_audio_samples = inter_frame_sym_count * sps;
+        let post_eot_samples =
+            (POST_EOT_SILENCE_S * AUDIO_RATE as f64) as usize;
+        let eot_audio_syms = frame2x::eot_frame_symbols_v4(&cfg);
+        let eot_audio_samples = eot_audio_syms * sps;
+
+        // Region : [audio.len() - post_eot - eot_audio - inter_frame ..
+        //           audio.len() - post_eot - eot_audio].
+        let region_end = audio.len() - post_eot_samples - eot_audio_samples;
+        let region_start = region_end - inter_frame_audio_samples;
+        let region = &audio[region_start..region_end];
+        let mean_e2: f64 = region
+            .iter()
+            .map(|&s| (s as f64) * (s as f64))
+            .sum::<f64>()
+            / region.len() as f64;
+        assert!(
+            mean_e2 > 1e-3,
+            "inter-frame region is silent (mean_e2={mean_e2:.6}) — \
+             expected PRBS audio",
+        );
     }
 }

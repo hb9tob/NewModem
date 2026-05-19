@@ -1570,8 +1570,19 @@ impl Rx2xSession {
             {
                 let ah = self.result.app_header.clone().unwrap();
                 let k_src = ah.k_symbols as usize;
-                let n_rep =
+                // Upper bound on repair count : default 30 % + the
+                // tail-fill bump that rounds `k_src + n_repair_default`
+                // up to the next `cw_per_cycle` boundary. The GUI
+                // fountain-fill progress uses `n_repair` as a
+                // denominator hint ; the exact count is the converged
+                // bitmap. Adding `cw_per_cycle` covers the worst-case
+                // tail-fill (when `n_total % cw_per_cycle == 1`).
+                let n_rep_default =
                     raptorq_codec::n_repair_default(k_src as u32) as usize;
+                let cw_per_cycle = crate::frame2x::data_cw_per_cycle(
+                    &crate::profile2x::config_by_name_2x(&self.profile_name).unwrap(),
+                );
+                let n_rep = n_rep_default + cw_per_cycle;
                 let session_id = ah.session_id;
                 self.app_header = Some(ah.clone());
                 self.k_source = Some(k_src);
@@ -2432,8 +2443,14 @@ impl Rx2xSession {
                 {
                     let ah = self.result.app_header.clone().unwrap();
                     let k_src = ah.k_symbols as usize;
-                    let n_rep =
+                    // Same tail-fill upper bound as the SOF-METAL
+                    // path above. See comment around line 1574.
+                    let n_rep_default =
                         raptorq_codec::n_repair_default(k_src as u32) as usize;
+                    let cw_per_cycle = crate::frame2x::data_cw_per_cycle(
+                        &crate::profile2x::config_by_name_2x(&self.profile_name).unwrap(),
+                    );
+                    let n_rep = n_rep_default + cw_per_cycle;
                     let session_id = ah.session_id;
                     self.app_header = Some(ah.clone());
                     self.k_source = Some(k_src);
@@ -3105,6 +3122,49 @@ mod tests {
             assert_eq!(
                 result.data, payload,
                 "byte-exact payload after preburst path"
+            );
+        }
+    }
+
+    #[test]
+    fn converged_bitmap_all_ones_through_tail_filled_last_cycle() {
+        // With the V4 tail-fill (frame2x::tail_filled_data_cw_count)
+        // every cycle on the wire — including the FLAG2X_LAST cycle —
+        // carries exactly cw_per_cycle DATA-CWs. On a noise-free WAV
+        // the RX must converge every DATA-CW and the bitmap must have
+        // all bits set up to data_cws_total.
+        let cfg = profile_high_2x();
+        // Payload sized to cross at least 2 cycles AND be unaligned
+        // mod cw_per_cycle so the tail-fill actually triggers.
+        let payload = rng_bytes(2500, 0xC0DE);
+        let audio = modulate_for(&cfg, &payload, 0xABBA);
+        let (_session, events) = collect_events_chunked(cfg, "HIGH2X", &audio);
+
+        let final_event = events
+            .iter()
+            .find(|e| matches!(e, Rx2xEvent::SessionFinalised { .. }))
+            .expect("SessionFinalised emitted");
+        if let Rx2xEvent::SessionFinalised { result } = final_event {
+            assert_eq!(
+                result.data, payload,
+                "tail-filled payload decodes byte-exact"
+            );
+            // Every bit up to data_cws_total set ?
+            let total = result.data_cws_total;
+            for bit_idx in 0..total {
+                let byte = bit_idx >> 3;
+                let mask = 1u8 << (bit_idx & 7);
+                let set = result.converged_bitmap.get(byte).copied().unwrap_or(0) & mask != 0;
+                assert!(
+                    set,
+                    "CW {} did not converge (bitmap bit clear) — \
+                     data_cws_converged={} data_cws_total={}",
+                    bit_idx, result.data_cws_converged, total,
+                );
+            }
+            assert_eq!(
+                result.data_cws_converged, result.data_cws_total,
+                "data_cws_converged must equal data_cws_total post-tail-fill",
             );
         }
     }
