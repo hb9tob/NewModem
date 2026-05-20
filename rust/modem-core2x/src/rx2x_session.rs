@@ -49,6 +49,7 @@ use modem_core_base::interleaver;
 use modem_core_base::ldpc::decoder::LdpcDecoder;
 use modem_core_base::ldpc::encoder::LdpcEncoder;
 use modem_core_base::rrc::{self, rrc_taps};
+use modem_core_base::scrambler;
 use modem_core_base::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
 use modem_framing::app_header::AppHeader;
 use modem_framing::raptorq_codec;
@@ -2834,9 +2835,15 @@ impl Rx2xSession {
             ah.file_size,
             ah.t_bytes as u16,
         ) {
+            // Descramble : mirror of `scrambler::scramble` applied to
+            // the padded source bytes in
+            // `frame2x::build_superframe_v4_range`. Self-sync, so byte N
+            // depends only on bytes < N — operating on the file-size
+            // truncated buffer is safe.
+            let descrambled = scrambler::descramble(&payload);
             self.payload_assembled = true;
-            self.result.data = payload.clone();
-            events.push(Rx2xEvent::PayloadAssembled { bytes: payload });
+            self.result.data = descrambled.clone();
+            events.push(Rx2xEvent::PayloadAssembled { bytes: descrambled });
         }
     }
 
@@ -3387,7 +3394,9 @@ impl Rx2xSession {
                 );
             }
         }
-        // RaptorQ assembly if app_header recovered.
+        // RaptorQ assembly if app_header recovered. Descramble mirrors
+        // the TX-side `scrambler::scramble` on the padded source bytes
+        // in `frame2x::build_superframe_v4_range`.
         if let Some(ref h) = self.app_header {
             if !self.payload_assembled {
                 if let Some(payload) = raptorq_codec::try_decode(
@@ -3395,8 +3404,9 @@ impl Rx2xSession {
                     h.file_size,
                     h.t_bytes as u16,
                 ) {
-                    self.result.data = payload.clone();
-                    events.push(Rx2xEvent::PayloadAssembled { bytes: payload });
+                    let descrambled = scrambler::descramble(&payload);
+                    self.result.data = descrambled.clone();
+                    events.push(Rx2xEvent::PayloadAssembled { bytes: descrambled });
                     self.payload_assembled = true;
                 } else {
                     // ESI-sorted concat fallback (zero-padded) for partial
@@ -3412,7 +3422,7 @@ impl Rx2xSession {
                         }
                     }
                     acc.truncate(h.file_size as usize);
-                    self.result.data = acc;
+                    self.result.data = scrambler::descramble(&acc);
                 }
             }
         }

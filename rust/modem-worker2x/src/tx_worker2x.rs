@@ -487,13 +487,13 @@ mod tests {
         )
         .expect("encode in process");
         // encode_in_process passes vox_seconds = TX_VOX_SECONDS (0.5s)
-        // + 50ms tail silence + PRBS pre-burst + 200ms inter-frame
-        // silence + 100ms post-EOT silence. Strip those for the
-        // data+EOT comparison. The pre-burst contributes exactly the
-        // same modulator-tail-included length as any other symbol
-        // burst, so we reproduce the modulate() call here to subtract
-        // it.
-        let vox_overhead_s = TX_VOX_SECONDS + 0.05 + 0.1; // tone+tail+post-EOT
+        // + 50ms tail silence + PRBS pre-burst + 200ms inter-frame PRBS
+        // + 100ms post-EOT PRBS leadout + 100ms post-EOT silence. Strip
+        // all of those for the data+EOT comparison. Pre-burst and leadout
+        // are modulated symbol bursts, so we reproduce the modulate()
+        // call here to subtract their actual sample count (which includes
+        // the RRC modulator tail).
+        let vox_overhead_s = TX_VOX_SECONDS + 0.05 + 0.1; // tone+tail+post-EOT silence
         let cfg = config_by_name_2x("HIGH2X").expect("HIGH2X cfg");
         let (sps, pitch) = modem_core_base::rrc::check_integer_constraints(
             AUDIO_RATE,
@@ -513,14 +513,32 @@ mod tests {
             cfg.base.center_freq_hz,
         );
         let preburst_s = preburst_audio.len() as f64 / AUDIO_RATE as f64;
+        // POST_EOT_LEADOUT_S worth of PRBS QPSK symbols modulated through
+        // the same RRC chain (added by `0e31eb0` to drain the RX matched
+        // filter and absorb the channel-sim tail-clip artifact at negative
+        // drift). Same shape as any other symbol burst.
+        const POST_EOT_LEADOUT_S: f64 = 0.1;
+        let leadout_syms_n =
+            (POST_EOT_LEADOUT_S * cfg.base.symbol_rate) as usize;
+        let leadout_syms: Vec<modem_core_base::types::Complex64> = (0..leadout_syms_n)
+            .map(|_| modem_core_base::types::Complex64::new(0.0, 0.0))
+            .collect();
+        let leadout_audio = modem_core_base::modulator::modulate(
+            &leadout_syms,
+            sps,
+            pitch,
+            &taps,
+            cfg.base.center_freq_hz,
+        );
+        let leadout_s = leadout_audio.len() as f64 / AUDIO_RATE as f64;
         let actual_total_s = audio.len() as f64 / AUDIO_RATE as f64;
-        // Plan already includes the 200ms inter-frame silence implicitly
-        // via the EOT slot in the wire layout? No — V4 plan covers only
-        // the modulated symbols (data superframe + EOT frame). The
-        // 200ms silence between them and the 100ms post-EOT silence sit
-        // OUTSIDE the symbol stream. Plan therefore tracks
-        // (actual_total_s - vox_overhead_s - preburst_s - 0.2 [inter-frame]).
-        let actual_modulated_s = actual_total_s - vox_overhead_s - preburst_s - 0.2;
+        // V4 plan covers only the modulated symbols (data superframe +
+        // EOT frame). The 200ms inter-frame PRBS sits between the data
+        // and EOT bursts, the leadout sits after the EOT, and the
+        // post-EOT silence + VOX overhead sit at the edges — all outside
+        // the planned symbol stream.
+        let actual_modulated_s =
+            actual_total_s - vox_overhead_s - preburst_s - 0.2 - leadout_s;
         let drift = (actual_modulated_s - plan.duration_s_initial).abs()
             / plan.duration_s_initial;
         assert!(

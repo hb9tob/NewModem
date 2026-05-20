@@ -46,3 +46,9 @@ pub mod phase_smoother;
 // `modem-worker-base/src/sounder.rs`.
 pub mod probe;
 pub mod probe_analyze;
+
+// G3RUH self-synchronising scrambler / descrambler (multiplicative,
+// G(x) = 1 + x^12 + x^17). Applied on the source payload before
+// RaptorQ at TX and on the reassembled payload after RaptorQ at RX, to
+// whiten the bitstream regardless of user content.
+pub mod scrambler;

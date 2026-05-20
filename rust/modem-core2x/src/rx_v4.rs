@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use modem_core_base::ffe::train_ffe_ls;
 use modem_core_base::interleaver;
 use modem_core_base::ldpc::decoder::LdpcDecoder;
+use modem_core_base::scrambler;
 use modem_core_base::phase_smoother::{
     rts_phase_smooth, rts_smooth_scalar, PhaseObs, PhaseSmootherParams,
     ScalarObs, ScalarRtsParams,
@@ -1904,14 +1905,18 @@ fn rx_v4_decode_pass(
         }
     }
 
-    // RaptorQ reassembly.
+    // RaptorQ reassembly, then G3RUH descramble — the mirror of the
+    // TX-side `scrambler::scramble` applied to the padded source bytes
+    // in `frame2x::build_superframe_v4_range`.
     if let Some(ref h) = result.app_header {
-        if let Some(payload) = modem_framing::raptorq_codec::try_decode(
-            &cw_bytes,
-            h.file_size,
-            h.t_bytes as u16,
-        ) {
-            result.data = payload;
+        let scrambled: Vec<u8> = if let Some(payload) =
+            modem_framing::raptorq_codec::try_decode(
+                &cw_bytes,
+                h.file_size,
+                h.t_bytes as u16,
+            )
+        {
+            payload
         } else {
             // Fall back to ESI-sorted concat (zero-padded missing slots)
             // — same V3 strategy when not enough packets converged for
@@ -1926,8 +1931,9 @@ fn rx_v4_decode_pass(
                 }
             }
             acc.truncate(h.file_size as usize);
-            result.data = acc;
-        }
+            acc
+        };
+        result.data = scrambler::descramble(&scrambled);
     }
 
     if sigma2_n > 0 {

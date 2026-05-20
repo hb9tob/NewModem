@@ -35,6 +35,7 @@ use modem_core_base::constellation::{
 use modem_core_base::interleaver;
 use modem_core_base::ldpc::encoder::LdpcEncoder;
 use modem_core_base::profile_types::ConstellationType;
+use modem_core_base::scrambler;
 use modem_core_base::types::Complex64;
 use modem_framing::app_header::{self, AppHeader};
 
@@ -324,7 +325,16 @@ pub fn build_superframe_v4_range(
         padded.extend_from_slice(&preburst::lfsr15_bytes(padded_len - data.len()));
         Some(padded)
     };
-    let data_for_encode: &[u8] = padded_owned.as_deref().unwrap_or(data);
+    let raw_for_encode: &[u8] = padded_owned.as_deref().unwrap_or(data);
+
+    // G3RUH scrambler on the source bytes (before RaptorQ). Whitens the
+    // payload so the modulator never sees long correlated runs, no
+    // matter what the user data looks like. The matching descrambler
+    // runs in `rx_v4` on the reassembled buffer truncated to
+    // `file_size`. Self-sync, so byte N only depends on bytes < N — the
+    // truncation at RX is safe.
+    let scrambled_for_encode: Vec<u8> = scrambler::scramble(raw_for_encode);
+    let data_for_encode: &[u8] = &scrambled_for_encode;
 
     // Tail-fill : round `n_packets` up to the next multiple of
     // `data_cw_per_cycle(cfg)` so the burst's last cycle is fully

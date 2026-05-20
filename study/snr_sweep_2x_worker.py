@@ -149,6 +149,10 @@ def main():
     ap.add_argument("--drift-ppm", type=float, default=0.0)
     ap.add_argument("--thermal-ppm", type=float, default=0.0)
     ap.add_argument("--thermal-period", type=float, default=120.0)
+    ap.add_argument("--drift-ramp-ppm-per-s", type=float, default=0.0,
+                    help="Linear drift ramp (ppm/s) added on top of "
+                         "static --drift-ppm. Models a SoC clock heating "
+                         "up linearly during a long burst.")
     ap.add_argument("--tx-clip", type=float, default=None)
     ap.add_argument("--repair-pct", type=int, default=30,
                     help="RaptorQ repair pct on top of K (default 30; pass "
@@ -177,6 +181,8 @@ def main():
           f"→ {payload_path}")
     print(f"Profiles: {args.profiles}")
     drift_desc = f"drift={args.drift_ppm:+.1f} ppm"
+    if args.drift_ramp_ppm_per_s != 0.0:
+        drift_desc += f" + ramp {args.drift_ramp_ppm_per_s:+.3f} ppm/s"
     if args.thermal_ppm > 0:
         drift_desc += (f" + thermal ±{args.thermal_ppm:.1f} ppm "
                        f"/ {args.thermal_period:.0f} s")
@@ -225,6 +231,7 @@ def main():
                         drift_ppm=args.drift_ppm,
                         thermal_ppm=args.thermal_ppm,
                         thermal_period_s=args.thermal_period,
+                        drift_ramp_ppm_per_s=args.drift_ramp_ppm_per_s,
                         phase_walk_rad_per_sqrt_s=phase_walk,
                         start_delay_s=0.5,
                         rng_seed=args.seed + int(if_noise * 1000)
