@@ -344,6 +344,27 @@ fn translate_events(
             Rx2xEvent::CwConverged { is_meta, .. } if !*is_meta => {
                 // Emit v2_progress on each new DATA-CW converged.
                 let snap = session.snapshot();
+                // Fountain-banner event fires on every CwConverged event
+                // (cheap), using `session.data_cws_converged()` =
+                // `cw_bytes.len()` which is monotone and matches the
+                // raptorq decode threshold. Decoupled from the
+                // `snap.data_cws_converged` gate below (that one tracks
+                // a rollback-prone counter — see comment further down).
+                if let (Some(sid), Some(needed)) = (
+                    *emitted_session_id,
+                    session.k_source(),
+                ) {
+                    sink.emit(
+                        "session_progress",
+                        SessionProgressPayload {
+                            session_id: sid,
+                            received: session.data_cws_converged() as u32,
+                            needed: needed as u32,
+                            decoded: false,
+                            cap_reached: false,
+                        },
+                    );
+                }
                 if snap.data_cws_converged != *last_progress_converged {
                     let pilot_phase_segments: Vec<Vec<f32>> = snap
                         .pilot_phase_per_cw
@@ -377,27 +398,6 @@ fn translate_events(
                         }),
                     );
                     *last_progress_converged = snap.data_cws_converged;
-                    // V3-parity fountain-banner event. The 2x decoder
-                    // tracks unique RaptorQ ESIs as `cw_bytes.len()`
-                    // (==`data_cws_converged`) and needs `k_symbols`
-                    // RaptorQ source symbols for assembly. Emit on every
-                    // new converged DATA-CW so the GUI fountain banner
-                    // updates live, same as V3.
-                    if let (Some(sid), Some(needed)) = (
-                        *emitted_session_id,
-                        session.k_source(),
-                    ) {
-                        sink.emit(
-                            "session_progress",
-                            SessionProgressPayload {
-                                session_id: sid,
-                                received: snap.data_cws_converged as u32,
-                                needed: needed as u32,
-                                decoded: false,
-                                cap_reached: false,
-                            },
-                        );
-                    }
                 }
             }
             Rx2xEvent::PayloadAssembled { .. } => {
@@ -410,12 +410,11 @@ fn translate_events(
                     *emitted_session_id,
                     session.k_source(),
                 ) {
-                    let snap = session.snapshot();
                     sink.emit(
                         "session_progress",
                         SessionProgressPayload {
                             session_id: sid,
-                            received: snap.data_cws_converged as u32,
+                            received: session.data_cws_converged() as u32,
                             needed: needed as u32,
                             decoded: true,
                             cap_reached: false,

@@ -3572,6 +3572,14 @@ impl Rx2xSession {
         // RaptorQ assembly if app_header recovered. Descramble mirrors
         // the TX-side `scrambler::scramble` on the padded source bytes
         // in `frame2x::build_superframe_v4_range`.
+        //
+        // Strict: only commit `result.data` when RaptorQ actually
+        // decodes. The previous zero-padded ESI-concat fallback was
+        // wrong — it produced a file that looked complete (right
+        // magic for valid header CWs received, zeros after) and
+        // tripped the worker's `file_complete` save path, hiding the
+        // fact that the decode was partial. Operators saw a .bin/.avif
+        // saved when in reality only some CWs were received.
         if let Some(ref h) = self.app_header {
             if !self.payload_assembled {
                 if let Some(payload) = raptorq_codec::try_decode(
@@ -3583,21 +3591,6 @@ impl Rx2xSession {
                     self.result.data = descrambled.clone();
                     events.push(Rx2xEvent::PayloadAssembled { bytes: descrambled });
                     self.payload_assembled = true;
-                } else {
-                    // ESI-sorted concat fallback (zero-padded) for partial
-                    // decode display in the GUI.
-                    let n_source_cw = self.k_source.unwrap_or(h.k_symbols as usize);
-                    let mut acc =
-                        Vec::with_capacity(n_source_cw * self.k_bytes);
-                    for esi in 0..n_source_cw as u32 {
-                        if let Some(b) = self.cw_bytes.get(&esi) {
-                            acc.extend_from_slice(b);
-                        } else {
-                            acc.extend(std::iter::repeat(0u8).take(self.k_bytes));
-                        }
-                    }
-                    acc.truncate(h.file_size as usize);
-                    self.result.data = scrambler::descramble(&acc);
                 }
             }
         }
