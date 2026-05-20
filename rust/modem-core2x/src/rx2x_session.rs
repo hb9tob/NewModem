@@ -2703,34 +2703,23 @@ impl Rx2xSession {
             //      frame (TX-time mapping). Subsequent SOFs in the
             //      new frame will be re-refined and feed the fine
             //      tracker.
-            //   4. Reset CW counters + bitmap. Any decode attempts
-            //      pre-apply happened at the wrong ratio — they failed
-            //      to converge (so didn't pollute `cw_bytes`) but DID
-            //      bump `data_cws_total`. Without this reset, the
-            //      post-apply re-decode of the same ESIs would
-            //      double-count (esi_known_before=false because the
-            //      pre-apply failed CWs aren't in `cw_bytes`, so
-            //      `decode_one_cw` bumps `data_cws_total` again).
-            //      Symptom : `total=80` instead of `70` at HIGH+2X.
+            //   4. **Keep** CW counters, bitmap, AND `cw_bytes`. V3
+            //      parity: blocks already decoded (LDPC+CRC validated,
+            //      so cryptographically authentic regardless of the
+            //      sample-timing the drift refine just corrected)
+            //      remain available to RaptorQ assembly even if the
+            //      audio that produced them is trimmed past after
+            //      `drift_locked` flips. The post-apply Pass 1 will
+            //      re-visit the same ESIs: `esi_known_before == true`
+            //      triggers the rollback at drive_locked:2032 which
+            //      uses the *pre-decode* counter snapshot (NOT the
+            //      reset-to-zero scenario) — so counters stay
+            //      consistent with cw_bytes.len(). Removing the reset
+            //      avoids the "bitmap goes red after drift apply"
+            //      regression AND preserves the user's accumulated
+            //      RaptorQ packets across drift refinement.
             self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
             self.drift_refined_sofs.clear();
-            self.result.data_cws_total = 0;
-            self.result.data_cws_converged = 0;
-            self.result.total_cws = 0;
-            self.result.converged_cws = 0;
-            self.result.converged_bitmap.clear();
-            // Clear the per-ESI byte cache too. Otherwise any ESI that
-            // had converged in a pre-apply turbo retry stays in
-            // `cw_bytes`, and the post-apply Pass 1 re-visit sees
-            // `esi_known_before = true` → the unconditional rollback in
-            // `drive_locked` (line ~1572) reverts the `data_cws_total +=
-            // 1` bump for THAT ESI. Net: one missing count per
-            // pre-apply turbo-converged ESI — observed as `total=69`
-            // instead of 70 on a 7-cycle burst where cycle 0's turbo
-            // happened to rescue exactly one CW. Post-apply at the
-            // correct ratio every ESI re-decodes anyway, so flushing
-            // here costs nothing.
-            self.cw_bytes.clear();
             // Now that the resampler ratio is committed, enable
             // `trim_audio_for_streaming` (gated on `drift_locked`).
             // From this point onward the audio_buffer is allowed to
