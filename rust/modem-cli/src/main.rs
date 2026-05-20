@@ -1190,7 +1190,11 @@ fn run_rx_2x(input: &PathBuf, output: &PathBuf, profile: &str) {
         pi.name().to_string(),
     );
     let mut events: Vec<modem_core2x::rx2x_session::Rx2xEvent> = Vec::new();
-    const CHUNK: usize = 24_000;
+    let chunk_size: usize = std::env::var("RX2X_CLI_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24_000);
+    let CHUNK = chunk_size;
     // `RX2X_LOG_DRIFT_TICK=1` (drift validation harness) prints
     //   `[rx2x-drift-tick] t=<wav_s> drift_ppm=<x>`
     // one line per chunk. The wav-relative time tracks the *injected*

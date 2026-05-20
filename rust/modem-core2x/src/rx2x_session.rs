@@ -806,8 +806,22 @@ impl Rx2xSession {
             .equalized_up_to_abs
             .saturating_sub(self.buf_start_abs) as usize;
         let scan_from = scan_from.min(self.sym_buffer.len());
-        self.sym_buffer = equalize_symbols_per_cycle_from(
-            &self.sym_buffer, &self.cfg, &[], scan_from);
+        // FFE training + apply must read from RAW symbols (the
+        // streaming pipeline's canonical view), NOT from the
+        // partially-equalised `self.sym_buffer` — training on already-
+        // equalised pilots would give near-identity taps. Compute the
+        // fresh equalisation on the raw streaming buffer, then splice
+        // in only the freshly-equalised tail `[scan_from..end]` —
+        // `self.sym_buffer[0..scan_from]` stays in its prior equalised
+        // state from earlier chunks' calls (no destroy-and-rebuild).
+        let raw_full: Vec<Complex64> =
+            self.streaming.sym_buffer().to_vec();
+        let new_eq = equalize_symbols_per_cycle_from(
+            &raw_full, &self.cfg, &[], scan_from);
+        self.sym_buffer.truncate(scan_from);
+        if scan_from < new_eq.len() {
+            self.sym_buffer.extend_from_slice(&new_eq[scan_from..]);
+        }
         // After equalise, advance the cursor to the position past the
         // last fully-equalised cycle. Conservative bound: the streaming
         // sym_buffer end minus one cycle of margin (the last cycle in
@@ -1471,11 +1485,35 @@ impl Rx2xSession {
             self.audio_drained_samples,
             self.cached_drift_ppm,
         );
-        // Mirror the streaming sym_buffer into the session-owned Vec so
-        // the per-cycle FFE equaliser can mutate in place without
-        // contending with the streaming pipeline's append-only buffer.
-        self.sym_buffer = self.streaming.sym_buffer().to_vec();
-        self.buf_start_abs = self.streaming.sym_buffer_start_abs();
+        // Cumulative-equalised mirror of the streaming raw buffer.
+        // **Persistent across chunks**: cycles equalised by the per-cycle
+        // FFE pass in `process_audio_chunk` stay equalised — the prior
+        // `to_vec()` overwrite was destroying their state every refresh.
+        // The actual FFE pass downstream reads RAW from
+        // `self.streaming.sym_buffer()` (the canonical raw cumulative
+        // view), so this mirror only carries the equalised output for
+        // downstream FSM consumers.
+        let stream_start = self.streaming.sym_buffer_start_abs();
+        let stream_len = self.streaming.sym_buffer().len();
+        let stream_end = stream_start + stream_len as u64;
+        if stream_start > self.buf_start_abs {
+            let drop = (stream_start - self.buf_start_abs) as usize;
+            let drop = drop.min(self.sym_buffer.len());
+            self.sym_buffer.drain(..drop);
+            self.buf_start_abs = stream_start;
+            if self.equalized_up_to_abs < self.buf_start_abs {
+                self.equalized_up_to_abs = self.buf_start_abs;
+            }
+        }
+        let session_end = self.buf_start_abs + self.sym_buffer.len() as u64;
+        if stream_end > session_end {
+            let offset = (session_end - stream_start) as usize;
+            if offset < stream_len {
+                let new_tail: Vec<Complex64> =
+                    self.streaming.sym_buffer()[offset..].to_vec();
+                self.sym_buffer.extend(new_tail);
+            }
+        }
     }
 
     /// Channel close / explicit flush. Triggers Retrying if there's an
