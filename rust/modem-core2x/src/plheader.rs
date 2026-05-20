@@ -445,8 +445,16 @@ pub fn decode_plheader_at(
         .map(|&s| s / gain)
         .collect();
 
-    let payload = decode_pls(&pls_norm)?;
-    Some((payload, gain))
+    let payload = decode_pls(&pls_norm);
+    if std::env::var_os("RX2X_LOG_PLS").is_some() {
+        let pls_rms: f64 = (pls_norm.iter().map(|c| c.norm_sqr()).sum::<f64>()
+            / pls_norm.len() as f64).sqrt();
+        eprintln!(
+            "[rx2x-pls] gain.norm={:.4} gain.arg={:+.4} pls_rms={:.4} decode_ok={}",
+            gain.norm(), gain.arg(), pls_rms, payload.is_some(),
+        );
+    }
+    payload.map(|p| (p, gain))
 }
 
 #[cfg(test)]

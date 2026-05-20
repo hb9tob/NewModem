@@ -62,25 +62,27 @@ const LDPC_MAX_ITER: usize = 30;
 /// Conservative σ² floor when no pilot residual is available yet.
 const SIGMA2_FLOOR: f64 = 1e-3;
 
-/// Preamble correlation peak threshold (fraction of `PREAMBLE_LEN_SYM`).
-/// For the double-Chu preamble (128 unit-magnitude symbols),
-/// autocorrelation peaks at 128 on a clean roundtrip.
+/// Normalised preamble correlation threshold, ρ = |Σ y·conj(p)| /
+/// sqrt(Σ|y|² · Σ|p|²), in [0, 1].
 ///
-/// Real OTA paths (NBFM transceiver chain with audio-band LPF +
-/// de-emphasis + AGC) attenuate the preamble pulse magnitude by
-/// 70-80% — observed cross-correlation peaks land in the 30-40 range
-/// on the reference sound-card chain FT-991A (TX) → FTX-1 (RX) even
-/// at high SNR (= +3 dB above the legacy single-Chu 15-20 range).
-/// Threshold 0.2 × 128 = 25.6 admits those while staying well above
-/// the noise correlation level (random Chu match peaks
-/// ≈ √(128·2·ln(L))·σ for L=5000 syms, so at σ=0.06 a noise peak is
-/// ~2 — well under threshold).
+/// This metric is **amplitude-invariant**: a perfect (scaled, phase-
+/// rotated) match of the preamble template gives ρ = 1.0 regardless
+/// of the absolute symbol level, so the threshold doesn't need to be
+/// re-tuned when AGC / audio LPF / de-emphasis crush the OTA preamble
+/// down to 20-30 % of the synthetic-WAV amplitude. The pre-2026-05-20
+/// implementation compared the raw correlation magnitude against an
+/// absolute threshold (0.2 × PREAMBLE_LEN = 25.6), which silently
+/// missed real PLHEADERs on any OTA path with stronger-than-expected
+/// AGC attack.
 ///
-/// Was 0.5 pre-v0.11.0-2x4 (single-Chu, correct for synthetic WAV
-/// roundtrip, blew past every real OTA capture). Migration to
-/// double-Chu in the Schmidl-Cox refactor doubles the SNR floor while
-/// keeping the same 0.2 fraction (= ×2 more noise rejection).
-const SOF_PEAK_THRESHOLD_FRAC: f64 = 0.2;
+/// On a noise-only window the normalised correlation collects ~√N
+/// independent random phases, so ρ ≈ 1/√PREAMBLE_LEN ≈ 0.088 in
+/// expectation (Rayleigh-distributed, tail decays exponentially).
+/// Threshold 0.4 is well above that floor (4.5×) and well below the
+/// 0.7-0.9 range observed for real OTA preambles after AGC + LPF
+/// distortion. Tightened from the 0.2 absolute-frac equivalent
+/// because the new metric no longer needs slack for amplitude loss.
+const SOF_PEAK_RATIO_THRESHOLD: f64 = 0.4;
 
 /// One decoded V4 burst.
 #[derive(Clone, Debug)]
@@ -276,12 +278,9 @@ impl RxResult2x {
 /// Find the next SOF starting at or after `cursor`. Returns the symbol
 /// index of the first SOF symbol on success.
 ///
-/// Uses simple linear cross-correlation:
-///   peak = max_k |Σ_n y[k+n] · conj(sof[n])|   for k in cursor ..= end
-/// and accepts the first peak above [`SOF_PEAK_THRESHOLD_FRAC`] · `SOF_LEN_SYM`.
-/// Linear (not normalised) is enough because the SOF is constant-magnitude
-/// and the gain estimate inside `decode_plheader_at` will absorb any
-/// channel scaling later.
+/// Uses the amplitude-invariant normalised cross-correlation:
+///   ρ_k = |Σ_n y[k+n] · conj(p[n])| / sqrt(Σ_n |y[k+n]|² · Σ_n |p[n]|²)
+/// and accepts the first peak above [`SOF_PEAK_RATIO_THRESHOLD`].
 /// Circular mean of a phase trajectory in radians (output in `[-π, π]`).
 /// Pushed into `RxResult2x.pilot_phase_per_cw` so the GUI's pilot-phase
 /// canvas plots one point per CW summarising the Pass 2 RTS-smoothed
@@ -321,63 +320,74 @@ pub fn find_all_sofs(
     }
     let preamble = plheader::preamble_for_family(family);
     debug_assert_eq!(preamble.len(), PREAMBLE_LEN_SYM);
-    // Double-Chu preamble: clean autocorr peak = PREAMBLE_LEN_SYM
-    // = 128. The 0.2 fractional threshold (= 25.6) admits OTA peaks
-    // attenuated by ~70-80 % on the FT-991A → FTX-1 sound-card
-    // reference chain, while staying well above the noise correlation
-    // level. False-positive Chu hits in band noise are filtered
-    // downstream by per-PLS Golay+CRC validation at the
-    // bootstrap-commit gate AND by the Schmidl-Cox auto-correlation
-    // gate upstream.
-    let threshold = SOF_PEAK_THRESHOLD_FRAC * PREAMBLE_LEN_SYM as f64;
-    let end = symbols.len() - PREAMBLE_LEN_SYM;
+    // Amplitude-invariant normalised correlation:
+    //   ρ_k = |Σ y[k+n]·conj(p[n])| / sqrt(Σ|y[k+n]|² · Σ|p[n]|²)
+    // Σ|p|² = PREAMBLE_LEN_SYM (Chu sequences are unit magnitude).
+    // ρ peaks at 1.0 on a perfect (scaled) match and sits near
+    // 1/√128 ≈ 0.088 on noise, so AGC / audio LPF attenuation no
+    // longer pushes real peaks below threshold. False-positive Chu
+    // hits in band noise are filtered downstream by per-PLS Golay+CRC
+    // validation at the bootstrap-commit gate AND by the Schmidl-Cox
+    // auto-correlation gate upstream.
+    let n_p = PREAMBLE_LEN_SYM;
+    let preamble_energy = n_p as f64;
+    let end = symbols.len() - n_p;
     let log_chu = std::env::var_os("RX2X_LOG_CHU").is_some();
-    let skip = min_cycle_skip_syms.max(PREAMBLE_LEN_SYM);
-    // Two-pass: first pass computes correlation magnitude at every
-    // position above threshold. Second pass walks in `skip`-sized
-    // windows and emits the LOCAL MAXIMUM per window (not the first
+    let skip = min_cycle_skip_syms.max(n_p);
+    // Two-pass: first pass computes the normalised correlation ratio
+    // at every position. Second pass walks in `skip`-sized windows
+    // and emits the LOCAL MAXIMUM per window (not the first
     // crossing). The first-crossing strategy used historically
-    // suppressed real PLHEADERs (correlation ≈ 128) when a chance
-    // false-positive (correlation ≈ 25.6 = exactly threshold) sat
-    // earlier in the same `skip` window — find_all_sofs would report
-    // the false-positive and skip past the real one. Common failure
-    // mode with the PRBS pre-burst path: PRBS chance correlations at
-    // ~2 % of positions exceeded threshold and masked the cycle 0
-    // PLHEADER deeper in the buffer.
-    let mut mags: Vec<f64> = Vec::with_capacity(end + 1);
+    // suppressed real PLHEADERs (ratio ≈ 1.0) when a chance false-
+    // positive (ratio just above threshold) sat earlier in the same
+    // `skip` window — find_all_sofs would report the false-positive
+    // and skip past the real one. Common failure mode with the PRBS
+    // pre-burst path: PRBS chance correlations at ~2 % of positions
+    // exceeded threshold and masked the cycle 0 PLHEADER deeper in
+    // the buffer.
+    let mut ratios: Vec<f64> = Vec::with_capacity(end + 1);
+    // Running sum of |y|² over the current window of size n_p.
+    let mut window_energy: f64 =
+        symbols[..n_p].iter().map(|s| s.norm_sqr()).sum();
     let mut best_k_log: usize = 0;
-    let mut best_peak_log: f64 = 0.0;
+    let mut best_ratio_log: f64 = 0.0;
     for k in 0..=end {
+        if k > 0 {
+            window_energy -= symbols[k - 1].norm_sqr();
+            window_energy += symbols[k + n_p - 1].norm_sqr();
+        }
         let mut acc = Complex64::new(0.0, 0.0);
-        for n in 0..PREAMBLE_LEN_SYM {
+        for n in 0..n_p {
             acc += symbols[k + n] * preamble[n].conj();
         }
-        let mag = acc.norm();
-        mags.push(mag);
-        if log_chu && mag > best_peak_log {
-            best_peak_log = mag;
+        let denom = (window_energy.max(0.0) * preamble_energy).sqrt();
+        let rho = if denom > 1e-12 { acc.norm() / denom } else { 0.0 };
+        ratios.push(rho);
+        if log_chu && rho > best_ratio_log {
+            best_ratio_log = rho;
             best_k_log = k;
         }
     }
+    let threshold = SOF_PEAK_RATIO_THRESHOLD;
     let mut window_start = 0usize;
     while window_start <= end {
         let window_end = (window_start + skip).min(end + 1);
         let mut local_best_k = window_start;
-        let mut local_best_mag = 0.0_f64;
+        let mut local_best_ratio = 0.0_f64;
         for k in window_start..window_end {
-            if mags[k] > local_best_mag {
-                local_best_mag = mags[k];
+            if ratios[k] > local_best_ratio {
+                local_best_ratio = ratios[k];
                 local_best_k = k;
             }
         }
-        if local_best_mag >= threshold {
+        if local_best_ratio >= threshold {
             out.push(local_best_k);
             if log_chu {
                 eprintln!(
-                    "[rx2x-chu] src=find_all_sofs status=accept k={} peak={:.4} \
+                    "[rx2x-chu] src=find_all_sofs status=accept k={} \
                      ratio={:.4} threshold={:.4} preamble_len={} family={:?} win_len={}",
-                    local_best_k, local_best_mag, local_best_mag / PREAMBLE_LEN_SYM as f64,
-                    threshold, PREAMBLE_LEN_SYM, family, symbols.len(),
+                    local_best_k, local_best_ratio,
+                    threshold, n_p, family, symbols.len(),
                 );
             }
             // Skip past the window we just selected the peak from.
@@ -388,13 +398,11 @@ pub fn find_all_sofs(
             window_start = window_end;
         }
     }
-    let best_k = best_k_log;
-    let best_peak = best_peak_log;
     if log_chu {
         eprintln!(
-            "[rx2x-chu] src=find_all_sofs summary win_len={} k_best={} peak_best={:.4} \
+            "[rx2x-chu] src=find_all_sofs summary win_len={} k_best={} \
              ratio_best={:.4} threshold={:.4} accepted={} family={:?}",
-            symbols.len(), best_k, best_peak, best_peak / PREAMBLE_LEN_SYM as f64,
+            symbols.len(), best_k_log, best_ratio_log,
             threshold, out.len(), family,
         );
     }
@@ -412,7 +420,7 @@ pub fn find_all_sofs(
 /// `(slope − cycle_period_sym) / cycle_period_sym × 1e6`.
 ///
 /// **Outlier rejection** (critical on real OTA where the
-/// [`SOF_PEAK_THRESHOLD_FRAC`] = 0.2 lets through a few noise
+/// [`SOF_PEAK_RATIO_THRESHOLD`] still lets through occasional noise
 /// correlations between bursts): each SOF is included in the fit only
 /// if its residual from `k × cycle` is < 30 % of one cycle. Without
 /// this, false-positive SOF detections in band noise produce garbage
@@ -481,39 +489,98 @@ pub(crate) fn find_next_sof(
     }
     let preamble = plheader::preamble_for_family(family);
     debug_assert_eq!(preamble.len(), PREAMBLE_LEN_SYM);
-    let threshold = SOF_PEAK_THRESHOLD_FRAC * PREAMBLE_LEN_SYM as f64;
-    let end = symbols.len() - PREAMBLE_LEN_SYM;
+    let n_p = PREAMBLE_LEN_SYM;
+    let preamble_energy = n_p as f64;
+    let threshold = SOF_PEAK_RATIO_THRESHOLD;
+    let end = symbols.len() - n_p;
     let log_chu = std::env::var_os("RX2X_LOG_CHU").is_some();
-    let mut best_k: usize = cursor;
-    let mut best_peak: f64 = 0.0;
+    // Sliding window energy over [cursor, cursor + n_p).
+    let mut window_energy: f64 =
+        symbols[cursor..cursor + n_p].iter().map(|s| s.norm_sqr()).sum();
+    // **Local-maximum search instead of first-crossing.** The double-
+    // Chu preamble (2 × Chu_64) produces a strong cross-correlation
+    // sidelobe at position X + SOF_LEN_SYM (= half-preamble offset),
+    // ρ ≈ 0.5 even on a degraded match where the true peak at X is
+    // ρ ≈ 0.5-1.0. First-crossing would return the sidelobe X+64 BEFORE
+    // the real X if X's amplitude is degraded (e.g., post-noise-gap
+    // recovery where streaming MF settles back to clean). Scanning a
+    // SOF_LEN-sized window past the first crossing and emitting the
+    // local MAX picks the real peak. Observed 2026-05-20 on the noise-
+    // splice recovery test (s0xCAFE, 6 s noise mid-burst): post-gap
+    // cycle 5 SOF at sym 33102 had ρ ≈ 0.5 at X, ρ ≈ 0.5 at X+64 ; the
+    // pre-fix code latched the X+64 sidelobe and failed PLS Golay,
+    // never finding the real cycle 5 PLHEADER.
+    let mut first_above: Option<usize> = None;
+    let mut best_k_in_window: usize = cursor;
+    let mut best_ratio_in_window: f64 = 0.0;
+    let mut best_k_log: usize = cursor;
+    let mut best_ratio_log: f64 = 0.0;
     for k in cursor..=end {
+        if k > cursor {
+            window_energy -= symbols[k - 1].norm_sqr();
+            window_energy += symbols[k + n_p - 1].norm_sqr();
+        }
         let mut acc = Complex64::new(0.0, 0.0);
-        for n in 0..PREAMBLE_LEN_SYM {
+        for n in 0..n_p {
             acc += symbols[k + n] * preamble[n].conj();
         }
-        let mag = acc.norm();
-        if log_chu && mag > best_peak {
-            best_peak = mag;
-            best_k = k;
+        let denom = (window_energy.max(0.0) * preamble_energy).sqrt();
+        let rho = if denom > 1e-12 { acc.norm() / denom } else { 0.0 };
+        if log_chu && rho > best_ratio_log {
+            best_ratio_log = rho;
+            best_k_log = k;
         }
-        if mag >= threshold {
-            if log_chu {
-                eprintln!(
-                    "[rx2x-chu] src=find_next_sof status=accept cursor={} end={} \
-                     k={} peak={:.4} ratio={:.4} threshold={:.4} preamble_len={} family={:?}",
-                    cursor, end, k, mag, mag / PREAMBLE_LEN_SYM as f64,
-                    threshold, PREAMBLE_LEN_SYM, family,
-                );
+        if rho >= threshold {
+            // Track the local max over a SOF_LEN_SYM window past the
+            // first crossing — this absorbs the X+64 sidelobe of the
+            // double-Chu preamble. If a higher peak shows up within
+            // the window, prefer it.
+            match first_above {
+                None => {
+                    first_above = Some(k);
+                    best_k_in_window = k;
+                    best_ratio_in_window = rho;
+                }
+                Some(fa) => {
+                    if rho > best_ratio_in_window {
+                        best_k_in_window = k;
+                        best_ratio_in_window = rho;
+                    }
+                    if k >= fa + crate::plheader::SOF_LEN_SYM {
+                        // Window closed — emit the best position found.
+                        if log_chu {
+                            eprintln!(
+                                "[rx2x-chu] src=find_next_sof status=accept cursor={} \
+                                 first_above={} k_best={} ratio={:.4} threshold={:.4} \
+                                 preamble_len={} family={:?}",
+                                cursor, fa, best_k_in_window,
+                                best_ratio_in_window, threshold, n_p, family,
+                            );
+                        }
+                        return Some(best_k_in_window);
+                    }
+                }
             }
-            return Some(k);
         }
+    }
+    // EOF before window closed — emit whatever local max we accumulated
+    // (caller may still get a useful position if the scan ended on the
+    // first crossing of a real preamble).
+    if let Some(fa) = first_above {
+        if log_chu {
+            eprintln!(
+                "[rx2x-chu] src=find_next_sof status=accept_eof cursor={} \
+                 first_above={} k_best={} ratio={:.4} family={:?}",
+                cursor, fa, best_k_in_window, best_ratio_in_window, family,
+            );
+        }
+        return Some(best_k_in_window);
     }
     if log_chu {
         eprintln!(
             "[rx2x-chu] src=find_next_sof status=noaccept cursor={} end={} \
-             k_best={} peak_best={:.4} ratio_best={:.4} threshold={:.4} preamble_len={} family={:?}",
-            cursor, end, best_k, best_peak, best_peak / PREAMBLE_LEN_SYM as f64,
-            threshold, PREAMBLE_LEN_SYM, family,
+             k_best={} ratio_best={:.4} threshold={:.4} preamble_len={} family={:?}",
+            cursor, end, best_k_log, best_ratio_log, threshold, n_p, family,
         );
     }
     None

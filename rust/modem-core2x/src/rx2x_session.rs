@@ -104,6 +104,43 @@ pub const RX2X_RETRY_BUDGET: u8 = 2;
 /// pilots and decoded data. Catastrophe trigger TBD.
 pub const RX2X_MAX_DRIFT_RESETS: u8 = 1;
 
+/// Drift delta magnitude (ppm) below which a post-bootstrap update is
+/// treated as a **smooth refinement** rather than a full FSM rewind.
+/// At ≤ 2 ppm the symbol-grid slip per cycle is < 0.013 sym (HIGH+2X
+/// at sps=32, ~5689 sym/cycle) — well below the matched-filter RRC
+/// span, absorbed by the live phase tracker without retraining the
+/// FFE. Above 2 ppm we'd risk a discontinuity larger than the FFE can
+/// chase mid-burst, so the full reset path (one-shot) stays the
+/// fallback for unusual cases.
+pub const SMALL_DRIFT_REFINE_PPM: f64 = 2.0;
+
+/// Consecutive CW-decode failures within a cycle before we ABORT the
+/// cycle (skip remaining CWs, advance scan_cursor to the next expected
+/// PLHEADER). When the FFE/phase tracker upstream are stale, continuing
+/// to attempt CWs in the same cycle just burns CPU on guaranteed
+/// failures and contaminates the σ²/scatter metrics. Aborting at 3
+/// preserves cycles where 1-2 random LDPC failures sit alongside good
+/// CWs (the cycle-end RTS turbo redecode rescues those).
+pub const ABORT_CYCLE_FAILED_CW_THRESH: u8 = 3;
+
+// Note: the previous `REBOOTSTRAP_LOCK_FAIL_THRESH` counter was
+// retired 2026-05-20. The trigger now is deterministic: **one** Golay-
+// invalidating try_lock failure post-first-cycle is the exit
+// condition, because at that point the FSM is hunting at a
+// PREDICTED position (anchor + cycle_period) and a candidate showing
+// up there but failing PLS validation means the upstream chain has
+// shifted (drift drifted, AGC squashed, audio gap). No reason to wait
+// for a second confirmation. Pre-first-cycle fails (bootstrap
+// settling) are gated separately by `result.cycles >= 1`.
+
+/// Maximum number of **smooth** running drift refinements per session.
+/// At one update per cycle (~4 s), this caps the session length over
+/// which we keep chasing the LS estimate. After 16 refinements (~64 s
+/// at HIGH+2X), the running LS is converged to < 0.1 ppm noise on
+/// realistic OTA traces and further updates oscillate in the noise —
+/// freezing then is harmless and saves CPU.
+pub const RX2X_MAX_DRIFT_REFINES: u8 = 16;
+
 /// Number of consecutive chunks with no significant drift update
 /// (< 0.5 ppm) before `drift_locked` flips to true on the early path
 /// (before `n_drift_resets` hits `RX2X_MAX_DRIFT_RESETS`). Once locked,
@@ -303,6 +340,44 @@ pub struct Rx2xSession {
     /// updates significantly enough to trigger an FSM reset (see
     /// `reset_for_backward_fix`). Capped at `RX2X_MAX_DRIFT_RESETS`.
     n_drift_resets: u8,
+
+    /// Smooth-refinement counter — incremented each time
+    /// `cached_drift_ppm` is updated by the running per-cycle LS
+    /// refinement post-bootstrap. Capped at `RX2X_MAX_DRIFT_REFINES`.
+    /// Disjoint from `n_drift_resets`: the first commit goes through
+    /// the full-reset path; subsequent small-delta updates take the
+    /// soft-reset (rewind-before-SOF) path.
+    n_drift_refines: u8,
+
+    /// Pending smooth drift refinement, set by the LS estimator when a
+    /// post-bootstrap delta in [`apply_threshold`, `SMALL_DRIFT_REFINE_PPM`)
+    /// is detected. Consumed at the next inter-cycle moment (state ==
+    /// Idle at the top of the chunk) by `apply_pending_drift_refine`,
+    /// which rewinds `streaming_dsp` so the **next** PLHEADER is
+    /// resampled at the new ratio. Apply-on-chunk-boundary would land
+    /// mid-CW and break the turbo-EM atomicity (per the architecture
+    /// constraint validated 2026-05-20).
+    pending_drift_refine_ppm: Option<f64>,
+
+    /// Consecutive CW decode failures inside the **current** cycle.
+    /// Incremented on every failed `decode_one_cw` in `drive_locked`,
+    /// reset on every success AND at every new cycle entry
+    /// (`next_cw_idx == 0`). When the value crosses
+    /// [`ABORT_CYCLE_FAILED_CW_THRESH`] the FSM aborts the cycle —
+    /// skips remaining CWs, advances `scan_cursor_abs` to the next
+    /// expected PLHEADER, returns to `Idle`. Saves CPU + keeps the
+    /// σ²/scatter metrics clean by not feeding guaranteed-fail CWs
+    /// into the accumulator.
+    consecutive_cw_failed: u8,
+
+    /// Snapshot of `result.data_cws_converged` at the START of the
+    /// current cycle (set by `drive_locked` when `next_cw_idx == 0`).
+    /// Compared at cycle end : delta == 0 ⇒ the entire cycle was a
+    /// wash (META + every DATA-CW failed even after the turbo
+    /// redecode), trigger `full_rebootstrap` to recover from the
+    /// broken upstream state instead of continuing to scan at a
+    /// drifted grid.
+    cycle_converged_count_at_start: usize,
 
     /// Phase 3 per-cycle pilot phase observations. Each entry is
     /// `(absolute_symbol_index, PhaseObs)` for one pilot group. The
@@ -548,6 +623,10 @@ impl Rx2xSession {
             drift_per_cycle: Vec::new(),
             dd_refs_pool: Vec::new(),
             n_drift_resets: 0,
+            n_drift_refines: 0,
+            pending_drift_refine_ppm: None,
+            consecutive_cw_failed: 0,
+            cycle_converged_count_at_start: 0,
             cycle_phase_obs: Vec::new(),
             cycle_failed_cws: Vec::new(),
             gate_armed: false,
@@ -623,6 +702,13 @@ impl Rx2xSession {
     /// generated during this chunk's processing.
     pub fn process_audio_chunk(&mut self, samples: &[f32]) -> Vec<Rx2xEvent> {
         self.audio_buffer.extend_from_slice(samples);
+
+        // Inter-cycle drift refinement (deferred from a previous
+        // chunk's LS estimate). Must run **before** refresh_symbols
+        // so the upcoming feed_audio() resamples at the new ratio from
+        // the start. Gated on `state == Idle` to land cleanly between
+        // cycles, never inside an active Locked / Acquiring decode.
+        self.apply_pending_drift_refine();
 
         // Streaming pipeline first: extend `sym_buffer` with the symbols
         // produced from the new audio. `streaming_dsp::feed_audio` is
@@ -1092,6 +1178,242 @@ impl Rx2xSession {
     /// re-acquisition reach when transitioning Locked → Idle between
     /// cycles. The kept-but-unprocessed prefix stays in `audio_buffer`
     /// for the future backward path to consume.
+    /// Consume a pending smooth drift refinement at an inter-cycle
+    /// moment, rewinding `streaming_dsp` so the next PLHEADER is
+    /// resampled at the new ratio.
+    ///
+    /// **When this fires.** Only when the FSM is `Idle` at the top of
+    /// a chunk. `Idle` after the first cycle means a previous cycle
+    /// finalised (line 1801 — `drive_locked` sets state Idle after
+    /// `cycles += 1`) and the next SOF probe hasn't fired yet. So the
+    /// audio for the next cycle's PLHEADER is in `audio_buffer` but
+    /// hasn't been resampled yet (we throw away the current
+    /// streaming_dsp output and rebuild at new ratio).
+    ///
+    /// **What gets preserved.**
+    /// - `cw_bytes` (decoded CW payloads — RaptorQ assembly state).
+    /// - `app_header`, `session_id`, `k_source`, `n_repair`,
+    ///   `pls_anchors` (session metadata learned pre-refine).
+    /// - `result.data_cws_total/converged/cw_bytes` (totals stay
+    ///   coherent — `drive_locked` already skips already-known ESIs
+    ///   via `esi_known_before`).
+    /// - `audio_buffer`, `audio_drained_samples` (raw source-of-truth
+    ///   for the re-resample).
+    /// - `n_drift_resets`, `drift_locked` (first-commit lock holds).
+    ///
+    /// **What gets rebuilt.**
+    /// - `streaming_dsp` (fresh instance — resampler / downmix / MF /
+    ///   decimation state all start at zero, re-process audio_buffer
+    ///   at new ratio).
+    /// - `sym_buffer`, `buf_start_abs`, `equalized_up_to_abs` (drop
+    ///   the old-ratio symbol stream; refresh_symbols rebuilds from
+    ///   streaming).
+    /// - `phase_tracker` reset (its [φ, ω] state references absolute
+    ///   TX-time positions that just shifted under the new mapping).
+    /// - `ffe_taps = None` (trained at old ratio; per-cycle FFE
+    ///   training in `equalize_symbols_per_cycle_from` retrains on
+    ///   the next PLHEADER's references).
+    /// - `drift_refined_sofs` cleared (the `sym_abs` field is now
+    ///   stale; the LS will rebuild from new SOFs as they validate).
+    ///
+    /// **Counter contract.** `n_drift_refines` increments by 1 per
+    /// successful apply. Capped at `RX2X_MAX_DRIFT_REFINES`.
+    fn apply_pending_drift_refine(&mut self) {
+        let new_drift = match self.pending_drift_refine_ppm {
+            Some(v) => v,
+            None => return,
+        };
+        if !matches!(self.state, Rx2xState::Idle) {
+            // Inside a cycle (Acquiring/Locked) or wrapping up
+            // (Retrying/Finalising). Keep pending for the next
+            // inter-cycle moment.
+            return;
+        }
+        if self.n_drift_refines >= RX2X_MAX_DRIFT_REFINES {
+            // Budget exhausted — drop the pending value and stop
+            // refining. The accumulated LS estimate at this point is
+            // already convergent (<0.1 ppm noise) and further chase
+            // would oscillate in measurement noise.
+            self.pending_drift_refine_ppm = None;
+            return;
+        }
+        if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
+            eprintln!(
+                "[rx2x-drift] apply_pending: cached={:+.3} → new={:+.3} ppm \
+                 n_refines={} → {}",
+                self.cached_drift_ppm,
+                new_drift,
+                self.n_drift_refines,
+                self.n_drift_refines + 1,
+            );
+        }
+        self.cached_drift_ppm = new_drift;
+        self.n_drift_refines = self.n_drift_refines.saturating_add(1);
+        self.pending_drift_refine_ppm = None;
+        // Rewind the streaming DSP — the next refresh_symbols re-feeds
+        // audio_buffer at the new ratio. audio_drained_samples stays
+        // intact (the rolling trim policy is unchanged).
+        self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
+        self.sym_buffer.clear();
+        self.buf_start_abs = self.streaming.sym_buffer_start_abs();
+        self.equalized_up_to_abs = self.buf_start_abs;
+        // Drop FFE taps and the cycle-end transient state — the next
+        // PLHEADER will retrain FFE and reseat the phase tracker.
+        self.ffe_taps = None;
+        self.ffe_anchor_abs = 0;
+        self.phase_tracker.reset();
+        // Discard the LS history — the sym_abs values are stale
+        // (different symbol grid under the new ratio). Audio-rate
+        // positions ARE invariant but the dup check inside
+        // estimate_drift_from_raw keys on sym_abs, so without a clear
+        // the same SOF would be re-refined under a new sym_abs and
+        // accumulate duplicates that biaise the LS.
+        self.drift_refined_sofs.clear();
+        self.drift_scan_cursor_sym = self.streaming.sym_buffer_start_abs();
+        // FSM stays at Idle — refresh_symbols repopulates sym_buffer,
+        // try_acquire then finds the upcoming SOF at its new-ratio
+        // position. Already-decoded ESIs are skipped by drive_locked
+        // (esi_known_before) so cw_bytes carries forward cleanly.
+    }
+
+    /// Full re-bootstrap : tear down all streaming-DSP / FSM state and
+    /// fall back into the bootstrap path (next chunk's
+    /// `try_bootstrap_pair` will scan for a fresh SOF pair in the
+    /// remaining audio). Triggered by the recovery strategy when the
+    /// upstream chain (drift / FFE / phase) is provably broken :
+    ///
+    /// - 2 consecutive `try_lock` failures (PLHEADER Golay/CRC reject),
+    /// - 1 cycle where 0 CWs converged (META + all DATA failed).
+    ///
+    /// **What gets reset.** Everything stream-dependent : streaming_dsp,
+    /// sym_buffer, FFE taps, phase_tracker, drift_refined_sofs,
+    /// drift counters, scan/idle state, recovery counters.
+    /// `cached_drift_ppm` resets to 0 so the new bootstrap can commit
+    /// freely. `bootstrap_committed = false` so `process_audio_chunk`
+    /// re-enters the bootstrap path.
+    ///
+    /// **What gets preserved.** Bytes-level state earned by previous
+    /// cycles : `cw_bytes` (decoded CW payloads, RaptorQ assembly
+    /// state), `app_header` / `session_id` / `k_source` / `n_repair`
+    /// (session metadata), `result.data_cws_converged` /
+    /// `result.converged_bitmap` (counter coherent via the existing
+    /// `esi_known_before` rollback logic in `drive_locked`), and the
+    /// raw `audio_buffer` / `audio_drained_samples` (the source for
+    /// the re-acquire scan).
+    ///
+    /// Logged under `RX2X_LOG_RECOVERY=1`.
+    fn full_rebootstrap(&mut self, reason: &str) {
+        // **Drain audio_buffer past the last good exit point** before
+        // dropping the streaming DSP. This is critical : without it the
+        // new bootstrap pair-finder would re-scan the retained-history
+        // tail (cycles already in `cw_bytes`) and possibly commit a
+        // ratio + frame alignment that refers to a PAST PLHEADER. Two
+        // bad consequences :
+        //   1. The post-rebootstrap streaming pipeline re-emits symbols
+        //      for already-decoded cycles — wasteful but more importantly
+        //      may decode them at a NEW ratio and overwrite the existing
+        //      `cw_bytes` entries with subtly-different bytes (LDPC
+        //      converging on a slightly mis-aligned grid). RaptorQ then
+        //      sees inconsistent ESIs and fails to assemble.
+        //   2. The bootstrap's geometric two-SOF check picks the PAST
+        //      cycle pair (still in the tail) instead of advancing to
+        //      the future cycles where the actual breakdown happened.
+        // Drain target : `scan_cursor_abs` is the FSM's "next expected
+        // PLHEADER" position when the recovery trigger fired. We drain
+        // up to its audio-rate equivalent at the OLD (pre-reset) ratio
+        // minus a half-cycle margin so the next genuine PLHEADER still
+        // sits comfortably inside the post-drain audio_buffer.
+        let sps = match modem_core_base::rrc::check_integer_constraints(
+            modem_core_base::types::AUDIO_RATE,
+            self.cfg.base.symbol_rate,
+            self.cfg.base.tau,
+        ) {
+            Ok((s, _)) => s as u64,
+            Err(_) => 32, // defensive — HIGH+2X path
+        };
+        let old_ratio = 1.0 + self.cached_drift_ppm * 1e-6;
+        let margin_sym = (self.cycle_period_sym as u64) / 2;
+        let drain_target_sym =
+            self.scan_cursor_abs.saturating_sub(margin_sym);
+        let drain_target_audio =
+            ((drain_target_sym as f64) * (sps as f64) * old_ratio) as u64;
+        let extra_drain = drain_target_audio
+            .saturating_sub(self.audio_drained_samples) as usize;
+        let extra_drain = extra_drain.min(self.audio_buffer.len());
+        // No `min_audio_after_drain` guard. The RX can't know when an
+        // interfering signal will stop, so we can't wait for "enough
+        // post-noise audio" before firing — we just RESET and let
+        // the bootstrap path naturally fail-silent until clean
+        // PLHEADER audio accumulates in `audio_buffer`. Each chunk
+        // appends new samples; the gate retries; once 2 clean SOFs
+        // sit at cycle_period distance, the geometric check commits
+        // and steady-state resumes. `bootstrap_committed = false`
+        // (set below) gates the recovery trigger so this can't
+        // infinite-loop.
+        if extra_drain > 0 {
+            self.audio_buffer.drain(..extra_drain);
+        }
+        // Reset `audio_drained_samples` to 0 so the new streaming
+        // pipeline treats `audio_buffer[0]` as RX-time origin 0.
+        // Keeping the previous value would force the resampler to
+        // emit `audio_drained_samples`-worth of leading zeros before
+        // producing real signal (run_resampler maps in_buf =
+        // abs_idx − drained, returns 0 for in_buf < 0). On long
+        // bursts that's seconds of wasted output and would push the
+        // gate past its initial probe window with all-zeros.
+        // Absolute position bookkeeping for `cw_bytes` (keyed by
+        // ESI from PLHEADER PLS) is unaffected by this reset.
+        self.audio_drained_samples = 0;
+        if std::env::var_os("RX2X_LOG_RECOVERY").is_some() {
+            eprintln!(
+                "[rx2x-recovery] full_rebootstrap reason={} \
+                 cached_drift={:+.2} n_refines={} cycles={} cw_bytes={} \
+                 drained={} audio_remaining={} audio_drained_now={}",
+                reason,
+                self.cached_drift_ppm,
+                self.n_drift_refines,
+                self.result.cycles,
+                self.cw_bytes.len(),
+                extra_drain,
+                self.audio_buffer.len(),
+                self.audio_drained_samples,
+            );
+        }
+        self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
+        self.sym_buffer.clear();
+        self.buf_start_abs = self.streaming.sym_buffer_start_abs();
+        self.equalized_up_to_abs = self.buf_start_abs;
+        self.ffe_taps = None;
+        self.ffe_anchor_abs = 0;
+        self.phase_tracker.reset();
+        self.drift_refined_sofs.clear();
+        self.drift_scan_cursor_sym = self.streaming.sym_buffer_start_abs();
+        self.cached_drift_ppm = 0.0;
+        self.n_drift_resets = 0;
+        self.n_drift_refines = 0;
+        self.pending_drift_refine_ppm = None;
+        self.bootstrap_committed = false;
+        self.gate_armed = false;
+        self.gate_arm_buf_len = 0;
+        self.state = Rx2xState::Idle;
+        self.scan_cursor_abs = 0;
+        self.locked_symbol_phase = None;
+        self.stable_chunks = 0;
+        self.consecutive_cw_failed = 0;
+        // Cycle-local accumulators must not bleed into the next cycle.
+        self.cycle_phase_obs.clear();
+        self.cycle_failed_cws.clear();
+        // σ² accumulators reflect the post-rebootstrap decode quality.
+        self.sigma2_sum = 0.0;
+        self.sigma2_radial_sum = 0.0;
+        self.sigma2_tangential_sum = 0.0;
+        self.sigma2_n = 0;
+        // KEEP: cw_bytes, app_header, session_id, k_source, n_repair,
+        // pls_anchors, audio_buffer, audio_drained_samples, drift_locked,
+        // result.{data_cws_converged, converged_bitmap, expected_data_cws,
+        // app_header}.
+    }
+
     /// Streaming refresh (slice 2x23). Each chunk drives the
     /// `StreamingDsp` pipeline forward — resampler → downmix → MF →
     /// decimate are all stateful and continue from where they left
@@ -1189,11 +1511,23 @@ impl Rx2xSession {
             find_next_sof(&self.sym_buffer, cursor_rel, self.cfg.family)
         {
             let sof_abs = self.buf_start_abs + rel as u64;
+            if std::env::var_os("RX2X_LOG_SOF").is_some() {
+                eprintln!(
+                    "[rx2x-sof] probe_fired sof_abs={} (rel={} buf_start={} buf_len={})",
+                    sof_abs, rel, self.buf_start_abs, self.sym_buffer.len(),
+                );
+            }
             events.push(Rx2xEvent::SofProbeFired { sof_at_abs: sof_abs });
             self.state = Rx2xState::Acquiring { sof_at_abs: sof_abs };
             self.scan_cursor_abs = sof_abs;
             true
         } else {
+            if std::env::var_os("RX2X_LOG_SOF").is_some() {
+                eprintln!(
+                    "[rx2x-sof] no_sof cursor_rel={} buf_len={} buf_start={}",
+                    cursor_rel, self.sym_buffer.len(), self.buf_start_abs,
+                );
+            }
             // Advance cursor to the end of buffer to avoid rescanning.
             self.scan_cursor_abs =
                 self.buf_start_abs + self.sym_buffer.len() as u64;
@@ -1217,7 +1551,41 @@ impl Rx2xSession {
             return false;
         }
         let plheader_slice = &self.sym_buffer[rel..rel + PLHEADER_LEN_SYM];
-        match decode_plheader_at(plheader_slice, self.cfg.family) {
+        let decode_res = decode_plheader_at(plheader_slice, self.cfg.family);
+        if std::env::var_os("RX2X_LOG_SOF").is_some() {
+            // Independent gain LS for the diag (mirrors the one inside
+            // decode_plheader_at) so we see it even on PLS-decode failures.
+            let mut num = num_complex::Complex64::new(0.0, 0.0);
+            let mut den = 0.0_f64;
+            let sof = crate::plheader::sof_for_family(self.cfg.family);
+            for half in 0..2 {
+                let base = half * crate::plheader::SOF_LEN_SYM;
+                for k in 0..crate::plheader::SOF_LEN_SYM {
+                    num += plheader_slice[base + k] * sof[k].conj();
+                    den += sof[k].norm_sqr();
+                }
+            }
+            let g = num / den.max(1e-12);
+            // PLS slice RMS (post-gain-normalised) to spot abnormal level
+            let pls_start = 2 * crate::plheader::SOF_LEN_SYM;
+            let pls_slice = &plheader_slice[pls_start..];
+            let pls_rms: f64 = (pls_slice
+                .iter()
+                .map(|c| (c / g).norm_sqr())
+                .sum::<f64>()
+                / pls_slice.len() as f64)
+                .sqrt();
+            eprintln!(
+                "[rx2x-sof] try_lock sof_abs={} ok={} gain.norm={:.4} \
+                 gain.arg={:+.4} pls_rms={:.4}",
+                sof_at_abs,
+                decode_res.is_some(),
+                g.norm(),
+                g.arg(),
+                pls_rms,
+            );
+        }
+        match decode_res {
             Some((pls, gain)) => {
                 self.pls_anchors.push((sof_at_abs, pls));
                 if pls.flags & FLAG2X_EOT != 0 {
@@ -1274,6 +1642,46 @@ impl Rx2xSession {
                 // CRC failed — skip past and resume Idle scan.
                 self.state = Rx2xState::Idle;
                 self.scan_cursor_abs = sof_at_abs + 1;
+                // Recovery counter : if PLHEADER Golay/CRC keeps
+                // failing across consecutive `try_lock` attempts, the
+                // upstream is broken (drift drifted away from cached
+                // ratio, AGC swallowed the SOF, audio gap) — full
+                // re-bootstrap on the remaining audio is more
+                // productive than continuing to scan at a broken grid.
+                //
+                // Gated on bootstrap_committed=true: PRE-bootstrap
+                // try_lock fails are routine (bad SOF candidates from
+                // the FFT gate) and must not trigger recovery. POST-
+                // bootstrap, even a SINGLE fail is a strong signal —
+                // a real PLHEADER was found at a known cycle distance
+                // but couldn't be Golay-validated, meaning the
+                // resampler ratio is out of sync with the actual
+                // clock (typical thermal drift cliff at ±150 ppm).
+                // Deterministic exit condition: after the FSM has
+                // decoded ≥ 2 cycles cleanly, the post-cycle scan
+                // looks for the next PLHEADER at the PREDICTED
+                // position (anchor + cycle_period). A Golay-
+                // invalidating candidate landing there means the
+                // upstream chain has shifted under us (drift / AGC
+                // squash / audio gap) — no Golay-valid PLHEADER
+                // appeared at the expected position. Recover
+                // immediately rather than continuing to scan a
+                // broken grid.
+                //
+                // Gate on `cycles >= 2` (not 1) : the FIRST 1-2
+                // cycles can carry sub-symbol grid mismatch from
+                // bootstrap-settle that resolves naturally as the
+                // streaming pipeline accumulates more pilot evidence
+                // and the optional smooth refine commits. Triggering
+                // recovery in that transient regresses borderline
+                // cases (s57005 d+100, s48879 d-10) that otherwise
+                // converge to 70/70 if left alone.
+                if self.bootstrap_committed
+                    && self.result.cycles >= 2
+                    && std::env::var_os("RX2X_DISABLE_RECOVERY").is_none()
+                {
+                    self.full_rebootstrap("golay_fail_at_expected_pos");
+                }
                 true
             }
         }
@@ -1291,6 +1699,14 @@ impl Rx2xSession {
         next_cw_idx: usize,
         events: &mut Vec<Rx2xEvent>,
     ) -> bool {
+        // Cycle entry — snapshot the converged counter for the
+        // "did this cycle yield zero CWs?" check at cycle end, and
+        // reset the consecutive-CW-fail recovery counter.
+        if next_cw_idx == 0 {
+            self.cycle_converged_count_at_start =
+                self.result.data_cws_converged;
+            self.consecutive_cw_failed = 0;
+        }
         // Compute the wire position of the CW we want to decode this
         // call. Layout per cycle :
         //   [PLHEADER 192][LMS warmup][META-CW][DATA-CW 0]...[DATA-CW N-1]
@@ -1446,8 +1862,21 @@ impl Rx2xSession {
         //      `tracker.phi_at(abs_pos)` per symbol, so the downstream
         //      `decode_one_cw` sees phase-corrected data. Its own gain
         //      estimator captures only the residual magnitude offset.
+        // 2026-05-20: phase tracker forward derotation flipped ON by
+        // default. Sweep validation (static drift ±5..±50 ppm, 7
+        // seeds × 2): 70/70 exact across all cases, σ² ≈ unchanged
+        // on clean channels and σ²_scatter divided by ~3500× on
+        // hard cases (the EM-iter divergence pathology was actually
+        // raw-symbol phase walk fed into the soft-symbol path). The
+        // forward Kalman+RTS on the streaming phase tracker is THE
+        // mitigation for QO-100-class LO phase noise, where pilot-
+        // only LS-per-CW is too local to track multi-symbol phase
+        // walk — see [[qo100-cfo-readiness]].
+        //
+        // Kill-switch `RX2X_PHASE_TRACKER_OFF=1` reverts to the
+        // pre-flip pilot-only-per-CW phase compensation.
         let use_phase_tracker =
-            std::env::var_os("RX2X_PHASE_TRACKER").is_some();
+            std::env::var_os("RX2X_PHASE_TRACKER_OFF").is_none();
         let mut chunk = chunk; // shadow as mutable for derotation
         if use_phase_tracker {
             let init_gain = crate::rx_v4::estimate_cw_gain(
@@ -1609,6 +2038,10 @@ impl Rx2xSession {
         let first_time_converged = converged && !esi_known_before;
 
         if converged {
+            // Convergence resets the consecutive-fail recovery counter
+            // — a successful CW in a cycle means the upstream is
+            // healthy, even if a few prior CWs failed.
+            self.consecutive_cw_failed = 0;
             // Only emit CwConverged for ESIs not already known from a
             // prior pass — suppresses duplicate GUI updates and CSV
             // counter inflation on backward-fix re-decode.
@@ -1708,6 +2141,48 @@ impl Rx2xSession {
                     abs_start: cw_chunk_abs_start,
                 });
             }
+            // Recovery counter : ABORT the cycle once consecutive CW
+            // failures cross the threshold. Continuing to attempt the
+            // remaining CWs in the same cycle just burns CPU on
+            // guaranteed-fail symbols (the upstream FFE / phase
+            // tracker / drift have provably diverged) AND inflates
+            // the σ²/scatter accumulators with trash. Cycle-end RTS
+            // turbo redecode still rescues the CWs already attempted.
+            self.consecutive_cw_failed =
+                self.consecutive_cw_failed.saturating_add(1);
+            if self.consecutive_cw_failed >= ABORT_CYCLE_FAILED_CW_THRESH
+                && self.result.cycles >= 1
+            {
+                if std::env::var_os("RX2X_LOG_RECOVERY").is_some() {
+                    eprintln!(
+                        "[rx2x-recovery] abort_cycle cycle={} next_cw={} \
+                         consecutive_fail={}",
+                        cycle_idx, next_cw_idx, self.consecutive_cw_failed,
+                    );
+                }
+                // Still run the cycle-end RTS turbo redecode on the
+                // CWs already attempted (those before the abort) —
+                // they may still be recoverable from pilots
+                // collected so far.
+                self.refine_cycle_and_turbo_redecode(
+                    cycle_idx, anchor_sof_abs, events,
+                );
+                let cycle_converged =
+                    self.result.data_cws_converged
+                        > self.cycle_converged_count_at_start;
+                self.result.cycles += 1;
+                self.scan_cursor_abs =
+                    anchor_sof_abs + self.cycle_period_sym as u64;
+                self.state = Rx2xState::Idle;
+                self.consecutive_cw_failed = 0;
+                self.maybe_trim_buffer();
+                // If the abort yielded no converged CW even after
+                // turbo, full re-bootstrap on the next chunk.
+                if !cycle_converged {
+                    self.full_rebootstrap("zero_conv_cycle");
+                }
+                return true;
+            }
         }
 
         // Advance FSM. cycle = 1 META + cw_per_cycle DATA.
@@ -1722,11 +2197,25 @@ impl Rx2xSession {
             self.refine_cycle_and_turbo_redecode(
                 cycle_idx, anchor_sof_abs, events,
             );
+            let cycle_converged =
+                self.result.data_cws_converged
+                    > self.cycle_converged_count_at_start;
             self.result.cycles += 1;
             self.scan_cursor_abs =
                 anchor_sof_abs + self.cycle_period_sym as u64;
             self.state = Rx2xState::Idle;
             self.maybe_trim_buffer();
+            // Recovery trigger : a cycle where 0 CWs converged (even
+            // after the cycle-end turbo redecode) means the upstream
+            // chain is broken in a way the local pilot smoother can't
+            // fix. Gated on `result.cycles >= 2` (= ≥ 1 prior good
+            // cycle before this empty one) — the first cycle of a
+            // burst can legitimately yield 0 CWs while the
+            // FSM/FFE/phase-tracker settle, and full-rebootstrapping
+            // from there would just loop on the same audio.
+            if !cycle_converged && self.result.cycles >= 2 {
+                self.full_rebootstrap("zero_conv_cycle");
+            }
         } else {
             self.state = Rx2xState::Locked {
                 cycle_idx,
@@ -2071,22 +2560,67 @@ impl Rx2xSession {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.5);
-        let would_apply = diff >= apply_threshold
-            && self.n_drift_resets < RX2X_MAX_DRIFT_RESETS
+        // Three decision branches:
+        //   1. First commit (n_drift_resets == 0) AND diff ≥ apply_threshold
+        //      → full FSM reset + resampler restart (the existing one-shot
+        //        bootstrap commit).
+        //   2. Post-bootstrap (n_drift_resets ≥ 1) AND apply_threshold ≤
+        //      diff < SMALL_DRIFT_REFINE_PPM AND refines budget remaining
+        //      → smooth in-place update of cached_drift_ppm, no reset.
+        //        The streaming polyphase resampler picks up the new
+        //        ratio on its next feed_audio() call; FSM/FFE/phase
+        //        tracker keep their state. Already-decoded CWs are
+        //        preserved.
+        //   3. Anything else (diff < apply_threshold OR
+        //      post-bootstrap large delta OR refines budget exhausted)
+        //      → skip.
+        let first_commit = self.n_drift_resets == 0
+            && diff >= apply_threshold
             && self.drift_refined_sofs.len() >= 2;
+        let smooth_refine = self.n_drift_resets >= RX2X_MAX_DRIFT_RESETS
+            && diff >= apply_threshold
+            && diff < SMALL_DRIFT_REFINE_PPM
+            && self.n_drift_refines < RX2X_MAX_DRIFT_REFINES
+            && self.drift_refined_sofs.len() >= 2
+            // Kill-switch for OTA bisection: setting
+            // `RX2X_DISABLE_SMOOTH_REFINE=1` reverts to the pre-2026-05-20
+            // one-shot-only drift commit behaviour. Use if a smooth
+            // refine ends up implicated in an OTA regression.
+            && std::env::var_os("RX2X_DISABLE_SMOOTH_REFINE").is_none();
         if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
             eprintln!(
                 "[rx2x-drift] sofs={} (streaming refined) cached={:+.2} \
-                 → measured={:+.2} ppm diff={:+.2} apply_thr={} apply={}",
+                 → measured={:+.2} ppm diff={:+.2} apply_thr={} \
+                 first_commit={} smooth_refine={} n_resets={} n_refines={}",
                 self.drift_refined_sofs.len(),
                 self.cached_drift_ppm,
                 new_drift,
                 new_drift - self.cached_drift_ppm,
                 apply_threshold,
-                would_apply,
+                first_commit,
+                smooth_refine,
+                self.n_drift_resets,
+                self.n_drift_refines,
             );
         }
-        if diff < apply_threshold {
+        if smooth_refine {
+            // **Defer to next inter-cycle moment.** Committing here
+            // would land the ratio change at an arbitrary chunk
+            // boundary, almost certainly mid-CW, which violates the
+            // turbo-EM atomicity rule (decoding one CW assumes a
+            // fixed timing/phase model). Instead stash the new
+            // estimate and let `apply_pending_drift_refine` apply it
+            // at the top of a chunk where `state == Idle` (between
+            // cycles). At that point the rewind of `streaming_dsp`
+            // re-resamples the upcoming PLHEADER + cycle at the new
+            // ratio cleanly. The pending slot is single-cell — if a
+            // later LS estimate fires before consumption, it
+            // overwrites the value (the latest LS is always the most
+            // informed).
+            self.pending_drift_refine_ppm = Some(new_drift);
+            return false;
+        }
+        if !first_commit {
             return false;
         }
         // **One-shot apply** (2026-05-19, [[feedback-drift-architecture-one-shot-plus-fine-tracking]]).
@@ -3197,6 +3731,7 @@ mod tests {
         assert_eq!(session.cw_bytes.len(), 0);
         assert!(session.app_header.is_none());
     }
+
 
     fn collect_events_chunked(
         cfg: ModemConfig2x,
