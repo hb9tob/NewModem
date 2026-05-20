@@ -232,6 +232,16 @@ body {
   font-size: 0.875rem;
   color: #9ccc65;
 }
+.app-version {
+  font-size: 0.75rem;
+  color: #7a7a7a;
+  font-family: monospace;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid #3a3a3a;
+  border-radius: 3px;
+  background: #1f1f1f;
+  white-space: nowrap;
+}
 .tab-bar {
   display: flex;
   gap: 0.25rem;

@@ -124,6 +124,15 @@ fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_input_devices().map_err(|e| e.to_string())
 }
 
+/// Returns the app version from `tauri.conf.json` (single source of
+/// truth — bumped per `tauri-deb-version-bump` memory). The frontend
+/// shows it in the top-bar so the operator can verify which build is
+/// installed without leaving the app.
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 #[tauri::command]
 fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_output_devices().map_err(|e| e.to_string())
@@ -1959,6 +1968,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_app_version,
             list_audio_devices,
             list_output_audio_devices,
             list_sdr_backends,

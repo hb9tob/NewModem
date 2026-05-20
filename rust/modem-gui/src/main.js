@@ -5760,6 +5760,25 @@ function setupKioskMode() {
   });
 }
 
+async function showAppVersion() {
+  const el = document.getElementById("app-version");
+  if (!el) return;
+  // Backend reads `tauri.conf.json` (single source of truth bumped on
+  // every build). `window.__TAURI__.app.getVersion` isn't reliably
+  // exposed by `withGlobalTauri` across Tauri versions, so we route
+  // through our own command.
+  try {
+    if (!window.__TAURI__ || !window.__TAURI__.core) return;
+    const v = await window.__TAURI__.core.invoke("get_app_version");
+    if (v) {
+      el.textContent = `v${v}`;
+      el.title = `Version de l'application : ${v}`;
+    }
+  } catch (err) {
+    console.error("get_app_version", err);
+  }
+}
+
 async function init() {
   setupKioskMode();
   setupSelectPicker();
@@ -5767,6 +5786,7 @@ async function init() {
   setupTabs();
   setupLightbox();
   setupTxTab();
+  showAppVersion();
   setupSettingsTab();
   setupOverlaysTab();
   setupCaptureSubmitPanel();

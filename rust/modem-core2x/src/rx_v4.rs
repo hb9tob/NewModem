@@ -1331,7 +1331,7 @@ const FFE_LEN_2X: usize = 64;
 /// Without the pre-burst (late entry, or VOX-off synthetic test path)
 /// the training set is just PLHEADER + warmup = 288 sym (4.5× over-
 /// determined for `n_ff = 64`) — same fallback the legacy V3 FFE used.
-fn gather_cycle_refs(
+pub(crate) fn gather_cycle_refs(
     cfg: &ModemConfig2x,
     pls: &PlsPayload,
     sof_at: usize,
@@ -1429,7 +1429,7 @@ fn try_gather_preburst_refs(
 /// would underflow / overflow the buffer keep the raw input value (no
 /// equalization at the edges; safer than zero-padding which would
 /// inject artifacts at the burst boundary).
-fn apply_ffe_to_range(
+pub(crate) fn apply_ffe_to_range(
     symbols: &[Complex64],
     taps: &[Complex64],
     start: usize,

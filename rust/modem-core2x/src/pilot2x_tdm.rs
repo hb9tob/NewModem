@@ -152,6 +152,54 @@ pub fn deinterleave_data_pilots_2x(
     out
 }
 
+/// Decision-directed refs from a (failed or noisy) CW chunk that's
+/// already been equalised and phase-derotated by the RX. For each
+/// data slot, hard-decides the symbol against `constellation`; for
+/// each pilot slot, drops in the theoretical rotating-QPSK pilot the
+/// TX would have placed there. The output is wire-aligned with
+/// `interleave_data_pilots_2x` so positions match the chunk index.
+///
+/// `chunk` length must equal `pattern.wire_len(data_len)`. Used by
+/// the turbo-FFE per-CW hook to harvest training pairs from CWs that
+/// LDPC didn't manage to converge — at moderate BER, the hard
+/// decisions still carry useful structural info for the LS-FFE.
+pub fn build_dd_refs_from_failed_cw_2x(
+    chunk: &[Complex64],
+    pattern: &PilotPattern2x,
+    data_len: usize,
+    group_idx_offset: usize,
+    constellation: &modem_core_base::constellation::Constellation,
+) -> Vec<Complex64> {
+    let expected = pattern.wire_len(data_len);
+    assert_eq!(
+        chunk.len(),
+        expected,
+        "chunk.len()={} expected {expected} (data_len={data_len}, d={} p={})",
+        chunk.len(),
+        pattern.d_syms,
+        pattern.p_syms,
+    );
+    let d = pattern.d_syms;
+    let n_groups = pattern.n_groups(data_len);
+    let mut out: Vec<Complex64> = Vec::with_capacity(expected);
+    let mut wire_cursor = 0usize;
+    let mut data_cursor = 0usize;
+    for g in 0..n_groups {
+        let take = d.min(data_len - data_cursor);
+        for k in 0..take {
+            let x = chunk[wire_cursor + k];
+            out.push(constellation.hard_decision(x));
+        }
+        wire_cursor += take;
+        data_cursor += take;
+        let pilots = pilots_for_group_2x(group_idx_offset + g, pattern);
+        out.extend_from_slice(&pilots);
+        wire_cursor += pilots.len();
+    }
+    debug_assert_eq!(out.len(), expected);
+    out
+}
+
 /// Helper: returns the pilot-symbol position table for a CW of
 /// `data_len` symbols, without materialising the interleaved buffer.
 /// Used by the RX to walk the wire and pick the right pilot reference

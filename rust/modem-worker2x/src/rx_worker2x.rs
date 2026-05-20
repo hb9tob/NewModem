@@ -46,6 +46,25 @@ struct SessionArmedPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct SessionProgressPayload {
+    session_id: u32,
+    /// Unique RaptorQ ESIs collected so far (= count of converged
+    /// DATA-CWs in the session's `cw_bytes` map). 1 LDPC CW = 1
+    /// RaptorQ symbol in V4, so this is directly comparable to
+    /// `needed`.
+    received: u32,
+    /// RaptorQ K source symbols required for assembly
+    /// (= `app_header.k_symbols`, the AppHeader's K).
+    needed: u32,
+    /// True once `try_raptorq_assembly` succeeded and a `PayloadAssembled`
+    /// event fired.
+    decoded: bool,
+    /// True when the TX has saturated the fountain (V3-parity field,
+    /// reserved — 2x doesn't expose a hard cap today).
+    cap_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SessionDecodedPayload {
     session_id: u32,
     session_dir: String,
@@ -309,8 +328,8 @@ fn translate_events(
                     "session_armed",
                     SessionArmedPayload {
                         session_id: *session_id,
-                        k: 0,
-                        t: 0,
+                        k: app_header.k_symbols as u32,
+                        t: app_header.t_bytes,
                         file_size: app_header.file_size,
                         mime_type: app_header.mime_type,
                         profile: profile.clone(),
@@ -358,6 +377,50 @@ fn translate_events(
                         }),
                     );
                     *last_progress_converged = snap.data_cws_converged;
+                    // V3-parity fountain-banner event. The 2x decoder
+                    // tracks unique RaptorQ ESIs as `cw_bytes.len()`
+                    // (==`data_cws_converged`) and needs `k_symbols`
+                    // RaptorQ source symbols for assembly. Emit on every
+                    // new converged DATA-CW so the GUI fountain banner
+                    // updates live, same as V3.
+                    if let (Some(sid), Some(needed)) = (
+                        *emitted_session_id,
+                        session.k_source(),
+                    ) {
+                        sink.emit(
+                            "session_progress",
+                            SessionProgressPayload {
+                                session_id: sid,
+                                received: snap.data_cws_converged as u32,
+                                needed: needed as u32,
+                                decoded: false,
+                                cap_reached: false,
+                            },
+                        );
+                    }
+                }
+            }
+            Rx2xEvent::PayloadAssembled { .. } => {
+                // RaptorQ assembly succeeded → flip the bandeau to
+                // "décodé ✓". `session_decoded` itself still fires
+                // later at SessionFinalised via finalize_session (it
+                // requires the on-disk save + envelope), but the live
+                // progress flag is set here for instant feedback.
+                if let (Some(sid), Some(needed)) = (
+                    *emitted_session_id,
+                    session.k_source(),
+                ) {
+                    let snap = session.snapshot();
+                    sink.emit(
+                        "session_progress",
+                        SessionProgressPayload {
+                            session_id: sid,
+                            received: snap.data_cws_converged as u32,
+                            needed: needed as u32,
+                            decoded: true,
+                            cap_reached: false,
+                        },
+                    );
                 }
             }
             Rx2xEvent::SessionFinalised { result } => {

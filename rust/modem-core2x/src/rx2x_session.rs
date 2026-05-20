@@ -337,6 +337,16 @@ pub struct Rx2xSession {
     /// CW's re-encoded data symbols. Used at Retrying for FFE re-train.
     dd_refs_pool: Vec<(u64, Complex64)>,
 
+    // --- Slice 1 turbo-FFE per-CW (intra-cycle, ruse au passage CW→CW+1) ---
+    /// Per-CW dd refs accumulated within the current cycle. Reset at
+    /// each new PLHEADER lock. Each entry: `(sym_buffer-relative wire
+    /// position, hard-or-DD reference symbol)`. Fed by `drive_locked`
+    /// at the end of every DATA-CW (converged OR failed), consumed by
+    /// `turbo_ffe_after_cw` to retrain a cascade correction filter and
+    /// apply it forward to the remainder of the cycle. Gated by env
+    /// `RX2X_TURBO_FFE_FWD=1`.
+    cycle_dd_refs: Vec<(usize, Complex64)>,
+
     /// Backward-fix counter — incremented each time `cached_drift_ppm`
     /// updates significantly enough to trigger an FSM reset (see
     /// `reset_for_backward_fix`). Capped at `RX2X_MAX_DRIFT_RESETS`.
@@ -623,6 +633,7 @@ impl Rx2xSession {
             drift_var: 1e6,
             drift_per_cycle: Vec::new(),
             dd_refs_pool: Vec::new(),
+            cycle_dd_refs: Vec::new(),
             n_drift_resets: 0,
             n_drift_refines: 0,
             pending_drift_refine_ppm: None,
@@ -1122,6 +1133,7 @@ impl Rx2xSession {
         // rebuild them with corrected sample timing.
         self.cycle_phase_obs.clear();
         self.cycle_failed_cws.clear();
+        self.cycle_dd_refs.clear();
         // Diagnostic: drop stale PLHEADER-phase entries; new pass refills.
         self.plheader_phases.clear();
         // Slice 2x21: drop the locked symbol phase + stability counter
@@ -1404,6 +1416,7 @@ impl Rx2xSession {
         // Cycle-local accumulators must not bleed into the next cycle.
         self.cycle_phase_obs.clear();
         self.cycle_failed_cws.clear();
+        self.cycle_dd_refs.clear();
         // σ² accumulators reflect the post-rebootstrap decode quality.
         self.sigma2_sum = 0.0;
         self.sigma2_radial_sum = 0.0;
@@ -1589,6 +1602,12 @@ impl Rx2xSession {
         match decode_res {
             Some((pls, gain)) => {
                 self.pls_anchors.push((sof_at_abs, pls));
+                // Slice 1 turbo-FFE: new cycle starts → drop the
+                // previous cycle's data-decision refs. The cascade
+                // correction filter is implicit (it lives in the
+                // mutation of sym_buffer for that cycle's range) and
+                // doesn't need explicit reset — only the ref pool does.
+                self.cycle_dd_refs.clear();
                 if pls.flags & FLAG2X_EOT != 0 {
                     self.eot_seen = true;
                 }
@@ -2184,6 +2203,24 @@ impl Rx2xSession {
                 }
                 return true;
             }
+        }
+
+        // Slice 1 turbo-FFE — ruse au passage CW i → CW i+1.
+        //
+        // Inconditionnel sur la convergence : un CW raté apporte des
+        // decision-directed refs encore utiles au LS-FFE (le LS estime
+        // 64 taps, pas un mot 461-bits ; un BER DD modéré se moyenne
+        // sur ~470 syms par CW). META exclu (k_bytes différent + déjà
+        // convergé en Pass-1 dans ~90 % des cas).
+        if std::env::var_os("RX2X_TURBO_FFE_FWD").is_some() && !is_meta {
+            self.turbo_ffe_after_cw(
+                anchor_sof_abs,
+                next_cw_idx,
+                esi,
+                converged,
+                chunk_rel,
+                abs_end,
+            );
         }
 
         // Advance FSM. cycle = 1 META + cw_per_cycle DATA.
@@ -2844,6 +2881,144 @@ impl Rx2xSession {
             self.payload_assembled = true;
             self.result.data = descrambled.clone();
             events.push(Rx2xEvent::PayloadAssembled { bytes: descrambled });
+        }
+    }
+
+    /// Slice 1 turbo-FFE per-CW. Appelée à la fin de `drive_locked`
+    /// pour chaque DATA-CW (convergé OU raté). Étapes :
+    ///   1. Extraire des refs du CW i (re-encode si convergé, DD si raté).
+    ///   2. Append à `cycle_dd_refs` (positions rel au sym_buffer).
+    ///   3. Retrain LS-FFE : PLHEADER + warmup + `cycle_dd_refs` cumulé.
+    ///   4. Apply le correctif au range `[cw_end_abs .. cycle_end_abs)`
+    ///      du sym_buffer.
+    /// Strict forward dans le cycle (CWs déjà décodés non re-équalisés),
+    /// audio_buffer jamais touché. Le retrain produit un filtre
+    /// **correctif cascade** sur le FFE Pass-1 déjà appliqué à
+    /// `sym_buffer` au chunk entry.
+    fn turbo_ffe_after_cw(
+        &mut self,
+        anchor_sof_abs: u64,
+        cw_idx: usize,
+        esi: u32,
+        converged: bool,
+        chunk_rel: usize,
+        cw_end_abs: u64,
+    ) {
+        // cw_idx==0 is META, filtered at the call site. DATA-CW k is
+        // therefore at cw_idx ∈ [1, 1+cw_per_cycle), k = cw_idx - 1.
+        let k = cw_idx.saturating_sub(1);
+
+        // 1. Extract refs for this CW.
+        let refs_this_cw: Vec<Complex64> = if converged {
+            let info_bytes = match self.cw_bytes.get(&esi) {
+                Some(b) => b.clone(),
+                None => return, // race-safety: should not happen
+            };
+            let data_syms = crate::frame2x::encode_one_codeword(
+                &info_bytes,
+                &self.encoder,
+                &self.interleave_perm,
+                &self.constellation,
+            );
+            if data_syms.len() != self.cw_data_syms {
+                return; // defensive : profile/encoder mismatch
+            }
+            let group_offset = self.groups_per_cw * (1 + k);
+            let (interleaved, _) =
+                crate::pilot2x_tdm::interleave_data_pilots_2x(
+                    &data_syms,
+                    &self.cfg.pilot_pattern,
+                    group_offset,
+                );
+            if interleaved.len() != self.cw_with_pilots {
+                return;
+            }
+            interleaved
+        } else {
+            // Decision-directed from the equalised chunk in sym_buffer.
+            if chunk_rel + self.cw_with_pilots > self.sym_buffer.len() {
+                return; // chunk no longer fully available
+            }
+            let chunk = &self.sym_buffer
+                [chunk_rel..chunk_rel + self.cw_with_pilots];
+            let group_offset = self.groups_per_cw * (1 + k);
+            crate::pilot2x_tdm::build_dd_refs_from_failed_cw_2x(
+                chunk,
+                &self.cfg.pilot_pattern,
+                self.cw_data_syms,
+                group_offset,
+                &self.constellation,
+            )
+        };
+
+        // 2. Append to per-cycle pool. Positions are sym_buffer-relative
+        //    (chunk_rel == this CW's wire start in sym_buffer).
+        for (i, sym) in refs_this_cw.iter().enumerate() {
+            self.cycle_dd_refs.push((chunk_rel + i, *sym));
+        }
+
+        // 3. Build cumulative ref set = PLHEADER + warmup + cycle pool.
+        let plheader_rel = match self.abs_to_rel(anchor_sof_abs) {
+            Some(r) => r,
+            None => return,
+        };
+        let pls = match self.pls_anchors.last() {
+            Some((_, p)) => *p,
+            None => return,
+        };
+        let (mut positions, mut refs) = crate::rx_v4::gather_cycle_refs(
+            &self.cfg, &pls, plheader_rel, &self.sym_buffer,
+        );
+        for &(p, s) in &self.cycle_dd_refs {
+            positions.push(p);
+            refs.push(s);
+        }
+
+        // 4. LS retrain + apply correction to the cycle's future range.
+        let taps = modem_core_base::ffe::train_ffe_ls(
+            &self.sym_buffer, &refs, &positions, RX2X_FFE_LEN,
+        );
+        let cycle_period = crate::frame2x::full_cycle_len_syms(&self.cfg);
+        let cycle_end_abs = anchor_sof_abs + cycle_period as u64;
+        let apply_start = match self.abs_to_rel(cw_end_abs) {
+            Some(r) => r,
+            None => return,
+        };
+        let apply_end = match self.abs_to_rel(cycle_end_abs) {
+            Some(r) => r.min(self.sym_buffer.len()),
+            None => self.sym_buffer.len().min(self.sym_buffer.len()),
+        };
+        if apply_start >= apply_end {
+            return; // last CW of cycle, nothing to correct forward
+        }
+        let snapshot = self.sym_buffer.clone();
+        crate::rx_v4::apply_ffe_to_range(
+            &snapshot, &taps, apply_start, apply_end, &mut self.sym_buffer,
+        );
+
+        if std::env::var_os("RX2X_LOG_TURBO_FFE").is_some() {
+            let center = taps.len() / 2;
+            let off_norm: f64 = taps
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != center)
+                .map(|(_, t)| t.norm_sqr())
+                .sum();
+            eprintln!(
+                "[turbo-ffe] cw_idx={} esi={} ({}) refs={} \
+                 taps[c]={:+.3}{:+.3}i off_norm²={:.5} \
+                 apply=[{},{}) ({} sym)",
+                cw_idx,
+                esi,
+                if converged { "OK" } else { "DD" },
+                positions.len(),
+                taps[center].re,
+                taps[center].im,
+                off_norm,
+                apply_start,
+                apply_end,
+                apply_end - apply_start,
+            );
         }
     }
 
