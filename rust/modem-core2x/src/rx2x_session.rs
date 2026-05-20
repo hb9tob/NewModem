@@ -55,7 +55,8 @@ use modem_framing::raptorq_codec;
 
 use crate::frame2x::{
     cw_with_pilots_len, data_cw_per_cycle, full_cycle_len_syms,
-    make_constellation_2x, make_lms_warmup_2x, pilot_groups_per_cw, FLAG2X_EOT, FLAG2X_LAST,
+    make_constellation_2x, make_lms_warmup_2x, pilot_groups_per_cw,
+    tail_filled_data_cw_count, FLAG2X_EOT, FLAG2X_LAST,
 };
 use crate::gate2x::{PreambleProbe2x, IDLE_PROBE_BUF_SAMPLES, PROBE_THRESHOLD_2X};
 use crate::pilot2x_tdm::PilotPattern2x;
@@ -1651,6 +1652,23 @@ impl Rx2xSession {
                 .map(|cfg| crate::frame2x::data_cw_per_cycle(&cfg))
                 .unwrap_or(0);
                 let n_rep = n_rep_default + cw_per_cycle;
+                // Honest "expected DATA CW count" the TX emitted on the
+                // wire = `tail_filled_data_cw_count(cfg, k_src +
+                // n_repair_default)`. Mirrors the TX path in
+                // `build_superframe_v4` (frame2x.rs:457-466). Letting the
+                // sweep harness divide `data_cws_converged` by this
+                // (instead of the symbol-availability-gated
+                // `data_cws_total`) exposes silent cycle loss at high
+                // drift / low SNR — a missed PLHEADER drops a full
+                // `cw_per_cycle` worth of CWs from `data_cws_total`
+                // without affecting `expected_data_cws`.
+                let n_total_default = k_src as u32
+                    + raptorq_codec::n_repair_default(k_src as u32);
+                let expected = tail_filled_data_cw_count(
+                    &self.cfg,
+                    n_total_default,
+                ) as usize;
+                self.result.expected_data_cws = Some(expected);
                 let session_id = ah.session_id;
                 self.app_header = Some(ah.clone());
                 self.k_source = Some(k_src);
@@ -2570,6 +2588,22 @@ impl Rx2xSession {
                     .map(|cfg| crate::frame2x::data_cw_per_cycle(&cfg))
                     .unwrap_or(0);
                     let n_rep = n_rep_default + cw_per_cycle;
+                    // Same honest "expected" computation as the
+                    // first-recovery path (~line 1690). Without this
+                    // mirror, a Pass-2 turbo META rescue (META failed
+                    // Pass 1, recovered after the RTS phase smoother
+                    // refined the cycle) emitted SessionArmed but left
+                    // `expected_data_cws = None`, masking the honest
+                    // denominator on bursts where Pass 2 saved the
+                    // session. Observed on seed 57005 d=-200 ppm
+                    // (70/70 exact but total_is_expected=0).
+                    let n_total_default = k_src as u32
+                        + raptorq_codec::n_repair_default(k_src as u32);
+                    let expected = tail_filled_data_cw_count(
+                        &self.cfg,
+                        n_total_default,
+                    ) as usize;
+                    self.result.expected_data_cws = Some(expected);
                     let session_id = ah.session_id;
                     self.app_header = Some(ah.clone());
                     self.k_source = Some(k_src);

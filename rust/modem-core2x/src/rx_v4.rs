@@ -211,6 +211,21 @@ pub struct RxResult2x {
     /// (`docs/modem_2x_loop_validation.html`) to compare injected vs
     /// estimated drift across the sweep harness.
     pub final_drift_ppm: Option<f64>,
+    /// Expected DATA CW count as broadcast by the TX (= `tail_filled_
+    /// data_cw_count(cfg, ceil(file_size / k_bytes))`). Populated once
+    /// the META CW converges and AppHeader is parsed; `None` before.
+    ///
+    /// Distinct from [`data_cws_total`](Self::data_cws_total): the
+    /// latter only counts CWs the RX *attempted* (gated by symbol
+    /// availability — a missed PLHEADER silently drops the cycle's
+    /// `cw_per_cycle` CWs from the denominator). The bias hides cycle
+    /// loss behind an inflated 100% LDPC convergence ratio at high
+    /// drift / low SNR (e.g. seed 57005 at ±200 ppm reports 40/40 but
+    /// the TX emitted 70 — three full cycles silently lost).
+    ///
+    /// Sweep harness reads this and emits `total = expected_data_cws`
+    /// so the CSV columns are self-documenting.
+    pub expected_data_cws: Option<usize>,
 }
 
 /// Cap on the scatter cloud we forward to the GUI per `rx_v4_symbols`
@@ -251,6 +266,7 @@ impl RxResult2x {
             converged_bitmap: Vec::new(),
             validated_sof_positions: Vec::new(),
             final_drift_ppm: None,
+            expected_data_cws: None,
         }
     }
 }

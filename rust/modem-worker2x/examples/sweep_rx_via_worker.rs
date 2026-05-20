@@ -146,7 +146,15 @@ fn main() -> ExitCode {
     let cycles: Option<u64> = final_summary
         .as_ref()
         .and_then(|p| p.get("cycles").and_then(Value::as_u64));
-    let (converged, total, sigma2, sigma2_scatter, es_scatter, scatter_n) =
+    // Honest denominator: `expected_data_cws` from AppHeader =
+    // tail_filled CW count the TX emitted on the wire. Falls back to
+    // `data_cws_total` only when AppHeader never landed (otherwise the
+    // legacy field hides silent cycle loss at high drift / low SNR —
+    // see seed 57005 ±200 ppm where 40/40 actually meant 40/70).
+    let expected_data_cws: Option<u64> = final_summary
+        .as_ref()
+        .and_then(|p| p.get("expected_data_cws").and_then(Value::as_u64));
+    let (converged, total_seen, sigma2, sigma2_scatter, es_scatter, scatter_n) =
         if let Some(p) = final_summary.as_ref() {
             (
                 p.get("data_cws_converged").and_then(Value::as_u64),
@@ -168,6 +176,11 @@ fn main() -> ExitCode {
         } else {
             (None, None, None, None, None, None)
         };
+    // `total` is the headline metric: prefer expected (honest), fall
+    // back to seen only if AppHeader never converged. `total_seen` is
+    // kept alongside for diagnostic so the cycle-loss delta is visible.
+    let total: Option<u64> = expected_data_cws.or(total_seen);
+    let total_is_expected: bool = expected_data_cws.is_some();
 
     let mut decoded_bytes: Option<u64> = None;
     let mut saved_path: Option<String> = None;
@@ -197,6 +210,8 @@ fn main() -> ExitCode {
         "chunks": chunk_count,
         "converged": converged,
         "total": total,
+        "total_seen": total_seen,
+        "total_is_expected": total_is_expected,
         "sigma2": sigma2,
         "sigma2_data_scatter": sigma2_scatter,
         "es_data_scatter": es_scatter,

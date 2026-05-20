@@ -343,7 +343,9 @@ fn translate_events(
                         serde_json::json!({
                             "blocks_converged": snap.data_cws_converged,
                             "blocks_total": snap.data_cws_total,
-                            "blocks_expected": snap.data_cws_total,
+                            "blocks_expected": snap
+                                .expected_data_cws
+                                .unwrap_or(snap.data_cws_total),
                             "converged_bitmap": snap.converged_bitmap,
                             "sigma2": snap.sigma2_data,
                             "sigma2_data": snap.sigma2_data,
@@ -370,6 +372,13 @@ fn translate_events(
                     serde_json::json!({
                         "data_cws_converged": result.data_cws_converged,
                         "data_cws_total": result.data_cws_total,
+                        // `expected_data_cws` is the honest denominator
+                        // (= tail_filled CW count from AppHeader). Sweep
+                        // harness divides by this, not `data_cws_total`,
+                        // so silent cycle loss at high drift / low SNR is
+                        // visible in the CSV (e.g. 40/70 instead of the
+                        // misleading 40/40 reported by the legacy field).
+                        "expected_data_cws": result.expected_data_cws,
                         "converged_cws": result.converged_cws,
                         "total_cws": result.total_cws,
                         "sigma2_data": result.sigma2_data,
@@ -397,13 +406,20 @@ fn translate_events(
                             result.sigma2_data,
                         );
                     } else {
+                        // Prefer the honest denominator
+                        // (expected_data_cws from AppHeader) when known
+                        // so the user sees "X / 70" instead of the
+                        // misleading "X / X" produced by silent cycle
+                        // loss inflating both numerator and denominator.
+                        let denom = result
+                            .expected_data_cws
+                            .unwrap_or(result.data_cws_total);
                         sink.emit(
                             "error",
                             ErrorPayload {
                                 message: format!(
                                     "RX V4 : décodage incomplet ({}/{} CW)",
-                                    result.data_cws_converged,
-                                    result.data_cws_total
+                                    result.data_cws_converged, denom
                                 ),
                             },
                         );

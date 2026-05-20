@@ -184,10 +184,17 @@ def main():
 
     csv_path = os.path.join(args.out_dir, "results.csv")
     with open(csv_path, "w") as csv_f:
+        # `total` is now the honest expected DATA CW count (from the
+        # AppHeader's RaptorQ K + default repair, rounded up by the
+        # tail-fill). `total_seen` is the legacy "CWs the RX actually
+        # attempted" count — useful for cycle-loss diagnostics. When
+        # AppHeader never lands, `total` falls back to `total_seen` and
+        # `total_is_expected = 0` so the row is flagged.
         csv_f.write(
             "profile,if_noise,phase_walk,injected_drift_ppm,"
             "injected_thermal_ppm,sigma2,snr_est_db,sigma2_data_scatter,"
-            "es_data_scatter,data_scatter_n,converged,total,"
+            "es_data_scatter,data_scatter_n,converged,total,total_seen,"
+            "total_is_expected,"
             "decoded_bytes,exact,file_complete_seen,error,total_time_s,"
             "estimated_drift_ppm,cycles\n")
 
@@ -245,6 +252,8 @@ def main():
                         snr_est = float("nan")
                     converged = info.get("converged")
                     total = info.get("total")
+                    total_seen = info.get("total_seen")
+                    total_is_expected = info.get("total_is_expected", False)
                     decoded_bytes = info.get("decoded_bytes")
                     exact = info.get("exact")
                     fc_seen = info.get("file_complete_seen", False)
@@ -266,6 +275,8 @@ def main():
                         csv_cell(sigma2_scatter), csv_cell(es_scatter),
                         csv_cell(scatter_n),
                         csv_cell(converged), csv_cell(total),
+                        csv_cell(total_seen),
+                        csv_cell(total_is_expected),
                         csv_cell(decoded_bytes), csv_cell(exact),
                         csv_cell(fc_seen),
                         (err or "").replace(",", ";"),
@@ -282,9 +293,16 @@ def main():
                             return f"{v:>{w}.{p}f}"
                         return f"{v:>{w}}"
 
-                    conv_str = (f"{converged or '-'}/{total or '-'}"
-                                if (converged is not None
-                                    and total is not None) else "-/-")
+                    # Tag the ratio with `*` when total is the
+                    # fallback (data_cws_total — no AppHeader), so an
+                    # operator scanning stdout sees at a glance that the
+                    # denominator is the symbol-gated count, not the
+                    # honest expected.
+                    if converged is not None and total is not None:
+                        flag = "" if total_is_expected else "*"
+                        conv_str = f"{converged}/{total}{flag}"
+                    else:
+                        conv_str = "-/-"
                     print(
                         f"{profile:<10} {if_noise:>5.2f} {phase_walk:>5.2f} "
                         f"{fmt(sigma2, 9, 5)} {fmt(snr_est, 6, 1)} "
