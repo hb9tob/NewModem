@@ -124,6 +124,18 @@ pub const SMALL_DRIFT_REFINE_PPM: f64 = 2.0;
 /// CWs (the cycle-end RTS turbo redecode rescues those).
 pub const ABORT_CYCLE_FAILED_CW_THRESH: u8 = 3;
 
+/// Consecutive Golay-fail-at-predicted-position threshold before the
+/// FSM triggers `full_rebootstrap`. With high-SNR captures (σ² ≈ 0.001)
+/// a single PLS validation failure at the expected cycle position is
+/// almost certainly noise/timing jitter on a real PLHEADER — the next
+/// cycle's PLHEADER usually validates fine. Bailing on the very first
+/// miss (the old `1` threshold) regularly dropped half a transmission
+/// even when CNR was 25+ dB. With `3` we give the FSM two more
+/// predicted-position attempts before giving up; this catches genuine
+/// upstream drift while preserving long bursts that have brief
+/// per-cycle glitches.
+pub const REBOOTSTRAP_PREDICTED_FAIL_THRESH: u8 = 3;
+
 // Note: the previous `REBOOTSTRAP_LOCK_FAIL_THRESH` counter was
 // retired 2026-05-20. The trigger now is deterministic: **one** Golay-
 // invalidating try_lock failure post-first-cycle is the exit
@@ -380,6 +392,12 @@ pub struct Rx2xSession {
     /// σ²/scatter metrics clean by not feeding guaranteed-fail CWs
     /// into the accumulator.
     consecutive_cw_failed: u8,
+
+    /// Consecutive Golay-fail at PREDICTED PLHEADER position
+    /// (post-bootstrap). Incremented on each `try_lock` Golay failure,
+    /// reset on successful PLS validation. Triggers `full_rebootstrap`
+    /// at [`REBOOTSTRAP_PREDICTED_FAIL_THRESH`].
+    consecutive_predicted_fail: u8,
 
     /// Snapshot of `result.data_cws_converged` at the START of the
     /// current cycle (set by `drive_locked` when `next_cw_idx == 0`).
@@ -638,6 +656,7 @@ impl Rx2xSession {
             n_drift_refines: 0,
             pending_drift_refine_ppm: None,
             consecutive_cw_failed: 0,
+            consecutive_predicted_fail: 0,
             cycle_converged_count_at_start: 0,
             cycle_phase_obs: Vec::new(),
             cycle_failed_cws: Vec::new(),
@@ -1413,6 +1432,7 @@ impl Rx2xSession {
         self.locked_symbol_phase = None;
         self.stable_chunks = 0;
         self.consecutive_cw_failed = 0;
+        self.consecutive_predicted_fail = 0;
         // Cycle-local accumulators must not bleed into the next cycle.
         self.cycle_phase_obs.clear();
         self.cycle_failed_cws.clear();
@@ -1629,6 +1649,9 @@ impl Rx2xSession {
                     );
                 }
                 self.plheader_phases.push((sof_at_abs, gain.arg()));
+                // Successful Golay validation resets the predicted-fail
+                // counter so a future single miss starts a fresh streak.
+                self.consecutive_predicted_fail = 0;
                 self.result.first_pls.get_or_insert(pls);
                 self.result.first_sof_at.get_or_insert(rel);
                 self.result.validated_sof_positions.push(rel);
@@ -1700,7 +1723,23 @@ impl Rx2xSession {
                     && self.result.cycles >= 2
                     && std::env::var_os("RX2X_DISABLE_RECOVERY").is_none()
                 {
-                    self.full_rebootstrap("golay_fail_at_expected_pos");
+                    self.consecutive_predicted_fail =
+                        self.consecutive_predicted_fail.saturating_add(1);
+                    if std::env::var_os("RX2X_LOG_RECOVERY").is_some() {
+                        eprintln!(
+                            "[rx2x-recovery] predicted_golay_fail \
+                             count={}/{} sof_abs={} cycles={}",
+                            self.consecutive_predicted_fail,
+                            REBOOTSTRAP_PREDICTED_FAIL_THRESH,
+                            sof_at_abs,
+                            self.result.cycles,
+                        );
+                    }
+                    if self.consecutive_predicted_fail
+                        >= REBOOTSTRAP_PREDICTED_FAIL_THRESH
+                    {
+                        self.full_rebootstrap("golay_fail_at_expected_pos");
+                    }
                 }
                 true
             }
@@ -1726,6 +1765,7 @@ impl Rx2xSession {
             self.cycle_converged_count_at_start =
                 self.result.data_cws_converged;
             self.consecutive_cw_failed = 0;
+        self.consecutive_predicted_fail = 0;
         }
         // Compute the wire position of the CW we want to decode this
         // call. Layout per cycle :
@@ -2062,6 +2102,7 @@ impl Rx2xSession {
             // — a successful CW in a cycle means the upstream is
             // healthy, even if a few prior CWs failed.
             self.consecutive_cw_failed = 0;
+        self.consecutive_predicted_fail = 0;
             // Only emit CwConverged for ESIs not already known from a
             // prior pass — suppresses duplicate GUI updates and CSV
             // counter inflation on backward-fix re-decode.
@@ -2195,6 +2236,7 @@ impl Rx2xSession {
                     anchor_sof_abs + self.cycle_period_sym as u64;
                 self.state = Rx2xState::Idle;
                 self.consecutive_cw_failed = 0;
+        self.consecutive_predicted_fail = 0;
                 self.maybe_trim_buffer();
                 // If the abort yielded no converged CW even after
                 // turbo, full re-bootstrap on the next chunk.
