@@ -100,7 +100,7 @@ Group=newmodem
 ExecStart=/usr/local/bin/newmodem-collector \
     --bind 127.0.0.1:8080 \
     --reports-dir /var/lib/newmodem-collector/reports \
-    --max-upload-mb 50
+    --max-upload-mb 200
 Restart=on-failure
 RestartSec=3
 
@@ -174,8 +174,10 @@ server {
     # ssl_certificate / ssl_certificate_key seront ajoutés par certbot
     # à la première exécution de `certbot --nginx`.
 
-    # 50 MB max upload côté nginx aussi (cohérent avec --max-upload-mb).
-    client_max_body_size 60m;
+    # 200 MB max upload côté nginx (cohérent avec --max-upload-mb).
+    # Doit être >= --max-upload-mb sinon nginx rejette en 413 avant
+    # même que la requête n'atteigne axum.
+    client_max_body_size 220m;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -275,6 +277,37 @@ Attends `200 {"ok":true,...}`. La page d'index doit montrer 1 entrée.
   et côté collector), rebuild les deux, redéploie. Casse les anciens
   clients pour la session.
 
+### 8.1 Bump du plafond d'upload sur une install existante
+
+Le défaut est passé de 50 → 200 MiB pour absorber les captures sondeur
+(probes ramp + multitone + chirp + Golay = jusqu'à ~30 MiB de WAV, plus
+marge). Pour aligner un serveur déjà en service, sans avoir à
+re-générer le fichier depuis le template :
+
+```bash
+# 1. service axum (axum lit la valeur en argument CLI, pas dans un .conf)
+sudo sed -i 's/--max-upload-mb [0-9]\+/--max-upload-mb 200/' \
+    /etc/systemd/system/newmodem-collector.service
+
+# 2. nginx (doit être >= --max-upload-mb sinon 413 avant axum)
+sudo sed -i 's/client_max_body_size [0-9]\+m;/client_max_body_size 220m;/' \
+    /etc/nginx/sites-available/newmodem-collector
+
+# 3. recharger les deux
+sudo systemctl daemon-reload
+sudo systemctl restart newmodem-collector
+sudo nginx -t && sudo systemctl reload nginx
+
+# 4. confirmer
+sudo systemctl status newmodem-collector --no-pager | head -15
+curl -s https://hb9tob.duckdns.org/api/v1/health
+```
+
+Pour pousser au-delà de 200, change les deux valeurs en parallèle :
+axum rejette si l'upload dépasse `--max-upload-mb`, et nginx rejette
+silencieusement (413) si l'upload dépasse `client_max_body_size` —
+**les deux limites doivent évoluer ensemble**.
+
 ## 9. Troubleshooting
 
 | Symptôme | Cause / fix |
@@ -282,5 +315,5 @@ Attends `200 {"ok":true,...}`. La page d'index doit montrer 1 entrée.
 | `secret.txt trop court` au démarrage | Le fichier est vide ou contient le placeholder. Génère via `openssl rand -hex 32`. |
 | 401 `bad signature` à la soumission | `secret.txt` côté GUI ≠ côté serveur, ou GUI rebuild manquant après changement. |
 | 400 `timestamp out of window` | Horloge VPS ou client désynchronisée de plus de 5 min. `timedatectl status`. |
-| `client_max_body_size` nginx | Si l'upload échoue silencieusement → augmenter à 100m si tu envoies des WAV bruts longs. |
+| 413 / upload too large | Le défaut courant est 200 MiB ; au-delà, augmenter `--max-upload-mb` côté axum **ET** `client_max_body_size` nginx en parallèle (l'un sans l'autre rejette dès qu'on dépasse le plus petit). |
 | Cert renewal échoue | `certbot renew --dry-run` ; vérifie que port 80 est bien atteignable depuis Internet. |

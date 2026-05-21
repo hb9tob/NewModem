@@ -2925,6 +2925,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "modem-core-base"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "realfft",
+ "rustfft",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "modem-framing"
 version = "0.1.0"
 dependencies = [
@@ -3034,6 +3045,21 @@ dependencies = [
  "serialport",
  "tempfile",
  "zstd",
+]
+
+[[package]]
+name = "modem-worker-base"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "modem-core-base",
+ "modem-framing",
+ "modem-io",
+ "modem-sdr-dsp",
+ "serde",
+ "serde_json",
+ "serialport",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
