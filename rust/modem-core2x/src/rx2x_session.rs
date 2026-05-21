@@ -69,8 +69,8 @@ use crate::plheader::{
 };
 use crate::profile2x::ModemConfig2x;
 use crate::rx_v4::{
-    decode_one_cw, equalize_symbols_per_cycle_from, find_all_sofs,
-    find_next_sof, RxResult2x,
+    decode_one_cw, find_all_sofs, find_next_sof, gather_cycle_refs,
+    RxResult2x,
 };
 
 /// Soft cap on the symbol buffer the session retains. ≈ 43 s @ HIGH+2X
@@ -273,10 +273,20 @@ pub struct Rx2xSession {
     /// only `rewind_for_drift_change` resets it (the rewind invalidates
     /// the TX-time symbol grid, so past obs are no longer coherent).
     phase_tracker: StreamingPhaseTracker,
-    /// Symbol buffer. Position `i` in this vec corresponds to absolute
-    /// symbol index `buf_start_abs + i`. Mirror of
-    /// `streaming.sym_buffer()` — kept as an owned `Vec` so the
-    /// FSM + equaliser can mutate it in place per-cycle.
+    /// Streaming FFE — forward-streaming equaliser. `push_raw` feeds new
+    /// raw symbols through `current_taps` (pass-through until the first
+    /// successful `train_at`). `train_at` is called from `try_lock`
+    /// on PLS Golay success to retrain on the cycle's references and
+    /// re-equalise the cycle window in `out_buf`. Cycle N's PLHEADER
+    /// is decoded on a stream already equalised by cycle (N − 1)'s
+    /// taps, breaking the PLS / FFE chicken-and-egg cliff observed at
+    /// +200 ppm seed 57005 ([[ffe-pls-chicken-and-egg]]).
+    streaming_ffe: crate::streaming_ffe::StreamingFfe,
+    /// Symbol buffer mirror of `streaming_ffe.out_buf()`. Position `i`
+    /// in this vec corresponds to absolute symbol index
+    /// `buf_start_abs + i`. Kept as an owned `Vec` so the FSM and the
+    /// decoder can hand out slices without holding a borrow on
+    /// `streaming_ffe`.
     sym_buffer: Vec<Complex64>,
     /// Absolute symbol index of `sym_buffer[0]` (always 0 in this
     /// slice — we re-derive symbols from the full audio buffer each
@@ -608,6 +618,17 @@ impl Rx2xSession {
             };
         let phase_tracker =
             StreamingPhaseTracker::new(phase_params, PLHEADER_LEN_SYM);
+        // Streaming FFE retention = 2 SOFs + cycle training references.
+        // `training_len` is the worst-case ref span behind a SOF: the
+        // optional preburst (192 sym) + PLHEADER (256) + LMS warmup.
+        let training_len = crate::preburst::PREBURST_LEN_SYM
+            + PLHEADER_LEN_SYM
+            + lms_warmup_syms;
+        let streaming_ffe = crate::streaming_ffe::StreamingFfe::new(
+            RX2X_FFE_LEN,
+            cycle_period_sym,
+            training_len,
+        );
         Rx2xSession {
             cfg,
             state: Rx2xState::Idle,
@@ -615,6 +636,7 @@ impl Rx2xSession {
             audio_buffer: Vec::new(),
             streaming,
             phase_tracker,
+            streaming_ffe,
             sym_buffer: Vec::new(),
             buf_start_abs: 0,
             scan_cursor_abs: 0,
@@ -729,6 +751,31 @@ impl Rx2xSession {
         self.result.validated_sof_positions.len()
     }
 
+    /// Diagnostic only — used by `examples/diff_chunked_streaming.rs`
+    /// to compare two runs at different chunk sizes for bit-equivalence.
+    pub fn sym_buffer_pub(&self) -> &[Complex64] {
+        &self.sym_buffer
+    }
+
+    /// Diagnostic only — see [`Self::sym_buffer_pub`].
+    pub fn buf_start_abs_pub(&self) -> u64 {
+        self.buf_start_abs
+    }
+
+    /// **Raw** symbol stream from `streaming_dsp` (pre-FFE). Used by
+    /// PLHEADER detection / Golay validation / drift LS scanner — all
+    /// of which must be chunk-invariant so the FSM makes deterministic
+    /// lock decisions regardless of chunk size. DATA-CW decoding keeps
+    /// reading from `self.sym_buffer` (post-FFE equalised).
+    ///
+    /// Returns `(symbols, start_abs)` where `symbols[i]` is the symbol
+    /// at absolute index `start_abs + i`. Tracks
+    /// `streaming.sym_buffer_start_abs()` which advances monotonically
+    /// (the streaming pipeline never re-emits earlier symbols).
+    fn raw_sym_buffer(&self) -> (&[Complex64], u64) {
+        (self.streaming.sym_buffer(), self.streaming.sym_buffer_start_abs())
+    }
+
     /// Push one chunk of f32 audio (mono, 48 kHz). Returns events
     /// generated during this chunk's processing.
     pub fn process_audio_chunk(&mut self, samples: &[f32]) -> Vec<Rx2xEvent> {
@@ -793,46 +840,14 @@ impl Rx2xSession {
 
         self.trim_audio_for_streaming();
 
-        // Incremental per-cycle FFE (slice 2x23+). Only scan the
-        // un-equalised tail of sym_buffer — cycles whose SOF was
-        // already processed by a previous chunk's call stay in
-        // equalised state. On a Pi5 with HIGH+2X this drops the
-        // per-chunk FFE cost by ~O(retained_cycles) (cycles_in_buffer
-        // ≈ 2-3 for HIGH+2X), making FFE finally affordable in the
-        // streaming hot path. PLHEADER + warmup refs only; T2 dd_refs
-        // feedback kicks in at Retrying via a separate pass on the
-        // affected cycle.
-        let scan_from = self
-            .equalized_up_to_abs
-            .saturating_sub(self.buf_start_abs) as usize;
-        let scan_from = scan_from.min(self.sym_buffer.len());
-        // FFE training + apply must read from RAW symbols (the
-        // streaming pipeline's canonical view), NOT from the
-        // partially-equalised `self.sym_buffer` — training on already-
-        // equalised pilots would give near-identity taps. Compute the
-        // fresh equalisation on the raw streaming buffer, then splice
-        // in only the freshly-equalised tail `[scan_from..end]` —
-        // `self.sym_buffer[0..scan_from]` stays in its prior equalised
-        // state from earlier chunks' calls (no destroy-and-rebuild).
-        let raw_full: Vec<Complex64> =
-            self.streaming.sym_buffer().to_vec();
-        let new_eq = equalize_symbols_per_cycle_from(
-            &raw_full, &self.cfg, &[], scan_from);
-        self.sym_buffer.truncate(scan_from);
-        if scan_from < new_eq.len() {
-            self.sym_buffer.extend_from_slice(&new_eq[scan_from..]);
-        }
-        // After equalise, advance the cursor to the position past the
-        // last fully-equalised cycle. Conservative bound: the streaming
-        // sym_buffer end minus one cycle of margin (the last cycle in
-        // the buffer may be incomplete on this chunk and only get
-        // finalised once more symbols arrive next chunk; leaving it
-        // un-marked lets the next chunk's scan_from re-pick it up at
-        // its real SOF if needed).
-        let cycle = self.cycle_period_sym as u64;
-        let buf_end_abs = self.buf_start_abs + self.sym_buffer.len() as u64;
-        self.equalized_up_to_abs =
-            buf_end_abs.saturating_sub(cycle);
+        // Streaming FFE refactor: the per-cycle FFE train + apply now
+        // runs from `try_lock` on PLS Golay success (cf.
+        // [[streaming-ffe-refactor-plan]]). Forward equalisation with
+        // the previous cycle's taps happens inside `refresh_symbols`
+        // via `streaming_ffe.push_raw`. The legacy batch
+        // `equalize_symbols_per_cycle_from` is gone — `self.sym_buffer`
+        // is now `streaming_ffe.out_buf` and is therefore continuously
+        // equalised forward as new symbols arrive.
 
         let mut events = Vec::new();
         self.run_state_machine(&mut events);
@@ -950,7 +965,12 @@ impl Rx2xSession {
         let needed_audio =
             (cycle_sym + PLHEADER_LEN_SYM + PREAMBLE_LEN_SYM) * sps
                 + 2 * RRC_SPAN_SYM * sps;
-        if self.sym_buffer.len() < needed_sym {
+        // Bootstrap reads RAW symbols (pre-FFE) — chunk-invariant.
+        // See `try_acquire` doc for the motivation; the bootstrap's
+        // gate sweeps the SAME stream the per-cycle find_next_sof
+        // does, so they must agree on what "the symbol stream" is.
+        let (boot_symbols, _boot_start) = self.raw_sym_buffer();
+        if boot_symbols.len() < needed_sym {
             // Cap how long we accumulate without firing the search. If
             // the burst ends before we ever hit `needed_audio`, drop the
             // tail and re-gate so the next burst can try.
@@ -977,7 +997,7 @@ impl Rx2xSession {
         // self.sym_buffer is bounded by streaming_dsp's trim policy.
         // `find_all_sofs` skips by min_cycle_skip_syms after each
         // detection (avoids re-counting under symbol-grid quantisation).
-        let symbols: &[Complex64] = &self.sym_buffer;
+        let symbols: &[Complex64] = boot_symbols;
         let min_skip = (cycle_sym / 2).max(PREAMBLE_LEN_SYM);
         let peaks = find_all_sofs(symbols, self.cfg.family, min_skip);
         if std::env::var_os("RX2X_LOG_GATE").is_some() {
@@ -1161,6 +1181,10 @@ impl Rx2xSession {
         self.sigma2_tangential_sum = 0.0;
         // FFE taps were trained at the old drift — invalidate.
         self.ffe_taps = None;
+        // Streaming FFE: drop taps + retained samples; the next refresh
+        // re-fills from the (about-to-be-rebuilt) raw stream.
+        self.streaming_ffe
+            .reset(self.streaming.sym_buffer_start_abs());
         // Phase 3 — drop any pending per-cycle phase + failed-CW state
         // from the wrong-drift pass; the re-decode after the fix will
         // rebuild them with corrected sample timing.
@@ -1307,6 +1331,8 @@ impl Rx2xSession {
         // PLHEADER will retrain FFE and reseat the phase tracker.
         self.ffe_taps = None;
         self.ffe_anchor_abs = 0;
+        self.streaming_ffe
+            .reset(self.streaming.sym_buffer_start_abs());
         self.phase_tracker.reset();
         // Discard the LS history — the sym_abs values are stale
         // (different symbol grid under the new ratio). Audio-rate
@@ -1349,102 +1375,69 @@ impl Rx2xSession {
     ///
     /// Logged under `RX2X_LOG_RECOVERY=1`.
     fn full_rebootstrap(&mut self, reason: &str) {
-        // **Drain audio_buffer past the last good exit point** before
-        // dropping the streaming DSP. This is critical : without it the
-        // new bootstrap pair-finder would re-scan the retained-history
-        // tail (cycles already in `cw_bytes`) and possibly commit a
-        // ratio + frame alignment that refers to a PAST PLHEADER. Two
-        // bad consequences :
-        //   1. The post-rebootstrap streaming pipeline re-emits symbols
-        //      for already-decoded cycles — wasteful but more importantly
-        //      may decode them at a NEW ratio and overwrite the existing
-        //      `cw_bytes` entries with subtly-different bytes (LDPC
-        //      converging on a slightly mis-aligned grid). RaptorQ then
-        //      sees inconsistent ESIs and fails to assemble.
-        //   2. The bootstrap's geometric two-SOF check picks the PAST
-        //      cycle pair (still in the tail) instead of advancing to
-        //      the future cycles where the actual breakdown happened.
-        // Drain target : `scan_cursor_abs` is the FSM's "next expected
-        // PLHEADER" position when the recovery trigger fired. We drain
-        // up to its audio-rate equivalent at the OLD (pre-reset) ratio
-        // minus a half-cycle margin so the next genuine PLHEADER still
-        // sits comfortably inside the post-drain audio_buffer.
-        let sps = match modem_core_base::rrc::check_integer_constraints(
-            modem_core_base::types::AUDIO_RATE,
-            self.cfg.base.symbol_rate,
-            self.cfg.base.tau,
-        ) {
-            Ok((s, _)) => s as u64,
-            Err(_) => 32, // defensive — HIGH+2X path
-        };
-        let old_ratio = 1.0 + self.cached_drift_ppm * 1e-6;
-        let margin_sym = (self.cycle_period_sym as u64) / 2;
-        let drain_target_sym =
-            self.scan_cursor_abs.saturating_sub(margin_sym);
-        let drain_target_audio =
-            ((drain_target_sym as f64) * (sps as f64) * old_ratio) as u64;
-        let extra_drain = drain_target_audio
-            .saturating_sub(self.audio_drained_samples) as usize;
-        let extra_drain = extra_drain.min(self.audio_buffer.len());
-        // No `min_audio_after_drain` guard. The RX can't know when an
-        // interfering signal will stop, so we can't wait for "enough
-        // post-noise audio" before firing — we just RESET and let
-        // the bootstrap path naturally fail-silent until clean
-        // PLHEADER audio accumulates in `audio_buffer`. Each chunk
-        // appends new samples; the gate retries; once 2 clean SOFs
-        // sit at cycle_period distance, the geometric check commits
-        // and steady-state resumes. `bootstrap_committed = false`
-        // (set below) gates the recovery trigger so this can't
-        // infinite-loop.
-        if extra_drain > 0 {
-            self.audio_buffer.drain(..extra_drain);
-        }
-        // Reset `audio_drained_samples` to 0 so the new streaming
-        // pipeline treats `audio_buffer[0]` as RX-time origin 0.
-        // Keeping the previous value would force the resampler to
-        // emit `audio_drained_samples`-worth of leading zeros before
-        // producing real signal (run_resampler maps in_buf =
-        // abs_idx − drained, returns 0 for in_buf < 0). On long
-        // bursts that's seconds of wasted output and would push the
-        // gate past its initial probe window with all-zeros.
-        // Absolute position bookkeeping for `cw_bytes` (keyed by
-        // ESI from PLHEADER PLS) is unaffected by this reset.
-        self.audio_drained_samples = 0;
+        // **Forward-only soft restart** (2026-05-21 chunk-bit-equivalence
+        // fix). The legacy implementation rebuilt `streaming_dsp` from
+        // scratch, drained `audio_buffer`, reset `cached_drift_ppm = 0`,
+        // and cleared every drift / FFE / phase tracker state — a full
+        // rewind. That made the chunk=2400 path re-enter the bootstrap
+        // pair-finder, re-fire `first_commit` at a NEW drift estimate,
+        // and lose every accumulated SOF anchor. At chunk=24000 the
+        // first cycle commit had enough margin to never trigger this
+        // path, so the result was chunk-size dependent (3-21/N at small
+        // chunks vs 71/N at large chunks).
+        //
+        // New behaviour: forward-only. The streaming DSP keeps emitting
+        // symbols at the already-committed drift ratio; the FFE / phase
+        // tracker / drift anchors all survive. We just reset the FSM
+        // state to Idle and advance `scan_cursor_abs` past the failed
+        // cycle so the next chunk picks up at the NEXT cycle's expected
+        // PLHEADER. If the issue is persistent (e.g. burst really did
+        // get clobbered), every subsequent cycle's PLHEADER probe will
+        // simply find no SOF — no harm, just skip. RaptorQ recovers
+        // missing CWs from later cycles as before.
+        //
+        // What we KEEP:
+        //   - streaming_dsp (cursor + state — pipeline continues forward)
+        //   - streaming_ffe taps + buffer (last good taps stay until
+        //     next train_at)
+        //   - cached_drift_ppm (one-shot bootstrap estimate)
+        //   - n_drift_resets / drift_locked (the one-shot rewind has
+        //     already happened — never again)
+        //   - drift_refined_sofs (LS history; new SOFs append)
+        //   - phase_tracker (drift didn't change; absolute positions still
+        //     valid). Could be reset if measurable phase noise wedge is
+        //     suspected, but as long as drift is committed the tracker
+        //     stays informative.
+        //   - audio_buffer (no drain — let trim_audio_for_streaming handle
+        //     it via drift_locked=true)
+        //   - cw_bytes / app_header / session_id (V3-parity preserved)
+        //
+        // What we RESET:
+        //   - FSM state → Idle
+        //   - scan_cursor_abs → past current cycle so we skip to next
+        //   - consecutive_cw_failed / consecutive_predicted_fail counters
         if std::env::var_os("RX2X_LOG_RECOVERY").is_some() {
             eprintln!(
-                "[rx2x-recovery] full_rebootstrap reason={} \
-                 cached_drift={:+.2} n_refines={} cycles={} cw_bytes={} \
-                 drained={} audio_remaining={} audio_drained_now={}",
+                "[rx2x-recovery] soft_restart reason={} \
+                 cached_drift={:+.2} cycles={} cw_bytes={} \
+                 audio_drained={} audio_buf={} scan_cursor={}",
                 reason,
                 self.cached_drift_ppm,
-                self.n_drift_refines,
                 self.result.cycles,
                 self.cw_bytes.len(),
-                extra_drain,
-                self.audio_buffer.len(),
                 self.audio_drained_samples,
+                self.audio_buffer.len(),
+                self.scan_cursor_abs,
             );
         }
-        self.streaming = crate::streaming_dsp::StreamingDsp::new(&self.cfg);
-        self.sym_buffer.clear();
-        self.buf_start_abs = self.streaming.sym_buffer_start_abs();
-        self.equalized_up_to_abs = self.buf_start_abs;
-        self.ffe_taps = None;
-        self.ffe_anchor_abs = 0;
-        self.phase_tracker.reset();
-        self.drift_refined_sofs.clear();
-        self.drift_scan_cursor_sym = self.streaming.sym_buffer_start_abs();
-        self.cached_drift_ppm = 0.0;
-        self.n_drift_resets = 0;
-        self.n_drift_refines = 0;
-        self.pending_drift_refine_ppm = None;
-        self.bootstrap_committed = false;
-        self.gate_armed = false;
-        self.gate_arm_buf_len = 0;
+        // **Don't advance scan_cursor here** — the abort_cycle /
+        // end-of-cycle paths that call into this function already set
+        // `scan_cursor_abs = anchor_sof_abs + cycle_period_sym`, which
+        // points at the NEXT expected PLHEADER. An additional advance
+        // here would double-skip (observed at chunk=2400 post-fix:
+        // SOFs probed at cycles 0, 1, 3, 5 — every other cycle missed
+        // because abort then this both incremented).
         self.state = Rx2xState::Idle;
-        self.scan_cursor_abs = 0;
-        self.locked_symbol_phase = None;
-        self.stable_chunks = 0;
         self.consecutive_cw_failed = 0;
         self.consecutive_predicted_fail = 0;
         // Cycle-local accumulators must not bleed into the next cycle.
@@ -1485,33 +1478,91 @@ impl Rx2xSession {
             self.audio_drained_samples,
             self.cached_drift_ppm,
         );
-        // Cumulative-equalised mirror of the streaming raw buffer.
-        // **Persistent across chunks**: cycles equalised by the per-cycle
-        // FFE pass in `process_audio_chunk` stay equalised — the prior
-        // `to_vec()` overwrite was destroying their state every refresh.
-        // The actual FFE pass downstream reads RAW from
-        // `self.streaming.sym_buffer()` (the canonical raw cumulative
-        // view), so this mirror only carries the equalised output for
-        // downstream FSM consumers.
+        // Pump the streaming FFE forward with any newly-arrived raw
+        // symbols. `streaming_ffe` keeps its own bounded retention; we
+        // just push the new tail of `streaming.sym_buffer()` once per
+        // chunk. The FFE convolves with `current_taps` (pass-through
+        // until the first PLHEADER lock) and produces `out_buf`, which
+        // we mirror into `self.sym_buffer` for FSM consumption.
         let stream_start = self.streaming.sym_buffer_start_abs();
-        let stream_len = self.streaming.sym_buffer().len();
-        let stream_end = stream_start + stream_len as u64;
-        if stream_start > self.buf_start_abs {
-            let drop = (stream_start - self.buf_start_abs) as usize;
-            let drop = drop.min(self.sym_buffer.len());
-            self.sym_buffer.drain(..drop);
-            self.buf_start_abs = stream_start;
-            if self.equalized_up_to_abs < self.buf_start_abs {
-                self.equalized_up_to_abs = self.buf_start_abs;
+        let stream_raw = self.streaming.sym_buffer();
+        let stream_end = stream_start + stream_raw.len() as u64;
+        // Realign the FFE if the streaming DSP has trimmed its head
+        // beyond our retained window (shouldn't usually happen — the
+        // streaming retention is at least as big as the FFE's — but
+        // be defensive).
+        if self.streaming_ffe.start_abs() < stream_start
+            && self.streaming_ffe.len() == 0
+        {
+            self.streaming_ffe.reset(stream_start);
+        }
+        let ffe_end_abs = self.streaming_ffe.start_abs()
+            + self.streaming_ffe.len() as u64;
+        if stream_end > ffe_end_abs && ffe_end_abs >= stream_start {
+            let offset = (ffe_end_abs - stream_start) as usize;
+            if offset < stream_raw.len() {
+                let new_tail: Vec<Complex64> =
+                    stream_raw[offset..].to_vec();
+                self.streaming_ffe.push_raw(&new_tail);
             }
         }
-        let session_end = self.buf_start_abs + self.sym_buffer.len() as u64;
-        if stream_end > session_end {
-            let offset = (session_end - stream_start) as usize;
-            if offset < stream_len {
-                let new_tail: Vec<Complex64> =
-                    self.streaming.sym_buffer()[offset..].to_vec();
-                self.sym_buffer.extend(new_tail);
+        self.sync_sym_buffer_from_ffe();
+    }
+
+    /// Re-mirror `streaming_ffe.out_buf` into `self.sym_buffer` and
+    /// realign `buf_start_abs`. Called after `push_raw` (every refresh)
+    /// and after `train_at` (when a cycle window in `out_buf` was
+    /// re-equalised with freshly-trained taps).
+    fn sync_sym_buffer_from_ffe(&mut self) {
+        self.buf_start_abs = self.streaming_ffe.start_abs();
+        self.sym_buffer.clear();
+        self.sym_buffer.extend_from_slice(self.streaming_ffe.out_buf());
+        if self.equalized_up_to_abs < self.buf_start_abs {
+            self.equalized_up_to_abs = self.buf_start_abs;
+        }
+    }
+
+    /// LS-train fresh FFE taps from the references of the cycle anchored
+    /// at `sof_at_abs` (PLS payload `pls`). The references are gathered
+    /// from the RAW symbol stream (`streaming.sym_buffer()`) because the
+    /// FFE convolution domain is raw — training on already-equalised
+    /// pilots would yield near-identity taps. On success the cycle
+    /// window in `streaming_ffe.out_buf` is re-equalised with the new
+    /// taps and `self.sym_buffer` is re-synced.
+    fn retrain_streaming_ffe(&mut self, sof_at_abs: u64, pls: &PlsPayload) {
+        let raw_start = self.streaming.sym_buffer_start_abs();
+        if sof_at_abs < raw_start {
+            return;
+        }
+        let sof_rel_raw = (sof_at_abs - raw_start) as usize;
+        // gather_cycle_refs reads PRBS preburst symbols from raw —
+        // requires a valid `symbols` slice with sof_rel inside.
+        let raw = self.streaming.sym_buffer();
+        if sof_rel_raw >= raw.len() {
+            return;
+        }
+        let (positions_rel, refs) =
+            gather_cycle_refs(&self.cfg, pls, sof_rel_raw, raw);
+        if positions_rel.is_empty() {
+            return;
+        }
+        let abs_refs: Vec<(u64, Complex64)> = positions_rel
+            .iter()
+            .zip(refs.iter())
+            .map(|(&p, &s)| (raw_start + p as u64, s))
+            .collect();
+        let ok = self.streaming_ffe.train_at(
+            sof_at_abs,
+            &abs_refs,
+            self.cycle_period_sym,
+        );
+        if ok {
+            self.sync_sym_buffer_from_ffe();
+            // Mark this cycle's window as equalised so downstream
+            // bookkeeping (diagnostic) reflects the new state.
+            let end_abs = sof_at_abs + self.cycle_period_sym as u64;
+            if end_abs > self.equalized_up_to_abs {
+                self.equalized_up_to_abs = end_abs;
             }
         }
     }
@@ -1573,20 +1624,30 @@ impl Rx2xSession {
     }
 
     /// Idle → Acquiring. Returns true if a SOF candidate was found.
+    ///
+    /// **PLHEADER detection runs on raw symbols** (pre-FFE) so the
+    /// probe is chunk-invariant — the FFE's forward-applied taps make
+    /// `self.sym_buffer` history-dependent (out_buf[k] depends on the
+    /// taps state when push_raw was called for position k, which
+    /// depends on chunk size) which broke at +60 ppm where small chunks
+    /// poisoned cycle 1+ PLHEADER. DATA-CW decode below still uses
+    /// `self.sym_buffer` (equalised post train_at re-equalises the
+    /// cycle's window after PLS lock).
     fn try_acquire(&mut self, events: &mut Vec<Rx2xEvent>) -> bool {
+        let (raw, raw_start) = self.raw_sym_buffer();
         let cursor_rel =
-            self.scan_cursor_abs.saturating_sub(self.buf_start_abs) as usize;
-        if cursor_rel + PREAMBLE_LEN_SYM >= self.sym_buffer.len() {
+            self.scan_cursor_abs.saturating_sub(raw_start) as usize;
+        if cursor_rel + PREAMBLE_LEN_SYM >= raw.len() {
             return false;
         }
         if let Some(rel) =
-            find_next_sof(&self.sym_buffer, cursor_rel, self.cfg.family)
+            find_next_sof(raw, cursor_rel, self.cfg.family)
         {
-            let sof_abs = self.buf_start_abs + rel as u64;
+            let sof_abs = raw_start + rel as u64;
             if std::env::var_os("RX2X_LOG_SOF").is_some() {
                 eprintln!(
-                    "[rx2x-sof] probe_fired sof_abs={} (rel={} buf_start={} buf_len={})",
-                    sof_abs, rel, self.buf_start_abs, self.sym_buffer.len(),
+                    "[rx2x-sof] probe_fired sof_abs={} (rel={} raw_start={} raw_len={})",
+                    sof_abs, rel, raw_start, raw.len(),
                 );
             }
             events.push(Rx2xEvent::SofProbeFired { sof_at_abs: sof_abs });
@@ -1596,33 +1657,41 @@ impl Rx2xSession {
         } else {
             if std::env::var_os("RX2X_LOG_SOF").is_some() {
                 eprintln!(
-                    "[rx2x-sof] no_sof cursor_rel={} buf_len={} buf_start={}",
-                    cursor_rel, self.sym_buffer.len(), self.buf_start_abs,
+                    "[rx2x-sof] no_sof cursor_rel={} raw_len={} raw_start={}",
+                    cursor_rel, raw.len(), raw_start,
                 );
             }
             // Advance cursor to the end of buffer to avoid rescanning.
-            self.scan_cursor_abs =
-                self.buf_start_abs + self.sym_buffer.len() as u64;
+            self.scan_cursor_abs = raw_start + raw.len() as u64;
             false
         }
     }
 
     /// Acquiring → Locked OR back to Idle.
+    ///
+    /// **PLS Golay decode runs on raw symbols** (pre-FFE) so the lock
+    /// decision is chunk-invariant. See `try_acquire` doc for the
+    /// motivation. The gain estimate returned here is the raw-channel
+    /// LS gain (no FFE); downstream phase tracking sees the natural
+    /// per-cycle phase walk, which is exactly what it needs to track.
     fn try_lock(&mut self, sof_at_abs: u64, events: &mut Vec<Rx2xEvent>) -> bool {
-        let rel = match self.abs_to_rel(sof_at_abs) {
-            Some(r) => r,
-            None => {
-                // Buffer trimmed past this SOF (shouldn't happen but be safe).
-                self.state = Rx2xState::Idle;
-                self.scan_cursor_abs = self.buf_start_abs;
-                return true;
-            }
+        let (raw, raw_start) = self.raw_sym_buffer();
+        let raw_len = raw.len();
+        let rel_raw = if sof_at_abs >= raw_start {
+            (sof_at_abs - raw_start) as usize
+        } else {
+            // SOF position predates the raw buffer head — shouldn't
+            // happen (streaming.sym_buffer only trims behind any active
+            // scan cursor) but be safe.
+            self.state = Rx2xState::Idle;
+            self.scan_cursor_abs = raw_start;
+            return true;
         };
-        if rel + PLHEADER_LEN_SYM > self.sym_buffer.len() {
+        if rel_raw + PLHEADER_LEN_SYM > raw_len {
             // Not enough symbols yet for PLS decode — wait.
             return false;
         }
-        let plheader_slice = &self.sym_buffer[rel..rel + PLHEADER_LEN_SYM];
+        let plheader_slice = &raw[rel_raw..rel_raw + PLHEADER_LEN_SYM];
         let decode_res = decode_plheader_at(plheader_slice, self.cfg.family);
         if std::env::var_os("RX2X_LOG_SOF").is_some() {
             // Independent gain LS for the diag (mirrors the one inside
@@ -1687,12 +1756,24 @@ impl Rx2xSession {
                     );
                 }
                 self.plheader_phases.push((sof_at_abs, gain.arg()));
+                // Streaming FFE retrain: now that this cycle's PLS has
+                // Golay-validated, harvest its references (PLHEADER +
+                // LMS warmup + optional preburst) from the RAW symbol
+                // stream and LS-train fresh taps. `train_at` re-equalises
+                // the cycle window in `streaming_ffe.out_buf` with the
+                // new taps; we then re-mirror into `self.sym_buffer` so
+                // the per-CW decoder downstream reads the improved
+                // equalisation. The forward pipeline already equalised
+                // this PLHEADER with cycle (N − 1)'s taps; this step
+                // upgrades cycle N to its own taps for the DATA-CW
+                // decode that follows.
+                self.retrain_streaming_ffe(sof_at_abs, &pls);
                 // Successful Golay validation resets the predicted-fail
                 // counter so a future single miss starts a fresh streak.
                 self.consecutive_predicted_fail = 0;
                 self.result.first_pls.get_or_insert(pls);
-                self.result.first_sof_at.get_or_insert(rel);
-                self.result.validated_sof_positions.push(rel);
+                self.result.first_sof_at.get_or_insert(rel_raw);
+                self.result.validated_sof_positions.push(rel_raw);
                 if is_eot {
                     // EOT marker = end of burst. The EOT frame carries
                     // only a META-CW (`frame2x::build_eot_frame_v4`) —
@@ -2401,10 +2482,19 @@ impl Rx2xSession {
         };
 
         // Step 1: scan NEW symbols past the persistent cursor for SOFs.
+        //
+        // **Reads RAW symbols** (pre-FFE) so the scanner is chunk-
+        // invariant — mirrors the change in `try_acquire` / `try_lock`.
+        // The drift LS estimator must accumulate the SAME set of valid
+        // PLHEADER anchors regardless of chunk size, otherwise small
+        // chunks accumulate fewer anchors (because forward-FFE poisons
+        // cycle 1+ PLHEADER in equalised buf) and the LS never fires
+        // → no drift apply → no recovery → cliff.
+        let (raw_syms, raw_start) = self.raw_sym_buffer();
         let cursor_rel = self
             .drift_scan_cursor_sym
-            .saturating_sub(self.buf_start_abs) as usize;
-        let cursor_rel = cursor_rel.min(self.sym_buffer.len());
+            .saturating_sub(raw_start) as usize;
+        let cursor_rel = cursor_rel.min(raw_syms.len());
         let min_skip = (self.cycle_period_sym / 2).max(PREAMBLE_LEN_SYM);
         let mut scan = cursor_rel;
         let mut new_validated: Vec<u64> = Vec::new();
@@ -2414,20 +2504,20 @@ impl Rx2xSession {
         // Track where the scan effectively stopped: the cursor advances
         // up to (but not past) the first candidate that needed more
         // symbols to validate, so subsequent chunks re-find it once
-        // the PLHEADER lands in `sym_buffer`.
-        let mut effective_scan_end = self.sym_buffer.len();
+        // the PLHEADER lands in the raw buffer.
+        let mut effective_scan_end = raw_syms.len();
         while let Some(pos_rel) =
-            find_next_sof(&self.sym_buffer, scan, self.cfg.family)
+            find_next_sof(raw_syms, scan, self.cfg.family)
         {
             n_candidates += 1;
-            if pos_rel + PLHEADER_LEN_SYM > self.sym_buffer.len() {
+            if pos_rel + PLHEADER_LEN_SYM > raw_syms.len() {
                 // Not enough symbols yet — leave cursor at pos_rel so
                 // the next chunk re-finds this same candidate once
                 // more audio arrives.
                 effective_scan_end = pos_rel;
                 break;
             }
-            let sym_abs = self.buf_start_abs + pos_rel as u64;
+            let sym_abs = raw_start + pos_rel as u64;
             // Skip if we already refined this SOF on a previous chunk.
             if self
                 .drift_refined_sofs
@@ -2438,7 +2528,7 @@ impl Rx2xSession {
                 continue;
             }
             let plheader_slice =
-                &self.sym_buffer[pos_rel..pos_rel + PLHEADER_LEN_SYM];
+                &raw_syms[pos_rel..pos_rel + PLHEADER_LEN_SYM];
             if decode_plheader_at(plheader_slice, self.cfg.family).is_some() {
                 new_validated.push(sym_abs);
                 scan = pos_rel + min_skip;
@@ -2452,8 +2542,8 @@ impl Rx2xSession {
                 "[drift-trace] sym_buf={} buf_start_abs={} cursor_rel={} \
                  candidates={} pls_fail={} new_validated={} refined_total={} \
                  audio_drained={} audio_buf={}",
-                self.sym_buffer.len(),
-                self.buf_start_abs,
+                raw_syms.len(),
+                raw_start,
                 cursor_rel,
                 n_candidates,
                 n_pls_fail,
@@ -2466,17 +2556,14 @@ impl Rx2xSession {
         // Advance cursor up to the end of the effective scan region,
         // but never past the last position where a full PLHEADER could
         // possibly fit. `find_next_sof` itself bails at
-        // `sym_buffer.len() - PREAMBLE_LEN_SYM`, AND we need the full
+        // `raw_syms.len() - PREAMBLE_LEN_SYM`, AND we need the full
         // PLHEADER (256 sym) for PLS validation, so any cursor past
-        // `sym_buffer.len() - PLHEADER_LEN_SYM` would skip over
+        // `raw_syms.len() - PLHEADER_LEN_SYM` would skip over
         // candidates that simply haven't arrived in full yet.
         // Already-refined SOFs are filtered by the dup check on sym_abs,
         // so re-scanning the tail across chunks is cheap.
-        let cursor_advance_cap = self
-            .sym_buffer
-            .len()
-            .saturating_sub(PLHEADER_LEN_SYM);
-        self.drift_scan_cursor_sym = self.buf_start_abs
+        let cursor_advance_cap = raw_syms.len().saturating_sub(PLHEADER_LEN_SYM);
+        self.drift_scan_cursor_sym = raw_start
             + effective_scan_end.min(cursor_advance_cap) as u64;
 
         // Step 2: refine each new SOF's audio-rate position via a local
@@ -2722,21 +2809,40 @@ impl Rx2xSession {
             );
         }
         if smooth_refine {
-            // **Defer to next inter-cycle moment.** Committing here
-            // would land the ratio change at an arbitrary chunk
-            // boundary, almost certainly mid-CW, which violates the
-            // turbo-EM atomicity rule (decoding one CW assumes a
-            // fixed timing/phase model). Instead stash the new
-            // estimate and let `apply_pending_drift_refine` apply it
-            // at the top of a chunk where `state == Idle` (between
-            // cycles). At that point the rewind of `streaming_dsp`
-            // re-resamples the upcoming PLHEADER + cycle at the new
-            // ratio cleanly. The pending slot is single-cell — if a
-            // later LS estimate fires before consumption, it
-            // overwrites the value (the latest LS is always the most
-            // informed).
-            self.pending_drift_refine_ppm = Some(new_drift);
-            return false;
+            // **Forward-only refinement** (2026-05-21, bit-equivalence
+            // fix). The legacy path stashed `new_drift` into
+            // `pending_drift_refine_ppm` and let
+            // `apply_pending_drift_refine` rebuild `streaming_dsp` +
+            // replay the audio_buffer at the new ratio at the next
+            // inter-cycle moment. That rebuild also cleared
+            // `validated_sof_positions` / `drift_refined_sofs` /
+            // streaming_ffe state and could fire multiple times as the
+            // LS estimate refined — making the FSM's converged-cycle
+            // count chunk-size-dependent (at chunk=2400 the LS
+            // converges slowly so the rebuild re-fires every chunk,
+            // each time clearing the SOF count → cycles=1 reported
+            // despite 5 try_lock OK observed).
+            //
+            // Forward-only: just update `cached_drift_ppm`. The
+            // streaming resampler picks up the new ratio on its next
+            // feed_audio call; output samples already emitted keep
+            // their old-ratio mapping (a sub-sample discontinuity at
+            // the boundary, but the diff is bounded < 2 ppm here so
+            // the shift is < 2e-6·K samples per output position —
+            // negligible vs the RRC band-pass and FFE absorption).
+            // The big jump (0 → ~60 ppm at bootstrap) still goes
+            // through `first_commit` below which does the proper
+            // rewind+replay.
+            if std::env::var_os("RX2X_LOG_DRIFT").is_some() {
+                eprintln!(
+                    "[rx2x-drift] smooth_refine forward-apply: \
+                     cached={:+.3} → {:+.3} ppm (no rewind)",
+                    self.cached_drift_ppm, new_drift,
+                );
+            }
+            self.cached_drift_ppm = new_drift;
+            self.n_drift_refines = self.n_drift_refines.saturating_add(1);
+            return true;
         }
         if !first_commit {
             return false;

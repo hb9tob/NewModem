@@ -120,6 +120,12 @@ pub mod streaming_dsp;
 // cycle-end batch RTS.
 pub mod streaming_phase;
 
+// Streaming FFE — forward-streaming equaliser with on-demand tap
+// retraining. Cycle N's PLHEADER is decoded on a stream already
+// equalised by cycle (N − 1)'s taps, breaking the PLS / FFE chicken-
+// and-egg cliff observed in the per-chunk batch FFE.
+pub mod streaming_ffe;
+
 // Slice 2x19 — live streaming RX session. Full state machine + turbo
 // loops integrated. Replaces the worker's batch decode pattern. See
 // plan `ok-alors-le-rms-precious-shannon.md`.
