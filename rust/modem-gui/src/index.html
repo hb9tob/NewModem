@@ -20,6 +20,7 @@
       <span id="v2-progress-text">—</span>
     </span>
     <span id="status" class="status">prêt</span>
+    <span id="app-version" class="app-version" title="Version de l'application">—</span>
   </header>
   <nav class="tab-bar">
     <button class="tab active" data-tab="rx">RX</button>
@@ -291,6 +292,11 @@
           <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
         <fieldset>
+          <legend>Locator Maidenhead</legend>
+          <input type="text" id="locator-input" placeholder="JN36ld" maxlength="8">
+          <div class="tx-hint">Position de la station (4, 6 ou 8 caractères). Envoyé au collector avec chaque sondage.</div>
+        </fieldset>
+        <fieldset>
           <legend>Périphérique réception (RX)</legend>
           <select id="rx-device-select">
             <option>Chargement…</option>
@@ -305,18 +311,6 @@
             level-meter inchangés — seul le démod modem voit le signal
             filtré. À activer si le récepteur radio n'applique pas (ou
             insuffisamment) la désemphase.
-          </p>
-          <label class="ptt-row" style="margin-top: 0.7rem;">
-            <input type="checkbox" id="rx-allow-legacy-grid">
-            Grille de drift ±15 ppm (cold start)
-          </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
-            Filet de sécurité utilisé sur le 1er SF d'une session lorsque
-            l'estimateur Gardner échoue : 6 tentatives supplémentaires à
-            ±15 ppm autour de zéro. Coût ~480 ms de CPU par tick raté.
-            Recommandé sur PC moderne (négligeable). Décocher sur Pi
-            ou vieux PC où le worker peut prendre du retard temps-réel.
-            <em>Désactivé par défaut sur Raspberry Pi.</em>
           </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
                in main.js fills this from `BackendCapabilities` of the
@@ -548,26 +542,238 @@
               <button type="button" id="cascade-clear" class="cascade-clear">Vider</button>
             </div>
           </fieldset>
+
+          <fieldset class="sounder-tx">
+            <legend>Sondeur — émission TX</legend>
+            <p class="tx-hint">
+              Émet la séquence de sondage standard
+              (préambule 1750 Hz pour ouvrir un relais, sync chirp,
+              rampe d'amplitude, two-tone, chirp, multitone, AWGN, Golay).
+              Device de sortie : celui des Paramètres. Durée ≈
+              <span id="sounder-tx-duration-est">45</span> s.
+              Activez VOX ou maintenez PTT — le préambule 1750 Hz de
+              5 s laisse aux relais et au VOX le temps de s'engager.
+            </p>
+            <div class="sounder-row sounder-row-actions">
+              <button type="button" id="sounder-tx-emit" class="sounder-emit-btn">▶ Émettre la séquence de sondage</button>
+              <span class="sounder-status" id="sounder-tx-status">—</span>
+            </div>
+          </fieldset>
         </div>
 
         <div class="channel-col channel-rx">
           <h3 class="channel-col-title">Réception (RX)</h3>
-          <fieldset class="channel-rx-recommend">
-            <legend>Atténuation recommandée</legend>
-            <div class="channel-recommend-value" id="rx-recommend-value">—</div>
+          <fieldset class="sounder-rx">
+            <legend>Sondeur — capture + analyse RX</legend>
             <p class="tx-hint">
-              Valeur à communiquer à la station émettrice. Mesure automatique
-              en phase B (sondeur de canal).
+              Renseignez la chaîne (équipement TX, équipement RX,
+              relais éventuel, mode), cliquez
+              <strong>Démarrer la capture</strong> (la capture
+              utilise directement le device RX des Paramètres,
+              indépendamment du worker), demandez au TX d'émettre la
+              séquence, puis cliquez
+              <strong>Arrêter &amp; analyser</strong>. La référence
+              <code>schedule.json</code> est régénérée localement
+              (déterministe) — pas de fichier à transférer.
             </p>
-          </fieldset>
-
-          <fieldset class="channel-future">
-            <legend>Sondeur de canal — phase B (à venir)</legend>
-            <p class="tx-hint">
-              Trame de test (chirp + multi-tone + PN + EVM par profil) pour
-              estimer la réponse du canal et choisir le mode optimal. Le rapport
-              (HTML + JSON + WAV brut) sera exportable en ZIP/7Z.
-            </p>
+            <div class="sounder-row">
+              <label>Équipement TX
+                <input type="text" id="sounder-rx-tx-model" list="sounder-rig-models" placeholder="ex: FT-991A, IC-705, perso…">
+              </label>
+              <label>Équipement RX
+                <input type="text" id="sounder-rx-rx-model" list="sounder-rig-models" placeholder="ex: FTX-1, SDRplay, perso…">
+              </label>
+            </div>
+            <div class="sounder-row">
+              <label>Locator TX (dicté par l'OM émetteur)
+                <input type="text" id="sounder-rx-tx-locator" placeholder="ex: JN36ld" maxlength="8">
+              </label>
+            </div>
+            <datalist id="sounder-rig-models">
+              <!-- Yaesu -->
+              <option value="Yaesu FTX-1"></option>
+              <option value="Yaesu FT-991A"></option>
+              <option value="Yaesu FT-857D"></option>
+              <option value="Yaesu FT-817ND"></option>
+              <option value="Yaesu FT-818ND"></option>
+              <option value="Yaesu FTM-300D"></option>
+              <option value="Yaesu FTM-400DR"></option>
+              <option value="Yaesu FT-450D"></option>
+              <option value="Yaesu FT-710"></option>
+              <option value="Yaesu FT-891"></option>
+              <option value="Yaesu FT-DX10"></option>
+              <option value="Yaesu FT-DX101"></option>
+              <option value="Yaesu FT-2DR"></option>
+              <option value="Yaesu FT-5DR"></option>
+              <!-- Icom -->
+              <option value="Icom IC-705"></option>
+              <option value="Icom IC-7300"></option>
+              <option value="Icom IC-7610"></option>
+              <option value="Icom IC-7100"></option>
+              <option value="Icom IC-9700"></option>
+              <option value="Icom IC-R8600"></option>
+              <option value="Icom IC-705"></option>
+              <option value="Icom IC-V86"></option>
+              <option value="Icom ID-52"></option>
+              <option value="Icom IC-2730"></option>
+              <option value="Icom IC-5100"></option>
+              <!-- Kenwood -->
+              <option value="Kenwood TS-590S"></option>
+              <option value="Kenwood TS-590SG"></option>
+              <option value="Kenwood TS-890S"></option>
+              <option value="Kenwood TS-2000"></option>
+              <option value="Kenwood TM-V71E"></option>
+              <option value="Kenwood TM-D710"></option>
+              <option value="Kenwood TH-D74"></option>
+              <option value="Kenwood TH-D75"></option>
+              <!-- Elecraft -->
+              <option value="Elecraft K3S"></option>
+              <option value="Elecraft K4"></option>
+              <option value="Elecraft KX2"></option>
+              <option value="Elecraft KX3"></option>
+              <!-- Xiegu / portable / SDR -->
+              <option value="Xiegu G90"></option>
+              <option value="Xiegu X6100"></option>
+              <option value="Xiegu G106"></option>
+              <option value="Anytone AT-D878UV"></option>
+              <option value="ADALM-Pluto SDR"></option>
+              <option value="HackRF One"></option>
+              <option value="SDRplay RSP1A"></option>
+              <option value="SDRplay RSP1B"></option>
+              <option value="SDRplay RSPdx"></option>
+              <option value="SDRplay RSPduo"></option>
+              <option value="Airspy HF+ Discovery"></option>
+              <option value="Airspy R2"></option>
+              <option value="Airspy Mini"></option>
+              <option value="RTL-SDR v3"></option>
+              <option value="RTL-SDR Blog v4"></option>
+              <option value="LimeSDR USB"></option>
+              <option value="LimeSDR Mini"></option>
+              <option value="QO-100 LNB direct"></option>
+              <option value="Carte son uniquement"></option>
+            </datalist>
+            <div class="sounder-row">
+              <label>Relais
+                <input type="text" id="sounder-rx-relay" list="sounder-relay-list" value="Aucun (simplex)" placeholder="ex: 1750 Hz, CTCSS, DCS, DMR…">
+              </label>
+              <label>Mode
+                <input type="text" id="sounder-rx-mode" list="sounder-mode-list" value="NBFM 5 kHz" placeholder="NBFM / SSB / AM / digital…">
+              </label>
+            </div>
+            <datalist id="sounder-relay-list">
+              <option value="Aucun (simplex)"></option>
+              <option value="1750 Hz (IARU R1)"></option>
+              <option value="CTCSS / PL"></option>
+              <option value="DCS"></option>
+              <option value="DTMF"></option>
+              <option value="DMR"></option>
+              <option value="D-STAR"></option>
+              <option value="C4FM / Fusion"></option>
+              <option value="Echolink / IRLP"></option>
+              <option value="QO-100 (NB transponder)"></option>
+            </datalist>
+            <datalist id="sounder-mode-list">
+              <option value="NBFM 5 kHz (standard amateur)"></option>
+              <option value="NBFM 2.5 kHz (étroit)"></option>
+              <option value="FM large (broadcast)"></option>
+              <option value="SSB USB"></option>
+              <option value="SSB LSB"></option>
+              <option value="AM"></option>
+              <option value="CW"></option>
+              <option value="Numérique (DV/DMR/C4FM)"></option>
+            </datalist>
+            <div class="sounder-row sounder-row-actions">
+              <button type="button" id="sounder-rx-capture-toggle">⏺ Démarrer la capture</button>
+              <button type="button" id="sounder-an-run" disabled>Analyser la capture</button>
+              <span class="sounder-status" id="sounder-an-status">—</span>
+            </div>
+            <details class="sounder-advanced">
+              <summary>Options avancées</summary>
+              <div class="sounder-row">
+                <label>Capture WAV
+                  <input type="text" id="sounder-an-capture" placeholder="rempli automatiquement après capture">
+                </label>
+              </div>
+              <div class="sounder-row">
+                <label>Schedule JSON
+                  <input type="text" id="sounder-an-schedule" placeholder="rempli automatiquement par 'Générer la référence ici'">
+                </label>
+                <button type="button" id="sounder-an-regen-ref" title="Régénère la référence localement (probe.wav + schedule.json) avec les paramètres standard">Générer la référence ici</button>
+              </div>
+              <div class="sounder-row">
+                <label>Seuil sync
+                  <input type="number" id="sounder-an-threshold" min="2" max="20" step="0.5" value="6">
+                </label>
+              </div>
+            </details>
+            <div class="sounder-results" id="sounder-an-results" hidden>
+              <h4>Recommandation à dicter à l'OM TX</h4>
+              <div class="sd-reco">
+                <span class="sd-reco-label">Atténuation TX :</span>
+                <span id="sd-reco-att" class="sd-reco-value">—</span>
+                <span class="sd-reco-unit">dB</span>
+              </div>
+              <p class="sd-reco-hint">
+                Valeur entière à transmettre par phonie à la station émettrice.
+                Côté TX, l'opérateur la saisit dans Canal → Cascade de rapports.
+              </p>
+              <h4>Verdict</h4>
+              <div class="sounder-verdict" id="sd-verdict">—</div>
+              <div class="sd-collector">
+                <button type="button" id="sd-collector-send" disabled>
+                  Envoyer au collector
+                </button>
+                <label class="sd-collector-opt">
+                  <input type="checkbox" id="sd-collector-with-wav">
+                  joindre capture.wav
+                </label>
+                <span id="sd-collector-status" class="status"></span>
+              </div>
+              <h4>Paramètres dérivés (au sweet-spot)</h4>
+              <table class="sounder-derived">
+                <tbody>
+                  <tr><th>SNR moyen</th><td><span id="sd-snr">—</span> dB</td></tr>
+                  <tr><th>IP3 (sortie)</th><td><span id="sd-ip3">—</span> dBFS</td></tr>
+                  <tr><th>P1dB (entrée)</th><td><span id="sd-p1db">—</span> dBFS</td></tr>
+                  <tr><th>Sweet spot</th><td><span id="sd-sweet">—</span> dBFS</td></tr>
+                  <tr><th>BW −3 dB</th><td><span id="sd-bw">—</span> Hz</td></tr>
+                  <tr><th>Group delay (pic)</th><td><span id="sd-gd">—</span> µs</td></tr>
+                  <tr><th>Plancher de bruit</th><td><span id="sd-noise">—</span> dBFS</td></tr>
+                  <tr><th>Delay spread 50 %</th><td><span id="sd-d50">—</span> µs</td></tr>
+                  <tr><th>Delay spread 90 %</th><td><span id="sd-d90">—</span> µs</td></tr>
+                  <tr><th>Plus fort écho</th><td><span id="sd-echo">—</span> dBc</td></tr>
+                  <tr><th>Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
+                </tbody>
+              </table>
+              <h4>Diagrammes</h4>
+              <div class="sounder-plots">
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">AM-AM (compression d'amplitude)</div>
+                  <svg id="sd-plot-amam" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">AM-PM (déphasage vs niveau)</div>
+                  <svg id="sd-plot-ampm" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">IMD3 vs niveau (sortie two-tone)</div>
+                  <svg id="sd-plot-imd3" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">Réponse en fréquence (multitone)</div>
+                  <svg id="sd-plot-freq" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">Group delay (chirp)</div>
+                  <svg id="sd-plot-gd" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+                <div class="sounder-plot">
+                  <div class="sounder-plot-title">Réponse impulsionnelle (Golay)</div>
+                  <svg id="sd-plot-ir" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
+                </div>
+              </div>
+              <div class="tx-hint" id="sounder-an-signature-path"></div>
+            </div>
           </fieldset>
         </div>
       </div>

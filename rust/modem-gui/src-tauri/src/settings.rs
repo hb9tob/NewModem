@@ -22,6 +22,15 @@ fn default_true() -> bool {
     true
 }
 
+/// Default base URL of the Phase-D collector. Used both for the
+/// `Default for Settings` factory and as a soft migration target when
+/// loading an old settings file with an empty `collector_url`.
+pub const DEFAULT_COLLECTOR_URL: &str = "https://hb9tob.duckdns.org";
+
+fn default_collector_url() -> String {
+    DEFAULT_COLLECTOR_URL.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -31,6 +40,12 @@ pub struct Settings {
     pub settings_schema_version: u32,
 
     pub callsign: String,
+    /// Maidenhead grid locator of the local station (`JN36ld`, `IN98`,
+    /// …). 4-, 6-, or 8-character grid; trimmed on save. Surfaces in
+    /// the `metadata.json` sent to the collector and is the default
+    /// `locator` for any sounding submission. Empty = unset.
+    #[serde(default)]
+    pub locator: String,
     /// Composite device name produced by `SdrBackend::list_devices`,
     /// e.g. `"pluto:usb:1.6.5"`, `"sdrplay:22340A2A34"`, or a plain
     /// cpal name like `"USB Audio (hw:1,0)"`. The registry's
@@ -77,8 +92,12 @@ pub struct Settings {
     #[serde(default = "default_rx_allow_legacy_grid")]
     pub rx_allow_legacy_grid: bool,
 
-    /// Base URL of the Phase-D collector. If empty, the post-raw-capture
-    /// prompt does not appear and submission is disabled for the session.
+    /// Base URL of the Phase-D collector. Pre-filled with
+    /// [`DEFAULT_COLLECTOR_URL`] so out-of-the-box installs talk to the
+    /// shared aggregator at `hb9tob.duckdns.org`. The user can override
+    /// in Paramètres → Collecteur to point at a private collector;
+    /// setting the field empty disables submission for that session.
+    #[serde(default = "default_collector_url")]
     pub collector_url: String,
     /// AVIF quality remembered across sessions (0-100). Default 10:
     /// compact file for slow NBFM passes.
@@ -279,6 +298,7 @@ impl Default for Settings {
         Settings {
             settings_schema_version: SETTINGS_SCHEMA_VERSION,
             callsign: String::new(),
+            locator: String::new(),
             rx_device: String::new(),
             tx_device: String::new(),
             ptt_enabled: false,
@@ -291,7 +311,7 @@ impl Default for Settings {
             tx_preemphasis_enabled: false,
             rx_deemphasis_enabled: false,
             rx_allow_legacy_grid: default_rx_allow_legacy_grid(),
-            collector_url: String::new(),
+            collector_url: default_collector_url(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),
             tx_mode: default_tx_mode(),
@@ -357,6 +377,13 @@ pub fn load() -> Settings {
         s.sdr_settings = SdrSettings::default();
         s.settings_schema_version = SETTINGS_SCHEMA_VERSION;
         let _ = save(&s);
+    }
+    // Soft migration: very old installs left the field empty (no
+    // default = empty string in serde), which disabled submission.
+    // Re-stamp with the shared default so existing users get the
+    // collector wired without touching Paramètres.
+    if s.collector_url.trim().is_empty() {
+        s.collector_url = default_collector_url();
     }
     s
 }

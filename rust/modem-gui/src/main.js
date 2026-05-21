@@ -552,7 +552,6 @@ let currentSettings = {
   tx_preemphasis_enabled: false,
   tx_save_wav: false,
   rx_deemphasis_enabled: false,
-  rx_allow_legacy_grid: true,
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
@@ -1459,11 +1458,11 @@ async function loadSettings() {
   } catch (err) {
     console.error("get_settings", err);
     currentSettings = {
-      callsign: "", rx_device: "", tx_device: "",
+      callsign: "", locator: "", rx_device: "", tx_device: "",
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -1475,6 +1474,8 @@ async function loadSettings() {
   ensureOverlaySlots();
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
+  const locInit = document.getElementById("locator-input");
+  if (locInit) locInit.value = currentSettings.locator || "";
   // Fetch profile list from modem-core BEFORE any code that touches the
   // tx-mode / rx-forced-profile selects (they're empty in index.html).
   await loadModemProfiles();
@@ -1491,8 +1492,6 @@ async function loadSettings() {
   if (saveWav) saveWav.checked = !!currentSettings.tx_save_wav;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
-  const grid = document.getElementById("rx-allow-legacy-grid");
-  if (grid) grid.checked = !!currentSettings.rx_allow_legacy_grid;
   const fdx = document.getElementById("full-duplex-enabled");
   if (fdx) fdx.checked = !!currentSettings.full_duplex_enabled;
 
@@ -1759,6 +1758,8 @@ async function persistSettings() {
   const colUrl = document.getElementById("collector-url");
   const histMax = document.getElementById("tx-history-max-input");
   currentSettings.callsign = (call && call.value || "").trim().toUpperCase();
+  const loc = document.getElementById("locator-input");
+  if (loc) currentSettings.locator = (loc.value || "").trim();
   currentSettings.rx_device = rxSel ? rxSel.value || "" : "";
   currentSettings.tx_device = txSel ? txSel.value || "" : "";
   if (colUrl) currentSettings.collector_url = (colUrl.value || "").trim();
@@ -1772,8 +1773,6 @@ async function persistSettings() {
   if (saveWav) currentSettings.tx_save_wav = !!saveWav.checked;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
-  const grid = document.getElementById("rx-allow-legacy-grid");
-  if (grid) currentSettings.rx_allow_legacy_grid = !!grid.checked;
 
   // SDR-specific config is mutated directly on
   // `currentSettings.sdr_settings.backends[id].config` by the
@@ -1790,6 +1789,7 @@ async function persistSettings() {
 
 function setupSettingsTab() {
   const call = document.getElementById("callsign-input");
+  const loc = document.getElementById("locator-input");
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
   if (call) {
@@ -1799,6 +1799,13 @@ function setupSettingsTab() {
     };
     call.addEventListener("change", onCallsignChange);
     call.addEventListener("blur", onCallsignChange);
+  }
+  if (loc) {
+    // The locator is informational only — persist on blur/change like
+    // the callsign so it round-trips into the sounder metadata.
+    const onLocChange = () => { persistSettings(); };
+    loc.addEventListener("change", onLocChange);
+    loc.addEventListener("blur", onLocChange);
   }
   if (rxSel) {
     rxSel.addEventListener("change", async () => {
@@ -2659,17 +2666,39 @@ function updateV2Progress(payload) {
   const bitmap = bm
     ? new Uint8Array(bm)
     : new Uint8Array(Math.ceil((payload.blocks_expected || 0) / 8));
-  // Prefer `sigma2_data` (frame-only, hard-decision residuals) when the
-  // worker provides it. Fall back to `sigma2` (pilot-residual) for
-  // older payloads so a partial rebuild doesn't blank the indicator.
-  const sigmaInst = Number.isFinite(payload.sigma2_data)
-    ? payload.sigma2_data
-    : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null);
+  // Prefer the honest **data-scatter** σ² (hard-decoded DATA symbol
+  // residuals, see `RxResult2x::sigma2_data_scatter` in Rust). Falls
+  // back to `sigma2_data` (pilot-residual) for old/2x20 payloads. The
+  // pilot σ² is biased low because the Pass 2 estimators fit the pilots
+  // themselves — the data scatter sees ICI, intra-CW phase noise, and
+  // AM-AM/AM-PM the pilot fit absorbs. Pair with `es_data_scatter` so
+  // the SNR is `10·log10(Es/σ²)`, not the legacy `−10·log10(σ²)` (which
+  // implicitly assumes Es = 1).
+  const scatterN = payload.data_scatter_n || 0;
+  const sigmaScatter = scatterN > 0
+    && Number.isFinite(payload.sigma2_data_scatter)
+    && payload.sigma2_data_scatter > 0
+    ? payload.sigma2_data_scatter
+    : null;
+  const esScatter = scatterN > 0
+    && Number.isFinite(payload.es_data_scatter)
+    && payload.es_data_scatter > 0
+    ? payload.es_data_scatter
+    : null;
+  const sigmaInst = sigmaScatter != null
+    ? sigmaScatter
+    : (Number.isFinite(payload.sigma2_data)
+      ? payload.sigma2_data
+      : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null));
   lastProgress = {
     bitmap,
     expected: payload.blocks_expected || 0,
     converged: payload.blocks_converged || 0,
     sigma2: sigmaInst,
+    // `esScatter != null` ⇒ honest data-scatter mode; the SNR readout
+    // uses `10·log10(es/σ²)`. Null ⇒ legacy fallback with implicit Es=1.
+    esScatter,
+    scatterN,
   };
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
@@ -2684,11 +2713,18 @@ function updateV2Progress(payload) {
   const sigmaStr = lastProgress.sigma2 != null
     ? lastProgress.sigma2.toFixed(3).padStart(6, " ")
     : "     ?";
+  // SNR readout uses the data-scatter Es/σ² ratio when the worker
+  // surfaced it; falls back to −10·log10(σ²) for legacy payloads.
+  const snrStr = lastProgress.sigma2 != null && lastProgress.sigma2 > 0
+    ? (lastProgress.esScatter != null && lastProgress.esScatter > 0
+      ? `${(10 * Math.log10(lastProgress.esScatter / lastProgress.sigma2)).toFixed(1)}dB`
+      : `${(-10 * Math.log10(lastProgress.sigma2)).toFixed(1)}dB`)
+    : "  ?dB";
   const mini = document.getElementById("v2-progress-text");
   if (mini) {
     const c = String(lastProgress.converged).padStart(3, " ");
     const e = String(lastProgress.expected).padStart(3, " ");
-    mini.textContent = `${c}/${e} σ²=${sigmaStr}`;
+    mini.textContent = `${c}/${e} σ²=${sigmaStr} SNR=${snrStr}`;
   }
   drawProgressBlocks();
   drawConstellation();
@@ -2966,12 +3002,18 @@ function drawPilotPhase() {
   }
 
   // Header overlay : range, segments count, σ² (if available), implied SNR.
+  // `esScatter != null` ⇒ data-scatter mode, SNR = 10·log10(Es/σ²).
+  // `esScatter == null` ⇒ legacy pilot σ² with implicit Es = 1.
   const rangeMrad = (yRange * 1000).toFixed(0);
   const sigma2 = lastProgress.sigma2;
+  const es = lastProgress.esScatter;
   let header = `±${(rangeMrad / 2).toFixed(0)} mrad · ${segments.length} seg`;
   if (sigma2 != null && sigma2 > 0) {
-    const snrDb = (-10 * Math.log10(sigma2)).toFixed(1);
-    header += ` · σ²=${sigma2.toFixed(3)} (${snrDb} dB)`;
+    const snrDb = es != null && es > 0
+      ? (10 * Math.log10(es / sigma2)).toFixed(1)
+      : (-10 * Math.log10(sigma2)).toFixed(1);
+    const tag = es != null ? "data" : "pilot";
+    header += ` · σ²(${tag})=${sigma2.toFixed(3)} (${snrDb} dB)`;
   }
   ctx.fillStyle = "rgba(0,0,0,0.55)";
   ctx.fillRect(plotX0, 0, plotW, 22 * dpr);
@@ -2993,10 +3035,6 @@ function wireEvents() {
     "file_complete",
     "session_end",
     "error",
-    // Per-scan DSP breakdown: profile + ppm + per-segment sigma². One
-    // entry per tick with decoded segments. Logged in the Info tab via
-    // the generic logEvent path (JSON dump under the event name).
-    "sf_detail",
   ];
   for (const name of names) {
     listen(name, (event) => {
@@ -3022,87 +3060,6 @@ function wireEvents() {
   });
   listen("rx_realtime", (event) => {
     noteRxRealtime(event.payload);
-  });
-
-  // 0.10.43 : worker-requested capture restart. The worker emits this
-  // whenever it transitions back to Idle (preamble-absence, EOT,
-  // brickwall) -- in-process resets proved insufficient to re-arm RX
-  // on a fresh signal. We mirror what a manual stop/start does : the
-  // backend `restart_capture` command drops the cpal/SDR stream +
-  // worker thread, and re-spawns with the same device + profile +
-  // forced the operator originally picked.
-  //
-  // 0.10.45 : added auto_stop / auto_start `logEvent` markers around
-  // the invoke so the operator can SEE in the GUI event log whether
-  // the restart cycle actually ran (or where it got stuck). Manual
-  // stop/start already logs "stop" + "start" entries from the
-  // button handlers ; this gives the auto path the same visibility.
-  listen("worker_requests_restart", async (event) => {
-    const reason = (event.payload && event.payload.reason) || "?";
-    logEvent("worker_requests_restart", { reason });
-    logEvent("auto_stop", { reason });
-    try {
-      // 0.10.46 fix : `invoke` is not in scope inside wireEvents()
-      // listener closures by default — must be destructured from
-      // `window.__TAURI__.core` like every other usage in this file
-      // (see e.g. main.js:133, 183, 711). Without this destructure
-      // the listener threw `ReferenceError: Can't find variable:
-      // invoke` and `worker_requests_restart_error` fired every
-      // single Idle transition since 0.10.43, meaning the auto
-      // stop/start NEVER actually ran.
-      const { invoke } = window.__TAURI__.core;
-      await invoke("restart_capture");
-      logEvent("auto_start", { reason });
-    } catch (err) {
-      logEvent("worker_requests_restart_error", { reason, error: String(err) });
-    }
-  });
-
-  // 0.10.38 : worker capture-state changes. Drives the status-bar chip
-  // (`#v2-state-chip`) so the chip reflects the actual modem state
-  // instead of staying permanently "idle". Also surfaced in the Info
-  // event log so the operator sees the timestamped Idle ↔ Streaming
-  // transitions alongside the rest of the per-tick telemetry.
-  listen("modem_state", (event) => {
-    const p = event.payload || {};
-    updateV2State(p.active ? "streaming" : "idle");
-    logEvent("modem_state", {
-      active: p.active,
-      profile: p.profile,
-      t_ms: p.t_ms,
-    });
-  });
-
-  // 0.10.38 : ±15 ppm safety-grid invocation. Emitted by the worker
-  // every tick where Gardner + fast-path both failed and the grid
-  // fired (lowpower fallback OR user-toggled high-power). Logs entry /
-  // exit timestamps + duration + ppm estimate + quota counter so the
-  // operator can audit grid usage from the GUI without tail-ing
-  // /tmp/nbfm-worker.log.
-  listen("grid_used", (event) => {
-    const p = event.payload || {};
-    const fmtTime = (ms) => {
-      if (!ms) return "?";
-      const d = new Date(ms);
-      const hh = String(d.getHours()).padStart(2, "0");
-      const mm = String(d.getMinutes()).padStart(2, "0");
-      const ss = String(d.getSeconds()).padStart(2, "0");
-      const fff = String(d.getMilliseconds()).padStart(3, "0");
-      return `${hh}:${mm}:${ss}.${fff}`;
-    };
-    const ppm =
-      p.drift_ppm === null || p.drift_ppm === undefined
-        ? "?"
-        : `${p.drift_ppm.toFixed(2)} ppm`;
-    logEvent("grid_used", {
-      in: fmtTime(p.t_start_ms),
-      out: fmtTime(p.t_end_ms),
-      duration_ms: p.duration_ms,
-      n_passes: p.n_passes,
-      ppm,
-      fallback: p.fallback,
-      quota: `${p.recent}/${p.quota}`,
-    });
   });
 
   listen("tx_plan", (ev) => {
@@ -4625,10 +4582,24 @@ function setupChannelTab() {
     });
   }
   if (applyBtn) {
-    applyBtn.addEventListener("click", () => {
+    applyBtn.addEventListener("click", async () => {
       const vals = cascadeFeedback.map(r => r.db);
       const m = median(vals);
-      if (m !== null) applyAttenuation(m, "médiane cascade");
+      if (m === null) return;
+      // Round to the nearest integer dB: that's what the RX operator
+      // dictates on the air, and what the TX operator types back here.
+      // Also avoids float-precision quirks (e.g. -12.499999 vs -12.5)
+      // that made the value silently fail to be persisted before.
+      const rounded = Math.round(m);
+      // Disable the button while save_settings is in flight, await
+      // the async persist so a quick second click can't race the disk
+      // write, and surface any error in the status line.
+      applyBtn.disabled = true;
+      try {
+        await applyAttenuation(rounded, "médiane cascade");
+      } finally {
+        applyBtn.disabled = cascadeFeedback.length === 0;
+      }
     });
   }
   if (clearBtn) {
@@ -4638,6 +4609,930 @@ function setupChannelTab() {
     });
   }
   renderCascade();
+}
+
+// ─────────────────────────────────────────── Sondeur (Canal tab, lower half)
+// Two Tauri commands back this UI:
+//   - sounding_tx_render(request) → builds probe.wav + schedule.json
+//     under <save_dir>/sounder/<id>/. The user plays the WAV via the RX
+//     tab's "▶ Lire WAV" feature (loopback test) or an external player.
+//   - sounding_analyze(capture_wav, schedule_json, family, metadata,
+//     sync_threshold) → cross-correlates the chirp anchor, runs each
+//     probe's analyser, writes <capture>.signature.json next to the WAV
+//     and returns the ChannelSignature payload we render below.
+//
+// File-IO uses plain string paths (no plugin-dialog in this build).
+// Defaults: a sane probe sequence covering SNR, IMD3, group delay,
+// noise floor, frequency response, and a 10-step level sweep so the
+// operator gets P1dB + sweet-spot estimates from a single TX render.
+
+// The reference TX level grid: 11 amplitudes from -30 to 0 dBFS in 3 dB
+// steps. The orchestrator emits every probe family at every level so
+// the analyser can compare each metric (SNR, IMD3, BW, group delay,
+// impulse response) against TX level — and flag the operator when
+// the TX rig is set too loud (the typical mistake: peak well above
+// the sweet spot, which produces gross IMD3 + clipping artefacts).
+const SOUNDER_LEVELS_DBFS = [
+  -30, -27, -24, -21, -18, -15, -12, -9, -6, -3, 0,
+];
+
+// Convert a dBFS level to a linear amplitude scale factor.
+function levelDbToAmp(level_db) {
+  return Math.pow(10, level_db / 20);
+}
+
+// Build the multi-level expansion of a probe family. `factory(amp)`
+// returns a ProbeSpec for one level given the linear amplitude scale.
+// Returns `{ probes, levels }` parallel arrays so the caller can pass
+// the per-probe level_db across to the Rust side.
+function expandLevels(factory) {
+  const probes = [];
+  const levels = [];
+  for (const level_db of SOUNDER_LEVELS_DBFS) {
+    probes.push(factory(levelDbToAmp(level_db)));
+    levels.push(level_db);
+  }
+  return { probes, levels };
+}
+
+// Returns `{ probes, levels }`. `levels[i]` is the intended TX dBFS
+// for `probes[i]`, or `null` for multi-level probes (level_sweep)
+// where the level is encoded internally.
+function defaultSounderProbes() {
+  const probes = [];
+  const levels = [];
+  // 1 — Level sweep on tone @ 1500 Hz. Runs FIRST so the analyser
+  //     can pin down the sweet spot before evaluating the other
+  //     probe families. Each family is then evaluated at the same
+  //     11 levels so the analyser can chart degradation against
+  //     TX level (and flag over-modulation explicitly).
+  probes.push({
+    kind: "level_sweep",
+    inner_tone_freq_hz: 1500.0,
+    levels_db: SOUNDER_LEVELS_DBFS,
+    duration_s_per_level: 0.6,
+    gap_s: 0.15,
+  });
+  levels.push(null);
+  const families = [
+    // 2 — Two-tone IMD3. f1=1300/f2=1700 so the IMD3 bins
+    //     (2·f1−f2=900 Hz, 2·f2−f1=2100 Hz) land inside the clean
+    //     part of the NBFM audio band.
+    (amp) => ({
+      kind: "two_tone",
+      f1_hz: 1300.0,
+      f2_hz: 1700.0,
+      amp_each: 0.5 * amp,
+    }),
+    // 3 — Linear chirp (group delay, BW).
+    (amp) => ({
+      kind: "chirp_linear",
+      f0_hz: 200.0,
+      f1_hz: 2600.0,
+      amplitude: 0.9 * amp,
+    }),
+    // 4 — Multitone (frequency response).
+    (amp) => ({
+      kind: "multitone",
+      freqs_hz: [300, 600, 900, 1200, 1500, 1800, 2100, 2400],
+      amp_each: 0.3 * amp,
+    }),
+    // 5 — AWGN (noise-floor shape under AGC).
+    (amp) => ({
+      kind: "awgn",
+      rms: 0.2 * amp,
+      seed: 0xc0ffee,
+    }),
+    // 6 — Golay complementary-pair impulse response. BPSK on
+    //     1500 Hz carrier, 256 chips at 1200 chip/s → ≈ 213 ms per
+    //     sequence × 2 + 100 ms gap × 2 ≈ 0.63 s / level instance.
+    (amp) => ({
+      kind: "golay_pair",
+      length_bits: 256,
+      chip_rate_hz: 1200.0,
+      carrier_hz: 1500.0,
+      amplitude: 0.7 * amp,
+      gap_s: 0.1,
+    }),
+  ];
+  for (const factory of families) {
+    const ex = expandLevels(factory);
+    probes.push(...ex.probes);
+    levels.push(...ex.levels);
+  }
+  return { probes, levels };
+}
+
+function setSounderStatus(id, text, level) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.classList.remove("ok", "err");
+  if (level === "ok") el.classList.add("ok");
+  else if (level === "err") el.classList.add("err");
+}
+
+function fmtNumOrDash(v, digits) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(digits ?? 2);
+}
+
+// Build the standard SoundingRequest the TX emit + RX regenerate
+// paths share. Deterministic at the JS level: the same defaults yield
+// byte-identical schedule.json + probe audio on TX and RX machines.
+function buildStandardSoundingRequest() {
+  const { probes, levels } = defaultSounderProbes();
+  return {
+    channel_family: "fm",
+    probes,
+    probe_levels_db: levels,
+    wake_up_amplitude: 0.6,
+    sync_marker_amplitude: 0.7,
+    // 0.4 s per non-sweep probe instance keeps 56 segments × 0.4 ≈
+    // 22 s of probe airtime in the new ramp-first schedule. The
+    // level sweep (probe #1) has its own duration_s_per_level (0.6).
+    default_probe_duration_s: 0.4,
+    // 0.1 s inter-probe gap reduces total gap airtime to ~5.6 s
+    // across the 56 segments — enough for AGC settle between probes
+    // but avoiding the 16 s we'd get with the legacy 0.3 s default.
+    inter_probe_gap_s: 0.1,
+    metadata: {
+      tx_callsign: "",
+      rx_callsign: "",
+      equipment: "",
+      notes: "",
+      // Deterministic timestamp (0) so the schedule stays
+      // byte-identical between machines that run the sounder at
+      // different wall-clock times; metadata.ts_unix is only used
+      // to label the signature on the RX side anyway.
+      ts_unix: 0,
+    },
+  };
+}
+
+// TX-side: one-shot button that builds the standard probe sequence
+// and plays it directly through the TX soundcard configured in the
+// Paramètres tab (single source of truth — same field used by
+// `txStart` for the regular modem TX). No files written, no fields
+// to fill — the user just clicks once and waits.
+async function runSounderTxEmit() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  // Read the device from the persisted settings (Paramètres tab).
+  // The previous version queried `getElementById("tx-device")` which
+  // never existed in the DOM (the actual id is `tx-device-select` and
+  // it lives under Paramètres), so the button always errored out
+  // even with a device configured.
+  const txDevice = ((currentSettings && currentSettings.tx_device) || "").trim();
+  if (!txDevice) {
+    setSounderStatus(
+      "sounder-tx-status",
+      "Choisir un périphérique TX dans Paramètres",
+      "err",
+    );
+    return;
+  }
+  const btn = document.getElementById("sounder-tx-emit");
+  const oldText = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Émission en cours…";
+  }
+  setSounderStatus("sounder-tx-status", "préparation…");
+  try {
+    const request = buildStandardSoundingRequest();
+    const res = await invoke("sounding_tx_emit", {
+      args: { request, tx_device: txDevice },
+    });
+    // Update the duration estimate next to the helper text.
+    const est = document.getElementById("sounder-tx-duration-est");
+    if (est) est.textContent = res.duration_s.toFixed(0);
+    setSounderStatus(
+      "sounder-tx-status",
+      `émission ${res.duration_s.toFixed(0)} s…`,
+    );
+    // Re-enable the button after the airtime + a small safety margin.
+    const reenableMs = Math.ceil(res.duration_s * 1000) + 500;
+    setTimeout(() => {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+      }
+      setSounderStatus("sounder-tx-status", `terminé ${now()}`, "ok");
+    }, reenableMs);
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+    }
+    setSounderStatus("sounder-tx-status", `erreur : ${err}`, "err");
+  }
+}
+
+// RX-side helper: regenerate the reference probe.wav + schedule.json
+// locally with the standard parameters, then auto-fill the analyse
+// pane's schedule path. The generator is deterministic, so the bytes
+// match whatever the TX side emitted with the same JS — no file
+// transfer between machines required.
+async function runSounderTxRender() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  setSounderStatus("sounder-an-status", "génération…");
+  try {
+    const request = buildStandardSoundingRequest();
+    const res = await invoke("sounding_tx_render", { request });
+    const sched = document.getElementById("sounder-an-schedule");
+    if (sched) sched.value = res.schedule_json;
+    setSounderStatus(
+      "sounder-an-status",
+      `référence régénérée (${res.duration_s.toFixed(0)} s)`,
+      "ok",
+    );
+  } catch (err) {
+    setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
+  }
+}
+
+// Stitch the RX chain-metadata form fields into a free-text equipment
+// + notes string so the analyser side can persist them in the
+// signature JSON. The Rust `SoundingMetadata` keeps a flat shape
+// (text fields only) for backwards compatibility with the legacy
+// schedule.
+function buildRxChainMetadata() {
+  const txModel = (
+    document.getElementById("sounder-rx-tx-model")?.value || ""
+  ).trim();
+  const rxModel = (
+    document.getElementById("sounder-rx-rx-model")?.value || ""
+  ).trim();
+  // The TX station's Maidenhead grid is dictated by phonie from the
+  // remote operator (the local locator lives in Paramètres). It's
+  // optional — leave empty if not communicated.
+  const txLocator = (
+    document.getElementById("sounder-rx-tx-locator")?.value || ""
+  ).trim();
+  const relay = (
+    document.getElementById("sounder-rx-relay")?.value || "none"
+  ).trim();
+  const mode = (
+    document.getElementById("sounder-rx-mode")?.value || "fm_5khz"
+  ).trim();
+  // Compact human-readable equipment string for the in-signature
+  // `SoundingMetadata` (legacy flat schema).
+  const eqParts = [];
+  if (txModel) eqParts.push(`TX=${txModel}`);
+  if (rxModel) eqParts.push(`RX=${rxModel}`);
+  const equipment = eqParts.join(" / ");
+  const notes = `relay=${relay} mode=${mode}`;
+  // Also surface the individual fields so the collector-submit code
+  // can map them onto the structured `ReportMeta` (tx_model, relay,
+  // profile) the server expects. `txLocator` rides alongside as an
+  // extra `tx_locator` field — the server doesn't parse it today but
+  // preserves it in the on-disk metadata.json for later indexing.
+  return { equipment, notes, txModel, rxModel, txLocator, relay, mode };
+}
+
+async function runSounderAnalyze() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const capture = (
+    document.getElementById("sounder-an-capture")?.value || ""
+  ).trim();
+  let schedule = (
+    document.getElementById("sounder-an-schedule")?.value || ""
+  ).trim();
+  if (!capture) {
+    setSounderStatus("sounder-an-status", "aucune capture (cliquez Démarrer)", "err");
+    return;
+  }
+  // Auto-regenerate the reference schedule if the user didn't already
+  // produce one. The generator is deterministic so re-running on the
+  // RX side gives bit-identical bytes to whatever the TX side built.
+  if (!schedule) {
+    setSounderStatus("sounder-an-status", "génération de la référence…");
+    try {
+      const request = buildStandardSoundingRequest();
+      const ref = await invoke("sounding_tx_render", { request });
+      schedule = ref.schedule_json;
+      const sched = document.getElementById("sounder-an-schedule");
+      if (sched) sched.value = schedule;
+    } catch (err) {
+      setSounderStatus("sounder-an-status", `erreur ref: ${err}`, "err");
+      return;
+    }
+  }
+  const threshold =
+    Number(document.getElementById("sounder-an-threshold")?.value) || 6;
+  const { equipment, notes } = buildRxChainMetadata();
+  setSounderStatus("sounder-an-status", "analyse en cours…");
+  try {
+    const sig = await invoke("sounding_analyze", {
+      captureWav: capture,
+      scheduleJson: schedule,
+      family: "fm",
+      metadata: {
+        tx_callsign: "",
+        rx_callsign: "",
+        equipment,
+        notes,
+        ts_unix: Math.floor(Date.now() / 1000),
+      },
+      syncThreshold: threshold,
+    });
+    const d = sig.derived || {};
+    document.getElementById("sd-snr").textContent = fmtNumOrDash(d.snr_est_db, 2);
+    document.getElementById("sd-ip3").textContent = fmtNumOrDash(d.ip3_dbfs, 2);
+    document.getElementById("sd-p1db").textContent = fmtNumOrDash(d.p1db_dbfs, 2);
+    document.getElementById("sd-sweet").textContent =
+      fmtNumOrDash(d.sweet_spot_dbfs, 2);
+    if (d.bw_3db_hz && d.bw_3db_hz[1] > 0) {
+      document.getElementById("sd-bw").textContent = `${Math.round(
+        d.bw_3db_hz[0],
+      )}–${Math.round(d.bw_3db_hz[1])}`;
+    } else {
+      document.getElementById("sd-bw").textContent = "—";
+    }
+    document.getElementById("sd-gd").textContent = fmtNumOrDash(
+      d.group_delay_peak_us,
+      0,
+    );
+    document.getElementById("sd-noise").textContent = fmtNumOrDash(
+      d.noise_floor_dbfs,
+      2,
+    );
+    document.getElementById("sd-d50").textContent = fmtNumOrDash(
+      d.delay_spread_50_us,
+      0,
+    );
+    document.getElementById("sd-d90").textContent = fmtNumOrDash(
+      d.delay_spread_90_us,
+      0,
+    );
+    document.getElementById("sd-echo").textContent = fmtNumOrDash(
+      d.strongest_echo_dbc,
+      1,
+    );
+    document.getElementById("sd-anchor").textContent =
+      sig.capture_anchor_sample != null
+        ? String(sig.capture_anchor_sample)
+        : "—";
+    document.getElementById("sounder-an-signature-path").textContent =
+      `signature.json écrite à côté du WAV (${sig.measurements?.length ?? 0} mesures)`;
+    // Verdict from the over-modulation analyser.
+    const v = sig.verdict || {};
+    const vEl = document.getElementById("sd-verdict");
+    if (vEl) {
+      vEl.textContent = v.message || "—";
+      vEl.classList.remove("ok", "warn");
+      if ((v.message || "").includes("OK")) vEl.classList.add("ok");
+      else if ((v.message || "").includes("⚠️")) vEl.classList.add("warn");
+    }
+    // Recommended attenuation to dictate over the air to the TX
+    // operator. The sweet_spot_dbfs is the peak level (relative to
+    // full-scale) at which the rig stops over-modulating; the TX
+    // operator types that same negative value into Canal → Cascade.
+    // Round to the nearest integer dB because that's what gets
+    // dictated by voice (and matches the cascade slider's effective
+    // resolution after the recent fix).
+    const recoEl = document.getElementById("sd-reco-att");
+    if (recoEl) {
+      const sweet = Number(v.sweet_spot_dbfs);
+      if (Number.isFinite(sweet)) {
+        // Clamp to [-30, 0] like the TX attenuation chain itself.
+        const clamped = Math.min(0, Math.max(-30, sweet));
+        recoEl.textContent = String(Math.round(clamped));
+      } else {
+        recoEl.textContent = "—";
+      }
+    }
+    // Stash the result so the collector-send button can pick it up
+    // later without re-invoking the analyser. Keep both the raw form
+    // fields (mapped to the collector's ReportMeta schema) and a
+    // free-text `notes` line that carries the rx_model — for which
+    // the server schema has no dedicated field yet.
+    const chain = buildRxChainMetadata();
+    const noteParts = [];
+    if (chain.rxModel) noteParts.push(`RX=${chain.rxModel}`);
+    if (chain.mode && chain.mode !== "fm_5khz") {
+      noteParts.push(`mode=${chain.mode}`);
+    }
+    lastSounderResult = {
+      wavPath: capture,
+      signatureJson: JSON.stringify(sig),
+      txModel: chain.txModel || null,
+      txLocator: chain.txLocator || null,
+      relay: chain.relay && chain.relay !== "none" ? chain.relay : null,
+      profile: chain.mode || null,
+      notes: noteParts.length ? noteParts.join(" / ") : null,
+    };
+    const sendBtn = document.getElementById("sd-collector-send");
+    if (sendBtn) sendBtn.disabled = false;
+    const sendStatus = document.getElementById("sd-collector-status");
+    if (sendStatus) {
+      sendStatus.textContent = "";
+      sendStatus.classList.remove("ok", "err");
+    }
+    const res = document.getElementById("sounder-an-results");
+    if (res) res.hidden = false;
+    // Render the channel-characterisation plots from the per-segment
+    // measurements that are now in the signature.
+    try {
+      renderSounderPlots(sig);
+    } catch (plotErr) {
+      console.error("renderSounderPlots", plotErr);
+    }
+    setSounderStatus("sounder-an-status", `OK ${now()}`, "ok");
+  } catch (err) {
+    setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
+  }
+}
+
+// Holds the most recent successful sounder analysis so the "Envoyer au
+// collector" button can ship it without re-running anything. Reset
+// implicitly each time `runSounderAnalyze` succeeds; we never clear it
+// on error so a transient analyse-fail doesn't wipe a good result.
+let lastSounderResult = null;
+
+// Phone-by-phone manual: the RX operator reads `#sd-reco-att` to the
+// TX operator, who types it into Channel → Cascade. This button does
+// NOT touch local tx_attenuation_db (the local machine is the receiver,
+// it isn't the one transmitting); it only ships the result to the
+// shared collector at hb9tob.duckdns.org.
+async function runSounderCollectorSend() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  if (!lastSounderResult) return;
+  const { invoke } = window.__TAURI__.core;
+  const btn = document.getElementById("sd-collector-send");
+  const statusEl = document.getElementById("sd-collector-status");
+  const wavChk = document.getElementById("sd-collector-with-wav");
+  const setStatus = (msg, kind) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.classList.remove("ok", "err");
+    if (kind) statusEl.classList.add(kind);
+  };
+  const callsign = (currentSettings && currentSettings.callsign || "").trim();
+  if (!callsign) {
+    setStatus("indicatif vide (Paramètres → Indicatif)", "err");
+    return;
+  }
+  const collectorUrl =
+    (currentSettings && currentSettings.collector_url || "").trim();
+  if (!collectorUrl) {
+    setStatus("URL collecteur vide (Paramètres → Collecteur)", "err");
+    return;
+  }
+  if (btn) btn.disabled = true;
+  setStatus("envoi en cours…");
+  try {
+    const locator = (currentSettings && currentSettings.locator || "").trim();
+    const res = await invoke("submit_sounding", {
+      args: {
+        wav_path: lastSounderResult.wavPath || "",
+        callsign,
+        collector_url: collectorUrl,
+        signature_json: lastSounderResult.signatureJson,
+        locator: locator || null,
+        tx_locator: lastSounderResult.txLocator || null,
+        profile: lastSounderResult.profile || null,
+        relay: lastSounderResult.relay || null,
+        tx_model: lastSounderResult.txModel || null,
+        notes: lastSounderResult.notes || null,
+        include_wav: !!(wavChk && wavChk.checked),
+      },
+    });
+    const link = `${collectorUrl.replace(/\/+$/, "")}${res.url || ""}`;
+    setStatus(`OK ${(res.bytes_uploaded / 1024).toFixed(0)} KiB — ${link}`, "ok");
+    // Best-effort: open the entry in the OS browser. The opener
+    // plugin is optional; swallow the error if it's not registered.
+    try {
+      if (window.__TAURI__.opener && window.__TAURI__.opener.openUrl) {
+        await window.__TAURI__.opener.openUrl(link);
+      }
+    } catch (_) {
+      /* the URL is shown in the status line anyway */
+    }
+  } catch (err) {
+    setStatus(`erreur : ${err}`, "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Integrated capture + analyse toggle for the RX panel. Independent
+// of the modem rx_worker — the Sounder tab stops the worker so the
+// audio device is free. First click = spin up a standalone cpal/SDR
+// → WAV writer; second click = stop the writer, finalise the WAV,
+// then immediately fire the analyser. The WAV path auto-fills the
+// analyse input.
+let sounderRxRecording = false;
+async function runSounderRxCaptureToggle() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const btn = document.getElementById("sounder-rx-capture-toggle");
+  const analyseBtn = document.getElementById("sounder-an-run");
+  if (!sounderRxRecording) {
+    // Reuse the RX device the user has already configured in
+    // Paramètres — same dropdown as the main RX play button.
+    const deviceSelect = document.getElementById("rx-device-select");
+    const deviceName = deviceSelect ? deviceSelect.value : "";
+    if (!deviceName) {
+      setSounderStatus(
+        "sounder-an-status",
+        "Sélectionner une carte RX dans Paramètres",
+        "err",
+      );
+      return;
+    }
+    try {
+      const path = await invoke("sounding_rx_start_capture", {
+        deviceName,
+      });
+      sounderRxRecording = true;
+      const captureInput = document.getElementById("sounder-an-capture");
+      if (captureInput) captureInput.value = path;
+      if (btn) {
+        btn.textContent = "⏹ Arrêter & analyser";
+        btn.classList.add("recording");
+      }
+      if (analyseBtn) analyseBtn.disabled = true;
+      setSounderStatus(
+        "sounder-an-status",
+        "capture en cours — émettez côté TX, puis cliquez pour arrêter",
+      );
+    } catch (err) {
+      setSounderStatus("sounder-an-status", `erreur capture : ${err}`, "err");
+    }
+  } else {
+    try {
+      const info = await invoke("sounding_rx_stop_capture");
+      sounderRxRecording = false;
+      const captureInput = document.getElementById("sounder-an-capture");
+      if (captureInput) captureInput.value = info.path;
+      if (btn) {
+        btn.textContent = "⏺ Démarrer la capture";
+        btn.classList.remove("recording");
+      }
+      if (analyseBtn) analyseBtn.disabled = false;
+      setSounderStatus(
+        "sounder-an-status",
+        `capture ${info.duration_sec.toFixed(0)} s — analyse…`,
+      );
+      // Auto-fire the analyser. The function regenerates the
+      // reference schedule itself if the field is empty.
+      await runSounderAnalyze();
+    } catch (err) {
+      setSounderStatus("sounder-an-status", `erreur stop : ${err}`, "err");
+    }
+  }
+}
+
+// ─────────────── Sounder plots (inline SVG, no external lib)
+//
+// Renders 6 channel-characterisation plots into <svg> tags inside the
+// results panel after a successful sounding_analyze run. Each plot is
+// self-contained: SVG nodes are wiped + rebuilt every call (cheap,
+// the panels are small).
+
+// Generic XY plotter. `points` = [[x, y], …]. Auto-scales axes unless
+// `xMin/xMax/yMin/yMax` are supplied. Optional secondary trace, sweet-
+// spot vertical line, and y=x reference diagonal.
+function svgXY(svgId, points, opts) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  if (!points || points.length === 0) return;
+  const o = Object.assign(
+    {
+      w: 360,
+      h: 220,
+      padL: 38,
+      padR: 12,
+      padT: 12,
+      padB: 28,
+      xMin: null,
+      xMax: null,
+      yMin: null,
+      yMax: null,
+      xLabel: "",
+      yLabel: "",
+      diagonal: false,
+      sweet: null,
+      secondary: null, // [[x, y], …]
+    },
+    opts,
+  );
+  let xMin = o.xMin,
+    xMax = o.xMax,
+    yMin = o.yMin,
+    yMax = o.yMax;
+  if (xMin === null) xMin = Math.min(...points.map((p) => p[0]));
+  if (xMax === null) xMax = Math.max(...points.map((p) => p[0]));
+  if (yMin === null) yMin = Math.min(...points.map((p) => p[1]));
+  if (yMax === null) yMax = Math.max(...points.map((p) => p[1]));
+  if (o.secondary && o.secondary.length) {
+    yMin = Math.min(yMin, ...o.secondary.map((p) => p[1]));
+    yMax = Math.max(yMax, ...o.secondary.map((p) => p[1]));
+  }
+  if (xMin === xMax) xMax = xMin + 1;
+  if (yMin === yMax) yMax = yMin + 1;
+  // Add 5% margin so traces don't kiss the axes.
+  const dy = yMax - yMin;
+  yMin -= dy * 0.05;
+  yMax += dy * 0.05;
+
+  const plotW = o.w - o.padL - o.padR;
+  const plotH = o.h - o.padT - o.padB;
+  const sx = (x) => o.padL + ((x - xMin) / (xMax - xMin)) * plotW;
+  const sy = (y) => o.padT + (1 - (y - yMin) / (yMax - yMin)) * plotH;
+
+  const NS = "http://www.w3.org/2000/svg";
+  const mk = (tag, attrs, text) => {
+    const el = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    if (text != null) el.textContent = text;
+    return el;
+  };
+
+  // Grid + axes (5 vertical, 4 horizontal ticks).
+  for (let i = 0; i <= 5; i++) {
+    const x = sx(xMin + (i / 5) * (xMax - xMin));
+    svg.appendChild(
+      mk("line", { class: "grid", x1: x, y1: o.padT, x2: x, y2: o.padT + plotH }),
+    );
+    svg.appendChild(
+      mk(
+        "text",
+        { class: "label", x: x, y: o.padT + plotH + 12, "text-anchor": "middle" },
+        (xMin + (i / 5) * (xMax - xMin)).toFixed(
+          Math.abs(xMax - xMin) > 50 ? 0 : 1,
+        ),
+      ),
+    );
+  }
+  for (let i = 0; i <= 4; i++) {
+    const y = sy(yMin + (i / 4) * (yMax - yMin));
+    svg.appendChild(
+      mk("line", { class: "grid", x1: o.padL, y1: y, x2: o.padL + plotW, y2: y }),
+    );
+    svg.appendChild(
+      mk(
+        "text",
+        { class: "label", x: o.padL - 4, y: y + 3, "text-anchor": "end" },
+        (yMin + (i / 4) * (yMax - yMin)).toFixed(
+          Math.abs(yMax - yMin) > 50 ? 0 : 1,
+        ),
+      ),
+    );
+  }
+  svg.appendChild(
+    mk("line", {
+      class: "axis",
+      x1: o.padL,
+      y1: o.padT,
+      x2: o.padL,
+      y2: o.padT + plotH,
+    }),
+  );
+  svg.appendChild(
+    mk("line", {
+      class: "axis",
+      x1: o.padL,
+      y1: o.padT + plotH,
+      x2: o.padL + plotW,
+      y2: o.padT + plotH,
+    }),
+  );
+  if (o.xLabel)
+    svg.appendChild(
+      mk(
+        "text",
+        {
+          class: "axis-title",
+          x: o.padL + plotW / 2,
+          y: o.h - 4,
+          "text-anchor": "middle",
+        },
+        o.xLabel,
+      ),
+    );
+  if (o.yLabel)
+    svg.appendChild(
+      mk(
+        "text",
+        {
+          class: "axis-title",
+          x: 9,
+          y: o.padT + plotH / 2,
+          "text-anchor": "middle",
+          transform: `rotate(-90 9 ${o.padT + plotH / 2})`,
+        },
+        o.yLabel,
+      ),
+    );
+
+  if (o.diagonal) {
+    // y=x reference (only meaningful when both axes have the same units).
+    const xa = Math.max(xMin, yMin);
+    const xb = Math.min(xMax, yMax);
+    if (xb > xa) {
+      svg.appendChild(
+        mk("line", {
+          class: "ref",
+          x1: sx(xa),
+          y1: sy(xa),
+          x2: sx(xb),
+          y2: sy(xb),
+        }),
+      );
+    }
+  }
+
+  if (o.sweet != null && isFinite(o.sweet) && o.sweet >= xMin && o.sweet <= xMax) {
+    const xs = sx(o.sweet);
+    svg.appendChild(
+      mk("line", {
+        class: "sweet",
+        x1: xs,
+        y1: o.padT,
+        x2: xs,
+        y2: o.padT + plotH,
+      }),
+    );
+    svg.appendChild(
+      mk(
+        "text",
+        {
+          class: "sweet-label",
+          x: xs + 3,
+          y: o.padT + 10,
+          "text-anchor": "start",
+        },
+        "sweet",
+      ),
+    );
+  }
+
+  // Secondary trace first so it sits BEHIND the main trace.
+  if (o.secondary && o.secondary.length > 1) {
+    const d = o.secondary
+      .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p[0])} ${sy(p[1])}`)
+      .join(" ");
+    svg.appendChild(mk("path", { class: "trace-secondary", d }));
+  }
+  const d = points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p[0])} ${sy(p[1])}`)
+    .join(" ");
+  svg.appendChild(mk("path", { class: "trace", d }));
+  // Add small dots so sparse data is visible.
+  if (points.length <= 32) {
+    for (const p of points) {
+      svg.appendChild(
+        mk("circle", { class: "point", cx: sx(p[0]), cy: sy(p[1]), r: 2 }),
+      );
+    }
+  }
+}
+
+// Render the 6 sounder plots from a signature object. Walks the
+// measurements array to find the right per-family instance for each
+// plot (sweet-spot for chirp/multitone; highest-peak for Golay).
+function renderSounderPlots(sig) {
+  const meas = sig.measurements || [];
+  const d = sig.derived || {};
+  const sweet = d.sweet_spot_dbfs;
+
+  // (1) AM-AM — from the unique LevelSweep entry.
+  const sweep = meas.find((m) => m.kind === "level_sweep");
+  if (sweep && sweep.result && sweep.result.am_am_curve) {
+    svgXY("sd-plot-amam", sweep.result.am_am_curve, {
+      xLabel: "Entrée (dBFS)",
+      yLabel: "Sortie (dBFS)",
+      diagonal: true,
+      sweet,
+    });
+    // (1bis) AM-PM curve overlay onto the AM-PM panel.
+    if (sweep.result.am_pm_curve) {
+      svgXY("sd-plot-ampm", sweep.result.am_pm_curve, {
+        xLabel: "Entrée (dBFS)",
+        yLabel: "Phase (rad)",
+        sweet,
+      });
+    }
+  }
+
+  // (2) IMD3 vs level — group all two-tone measurements with their
+  //     parent ProbeSegment's level_db (from the schedule, which the
+  //     analyse pass doesn't echo back, so we reverse-engineer from
+  //     amp_each: level = 20·log10(amp_each / 0.5)).
+  //
+  //     We don't have the schedule here, but we have measurements with
+  //     amp inside each spec's result. The two-tone measurements
+  //     return a1_dbfs / a2_dbfs (output level), and we can map
+  //     measurement index back to its input level if the schedule was
+  //     standard. As a pragmatic shortcut, use a1_dbfs as the x-axis
+  //     proxy (output level at the receiver — what actually matters
+  //     for IMD3 anyway).
+  const tts = meas
+    .filter((m) => m.kind === "two_tone")
+    .map((m) => [m.result.a1_dbfs, 0.5 * (m.result.imd3_low_dbc + m.result.imd3_high_dbc)])
+    .sort((a, b) => a[0] - b[0]);
+  if (tts.length > 0) {
+    svgXY("sd-plot-imd3", tts, {
+      xLabel: "Sortie f₁ (dBFS)",
+      yLabel: "IMD3 moyen (dBc)",
+    });
+  }
+
+  // (3) Frequency response — from the multitone at sweet-spot.
+  let mtPick = null;
+  let mtBestDist = Infinity;
+  for (const m of meas) {
+    if (m.kind !== "multitone") continue;
+    // We don't carry level_db on the measurement, so we approximate
+    // "sweet-spot multitone" as the one whose strongest bin is closest
+    // to sweet_spot in dBFS. The peak bin amp is the multitone result's
+    // ref level (gain_db_per_freq is normalised to peak).
+    // Practical fallback: pick the highest output level (= highest
+    // measured raw multitone peak amp ≈ middle-of-band tone amplitude).
+    // We just look at the first gain entry which is normalised to 0 dB
+    // at peak, so all multitones look similar shape-wise. Pick the
+    // last one (highest TX level) for the curve display.
+    mtPick = m;
+  }
+  if (mtPick && mtPick.result && mtPick.result.gain_db_per_freq) {
+    svgXY("sd-plot-freq", mtPick.result.gain_db_per_freq, {
+      xLabel: "Fréquence (Hz)",
+      yLabel: "Gain (dB)",
+    });
+  }
+
+  // (4) Group delay — from chirp at sweet-spot. Take the last chirp
+  //     (highest level, best SNR for the IF estimator).
+  let chPick = null;
+  for (const m of meas) {
+    if (m.kind === "chirp") chPick = m;
+  }
+  if (chPick && chPick.result && chPick.result.group_delay_per_freq) {
+    svgXY("sd-plot-gd", chPick.result.group_delay_per_freq, {
+      xLabel: "Fréquence (Hz)",
+      yLabel: "Δ group delay (µs)",
+    });
+  }
+
+  // (5) Impulse response — pick the Golay with the highest peak amp
+  //     (same heuristic as the derived numbers).
+  let irPick = null;
+  let irBest = -Infinity;
+  for (const m of meas) {
+    if (m.kind !== "golay_pair") continue;
+    if (m.result && m.result.peak_amplitude > irBest) {
+      irBest = m.result.peak_amplitude;
+      irPick = m;
+    }
+  }
+  if (irPick && irPick.result && irPick.result.impulse_response) {
+    const ir = irPick.result.impulse_response;
+    const peak = irPick.result.peak_amplitude || 1;
+    // Show in dBc relative to peak. Sample down to ~120 points so
+    // SVG stays light.
+    const stride = Math.max(1, Math.floor(ir.length / 120));
+    const pts = [];
+    for (let i = 0; i < ir.length; i += stride) {
+      const v = ir[i];
+      const dbc = 20 * Math.log10(Math.max(v / peak, 1e-6));
+      pts.push([(i / 48), dbc]); // x in ms (48k -> 48 samples per ms)
+    }
+    svgXY("sd-plot-ir", pts, {
+      xLabel: "Retard (ms)",
+      yLabel: "|h| (dBc)",
+      yMin: -40,
+      yMax: 3,
+    });
+  }
+}
+
+function setupSounderTab() {
+  document
+    .getElementById("sounder-tx-emit")
+    ?.addEventListener("click", runSounderTxEmit);
+  document
+    .getElementById("sounder-rx-capture-toggle")
+    ?.addEventListener("click", runSounderRxCaptureToggle);
+  document
+    .getElementById("sounder-an-run")
+    ?.addEventListener("click", runSounderAnalyze);
+  // Advanced: regenerate the reference schedule manually (the
+  // analyse-side does it automatically when the field is blank, but
+  // power users may want to ferry the file or inspect it).
+  document
+    .getElementById("sounder-an-regen-ref")
+    ?.addEventListener("click", runSounderTxRender);
+  document
+    .getElementById("sd-collector-send")
+    ?.addEventListener("click", runSounderCollectorSend);
 }
 
 // ─────────────────────────────────────────── History tab
@@ -4865,6 +5760,25 @@ function setupKioskMode() {
   });
 }
 
+async function showAppVersion() {
+  const el = document.getElementById("app-version");
+  if (!el) return;
+  // Backend reads `tauri.conf.json` (single source of truth bumped on
+  // every build). `window.__TAURI__.app.getVersion` isn't reliably
+  // exposed by `withGlobalTauri` across Tauri versions, so we route
+  // through our own command.
+  try {
+    if (!window.__TAURI__ || !window.__TAURI__.core) return;
+    const v = await window.__TAURI__.core.invoke("get_app_version");
+    if (v) {
+      el.textContent = `v${v}`;
+      el.title = `Version de l'application : ${v}`;
+    }
+  } catch (err) {
+    console.error("get_app_version", err);
+  }
+}
+
 async function init() {
   setupKioskMode();
   setupSelectPicker();
@@ -4872,6 +5786,7 @@ async function init() {
   setupTabs();
   setupLightbox();
   setupTxTab();
+  showAppVersion();
   setupSettingsTab();
   setupOverlaysTab();
   setupCaptureSubmitPanel();
@@ -4880,6 +5795,7 @@ async function init() {
   await loadSdrBackends();
   applyOverlaysToUI();
   setupChannelTab();
+  setupSounderTab();
   await loadDevices();
   await loadSerialPorts();
   await loadSaveDir();

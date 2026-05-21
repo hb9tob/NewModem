@@ -232,6 +232,16 @@ body {
   font-size: 0.875rem;
   color: #9ccc65;
 }
+.app-version {
+  font-size: 0.75rem;
+  color: #7a7a7a;
+  font-family: monospace;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid #3a3a3a;
+  border-radius: 3px;
+  background: #1f1f1f;
+  white-space: nowrap;
+}
 .tab-bar {
   display: flex;
   gap: 0.25rem;
@@ -1237,17 +1247,6 @@ main {
 .channel-rx .channel-col-title {
   color: #ffb74d;
 }
-.channel-recommend-value {
-  font-size: 2.2rem;
-  font-family: ui-monospace, monospace;
-  color: #ffb74d;
-  text-align: center;
-  padding: 0.6rem 0;
-  letter-spacing: 0.04em;
-}
-.channel-rx-recommend {
-  background: rgba(0, 0, 0, 0.15);
-}
 .channel-form fieldset {
   border: 1px solid #3a3a3a;
   border-radius: 4px;
@@ -1398,6 +1397,316 @@ main {
 }
 .channel-future {
   opacity: 0.65;
+}
+
+/* ─────────── Sondeur (Canal tab) */
+.sounder-tx,
+.sounder-rx {
+  margin-top: 0.6rem;
+}
+.sounder-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  align-items: flex-end;
+  margin: 0.5rem 0;
+}
+.sounder-row label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.85rem;
+  color: #bcd;
+  gap: 0.2rem;
+  flex: 1 1 12ch;
+  min-width: 12ch;
+}
+.sounder-row input[type="text"],
+.sounder-row input[type="number"],
+.sounder-row select {
+  background: #1a2230;
+  color: #e8eef5;
+  border: 1px solid #3a4858;
+  border-radius: 3px;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.9rem;
+  min-width: 0;
+  /* Force dark theme over the WebView default — WebKit/Chromium on
+     Linux often picks system light colours for native <select> and
+     for <input list> dropdown arrows when not explicitly overridden. */
+  appearance: none;
+  -webkit-appearance: none;
+  color-scheme: dark;
+}
+.sounder-row input[type="text"]::placeholder {
+  color: #5d728c;
+}
+/* Native dropdown indicator for <input list> — give the input a
+   subtle chevron so the user knows there's a suggestion list. */
+.sounder-row input[list] {
+  background-image: linear-gradient(45deg, transparent 50%, #8aa3bd 50%),
+                    linear-gradient(135deg, #8aa3bd 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 9px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 1.5rem;
+}
+.sounder-row-actions {
+  align-items: center;
+  gap: 0.9rem;
+}
+.sounder-status {
+  font-size: 0.85rem;
+  color: #88a;
+}
+.sounder-status.ok {
+  color: #6ec07a;
+}
+.sounder-status.err {
+  color: #e57373;
+}
+.sounder-paths {
+  background: #131a24;
+  border: 1px solid #2a3344;
+  border-radius: 3px;
+  padding: 0.5rem 0.7rem;
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.sounder-paths code {
+  color: #b9d6ff;
+  word-break: break-all;
+}
+.sounder-results {
+  background: #131a24;
+  border: 1px solid #2a3344;
+  border-radius: 3px;
+  padding: 0.6rem 0.9rem;
+  margin-top: 0.4rem;
+}
+.sounder-results h4 {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.95rem;
+  color: #cfd8e3;
+}
+.sounder-derived {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+.sounder-derived th {
+  text-align: left;
+  font-weight: 400;
+  color: #9aa6b3;
+  padding: 0.2rem 0.5rem 0.2rem 0;
+  width: 14rem;
+}
+.sounder-derived td {
+  color: #e8eef5;
+  padding: 0.2rem 0;
+  font-variant-numeric: tabular-nums;
+}
+/* Recommendation block — big numeric attenuation the RX operator
+ * dictates to the TX operator on the air. Sits right above the
+ * verdict prose. The number wants to be reading-from-across-the-shack
+ * sized; the rest stays at body weight. */
+.sd-reco {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  margin: 0.4rem 0 0.3rem;
+  background: #1a2530;
+  border: 1px solid #354a5e;
+  border-left: 4px solid #4ea3ff;
+  border-radius: 4px;
+}
+.sd-reco-label {
+  color: #9aa6b3;
+  font-size: 0.95rem;
+}
+.sd-reco-value {
+  color: #f0f6ff;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Mono", monospace;
+  font-size: 2.4rem;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.sd-reco-unit {
+  color: #cfd8e3;
+  font-size: 1.1rem;
+}
+.sd-reco-hint {
+  margin: 0 0 0.6rem;
+  padding: 0 0.1rem;
+  color: #8aa3bd;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+/* Send-to-collector block placed under the verdict prose. */
+.sd-collector {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin: 0.4rem 0 0.6rem;
+  padding: 0.5rem 0.7rem;
+  background: #131a24;
+  border: 1px solid #2a3344;
+  border-radius: 4px;
+}
+.sd-collector button {
+  padding: 0.35rem 0.9rem;
+  font-size: 0.92rem;
+}
+.sd-collector-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #cfd8e3;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+.sd-collector .status {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #9aa6b3;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+.sd-collector .status.ok {
+  color: #7fe095;
+}
+.sd-collector .status.err {
+  color: #ff8a80;
+}
+
+/* Sounder verdict box — over-modulation warning / OK confirmation. */
+.sounder-verdict {
+  padding: 0.6rem 0.9rem;
+  margin: 0.5rem 0 0.8rem;
+  border-radius: 4px;
+  background: #1e2a36;
+  border: 1px solid #354a5e;
+  color: #c8d4df;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+.sounder-verdict.ok {
+  border-color: #4caf50;
+  background: #1d2d22;
+}
+.sounder-verdict.warn {
+  border-color: #ff9800;
+  background: #2d2418;
+  color: #ffd99a;
+}
+.sounder-advanced {
+  margin: 0.5rem 0;
+  padding: 0.3rem 0.7rem;
+  background: #14202b;
+  border-left: 2px solid #2a3a4c;
+  font-size: 0.9rem;
+}
+.sounder-advanced summary {
+  cursor: pointer;
+  color: #8aa3bd;
+  padding: 0.2rem 0;
+}
+.sounder-advanced summary:hover {
+  color: #c8d4df;
+}
+/* Sounder emit / capture-toggle buttons in recording state — same
+   visual cue as the legacy "⏺ capture brute" button so operators
+   recognise the active state instantly. */
+.sounder-emit-btn[disabled] {
+  background: #2a3a4c;
+  color: #6c8197;
+}
+#sounder-rx-capture-toggle.recording {
+  background: #b03030;
+  color: #fff;
+  border-color: #c84545;
+}
+/* Sounder plots — grid of SVG diagrams populated after analyse. */
+.sounder-plots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 0.6rem;
+  margin: 0.4rem 0 0.6rem;
+}
+.sounder-plot {
+  background: #0e1620;
+  border: 1px solid #2a3344;
+  border-radius: 3px;
+  padding: 0.4rem 0.5rem 0.5rem;
+}
+.sounder-plot-title {
+  font-size: 0.85rem;
+  color: #b9d6ff;
+  margin-bottom: 0.2rem;
+  font-weight: 500;
+}
+.sounder-plot-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.sounder-plot-svg .axis {
+  stroke: #4a5a70;
+  stroke-width: 0.7;
+  fill: none;
+}
+.sounder-plot-svg .grid {
+  stroke: #1f2a3a;
+  stroke-width: 0.5;
+  fill: none;
+}
+.sounder-plot-svg .label {
+  fill: #8aa3bd;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+}
+.sounder-plot-svg .axis-title {
+  fill: #c8d4df;
+  font-size: 9.5px;
+  font-family: ui-monospace, monospace;
+}
+.sounder-plot-svg .trace {
+  stroke: #4a9eff;
+  stroke-width: 1.4;
+  fill: none;
+}
+.sounder-plot-svg .trace-secondary {
+  stroke: #9e6df0;
+  stroke-width: 1.2;
+  fill: none;
+}
+.sounder-plot-svg .ref {
+  stroke: #4a5a70;
+  stroke-width: 0.7;
+  stroke-dasharray: 3 3;
+  fill: none;
+}
+.sounder-plot-svg .sweet {
+  stroke: #66bb6a;
+  stroke-width: 0.8;
+  stroke-dasharray: 2 2;
+  fill: none;
+}
+.sounder-plot-svg .sweet-label {
+  fill: #66bb6a;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+}
+.sounder-plot-svg .point {
+  fill: #4a9eff;
 }
 
 /* ─────────── Prompt post-capture brute (Phase D) */

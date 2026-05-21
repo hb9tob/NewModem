@@ -1088,9 +1088,11 @@ mod tests {
             "p1db {}",
             sig.derived.p1db_dbfs,
         );
-        // Sweet spot = P1dB − 3 dB ≈ -4 dBFS.
+        // Sweet spot = P1dB − 6 dB (changed from −3 dB in the
+        // sounder-collector-upload bundle so the operator stays well
+        // below compression on a long burst).
         assert!(
-            (sig.derived.sweet_spot_dbfs - (sig.derived.p1db_dbfs - 3.0)).abs()
+            (sig.derived.sweet_spot_dbfs - (sig.derived.p1db_dbfs - 6.0)).abs()
                 < 0.1,
             "sweet {} vs p1db {}",
             sig.derived.sweet_spot_dbfs,

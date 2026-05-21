@@ -83,6 +83,18 @@ struct CaptureSession {
     forced: bool,
 }
 
+/// Standalone sound-card → WAV capture used exclusively by the
+/// Sounder tab. Independent of [`CaptureSession`] (the modem
+/// rx_worker is intentionally stopped while sounding so the cpal/SDR
+/// device is free for raw capture; see Canal-tab tab-switch logic).
+struct SounderCapture {
+    capture: CaptureKind,
+    /// Drains the sample receiver into a 16-bit mono WAV. Returns
+    /// `(path, samples_written)` when the receiver hangs up (= the
+    /// capture handle is dropped on stop).
+    writer_thread: Option<std::thread::JoinHandle<(PathBuf, usize)>>,
+}
+
 struct AppState {
     session: Mutex<Option<CaptureSession>>,
     save_dir: Arc<Mutex<PathBuf>>,
@@ -94,6 +106,7 @@ struct AppState {
     tx_payload_path: Arc<Mutex<Option<PathBuf>>>,
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
+    sounder_capture: Mutex<Option<SounderCapture>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -716,6 +729,17 @@ async fn submit_capture(
     collector_client::submit(args).await
 }
 
+/// Upload a finished sounding run (the directory holding signature.json
+/// + metadata.json, and optionally capture.wav) to the Phase-D
+/// collector. Same HMAC contract as `submit_capture`, but reads its
+/// payload from disk rather than re-building it from an event log.
+#[tauri::command]
+async fn submit_sounding(
+    args: collector_client::SubmitSoundingArgs,
+) -> Result<collector_client::SubmitResult, String> {
+    collector_client::submit_sounding(args).await
+}
+
 #[derive(serde::Serialize)]
 struct CompressResult {
     preview_path: String,
@@ -1274,6 +1298,446 @@ fn set_save_dir(path: String, state: State<'_, AppState>) -> Result<(), String> 
     Ok(())
 }
 
+// `sounding_tx_render` builds the probe audio + schedule on TX side and
+// drops them under `<save_dir>/sounder/<id>/` so the operator can play
+// `probe.wav` through their soundcard. `sounding_analyze` consumes a
+// recorded capture WAV against the matching schedule and writes a
+// `signature.json` ready to feed back into `study/nbfm_channel_sim`.
+//
+// Pure file-IO wrappers around `modem_worker_base::sounder` — no Tauri
+// state involved beyond the configured save_dir; same DSP path the
+// CLI's `sounding-analyze` subcommand uses.
+
+#[derive(serde::Serialize)]
+struct SoundingTxResult {
+    /// Unique run id (`<unix>-<rand>`), also the subdirectory name
+    /// under `<save_dir>/sounder/`.
+    id: String,
+    /// Absolute path of `probe.wav` (48 kHz mono, 16-bit PCM).
+    probe_wav: String,
+    /// Absolute path of `schedule.json` (the contract the RX side
+    /// needs to run `sounding_analyze`).
+    schedule_json: String,
+    /// Total duration of `probe.wav` in seconds, so the GUI can show
+    /// "play, then wait N seconds".
+    duration_s: f64,
+}
+
+/// Render a probe schedule + WAV from a `SoundingRequest` and drop both
+/// under `<save_dir>/sounder/<id>/`. Front-end: TX operator picks
+/// probes, calls this, plays `probe.wav` through their soundcard while
+/// the RX side records.
+#[tauri::command]
+fn sounding_tx_render(
+    request: modem_worker_base::sounder::SoundingRequest,
+    state: State<'_, AppState>,
+) -> Result<SoundingTxResult, String> {
+    use modem_worker_base::sounder::build_probe_schedule;
+    let (audio, schedule) = build_probe_schedule(&request);
+
+    // Land everything under <save_dir>/sounder/<id>/.
+    let save_dir = state
+        .save_dir
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let id = format!(
+        "{}-{:04x}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        rand_u16(),
+    );
+    let run_dir = save_dir.join("sounder").join(&id);
+    std::fs::create_dir_all(&run_dir)
+        .map_err(|e| format!("create {}: {e}", run_dir.display()))?;
+
+    let probe_wav = run_dir.join("probe.wav");
+    let schedule_json = run_dir.join("schedule.json");
+
+    // Same 16-bit mono encoding the CLI uses.
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: modem_core_base::types::AUDIO_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&probe_wav, spec)
+        .map_err(|e| format!("create {}: {e}", probe_wav.display()))?;
+    for &s in &audio {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        w.write_sample(v)
+            .map_err(|e| format!("write sample: {e}"))?;
+    }
+    w.finalize()
+        .map_err(|e| format!("finalize {}: {e}", probe_wav.display()))?;
+
+    let sched_bytes = serde_json::to_vec_pretty(&schedule)
+        .map_err(|e| format!("serialize schedule: {e}"))?;
+    std::fs::write(&schedule_json, &sched_bytes)
+        .map_err(|e| format!("write {}: {e}", schedule_json.display()))?;
+
+    let duration_s =
+        audio.len() as f64 / modem_core_base::types::AUDIO_RATE as f64;
+    Ok(SoundingTxResult {
+        id,
+        probe_wav: probe_wav.to_string_lossy().into_owned(),
+        schedule_json: schedule_json.to_string_lossy().into_owned(),
+        duration_s,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct SoundingTxEmitArgs {
+    request: modem_worker_base::sounder::SoundingRequest,
+    tx_device: String,
+}
+
+#[derive(serde::Serialize)]
+struct SoundingTxEmitResult {
+    /// Total airtime of the probe sequence in seconds — the front-end
+    /// uses this to enable a countdown / disable the button.
+    duration_s: f64,
+}
+
+/// Emit a probe sequence directly through `tx_device` — no probe.wav
+/// on disk, no schedule.json shown to the user. The RX side will
+/// regenerate the same schedule locally (deterministic generation,
+/// proven by the md5-matches-across-runs property of
+/// `build_probe_schedule`).
+///
+/// PTT discipline: if a serial-port PTT is configured (Paramètres
+/// tab), it is engaged before opening the audio stream and released
+/// `PTT_GUARD_MS` after the last sample plays — same pattern as
+/// `tx_runtime::run_playback`. With PTT disabled the radio is assumed
+/// to be VOX-keyed; the 5 s @ 1750 Hz repeater-opening preamble at
+/// the start of the probe gives VOX plenty of time to engage.
+#[tauri::command]
+fn sounding_tx_emit(
+    args: SoundingTxEmitArgs,
+    state: State<'_, AppState>,
+) -> Result<SoundingTxEmitResult, String> {
+    use modem_worker_base::sounder::build_probe_schedule;
+    if args.tx_device.trim().is_empty() {
+        return Err("Choisir un device de sortie audio".into());
+    }
+    let (audio, _schedule) = build_probe_schedule(&args.request);
+    let duration_s =
+        audio.len() as f64 / modem_core_base::types::AUDIO_RATE as f64;
+
+    let cfg = settings::load();
+    let sink = resolve_tx_sink(&args.tx_device, &cfg)?;
+    let device = args.tx_device.clone();
+    let ptt_slot = state.ptt.clone();
+    // Run the playback on a dedicated thread — the PlaybackHandle wraps
+    // a cpal `Stream` whose underlying object is `Box<dyn Any>` (not
+    // marked Send), so we can't move it across threads after creation.
+    // Instead, we build it ON the worker thread; the Arc<dyn
+    // SampleSink> + the audio Vec are both Send.
+    std::thread::spawn(move || {
+        let ptt_engaged = engage_ptt_sounder(&ptt_slot);
+        if ptt_engaged {
+            std::thread::sleep(std::time::Duration::from_millis(
+                ptt::PTT_GUARD_MS,
+            ));
+        }
+        let handle = match sink.play_buffer(
+            &device,
+            modem_core_base::types::AUDIO_RATE,
+            audio,
+        ) {
+            Ok(h) => h,
+            Err(_) => {
+                if ptt_engaged {
+                    release_ptt_sounder(&ptt_slot);
+                }
+                return;
+            }
+        };
+        let mut consecutive_done = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if handle.is_done() {
+                consecutive_done += 1;
+                if consecutive_done >= 5 {
+                    break;
+                }
+            }
+        }
+        drop(handle);
+        if ptt_engaged {
+            std::thread::sleep(std::time::Duration::from_millis(
+                ptt::PTT_GUARD_MS,
+            ));
+            release_ptt_sounder(&ptt_slot);
+        }
+    });
+
+    Ok(SoundingTxEmitResult { duration_s })
+}
+
+/// Mirror of `tx_runtime::ptt_engage` — kept private to that module,
+/// so we re-implement the 4-line helper here rather than make it `pub`
+/// just for the sounder. Returns `true` iff a controller was present
+/// AND `set_tx` succeeded.
+fn engage_ptt_sounder(slot: &SharedPtt) -> bool {
+    let mut g = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(ctrl) = g.as_mut() else { return false };
+    match ctrl.set_tx() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[ptt] sounder set_tx: {e}");
+            false
+        }
+    }
+}
+
+fn release_ptt_sounder(slot: &SharedPtt) {
+    let mut g = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(ctrl) = g.as_mut() {
+        if let Err(e) = ctrl.set_rx() {
+            eprintln!("[ptt] sounder set_rx: {e}");
+        }
+    }
+}
+
+/// Open `device_name` (same composite-name form as `start_capture`:
+/// `<backend>:<id>` for SDRs, plain cpal name otherwise) and dump
+/// every received sample to a 48 kHz / 16-bit / mono WAV under the
+/// configured save_dir. Returns the absolute path of the WAV.
+///
+/// This is **independent of the rx_worker / modem decoding pipeline**:
+/// the Sounder tab intentionally stops the worker before sounding so
+/// the cpal/SDR device is free for raw capture.
+#[tauri::command]
+fn sounding_rx_start_capture(
+    device_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut guard = state.sounder_capture.lock().map_err(|e| e.to_string())?;
+    if guard.is_some() {
+        return Err("Capture sondeur déjà active".into());
+    }
+    if state.session.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return Err(
+            "Arrêter d'abord la réception (▶) avant d'utiliser le sondeur — \
+             le device audio doit être libre"
+                .into(),
+        );
+    }
+    if device_name.trim().is_empty() {
+        return Err("Sélectionner une carte RX dans Paramètres".into());
+    }
+
+    let cfg = settings::load();
+    let (capture, samples_rx) = if let Some((backend, device_id)) =
+        sdr_registry::parse_composite_name(&device_name)
+    {
+        let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
+        let descriptor = DeviceDescriptor::new(
+            backend.id(),
+            device_id,
+            format!("{}:{device_id}", backend.id()),
+        );
+        let mut device = backend
+            .open(&descriptor, &sdr_cfg)
+            .map_err(|e| format!("{}: {e}", backend.id()))?;
+        let (cap_handle, rx) = device
+            .start_rx()
+            .map_err(|e| format!("{}: {e}", backend.id()))?;
+        (CaptureKind::Sdr(device, cap_handle), rx)
+    } else {
+        let (h, rx) = cpal_capture::start(&device_name)?;
+        (CaptureKind::Cpal(h), rx)
+    };
+
+    let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("capture-{ts}.wav"));
+    let path_str = path.to_string_lossy().into_owned();
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: modem_core_base::types::AUDIO_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&path, spec)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+
+    let path_thread = path.clone();
+    let writer_thread = std::thread::spawn(move || {
+        let mut total = 0_usize;
+        while let Ok(chunk) = samples_rx.recv() {
+            for &s in &chunk {
+                let v = (s.clamp(-1.0, 1.0) * 32_767.0) as i16;
+                let _ = w.write_sample(v);
+            }
+            total += chunk.len();
+        }
+        let _ = w.finalize();
+        (path_thread, total)
+    });
+
+    *guard = Some(SounderCapture {
+        capture,
+        writer_thread: Some(writer_thread),
+    });
+    Ok(path_str)
+}
+
+/// Stop the standalone sounder capture: drops the [`CaptureKind`]
+/// (which closes the cpal/SDR backend → the writer thread's recv()
+/// errors out → it finalises the WAV and exits), then joins the
+/// writer thread and returns the final path + sample count.
+#[tauri::command]
+fn sounding_rx_stop_capture(
+    state: State<'_, AppState>,
+) -> Result<RawRecordingStatus, String> {
+    let cap = {
+        let mut guard = state
+            .sounder_capture
+            .lock()
+            .map_err(|e| e.to_string())?;
+        guard
+            .take()
+            .ok_or_else(|| "Aucune capture sondeur active".to_string())?
+    };
+    let SounderCapture {
+        capture,
+        writer_thread,
+    } = cap;
+    capture.stop();
+    let (path, samples) = if let Some(t) = writer_thread {
+        t.join()
+            .map_err(|_| "Writer thread panicked".to_string())?
+    } else {
+        return Err("Pas de writer thread".into());
+    };
+    Ok(RawRecordingStatus {
+        path: path.to_string_lossy().into_owned(),
+        samples: samples as u64,
+        duration_sec: samples as f64
+            / modem_core_base::types::AUDIO_RATE as f64,
+    })
+}
+
+/// Run the sounder analyser on a recorded capture WAV. Writes
+/// `signature.json` next to the capture and returns the signature so
+/// the GUI can render the derived parameters directly.
+#[tauri::command]
+fn sounding_analyze(
+    capture_wav: String,
+    schedule_json: String,
+    family: String,
+    metadata: modem_worker_base::sounder::SoundingMetadata,
+    sync_threshold: f32,
+) -> Result<modem_worker_base::sounder::ChannelSignature, String> {
+    use modem_worker_base::sounder::{
+        analyze_capture, ChannelFamily, ProbeSchedule,
+    };
+    let capture_path = PathBuf::from(&capture_wav);
+    let schedule_path = PathBuf::from(&schedule_json);
+
+    let sched_bytes = std::fs::read(&schedule_path)
+        .map_err(|e| format!("read {}: {e}", schedule_path.display()))?;
+    let sched: ProbeSchedule = serde_json::from_slice(&sched_bytes)
+        .map_err(|e| format!("parse {}: {e}", schedule_path.display()))?;
+    if sched.sample_rate != modem_core_base::types::AUDIO_RATE {
+        return Err(format!(
+            "schedule sample_rate {} != GUI AUDIO_RATE {}",
+            sched.sample_rate,
+            modem_core_base::types::AUDIO_RATE,
+        ));
+    }
+
+    let mut reader = hound::WavReader::open(&capture_path)
+        .map_err(|e| format!("open {}: {e}", capture_path.display()))?;
+    let spec = reader.spec();
+    if spec.sample_rate != modem_core_base::types::AUDIO_RATE {
+        return Err(format!(
+            "capture sample_rate {} != {} Hz",
+            spec.sample_rate,
+            modem_core_base::types::AUDIO_RATE,
+        ));
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let scale = ((1u32 << (spec.bits_per_sample - 1)) - 1) as f32;
+            reader
+                .samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|s| s as f32 / scale)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .filter_map(Result::ok)
+            .collect(),
+    };
+    if samples.is_empty() {
+        return Err(format!("capture {} is empty", capture_path.display()));
+    }
+    let mono: Vec<f32> = if spec.channels == 1 {
+        samples
+    } else {
+        samples
+            .chunks(spec.channels as usize)
+            .map(|c| c[0])
+            .collect()
+    };
+
+    let fam = match family.to_lowercase().as_str() {
+        "fm" => ChannelFamily::Fm,
+        "qo100" | "qo-100" => ChannelFamily::Qo100,
+        "ssb_hf" | "ssb-hf" | "ssbhf" => ChannelFamily::SsbHf,
+        other => {
+            return Err(format!(
+                "unknown family '{other}' (expected fm | qo100 | ssb_hf)"
+            ));
+        }
+    };
+
+    let sig = analyze_capture(&mono, &sched, fam, metadata, sync_threshold)
+        .map_err(|e| format!("analyse: {e}"))?;
+
+    let sig_path = capture_path.with_file_name(
+        capture_path
+            .file_stem()
+            .map(|s| format!("{}.signature.json", s.to_string_lossy()))
+            .unwrap_or_else(|| "signature.json".to_string()),
+    );
+    let sig_bytes = serde_json::to_vec_pretty(&sig)
+        .map_err(|e| format!("serialize signature: {e}"))?;
+    std::fs::write(&sig_path, &sig_bytes)
+        .map_err(|e| format!("write {}: {e}", sig_path.display()))?;
+
+    Ok(sig)
+}
+
+/// Tiny 16-bit PRNG for the run-id suffix. Avoids pulling in `rand`
+/// just to disambiguate two TX renders inside the same second.
+fn rand_u16() -> u16 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let probe: u16 = 0xa1b2;
+    let addr = &probe as *const _ as usize as u32;
+    (nanos.wrapping_mul(2654435761) ^ addr ^ probe as u32) as u16
+}
+
 /// Adapter that bridges `modem_worker::EventSink` onto a Tauri `AppHandle`,
 /// so workers extracted into `modem-worker` can keep their existing event
 /// names + payload shapes without depending on Tauri.
@@ -1359,6 +1823,7 @@ fn main() {
                 tx_payload_path: Arc::new(Mutex::new(None)),
                 tx_handle: Mutex::new(None),
                 ptt,
+                sounder_capture: Mutex::new(None),
             });
             // Auto-kiosk on tiny touchscreens (e.g. Pi 7" 800x480) or
             // when `NBFM_KIOSK=1` is set in the environment. Both paths
@@ -1442,6 +1907,12 @@ fn main() {
             stop_raw_recording,
             is_raw_recording,
             submit_capture,
+            submit_sounding,
+            sounding_tx_render,
+            sounding_tx_emit,
+            sounding_rx_start_capture,
+            sounding_rx_stop_capture,
+            sounding_analyze,
             set_tx_source,
             set_tx_source_from_path,
             clear_tx_source,
