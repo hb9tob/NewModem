@@ -443,9 +443,9 @@ pub fn estimate_drift_from_sof_positions(
     // Outlier tolerance: position must land within ±10 % of a cycle
     // boundary. Loose enough to absorb a ±1 % drift accumulating
     // across many cycles, tight enough to reject false-positive
-    // PLS-Golay-passes-by-luck or partial cycles. Drops to 30 % for
-    // the longest-running burst (drift of 300 ppm × 20 cycles ≈ 33
-    // sym = 0.6 % of cycle, well inside 10 %).
+    // PLS-Golay-passes-by-luck or partial cycles. Even at 300 ppm
+    // over 20 cycles the drift accumulates only ~0.6 % of a cycle,
+    // so a fixed 10 % bound covers the full realistic range.
     let tolerance = cycle * 0.10;
     let mut sum_xy = 0.0_f64;
     let mut sum_xx = 0.0_f64;

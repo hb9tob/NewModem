@@ -382,14 +382,21 @@ pub struct Rx2xSession {
     /// soft-reset (rewind-before-SOF) path.
     n_drift_refines: u8,
 
-    /// Pending smooth drift refinement, set by the LS estimator when a
-    /// post-bootstrap delta in [`apply_threshold`, `SMALL_DRIFT_REFINE_PPM`)
-    /// is detected. Consumed at the next inter-cycle moment (state ==
-    /// Idle at the top of the chunk) by `apply_pending_drift_refine`,
-    /// which rewinds `streaming_dsp` so the **next** PLHEADER is
-    /// resampled at the new ratio. Apply-on-chunk-boundary would land
-    /// mid-CW and break the turbo-EM atomicity (per the architecture
-    /// constraint validated 2026-05-20).
+    /// **DEAD as of commit 1f73202 (chunk-bit-equivalence fix,
+    /// 2026-05-21).** The legacy deferred-apply path stashed the new
+    /// drift here and let `apply_pending_drift_refine` rewind
+    /// `streaming_dsp` at the next FSM Idle. Chunk-bit-equivalence work
+    /// showed that path made the FSM's converged-cycle count
+    /// chunk-size-dependent (re-fires every chunk, each one clearing
+    /// the SOF count). The smooth_refine branch in
+    /// `estimate_drift_from_raw` is now **forward-only** — it writes
+    /// `cached_drift_ppm` directly and the streaming polyphase picks up
+    /// the new ratio at its next emit (sub-sample boundary
+    /// discontinuity bounded by `SMALL_DRIFT_REFINE_PPM = 2.0` ppm,
+    /// absorbed by RRC band-pass + FFE). This field is therefore
+    /// permanently `None`; `apply_pending_drift_refine` exits early
+    /// every call. Kept for now to leave a wiring point if a future
+    /// large-delta refinement needs the deferred path back.
     pending_drift_refine_ppm: Option<f64>,
 
     /// Consecutive CW decode failures inside the **current** cycle.
@@ -861,11 +868,14 @@ impl Rx2xSession {
     ///      with `|s2 − s1 − cycle_period_sym| ≤ 10 %` (geometric),
     ///   2. `decode_plheader_at(symbols[s1..])` returns Some (Golay+CRC
     ///      payload valid — cryptographic).
-    /// On commit it sets `cached_drift_ppm = ((s2 − s1) / cycle − 1) ×
-    /// 1e6`, flips `bootstrap_committed` + `drift_locked` to true, and
-    /// leaves `audio_buffer` untouched so the steady-state pipeline can
-    /// re-derive `sym_buffer` and let the FSM rediscover the SOF at s1
-    /// in the drift-corrected stream.
+    /// On commit it sets `cached_drift_ppm = 0.0` (the 2-SOF integer-sym
+    /// spacing only resolves ~180 ppm — useless past the first cycle),
+    /// flips `bootstrap_committed = true`, and leaves **`drift_locked`
+    /// FALSE** (it is set later by the first-commit branch of
+    /// `estimate_drift_from_raw` once the audio-rate parabolic LS has a
+    /// real ppm value). `audio_buffer` is left untouched so the
+    /// steady-state pipeline can re-derive `sym_buffer` and let the FSM
+    /// rediscover the SOF at s1.
     ///
     /// On failure (gate didn't fire, no peaks, peaks at wrong distance,
     /// or Golay didn't validate on any peak) it drops audio up to the
@@ -1248,46 +1258,30 @@ impl Rx2xSession {
     /// re-acquisition reach when transitioning Locked → Idle between
     /// cycles. The kept-but-unprocessed prefix stays in `audio_buffer`
     /// for the future backward path to consume.
-    /// Consume a pending smooth drift refinement at an inter-cycle
-    /// moment, rewinding `streaming_dsp` so the next PLHEADER is
-    /// resampled at the new ratio.
     ///
-    /// **When this fires.** Only when the FSM is `Idle` at the top of
-    /// a chunk. `Idle` after the first cycle means a previous cycle
-    /// finalised (line 1801 — `drive_locked` sets state Idle after
-    /// `cycles += 1`) and the next SOF probe hasn't fired yet. So the
-    /// audio for the next cycle's PLHEADER is in `audio_buffer` but
-    /// hasn't been resampled yet (we throw away the current
-    /// streaming_dsp output and rebuild at new ratio).
+    /// **DEAD PATH (commit 1f73202, 2026-05-21).** This function is
+    /// called once per chunk from `process_audio_chunk`, but
+    /// `pending_drift_refine_ppm` is never set to `Some(_)` anywhere in
+    /// the current code — see that field's doc for the rationale. The
+    /// function exits at the `None => return` arm on every call.
     ///
-    /// **What gets preserved.**
-    /// - `cw_bytes` (decoded CW payloads — RaptorQ assembly state).
-    /// - `app_header`, `session_id`, `k_source`, `n_repair`,
-    ///   `pls_anchors` (session metadata learned pre-refine).
-    /// - `result.data_cws_total/converged/cw_bytes` (totals stay
-    ///   coherent — `drive_locked` already skips already-known ESIs
-    ///   via `esi_known_before`).
-    /// - `audio_buffer`, `audio_drained_samples` (raw source-of-truth
-    ///   for the re-resample).
-    /// - `n_drift_resets`, `drift_locked` (first-commit lock holds).
+    /// The legacy behaviour (rewind streaming_dsp at next Idle to apply
+    /// the new ratio) is kept here for reference because it documents
+    /// the invariants that **would** need to hold if the deferred path
+    /// is ever re-armed (e.g. for a future large-delta refinement path
+    /// that can't be forward-only):
     ///
-    /// **What gets rebuilt.**
-    /// - `streaming_dsp` (fresh instance — resampler / downmix / MF /
-    ///   decimation state all start at zero, re-process audio_buffer
-    ///   at new ratio).
-    /// - `sym_buffer`, `buf_start_abs`, `equalized_up_to_abs` (drop
-    ///   the old-ratio symbol stream; refresh_symbols rebuilds from
-    ///   streaming).
-    /// - `phase_tracker` reset (its [φ, ω] state references absolute
-    ///   TX-time positions that just shifted under the new mapping).
-    /// - `ffe_taps = None` (trained at old ratio; per-cycle FFE
-    ///   training in `equalize_symbols_per_cycle_from` retrains on
-    ///   the next PLHEADER's references).
-    /// - `drift_refined_sofs` cleared (the `sym_abs` field is now
-    ///   stale; the LS will rebuild from new SOFs as they validate).
-    ///
-    /// **Counter contract.** `n_drift_refines` increments by 1 per
-    /// successful apply. Capped at `RX2X_MAX_DRIFT_REFINES`.
+    /// - Preserved : `cw_bytes`, `app_header`, `session_id`,
+    ///   `k_source`, `n_repair`, `pls_anchors`, `result` counters
+    ///   (via `esi_known_before` rollback in `drive_locked`),
+    ///   `audio_buffer`, `audio_drained_samples`, `n_drift_resets`,
+    ///   `drift_locked`.
+    /// - Rebuilt : `streaming_dsp` (fresh), `sym_buffer`,
+    ///   `buf_start_abs`, `equalized_up_to_abs`, `phase_tracker`,
+    ///   `ffe_taps = None`, `streaming_ffe.reset`, `drift_refined_sofs`
+    ///   (stale `sym_abs`).
+    /// - Counter : `n_drift_refines += 1`, capped at
+    ///   `RX2X_MAX_DRIFT_REFINES`.
     fn apply_pending_drift_refine(&mut self) {
         let new_drift = match self.pending_drift_refine_ppm {
             Some(v) => v,
@@ -2921,22 +2915,18 @@ impl Rx2xSession {
             // [φ, ω] state. The next PLHEADER will re-anchor it
             // quickly via its strong pilot obs.
             self.phase_tracker.reset();
-            // **KEEP** drift_refined_sofs across the rewind. The
-            // `audio_abs_refined` values are physical RX-time absolute
-            // positions of the SOFs in the captured audio — invariant
-            // under any drift correction we choose to apply (only the
-            // symbol-grid alignment derived from them changes). Clearing
-            // them on each rewind starves the LS back to 2 points,
-            // causing the estimate to oscillate by ±50 ppm and the
-            // apply path to re-fire indefinitely (empirical 2026-05-18
-            // OTA 2: 6 rewinds, sofs stuck at 2 every time, drift
-            // bouncing through 250 ppm range). Carrying the SOFs across
-            // rewinds lets the LS converge as cycles accumulate.
-            //
-            // The drift_scan_cursor restarts at the new sym_buffer
-            // frontier so the next FSM scan picks up post-rewind SOFs;
-            // already-refined pre-rewind SOFs stay in the Vec and
-            // contribute to the LS as a longer baseline.
+            // `drift_refined_sofs` was cleared a few lines above (right
+            // after the streaming_dsp rebuild). With
+            // `RX2X_MAX_DRIFT_RESETS = 1` the first_commit branch fires
+            // at most once per session, so the LS-oscillation failure
+            // mode that motivated "carry SOFs across rewinds" (2026-05-
+            // 18 OTA 2 : 6 rewinds, sofs stuck at 2 every time, drift
+            // bouncing 250 ppm) can no longer happen — there is no
+            // second rewind. After commit, fine refinement is handled
+            // by the forward-only `smooth_refine` branch (no rewind,
+            // no clear). The `drift_scan_cursor` restart below lets the
+            // next FSM scan pick up post-commit SOFs from the new
+            // sym_buffer frontier.
             self.drift_scan_cursor_sym = self.streaming.sym_buffer_start_abs();
             // Mirror the now-empty streaming sym_buffer into the
             // session-owned vec + advance buf_start_abs so subsequent
