@@ -552,6 +552,7 @@ let currentSettings = {
   tx_preemphasis_enabled: false,
   tx_save_wav: false,
   rx_deemphasis_enabled: false,
+  rx_allow_legacy_grid: true,
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
@@ -1458,11 +1459,11 @@ async function loadSettings() {
   } catch (err) {
     console.error("get_settings", err);
     currentSettings = {
-      callsign: "", locator: "", rx_device: "", tx_device: "",
+      callsign: "", rx_device: "", tx_device: "",
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -1474,8 +1475,6 @@ async function loadSettings() {
   ensureOverlaySlots();
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
-  const locInit = document.getElementById("locator-input");
-  if (locInit) locInit.value = currentSettings.locator || "";
   // Fetch profile list from modem-core BEFORE any code that touches the
   // tx-mode / rx-forced-profile selects (they're empty in index.html).
   await loadModemProfiles();
@@ -1492,6 +1491,8 @@ async function loadSettings() {
   if (saveWav) saveWav.checked = !!currentSettings.tx_save_wav;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
+  const grid = document.getElementById("rx-allow-legacy-grid");
+  if (grid) grid.checked = !!currentSettings.rx_allow_legacy_grid;
   const fdx = document.getElementById("full-duplex-enabled");
   if (fdx) fdx.checked = !!currentSettings.full_duplex_enabled;
 
@@ -1758,8 +1759,6 @@ async function persistSettings() {
   const colUrl = document.getElementById("collector-url");
   const histMax = document.getElementById("tx-history-max-input");
   currentSettings.callsign = (call && call.value || "").trim().toUpperCase();
-  const loc = document.getElementById("locator-input");
-  if (loc) currentSettings.locator = (loc.value || "").trim();
   currentSettings.rx_device = rxSel ? rxSel.value || "" : "";
   currentSettings.tx_device = txSel ? txSel.value || "" : "";
   if (colUrl) currentSettings.collector_url = (colUrl.value || "").trim();
@@ -1773,6 +1772,8 @@ async function persistSettings() {
   if (saveWav) currentSettings.tx_save_wav = !!saveWav.checked;
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
+  const grid = document.getElementById("rx-allow-legacy-grid");
+  if (grid) currentSettings.rx_allow_legacy_grid = !!grid.checked;
 
   // SDR-specific config is mutated directly on
   // `currentSettings.sdr_settings.backends[id].config` by the
@@ -1789,7 +1790,6 @@ async function persistSettings() {
 
 function setupSettingsTab() {
   const call = document.getElementById("callsign-input");
-  const loc = document.getElementById("locator-input");
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
   if (call) {
@@ -1799,13 +1799,6 @@ function setupSettingsTab() {
     };
     call.addEventListener("change", onCallsignChange);
     call.addEventListener("blur", onCallsignChange);
-  }
-  if (loc) {
-    // The locator is informational only — persist on blur/change like
-    // the callsign so it round-trips into the sounder metadata.
-    const onLocChange = () => { persistSettings(); };
-    loc.addEventListener("change", onLocChange);
-    loc.addEventListener("blur", onLocChange);
   }
   if (rxSel) {
     rxSel.addEventListener("change", async () => {
@@ -2666,39 +2659,17 @@ function updateV2Progress(payload) {
   const bitmap = bm
     ? new Uint8Array(bm)
     : new Uint8Array(Math.ceil((payload.blocks_expected || 0) / 8));
-  // Prefer the honest **data-scatter** σ² (hard-decoded DATA symbol
-  // residuals, see `RxResult2x::sigma2_data_scatter` in Rust). Falls
-  // back to `sigma2_data` (pilot-residual) for old/2x20 payloads. The
-  // pilot σ² is biased low because the Pass 2 estimators fit the pilots
-  // themselves — the data scatter sees ICI, intra-CW phase noise, and
-  // AM-AM/AM-PM the pilot fit absorbs. Pair with `es_data_scatter` so
-  // the SNR is `10·log10(Es/σ²)`, not the legacy `−10·log10(σ²)` (which
-  // implicitly assumes Es = 1).
-  const scatterN = payload.data_scatter_n || 0;
-  const sigmaScatter = scatterN > 0
-    && Number.isFinite(payload.sigma2_data_scatter)
-    && payload.sigma2_data_scatter > 0
-    ? payload.sigma2_data_scatter
-    : null;
-  const esScatter = scatterN > 0
-    && Number.isFinite(payload.es_data_scatter)
-    && payload.es_data_scatter > 0
-    ? payload.es_data_scatter
-    : null;
-  const sigmaInst = sigmaScatter != null
-    ? sigmaScatter
-    : (Number.isFinite(payload.sigma2_data)
-      ? payload.sigma2_data
-      : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null));
+  // Prefer `sigma2_data` (frame-only, hard-decision residuals) when the
+  // worker provides it. Fall back to `sigma2` (pilot-residual) for
+  // older payloads so a partial rebuild doesn't blank the indicator.
+  const sigmaInst = Number.isFinite(payload.sigma2_data)
+    ? payload.sigma2_data
+    : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null);
   lastProgress = {
     bitmap,
     expected: payload.blocks_expected || 0,
     converged: payload.blocks_converged || 0,
     sigma2: sigmaInst,
-    // `esScatter != null` ⇒ honest data-scatter mode; the SNR readout
-    // uses `10·log10(es/σ²)`. Null ⇒ legacy fallback with implicit Es=1.
-    esScatter,
-    scatterN,
   };
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
@@ -2713,18 +2684,11 @@ function updateV2Progress(payload) {
   const sigmaStr = lastProgress.sigma2 != null
     ? lastProgress.sigma2.toFixed(3).padStart(6, " ")
     : "     ?";
-  // SNR readout uses the data-scatter Es/σ² ratio when the worker
-  // surfaced it; falls back to −10·log10(σ²) for legacy payloads.
-  const snrStr = lastProgress.sigma2 != null && lastProgress.sigma2 > 0
-    ? (lastProgress.esScatter != null && lastProgress.esScatter > 0
-      ? `${(10 * Math.log10(lastProgress.esScatter / lastProgress.sigma2)).toFixed(1)}dB`
-      : `${(-10 * Math.log10(lastProgress.sigma2)).toFixed(1)}dB`)
-    : "  ?dB";
   const mini = document.getElementById("v2-progress-text");
   if (mini) {
     const c = String(lastProgress.converged).padStart(3, " ");
     const e = String(lastProgress.expected).padStart(3, " ");
-    mini.textContent = `${c}/${e} σ²=${sigmaStr} SNR=${snrStr}`;
+    mini.textContent = `${c}/${e} σ²=${sigmaStr}`;
   }
   drawProgressBlocks();
   drawConstellation();
@@ -3002,18 +2966,12 @@ function drawPilotPhase() {
   }
 
   // Header overlay : range, segments count, σ² (if available), implied SNR.
-  // `esScatter != null` ⇒ data-scatter mode, SNR = 10·log10(Es/σ²).
-  // `esScatter == null` ⇒ legacy pilot σ² with implicit Es = 1.
   const rangeMrad = (yRange * 1000).toFixed(0);
   const sigma2 = lastProgress.sigma2;
-  const es = lastProgress.esScatter;
   let header = `±${(rangeMrad / 2).toFixed(0)} mrad · ${segments.length} seg`;
   if (sigma2 != null && sigma2 > 0) {
-    const snrDb = es != null && es > 0
-      ? (10 * Math.log10(es / sigma2)).toFixed(1)
-      : (-10 * Math.log10(sigma2)).toFixed(1);
-    const tag = es != null ? "data" : "pilot";
-    header += ` · σ²(${tag})=${sigma2.toFixed(3)} (${snrDb} dB)`;
+    const snrDb = (-10 * Math.log10(sigma2)).toFixed(1);
+    header += ` · σ²=${sigma2.toFixed(3)} (${snrDb} dB)`;
   }
   ctx.fillStyle = "rgba(0,0,0,0.55)";
   ctx.fillRect(plotX0, 0, plotW, 22 * dpr);
@@ -3035,6 +2993,10 @@ function wireEvents() {
     "file_complete",
     "session_end",
     "error",
+    // Per-scan DSP breakdown: profile + ppm + per-segment sigma². One
+    // entry per tick with decoded segments. Logged in the Info tab via
+    // the generic logEvent path (JSON dump under the event name).
+    "sf_detail",
   ];
   for (const name of names) {
     listen(name, (event) => {
@@ -3060,6 +3022,87 @@ function wireEvents() {
   });
   listen("rx_realtime", (event) => {
     noteRxRealtime(event.payload);
+  });
+
+  // 0.10.43 : worker-requested capture restart. The worker emits this
+  // whenever it transitions back to Idle (preamble-absence, EOT,
+  // brickwall) -- in-process resets proved insufficient to re-arm RX
+  // on a fresh signal. We mirror what a manual stop/start does : the
+  // backend `restart_capture` command drops the cpal/SDR stream +
+  // worker thread, and re-spawns with the same device + profile +
+  // forced the operator originally picked.
+  //
+  // 0.10.45 : added auto_stop / auto_start `logEvent` markers around
+  // the invoke so the operator can SEE in the GUI event log whether
+  // the restart cycle actually ran (or where it got stuck). Manual
+  // stop/start already logs "stop" + "start" entries from the
+  // button handlers ; this gives the auto path the same visibility.
+  listen("worker_requests_restart", async (event) => {
+    const reason = (event.payload && event.payload.reason) || "?";
+    logEvent("worker_requests_restart", { reason });
+    logEvent("auto_stop", { reason });
+    try {
+      // 0.10.46 fix : `invoke` is not in scope inside wireEvents()
+      // listener closures by default — must be destructured from
+      // `window.__TAURI__.core` like every other usage in this file
+      // (see e.g. main.js:133, 183, 711). Without this destructure
+      // the listener threw `ReferenceError: Can't find variable:
+      // invoke` and `worker_requests_restart_error` fired every
+      // single Idle transition since 0.10.43, meaning the auto
+      // stop/start NEVER actually ran.
+      const { invoke } = window.__TAURI__.core;
+      await invoke("restart_capture");
+      logEvent("auto_start", { reason });
+    } catch (err) {
+      logEvent("worker_requests_restart_error", { reason, error: String(err) });
+    }
+  });
+
+  // 0.10.38 : worker capture-state changes. Drives the status-bar chip
+  // (`#v2-state-chip`) so the chip reflects the actual modem state
+  // instead of staying permanently "idle". Also surfaced in the Info
+  // event log so the operator sees the timestamped Idle ↔ Streaming
+  // transitions alongside the rest of the per-tick telemetry.
+  listen("modem_state", (event) => {
+    const p = event.payload || {};
+    updateV2State(p.active ? "streaming" : "idle");
+    logEvent("modem_state", {
+      active: p.active,
+      profile: p.profile,
+      t_ms: p.t_ms,
+    });
+  });
+
+  // 0.10.38 : ±15 ppm safety-grid invocation. Emitted by the worker
+  // every tick where Gardner + fast-path both failed and the grid
+  // fired (lowpower fallback OR user-toggled high-power). Logs entry /
+  // exit timestamps + duration + ppm estimate + quota counter so the
+  // operator can audit grid usage from the GUI without tail-ing
+  // /tmp/nbfm-worker.log.
+  listen("grid_used", (event) => {
+    const p = event.payload || {};
+    const fmtTime = (ms) => {
+      if (!ms) return "?";
+      const d = new Date(ms);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      const fff = String(d.getMilliseconds()).padStart(3, "0");
+      return `${hh}:${mm}:${ss}.${fff}`;
+    };
+    const ppm =
+      p.drift_ppm === null || p.drift_ppm === undefined
+        ? "?"
+        : `${p.drift_ppm.toFixed(2)} ppm`;
+    logEvent("grid_used", {
+      in: fmtTime(p.t_start_ms),
+      out: fmtTime(p.t_end_ms),
+      duration_ms: p.duration_ms,
+      n_passes: p.n_passes,
+      ppm,
+      fallback: p.fallback,
+      quota: `${p.recent}/${p.quota}`,
+    });
   });
 
   listen("tx_plan", (ev) => {
@@ -4582,24 +4625,10 @@ function setupChannelTab() {
     });
   }
   if (applyBtn) {
-    applyBtn.addEventListener("click", async () => {
+    applyBtn.addEventListener("click", () => {
       const vals = cascadeFeedback.map(r => r.db);
       const m = median(vals);
-      if (m === null) return;
-      // Round to the nearest integer dB: that's what the RX operator
-      // dictates on the air, and what the TX operator types back here.
-      // Also avoids float-precision quirks (e.g. -12.499999 vs -12.5)
-      // that made the value silently fail to be persisted before.
-      const rounded = Math.round(m);
-      // Disable the button while save_settings is in flight, await
-      // the async persist so a quick second click can't race the disk
-      // write, and surface any error in the status line.
-      applyBtn.disabled = true;
-      try {
-        await applyAttenuation(rounded, "médiane cascade");
-      } finally {
-        applyBtn.disabled = cascadeFeedback.length === 0;
-      }
+      if (m !== null) applyAttenuation(m, "médiane cascade");
     });
   }
   if (clearBtn) {
@@ -4611,7 +4640,841 @@ function setupChannelTab() {
   renderCascade();
 }
 
-// ─────────────────────────────────────────── Sondeur (Canal tab, lower half)
+// ─────────────────────────────────────────── History tab
+// Unified TX (files emitted, archived at each tx_start) and RX (decoded
+// sessions) view. "↻ Relay" button on each thumbnail for the emergency-
+// radio mode: reload a file in the TX tab and propagate it further on
+// the network.
+
+function setupHistoryTab() {
+  document
+    .getElementById("btn-history-refresh")
+    ?.addEventListener("click", refreshHistory);
+}
+
+async function refreshHistory() {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    const [tx, rx] = await Promise.all([
+      invoke("list_tx_history"),
+      invoke("list_rx_history"),
+    ]);
+    renderHistoryColumn(tx, "tx");
+    renderHistoryColumn(rx, "rx");
+    const cnt = document.getElementById("history-count");
+    if (cnt) cnt.textContent = `TX ${tx.length} · RX ${rx.length}`;
+  } catch (err) {
+    logEvent("history_error", { message: String(err) });
+  }
+}
+
+function renderHistoryColumn(items, kind) {
+  const list = document.getElementById(`history-${kind}-list`);
+  if (!list) return;
+  list.innerHTML = "";
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = kind === "tx" ? "Aucun fichier émis." : "Aucun fichier reçu.";
+    list.appendChild(empty);
+    return;
+  }
+  const { convertFileSrc } = window.__TAURI__.core;
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = "history-card";
+
+    // Thumbnail (image or file icon).
+    const thumb = document.createElement("div");
+    thumb.className = "history-card-thumb";
+    const previewPath = kind === "tx" ? item.file_path : item.preview_path;
+    if (item.is_image) {
+      const img = document.createElement("img");
+      img.alt = item.filename;
+      img.src = convertFileSrc(previewPath);
+      img.addEventListener("dblclick", () =>
+        openLightbox(convertFileSrc(previewPath), item.filename),
+      );
+      thumb.addEventListener("click", () =>
+        openLightbox(convertFileSrc(previewPath), item.filename),
+      );
+      thumb.appendChild(img);
+    } else {
+      const icon = document.createElement("div");
+      icon.className = "file-icon";
+      icon.textContent = "📄";
+      thumb.appendChild(icon);
+      const fname = document.createElement("div");
+      fname.className = "file-name";
+      fname.textContent = item.filename;
+      thumb.appendChild(fname);
+      thumb.style.cursor = "default";
+    }
+    card.appendChild(thumb);
+
+    // Bandeau metadata.
+    const meta = document.createElement("div");
+    meta.className = "history-card-meta";
+    const row1 = document.createElement("div");
+    row1.className = "row";
+    const fname = document.createElement("span");
+    fname.className = "filename";
+    fname.title = item.filename;
+    fname.textContent = item.filename;
+    row1.appendChild(fname);
+    const mode = document.createElement("span");
+    mode.className = "mode";
+    mode.textContent = item.mode;
+    row1.appendChild(mode);
+    meta.appendChild(row1);
+    const row2 = document.createElement("div");
+    row2.className = "row";
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = formatTimestamp(item.timestamp);
+    row2.appendChild(ts);
+    if (kind === "rx" && item.callsign) {
+      const cs = document.createElement("span");
+      cs.className = "callsign";
+      cs.textContent = item.callsign;
+      row2.appendChild(cs);
+    }
+    const sz = document.createElement("span");
+    sz.className = "size";
+    sz.textContent = formatBytes(item.size_bytes);
+    row2.appendChild(sz);
+    meta.appendChild(row2);
+    card.appendChild(meta);
+
+    // Actions : ↻ Renvoyer (TX & RX = relayage radio-secours) + 🗑 Supprimer.
+    const actions = document.createElement("div");
+    actions.className = "history-card-actions";
+    const relayBtn = document.createElement("button");
+    relayBtn.className = "btn-relay";
+    relayBtn.textContent = kind === "tx" ? "↻ Renvoyer" : "↻ Relayer";
+    relayBtn.title =
+      kind === "tx"
+        ? "Recharger ce fichier dans l'onglet TX"
+        : "Relayer ce fichier reçu (radio-secours)";
+    const relayPath = kind === "tx" ? item.file_path : item.relay_path;
+    relayBtn.addEventListener("click", () => relayHistoryItem(relayPath));
+    actions.appendChild(relayBtn);
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-delete";
+    delBtn.textContent = "🗑";
+    delBtn.title = "Supprimer cette entrée";
+    delBtn.addEventListener("click", () => {
+      const label = item.filename || "cette entrée";
+      if (!confirm(`Supprimer ${label} de l'historique ?`)) return;
+      const key = kind === "tx" ? item.file_path : item.session_id;
+      deleteHistoryItem(kind, key);
+    });
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+
+    list.appendChild(card);
+  }
+}
+
+async function relayHistoryItem(absolutePath) {
+  // Bascule sur l'onglet TX puis recharge le fichier comme un drag-drop.
+  const txBtn = document.querySelector('.tab-bar .tab[data-tab="tx"]');
+  if (txBtn) txBtn.click();
+  try {
+    await loadTxFileFromPath(absolutePath);
+  } catch (err) {
+    logEvent("history_relay_error", { path: absolutePath, message: String(err) });
+  }
+}
+
+async function deleteHistoryItem(kind, key) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  try {
+    await invoke("delete_history_item", { kind, key });
+    await refreshHistory();
+  } catch (err) {
+    logEvent("history_delete_error", { kind, key, message: String(err) });
+    alert(`Suppression impossible : ${err}`);
+  }
+}
+
+function formatTimestamp(unixSeconds) {
+  if (!unixSeconds) return "—";
+  const d = new Date(unixSeconds * 1000);
+  return d.toLocaleString("fr-CH", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatBytes(n) {
+  if (!n || n < 1024) return `${n || 0} o`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
+  return `${(n / (1024 * 1024)).toFixed(2)} Mio`;
+}
+
+// Kiosk mode (small touchscreen, e.g. Pi 7" 800x480) — the Rust setup
+// hook auto-engages fullscreen and emits `kiosk_mode` so the frontend
+// can switch its CSS layout and reveal the on-screen exit button.
+function setupKioskMode() {
+  // Add the body class based on viewport size — independent of any
+  // Rust-side event. The Rust setup hook emits `kiosk_mode` *before*
+  // the webview is loaded so the listener-driven path always loses
+  // the race; we still register the listener for completeness (e.g.
+  // when an event fires later from runtime), but the viewport check
+  // is what actually drives the class on a fresh open.
+  if (window.innerWidth <= 900 || window.innerHeight <= 600) {
+    document.body.classList.add("kiosk-mode");
+  }
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("kiosk_mode", () => {
+      document.body.classList.add("kiosk-mode");
+    });
+  }
+  const exitBtn = document.getElementById("kiosk-exit");
+  if (exitBtn && window.__TAURI__ && window.__TAURI__.window) {
+    exitBtn.addEventListener("click", async () => {
+      try {
+        await window.__TAURI__.window.getCurrentWindow().close();
+      } catch (e) {
+        console.error("kiosk close", e);
+      }
+    });
+  }
+  // Escape toggles fullscreen on/off (kiosk mode only). The image
+  // lightbox owns its own Escape handler and we yield to it when open.
+  window.addEventListener("keydown", async (ev) => {
+    if (ev.key !== "Escape") return;
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    const lb = document.getElementById("image-lightbox");
+    if (lb && !lb.hidden) return;
+    if (!window.__TAURI__ || !window.__TAURI__.window) return;
+    try {
+      const win = window.__TAURI__.window.getCurrentWindow();
+      const isFs = await win.isFullscreen();
+      await win.setFullscreen(!isFs);
+    } catch (e) {
+      console.error("kiosk toggle", e);
+    }
+  });
+}
+
+async function init() {
+  setupKioskMode();
+  setupSelectPicker();
+  setupVirtKeyboard();
+  setupTabs();
+  setupLightbox();
+  setupTxTab();
+  setupSettingsTab();
+  setupOverlaysTab();
+  setupCaptureSubmitPanel();
+  setupHistoryTab();
+  await loadSettings();
+  await loadSdrBackends();
+  applyOverlaysToUI();
+  setupChannelTab();
+  setupSounderTab();
+  await loadDevices();
+  await loadSerialPorts();
+  await loadSaveDir();
+  // Display the initial PTT state (computed by the backend at setup).
+  try {
+    const st = await window.__TAURI__.core.invoke("ptt_status");
+    renderPttStatus(st);
+  } catch (err) {
+    console.error("ptt_status", err);
+  }
+  wireEvents();
+  document.getElementById("btn-start").addEventListener("click", startCapture);
+  document.getElementById("btn-stop").addEventListener("click", stopCapture);
+  document.getElementById("btn-raw").addEventListener("click", toggleRawRecording);
+  setupWavPlayback();
+  window.addEventListener("resize", redrawAll);
+  document
+    .getElementById("btn-sessions-refresh")
+    ?.addEventListener("click", refreshSessions);
+  await refreshRawRecordingState();
+  await refreshSessions();
+  resetRxVisuals();
+  // #HB9TOB: periodic tick to clear the OVD chip if no overdrive batch
+  // has arrived for OVD_STICKY_MS (also useful when capture is stopped).
+  setInterval(refreshOverdriveChip, 200);
+  // Auto-start RX capture if a device is configured.
+  await tryAutoStartCapture();
+}
+
+// ─── Touch-friendly <select> picker (kiosk) ───────────────────────
+//
+// WebKitGTK on Wayland renders `<select>` as a native popup whose
+// height is capped to ~5-6 rows on the 800x480 Pi DSI panel. With
+// 10 entries in `tx-mode` / `rx-forced-profile` the bottom of the
+// list (where the experimental profiles live) is unreachable on a
+// touchscreen — the popup is scrollable in theory but the affordance
+// is invisible, so the user thinks the experimentals are gone.
+//
+// Fix: in kiosk mode we capture `mousedown` on every `<select>`
+// before the engine opens its popup, and present a fullscreen modal
+// instead — same options, ≥48 px tap targets, scroll obvious. Off
+// kiosk this stays dormant, so the desktop UX is untouched.
+//
+// Opt-out: `data-select-picker-skip="1"` on the `<select>`.
+
+const selectPicker = {
+  modal: null,
+  labelEl: null,
+  listEl: null,
+  closeEl: null,
+  target: null,
+};
+
+function setupSelectPicker() {
+  selectPicker.modal = document.getElementById("select-picker-modal");
+  selectPicker.labelEl = document.getElementById("select-picker-label");
+  selectPicker.listEl = document.getElementById("select-picker-list");
+  selectPicker.closeEl = document.getElementById("select-picker-cancel");
+  if (!selectPicker.modal) return;
+
+  // Capture phase — must run before WebKitGTK opens its native popup.
+  // Mousedown is the right hook: click is fired AFTER the native
+  // popup has already opened (and consumed the gesture on touch).
+  document.addEventListener("mousedown", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    let el = e.target;
+    if (el instanceof HTMLOptionElement) el = el.parentElement;
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled) return;
+    if (el.dataset.selectPickerSkip === "1") return;
+    if (selectPicker.modal.contains(el)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.blur();
+    openSelectPicker(el);
+  }, /*capture=*/true);
+
+  // Same hook on `keydown` Space/Enter, in case the select is
+  // reached by Tab (the kiosk has no keyboard, but the desktop devs
+  // can still keyboard-navigate).
+  document.addEventListener("keydown", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    if (e.key !== " " && e.key !== "Enter" && e.key !== "ArrowDown") return;
+    const el = e.target;
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled || el.dataset.selectPickerSkip === "1") return;
+    e.preventDefault();
+    openSelectPicker(el);
+  }, /*capture=*/true);
+
+  selectPicker.closeEl.addEventListener("click", closeSelectPicker);
+  selectPicker.modal.addEventListener("click", (e) => {
+    if (e.target === selectPicker.modal) closeSelectPicker();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (selectPicker.modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeSelectPicker();
+    }
+  });
+}
+
+function selectLabel(sel) {
+  // Surrounding <label>'s text minus the <select>'s current option text,
+  // falls back to <legend>, then to the id. Matches the virtKb pattern.
+  const lab = sel.closest("label");
+  if (lab) {
+    const txt = (lab.textContent || "")
+      .replace(sel.options[sel.selectedIndex]?.textContent || "", "")
+      .trim();
+    if (txt) return txt.replace(/\s+/g, " ").slice(0, 80);
+  }
+  const fs = sel.closest("fieldset");
+  const lg = fs && fs.querySelector("legend");
+  if (lg && lg.textContent) return lg.textContent.trim().slice(0, 80);
+  return sel.id || "Choisir";
+}
+
+function openSelectPicker(sel) {
+  selectPicker.target = sel;
+  selectPicker.labelEl.textContent = selectLabel(sel);
+  const list = selectPicker.listEl;
+  list.innerHTML = "";
+  for (const opt of sel.options) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "select-picker-row";
+    if (opt.classList.contains("experimental-option")) {
+      row.classList.add("select-picker-experimental");
+    }
+    if (opt.value === sel.value) {
+      row.classList.add("select-picker-current");
+    }
+    if (opt.disabled) row.classList.add("select-picker-disabled");
+    row.dataset.value = opt.value;
+    row.textContent = opt.textContent;
+    if (opt.disabled) row.disabled = true;
+    row.addEventListener("click", () => {
+      const target = selectPicker.target;
+      if (target && target.value !== opt.value) {
+        target.value = opt.value;
+        // Notify the rest of the app exactly as the native popup does.
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      closeSelectPicker();
+    });
+    list.appendChild(row);
+  }
+  selectPicker.modal.hidden = false;
+  // Scroll the current selection into view so opening on a long list
+  // (10 modem profiles, 39 CTCSS tones) doesn't always start from top.
+  const cur = list.querySelector(".select-picker-current");
+  if (cur) cur.scrollIntoView({ block: "center" });
+}
+
+function closeSelectPicker() {
+  if (!selectPicker.modal || selectPicker.modal.hidden) return;
+  selectPicker.modal.hidden = true;
+  selectPicker.target = null;
+  selectPicker.listEl.innerHTML = "";
+}
+
+// ─── Native virtual keyboard (kiosk text/number entry) ────────────
+//
+// In kiosk mode (no physical keyboard on the 7" Pi panel) text/number
+// inputs become impossible to fill: the user can't enter their callsign,
+// a filename, a Pluto frequency offset, etc. This component is a pure
+// in-app touch keyboard — no system dependency (no squeekboard / wvkbd /
+// onboard) — that auto-opens when an `<input>` is focused while
+// `body.kiosk-mode` is set. Outside kiosk it stays dormant: a physical
+// keyboard typing into the input works like before.
+//
+// Layouts:
+//   * `alpha`   QWERTY uppercase + lower toggle, with shift, space,
+//               and a `?123` key to switch to symbols/numerics.
+//   * `symbols` digits, common punctuation, `ABC` to come back.
+//   * `numeric` 0-9 + decimal point + sign for `<input type="number">`.
+//
+// Special-cased by input id:
+//   * `callsign-input` opens caps-locked, ASCII letters + digits only.
+//
+// On Valider: write `virtKb.draft` to `target.value`, dispatch `input`
+// + `change`, close. On Annuler / outside-tap / Esc: close, no save.
+const VIRT_KB_QWERTY_ROWS = [
+  ["q","w","e","r","t","y","u","i","o","p"],
+  ["a","s","d","f","g","h","j","k","l"],
+  ["z","x","c","v","b","n","m"],
+];
+const VIRT_KB_SYMBOLS_ROWS = [
+  ["1","2","3","4","5","6","7","8","9","0"],
+  ["@","#","_","-",".",",","/",":","="],
+  ["+","*","(",")","'","\"","?","!","%"],
+];
+const VIRT_KB_NUMERIC_ROWS = [
+  ["1","2","3"],
+  ["4","5","6"],
+  ["7","8","9"],
+  ["-",".","0"],
+];
+
+const virtKb = {
+  modal: null,
+  rowsEl: null,
+  displayEl: null,
+  labelEl: null,
+  okBtn: null,
+  cancelBtn: null,
+  closeBtn: null,
+  // Live state — reset on every open():
+  target: null,        // the original <input> element
+  draft: "",           // editable string buffer
+  layout: "alpha",     // "alpha" | "symbols" | "numeric"
+  shift: false,        // true = uppercase letters in alpha mode
+  capsLock: false,     // sticky shift (callsign field auto-engages)
+};
+
+function setupVirtKeyboard() {
+  virtKb.modal = document.getElementById("virt-keyboard-modal");
+  virtKb.rowsEl = document.getElementById("virt-kb-rows");
+  virtKb.displayEl = document.getElementById("virt-kb-value");
+  virtKb.labelEl = document.getElementById("virt-kb-label");
+  virtKb.okBtn = document.getElementById("virt-kb-ok");
+  virtKb.cancelBtn = document.getElementById("virt-kb-cancel-btn");
+  virtKb.closeBtn = document.getElementById("virt-kb-cancel");
+  if (!virtKb.modal) return;
+
+  // Single delegated focusin handler (cheap, no re-attach when DOM
+  // changes). Filters by input.type so checkboxes / radios / file pickers
+  // don't trigger the keyboard. Hidden inputs in modals (e.g. file
+  // picker) are skipped via `:not([hidden])`.
+  document.addEventListener("focusin", (e) => {
+    if (!document.body.classList.contains("kiosk-mode")) return;
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement)) return;
+    if (t.dataset.virtKbSkip === "1") return;
+    const type = (t.type || "text").toLowerCase();
+    if (type !== "text" && type !== "number" && type !== "search" && type !== "tel" && type !== "url") return;
+    // Already inside the keyboard? avoid recursion (the display is a
+    // <span>, not an input, but defensive).
+    if (virtKb.modal.contains(t)) return;
+    // Unfocus the input so the OS soft-keyboard (if any) doesn't try to
+    // appear underneath. We keep a reference for the commit.
+    t.blur();
+    openVirtKeyboard(t);
+  });
+
+  // OK / Cancel / outside-tap / Esc.
+  virtKb.okBtn.addEventListener("click", () => closeVirtKeyboard(true));
+  virtKb.cancelBtn.addEventListener("click", () => closeVirtKeyboard(false));
+  virtKb.closeBtn.addEventListener("click", () => closeVirtKeyboard(false));
+  virtKb.modal.addEventListener("click", (e) => {
+    if (e.target === virtKb.modal) closeVirtKeyboard(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (virtKb.modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeVirtKeyboard(false);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      closeVirtKeyboard(true);
+    }
+  });
+}
+
+function openVirtKeyboard(input) {
+  virtKb.target = input;
+  virtKb.draft = input.value || "";
+  // Pick layout from input.type and id.
+  const type = (input.type || "text").toLowerCase();
+  if (type === "number") {
+    virtKb.layout = "numeric";
+    virtKb.shift = false;
+    virtKb.capsLock = false;
+  } else {
+    virtKb.layout = "alpha";
+    // Callsign field — uppercase locked, ASCII alphanum only. Same
+    // pragmatic behaviour as a real radio's callsign editor.
+    virtKb.capsLock = (input.id === "callsign-input");
+    virtKb.shift = virtKb.capsLock;
+  }
+  virtKb.labelEl.textContent = inputLabel(input);
+  virtKb.modal.hidden = false;
+  renderVirtKeyboardLayout();
+  refreshVirtKbDisplay();
+}
+
+function closeVirtKeyboard(commit) {
+  if (!virtKb.modal || virtKb.modal.hidden) return;
+  const target = virtKb.target;
+  if (commit && target) {
+    const max = parseInt(target.getAttribute("maxlength") || "0", 10);
+    let out = virtKb.draft;
+    if (max > 0) out = out.slice(0, max);
+    target.value = out;
+    // Notify any change listener wired by the rest of the app
+    // (persistSettings, refreshTxEstimate, …).
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    // Frequency inputs : add the validated value to the MRU
+    // favorites so the next keypad open offers it as a quick-pick.
+    if (isFreqInputId(target.id)) {
+      const mhz = parseFloat(out);
+      if (Number.isFinite(mhz) && mhz > 0) {
+        // fire-and-forget — own save flush, doesn't block close.
+        pushFreqMru(mhz, target);
+      }
+    }
+  }
+  virtKb.modal.hidden = true;
+  virtKb.target = null;
+  virtKb.draft = "";
+}
+
+function inputLabel(input) {
+  // Prefer the surrounding <label>'s direct text node, fall back to
+  // placeholder, then to the id.
+  const lab = input.closest("label");
+  if (lab) {
+    const txt = (lab.textContent || "").replace(input.value || "", "").trim();
+    if (txt) return txt.replace(/\s+/g, " ").slice(0, 60);
+  }
+  if (input.placeholder) return input.placeholder;
+  return input.id || "Saisie";
+}
+
+function renderVirtKeyboardLayout() {
+  const rows = virtKb.rowsEl;
+  rows.innerHTML = "";
+  if (virtKb.layout === "numeric") {
+    // Extra rows for frequency inputs: MRU favorites + step buttons.
+    // Detected by input id; falls back to a plain numeric pad for any
+    // other `<input type="number">` (gain dB, attenuation, etc).
+    if (isFreqInputId(virtKb.target?.id)) {
+      renderVirtKbFavoritesRow();
+      renderVirtKbStepRow();
+    }
+    for (const row of VIRT_KB_NUMERIC_ROWS) {
+      const r = document.createElement("div");
+      r.className = "virt-kb-row";
+      for (const k of row) r.appendChild(makeKbKey(k));
+      rows.appendChild(r);
+    }
+    const trailer = document.createElement("div");
+    trailer.className = "virt-kb-row";
+    trailer.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+    rows.appendChild(trailer);
+    return;
+  }
+  const rowsData = virtKb.layout === "symbols" ? VIRT_KB_SYMBOLS_ROWS : VIRT_KB_QWERTY_ROWS;
+  for (const row of rowsData) {
+    const r = document.createElement("div");
+    r.className = "virt-kb-row";
+    for (const k of row) {
+      const display = (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock))
+        ? k.toUpperCase()
+        : k;
+      r.appendChild(makeKbKey(display, k));
+    }
+    rows.appendChild(r);
+  }
+  // Last row : layout-specific specials.
+  const last = document.createElement("div");
+  last.className = "virt-kb-row";
+  if (virtKb.layout === "alpha") {
+    const shiftLabel = virtKb.capsLock ? "⇪" : "⇧";
+    last.appendChild(makeKbKey(shiftLabel, "shift", "wide-2 special"));
+    last.appendChild(makeKbKey("?123", "to-symbols", "wide-2 special"));
+    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
+    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+  } else {
+    last.appendChild(makeKbKey("ABC", "to-alpha", "wide-2 special"));
+    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
+    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
+  }
+  rows.appendChild(last);
+}
+
+function makeKbKey(label, action, extraClass) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "virt-kb-key" + (extraClass ? " " + extraClass : "");
+  b.textContent = label;
+  b.dataset.action = action || label;
+  b.addEventListener("click", () => onVirtKbKey(b.dataset.action));
+  return b;
+}
+
+function onVirtKbKey(action) {
+  switch (action) {
+    case "back":
+      virtKb.draft = virtKb.draft.slice(0, -1);
+      break;
+    case "space":
+      appendVirtKbChar(" ");
+      break;
+    case "shift":
+      if (virtKb.shift && !virtKb.capsLock) {
+        // 1st tap : shift on. 2nd consecutive tap : caps-lock.
+        virtKb.capsLock = true;
+      } else if (virtKb.capsLock) {
+        // Tap while capsLock : turn everything off.
+        virtKb.capsLock = false;
+        virtKb.shift = false;
+      } else {
+        virtKb.shift = true;
+      }
+      renderVirtKeyboardLayout();
+      return;
+    case "to-symbols":
+      virtKb.layout = "symbols";
+      renderVirtKeyboardLayout();
+      return;
+    case "to-alpha":
+      virtKb.layout = "alpha";
+      renderVirtKeyboardLayout();
+      return;
+    default:
+      // Single-character key: respect shift / capsLock for letters.
+      let c = action;
+      if (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock) && c.length === 1) {
+        c = c.toUpperCase();
+      }
+      appendVirtKbChar(c);
+      // Auto-release a one-shot shift (capsLock keeps it on).
+      if (virtKb.shift && !virtKb.capsLock) {
+        virtKb.shift = false;
+        renderVirtKeyboardLayout();
+      }
+      break;
+  }
+  refreshVirtKbDisplay();
+}
+
+function appendVirtKbChar(c) {
+  if (virtKb.target) {
+    const max = parseInt(virtKb.target.getAttribute("maxlength") || "0", 10);
+    if (max > 0 && virtKb.draft.length >= max) return;
+  }
+  virtKb.draft += c;
+}
+
+function refreshVirtKbDisplay() {
+  // Replace ` ` to keep an empty draft visible (otherwise the
+  // height collapses).
+  virtKb.displayEl.textContent = virtKb.draft.length ? virtKb.draft : " ";
+}
+
+// ─── Frequency-keypad enrichments (MRU favorites + step buttons) ──
+//
+// Active when the focused input is an SDR frequency field. The new
+// dynamic-render scheme produces IDs like `sdr-rx-freq-<backend>`
+// or `sdr-tx-freq-<backend>` — one prefix matches every registered
+// backend. The MRU bucket is per-backend, picked off the input's
+// `data-backend` attribute (set when the row was built); step
+// buttons (5 / 6.25 / 12.5 / 25 kHz) work uniformly across all
+// backends. The pick survives keypad close/re-open via
+// `virtKb.stepKHz`.
+const FREQ_INPUT_ID_PREFIX = ["sdr-rx-freq-", "sdr-tx-freq-"];
+const STEP_OPTIONS_KHZ = [5.0, 6.25, 12.5, 25.0];
+virtKb.stepKHz = 6.25;
+
+function isFreqInputId(id) {
+  if (!id) return false;
+  return FREQ_INPUT_ID_PREFIX.some(p => id.startsWith(p));
+}
+
+/// Pick the per-backend MRU list. Reads the `data-backend`
+/// attribute on the input — set by the row builders to the backend
+/// ID. Returns the live array (mutable) so callers can splice.
+function backendIdForFreqInput(targetEl) {
+  if (!targetEl) return null;
+  return targetEl.dataset && targetEl.dataset.backend
+    ? targetEl.dataset.backend : null;
+}
+
+function freqFavoritesArray(backendId) {
+  if (!backendId) return [];
+  ensureBackendEntry(backendId);
+  const entry = currentSettings.sdr_settings.backends[backendId];
+  if (!Array.isArray(entry.freq_favorites)) entry.freq_favorites = [];
+  return entry.freq_favorites;
+}
+
+function renderVirtKbFavoritesRow() {
+  const target = virtKb.target;
+  const backendId = backendIdForFreqInput(target);
+  const favs = backendId ? freqFavoritesArray(backendId) : [];
+  if (favs.length === 0) return;
+  const row = document.createElement("div");
+  row.className = "virt-kb-row virt-kb-favs";
+  for (const hz of favs) {
+    const mhz = (hz / 1e6).toFixed(3);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "virt-kb-key special";
+    b.textContent = mhz;
+    b.title = `Charger ${mhz} MHz`;
+    b.addEventListener("click", () => {
+      // Strip trailing zeros so "145.500" displays compact, but
+      // keep the decimal point so the user knows it's fractional.
+      virtKb.draft = mhz.replace(/0+$/, "").replace(/\.$/, "");
+      refreshVirtKbDisplay();
+    });
+    row.appendChild(b);
+  }
+  virtKb.rowsEl.appendChild(row);
+}
+
+function renderVirtKbStepRow() {
+  const row = document.createElement("div");
+  row.className = "virt-kb-row virt-kb-step-row";
+  // Step selector — taps cycle through STEP_OPTIONS_KHZ.
+  const stepBtn = document.createElement("button");
+  stepBtn.type = "button";
+  stepBtn.className = "virt-kb-key special wide-2";
+  stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
+  stepBtn.title = "Cycle 5 / 6.25 / 12.5 / 25 kHz";
+  stepBtn.addEventListener("click", () => {
+    const idx = STEP_OPTIONS_KHZ.indexOf(virtKb.stepKHz);
+    virtKb.stepKHz = STEP_OPTIONS_KHZ[(idx + 1) % STEP_OPTIONS_KHZ.length];
+    stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
+  });
+  row.appendChild(stepBtn);
+
+  const minusBtn = document.createElement("button");
+  minusBtn.type = "button";
+  minusBtn.className = "virt-kb-key";
+  minusBtn.textContent = "−";
+  minusBtn.addEventListener("click", () => stepDraft(-1));
+  row.appendChild(minusBtn);
+
+  const plusBtn = document.createElement("button");
+  plusBtn.type = "button";
+  plusBtn.className = "virt-kb-key";
+  plusBtn.textContent = "+";
+  plusBtn.addEventListener("click", () => stepDraft(+1));
+  row.appendChild(plusBtn);
+
+  virtKb.rowsEl.appendChild(row);
+}
+
+function stepDraft(direction) {
+  // Parse the current draft as MHz (accept partials like "145." or
+  // ""). Empty / unparseable → start from 0.
+  const cur = parseFloat(virtKb.draft);
+  const start = Number.isFinite(cur) ? cur : 0;
+  const deltaMHz = (virtKb.stepKHz / 1000.0) * direction;
+  const next = start + deltaMHz;
+  // 5 decimals = 10 Hz precision, more than enough for amateur
+  // channel rasters. Trim trailing zeros for compact display.
+  let fixed = next.toFixed(5).replace(/0+$/, "").replace(/\.$/, "");
+  if (fixed === "" || fixed === "-") fixed = "0";
+  virtKb.draft = fixed;
+  refreshVirtKbDisplay();
+}
+
+/// Push a freshly-validated frequency (MHz) onto the per-backend
+/// MRU list. Dedup on Hz equality, prepend, cap at 6. Persists via
+/// `save_settings` so the next keypad open already shows it. The
+/// MRU bucket is the live array under
+/// `currentSettings.sdr_settings.backends[backendId].freq_favorites`.
+async function pushFreqMru(mhz, targetEl) {
+  if (!Number.isFinite(mhz) || mhz <= 0) return;
+  const backendId = backendIdForFreqInput(targetEl);
+  if (!backendId) return;
+  const hz = Math.round(mhz * 1e6);
+  const list = freqFavoritesArray(backendId);
+  const idx = list.indexOf(hz);
+  if (idx !== -1) list.splice(idx, 1);
+  list.unshift(hz);
+  while (list.length > 6) list.pop();
+  if (window.__TAURI__ && window.__TAURI__.core) {
+    try {
+      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
+    } catch (err) {
+      console.warn("save favorites:", err);
+    }
+  }
+}
+
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", init);
+} else {
+  init();
+}
+
+// ────────────────────────────────────────────────── Sounder tab
+// Ported from feat/modem-2x (channel-sounder feature, 2026-05-21).
+// Backend lives in modem-worker-base/src/sounder.rs + the Tauri
+// commands at the bottom of src-tauri/src/main.rs.
+
 // Two Tauri commands back this UI:
 //   - sounding_tx_render(request) → builds probe.wav + schedule.json
 //     under <save_dir>/sounder/<id>/. The user plays the WAV via the RX
@@ -5533,854 +6396,4 @@ function setupSounderTab() {
   document
     .getElementById("sd-collector-send")
     ?.addEventListener("click", runSounderCollectorSend);
-}
-
-// ─────────────────────────────────────────── History tab
-// Unified TX (files emitted, archived at each tx_start) and RX (decoded
-// sessions) view. "↻ Relay" button on each thumbnail for the emergency-
-// radio mode: reload a file in the TX tab and propagate it further on
-// the network.
-
-function setupHistoryTab() {
-  document
-    .getElementById("btn-history-refresh")
-    ?.addEventListener("click", refreshHistory);
-}
-
-async function refreshHistory() {
-  if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
-  try {
-    const [tx, rx] = await Promise.all([
-      invoke("list_tx_history"),
-      invoke("list_rx_history"),
-    ]);
-    renderHistoryColumn(tx, "tx");
-    renderHistoryColumn(rx, "rx");
-    const cnt = document.getElementById("history-count");
-    if (cnt) cnt.textContent = `TX ${tx.length} · RX ${rx.length}`;
-  } catch (err) {
-    logEvent("history_error", { message: String(err) });
-  }
-}
-
-function renderHistoryColumn(items, kind) {
-  const list = document.getElementById(`history-${kind}-list`);
-  if (!list) return;
-  list.innerHTML = "";
-  if (!items.length) {
-    const empty = document.createElement("div");
-    empty.className = "history-empty";
-    empty.textContent = kind === "tx" ? "Aucun fichier émis." : "Aucun fichier reçu.";
-    list.appendChild(empty);
-    return;
-  }
-  const { convertFileSrc } = window.__TAURI__.core;
-  for (const item of items) {
-    const card = document.createElement("div");
-    card.className = "history-card";
-
-    // Thumbnail (image or file icon).
-    const thumb = document.createElement("div");
-    thumb.className = "history-card-thumb";
-    const previewPath = kind === "tx" ? item.file_path : item.preview_path;
-    if (item.is_image) {
-      const img = document.createElement("img");
-      img.alt = item.filename;
-      img.src = convertFileSrc(previewPath);
-      img.addEventListener("dblclick", () =>
-        openLightbox(convertFileSrc(previewPath), item.filename),
-      );
-      thumb.addEventListener("click", () =>
-        openLightbox(convertFileSrc(previewPath), item.filename),
-      );
-      thumb.appendChild(img);
-    } else {
-      const icon = document.createElement("div");
-      icon.className = "file-icon";
-      icon.textContent = "📄";
-      thumb.appendChild(icon);
-      const fname = document.createElement("div");
-      fname.className = "file-name";
-      fname.textContent = item.filename;
-      thumb.appendChild(fname);
-      thumb.style.cursor = "default";
-    }
-    card.appendChild(thumb);
-
-    // Bandeau metadata.
-    const meta = document.createElement("div");
-    meta.className = "history-card-meta";
-    const row1 = document.createElement("div");
-    row1.className = "row";
-    const fname = document.createElement("span");
-    fname.className = "filename";
-    fname.title = item.filename;
-    fname.textContent = item.filename;
-    row1.appendChild(fname);
-    const mode = document.createElement("span");
-    mode.className = "mode";
-    mode.textContent = item.mode;
-    row1.appendChild(mode);
-    meta.appendChild(row1);
-    const row2 = document.createElement("div");
-    row2.className = "row";
-    const ts = document.createElement("span");
-    ts.className = "ts";
-    ts.textContent = formatTimestamp(item.timestamp);
-    row2.appendChild(ts);
-    if (kind === "rx" && item.callsign) {
-      const cs = document.createElement("span");
-      cs.className = "callsign";
-      cs.textContent = item.callsign;
-      row2.appendChild(cs);
-    }
-    const sz = document.createElement("span");
-    sz.className = "size";
-    sz.textContent = formatBytes(item.size_bytes);
-    row2.appendChild(sz);
-    meta.appendChild(row2);
-    card.appendChild(meta);
-
-    // Actions : ↻ Renvoyer (TX & RX = relayage radio-secours) + 🗑 Supprimer.
-    const actions = document.createElement("div");
-    actions.className = "history-card-actions";
-    const relayBtn = document.createElement("button");
-    relayBtn.className = "btn-relay";
-    relayBtn.textContent = kind === "tx" ? "↻ Renvoyer" : "↻ Relayer";
-    relayBtn.title =
-      kind === "tx"
-        ? "Recharger ce fichier dans l'onglet TX"
-        : "Relayer ce fichier reçu (radio-secours)";
-    const relayPath = kind === "tx" ? item.file_path : item.relay_path;
-    relayBtn.addEventListener("click", () => relayHistoryItem(relayPath));
-    actions.appendChild(relayBtn);
-
-    const delBtn = document.createElement("button");
-    delBtn.className = "btn-delete";
-    delBtn.textContent = "🗑";
-    delBtn.title = "Supprimer cette entrée";
-    delBtn.addEventListener("click", () => {
-      const label = item.filename || "cette entrée";
-      if (!confirm(`Supprimer ${label} de l'historique ?`)) return;
-      const key = kind === "tx" ? item.file_path : item.session_id;
-      deleteHistoryItem(kind, key);
-    });
-    actions.appendChild(delBtn);
-    card.appendChild(actions);
-
-    list.appendChild(card);
-  }
-}
-
-async function relayHistoryItem(absolutePath) {
-  // Bascule sur l'onglet TX puis recharge le fichier comme un drag-drop.
-  const txBtn = document.querySelector('.tab-bar .tab[data-tab="tx"]');
-  if (txBtn) txBtn.click();
-  try {
-    await loadTxFileFromPath(absolutePath);
-  } catch (err) {
-    logEvent("history_relay_error", { path: absolutePath, message: String(err) });
-  }
-}
-
-async function deleteHistoryItem(kind, key) {
-  if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
-  try {
-    await invoke("delete_history_item", { kind, key });
-    await refreshHistory();
-  } catch (err) {
-    logEvent("history_delete_error", { kind, key, message: String(err) });
-    alert(`Suppression impossible : ${err}`);
-  }
-}
-
-function formatTimestamp(unixSeconds) {
-  if (!unixSeconds) return "—";
-  const d = new Date(unixSeconds * 1000);
-  return d.toLocaleString("fr-CH", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatBytes(n) {
-  if (!n || n < 1024) return `${n || 0} o`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
-  return `${(n / (1024 * 1024)).toFixed(2)} Mio`;
-}
-
-// Kiosk mode (small touchscreen, e.g. Pi 7" 800x480) — the Rust setup
-// hook auto-engages fullscreen and emits `kiosk_mode` so the frontend
-// can switch its CSS layout and reveal the on-screen exit button.
-function setupKioskMode() {
-  // Add the body class based on viewport size — independent of any
-  // Rust-side event. The Rust setup hook emits `kiosk_mode` *before*
-  // the webview is loaded so the listener-driven path always loses
-  // the race; we still register the listener for completeness (e.g.
-  // when an event fires later from runtime), but the viewport check
-  // is what actually drives the class on a fresh open.
-  if (window.innerWidth <= 900 || window.innerHeight <= 600) {
-    document.body.classList.add("kiosk-mode");
-  }
-  if (window.__TAURI__ && window.__TAURI__.event) {
-    window.__TAURI__.event.listen("kiosk_mode", () => {
-      document.body.classList.add("kiosk-mode");
-    });
-  }
-  const exitBtn = document.getElementById("kiosk-exit");
-  if (exitBtn && window.__TAURI__ && window.__TAURI__.window) {
-    exitBtn.addEventListener("click", async () => {
-      try {
-        await window.__TAURI__.window.getCurrentWindow().close();
-      } catch (e) {
-        console.error("kiosk close", e);
-      }
-    });
-  }
-  // Escape toggles fullscreen on/off (kiosk mode only). The image
-  // lightbox owns its own Escape handler and we yield to it when open.
-  window.addEventListener("keydown", async (ev) => {
-    if (ev.key !== "Escape") return;
-    if (!document.body.classList.contains("kiosk-mode")) return;
-    const lb = document.getElementById("image-lightbox");
-    if (lb && !lb.hidden) return;
-    if (!window.__TAURI__ || !window.__TAURI__.window) return;
-    try {
-      const win = window.__TAURI__.window.getCurrentWindow();
-      const isFs = await win.isFullscreen();
-      await win.setFullscreen(!isFs);
-    } catch (e) {
-      console.error("kiosk toggle", e);
-    }
-  });
-}
-
-async function showAppVersion() {
-  const el = document.getElementById("app-version");
-  if (!el) return;
-  // Backend reads `tauri.conf.json` (single source of truth bumped on
-  // every build). `window.__TAURI__.app.getVersion` isn't reliably
-  // exposed by `withGlobalTauri` across Tauri versions, so we route
-  // through our own command.
-  try {
-    if (!window.__TAURI__ || !window.__TAURI__.core) return;
-    const v = await window.__TAURI__.core.invoke("get_app_version");
-    if (v) {
-      el.textContent = `v${v}`;
-      el.title = `Version de l'application : ${v}`;
-    }
-  } catch (err) {
-    console.error("get_app_version", err);
-  }
-}
-
-async function init() {
-  setupKioskMode();
-  setupSelectPicker();
-  setupVirtKeyboard();
-  setupTabs();
-  setupLightbox();
-  setupTxTab();
-  showAppVersion();
-  setupSettingsTab();
-  setupOverlaysTab();
-  setupCaptureSubmitPanel();
-  setupHistoryTab();
-  await loadSettings();
-  await loadSdrBackends();
-  applyOverlaysToUI();
-  setupChannelTab();
-  setupSounderTab();
-  await loadDevices();
-  await loadSerialPorts();
-  await loadSaveDir();
-  // Display the initial PTT state (computed by the backend at setup).
-  try {
-    const st = await window.__TAURI__.core.invoke("ptt_status");
-    renderPttStatus(st);
-  } catch (err) {
-    console.error("ptt_status", err);
-  }
-  wireEvents();
-  document.getElementById("btn-start").addEventListener("click", startCapture);
-  document.getElementById("btn-stop").addEventListener("click", stopCapture);
-  document.getElementById("btn-raw").addEventListener("click", toggleRawRecording);
-  setupWavPlayback();
-  window.addEventListener("resize", redrawAll);
-  document
-    .getElementById("btn-sessions-refresh")
-    ?.addEventListener("click", refreshSessions);
-  await refreshRawRecordingState();
-  await refreshSessions();
-  resetRxVisuals();
-  // #HB9TOB: periodic tick to clear the OVD chip if no overdrive batch
-  // has arrived for OVD_STICKY_MS (also useful when capture is stopped).
-  setInterval(refreshOverdriveChip, 200);
-  // Auto-start RX capture if a device is configured.
-  await tryAutoStartCapture();
-}
-
-// ─── Touch-friendly <select> picker (kiosk) ───────────────────────
-//
-// WebKitGTK on Wayland renders `<select>` as a native popup whose
-// height is capped to ~5-6 rows on the 800x480 Pi DSI panel. With
-// 10 entries in `tx-mode` / `rx-forced-profile` the bottom of the
-// list (where the experimental profiles live) is unreachable on a
-// touchscreen — the popup is scrollable in theory but the affordance
-// is invisible, so the user thinks the experimentals are gone.
-//
-// Fix: in kiosk mode we capture `mousedown` on every `<select>`
-// before the engine opens its popup, and present a fullscreen modal
-// instead — same options, ≥48 px tap targets, scroll obvious. Off
-// kiosk this stays dormant, so the desktop UX is untouched.
-//
-// Opt-out: `data-select-picker-skip="1"` on the `<select>`.
-
-const selectPicker = {
-  modal: null,
-  labelEl: null,
-  listEl: null,
-  closeEl: null,
-  target: null,
-};
-
-function setupSelectPicker() {
-  selectPicker.modal = document.getElementById("select-picker-modal");
-  selectPicker.labelEl = document.getElementById("select-picker-label");
-  selectPicker.listEl = document.getElementById("select-picker-list");
-  selectPicker.closeEl = document.getElementById("select-picker-cancel");
-  if (!selectPicker.modal) return;
-
-  // Capture phase — must run before WebKitGTK opens its native popup.
-  // Mousedown is the right hook: click is fired AFTER the native
-  // popup has already opened (and consumed the gesture on touch).
-  document.addEventListener("mousedown", (e) => {
-    if (!document.body.classList.contains("kiosk-mode")) return;
-    let el = e.target;
-    if (el instanceof HTMLOptionElement) el = el.parentElement;
-    if (!(el instanceof HTMLSelectElement)) return;
-    if (el.disabled) return;
-    if (el.dataset.selectPickerSkip === "1") return;
-    if (selectPicker.modal.contains(el)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    el.blur();
-    openSelectPicker(el);
-  }, /*capture=*/true);
-
-  // Same hook on `keydown` Space/Enter, in case the select is
-  // reached by Tab (the kiosk has no keyboard, but the desktop devs
-  // can still keyboard-navigate).
-  document.addEventListener("keydown", (e) => {
-    if (!document.body.classList.contains("kiosk-mode")) return;
-    if (e.key !== " " && e.key !== "Enter" && e.key !== "ArrowDown") return;
-    const el = e.target;
-    if (!(el instanceof HTMLSelectElement)) return;
-    if (el.disabled || el.dataset.selectPickerSkip === "1") return;
-    e.preventDefault();
-    openSelectPicker(el);
-  }, /*capture=*/true);
-
-  selectPicker.closeEl.addEventListener("click", closeSelectPicker);
-  selectPicker.modal.addEventListener("click", (e) => {
-    if (e.target === selectPicker.modal) closeSelectPicker();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (selectPicker.modal.hidden) return;
-    if (e.key === "Escape") {
-      e.preventDefault();
-      closeSelectPicker();
-    }
-  });
-}
-
-function selectLabel(sel) {
-  // Surrounding <label>'s text minus the <select>'s current option text,
-  // falls back to <legend>, then to the id. Matches the virtKb pattern.
-  const lab = sel.closest("label");
-  if (lab) {
-    const txt = (lab.textContent || "")
-      .replace(sel.options[sel.selectedIndex]?.textContent || "", "")
-      .trim();
-    if (txt) return txt.replace(/\s+/g, " ").slice(0, 80);
-  }
-  const fs = sel.closest("fieldset");
-  const lg = fs && fs.querySelector("legend");
-  if (lg && lg.textContent) return lg.textContent.trim().slice(0, 80);
-  return sel.id || "Choisir";
-}
-
-function openSelectPicker(sel) {
-  selectPicker.target = sel;
-  selectPicker.labelEl.textContent = selectLabel(sel);
-  const list = selectPicker.listEl;
-  list.innerHTML = "";
-  for (const opt of sel.options) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "select-picker-row";
-    if (opt.classList.contains("experimental-option")) {
-      row.classList.add("select-picker-experimental");
-    }
-    if (opt.value === sel.value) {
-      row.classList.add("select-picker-current");
-    }
-    if (opt.disabled) row.classList.add("select-picker-disabled");
-    row.dataset.value = opt.value;
-    row.textContent = opt.textContent;
-    if (opt.disabled) row.disabled = true;
-    row.addEventListener("click", () => {
-      const target = selectPicker.target;
-      if (target && target.value !== opt.value) {
-        target.value = opt.value;
-        // Notify the rest of the app exactly as the native popup does.
-        target.dispatchEvent(new Event("input", { bubbles: true }));
-        target.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      closeSelectPicker();
-    });
-    list.appendChild(row);
-  }
-  selectPicker.modal.hidden = false;
-  // Scroll the current selection into view so opening on a long list
-  // (10 modem profiles, 39 CTCSS tones) doesn't always start from top.
-  const cur = list.querySelector(".select-picker-current");
-  if (cur) cur.scrollIntoView({ block: "center" });
-}
-
-function closeSelectPicker() {
-  if (!selectPicker.modal || selectPicker.modal.hidden) return;
-  selectPicker.modal.hidden = true;
-  selectPicker.target = null;
-  selectPicker.listEl.innerHTML = "";
-}
-
-// ─── Native virtual keyboard (kiosk text/number entry) ────────────
-//
-// In kiosk mode (no physical keyboard on the 7" Pi panel) text/number
-// inputs become impossible to fill: the user can't enter their callsign,
-// a filename, a Pluto frequency offset, etc. This component is a pure
-// in-app touch keyboard — no system dependency (no squeekboard / wvkbd /
-// onboard) — that auto-opens when an `<input>` is focused while
-// `body.kiosk-mode` is set. Outside kiosk it stays dormant: a physical
-// keyboard typing into the input works like before.
-//
-// Layouts:
-//   * `alpha`   QWERTY uppercase + lower toggle, with shift, space,
-//               and a `?123` key to switch to symbols/numerics.
-//   * `symbols` digits, common punctuation, `ABC` to come back.
-//   * `numeric` 0-9 + decimal point + sign for `<input type="number">`.
-//
-// Special-cased by input id:
-//   * `callsign-input` opens caps-locked, ASCII letters + digits only.
-//
-// On Valider: write `virtKb.draft` to `target.value`, dispatch `input`
-// + `change`, close. On Annuler / outside-tap / Esc: close, no save.
-const VIRT_KB_QWERTY_ROWS = [
-  ["q","w","e","r","t","y","u","i","o","p"],
-  ["a","s","d","f","g","h","j","k","l"],
-  ["z","x","c","v","b","n","m"],
-];
-const VIRT_KB_SYMBOLS_ROWS = [
-  ["1","2","3","4","5","6","7","8","9","0"],
-  ["@","#","_","-",".",",","/",":","="],
-  ["+","*","(",")","'","\"","?","!","%"],
-];
-const VIRT_KB_NUMERIC_ROWS = [
-  ["1","2","3"],
-  ["4","5","6"],
-  ["7","8","9"],
-  ["-",".","0"],
-];
-
-const virtKb = {
-  modal: null,
-  rowsEl: null,
-  displayEl: null,
-  labelEl: null,
-  okBtn: null,
-  cancelBtn: null,
-  closeBtn: null,
-  // Live state — reset on every open():
-  target: null,        // the original <input> element
-  draft: "",           // editable string buffer
-  layout: "alpha",     // "alpha" | "symbols" | "numeric"
-  shift: false,        // true = uppercase letters in alpha mode
-  capsLock: false,     // sticky shift (callsign field auto-engages)
-};
-
-function setupVirtKeyboard() {
-  virtKb.modal = document.getElementById("virt-keyboard-modal");
-  virtKb.rowsEl = document.getElementById("virt-kb-rows");
-  virtKb.displayEl = document.getElementById("virt-kb-value");
-  virtKb.labelEl = document.getElementById("virt-kb-label");
-  virtKb.okBtn = document.getElementById("virt-kb-ok");
-  virtKb.cancelBtn = document.getElementById("virt-kb-cancel-btn");
-  virtKb.closeBtn = document.getElementById("virt-kb-cancel");
-  if (!virtKb.modal) return;
-
-  // Single delegated focusin handler (cheap, no re-attach when DOM
-  // changes). Filters by input.type so checkboxes / radios / file pickers
-  // don't trigger the keyboard. Hidden inputs in modals (e.g. file
-  // picker) are skipped via `:not([hidden])`.
-  document.addEventListener("focusin", (e) => {
-    if (!document.body.classList.contains("kiosk-mode")) return;
-    const t = e.target;
-    if (!(t instanceof HTMLInputElement)) return;
-    if (t.dataset.virtKbSkip === "1") return;
-    const type = (t.type || "text").toLowerCase();
-    if (type !== "text" && type !== "number" && type !== "search" && type !== "tel" && type !== "url") return;
-    // Already inside the keyboard? avoid recursion (the display is a
-    // <span>, not an input, but defensive).
-    if (virtKb.modal.contains(t)) return;
-    // Unfocus the input so the OS soft-keyboard (if any) doesn't try to
-    // appear underneath. We keep a reference for the commit.
-    t.blur();
-    openVirtKeyboard(t);
-  });
-
-  // OK / Cancel / outside-tap / Esc.
-  virtKb.okBtn.addEventListener("click", () => closeVirtKeyboard(true));
-  virtKb.cancelBtn.addEventListener("click", () => closeVirtKeyboard(false));
-  virtKb.closeBtn.addEventListener("click", () => closeVirtKeyboard(false));
-  virtKb.modal.addEventListener("click", (e) => {
-    if (e.target === virtKb.modal) closeVirtKeyboard(false);
-  });
-  document.addEventListener("keydown", (e) => {
-    if (virtKb.modal.hidden) return;
-    if (e.key === "Escape") {
-      e.preventDefault();
-      closeVirtKeyboard(false);
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      closeVirtKeyboard(true);
-    }
-  });
-}
-
-function openVirtKeyboard(input) {
-  virtKb.target = input;
-  virtKb.draft = input.value || "";
-  // Pick layout from input.type and id.
-  const type = (input.type || "text").toLowerCase();
-  if (type === "number") {
-    virtKb.layout = "numeric";
-    virtKb.shift = false;
-    virtKb.capsLock = false;
-  } else {
-    virtKb.layout = "alpha";
-    // Callsign field — uppercase locked, ASCII alphanum only. Same
-    // pragmatic behaviour as a real radio's callsign editor.
-    virtKb.capsLock = (input.id === "callsign-input");
-    virtKb.shift = virtKb.capsLock;
-  }
-  virtKb.labelEl.textContent = inputLabel(input);
-  virtKb.modal.hidden = false;
-  renderVirtKeyboardLayout();
-  refreshVirtKbDisplay();
-}
-
-function closeVirtKeyboard(commit) {
-  if (!virtKb.modal || virtKb.modal.hidden) return;
-  const target = virtKb.target;
-  if (commit && target) {
-    const max = parseInt(target.getAttribute("maxlength") || "0", 10);
-    let out = virtKb.draft;
-    if (max > 0) out = out.slice(0, max);
-    target.value = out;
-    // Notify any change listener wired by the rest of the app
-    // (persistSettings, refreshTxEstimate, …).
-    target.dispatchEvent(new Event("input", { bubbles: true }));
-    target.dispatchEvent(new Event("change", { bubbles: true }));
-    // Frequency inputs : add the validated value to the MRU
-    // favorites so the next keypad open offers it as a quick-pick.
-    if (isFreqInputId(target.id)) {
-      const mhz = parseFloat(out);
-      if (Number.isFinite(mhz) && mhz > 0) {
-        // fire-and-forget — own save flush, doesn't block close.
-        pushFreqMru(mhz, target);
-      }
-    }
-  }
-  virtKb.modal.hidden = true;
-  virtKb.target = null;
-  virtKb.draft = "";
-}
-
-function inputLabel(input) {
-  // Prefer the surrounding <label>'s direct text node, fall back to
-  // placeholder, then to the id.
-  const lab = input.closest("label");
-  if (lab) {
-    const txt = (lab.textContent || "").replace(input.value || "", "").trim();
-    if (txt) return txt.replace(/\s+/g, " ").slice(0, 60);
-  }
-  if (input.placeholder) return input.placeholder;
-  return input.id || "Saisie";
-}
-
-function renderVirtKeyboardLayout() {
-  const rows = virtKb.rowsEl;
-  rows.innerHTML = "";
-  if (virtKb.layout === "numeric") {
-    // Extra rows for frequency inputs: MRU favorites + step buttons.
-    // Detected by input id; falls back to a plain numeric pad for any
-    // other `<input type="number">` (gain dB, attenuation, etc).
-    if (isFreqInputId(virtKb.target?.id)) {
-      renderVirtKbFavoritesRow();
-      renderVirtKbStepRow();
-    }
-    for (const row of VIRT_KB_NUMERIC_ROWS) {
-      const r = document.createElement("div");
-      r.className = "virt-kb-row";
-      for (const k of row) r.appendChild(makeKbKey(k));
-      rows.appendChild(r);
-    }
-    const trailer = document.createElement("div");
-    trailer.className = "virt-kb-row";
-    trailer.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
-    rows.appendChild(trailer);
-    return;
-  }
-  const rowsData = virtKb.layout === "symbols" ? VIRT_KB_SYMBOLS_ROWS : VIRT_KB_QWERTY_ROWS;
-  for (const row of rowsData) {
-    const r = document.createElement("div");
-    r.className = "virt-kb-row";
-    for (const k of row) {
-      const display = (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock))
-        ? k.toUpperCase()
-        : k;
-      r.appendChild(makeKbKey(display, k));
-    }
-    rows.appendChild(r);
-  }
-  // Last row : layout-specific specials.
-  const last = document.createElement("div");
-  last.className = "virt-kb-row";
-  if (virtKb.layout === "alpha") {
-    const shiftLabel = virtKb.capsLock ? "⇪" : "⇧";
-    last.appendChild(makeKbKey(shiftLabel, "shift", "wide-2 special"));
-    last.appendChild(makeKbKey("?123", "to-symbols", "wide-2 special"));
-    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
-    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
-  } else {
-    last.appendChild(makeKbKey("ABC", "to-alpha", "wide-2 special"));
-    last.appendChild(makeKbKey("Esp.", "space", "wide-3 special"));
-    last.appendChild(makeKbKey("⌫", "back", "wide-2 special"));
-  }
-  rows.appendChild(last);
-}
-
-function makeKbKey(label, action, extraClass) {
-  const b = document.createElement("button");
-  b.type = "button";
-  b.className = "virt-kb-key" + (extraClass ? " " + extraClass : "");
-  b.textContent = label;
-  b.dataset.action = action || label;
-  b.addEventListener("click", () => onVirtKbKey(b.dataset.action));
-  return b;
-}
-
-function onVirtKbKey(action) {
-  switch (action) {
-    case "back":
-      virtKb.draft = virtKb.draft.slice(0, -1);
-      break;
-    case "space":
-      appendVirtKbChar(" ");
-      break;
-    case "shift":
-      if (virtKb.shift && !virtKb.capsLock) {
-        // 1st tap : shift on. 2nd consecutive tap : caps-lock.
-        virtKb.capsLock = true;
-      } else if (virtKb.capsLock) {
-        // Tap while capsLock : turn everything off.
-        virtKb.capsLock = false;
-        virtKb.shift = false;
-      } else {
-        virtKb.shift = true;
-      }
-      renderVirtKeyboardLayout();
-      return;
-    case "to-symbols":
-      virtKb.layout = "symbols";
-      renderVirtKeyboardLayout();
-      return;
-    case "to-alpha":
-      virtKb.layout = "alpha";
-      renderVirtKeyboardLayout();
-      return;
-    default:
-      // Single-character key: respect shift / capsLock for letters.
-      let c = action;
-      if (virtKb.layout === "alpha" && (virtKb.shift || virtKb.capsLock) && c.length === 1) {
-        c = c.toUpperCase();
-      }
-      appendVirtKbChar(c);
-      // Auto-release a one-shot shift (capsLock keeps it on).
-      if (virtKb.shift && !virtKb.capsLock) {
-        virtKb.shift = false;
-        renderVirtKeyboardLayout();
-      }
-      break;
-  }
-  refreshVirtKbDisplay();
-}
-
-function appendVirtKbChar(c) {
-  if (virtKb.target) {
-    const max = parseInt(virtKb.target.getAttribute("maxlength") || "0", 10);
-    if (max > 0 && virtKb.draft.length >= max) return;
-  }
-  virtKb.draft += c;
-}
-
-function refreshVirtKbDisplay() {
-  // Replace ` ` to keep an empty draft visible (otherwise the
-  // height collapses).
-  virtKb.displayEl.textContent = virtKb.draft.length ? virtKb.draft : " ";
-}
-
-// ─── Frequency-keypad enrichments (MRU favorites + step buttons) ──
-//
-// Active when the focused input is an SDR frequency field. The new
-// dynamic-render scheme produces IDs like `sdr-rx-freq-<backend>`
-// or `sdr-tx-freq-<backend>` — one prefix matches every registered
-// backend. The MRU bucket is per-backend, picked off the input's
-// `data-backend` attribute (set when the row was built); step
-// buttons (5 / 6.25 / 12.5 / 25 kHz) work uniformly across all
-// backends. The pick survives keypad close/re-open via
-// `virtKb.stepKHz`.
-const FREQ_INPUT_ID_PREFIX = ["sdr-rx-freq-", "sdr-tx-freq-"];
-const STEP_OPTIONS_KHZ = [5.0, 6.25, 12.5, 25.0];
-virtKb.stepKHz = 6.25;
-
-function isFreqInputId(id) {
-  if (!id) return false;
-  return FREQ_INPUT_ID_PREFIX.some(p => id.startsWith(p));
-}
-
-/// Pick the per-backend MRU list. Reads the `data-backend`
-/// attribute on the input — set by the row builders to the backend
-/// ID. Returns the live array (mutable) so callers can splice.
-function backendIdForFreqInput(targetEl) {
-  if (!targetEl) return null;
-  return targetEl.dataset && targetEl.dataset.backend
-    ? targetEl.dataset.backend : null;
-}
-
-function freqFavoritesArray(backendId) {
-  if (!backendId) return [];
-  ensureBackendEntry(backendId);
-  const entry = currentSettings.sdr_settings.backends[backendId];
-  if (!Array.isArray(entry.freq_favorites)) entry.freq_favorites = [];
-  return entry.freq_favorites;
-}
-
-function renderVirtKbFavoritesRow() {
-  const target = virtKb.target;
-  const backendId = backendIdForFreqInput(target);
-  const favs = backendId ? freqFavoritesArray(backendId) : [];
-  if (favs.length === 0) return;
-  const row = document.createElement("div");
-  row.className = "virt-kb-row virt-kb-favs";
-  for (const hz of favs) {
-    const mhz = (hz / 1e6).toFixed(3);
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "virt-kb-key special";
-    b.textContent = mhz;
-    b.title = `Charger ${mhz} MHz`;
-    b.addEventListener("click", () => {
-      // Strip trailing zeros so "145.500" displays compact, but
-      // keep the decimal point so the user knows it's fractional.
-      virtKb.draft = mhz.replace(/0+$/, "").replace(/\.$/, "");
-      refreshVirtKbDisplay();
-    });
-    row.appendChild(b);
-  }
-  virtKb.rowsEl.appendChild(row);
-}
-
-function renderVirtKbStepRow() {
-  const row = document.createElement("div");
-  row.className = "virt-kb-row virt-kb-step-row";
-  // Step selector — taps cycle through STEP_OPTIONS_KHZ.
-  const stepBtn = document.createElement("button");
-  stepBtn.type = "button";
-  stepBtn.className = "virt-kb-key special wide-2";
-  stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
-  stepBtn.title = "Cycle 5 / 6.25 / 12.5 / 25 kHz";
-  stepBtn.addEventListener("click", () => {
-    const idx = STEP_OPTIONS_KHZ.indexOf(virtKb.stepKHz);
-    virtKb.stepKHz = STEP_OPTIONS_KHZ[(idx + 1) % STEP_OPTIONS_KHZ.length];
-    stepBtn.textContent = `Pas: ${virtKb.stepKHz} kHz`;
-  });
-  row.appendChild(stepBtn);
-
-  const minusBtn = document.createElement("button");
-  minusBtn.type = "button";
-  minusBtn.className = "virt-kb-key";
-  minusBtn.textContent = "−";
-  minusBtn.addEventListener("click", () => stepDraft(-1));
-  row.appendChild(minusBtn);
-
-  const plusBtn = document.createElement("button");
-  plusBtn.type = "button";
-  plusBtn.className = "virt-kb-key";
-  plusBtn.textContent = "+";
-  plusBtn.addEventListener("click", () => stepDraft(+1));
-  row.appendChild(plusBtn);
-
-  virtKb.rowsEl.appendChild(row);
-}
-
-function stepDraft(direction) {
-  // Parse the current draft as MHz (accept partials like "145." or
-  // ""). Empty / unparseable → start from 0.
-  const cur = parseFloat(virtKb.draft);
-  const start = Number.isFinite(cur) ? cur : 0;
-  const deltaMHz = (virtKb.stepKHz / 1000.0) * direction;
-  const next = start + deltaMHz;
-  // 5 decimals = 10 Hz precision, more than enough for amateur
-  // channel rasters. Trim trailing zeros for compact display.
-  let fixed = next.toFixed(5).replace(/0+$/, "").replace(/\.$/, "");
-  if (fixed === "" || fixed === "-") fixed = "0";
-  virtKb.draft = fixed;
-  refreshVirtKbDisplay();
-}
-
-/// Push a freshly-validated frequency (MHz) onto the per-backend
-/// MRU list. Dedup on Hz equality, prepend, cap at 6. Persists via
-/// `save_settings` so the next keypad open already shows it. The
-/// MRU bucket is the live array under
-/// `currentSettings.sdr_settings.backends[backendId].freq_favorites`.
-async function pushFreqMru(mhz, targetEl) {
-  if (!Number.isFinite(mhz) || mhz <= 0) return;
-  const backendId = backendIdForFreqInput(targetEl);
-  if (!backendId) return;
-  const hz = Math.round(mhz * 1e6);
-  const list = freqFavoritesArray(backendId);
-  const idx = list.indexOf(hz);
-  if (idx !== -1) list.splice(idx, 1);
-  list.unshift(hz);
-  while (list.length > 6) list.pop();
-  if (window.__TAURI__ && window.__TAURI__.core) {
-    try {
-      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
-    } catch (err) {
-      console.warn("save favorites:", err);
-    }
-  }
-}
-
-if (document.readyState === "loading") {
-  window.addEventListener("DOMContentLoaded", init);
-} else {
-  init();
 }

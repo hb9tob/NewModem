@@ -20,7 +20,6 @@
       <span id="v2-progress-text">—</span>
     </span>
     <span id="status" class="status">prêt</span>
-    <span id="app-version" class="app-version" title="Version de l'application">—</span>
   </header>
   <nav class="tab-bar">
     <button class="tab active" data-tab="rx">RX</button>
@@ -292,11 +291,6 @@
           <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
         <fieldset>
-          <legend>Locator Maidenhead</legend>
-          <input type="text" id="locator-input" placeholder="JN36ld" maxlength="8">
-          <div class="tx-hint">Position de la station (4, 6 ou 8 caractères). Envoyé au collector avec chaque sondage.</div>
-        </fieldset>
-        <fieldset>
           <legend>Périphérique réception (RX)</legend>
           <select id="rx-device-select">
             <option>Chargement…</option>
@@ -311,6 +305,18 @@
             level-meter inchangés — seul le démod modem voit le signal
             filtré. À activer si le récepteur radio n'applique pas (ou
             insuffisamment) la désemphase.
+          </p>
+          <label class="ptt-row" style="margin-top: 0.7rem;">
+            <input type="checkbox" id="rx-allow-legacy-grid">
+            Grille de drift ±15 ppm (cold start)
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Filet de sécurité utilisé sur le 1er SF d'une session lorsque
+            l'estimateur Gardner échoue : 6 tentatives supplémentaires à
+            ±15 ppm autour de zéro. Coût ~480 ms de CPU par tick raté.
+            Recommandé sur PC moderne (négligeable). Décocher sur Pi
+            ou vieux PC où le worker peut prendre du retard temps-réel.
+            <em>Désactivé par défaut sur Raspberry Pi.</em>
           </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
                in main.js fills this from `BackendCapabilities` of the
@@ -590,7 +596,6 @@
               </label>
             </div>
             <datalist id="sounder-rig-models">
-              <!-- Yaesu -->
               <option value="Yaesu FTX-1"></option>
               <option value="Yaesu FT-991A"></option>
               <option value="Yaesu FT-857D"></option>
@@ -605,19 +610,16 @@
               <option value="Yaesu FT-DX101"></option>
               <option value="Yaesu FT-2DR"></option>
               <option value="Yaesu FT-5DR"></option>
-              <!-- Icom -->
               <option value="Icom IC-705"></option>
               <option value="Icom IC-7300"></option>
               <option value="Icom IC-7610"></option>
               <option value="Icom IC-7100"></option>
               <option value="Icom IC-9700"></option>
               <option value="Icom IC-R8600"></option>
-              <option value="Icom IC-705"></option>
               <option value="Icom IC-V86"></option>
               <option value="Icom ID-52"></option>
               <option value="Icom IC-2730"></option>
               <option value="Icom IC-5100"></option>
-              <!-- Kenwood -->
               <option value="Kenwood TS-590S"></option>
               <option value="Kenwood TS-590SG"></option>
               <option value="Kenwood TS-890S"></option>
@@ -626,12 +628,10 @@
               <option value="Kenwood TM-D710"></option>
               <option value="Kenwood TH-D74"></option>
               <option value="Kenwood TH-D75"></option>
-              <!-- Elecraft -->
               <option value="Elecraft K3S"></option>
               <option value="Elecraft K4"></option>
               <option value="Elecraft KX2"></option>
               <option value="Elecraft KX3"></option>
-              <!-- Xiegu / portable / SDR -->
               <option value="Xiegu G90"></option>
               <option value="Xiegu X6100"></option>
               <option value="Xiegu G106"></option>
