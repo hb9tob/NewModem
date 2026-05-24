@@ -223,6 +223,15 @@ fn list_modem_profiles() -> Vec<modem_core::traits::ProfileDescriptor> {
     modem_core::v3_modem::V3Modem.list_profiles()
 }
 
+/// Single source of truth for the user-visible app version: read it from
+/// `tauri.conf.json` via `package_info()` so the chip in the tab bar
+/// stays in sync with the .deb / installer version automatically (no
+/// hard-coded string in the frontend to drift after a release bump).
+#[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 #[tauri::command]
 fn get_settings() -> Settings {
     settings::load()
@@ -1906,6 +1915,7 @@ fn main() {
             list_sdr_devices,
             get_sdr_device_capabilities,
             list_modem_profiles,
+            get_app_version,
             list_serial_ports,
             ptt_status,
             get_settings,

@@ -4865,11 +4865,31 @@ function setupKioskMode() {
   });
 }
 
+// Resolve the running app version from the Tauri backend (which reads it
+// from tauri.conf.json — same string that ends up in the .deb) and paint
+// it into the right-pinned chip in the tab bar. Fire-and-forget; on
+// failure we fall back to the literal "?" so it's obvious the chip is
+// live and just couldn't talk to the backend.
+async function setupAppVersionChip() {
+  const el = document.getElementById("app-version");
+  if (!el) return;
+  try {
+    const { invoke } = window.__TAURI__.core;
+    const v = await invoke("get_app_version");
+    el.textContent = `v${v}`;
+    el.title = `Version de l'application : ${v}`;
+  } catch (e) {
+    console.error("get_app_version", e);
+    el.textContent = "v?";
+  }
+}
+
 async function init() {
   setupKioskMode();
   setupSelectPicker();
   setupVirtKeyboard();
   setupTabs();
+  setupAppVersionChip();
   setupLightbox();
   setupTxTab();
   setupSettingsTab();

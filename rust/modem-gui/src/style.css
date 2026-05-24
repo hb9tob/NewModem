@@ -262,6 +262,25 @@ body {
   border-bottom-color: #1e1e1e;
   margin-bottom: -1px;
 }
+/* Version chip pinned at the right of the tab bar. Always visible — the
+   user explicitly asked for the version to stay readable at a glance,
+   so we don't hide it in kiosk mode (just shrink it). Sits between the
+   Info tab and the kiosk-exit ✕ button when both are present. */
+.app-version {
+  align-self: center;
+  margin: 0.25rem 0.25rem 0.25rem 0.5rem;
+  padding: 2px 8px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.78rem;
+  color: #c8d4dc;
+  background: #2b3946;
+  border: 1px solid #3c4d5c;
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  user-select: none;
+  flex: 0 0 auto;
+}
 html, body {
   height: 100%;
   overflow: hidden;
@@ -2194,6 +2213,15 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
     text-overflow: ellipsis;
   }
   .tab-bar .tab[data-tab="info"] { display: none; }
+
+  /* Version chip compact on the 800×480 panel: shaves ~12 px so the
+     7 tabs + chip + kiosk-exit fit without truncating tab labels. */
+  .app-version {
+    font-size: 9.5px;
+    padding: 1px 5px;
+    margin: 2px 2px 2px 4px;
+    letter-spacing: 0;
+  }
 
   /* Top bar — compact, never wraps (height stays ~22 px). */
   .top-bar {
