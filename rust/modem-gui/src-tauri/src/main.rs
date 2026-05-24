@@ -431,7 +431,7 @@ fn build_capture_session(
     // don't need it — we still pass an Arc to keep `rx_worker::spawn`'s
     // signature uniform; the SDR-side counter just stays at zero and
     // the GUI chip never lights up for that reason.
-    let (capture, samples, dropped_samples) =
+    let (capture, samples, dropped_samples, is_sdr_source) =
         if let Some((backend, device_id)) = sdr_registry::parse_composite_name(device_name) {
             let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
             let descriptor = DeviceDescriptor::new(
@@ -449,12 +449,25 @@ fn build_capture_session(
                 CaptureKind::Sdr(device, cap_handle),
                 rx,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
             )
         } else {
             let (h, rx) = cpal_capture::start(device_name)?;
             let dropped = h.dropped_samples.clone();
-            (CaptureKind::Cpal(h), rx, dropped)
+            (CaptureKind::Cpal(h), rx, dropped, false)
         };
+    // SDR backends apply `DeemphasisLpf` unconditionally inside
+    // `NbfmRxChain` (modem-sdr-dsp/nbfm_rx_chain.rs:250). Forcing the
+    // worker-side toggle off when the source is SDR avoids the double-
+    // deemph that would over-attenuate the modem passband — the GUI
+    // checkbox is a soundcard-only knob in practice.
+    let effective_deemphasis = cfg.rx_deemphasis_enabled && !is_sdr_source;
+    if is_sdr_source && cfg.rx_deemphasis_enabled {
+        eprintln!(
+            "[rx] device '{device_name}' is SDR — ignoring rx_deemphasis_enabled \
+             (NbfmRxChain already applies DeemphasisLpf in-chain)"
+        );
+    }
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
         samples,
@@ -463,7 +476,7 @@ fn build_capture_session(
         state.wav_sink.clone(),
         profile_idx,
         forced,
-        cfg.rx_deemphasis_enabled,
+        effective_deemphasis,
         cfg.rx_allow_legacy_grid,
         dropped_samples,
     );

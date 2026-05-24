@@ -34,7 +34,7 @@ use modem_framing::{
     raptorq_codec::k_from_payload,
 };
 use modem_io::SampleSink;
-use modem_sdr_dsp::emphasis::preemphasis_nbfm_48k;
+use modem_sdr_dsp::audio_filters::PreemphasisHpf;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -544,13 +544,17 @@ fn run_playback(
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
 ) {
-    // Optional NBFM pre-emphasis (+6 dB/oct, tau = 750 us). Applied
-    // BEFORE the attenuation so that the re-normalized peak still
-    // respects the ATT setpoint. The shelf strongly lifts the high audio
-    // frequencies (+13 dB at 1 kHz, +18 dB at 2.7 kHz, plateau +20 dB):
-    // without re-normalization the signal would clip the sound card.
+    // Optional PM-emulation pre-emphasis (+6 dB/oct, 300 Hz zero /
+    // 12 kHz pole). Symmetric counterpart of the RX-side
+    // `DeemphasisLpf::calibrated` toggle: a legacy FM radio that lacks
+    // the PM ±6 dB/oct intrinsic gets the rising slope painted on by
+    // the modem so the over-the-air signal matches what a PM radio
+    // would produce. Applied BEFORE the attenuation so the re-
+    // normalized peak still respects the ATT setpoint. In-band gain
+    // tops out around +18 dB at 2.6 kHz, so re-normalization is still
+    // required to avoid sound-card clipping.
     if preemphasis_enabled {
-        preemphasis_nbfm_48k(&mut samples);
+        PreemphasisHpf::calibrated(AUDIO_RATE as f32).process(&mut samples);
         // Re-peak-normalize back to the modem-cli output level
         // (PEAK_NORMALIZE = 0.9 in modem-core::types). Keeps ~0.9 dB of
         // headroom before int16/F32 saturation regardless of the shelf

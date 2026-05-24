@@ -31,7 +31,7 @@ use modem_core::profile::{ModemConfig, ProfileIndex};
 use modem_core::rrc;
 use modem_core::rx_v2;
 use modem_core::sync as rx_sync;
-use modem_sdr_dsp::emphasis::DeemphasisFilter;
+use modem_sdr_dsp::audio_filters::DeemphasisLpf;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
@@ -683,7 +683,7 @@ struct WorkerState {
     /// Optional NBFM de-emphasis filter applied to the path going to the
     /// modem demodulator (after the raw WAV tee + level meter). `None`
     /// when the user has not enabled the toggle in Settings.
-    deemphasis: Option<DeemphasisFilter>,
+    deemphasis: Option<DeemphasisLpf>,
     /// Operator-controlled flag (Settings tab) : when `true`, the
     /// legacy `rx_v2()` ±15 ppm safety grid is allowed on cold-start
     /// CLOSED decodes that didn't get a session-level Gardner hint.
@@ -798,7 +798,7 @@ impl WorkerState {
             session_started_at: now,
             last_preamble_seen_at: now,
             total_samples: 0,
-            deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
+            deemphasis: deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32)),
             allow_legacy_grid,
             session_drift_ppm: None,
             perf_acc: rx_v2::PerfBreakdown::default(),
@@ -1019,11 +1019,12 @@ fn run_worker(
             state.last_audio_above_silence_at = Instant::now();
         }
 
-        // Optional NBFM de-emphasis. Applied AFTER the raw WAV tee and the
-        // audio_level metric so those still reflect what the radio actually
-        // delivered (clip diagnostics stay meaningful), and BEFORE feeding
-        // the modem demodulator so rx_v3 sees a flat spectrum when paired
-        // with a transmitter that ran the matching pre-emphasis.
+        // Optional PM-emulation de-emphasis (single-pole LPF, 300 Hz corner,
+        // -6 dB/oct slope) for legacy FM radios that lack the PM ±6 dB/oct
+        // intrinsic. Default off — modern PM radios already compensate
+        // internally and don't need this. Applied AFTER the raw WAV tee and
+        // the audio_level metric (so clip diagnostics still reflect what the
+        // radio actually delivered) and BEFORE the modem demodulator.
         if let Some(filter) = state.deemphasis.as_mut() {
             filter.process(&mut batch);
         }

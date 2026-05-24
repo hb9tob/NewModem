@@ -297,14 +297,16 @@
           </select>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="rx-deemphasis-enabled">
-            Désemphase NBFM −6 dB/oct (τ = 750 µs)
+            Désemphase PM −6 dB/oct (radio FM legacy)
           </label>
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
-            Inverse mathématique exact de la pré-emphase TX (~−13 dB à 1 kHz,
-            ~−18 dB à 2.7 kHz, plateau −20 dB). Capture WAV brute et
-            level-meter inchangés — seul le démod modem voit le signal
-            filtré. À activer si le récepteur radio n'applique pas (ou
-            insuffisamment) la désemphase.
+            Pente descendante −6 dB/oct au-dessus de 300 Hz (~−10 dB à 1 kHz,
+            ~−19 dB à 2.7 kHz). Symétrique exacte de la pré-emphase TX
+            ci-dessous : ensemble, ils émulent le ±6 dB/oct intrinsèque
+            d'une radio PM. Capture WAV brute et level-meter inchangés —
+            seul le démod modem voit le signal filtré. À activer
+            uniquement si la radio fait du vrai FM (sans le ±6 dB/oct PM
+            natif).
           </p>
           <label class="ptt-row" style="margin-top: 0.7rem;">
             <input type="checkbox" id="rx-allow-legacy-grid">
@@ -334,13 +336,15 @@
           </select>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="tx-preemphasis-enabled">
-            Pré-emphase NBFM +6 dB/oct (τ = 750 µs)
+            Pré-emphase PM +6 dB/oct (radio FM legacy)
           </label>
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
-            Boost des aigus dès ~212 Hz (~+13 dB à 1 kHz, ~+18 dB à 2.7 kHz,
-            plateau +20 dB). Le signal est re-normalisé après filtrage pour
-            ne pas écrêter la sortie TX. À activer si la chaîne audio TX
-            n'effectue pas elle-même la pré-emphase.
+            Pente montante +6 dB/oct au-dessus de 300 Hz (~+10 dB à 1 kHz,
+            ~+19 dB à 2.7 kHz). Émule la pré-emphase ±6 dB/oct intrinsèque
+            d'une radio PM. Le signal est re-normalisé après filtrage pour
+            ne pas écrêter la sortie TX. À activer uniquement si la radio
+            fait du vrai FM (sans le ±6 dB/oct PM natif) — toujours en
+            duo avec la désemphase RX côté récepteur.
           </p>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="tx-save-wav-enabled">

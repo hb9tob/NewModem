@@ -178,6 +178,91 @@ impl SubAudioHpf {
     }
 }
 
+/// Single-pole / single-zero high-shelf filter that synthesises a
+/// PM `+6 dB/oct` pre-emphasis across the useful NBFM audio band.
+///
+/// Analog prototype: `H(s) = (1 + s/ω_z) / (1 + s/ω_p)` with
+/// `ω_z = 2π·zero_hz` (the rising zero) and `ω_p = 2π·pole_hz`
+/// (a stabilising pole well above the audio band). Bilinear-with-prewarp
+/// at `sample_rate_hz`, same family as [`DeemphasisLpf`] and
+/// [`SubAudioHpf`].
+///
+/// With the calibrated defaults `zero_hz = 300 Hz` / `pole_hz = 12 kHz`:
+/// - DC – 300 Hz : flat (gain ≈ 1, matches [`DeemphasisLpf::DEFAULT_CORNER_HZ`])
+/// - 300 Hz – 2.6 kHz : `+6 dB/oct` rising (useful NBFM band)
+/// - ≫ 12 kHz : plateau (~ +32 dB)
+///
+/// Cascaded with [`DeemphasisLpf::calibrated`] the round-trip is flat
+/// to within fractions of a dB across the audio band. The use case is
+/// the legacy-FM-radio opt-in in the GUI Settings: a radio that does
+/// real FM (no intrinsic PM `±6 dB/oct`) needs the modem to apply this
+/// pre-emphasis on TX so the over-the-air signal matches what a PM
+/// radio would produce.
+#[derive(Debug, Clone)]
+pub struct PreemphasisHpf {
+    b0: f32,
+    b1: f32,
+    a1: f32,
+    x_prev: f32,
+    y_prev: f32,
+}
+
+impl PreemphasisHpf {
+    /// Default zero corner — matches [`DeemphasisLpf::DEFAULT_CORNER_HZ`]
+    /// so the two cascade flat across the useful audio band.
+    pub const DEFAULT_ZERO_HZ: f32 = 300.0;
+    /// Default stabilising pole, set well above the NBFM audio band
+    /// (2.6 kHz top) so the `+6 dB/oct` slope dominates from 300 Hz
+    /// upward. `fs/4` at 48 kHz audio.
+    pub const DEFAULT_POLE_HZ: f32 = 12_000.0;
+
+    pub fn new(sample_rate_hz: f32, zero_hz: f32, pole_hz: f32) -> Self {
+        debug_assert!(sample_rate_hz > 0.0);
+        debug_assert!(zero_hz > 0.0 && zero_hz < sample_rate_hz / 2.0);
+        debug_assert!(pole_hz > zero_hz && pole_hz < sample_rate_hz / 2.0);
+        let w_z = TAU * zero_hz;
+        let w_p = TAU * pole_hz;
+        let w_z_a = 2.0 * sample_rate_hz * (w_z / (2.0 * sample_rate_hz)).tan();
+        let w_p_a = 2.0 * sample_rate_hz * (w_p / (2.0 * sample_rate_hz)).tan();
+        let two_fs = 2.0 * sample_rate_hz;
+        let denom = w_z_a * (w_p_a + two_fs);
+        let b0 = w_p_a * (w_z_a + two_fs) / denom;
+        let b1 = w_p_a * (w_z_a - two_fs) / denom;
+        let a1 = (w_p_a - two_fs) / (w_p_a + two_fs);
+        Self {
+            b0,
+            b1,
+            a1,
+            x_prev: 0.0,
+            y_prev: 0.0,
+        }
+    }
+
+    pub fn calibrated(sample_rate_hz: f32) -> Self {
+        Self::new(sample_rate_hz, Self::DEFAULT_ZERO_HZ, Self::DEFAULT_POLE_HZ)
+    }
+
+    pub fn process(&mut self, samples: &mut [f32]) {
+        let (b0, b1, a1) = (self.b0, self.b1, self.a1);
+        let mut xp = self.x_prev;
+        let mut yp = self.y_prev;
+        for s in samples.iter_mut() {
+            let x = *s;
+            let y = b0 * x + b1 * xp - a1 * yp;
+            xp = x;
+            yp = y;
+            *s = y;
+        }
+        self.x_prev = xp;
+        self.y_prev = yp;
+    }
+
+    pub fn reset(&mut self) {
+        self.x_prev = 0.0;
+        self.y_prev = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +400,56 @@ mod tests {
             err_db.abs() < 0.5,
             "PM→FM-demod→deemph scale = {scale} (expected {expected}), err = {err_db} dB"
         );
+    }
+
+    /// PreemphasisHpf → DeemphasisLpf cascade should be magnitude-flat
+    /// across the useful NBFM audio band (300 Hz – 2.6 kHz). Tone-by-tone
+    /// amplitude check — the cascade has non-zero phase response (IIR), so
+    /// a per-sample SNR test would be pessimistic. Magnitude is what
+    /// matters for the legacy-FM-radio PM-emulation use case.
+    #[test]
+    fn preemph_deemph_pm_cascade_flat_in_audio_band() {
+        let fs = 48_000.0_f32;
+        let n = 8_192_usize;
+        let amp = 0.1_f32;
+        for &f in &[500.0_f32, 1_000.0, 2_000.0, 2_500.0] {
+            let signal_in: Vec<f32> = (0..n)
+                .map(|k| amp * (2.0 * PI * f * k as f32 / fs).sin())
+                .collect();
+            let mut s = signal_in.clone();
+            PreemphasisHpf::calibrated(fs).process(&mut s);
+            DeemphasisLpf::calibrated(fs).process(&mut s);
+            // Skip 2000 samples for transients to settle.
+            let in_rms = (signal_in[2000..].iter().map(|v| v * v).sum::<f32>()
+                / (n - 2000) as f32)
+                .sqrt();
+            let out_rms = (s[2000..].iter().map(|v| v * v).sum::<f32>() / (n - 2000) as f32)
+                .sqrt();
+            let mag_db = 20.0 * (out_rms / in_rms).log10();
+            // Cascade ≈ 1/(1 + s/ω_pole) at 12 kHz. Worst-case in band
+            // at 2.5 kHz: |H| = 1/√(1+(2.5/12)²) ≈ -0.19 dB. ±0.5 dB
+            // allows for bilinear prewarp distortion.
+            assert!(
+                mag_db.abs() < 0.5,
+                "cascade |H| at {f} Hz = {mag_db} dB (target ±0.5 dB)"
+            );
+        }
+    }
+
+    /// Cascade DC gain must be 1 (PreemphasisHpf default zero matches
+    /// DeemphasisLpf default corner → the cascade is `1/(1+s/ω_pole)`
+    /// at DC = 1.0 exactly).
+    #[test]
+    fn preemph_deemph_cascade_dc_gain_is_one() {
+        let fs = 48_000.0_f32;
+        let mut buf = vec![0.5_f32; 8_192];
+        PreemphasisHpf::calibrated(fs).process(&mut buf);
+        DeemphasisLpf::calibrated(fs).process(&mut buf);
+        let max_err = buf
+            .iter()
+            .skip(4_000)
+            .map(|v| (v - 0.5).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_err < 1e-3, "cascade DC gain error = {max_err}");
     }
 }
