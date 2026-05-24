@@ -375,7 +375,9 @@ pub struct DerivedChannelParams {
     pub noise_floor_dbfs: f32,
     /// 50 % cumulative-power delay spread (µs) from the Golay
     /// impulse-response probe, NaN if no Golay probe in the schedule.
-    /// A bigger number means more group-delay smear / multipath.
+    /// Raw value — still contains the OTA chain group-delay smear.
+    /// See `multipath_delay_50_us` / `ota_smear_us` for the dual-BW
+    /// separation.
     #[serde(default = "f32_nan")]
     pub delay_spread_50_us: f32,
     /// 90 % cumulative-power delay spread (µs), same definition.
@@ -386,6 +388,24 @@ pub struct DerivedChannelParams {
     /// ground-bounce multipath, or filter ringing.
     #[serde(default = "f32_nan")]
     pub strongest_echo_dbc: f32,
+    /// Multipath-only 50 % delay spread (µs) — the residual after
+    /// subtracting the OTA chain group-delay contribution measured by
+    /// pairing two Golay probes at different chip rates. NaN unless
+    /// the schedule contains at least one matching low+high-BW Golay
+    /// pair at the same level + carrier. Negative values are clamped
+    /// to 0 (would indicate the channel improves with narrower probe,
+    /// which is non-physical and means group-delay dominates).
+    #[serde(default = "f32_nan")]
+    pub multipath_delay_50_us: f32,
+    /// Multipath-only 90 % delay spread (µs), same definition.
+    #[serde(default = "f32_nan")]
+    pub multipath_delay_90_us: f32,
+    /// OTA chain group-delay smear contribution (µs) extracted from the
+    /// dual-BW Golay solve. NaN if no dual-BW pair available. This is
+    /// the part of `delay_spread_*_us` caused by the audio filters /
+    /// pre-emphasis chain — independent of any real channel multipath.
+    #[serde(default = "f32_nan")]
+    pub ota_smear_us: f32,
     // Phase-2 reserved
     #[serde(default)]
     pub lorentzian_corner_hz: Option<f32>,
@@ -786,6 +806,124 @@ pub fn analyze_capture(
         }
     }
 
+    // Dual-BW Golay solve — separate true multipath from OTA group-delay
+    // smear. For a bandlimited probe at chip rate B, the IR mainlobe
+    // width scales as 1/B, so the cumulative-energy delay spread
+    // splits into a B-dependent smear plus a B-independent multipath
+    // contribution:
+    //
+    //     D(B) = k / B + M
+    //
+    // With two probes at B_lo < B_hi sharing the same carrier and level
+    // (so the IR's underlying channel is identical, only the probe BW
+    // differs), we can solve:
+    //
+    //     M     = (D_lo·B_lo·(B_hi - B_lo) - ... ) -> simpler form:
+    //     M     = (B_hi·D_hi - B_lo·D_lo) / (B_hi - B_lo)
+    //     smear = (D_lo - D_hi)·B_lo·B_hi / (B_hi - B_lo)   [at B = 1]
+    //
+    // We report `smear / B_lo` (= the µs contribution of the chain to
+    // the low-BW probe) as `ota_smear_us` since that's the unit users
+    // expect. Negative `M` clamps to 0 (non-physical residue from
+    // measurement noise).
+    let mut multipath_50 = f32::NAN;
+    let mut multipath_90 = f32::NAN;
+    let mut ota_smear = f32::NAN;
+    {
+        // Group Golay indices by (level_db_int, carrier_int) → list of
+        // (chip_rate, idx, peak). Use rounded ints to bucket noisy
+        // floating-point keys.
+        use std::collections::HashMap;
+        let mut groups: HashMap<(i32, i32), Vec<(f64, usize, f32)>> =
+            HashMap::new();
+        for (i, m) in measurements.iter().enumerate() {
+            if let ProbeMeasurement::GolayPair {
+                chip_rate_hz,
+                carrier_hz,
+                result,
+                ..
+            } = m
+            {
+                if !result.peak_amplitude.is_finite() {
+                    continue;
+                }
+                let lvl_key = (levels[i] * 10.0).round() as i32;
+                let car_key = carrier_hz.round() as i32;
+                groups.entry((lvl_key, car_key)).or_default().push((
+                    *chip_rate_hz,
+                    i,
+                    result.peak_amplitude,
+                ));
+            }
+        }
+        // For each bucket, find the lowest- and highest-rate entries.
+        // Score = min(peak_lo, peak_hi). Keep the bucket with the best
+        // score for the headline values.
+        let mut best_pair: Option<(usize, usize, f32)> = None;
+        for entries in groups.values() {
+            if entries.len() < 2 {
+                continue;
+            }
+            let mut lo = &entries[0];
+            let mut hi = &entries[0];
+            for e in entries {
+                if e.0 < lo.0 {
+                    lo = e;
+                }
+                if e.0 > hi.0 {
+                    hi = e;
+                }
+            }
+            if lo.0 == hi.0 {
+                continue;
+            }
+            let score = lo.2.min(hi.2);
+            match best_pair {
+                None => best_pair = Some((lo.1, hi.1, score)),
+                Some((_, _, s)) if score > s => {
+                    best_pair = Some((lo.1, hi.1, score));
+                }
+                _ => {}
+            }
+        }
+        if let Some((idx_lo, idx_hi, _)) = best_pair {
+            if let (
+                ProbeMeasurement::GolayPair {
+                    chip_rate_hz: b_lo,
+                    result: r_lo,
+                    ..
+                },
+                ProbeMeasurement::GolayPair {
+                    chip_rate_hz: b_hi,
+                    result: r_hi,
+                    ..
+                },
+            ) = (&measurements[idx_lo], &measurements[idx_hi])
+            {
+                let solve = |d_lo: f32, d_hi: f32| -> (f32, f32) {
+                    let blo = *b_lo as f32;
+                    let bhi = *b_hi as f32;
+                    if !d_lo.is_finite() || !d_hi.is_finite() || bhi <= blo {
+                        return (f32::NAN, f32::NAN);
+                    }
+                    let m = (bhi * d_hi - blo * d_lo) / (bhi - blo);
+                    let smear_at_lo = (d_lo - d_hi) * bhi / (bhi - blo);
+                    (m.max(0.0), smear_at_lo.max(0.0))
+                };
+                let (m50, smear50) =
+                    solve(r_lo.delay_spread_50_us, r_hi.delay_spread_50_us);
+                let (m90, _) =
+                    solve(r_lo.delay_spread_90_us, r_hi.delay_spread_90_us);
+                multipath_50 = m50;
+                multipath_90 = m90;
+                // Report the smear at the low-BW probe — the value the
+                // user would otherwise read as a "delay spread" on a
+                // single-BW capture.
+                ota_smear = smear50;
+            }
+        }
+    }
+
     // 4. Build the over-modulation verdict.
     let verdict = build_verdict(
         sweet,
@@ -813,6 +951,9 @@ pub fn analyze_capture(
             delay_spread_50_us: delay_50,
             delay_spread_90_us: delay_90,
             strongest_echo_dbc: echo_dbc,
+            multipath_delay_50_us: multipath_50,
+            multipath_delay_90_us: multipath_90,
+            ota_smear_us: ota_smear,
             lorentzian_corner_hz: None,
             fading_doppler_spread_hz: None,
         },

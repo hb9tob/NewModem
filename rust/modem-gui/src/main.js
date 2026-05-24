@@ -5566,13 +5566,27 @@ function defaultSounderProbes() {
       rms: 0.2 * amp,
       seed: 0xc0ffee,
     }),
-    // 6 — Golay complementary-pair impulse response. BPSK on
+    // 6 — Golay complementary-pair impulse response (high-BW). BPSK on
     //     1500 Hz carrier, 256 chips at 1200 chip/s → ≈ 213 ms per
     //     sequence × 2 + 100 ms gap × 2 ≈ 0.63 s / level instance.
     (amp) => ({
       kind: "golay_pair",
       length_bits: 256,
       chip_rate_hz: 1200.0,
+      carrier_hz: 1500.0,
+      amplitude: 0.7 * amp,
+      gap_s: 0.1,
+    }),
+    // 7 — Golay complementary-pair impulse response (low-BW). Same
+    //     carrier + length as #6 but half the chip rate (600 chip/s),
+    //     which doubles the IR mainlobe width. Pairing the two BWs at
+    //     the analyser lets us split true multipath from OTA-chain
+    //     group-delay smear (see `sounder.rs` dual-BW Golay solve).
+    //     ≈ 427 ms per sequence × 2 + 100 ms gap × 2 ≈ 1.05 s / level.
+    (amp) => ({
+      kind: "golay_pair",
+      length_bits: 256,
+      chip_rate_hz: 600.0,
       carrier_hz: 1500.0,
       amplitude: 0.7 * amp,
       gap_s: 0.1,
@@ -5831,6 +5845,18 @@ async function runSounderAnalyze() {
     );
     document.getElementById("sd-d90").textContent = fmtNumOrDash(
       d.delay_spread_90_us,
+      0,
+    );
+    document.getElementById("sd-mp50").textContent = fmtNumOrDash(
+      d.multipath_delay_50_us,
+      0,
+    );
+    document.getElementById("sd-mp90").textContent = fmtNumOrDash(
+      d.multipath_delay_90_us,
+      0,
+    );
+    document.getElementById("sd-smear").textContent = fmtNumOrDash(
+      d.ota_smear_us,
       0,
     );
     document.getElementById("sd-echo").textContent = fmtNumOrDash(

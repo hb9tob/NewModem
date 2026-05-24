@@ -308,14 +308,13 @@
           </p>
           <label class="ptt-row" style="margin-top: 0.7rem;">
             <input type="checkbox" id="rx-allow-legacy-grid">
-            Grille de drift ±15 ppm (cold start)
+            Power Mode
           </label>
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
-            Filet de sécurité utilisé sur le 1er SF d'une session lorsque
-            l'estimateur Gardner échoue : 6 tentatives supplémentaires à
-            ±15 ppm autour de zéro. Coût ~480 ms de CPU par tick raté.
-            Recommandé sur PC moderne (négligeable). Décocher sur Pi
-            ou vieux PC où le worker peut prendre du retard temps-réel.
+            Active le filet de sécurité CPU au démarrage de session
+            (recherche de drift étendue ±15 ppm si l'estimateur principal
+            échoue). Recommandé sur PC moderne, à décocher sur Pi ou
+            vieux PC où le worker peut prendre du retard temps-réel.
             <em>Désactivé par défaut sur Raspberry Pi.</em>
           </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
@@ -739,8 +738,11 @@
                   <tr><th>BW −3 dB</th><td><span id="sd-bw">—</span> Hz</td></tr>
                   <tr><th>Group delay (pic)</th><td><span id="sd-gd">—</span> µs</td></tr>
                   <tr><th>Plancher de bruit</th><td><span id="sd-noise">—</span> dBFS</td></tr>
-                  <tr><th>Delay spread 50 %</th><td><span id="sd-d50">—</span> µs</td></tr>
-                  <tr><th>Delay spread 90 %</th><td><span id="sd-d90">—</span> µs</td></tr>
+                  <tr><th>Delay spread 50 % (brut)</th><td><span id="sd-d50">—</span> µs</td></tr>
+                  <tr><th>Delay spread 90 % (brut)</th><td><span id="sd-d90">—</span> µs</td></tr>
+                  <tr><th>Multipath 50 % (sans group delay)</th><td><span id="sd-mp50">—</span> µs</td></tr>
+                  <tr><th>Multipath 90 % (sans group delay)</th><td><span id="sd-mp90">—</span> µs</td></tr>
+                  <tr><th>Smear chaîne OTA</th><td><span id="sd-smear">—</span> µs</td></tr>
                   <tr><th>Plus fort écho</th><td><span id="sd-echo">—</span> dBc</td></tr>
                   <tr><th>Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
                 </tbody>
