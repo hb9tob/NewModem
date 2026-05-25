@@ -600,9 +600,10 @@ const TRUNCATE_MARGIN_MS: usize = 100;
 /// anyway (`MAX_SESSION_SECONDS`).
 const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 
-/// Fall back to Idle if no preamble has been seen for this long while
-/// Capturing — covers the case where the sender disappears mid-burst
-/// without sending an EOT.
+/// Base value of the preamble-absence fallback : if Capturing and no
+/// preamble has been seen for this long, return to Idle. Scaled per
+/// profile by `preamble_absence_timeout` — see that function for the
+/// rationale on why slow profiles need a larger margin.
 ///
 /// **Not** an audio-silence timer : in radio there is no silence once
 /// the TX un-keys, the RX AGC ramps up to noise floor and the demod
@@ -610,7 +611,26 @@ const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 /// of a decoded preamble** — the only signature that a real signal
 /// is on-air. Renamed in 0.10.42 from the historical
 /// `PREAMBLE_SILENCE_TIMEOUT_S` to make the semantics explicit.
-const PREAMBLE_ABSENCE_TIMEOUT_S: u64 = 6;
+const PREAMBLE_ABSENCE_TIMEOUT_BASE_S: u64 = 6;
+
+/// Per-profile preamble-absence timeout.
+///
+/// Scales linearly with samples-per-symbol (sps = AUDIO_RATE / Rs) so
+/// slow profiles get a proportionally longer window to redecode their
+/// next preamble. `V3_PREAMBLE_PERIOD_S` is 4 s for every profile, but
+/// the closed-window decode that confirms a still-live burst needs at
+/// least 2 consecutive preambles plus MF/Gardner pre-roll. For ULTRA
+/// (sps=96) this takes ~3 periods to lock — a uniform 6 s timeout
+/// triggers a full `soft_reset_buffer` mid-burst and the codewords are
+/// lost. Linear scaling on sps gives 6 s for sps=32 (NORMAL/HIGH/MEGA/
+/// HIGH+/HIGH++/HIGH56/HIGH+56/FAST), 9 s for ROBUST (sps=48), 18 s
+/// for ULTRA (sps=96), well under `MAX_SESSION_SECONDS`.
+fn preamble_absence_timeout(config: &modem_core::profile::ModemConfig) -> Duration {
+    let sps = (AUDIO_RATE as f64 / config.symbol_rate).round().max(1.0);
+    let scale = (sps / 32.0).max(1.0);
+    let secs = (PREAMBLE_ABSENCE_TIMEOUT_BASE_S as f64 * scale).ceil() as u64;
+    Duration::from_secs(secs)
+}
 
 /// Late-entry recovery (lowpower path only, `!allow_legacy_grid`).
 ///
@@ -1220,7 +1240,7 @@ fn maintenance_tick(
     }
 
     // Preamble-absence fallback : if we're Capturing but haven't seen a
-    // confirmed preamble for PREAMBLE_ABSENCE_TIMEOUT_S, the sender likely
+    // confirmed preamble for `preamble_absence_timeout(state.config)`, the sender likely
     // vanished mid-burst (no EOT received). Full reset back to Idle so the
     // next salve starts on a truly cold worker. NB : "absence" not
     // "silence" -- post-TX the RX AGC produces FM-tinted noise well
@@ -1229,8 +1249,13 @@ fn maintenance_tick(
     // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        if since_preamble >= Duration::from_secs(PREAMBLE_ABSENCE_TIMEOUT_S) {
-            worker_log("[worker] preamble-absence timeout, full reset to Idle");
+        let timeout = preamble_absence_timeout(&state.config);
+        if since_preamble >= timeout {
+            worker_log(&format!(
+                "[worker] preamble-absence timeout ({}s for profile {:?}), full reset to Idle",
+                timeout.as_secs(),
+                state.profile,
+            ));
             // 0.10.41 : on top of the in-state `soft_reset_buffer()` we
             // also drain the cpal mpsc backlog -- same recipe as the
             // brickwall paths (rx_worker.rs:966, 1050). Without the drain,
