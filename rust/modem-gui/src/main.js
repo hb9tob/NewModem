@@ -2560,7 +2560,12 @@ function updateV2State(state) {
   chip.textContent = state.replace(/_/g, " ");
   if (state === "idle") {
     document.getElementById("v2-marker-info").textContent = "—";
-    resetRxVisuals();
+    // Do NOT clear lastProgress / fountain / constellation / pilot phases
+    // here: the worker goes idle every time it loses the preamble, even
+    // mid-burst while waiting for a late re-entry. Wiping the stats then
+    // would make the operator believe everything is lost. The visuals are
+    // cleared instead when a *new* session_id arrives (genuinely new
+    // transmission, see the session_armed handler).
     noteProfileFromHeader(null);
   }
 }
@@ -3135,6 +3140,18 @@ function wireEvents() {
   });
   listen("session_armed", (event) => {
     const p = event.payload || {};
+    // A different session_id means a genuinely new transmission is
+    // starting — clear the previous burst's visuals so stale progress
+    // bars / constellation / pilots don't linger over the new data.
+    // A re-armed identical session_id (e.g. a worker restart on the same
+    // burst) keeps the existing display so the operator doesn't lose
+    // already-converged blocks visually.
+    if (
+      fountainState.sessionId != null &&
+      fountainState.sessionId !== p.session_id
+    ) {
+      resetRxVisuals();
+    }
     upsertSession({
       session_id: p.session_id,
       k_symbols: p.k,
