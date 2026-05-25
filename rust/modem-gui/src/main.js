@@ -718,6 +718,101 @@ async function loadSdrBackends() {
   }
 }
 
+/// Read the per-backend `enabled` flag from settings (defaults to
+/// `false`). Single source of truth for "should the GUI bother
+/// enumerating this backend".
+function isBackendEnabled(backendId) {
+  if (!currentSettings.sdr_settings) return false;
+  const entry = currentSettings.sdr_settings.backends &&
+    currentSettings.sdr_settings.backends[backendId];
+  return entry ? entry.enabled === true : false;
+}
+
+/// Build the "Backends SDR" checkbox section in Paramètres. One row
+/// per registered backend, status text fed by
+/// `get_backend_library_status`. Toggling a checkbox persists the new
+/// `enabled` flag and triggers an immediate `loadDevices()` so the
+/// device dropdown reflects the change without a tab refresh.
+async function renderSdrBackendsList() {
+  const host = document.getElementById("sdr-backends-list");
+  if (!host) return;
+  if (!sdrBackends || sdrBackends.size === 0) {
+    host.innerHTML = `<span class="tx-hint">Aucun backend SDR compilé dans ce binaire.</span>`;
+    return;
+  }
+  host.innerHTML = "";
+  const { invoke } = window.__TAURI__.core;
+  for (const [id, info] of sdrBackends.entries()) {
+    // Seed the settings entry so the persisted bool round-trips
+    // even when the user hasn't touched the checkbox yet.
+    ensureBackendEntry(id);
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.backendId = id;
+    cb.checked = isBackendEnabled(id);
+    const name = document.createElement("span");
+    name.textContent = `Activer ${info.display_name || id}`;
+    const status = document.createElement("span");
+    status.className = "sdr-backend-status";
+    status.dataset.backendId = id;
+    status.textContent = "";
+    label.appendChild(cb);
+    label.appendChild(name);
+    label.appendChild(status);
+    host.appendChild(label);
+
+    cb.addEventListener("change", async () => {
+      const entry = ensureBackendEntry(id);
+      entry.enabled = cb.checked;
+      try {
+        await invoke("save_settings", { settings: currentSettings });
+      } catch (err) {
+        console.error("save_settings (backend enable):", err);
+      }
+      // Refresh both the inline status (re-attempts the dlopen when
+      // turning on) and the device dropdown.
+      await refreshBackendLibraryStatus(id);
+      await loadDevices();
+    });
+  }
+  // Initial status sweep — only ping enabled backends so we don't
+  // dlopen vendor libraries just to render the panel.
+  for (const id of sdrBackends.keys()) {
+    if (isBackendEnabled(id)) await refreshBackendLibraryStatus(id);
+  }
+}
+
+/// Ping `get_backend_library_status` for one backend and update the
+/// inline status span. Called on tab open + after every checkbox
+/// toggle.
+async function refreshBackendLibraryStatus(backendId) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const span = document.querySelector(
+    `.sdr-backend-status[data-backend-id="${backendId}"]`
+  );
+  if (!span) return;
+  if (!isBackendEnabled(backendId)) {
+    span.textContent = "";
+    span.classList.remove("warn");
+    return;
+  }
+  try {
+    const st = await invoke("get_backend_library_status", { backendId });
+    if (st.available) {
+      span.textContent = "OK";
+      span.classList.remove("warn");
+    } else {
+      span.textContent = st.message || "Bibliothèque manquante";
+      span.classList.add("warn");
+    }
+  } catch (err) {
+    span.textContent = "Statut indisponible";
+    span.classList.add("warn");
+  }
+}
+
 /// Per-device capability cache keyed by composite name (e.g.
 /// "sdrplay:1500R76GR1"). Backends with multiple hardware variants
 /// (SDRplay: RSPduo / RSP1A / RSP1B / RSP1) ship per-device caps via
@@ -847,6 +942,23 @@ function makeDefaultSdrConfig(backendId) {
       ctcss_freq_hz: 0.0, ctcss_level: 0.1,
       rf_bandwidth_hz: null,
       backend_extras: { tuner: "B", decimation: 4 },
+    };
+  }
+  if (backendId === "rtlsdr") {
+    // Mirrors `default_sdr_config_for("rtlsdr")` in settings.rs.
+    // Step 22 ≈ 40.2 dB on the R820T-family ladder — enough head-room
+    // for typical 2 m signals out of the box; the operator drops it
+    // via the gain dropdown when receiving a strong neighbour.
+    return {
+      backend_id: "rtlsdr", device_id: "",
+      rx_freq_hz: 145_500_000, tx_freq_hz: 145_500_000,
+      gain: { kind: "manual", shape: "discrete", step_idx: 22 },
+      max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+      antenna: "",
+      bias_t: false, fm_notch: false, dab_notch: false,
+      ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+      rf_bandwidth_hz: null,
+      backend_extras: { ppm_correction: 0, direct_sampling: false },
     };
   }
   return {
@@ -1126,6 +1238,38 @@ function buildGainRow(direction, backendId, caps, cfg) {
     ifInput.addEventListener("change", onSdrFieldChange);
     ifLabel.appendChild(ifInput);
     row.appendChild(ifLabel);
+  } else if (shape && shape.DbDiscrete) {
+    // RTL-SDR-style ladder: one `<select>` of "<N> dB" options, indexed
+    // by step_idx so the backend resolves the matching tenths-of-dB
+    // gain value internally. Disabled when AGC is engaged (the tuner
+    // drives the IF gain itself).
+    const r = shape.DbDiscrete;
+    const label = document.createElement("label");
+    label.className = "pluto-field";
+    label.textContent = direction === "rx" ? "Gain RX (dB) : " : "Gain TX (dB) : ";
+    const sel = document.createElement("select");
+    sel.id = `sdr-${direction}-gain-step-${backendId}`;
+    sel.disabled = isAgc;
+    for (let i = 0; i < r.steps_db.length; i++) {
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = `${r.steps_db[i]} dB`;
+      sel.appendChild(opt);
+    }
+    let curIdx = 0;
+    if (
+      cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "discrete" &&
+      Number.isFinite(cfg.gain.step_idx)
+    ) {
+      curIdx = Math.min(Math.max(0, cfg.gain.step_idx), r.steps_db.length - 1);
+    }
+    sel.value = String(curIdx);
+    sel.dataset.sdrField = "gain.step_idx";
+    sel.dataset.sdrTransform = "manual_step_idx";
+    sel.dataset.backend = backendId;
+    sel.addEventListener("change", onSdrFieldChange);
+    label.appendChild(sel);
+    row.appendChild(label);
   }
   return row;
 }
@@ -1355,6 +1499,13 @@ function applySdrFieldUpdate(cfg, field, transform, el) {
       }
       break;
     }
+    case "manual_step_idx": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) {
+        cfg.gain = { kind: "manual", shape: "discrete", step_idx: v };
+      }
+      break;
+    }
     case "extras_float": {
       const v = parseFloat(el.value);
       const key = field.split(".")[1];
@@ -1410,20 +1561,27 @@ async function loadDevices() {
     ]);
     const backendDevices = new Map();
     const backendTags = [];
+    // Only enumerate backends the operator opted into via the
+    // Paramètres checkboxes — keeps the GUI from triggering vendor-
+    // library dlopens at startup on hosts that don't have the
+    // hardware. The Tauri-side `list_sdr_devices` enforces the same
+    // gate as defence-in-depth.
     await Promise.all(
-      Array.from(sdrBackends.keys()).map(async (id) => {
-        try {
-          const list = await invoke("list_sdr_devices", { backendId: id });
-          backendDevices.set(id, list);
-          if (list.length > 0) {
-            const info = sdrBackends.get(id);
-            backendTags.push(` · ${list.length} ${info ? info.display_name : id}`);
+      Array.from(sdrBackends.keys())
+        .filter((id) => isBackendEnabled(id))
+        .map(async (id) => {
+          try {
+            const list = await invoke("list_sdr_devices", { backendId: id });
+            backendDevices.set(id, list);
+            if (list.length > 0) {
+              const info = sdrBackends.get(id);
+              backendTags.push(` · ${list.length} ${info ? info.display_name : id}`);
+            }
+          } catch (err) {
+            console.warn(`list_sdr_devices(${id}):`, err);
+            backendDevices.set(id, []);
           }
-        } catch (err) {
-          console.warn(`list_sdr_devices(${id}):`, err);
-          backendDevices.set(id, []);
-        }
-      })
+        })
     );
     populateDeviceSelect(
       "rx-device-select", rxDevices, currentSettings.rx_device, backendDevices, "rx",
@@ -4915,6 +5073,7 @@ async function init() {
   setupHistoryTab();
   await loadSettings();
   await loadSdrBackends();
+  await renderSdrBackendsList();
   applyOverlaysToUI();
   setupChannelTab();
   setupSounderTab();

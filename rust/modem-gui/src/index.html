@@ -291,6 +291,23 @@
           <input type="text" id="callsign-input" placeholder="HB9TOB" maxlength="12">
           <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
+        <!-- Per-backend enable checkboxes. Populated at runtime from
+             `list_sdr_backends` (one row per registered backend). All
+             unchecked by default — the operator opts in to whichever
+             SDR family they actually have hardware for, so we don't
+             dlopen vendor libraries on hosts that don't need them.
+             The inline status text reports "Bibliothèque manquante"
+             when the runtime library isn't loadable. -->
+        <fieldset id="sdr-backends-fieldset">
+          <legend>Backends SDR</legend>
+          <p class="tx-hint" style="margin: 0 0 0.5rem;">
+            Activer la recherche des récepteurs SDR. Chaque backend
+            n'interroge son driver que s'il est coché.
+          </p>
+          <div id="sdr-backends-list" class="sdr-backends-list">
+            <span class="tx-hint">Chargement…</span>
+          </div>
+        </fieldset>
         <fieldset>
           <legend>Périphérique réception (RX)</legend>
           <select id="rx-device-select">

@@ -1,5 +1,5 @@
 [workspace]
-members = ["modem-core-base", "modem-core", "modem-cli", "modem-framing", "modem-gui/src-tauri", "modem-io", "modem-pluto", "modem-sdr", "modem-sdr-dsp", "modem-sdrplay", "modem-worker", "modem-worker-base", "newmodem-collector"]
+members = ["modem-core-base", "modem-core", "modem-cli", "modem-framing", "modem-gui/src-tauri", "modem-io", "modem-pluto", "modem-rtlsdr", "modem-sdr", "modem-sdr-dsp", "modem-sdrplay", "modem-worker", "modem-worker-base", "newmodem-collector"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -17,3 +17,16 @@ strip = true
 debug = false
 incremental = false
 overflow-checks = false
+
+# Quick release build for development iteration: same target tree
+# (`target/release-fast/`), no LTO, opt-level 1 (good enough for the
+# realtime DSP path), 256 codegen units + incremental on. Cuts the
+# full GUI build from ~3 min to ~30 s on this Surface Pro 7. Run with
+# `cargo build --profile release-fast -p modem-gui`.
+[profile.release-fast]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 256
+incremental = true
+strip = false

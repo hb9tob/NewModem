@@ -16,9 +16,12 @@ tauri-build = { version = "2", features = [] }
 # this. A reduced "windows-min" build can `--no-default-features
 # --features pluto` once Phase E removes the direct-named-backend
 # code paths from main.rs / settings.rs.
-default = ["pluto", "sdrplay"]
+default = ["pluto", "sdrplay", "rtlsdr"]
 pluto = ["dep:modem-pluto"]
 sdrplay = ["dep:modem-sdrplay"]
+# RTL-SDR is loaded at runtime via libloading — safe to enable in the
+# default set even when librtlsdr.so isn't installed on the target.
+rtlsdr = ["dep:modem-rtlsdr"]
 windows-min = ["pluto"]
 
 [dependencies]
@@ -28,6 +31,7 @@ modem-io = { path = "../../modem-io" }
 modem-sdr = { path = "../../modem-sdr" }
 modem-pluto = { path = "../../modem-pluto", optional = true }
 modem-sdrplay = { path = "../../modem-sdrplay", optional = true }
+modem-rtlsdr = { path = "../../modem-rtlsdr", optional = true }
 modem-worker = { path = "../../modem-worker" }
 modem-worker-base = { path = "../../modem-worker-base" }
 modem-core-base = { path = "../../modem-core-base" }

@@ -35,8 +35,6 @@ use std::path::PathBuf;
 fn main() {
     let include_dir = env::var("SDRPLAY_API_INCLUDE_DIR")
         .unwrap_or_else(|_| default_include_dir().to_string());
-    let lib_dir = env::var("SDRPLAY_API_LIB_DIR")
-        .unwrap_or_else(|_| default_lib_dir().to_string());
 
     let header = PathBuf::from(&include_dir).join("sdrplay_api.h");
     if !header.exists() {
@@ -45,19 +43,25 @@ fn main() {
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=SDRPLAY_API_INCLUDE_DIR");
-    println!("cargo:rerun-if-env-changed=SDRPLAY_API_LIB_DIR");
 
-    // Link against the SDRplay API. Linker name resolution:
-    //   * Linux ld    -> -lsdrplay_api  -> libsdrplay_api.so
-    //   * Windows MSVC link.exe -> sdrplay_api.lib (import library
-    //     for sdrplay_api.dll, which must be reachable at runtime via
-    //     PATH or co-located with the .exe)
-    // The `dylib=` directive does the right thing on both toolchains.
-    println!("cargo:rustc-link-search=native={lib_dir}");
-    println!("cargo:rustc-link-lib=dylib=sdrplay_api");
+    // No `cargo:rustc-link-lib=dylib=sdrplay_api` here on purpose:
+    // we used to add libsdrplay_api as an ELF NEEDED entry, which made
+    // the GUI binary refuse to launch on Linux hosts without the SDK
+    // installed. Now bindgen emits a `dynamic_library_name("SdrplayApi")`
+    // wrapper that dlopens the library at runtime instead — see
+    // `crate::api::api()`. The Linux/Windows path discovery lives in
+    // `runtime_guard::discover_library_path`.
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
+        // Emit a `SdrplayApi` struct that holds the loaded
+        // `libloading::Library` plus one fn-pointer field per
+        // allowlisted function, with thin pass-through methods so
+        // callers write `api.sdrplay_api_Open(...)` instead of
+        // `sdrplay_api_Open(...)`. Constructor:
+        // `unsafe fn SdrplayApi::new<P: AsRef<OsStr>>(P) ->
+        //  Result<Self, libloading::Error>`.
+        .dynamic_library_name("SdrplayApi")
         .clang_arg(format!("-I{include_dir}"))
         // Surface only the SDRplay API symbols, drop the libc / kernel
         // leakage that comes through the system headers — keeps the
@@ -89,18 +93,6 @@ fn default_include_dir() -> &'static str {
         r"C:\Program Files\SDRplay\API\inc"
     } else {
         "/usr/local/include"
-    }
-}
-
-/// Default import-library / shared-object directory. Windows picks
-/// `x64` because the workspace targets `x86_64-pc-windows-msvc` only
-/// (no 32-bit, no Windows-on-ARM yet — both are present in the SDK
-/// but unused).
-fn default_lib_dir() -> &'static str {
-    if cfg!(windows) {
-        r"C:\Program Files\SDRplay\API\x64"
-    } else {
-        "/usr/local/lib"
     }
 }
 

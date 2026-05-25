@@ -1072,6 +1072,27 @@ main {
   padding: 0 0.4rem;
   letter-spacing: 0.02em;
 }
+.sdr-backends-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.sdr-backends-list label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+.sdr-backends-list .sdr-backend-status {
+  font-size: 0.8rem;
+  color: #888;
+  margin-left: auto;
+  font-style: italic;
+}
+.sdr-backends-list .sdr-backend-status.warn {
+  color: #e6a700;
+  font-style: normal;
+}
 .settings-form input[type="text"] {
   width: 100%;
   background: #1e1e1e;

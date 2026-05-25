@@ -169,13 +169,98 @@ fn list_sdr_backends() -> Vec<SdrBackendInfo> {
 }
 
 /// List the live devices visible to one specific SDR backend.
-/// Returns an empty `Vec` (not an error) when the backend itself is
-/// reachable but no hardware is plugged in — the GUI surfaces this
-/// as an empty group, not a red banner.
+/// Returns an empty `Vec` (not an error) when:
+///   - the backend is disabled in Paramètres (defence-in-depth — the
+///     frontend already skips disabled backends, but a stray call must
+///     not trigger a library load as a side effect)
+///   - the backend is reachable but no hardware is plugged in
+///   - the backend's runtime library couldn't be loaded (the GUI
+///     surfaces that via `get_backend_library_status` instead)
 #[tauri::command]
 fn list_sdr_devices(backend_id: String) -> Result<Vec<DeviceDescriptor>, String> {
+    // Gate on the operator's opt-in checkbox. Reads the on-disk
+    // settings — cheap (one ~few-KiB JSON parse), no I/O on the hot
+    // path since this is only called when the dropdown refreshes.
+    let settings = settings::load();
+    let enabled = settings
+        .sdr_settings
+        .backends
+        .get(&backend_id)
+        .map(|bs| bs.enabled)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(Vec::new());
+    }
     let backend = sdr_registry::backend_by_id(&backend_id).map_err(|e| e.to_string())?;
     backend.list_devices().map_err(|e| e.to_string())
+}
+
+/// Report whether a backend's runtime library is loadable on this
+/// host, so the GUI can paint an inline "Bibliothèque manquante"
+/// hint next to the Paramètres checkbox.
+///
+/// `available = true` means:
+///   - Pluto: always (pure-Rust TCP transport, no native lib needed)
+///   - SDRplay: `libsdrplay_api.so.3` (Linux) / `sdrplay_api.dll`
+///     (Windows, registry-discovered) is loadable
+///   - RTL-SDR: `librtlsdr.so.0` (Linux) / `rtlsdr.dll` (Windows)
+///     is loadable
+///
+/// Triggers the one-shot dlopen the first time it's called for a
+/// runtime-loaded backend — that's the natural moment (the user just
+/// ticked the checkbox). Subsequent calls read the cached result.
+#[derive(Debug, Clone, serde::Serialize)]
+struct BackendLibraryStatus {
+    available: bool,
+    /// Optional French label for the GUI to surface inline. `None`
+    /// when `available = true` (no diagnostic needed).
+    message: Option<String>,
+}
+
+#[tauri::command]
+fn get_backend_library_status(backend_id: String) -> BackendLibraryStatus {
+    match backend_id.as_str() {
+        "pluto" => BackendLibraryStatus {
+            available: true,
+            message: None,
+        },
+        #[cfg(feature = "sdrplay")]
+        "sdrplay" => {
+            let ok = modem_sdrplay::backend::SdrplayBackend.library_available();
+            BackendLibraryStatus {
+                available: ok,
+                message: if ok {
+                    None
+                } else {
+                    Some(
+                        "Bibliothèque libsdrplay_api introuvable — installer \
+                         le SDK depuis https://www.sdrplay.com/api/."
+                            .into(),
+                    )
+                },
+            }
+        }
+        #[cfg(feature = "rtlsdr")]
+        "rtlsdr" => {
+            let ok = modem_rtlsdr::backend::RtlsdrBackend.library_available();
+            BackendLibraryStatus {
+                available: ok,
+                message: if ok {
+                    None
+                } else {
+                    Some(
+                        "Bibliothèque librtlsdr introuvable — installer le \
+                         paquet `librtlsdr0`."
+                            .into(),
+                    )
+                },
+            }
+        }
+        _ => BackendLibraryStatus {
+            available: false,
+            message: Some(format!("Backend inconnu : {backend_id}")),
+        },
+    }
 }
 
 /// Return per-device capabilities for the device identified by its
@@ -1913,6 +1998,7 @@ fn main() {
             list_output_audio_devices,
             list_sdr_backends,
             list_sdr_devices,
+            get_backend_library_status,
             get_sdr_device_capabilities,
             list_modem_profiles,
             get_app_version,

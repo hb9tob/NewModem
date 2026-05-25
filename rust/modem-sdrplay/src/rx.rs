@@ -40,7 +40,7 @@ use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
 
 use crate::api::{
     self, sdrplay_api_CallbackFnsT, sdrplay_api_EventParamsT, sdrplay_api_EventT,
-    sdrplay_api_Init, sdrplay_api_StreamCbParamsT, sdrplay_api_TunerSelectT, sdrplay_api_Uninit,
+    sdrplay_api_StreamCbParamsT, sdrplay_api_TunerSelectT,
 };
 use crate::device::{self, SdrplayConfig, SdrplaySession, DEFAULT_LO_OFFSET_HZ};
 use crate::error::SdrplayError;
@@ -179,10 +179,12 @@ pub fn start_on(
     // pointer.
     let cb_ctx_arc: Arc<Mutex<CallbackState>> = cb_state.clone();
     let cb_ctx_ptr = Arc::into_raw(cb_ctx_arc) as *mut std::ffi::c_void;
+    let lib = api::api()?;
     let init_res = unsafe {
         api::check(
+            lib,
             "Init",
-            sdrplay_api_Init(session.device.dev, &mut callbacks as *mut _, cb_ctx_ptr),
+            lib.sdrplay_api_Init(session.device.dev, &mut callbacks as *mut _, cb_ctx_ptr),
         )
     };
     if let Err(e) = init_res {
@@ -254,8 +256,12 @@ fn run_supervisor(
 
     // SAFETY: tearing down. Uninit blocks until the daemon's stream
     // thread has finished any in-flight callbacks, so no further
-    // dereference of cb_ctx_ptr happens after this returns.
-    let _ = unsafe { api::check("Uninit", sdrplay_api_Uninit(session.device.dev)) };
+    // dereference of cb_ctx_ptr happens after this returns. If the
+    // library somehow became unloadable mid-flight (shouldn't happen
+    // — we got this far), there's nothing to call.
+    if let Ok(lib) = api::api() {
+        let _ = unsafe { api::check(lib, "Uninit", lib.sdrplay_api_Uninit(session.device.dev)) };
+    }
 
     // Reclaim the Arc<Mutex<CallbackState>> we leaked into the API's
     // context. The Arc decrement is benign — the supervisor thread

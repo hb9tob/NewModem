@@ -273,6 +273,18 @@ pub fn capabilities_for_hint(hint: Option<&str>) -> &'static BackendCapabilities
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SdrplayBackend;
 
+impl SdrplayBackend {
+    /// Returns `true` when the SDRplay API shared library can be
+    /// loaded on this host. Triggers the one-shot dlopen via
+    /// `crate::api::api()` if it hasn't run yet — same caching shape
+    /// as `modem-rtlsdr::backend::RtlsdrBackend::library_available`.
+    /// The GUI calls this when the operator ticks the Paramètres
+    /// SDRplay checkbox.
+    pub fn library_available(&self) -> bool {
+        crate::api::library_available()
+    }
+}
+
 impl SdrBackend for SdrplayBackend {
     fn id(&self) -> &'static str {
         BACKEND_ID

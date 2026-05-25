@@ -24,12 +24,9 @@ use std::os::raw::c_uint;
 use std::ptr;
 
 use crate::api::{
-    check, check_open, cstr_field_to_string, sdrplay_api_AgcControlT, sdrplay_api_Bw_MHzT,
-    sdrplay_api_Close, sdrplay_api_DeviceParamsT, sdrplay_api_DeviceT,
-    sdrplay_api_GetDeviceParams, sdrplay_api_GetDevices, sdrplay_api_If_kHzT,
-    sdrplay_api_LockDeviceApi, sdrplay_api_Open, sdrplay_api_ReleaseDevice,
-    sdrplay_api_RspDuoModeT, sdrplay_api_RspDuo_AmPortSelectT, sdrplay_api_SelectDevice,
-    sdrplay_api_TunerSelectT, sdrplay_api_UnlockDeviceApi,
+    api, check, check_open, cstr_field_to_string, sdrplay_api_AgcControlT, sdrplay_api_Bw_MHzT,
+    sdrplay_api_DeviceParamsT, sdrplay_api_DeviceT, sdrplay_api_If_kHzT,
+    sdrplay_api_RspDuoModeT, sdrplay_api_RspDuo_AmPortSelectT, sdrplay_api_TunerSelectT,
 };
 use crate::error::SdrplayError;
 
@@ -305,10 +302,13 @@ impl Drop for SdrplaySession {
         // remain (the RX thread owns the only `Init` and joins
         // before its `SdrplaySession` drop), and the device handle
         // came from `SelectDevice` so `ReleaseDevice` is the
-        // matching teardown.
-        unsafe {
-            let _ = sdrplay_api_ReleaseDevice(&mut self.device as *mut _);
-            let _ = sdrplay_api_Close();
+        // matching teardown. If the library failed to load (extremely
+        // unlikely since we got this far), there's no cleanup to do.
+        if let Ok(lib) = api() {
+            unsafe {
+                let _ = lib.sdrplay_api_ReleaseDevice(&mut self.device as *mut _);
+                let _ = lib.sdrplay_api_Close();
+            }
         }
     }
 }
@@ -328,30 +328,32 @@ pub fn list_serials() -> Result<Vec<String>, SdrplayError> {
 /// The backend uses this to label devices ("SDRplay RSP1A — …" vs
 /// "SDRplay RSPduo — …") in the GUI dropdown.
 pub fn list_devices_meta() -> Result<Vec<(String, SdrplayHardware)>, SdrplayError> {
-    // Delay-load guard (Windows): if sdrplay_api.dll isn't installed
-    // at all, surface DllMissing rather than crash on the first API
-    // call. No-op on Linux (ELF loader catches it at startup).
-    crate::runtime_guard::ensure_dll_loadable()?;
+    // Resolve + cache the runtime-loaded API. On a host without the
+    // SDRplay SDK installed this returns `SdrplayError::DllMissing`;
+    // the backend's `list_devices()` turns that into an empty Vec so
+    // the GUI degrades gracefully.
+    let lib = api()?;
 
     // SAFETY: `sdrplay_api_Open` is reference-counted on the daemon
     // side, the `[DeviceT; 8]` fits the API's documented max device
     // count, and `numDevs` is initialised to 0 before being passed
     // by pointer.
-    unsafe { check_open(sdrplay_api_Open())? };
+    unsafe { check_open(lib, lib.sdrplay_api_Open())? };
 
     let mut devices: [sdrplay_api_DeviceT; 8] = unsafe { std::mem::zeroed() };
     let mut n_devs: c_uint = 0;
     let res = unsafe {
         check(
+            lib,
             "GetDevices",
-            sdrplay_api_GetDevices(
+            lib.sdrplay_api_GetDevices(
                 devices.as_mut_ptr(),
                 &mut n_devs as *mut _,
                 devices.len() as c_uint,
             ),
         )
     };
-    let _ = unsafe { sdrplay_api_Close() };
+    let _ = unsafe { lib.sdrplay_api_Close() };
     res?;
 
     Ok(devices[..n_devs as usize]
@@ -370,22 +372,24 @@ pub fn list_devices_meta() -> Result<Vec<(String, SdrplayHardware)>, SdrplayErro
 /// [`crate::rx::start`] which calls `sdrplay_api_Init` with the
 /// callback functions.
 pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
-    // Delay-load guard mirrors `list_devices_meta`. Defensive: any
-    // direct caller that skips enumeration still hits a typed error
-    // rather than a delay-load SEH crash on Windows.
-    crate::runtime_guard::ensure_dll_loadable()?;
+    // Resolve + cache the runtime-loaded API. Any direct caller that
+    // skips enumeration still hits a typed `DllMissing` here rather
+    // than a delay-load SEH crash on Windows or an ELF-loader bail
+    // on Linux.
+    let lib = api()?;
 
     // Phase 1 — connect to the daemon and discover devices.
     // SAFETY: see `list_serials`. Same bounded fixed-size array
     // pattern, same daemon-owned lifecycle.
-    unsafe { check_open(sdrplay_api_Open())? };
+    unsafe { check_open(lib, lib.sdrplay_api_Open())? };
 
     let mut devices: [sdrplay_api_DeviceT; 8] = unsafe { std::mem::zeroed() };
     let mut n_devs: c_uint = 0;
     let getdevs = unsafe {
         check(
+            lib,
             "GetDevices",
-            sdrplay_api_GetDevices(
+            lib.sdrplay_api_GetDevices(
                 devices.as_mut_ptr(),
                 &mut n_devs as *mut _,
                 devices.len() as c_uint,
@@ -393,11 +397,11 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
         )
     };
     if let Err(e) = getdevs {
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(e);
     }
     if n_devs == 0 {
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(SdrplayError::NoDevice);
     }
 
@@ -412,7 +416,7 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
         {
             Some(i) => i,
             None => {
-                let _ = unsafe { sdrplay_api_Close() };
+                let _ = unsafe { lib.sdrplay_api_Close() };
                 return Err(SdrplayError::UnknownSerial(config.serial.clone()));
             }
         }
@@ -426,7 +430,7 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
     // bubbles back up.
     let hardware = SdrplayHardware::from_hw_ver(device.hwVer);
     if let SdrplayHardware::Unsupported(v) = hardware {
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(SdrplayError::Api {
             call: "GetDevices",
             code: -1,
@@ -461,19 +465,20 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
     // Phase 3 — atomic select+program against the locked API.
     // SAFETY: Lock / Unlock pair guarantees the daemon serialises
     // our SelectDevice against any other client.
-    if let Err(e) = unsafe { check("LockDeviceApi", sdrplay_api_LockDeviceApi()) } {
-        let _ = unsafe { sdrplay_api_Close() };
+    if let Err(e) = unsafe { check(lib, "LockDeviceApi", lib.sdrplay_api_LockDeviceApi()) } {
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(e);
     }
     let select_res = unsafe {
         check(
+            lib,
             "SelectDevice",
-            sdrplay_api_SelectDevice(&mut device as *mut _),
+            lib.sdrplay_api_SelectDevice(&mut device as *mut _),
         )
     };
-    let _ = unsafe { sdrplay_api_UnlockDeviceApi() };
+    let _ = unsafe { lib.sdrplay_api_UnlockDeviceApi() };
     if let Err(e) = select_res {
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(e);
     }
 
@@ -481,18 +486,19 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
     let mut params: *mut sdrplay_api_DeviceParamsT = ptr::null_mut();
     let getparams = unsafe {
         check(
+            lib,
             "GetDeviceParams",
-            sdrplay_api_GetDeviceParams(device.dev, &mut params as *mut _),
+            lib.sdrplay_api_GetDeviceParams(device.dev, &mut params as *mut _),
         )
     };
     if let Err(e) = getparams {
-        let _ = unsafe { sdrplay_api_ReleaseDevice(&mut device as *mut _) };
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_ReleaseDevice(&mut device as *mut _) };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(e);
     }
     if params.is_null() {
-        let _ = unsafe { sdrplay_api_ReleaseDevice(&mut device as *mut _) };
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_ReleaseDevice(&mut device as *mut _) };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(SdrplayError::Api {
             call: "GetDeviceParams",
             code: -1,
@@ -505,8 +511,8 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
     let mut effective_config = config.clone();
     effective_config.tuner = effective_tuner;
     if let Err(e) = program_params(params, &effective_config, hardware) {
-        let _ = unsafe { sdrplay_api_ReleaseDevice(&mut device as *mut _) };
-        let _ = unsafe { sdrplay_api_Close() };
+        let _ = unsafe { lib.sdrplay_api_ReleaseDevice(&mut device as *mut _) };
+        let _ = unsafe { lib.sdrplay_api_Close() };
         return Err(e);
     }
 

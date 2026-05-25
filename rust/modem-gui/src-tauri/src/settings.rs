@@ -162,6 +162,21 @@ pub struct SdrSettings {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendSettings {
+    /// Whether the GUI should attempt to enumerate this backend. **Off
+    /// by default** so a fresh install (or an upgrade landing without
+    /// this field) doesn't try to dlopen the vendor library for every
+    /// compiled-in backend at startup. The Paramètres panel exposes a
+    /// per-backend checkbox the operator ticks to opt in. Behaviour
+    /// when this is `false`:
+    ///   * `list_sdr_devices(backend_id)` returns an empty Vec without
+    ///     touching the backend
+    ///   * the GUI device dropdown carries no entry for that backend
+    /// Enabling the checkbox triggers the one-shot library load
+    /// (runtime-loaded backends like rtlsdr and sdrplay-on-Linux);
+    /// failure to load surfaces as an inline "Bibliothèque manquante"
+    /// status next to the checkbox.
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub config: SdrConfig,
     /// MRU list of recently-used frequencies, in Hz (most-recent
@@ -245,6 +260,31 @@ pub fn default_sdr_config_for(backend_id: &str) -> SdrConfig {
                 .insert("tuner".into(), serde_json::json!("B"));
             cfg.backend_extras
                 .insert("decimation".into(), serde_json::json!(4));
+            cfg
+        }
+        "rtlsdr" => {
+            // RTL-SDR Blog V3 / V4 default: 2 m simplex, mid-table gain
+            // (≈ 28 dB on the R820T-family ladder), bias-T off, PPM
+            // correction 0. The frontend builds ManualGainValue::Discrete
+            // with the matching index from BackendCapabilities.
+            let mut cfg = SdrConfig {
+                backend_id: "rtlsdr".into(),
+                device_id: String::new(),
+                rx_freq_hz: 145_500_000,
+                tx_freq_hz: 145_500_000,
+                // Step 22 ≈ 40.2 dB on the R820T-family ladder — much
+                // better default for typical 2 m signals than the
+                // mid-table 28 dB. The user can still drop it via the
+                // GUI dropdown.
+                gain: GainSetting::Manual(ManualGainValue::Discrete { step_idx: 22 }),
+                max_deviation_hz: 5_000.0,
+                tx_deviation_hz: 5_000.0,
+                ..SdrConfig::default()
+            };
+            cfg.backend_extras
+                .insert("ppm_correction".into(), serde_json::json!(0));
+            cfg.backend_extras
+                .insert("direct_sampling".into(), serde_json::json!(false));
             cfg
         }
         _ => SdrConfig {
