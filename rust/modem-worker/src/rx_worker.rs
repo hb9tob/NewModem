@@ -1249,14 +1249,17 @@ fn maintenance_tick(
     // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        // Power Mode (= 0.9.x semantics) : flat 2 s timeout so a fresh
-        // burst landing within a few seconds of the previous one re-arms
-        // cleanly. The profile-indexed 6-18 s timeout is part of the
-        // modern Gardner pipeline that needs a longer settling window ;
-        // in Power Mode each CLOSED does its own grid and there is no
-        // session-level state to protect across an inter-burst silence.
+        // Power Mode (= 0.9.x semantics) : timeout measured from the
+        // EXPECTED next preamble position, not from the last one seen.
+        // `last_preamble_seen_at` is updated once per AppHeader decode
+        // (~every V3_PREAMBLE_PERIOD_S = 4 s on a healthy burst), so a
+        // flat 2 s would fire MID-BURST between two preambles. Correct
+        // timeout = 1 period + 2 s slack = 6 s, profile-independent.
+        // Snappy enough to re-arm on a new TX consecutive (vs the
+        // Light Mode 6-18 s profile-indexed window) without sacrificing
+        // mid-burst stability.
         let timeout = if state.allow_legacy_grid {
-            Duration::from_secs(2)
+            Duration::from_secs_f64(V3_PREAMBLE_PERIOD_S + 2.0)
         } else {
             preamble_absence_timeout(&state.config)
         };

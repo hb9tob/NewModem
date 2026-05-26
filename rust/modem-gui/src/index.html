@@ -333,9 +333,10 @@
           <p class="tx-hint" style="margin: 0.4rem 0 0;">
             Algorithme RX 0.9.x — balayage de drift complet ±80 ppm par
             fenêtre (coarse 20 ppm + fine ±10 ppm). Décode robuste éprouvé,
-            FSM réactive (timeout 2 s, ré-armement immédiat sur nouvelle TX).
-            Recommandé sur PC moderne, à décocher sur Pi ou vieux PC où le
-            worker peut prendre du retard temps-réel.
+            FSM réactive (timeout 6 s = 1 période préambule + 2 s de slack,
+            ré-armement rapide sur nouvelle TX). Recommandé sur PC moderne,
+            à décocher sur Pi ou vieux PC où le worker peut prendre du
+            retard temps-réel.
             <em>Désactivé par défaut sur Raspberry Pi.</em>
           </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
