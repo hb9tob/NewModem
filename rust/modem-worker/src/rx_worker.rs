@@ -1249,16 +1249,19 @@ fn maintenance_tick(
     // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        // `preamble_absence_timeout` scales on sps (= 6 s standard,
-        // 9 s ROBUST, 18 s ULTRA) to give slow profiles enough room
-        // to lock across 2-3 preamble periods. `last_preamble_seen_at`
-        // is updated once per AppHeader decode (~ every
-        // V3_PREAMBLE_PERIOD_S = 4 s on a healthy burst), so any flat
-        // value < period_eff + slack would fire MID-BURST. Same
-        // scaling applies to Power Mode — the broad ±80 ppm grid does
-        // not change the fact that ULTRA needs multiple periods to
-        // produce its first AppHeader on a borderline channel.
-        let timeout = preamble_absence_timeout(&state.config);
+        // Power Mode reproduces the strict 0.9.2rc5 timeout : flat 6 s
+        // for every profile, including ULTRA. Justified by the 0.9.x
+        // algorithm — each preamble is a clean re-sync point
+        // (deterministic find_preamble + broad ±80 ppm grid per CLOSED),
+        // so no need to wait the 2-3 periods that the modern Gardner
+        // pipeline needs to lock on ULTRA. Light Mode keeps the
+        // sps-scaled timeout (6/9/18 s) which was added in ac9c5d1
+        // specifically for the Gardner lock requirement.
+        let timeout = if state.allow_legacy_grid {
+            Duration::from_secs(6)
+        } else {
+            preamble_absence_timeout(&state.config)
+        };
         if since_preamble >= timeout {
             worker_log(&format!(
                 "[worker] preamble-absence timeout ({}s for profile {:?}), full reset to Idle",
