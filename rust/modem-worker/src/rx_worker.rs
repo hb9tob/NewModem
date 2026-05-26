@@ -1249,20 +1249,16 @@ fn maintenance_tick(
     // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        // Power Mode (= 0.9.x semantics) : timeout measured from the
-        // EXPECTED next preamble position, not from the last one seen.
-        // `last_preamble_seen_at` is updated once per AppHeader decode
-        // (~every V3_PREAMBLE_PERIOD_S = 4 s on a healthy burst), so a
-        // flat 2 s would fire MID-BURST between two preambles. Correct
-        // timeout = 1 period + 2 s slack = 6 s, profile-independent.
-        // Snappy enough to re-arm on a new TX consecutive (vs the
-        // Light Mode 6-18 s profile-indexed window) without sacrificing
-        // mid-burst stability.
-        let timeout = if state.allow_legacy_grid {
-            Duration::from_secs_f64(V3_PREAMBLE_PERIOD_S + 2.0)
-        } else {
-            preamble_absence_timeout(&state.config)
-        };
+        // `preamble_absence_timeout` scales on sps (= 6 s standard,
+        // 9 s ROBUST, 18 s ULTRA) to give slow profiles enough room
+        // to lock across 2-3 preamble periods. `last_preamble_seen_at`
+        // is updated once per AppHeader decode (~ every
+        // V3_PREAMBLE_PERIOD_S = 4 s on a healthy burst), so any flat
+        // value < period_eff + slack would fire MID-BURST. Same
+        // scaling applies to Power Mode — the broad ±80 ppm grid does
+        // not change the fact that ULTRA needs multiple periods to
+        // produce its first AppHeader on a borderline channel.
+        let timeout = preamble_absence_timeout(&state.config);
         if since_preamble >= timeout {
             worker_log(&format!(
                 "[worker] preamble-absence timeout ({}s for profile {:?}), full reset to Idle",
