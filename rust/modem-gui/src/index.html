@@ -2,80 +2,84 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
-  <title>NBFM Modem RX</title>
+  <title data-i18n="app.title">NBFM Modem RX</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="top-bar">
-    <span id="save-dir-label" class="save-dir" title="Dossier de sauvegarde"></span>
+    <span id="save-dir-label" class="save-dir" data-i18n-title="topbar.save_dir" title="Dossier de sauvegarde"></span>
     <span id="level-meter" class="level-meter">
       <span class="level-bar"><span id="level-fill"></span></span>
       <span id="level-text">—</span>
     </span>
-    <span id="ovd-chip" class="ovd-chip ovd-off" title="Overdrive TX (PAPR compressé) — limiteur du modulateur NBFM actif">écrêté</span>
-    <span id="rt-chip" class="rt-chip rt-off" title="Marge temps-réel RX (lag wall-clock vs audio consommé) — vert = sain, orange = chargé, rouge = surcharge CPU et samples perdus">RT</span>
-    <span id="v2-state-chip" class="state-chip state-idle" title="État du récepteur v2">idle</span>
-    <span id="v2-marker-info" class="marker-info" title="Dernier marker resync v2">—</span>
-    <span id="v2-progress-mini" class="progress-meter" title="Décodage incrémental v2">
+    <span id="ovd-chip" class="ovd-chip ovd-off" data-i18n="topbar.ovd" data-i18n-title="topbar.ovd_tip" title="Overdrive TX (PAPR compressé) — limiteur du modulateur NBFM actif">écrêté</span>
+    <span id="rt-chip" class="rt-chip rt-off" data-i18n="topbar.rt" data-i18n-title="topbar.rt_tip" title="Marge temps-réel RX (lag wall-clock vs audio consommé) — vert = sain, orange = chargé, rouge = surcharge CPU et samples perdus">RT</span>
+    <span id="v2-state-chip" class="state-chip state-idle" data-i18n="topbar.v2_state" data-i18n-title="topbar.v2_state_tip" title="État du récepteur v2">idle</span>
+    <span id="v2-marker-info" class="marker-info" data-i18n-title="topbar.v2_marker_tip" title="Dernier marker resync v2">—</span>
+    <span id="v2-progress-mini" class="progress-meter" data-i18n-title="topbar.v2_progress_tip" title="Décodage incrémental v2">
       <span id="v2-progress-text">—</span>
     </span>
-    <span id="status" class="status">prêt</span>
+    <span id="status" class="status" data-i18n="topbar.status_ready">prêt</span>
   </header>
   <nav class="tab-bar">
-    <button class="tab active" data-tab="rx">RX</button>
-    <button class="tab" data-tab="tx">TX</button>
-    <button class="tab" data-tab="sessions">Sessions</button>
-    <button class="tab" data-tab="history">Historique</button>
-    <button class="tab" data-tab="channel">Canal</button>
-    <button class="tab" data-tab="overlays">Overlays</button>
-    <button class="tab" data-tab="settings">Paramètres</button>
-    <button class="tab" data-tab="info">Info</button>
-    <span id="app-version" class="app-version" title="Version de l'application">…</span>
-    <button id="kiosk-exit" class="kiosk-only" title="Quitter (mode kiosk)">✕</button>
+    <button class="tab active" data-tab="rx" data-i18n="tabs.rx">RX</button>
+    <button class="tab" data-tab="tx" data-i18n="tabs.tx">TX</button>
+    <button class="tab" data-tab="sessions" data-i18n="tabs.sessions">Sessions</button>
+    <button class="tab" data-tab="history" data-i18n="tabs.history">Historique</button>
+    <button class="tab" data-tab="channel" data-i18n="tabs.channel">Canal</button>
+    <button class="tab" data-tab="overlays" data-i18n="tabs.overlays">Overlays</button>
+    <button class="tab" data-tab="settings" data-i18n="tabs.settings">Paramètres</button>
+    <button class="tab" data-tab="info" data-i18n="tabs.info">Info</button>
+    <span id="app-version" class="app-version" data-i18n-title="topbar.app_version_tip" title="Version de l'application">…</span>
+    <select id="lang-select" class="lang-select" data-i18n-title="topbar.lang_tip" title="Langue de l'interface">
+      <option value="fr">FR</option>
+      <option value="en">EN</option>
+    </select>
+    <button id="kiosk-exit" class="kiosk-only" data-i18n-title="topbar.kiosk_exit_tip" title="Quitter (mode kiosk)">✕</button>
   </nav>
   <main>
     <section id="tab-rx" class="tab-panel active rx-layout">
       <div class="rx-toolbar">
-        <button id="btn-start" disabled>Démarrer</button>
-        <button id="btn-stop" disabled>Arrêter</button>
-        <button id="btn-raw" class="btn-raw" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
-        <button id="btn-play-wav" class="btn-raw" title="Lire un fichier WAV 48 kHz mono à la place du flux audio">▶ Lire WAV</button>
+        <button id="btn-start" disabled data-i18n="rx.start">Démarrer</button>
+        <button id="btn-stop" disabled data-i18n="rx.stop">Arrêter</button>
+        <button id="btn-raw" class="btn-raw" data-i18n="rx.raw" data-i18n-title="rx.raw_tip" title="Enregistrer l'audio brut capté en WAV 48 kHz">⏺ capture brute</button>
+        <button id="btn-play-wav" class="btn-raw" data-i18n="rx.play_wav" data-i18n-title="rx.play_wav_tip" title="Lire un fichier WAV 48 kHz mono à la place du flux audio">▶ Lire WAV</button>
         <input type="file" id="rx-wav-input" accept=".wav,audio/wav,audio/x-wav" hidden>
-        <span id="rx-device-label" class="rx-device-label" title="Périphérique sélectionné dans les Paramètres">—</span>
+        <span id="rx-device-label" class="rx-device-label" data-i18n-title="rx.device_label_tip" title="Périphérique sélectionné dans les Paramètres">—</span>
       </div>
       <div class="rx-force-bar" id="rx-force-bar" hidden>
         <label>
           <input type="checkbox" id="rx-force-mode">
-          Forcer un profil
+          <span data-i18n="rx.force_profile">Forcer un profil</span>
         </label>
         <select id="rx-forced-profile" disabled>
           <!-- options populated dynamically from list_modem_profiles -->
         </select>
-        <span class="rx-force-hint">prend effet au prochain ▶ Démarrer</span>
+        <span class="rx-force-hint" data-i18n="rx.force_hint">prend effet au prochain ▶ Démarrer</span>
       </div>
       <div id="capture-submit-prompt" class="capture-submit-prompt" hidden>
         <div class="csp-line">
-          <strong>Capture terminée</strong>
+          <strong data-i18n="rx.capture_done">Capture terminée</strong>
           <span id="csp-meta" class="csp-meta">—</span>
         </div>
         <div class="csp-line">
-          <input type="text" id="csp-notes" placeholder="Notes optionnelles (ex: relais HB9F, S9, QSB léger…)">
+          <input type="text" id="csp-notes" data-i18n-placeholder="rx.notes_placeholder" placeholder="Notes optionnelles (ex: relais HB9F, S9, QSB léger…)">
         </div>
         <div class="csp-line csp-actions">
           <span id="csp-status" class="csp-status">—</span>
-          <button type="button" id="csp-submit">Soumettre au collecteur</button>
-          <button type="button" id="csp-dismiss" class="csp-dismiss">Ignorer</button>
+          <button type="button" id="csp-submit" data-i18n="rx.submit_collector">Soumettre au collecteur</button>
+          <button type="button" id="csp-dismiss" class="csp-dismiss" data-i18n="rx.dismiss">Ignorer</button>
         </div>
       </div>
       <div id="rx-fountain-status" class="rx-fountain-status" hidden>
-        <span class="label">RaptorQ</span>
+        <span class="label" data-i18n="rx.fountain_label">RaptorQ</span>
         <strong id="rx-fountain-counter">— / —</strong>
         <span id="rx-fountain-pct" class="rx-fountain-pct">—</span>
         <span id="rx-fountain-session" class="rx-fountain-session">—</span>
       </div>
-      <div id="current-info" class="rx-info">Aucun fichier reçu</div>
+      <div id="current-info" class="rx-info" data-i18n="rx.no_file">Aucun fichier reçu</div>
       <div id="current-image-wrap" class="rx-image-wrap">
-        <div class="rx-placeholder">En attente d'image…</div>
+        <div class="rx-placeholder" data-i18n="rx.placeholder">En attente d'image…</div>
       </div>
       <canvas id="constellation-canvas" class="rx-constellation" width="260" height="260"></canvas>
       <canvas id="pilot-phase-canvas" class="rx-pilot-phase" width="600" height="120"></canvas>
@@ -83,7 +87,7 @@
     <section id="tab-tx" class="tab-panel tx-layout">
       <div class="tx-image-area">
         <div id="tx-drop-zone" class="tx-drop-zone">
-          <p>Glisser une image ou un fichier ici<br>ou cliquer pour choisir…</p>
+          <p><span data-i18n="tx.drop_zone">Glisser une image ou un fichier ici</span><br><span data-i18n="tx.drop_zone_2">ou cliquer pour choisir…</span></p>
           <input type="file" id="tx-file-input" hidden>
         </div>
         <div id="tx-preview" class="tx-preview" hidden>
@@ -92,68 +96,68 @@
           <div class="tx-preview-overlay">
             <span id="tx-preview-info">—</span>
           </div>
-          <button id="tx-preview-reset" class="tx-preview-reset" title="Changer d'image">✕</button>
+          <button id="tx-preview-reset" class="tx-preview-reset" data-i18n-title="tx.preview_reset_tip" title="Changer d'image">✕</button>
         </div>
       </div>
       <aside class="tx-controls">
         <fieldset>
-          <legend>Mode modem</legend>
+          <legend data-i18n="tx.legend_mode">Mode modem</legend>
           <select id="tx-mode">
             <!-- options populated dynamically from list_modem_profiles -->
           </select>
-          <div id="tx-experimental-warn" class="experimental-warn" hidden>
+          <div id="tx-experimental-warn" class="experimental-warn" hidden data-i18n="tx.experimental_warn">
             ⚠ Mode expérimental — non décodable côté RX sans activer "Forcer un profil" sur le pair, et seulement sur la même version de l'appli.
           </div>
         </fieldset>
 
         <fieldset>
-          <legend>Redimensionnement</legend>
-          <label><input type="radio" name="tx-resize" value="none"> Aucun</label>
+          <legend data-i18n="tx.legend_resize">Redimensionnement</legend>
+          <label><input type="radio" name="tx-resize" value="none"> <span data-i18n="tx.resize_none">Aucun</span></label>
           <label><input type="radio" name="tx-resize" value="1920x1024"> 1920 × 1024</label>
           <label><input type="radio" name="tx-resize" value="800x600" checked> 800 × 600</label>
-          <label><input type="radio" name="tx-resize" value="free"> Libre</label>
+          <label><input type="radio" name="tx-resize" value="free"> <span data-i18n="tx.resize_free">Libre</span></label>
           <div id="tx-resize-free" class="tx-resize-free" hidden>
             <input type="number" id="tx-free-w" min="16" step="1"> ×
-            <input type="number" id="tx-free-h" min="16" step="1"> px
+            <input type="number" id="tx-free-h" min="16" step="1"> <span data-i18n="tx.resize_px">px</span>
           </div>
         </fieldset>
 
         <fieldset>
-          <legend>Qualité AVIF</legend>
+          <legend data-i18n="tx.legend_quality">Qualité AVIF</legend>
           <input type="range" id="tx-quality" min="0" max="100" value="10">
           <div class="tx-quality-row">
             <span>q = <span id="tx-quality-val">10</span></span>
-            <span class="tx-hint">AVIF 4:2:0</span>
+            <span class="tx-hint" data-i18n="tx.quality_hint">AVIF 4:2:0</span>
           </div>
           <label class="tx-speed-label" for="tx-speed">
-            Vitesse encodeur
-            <span class="tx-hint">1 = max compression/lent · 10 = rapide/moins bon</span>
+            <span data-i18n="tx.speed_label">Vitesse encodeur</span>
+            <span class="tx-hint" data-i18n="tx.speed_hint">1 = max compression/lent · 10 = rapide/moins bon</span>
           </label>
           <input type="range" id="tx-speed" min="1" max="10" value="6">
           <div class="tx-quality-row">
             <span>speed = <span id="tx-speed-val">6</span></span>
-            <span class="tx-hint" id="tx-speed-hint">équilibré</span>
+            <span class="tx-hint" id="tx-speed-hint" data-i18n="tx.speed_balanced">équilibré</span>
           </div>
         </fieldset>
 
         <div class="tx-size-info">
-          <div>Source : <span id="tx-source-size">—</span></div>
-          <div>Compressé : <span id="tx-compressed-size">—</span></div>
+          <div><span data-i18n="tx.source_size">Source :</span> <span id="tx-source-size">—</span></div>
+          <div><span data-i18n="tx.compressed_size">Compressé :</span> <span id="tx-compressed-size">—</span></div>
         </div>
 
-        <div id="tx-passthrough-hint" class="tx-passthrough-hint" hidden>
+        <div id="tx-passthrough-hint" class="tx-passthrough-hint" hidden data-i18n="tx.passthrough_hint">
           AVIF natif → passthrough (pas de ré-encodage)
         </div>
 
-        <button id="tx-btn-compress" class="tx-btn tx-btn-compress" disabled>Recalculer la compression</button>
+        <button id="tx-btn-compress" class="tx-btn tx-btn-compress" disabled data-i18n="tx.btn_compress">Recalculer la compression</button>
 
         <div class="tx-actions">
           <div class="tx-actions-row">
-            <button id="tx-btn-tx" class="tx-btn tx-btn-primary" disabled>TX</button>
+            <button id="tx-btn-tx" class="tx-btn tx-btn-primary" disabled data-i18n="tx.btn_tx">TX</button>
             <input type="number" id="tx-repair-pct" class="tx-more-pct"
                    list="tx-repair-pct-presets" min="0" max="200" step="5" value="5"
-                   title="Redondance RaptorQ ajoutée au burst initial (K + repair)" disabled>
-            <span class="tx-unit">% repair</span>
+                   data-i18n-title="tx.repair_tip" title="Redondance RaptorQ ajoutée au burst initial (K + repair)" disabled>
+            <span class="tx-unit" data-i18n="tx.repair_unit">% repair</span>
             <datalist id="tx-repair-pct-presets">
               <option value="0"></option>
               <option value="5"></option>
@@ -163,14 +167,14 @@
               <option value="50"></option>
               <option value="100"></option>
             </datalist>
-            <button id="tx-btn-stop" class="tx-btn tx-btn-stop" disabled>Stop</button>
+            <button id="tx-btn-stop" class="tx-btn tx-btn-stop" disabled data-i18n="tx.btn_stop">Stop</button>
           </div>
           <div class="tx-actions-row">
-            <button id="tx-btn-more" class="tx-btn tx-btn-more" disabled>TX more</button>
+            <button id="tx-btn-more" class="tx-btn tx-btn-more" disabled data-i18n="tx.btn_more">TX more</button>
             <input type="number" id="tx-more-count" class="tx-more-pct"
                    list="tx-more-count-presets" min="1" max="999" step="1" value="5"
-                   title="Nombre de blocs additionnels à émettre (exact)" disabled>
-            <span class="tx-unit">blocs</span>
+                   data-i18n-title="tx.more_tip" title="Nombre de blocs additionnels à émettre (exact)" disabled>
+            <span class="tx-unit" data-i18n="tx.more_unit">blocs</span>
             <datalist id="tx-more-count-presets">
               <option value="1"></option>
               <option value="2"></option>
@@ -187,137 +191,137 @@
     <section id="tab-overlays" class="tab-panel overlays-layout">
       <div class="overlays-form">
         <fieldset class="overlays-slot-bar">
-          <legend>Slot actif</legend>
+          <legend data-i18n="overlays.legend_slot">Slot actif</legend>
           <div class="ov-slot-row" id="ov-slot-row">
-            <label><input type="radio" name="active-overlay" value="0" checked> <span class="ov-slot-label">Aucun</span></label>
+            <label><input type="radio" name="active-overlay" value="0" checked> <span class="ov-slot-label" data-i18n="overlays.slot_none">Aucun</span></label>
             <label><input type="radio" name="active-overlay" value="1"> <span class="ov-slot-label" data-slot="1">Overlay 1</span></label>
             <label><input type="radio" name="active-overlay" value="2"> <span class="ov-slot-label" data-slot="2">Overlay 2</span></label>
             <label><input type="radio" name="active-overlay" value="3"> <span class="ov-slot-label" data-slot="3">Overlay 3</span></label>
             <label><input type="radio" name="active-overlay" value="4"> <span class="ov-slot-label" data-slot="4">Overlay 4</span></label>
           </div>
-          <div class="ov-hint">Le slot « Aucun » ne modifie pas l'image. Sélectionner 1 à 4 pour appliquer un overlay à chaque recompression.</div>
+          <div class="ov-hint" data-i18n="overlays.slot_hint">Le slot « Aucun » ne modifie pas l'image. Sélectionner 1 à 4 pour appliquer un overlay à chaque recompression.</div>
         </fieldset>
 
         <div id="ov-editor" class="overlays-editor" hidden>
           <fieldset>
-            <legend>Nom du slot</legend>
-            <input type="text" id="ov-name" maxlength="40" placeholder="ex. callsign + logo club">
+            <legend data-i18n="overlays.legend_name">Nom du slot</legend>
+            <input type="text" id="ov-name" maxlength="40" data-i18n-placeholder="overlays.name_placeholder" placeholder="ex. callsign + logo club">
           </fieldset>
 
           <fieldset class="ov-block">
-            <legend><label><input type="checkbox" id="ov-text-enable"> Texte</label></legend>
+            <legend><label><input type="checkbox" id="ov-text-enable"> <span data-i18n="overlays.text">Texte</span></label></legend>
             <div class="ov-row">
-              <label class="ov-row-full">Contenu
-                <input type="text" id="ov-text-content" maxlength="60" placeholder="HB9TOB">
+              <label class="ov-row-full"><span data-i18n="overlays.text_content">Contenu</span>
+                <input type="text" id="ov-text-content" maxlength="60" data-i18n-placeholder="overlays.text_content_placeholder" placeholder="HB9TOB">
               </label>
             </div>
             <div class="ov-row">
-              <label>Coin
+              <label><span data-i18n="overlays.corner">Coin</span>
                 <select id="ov-text-anchor">
-                  <option value="top_left">Haut gauche</option>
-                  <option value="top_right">Haut droit</option>
-                  <option value="bottom_left">Bas gauche</option>
-                  <option value="bottom_right" selected>Bas droit</option>
+                  <option value="top_left" data-i18n="overlays.corner_tl">Haut gauche</option>
+                  <option value="top_right" data-i18n="overlays.corner_tr">Haut droit</option>
+                  <option value="bottom_left" data-i18n="overlays.corner_bl">Bas gauche</option>
+                  <option value="bottom_right" selected data-i18n="overlays.corner_br">Bas droit</option>
                 </select>
               </label>
-              <label>Hauteur (%)
+              <label><span data-i18n="overlays.height_pct">Hauteur (%)</span>
                 <input type="number" id="ov-text-h" min="1" max="50" step="0.5" value="6">
               </label>
             </div>
             <div class="ov-row">
-              <label>Marge X (%)
+              <label><span data-i18n="overlays.margin_x">Marge X (%)</span>
                 <input type="number" id="ov-text-mx" min="0" max="50" step="0.1" value="2">
               </label>
-              <label>Marge Y (%)
+              <label><span data-i18n="overlays.margin_y">Marge Y (%)</span>
                 <input type="number" id="ov-text-my" min="0" max="50" step="0.1" value="2">
               </label>
             </div>
             <div class="ov-row">
-              <label>Couleur
+              <label><span data-i18n="overlays.color">Couleur</span>
                 <input type="color" id="ov-text-color" value="#ffffff">
               </label>
               <label class="ov-checkbox">
-                <input type="checkbox" id="ov-text-halo" checked> Halo noir
+                <input type="checkbox" id="ov-text-halo" checked> <span data-i18n="overlays.halo">Halo noir</span>
               </label>
             </div>
           </fieldset>
 
           <fieldset class="ov-block">
-            <legend><label><input type="checkbox" id="ov-logo-enable"> Logo</label></legend>
+            <legend><label><input type="checkbox" id="ov-logo-enable"> <span data-i18n="overlays.logo">Logo</span></label></legend>
             <div class="ov-row">
-              <button type="button" id="ov-logo-pick" class="ov-btn">Choisir un fichier…</button>
+              <button type="button" id="ov-logo-pick" class="ov-btn" data-i18n="overlays.logo_pick">Choisir un fichier…</button>
               <span id="ov-logo-name" class="ov-logo-name">—</span>
               <input type="file" id="ov-logo-input" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif" hidden>
             </div>
             <img id="ov-logo-preview" class="ov-logo-preview" alt="" hidden>
             <div class="ov-row">
-              <label>Coin
+              <label><span data-i18n="overlays.corner">Coin</span>
                 <select id="ov-logo-anchor">
-                  <option value="top_left" selected>Haut gauche</option>
-                  <option value="top_right">Haut droit</option>
-                  <option value="bottom_left">Bas gauche</option>
-                  <option value="bottom_right">Bas droit</option>
+                  <option value="top_left" selected data-i18n="overlays.corner_tl">Haut gauche</option>
+                  <option value="top_right" data-i18n="overlays.corner_tr">Haut droit</option>
+                  <option value="bottom_left" data-i18n="overlays.corner_bl">Bas gauche</option>
+                  <option value="bottom_right" data-i18n="overlays.corner_br">Bas droit</option>
                 </select>
               </label>
-              <label>Taille (%)
+              <label><span data-i18n="overlays.size_pct">Taille (%)</span>
                 <input type="number" id="ov-logo-size" min="1" max="50" step="0.5" value="12">
               </label>
             </div>
             <div class="ov-row">
-              <label>Marge X (%)
+              <label><span data-i18n="overlays.margin_x">Marge X (%)</span>
                 <input type="number" id="ov-logo-mx" min="0" max="50" step="0.1" value="2">
               </label>
-              <label>Marge Y (%)
+              <label><span data-i18n="overlays.margin_y">Marge Y (%)</span>
                 <input type="number" id="ov-logo-my" min="0" max="50" step="0.1" value="2">
               </label>
             </div>
           </fieldset>
 
-          <div class="ov-hint">Marges et tailles sont relatives à l'image redimensionnée pour la transmission. L'overlay est intégré aux pixels — visible côté RX comme côté preview.</div>
+          <div class="ov-hint" data-i18n="overlays.hint">Marges et tailles sont relatives à l'image redimensionnée pour la transmission. L'overlay est intégré aux pixels — visible côté RX comme côté preview.</div>
         </div>
       </div>
     </section>
     <section id="tab-settings" class="tab-panel settings-layout">
       <div class="settings-form">
         <div id="settings-rx-warn" class="settings-warn" hidden>
-          <span class="settings-warn-text">
+          <span class="settings-warn-text" data-i18n="settings.rx_warn_html">
             ⚠ Le RX est en cours. Pour modifier le périphérique RX ou
             la désemphase, il faut d'abord arrêter la réception.
           </span>
-          <button type="button" id="settings-stop-rx-btn">Arrêter le RX</button>
+          <button type="button" id="settings-stop-rx-btn" data-i18n="settings.stop_rx_btn">Arrêter le RX</button>
         </div>
         <fieldset>
-          <legend>Indicatif</legend>
-          <input type="text" id="callsign-input" placeholder="HB9TOB" maxlength="12">
-          <div class="tx-hint">Affiché dans les en-têtes transmis.</div>
+          <legend data-i18n="settings.legend_callsign">Indicatif</legend>
+          <input type="text" id="callsign-input" data-i18n-placeholder="settings.callsign_placeholder" placeholder="HB9TOB" maxlength="12">
+          <div class="tx-hint" data-i18n="settings.callsign_hint">Affiché dans les en-têtes transmis.</div>
         </fieldset>
         <!-- Per-backend enable checkboxes. Populated at runtime from
              `list_sdr_backends` (one row per registered backend). All
              unchecked by default — the operator opts in to whichever
              SDR family they actually have hardware for, so we don't
              dlopen vendor libraries on hosts that don't need them.
-             The inline status text reports "Bibliothèque manquante"
+             The inline status text reports "Library missing"
              when the runtime library isn't loadable. -->
         <fieldset id="sdr-backends-fieldset">
-          <legend>Backends SDR</legend>
-          <p class="tx-hint" style="margin: 0 0 0.5rem;">
+          <legend data-i18n="settings.legend_sdr_backends">Backends SDR</legend>
+          <p class="tx-hint" style="margin: 0 0 0.5rem;" data-i18n="settings.sdr_backends_hint">
             Activer la recherche des récepteurs SDR. Chaque backend
             n'interroge son driver que s'il est coché.
           </p>
           <div id="sdr-backends-list" class="sdr-backends-list">
-            <span class="tx-hint">Chargement…</span>
+            <span class="tx-hint" data-i18n="settings.loading">Chargement…</span>
           </div>
         </fieldset>
         <fieldset>
-          <legend>Périphérique réception (RX)</legend>
+          <legend data-i18n="settings.legend_rx_device">Périphérique réception (RX)</legend>
           <select id="rx-device-select">
-            <option>Chargement…</option>
+            <option data-i18n="settings.loading">Chargement…</option>
           </select>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="rx-deemphasis-enabled">
-            Désemphase PM −6 dB/oct (radio FM legacy)
+            <span data-i18n="settings.rx_deemphasis">Désemphase PM −6 dB/oct (radio FM legacy)</span>
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="settings.rx_deemphasis_hint">
             Pente descendante −6 dB/oct au-dessus de 300 Hz (~−10 dB à 1 kHz,
             ~−19 dB à 2.7 kHz). Symétrique exacte de la pré-emphase TX
             ci-dessous : ensemble, ils émulent le ±6 dB/oct intrinsèque
@@ -328,9 +332,9 @@
           </p>
           <label class="ptt-row" style="margin-top: 0.7rem;">
             <input type="checkbox" id="rx-allow-legacy-grid">
-            Power Mode
+            <span data-i18n="settings.rx_power_mode">Power Mode</span>
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n-html="settings.rx_power_mode_hint_html">
             Algorithme RX 0.9.x — balayage de drift complet ±80 ppm par
             fenêtre (coarse 20 ppm + fine ±10 ppm). Décode robuste éprouvé.
             Timeout preamble-absence flat 6 s pour tous profils (strict
@@ -349,15 +353,15 @@
           </fieldset>
         </fieldset>
         <fieldset>
-          <legend>Périphérique émission (TX)</legend>
+          <legend data-i18n="settings.legend_tx_device">Périphérique émission (TX)</legend>
           <select id="tx-device-select">
-            <option>Chargement…</option>
+            <option data-i18n="settings.loading">Chargement…</option>
           </select>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="tx-preemphasis-enabled">
-            Pré-emphase PM +6 dB/oct (radio FM legacy)
+            <span data-i18n="settings.tx_preemphasis">Pré-emphase PM +6 dB/oct (radio FM legacy)</span>
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="settings.tx_preemphasis_hint">
             Pente montante +6 dB/oct au-dessus de 300 Hz (~+10 dB à 1 kHz,
             ~+19 dB à 2.7 kHz). Émule la pré-emphase ±6 dB/oct intrinsèque
             d'une radio PM. Le signal est re-normalisé après filtrage pour
@@ -367,9 +371,9 @@
           </p>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="tx-save-wav-enabled">
-            Sauver le WAV émis dans tx_history/
+            <span data-i18n="settings.tx_save_wav">Sauver le WAV émis dans tx_history/</span>
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="settings.tx_save_wav_hint">
             Écrit l'audio synthétisé (mono 48 kHz int16, post pré-emphase
             et atténuation) à côté du fichier source archivé. Désactivé
             par défaut.
@@ -384,36 +388,36 @@
           </fieldset>
         </fieldset>
         <fieldset>
-          <legend>PTT (RTS/DTR sur port série)</legend>
+          <legend data-i18n="settings.legend_ptt">PTT (RTS/DTR sur port série)</legend>
           <label class="ptt-row">
             <input type="checkbox" id="ptt-enabled">
-            Activer la commande PTT
+            <span data-i18n="settings.ptt_enable">Activer la commande PTT</span>
           </label>
           <div id="ptt-config" class="ptt-config" hidden>
             <label class="ptt-row">
-              Port :
+              <span data-i18n="settings.ptt_port">Port :</span>
               <select id="ptt-port-select">
-                <option value="">— aucun port —</option>
+                <option value="" data-i18n="settings.ptt_no_port">— aucun port —</option>
               </select>
-              <button type="button" id="ptt-port-refresh" class="ptt-refresh" title="Rafraîchir la liste des ports série">↻</button>
+              <button type="button" id="ptt-port-refresh" class="ptt-refresh" data-i18n-title="settings.ptt_refresh_tip" title="Rafraîchir la liste des ports série">↻</button>
             </label>
             <div class="ptt-line">
               <label class="ptt-row">
                 <input type="checkbox" id="ptt-use-rts" checked>
-                Utiliser RTS — niveau en émission :
+                <span data-i18n="settings.ptt_rts">Utiliser RTS — niveau en émission :</span>
               </label>
-              <label><input type="radio" name="ptt-rts-pol" value="high" checked> Haut (+)</label>
-              <label><input type="radio" name="ptt-rts-pol" value="low"> Bas (−)</label>
+              <label><input type="radio" name="ptt-rts-pol" value="high" checked> <span data-i18n="settings.ptt_high">Haut (+)</span></label>
+              <label><input type="radio" name="ptt-rts-pol" value="low"> <span data-i18n="settings.ptt_low">Bas (−)</span></label>
             </div>
             <div class="ptt-line">
               <label class="ptt-row">
                 <input type="checkbox" id="ptt-use-dtr">
-                Utiliser DTR — niveau en émission :
+                <span data-i18n="settings.ptt_dtr">Utiliser DTR — niveau en émission :</span>
               </label>
-              <label><input type="radio" name="ptt-dtr-pol" value="high" checked> Haut (+)</label>
-              <label><input type="radio" name="ptt-dtr-pol" value="low"> Bas (−)</label>
+              <label><input type="radio" name="ptt-dtr-pol" value="high" checked> <span data-i18n="settings.ptt_high">Haut (+)</span></label>
+              <label><input type="radio" name="ptt-dtr-pol" value="low"> <span data-i18n="settings.ptt_low">Bas (−)</span></label>
             </div>
-            <div class="tx-hint">
+            <div class="tx-hint" data-i18n="settings.ptt_hint">
               En réception les lignes prennent la polarité inverse. Délai
               PTT⇄audio : 200 ms.
             </div>
@@ -421,35 +425,35 @@
           <div id="ptt-status" class="ptt-status">—</div>
         </fieldset>
         <fieldset>
-          <legend>Collecteur de sondages (Phase D)</legend>
+          <legend data-i18n="settings.legend_collector">Collecteur de sondages (Phase D)</legend>
           <label class="ptt-row">
-            URL :
+            <span data-i18n="settings.collector_url">URL :</span>
             <input type="url" id="collector-url" placeholder="https://hb9tob-modem.duckdns.org">
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="settings.collector_hint">
             Si renseigné, à la fin de chaque capture brute le GUI propose
             de soumettre le WAV + l'event log au serveur. Vide = pas de
             soumission, prompt désactivé.
           </p>
         </fieldset>
         <fieldset>
-          <legend>Historique TX</legend>
+          <legend data-i18n="settings.legend_tx_history">Historique TX</legend>
           <label class="ptt-row">
-            Nombre maximum de fichiers conservés :
+            <span data-i18n="settings.tx_history_max">Nombre maximum de fichiers conservés :</span>
             <input type="number" id="tx-history-max-input" min="10" step="10" value="100">
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n-html="settings.tx_history_hint_html">
             Au-delà, les plus anciens sont purgés à chaque nouvelle émission.
             Stocké sous <code>&lt;save_dir&gt;/tx_history/</code>.
           </p>
         </fieldset>
         <fieldset>
-          <legend>Modes expérimentaux</legend>
+          <legend data-i18n="settings.legend_experimental">Modes expérimentaux</legend>
           <label class="ptt-row">
             <input type="checkbox" id="experimental-modes-enabled">
-            Activer les modes expérimentaux
+            <span data-i18n="settings.experimental_enable">Activer les modes expérimentaux</span>
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="settings.experimental_hint">
             Affiche les profils marqués ⚠ dans les combos TX et RX (MEGA,
             FAST, HIGH++, HIGH+56), et l'option « Forcer un profil » au
             démarrage RX. Ces modes ne sont décodables que par un pair
@@ -457,12 +461,12 @@
           </p>
         </fieldset>
         <fieldset>
-          <legend>Full-duplex</legend>
+          <legend data-i18n="settings.legend_fdx">Full-duplex</legend>
           <label class="ptt-row">
             <input type="checkbox" id="full-duplex-enabled">
-            Autoriser émission et réception simultanées
+            <span data-i18n="settings.fdx_enable">Autoriser émission et réception simultanées</span>
           </label>
-          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="settings.fdx_hint">
             Par défaut, l'émission interrompt la réception (puis la
             relance après TX). Si activé : les deux tournent en parallèle
             (utile avec un device RX distinct du device TX, ex. SDRplay
@@ -477,27 +481,27 @@
     </section>
     <section id="tab-sessions" class="tab-panel sessions-layout">
       <div class="sessions-toolbar">
-        <button id="btn-sessions-refresh">Actualiser</button>
-        <span id="sessions-count" class="sessions-count">0 session</span>
+        <button id="btn-sessions-refresh" data-i18n="sessions.refresh">Actualiser</button>
+        <span id="sessions-count" class="sessions-count" data-i18n="sessions.count_zero">0 session</span>
       </div>
       <table class="sessions-table">
         <thead>
           <tr>
-            <th>Session</th>
-            <th>De</th>
-            <th>Fichier</th>
-            <th>Profil</th>
-            <th>Reçus / K</th>
-            <th>Progression</th>
-            <th>Statut</th>
+            <th data-i18n="sessions.col_session">Session</th>
+            <th data-i18n="sessions.col_from">De</th>
+            <th data-i18n="sessions.col_file">Fichier</th>
+            <th data-i18n="sessions.col_profile">Profil</th>
+            <th data-i18n="sessions.col_received">Reçus / K</th>
+            <th data-i18n="sessions.col_progress">Progression</th>
+            <th data-i18n="sessions.col_status">Statut</th>
             <th></th>
           </tr>
         </thead>
         <tbody id="sessions-tbody">
-          <tr><td colspan="8" class="sessions-empty">Aucune session.</td></tr>
+          <tr><td colspan="8" class="sessions-empty" data-i18n="sessions.empty">Aucune session.</td></tr>
         </tbody>
       </table>
-      <div class="sessions-hint">
+      <div class="sessions-hint" data-i18n-html="sessions.hint_html">
         Les sessions sont conservées 24 h. Chaque dossier <code>&lt;save_dir&gt;/sessions/&lt;id&gt;.session/</code>
         contient <code>meta.json</code>, <code>packets.blob</code> et <code>decoded.&lt;ext&gt;</code> si
         le décodage a abouti.
@@ -505,20 +509,20 @@
     </section>
     <section id="tab-history" class="tab-panel history-layout">
       <div class="history-toolbar">
-        <button id="btn-history-refresh">Actualiser</button>
+        <button id="btn-history-refresh" data-i18n="history.refresh">Actualiser</button>
         <span id="history-count" class="history-count">—</span>
       </div>
       <div class="history-grid">
         <div class="history-col history-tx">
-          <h3 class="history-col-title">Émis (TX)</h3>
+          <h3 class="history-col-title" data-i18n="history.tx_title">Émis (TX)</h3>
           <div id="history-tx-list" class="history-list">
-            <div class="history-empty">Aucun fichier émis.</div>
+            <div class="history-empty" data-i18n="history.tx_empty">Aucun fichier émis.</div>
           </div>
         </div>
         <div class="history-col history-rx">
-          <h3 class="history-col-title">Reçus (RX)</h3>
+          <h3 class="history-col-title" data-i18n="history.rx_title">Reçus (RX)</h3>
           <div id="history-rx-list" class="history-list">
-            <div class="history-empty">Aucun fichier reçu.</div>
+            <div class="history-empty" data-i18n="history.rx_empty">Aucun fichier reçu.</div>
           </div>
         </div>
       </div>
@@ -526,54 +530,54 @@
     <section id="tab-channel" class="tab-panel channel-layout">
       <div class="channel-form">
         <div class="channel-col channel-tx">
-          <h3 class="channel-col-title">Émission (TX)</h3>
+          <h3 class="channel-col-title" data-i18n="channel.tx_title">Émission (TX)</h3>
           <fieldset>
-            <legend>Atténuation appliquée à ma TX</legend>
+            <legend data-i18n="channel.legend_att">Atténuation appliquée à ma TX</legend>
             <p class="tx-hint">
-              Réduit le niveau du WAV transmis avant la sortie TX. Gain
-              appliqué : <span id="att-gain-info">×1.000 (0 dB)</span>.
+              <span data-i18n="channel.att_hint">Réduit le niveau du WAV transmis avant la sortie TX. Gain appliqué :</span>
+              <span id="att-gain-info">×1.000 (0 dB)</span>.
             </p>
             <div class="channel-att-row">
               <input type="range" id="att-slider" min="-30" max="0" step="0.5" value="0">
               <input type="number" id="att-input" min="-30" max="0" step="0.5" value="0">
               <span class="tx-hint">dB</span>
-              <button type="button" id="att-reset" class="ptt-refresh" title="Remettre à 0 dB">0 dB</button>
+              <button type="button" id="att-reset" class="ptt-refresh" data-i18n-title="channel.att_reset_tip" title="Remettre à 0 dB">0 dB</button>
             </div>
             <div class="channel-status" id="att-status">—</div>
           </fieldset>
 
           <fieldset>
-            <legend>Rapports reçus (oral)</legend>
-            <p class="tx-hint">
+            <legend data-i18n="channel.legend_cascade">Rapports reçus (oral)</legend>
+            <p class="tx-hint" data-i18n="channel.cascade_hint">
               Atténuation annoncée par les correspondants lors du QSO
               (négatif = "trop fort, baisse de N dB"). La médiane peut être
               appliquée à ma TX d'un clic.
             </p>
             <div class="cascade-add">
-              <input type="text" id="cascade-call" placeholder="HB9XYZ" maxlength="12">
-              <input type="number" id="cascade-db" placeholder="-5" step="0.5">
+              <input type="text" id="cascade-call" data-i18n-placeholder="channel.cascade_call_placeholder" placeholder="HB9XYZ" maxlength="12">
+              <input type="number" id="cascade-db" data-i18n-placeholder="channel.cascade_db_placeholder" placeholder="-5" step="0.5">
               <span class="tx-hint">dB</span>
-              <button type="button" id="cascade-add">Ajouter</button>
+              <button type="button" id="cascade-add" data-i18n="channel.cascade_add">Ajouter</button>
             </div>
             <table class="cascade-table">
               <thead>
-                <tr><th>Indicatif</th><th>dB</th><th></th></tr>
+                <tr><th data-i18n="channel.cascade_col_call">Indicatif</th><th data-i18n="channel.cascade_col_db">dB</th><th></th></tr>
               </thead>
               <tbody id="cascade-tbody">
-                <tr><td colspan="3" class="cascade-empty">Aucun rapport.</td></tr>
+                <tr><td colspan="3" class="cascade-empty" data-i18n="channel.cascade_empty">Aucun rapport.</td></tr>
               </tbody>
             </table>
             <div class="cascade-summary">
-              <span>Médiane : <strong id="cascade-median">—</strong></span>
-              <span>Moyenne : <strong id="cascade-mean">—</strong></span>
-              <button type="button" id="cascade-apply" disabled>Appliquer la médiane</button>
-              <button type="button" id="cascade-clear" class="cascade-clear">Vider</button>
+              <span><span data-i18n="channel.cascade_median">Médiane :</span> <strong id="cascade-median">—</strong></span>
+              <span><span data-i18n="channel.cascade_mean">Moyenne :</span> <strong id="cascade-mean">—</strong></span>
+              <button type="button" id="cascade-apply" disabled data-i18n="channel.cascade_apply">Appliquer la médiane</button>
+              <button type="button" id="cascade-clear" class="cascade-clear" data-i18n="channel.cascade_clear">Vider</button>
             </div>
           </fieldset>
 
           <fieldset class="sounder-tx">
-            <legend>Sondeur — émission TX</legend>
-            <p class="tx-hint">
+            <legend data-i18n="channel.sounder_tx_legend">Sondeur — émission TX</legend>
+            <p class="tx-hint" id="sounder-tx-hint-p">
               Émet la séquence de sondage standard
               (préambule 1750 Hz pour ouvrir un relais, sync chirp,
               rampe d'amplitude, two-tone, chirp, multitone, AWGN, Golay).
@@ -583,17 +587,17 @@
               5 s laisse aux relais et au VOX le temps de s'engager.
             </p>
             <div class="sounder-row sounder-row-actions">
-              <button type="button" id="sounder-tx-emit" class="sounder-emit-btn">▶ Émettre la séquence de sondage</button>
+              <button type="button" id="sounder-tx-emit" class="sounder-emit-btn" data-i18n="channel.sounder_tx_emit">▶ Émettre la séquence de sondage</button>
               <span class="sounder-status" id="sounder-tx-status">—</span>
             </div>
           </fieldset>
         </div>
 
         <div class="channel-col channel-rx">
-          <h3 class="channel-col-title">Réception (RX)</h3>
+          <h3 class="channel-col-title" data-i18n="channel.rx_title">Réception (RX)</h3>
           <fieldset class="sounder-rx">
-            <legend>Sondeur — capture + analyse RX</legend>
-            <p class="tx-hint">
+            <legend data-i18n="channel.sounder_rx_legend">Sondeur — capture + analyse RX</legend>
+            <p class="tx-hint" data-i18n-html="channel.sounder_rx_hint_html">
               Renseignez la chaîne (équipement TX, équipement RX,
               relais éventuel, mode), cliquez
               <strong>Démarrer la capture</strong> (la capture
@@ -605,16 +609,16 @@
               (déterministe) — pas de fichier à transférer.
             </p>
             <div class="sounder-row">
-              <label>Équipement TX
-                <input type="text" id="sounder-rx-tx-model" list="sounder-rig-models" placeholder="ex: FT-991A, IC-705, perso…">
+              <label><span data-i18n="channel.sounder_tx_model">Équipement TX</span>
+                <input type="text" id="sounder-rx-tx-model" list="sounder-rig-models" data-i18n-placeholder="channel.sounder_tx_model_placeholder" placeholder="ex: FT-991A, IC-705, perso…">
               </label>
-              <label>Équipement RX
-                <input type="text" id="sounder-rx-rx-model" list="sounder-rig-models" placeholder="ex: FTX-1, SDRplay, perso…">
+              <label><span data-i18n="channel.sounder_rx_model">Équipement RX</span>
+                <input type="text" id="sounder-rx-rx-model" list="sounder-rig-models" data-i18n-placeholder="channel.sounder_rx_model_placeholder" placeholder="ex: FTX-1, SDRplay, perso…">
               </label>
             </div>
             <div class="sounder-row">
-              <label>Locator TX (dicté par l'OM émetteur)
-                <input type="text" id="sounder-rx-tx-locator" placeholder="ex: JN36ld" maxlength="8">
+              <label><span data-i18n="channel.sounder_tx_locator">Locator TX (dicté par l'OM émetteur)</span>
+                <input type="text" id="sounder-rx-tx-locator" data-i18n-placeholder="channel.sounder_tx_locator_placeholder" placeholder="ex: JN36ld" maxlength="8">
               </label>
             </div>
             <datalist id="sounder-rig-models">
@@ -675,11 +679,11 @@
               <option value="Carte son uniquement"></option>
             </datalist>
             <div class="sounder-row">
-              <label>Relais
-                <input type="text" id="sounder-rx-relay" list="sounder-relay-list" value="Aucun (simplex)" placeholder="ex: 1750 Hz, CTCSS, DCS, DMR…">
+              <label><span data-i18n="channel.sounder_relay">Relais</span>
+                <input type="text" id="sounder-rx-relay" list="sounder-relay-list" value="Aucun (simplex)" data-i18n-placeholder="channel.sounder_relay_placeholder" placeholder="ex: 1750 Hz, CTCSS, DCS, DMR…">
               </label>
-              <label>Mode
-                <input type="text" id="sounder-rx-mode" list="sounder-mode-list" value="NBFM 5 kHz" placeholder="NBFM / SSB / AM / digital…">
+              <label><span data-i18n="channel.sounder_mode">Mode</span>
+                <input type="text" id="sounder-rx-mode" list="sounder-mode-list" value="NBFM 5 kHz" data-i18n-placeholder="channel.sounder_mode_placeholder" placeholder="NBFM / SSB / AM / digital…">
               </label>
             </div>
             <datalist id="sounder-relay-list">
@@ -705,95 +709,95 @@
               <option value="Numérique (DV/DMR/C4FM)"></option>
             </datalist>
             <div class="sounder-row sounder-row-actions">
-              <button type="button" id="sounder-rx-capture-toggle">⏺ Démarrer la capture</button>
-              <button type="button" id="sounder-an-run" disabled>Analyser la capture</button>
+              <button type="button" id="sounder-rx-capture-toggle" data-i18n="channel.sounder_capture_start">⏺ Démarrer la capture</button>
+              <button type="button" id="sounder-an-run" disabled data-i18n="channel.sounder_analyse">Analyser la capture</button>
               <span class="sounder-status" id="sounder-an-status">—</span>
             </div>
             <details class="sounder-advanced">
-              <summary>Options avancées</summary>
+              <summary data-i18n="channel.sounder_advanced">Options avancées</summary>
               <div class="sounder-row">
-                <label>Capture WAV
-                  <input type="text" id="sounder-an-capture" placeholder="rempli automatiquement après capture">
+                <label><span data-i18n="channel.sounder_capture_wav">Capture WAV</span>
+                  <input type="text" id="sounder-an-capture" data-i18n-placeholder="channel.sounder_capture_wav_placeholder" placeholder="rempli automatiquement après capture">
                 </label>
               </div>
               <div class="sounder-row">
-                <label>Schedule JSON
-                  <input type="text" id="sounder-an-schedule" placeholder="rempli automatiquement par 'Générer la référence ici'">
+                <label><span data-i18n="channel.sounder_schedule">Schedule JSON</span>
+                  <input type="text" id="sounder-an-schedule" data-i18n-placeholder="channel.sounder_schedule_placeholder" placeholder="rempli automatiquement par 'Générer la référence ici'">
                 </label>
-                <button type="button" id="sounder-an-regen-ref" title="Régénère la référence localement (probe.wav + schedule.json) avec les paramètres standard">Générer la référence ici</button>
+                <button type="button" id="sounder-an-regen-ref" data-i18n-title="channel.sounder_regen_ref_tip" title="Régénère la référence localement (probe.wav + schedule.json) avec les paramètres standard" data-i18n="channel.sounder_regen_ref">Générer la référence ici</button>
               </div>
               <div class="sounder-row">
-                <label>Seuil sync
+                <label><span data-i18n="channel.sounder_threshold">Seuil sync</span>
                   <input type="number" id="sounder-an-threshold" min="2" max="20" step="0.5" value="6">
                 </label>
               </div>
             </details>
             <div class="sounder-results" id="sounder-an-results" hidden>
-              <h4>Recommandation à dicter à l'OM TX</h4>
+              <h4 data-i18n="channel.sounder_results_title">Recommandation à dicter à l'OM TX</h4>
               <div class="sd-reco">
-                <span class="sd-reco-label">Atténuation TX :</span>
+                <span class="sd-reco-label" data-i18n="channel.sounder_reco_label">Atténuation TX :</span>
                 <span id="sd-reco-att" class="sd-reco-value">—</span>
                 <span class="sd-reco-unit">dB</span>
               </div>
-              <p class="sd-reco-hint">
+              <p class="sd-reco-hint" data-i18n="channel.sounder_reco_hint">
                 Valeur entière à transmettre par phonie à la station émettrice.
                 Côté TX, l'opérateur la saisit dans Canal → Cascade de rapports.
               </p>
-              <h4>Verdict</h4>
+              <h4 data-i18n="channel.sounder_verdict_title">Verdict</h4>
               <div class="sounder-verdict" id="sd-verdict">—</div>
               <div class="sd-collector">
-                <button type="button" id="sd-collector-send" disabled>
+                <button type="button" id="sd-collector-send" disabled data-i18n="channel.sounder_collector_send">
                   Envoyer au collector
                 </button>
                 <label class="sd-collector-opt">
                   <input type="checkbox" id="sd-collector-with-wav">
-                  joindre capture.wav
+                  <span data-i18n="channel.sounder_collector_with_wav">joindre capture.wav</span>
                 </label>
                 <span id="sd-collector-status" class="status"></span>
               </div>
-              <h4>Paramètres dérivés (au sweet-spot)</h4>
+              <h4 data-i18n="channel.sounder_derived_title">Paramètres dérivés (au sweet-spot)</h4>
               <table class="sounder-derived">
                 <tbody>
-                  <tr><th>SNR moyen</th><td><span id="sd-snr">—</span> dB</td></tr>
-                  <tr><th>IP3 (sortie)</th><td><span id="sd-ip3">—</span> dBFS</td></tr>
-                  <tr><th>P1dB (entrée)</th><td><span id="sd-p1db">—</span> dBFS</td></tr>
-                  <tr><th>Sweet spot</th><td><span id="sd-sweet">—</span> dBFS</td></tr>
-                  <tr><th>BW −3 dB</th><td><span id="sd-bw">—</span> Hz</td></tr>
-                  <tr><th>Group delay (pic)</th><td><span id="sd-gd">—</span> µs</td></tr>
-                  <tr><th>Plancher de bruit</th><td><span id="sd-noise">—</span> dBFS</td></tr>
-                  <tr><th>Delay spread 50 % (brut)</th><td><span id="sd-d50">—</span> µs</td></tr>
-                  <tr><th>Delay spread 90 % (brut)</th><td><span id="sd-d90">—</span> µs</td></tr>
-                  <tr><th>Multipath 50 % (sans group delay)</th><td><span id="sd-mp50">—</span> µs</td></tr>
-                  <tr><th>Multipath 90 % (sans group delay)</th><td><span id="sd-mp90">—</span> µs</td></tr>
-                  <tr><th>Smear chaîne OTA</th><td><span id="sd-smear">—</span> µs</td></tr>
-                  <tr><th>Plus fort écho</th><td><span id="sd-echo">—</span> dBc</td></tr>
-                  <tr><th>Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
+                  <tr><th data-i18n="channel.sd_snr">SNR moyen</th><td><span id="sd-snr">—</span> dB</td></tr>
+                  <tr><th data-i18n="channel.sd_ip3">IP3 (sortie)</th><td><span id="sd-ip3">—</span> dBFS</td></tr>
+                  <tr><th data-i18n="channel.sd_p1db">P1dB (entrée)</th><td><span id="sd-p1db">—</span> dBFS</td></tr>
+                  <tr><th data-i18n="channel.sd_sweet">Sweet spot</th><td><span id="sd-sweet">—</span> dBFS</td></tr>
+                  <tr><th data-i18n="channel.sd_bw">BW −3 dB</th><td><span id="sd-bw">—</span> Hz</td></tr>
+                  <tr><th data-i18n="channel.sd_gd">Group delay (pic)</th><td><span id="sd-gd">—</span> µs</td></tr>
+                  <tr><th data-i18n="channel.sd_noise">Plancher de bruit</th><td><span id="sd-noise">—</span> dBFS</td></tr>
+                  <tr><th data-i18n="channel.sd_d50">Delay spread 50 % (brut)</th><td><span id="sd-d50">—</span> µs</td></tr>
+                  <tr><th data-i18n="channel.sd_d90">Delay spread 90 % (brut)</th><td><span id="sd-d90">—</span> µs</td></tr>
+                  <tr><th data-i18n="channel.sd_mp50">Multipath 50 % (sans group delay)</th><td><span id="sd-mp50">—</span> µs</td></tr>
+                  <tr><th data-i18n="channel.sd_mp90">Multipath 90 % (sans group delay)</th><td><span id="sd-mp90">—</span> µs</td></tr>
+                  <tr><th data-i18n="channel.sd_smear">Smear chaîne OTA</th><td><span id="sd-smear">—</span> µs</td></tr>
+                  <tr><th data-i18n="channel.sd_echo">Plus fort écho</th><td><span id="sd-echo">—</span> dBc</td></tr>
+                  <tr><th data-i18n="channel.sd_anchor">Sync trouvée à l'échantillon</th><td><span id="sd-anchor">—</span></td></tr>
                 </tbody>
               </table>
-              <h4>Diagrammes</h4>
+              <h4 data-i18n="channel.diagrams_title">Diagrammes</h4>
               <div class="sounder-plots">
                 <div class="sounder-plot">
-                  <div class="sounder-plot-title">AM-AM (compression d'amplitude)</div>
+                  <div class="sounder-plot-title" data-i18n="channel.plot_amam">AM-AM (compression d'amplitude)</div>
                   <svg id="sd-plot-amam" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
                 </div>
                 <div class="sounder-plot">
-                  <div class="sounder-plot-title">AM-PM (déphasage vs niveau)</div>
+                  <div class="sounder-plot-title" data-i18n="channel.plot_ampm">AM-PM (déphasage vs niveau)</div>
                   <svg id="sd-plot-ampm" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
                 </div>
                 <div class="sounder-plot">
-                  <div class="sounder-plot-title">IMD3 vs niveau (sortie two-tone)</div>
+                  <div class="sounder-plot-title" data-i18n="channel.plot_imd3">IMD3 vs niveau (sortie two-tone)</div>
                   <svg id="sd-plot-imd3" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
                 </div>
                 <div class="sounder-plot">
-                  <div class="sounder-plot-title">Réponse en fréquence (multitone)</div>
+                  <div class="sounder-plot-title" data-i18n="channel.plot_freq">Réponse en fréquence (multitone)</div>
                   <svg id="sd-plot-freq" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
                 </div>
                 <div class="sounder-plot">
-                  <div class="sounder-plot-title">Group delay (chirp)</div>
+                  <div class="sounder-plot-title" data-i18n="channel.plot_gd">Group delay (chirp)</div>
                   <svg id="sd-plot-gd" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
                 </div>
                 <div class="sounder-plot">
-                  <div class="sounder-plot-title">Réponse impulsionnelle (Golay)</div>
+                  <div class="sounder-plot-title" data-i18n="channel.plot_ir">Réponse impulsionnelle (Golay)</div>
                   <svg id="sd-plot-ir" class="sounder-plot-svg" viewBox="0 0 360 220"></svg>
                 </div>
               </div>
@@ -823,7 +827,7 @@
   </div>
   <!-- Image lightbox: fullscreen + zoom up to 1:1. -->
   <div id="image-lightbox" class="image-lightbox" tabindex="-1" hidden>
-    <div class="image-lightbox-hint">a/q ou +/− ou molette : zoom (jusqu'à 8×) · 0 : ajuster · flèches ou drag : pan · Échap : fermer</div>
+    <div class="image-lightbox-hint" data-i18n="lightbox.hint">a/q ou +/− ou molette : zoom (jusqu'à 8×) · 0 : ajuster · flèches ou drag : pan · Échap : fermer</div>
     <img id="image-lightbox-img" alt="" />
   </div>
   <!--
@@ -846,7 +850,7 @@
     <div class="select-picker-panel">
       <div class="select-picker-header">
         <span class="select-picker-label" id="select-picker-label">—</span>
-        <span class="select-picker-close" id="select-picker-cancel" title="Annuler">✕</span>
+        <span class="select-picker-close" id="select-picker-cancel" data-i18n-title="picker.cancel" title="Annuler">✕</span>
       </div>
       <div class="select-picker-list" id="select-picker-list">
         <!-- Rows injected by openSelectPicker(). -->
@@ -857,7 +861,7 @@
     <div class="virt-kb-panel">
       <div class="virt-kb-header">
         <span class="virt-kb-label" id="virt-kb-label">—</span>
-        <span class="virt-kb-close" id="virt-kb-cancel" title="Annuler">✕</span>
+        <span class="virt-kb-close" id="virt-kb-cancel" data-i18n-title="vkb.cancel" title="Annuler">✕</span>
       </div>
       <div class="virt-kb-display">
         <span id="virt-kb-value">&nbsp;</span><span class="virt-kb-caret">|</span>
@@ -866,8 +870,8 @@
         <!-- Rows injected by setupVirtKeyboard(). -->
       </div>
       <div class="virt-kb-actions">
-        <button type="button" id="virt-kb-cancel-btn">Annuler</button>
-        <button type="button" id="virt-kb-ok">Valider</button>
+        <button type="button" id="virt-kb-cancel-btn" data-i18n="vkb.cancel">Annuler</button>
+        <button type="button" id="virt-kb-ok" data-i18n="vkb.ok">Valider</button>
       </div>
     </div>
   </div>

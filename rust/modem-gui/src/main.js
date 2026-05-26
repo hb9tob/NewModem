@@ -1,6 +1,8 @@
 // NBFM Modem GUI — 3-tab layout (RX / TX / Info) with per-block progress and
 // live constellation display.
 
+import { initI18n, setLang, getLang, supportedLangs, t, applyI18n } from "./i18n.js";
+
 // Mapping aligned with modem-core/src/app_header.rs :: mime
 //   0 = BINARY, 1 = TEXT, 2 = IMAGE_AVIF, 3 = IMAGE_JPEG, 4 = IMAGE_PNG,
 //   5 = ZSTD (non-image file decompressed RX-side by the Rust worker).
@@ -57,6 +59,40 @@ function logEvent(name, data) {
   li.appendChild(body);
   log.insertBefore(li, log.firstChild);
   while (log.children.length > 500) log.removeChild(log.lastChild);
+}
+
+// ────────────────────────────────────────────────────────── Language
+// The <select id="lang-select"> in the top bar persists across
+// reloads (i18n.js localStorage). On change we let i18n.js rewalk
+// the DOM via applyI18n + fire `langchange`; everything dynamic
+// (sessions table, history list, status chips, etc.) re-renders
+// itself by listening on that event.
+function setupLangSelect() {
+  const sel = document.getElementById("lang-select");
+  if (!sel) return;
+  // Pre-select the active language and seed the visible options
+  // from supportedLangs() so adding a 3rd language is a JSON drop.
+  sel.innerHTML = "";
+  for (const lang of supportedLangs()) {
+    const opt = document.createElement("option");
+    opt.value = lang;
+    opt.textContent = lang.toUpperCase();
+    sel.appendChild(opt);
+  }
+  sel.value = getLang();
+  sel.addEventListener("change", async () => {
+    try { await setLang(sel.value); } catch (err) { console.error("setLang", err); }
+  });
+  document.addEventListener("langchange", () => {
+    // Keep the visible value in sync if setLang was invoked programmatically.
+    sel.value = getLang();
+    // Re-render every list/table that builds its own DOM and would
+    // otherwise still show the previous language. Wrapped because
+    // some renderers run before their backing state has loaded.
+    try { renderSessionsTable(); } catch (_) {}
+    try { refreshHistory(); } catch (_) {}
+    try { renderSdrBackendsList(); } catch (_) {}
+  });
 }
 
 // ────────────────────────────────────────────────────────────── Tabs
@@ -165,9 +201,13 @@ function renderSessionsTable() {
     (a, b) => (b.created_at || 0) - (a.created_at || 0)
   );
   countEl.textContent =
-    entries.length === 0 ? "0 session" : `${entries.length} session${entries.length > 1 ? "s" : ""}`;
+    entries.length === 0
+      ? t("sessions.count_zero")
+      : entries.length === 1
+        ? t("sessions.count_one")
+        : t("sessions.count_many", { n: entries.length });
   if (entries.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" class="sessions-empty">Aucune session.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="sessions-empty">${escapeHtml(t("sessions.empty"))}</td></tr>`;
     return;
   }
   tbody.innerHTML = entries.map(renderSessionRow).join("");
@@ -176,7 +216,7 @@ function renderSessionsTable() {
     btn.addEventListener("click", async (ev) => {
       const id = parseInt(ev.currentTarget.dataset.sid, 10);
       if (!Number.isFinite(id)) return;
-      if (!confirm(`Supprimer la session ${id.toString(16).padStart(8, "0")} ?`)) {
+      if (!confirm(t("sessions.delete_confirm", { id: id.toString(16).padStart(8, "0") }))) {
         return;
       }
       try {
@@ -203,15 +243,15 @@ function renderSessionRow(s) {
   if (s.decoded) {
     fillClass = " done";
     statusClass = "done";
-    statusText = "décodé";
+    statusText = t("sessions.status_decoded");
   } else if (s.cap_reached) {
     fillClass = " cap-reached";
     statusClass = "cap-reached";
-    statusText = "cap 3× atteint";
+    statusText = t("sessions.status_cap_reached");
   } else if (ratio >= 2.0) {
     fillClass = " cap-warn";
     statusClass = "cap-warn";
-    statusText = "canal dégradé";
+    statusText = t("sessions.status_degraded");
   }
   const filename = s.filename || "—";
   const callsign = s.callsign || "—";
@@ -229,7 +269,7 @@ function renderSessionRow(s) {
         <span style="margin-left:8px;color:#888">${pct}%</span>
       </td>
       <td><span class="status-chip ${statusClass}">${statusText}</span></td>
-      <td><button class="btn-session-delete" data-sid="${s.session_id}" title="Supprimer le dossier session">✕</button></td>
+      <td><button class="btn-session-delete" data-sid="${s.session_id}" title="${escapeHtml(t("sessions.delete_tip"))}">✕</button></td>
     </tr>`;
 }
 
@@ -631,7 +671,7 @@ function populateDeviceSelect(selectId, devices, savedName, backendDevices, dire
   })();
   if (audio.length === 0 && sdrCount === 0) {
     const opt = document.createElement("option");
-    opt.textContent = "aucun périphérique détecté";
+    opt.textContent = t("status.no_device");
     opt.value = "";
     select.appendChild(opt);
     return null;
@@ -737,7 +777,7 @@ async function renderSdrBackendsList() {
   const host = document.getElementById("sdr-backends-list");
   if (!host) return;
   if (!sdrBackends || sdrBackends.size === 0) {
-    host.innerHTML = `<span class="tx-hint">Aucun backend SDR compilé dans ce binaire.</span>`;
+    host.innerHTML = `<span class="tx-hint">${escapeHtml(t("status.no_sdr_backends"))}</span>`;
     return;
   }
   host.innerHTML = "";
@@ -752,7 +792,7 @@ async function renderSdrBackendsList() {
     cb.dataset.backendId = id;
     cb.checked = isBackendEnabled(id);
     const name = document.createElement("span");
-    name.textContent = `Activer ${info.display_name || id}`;
+    name.textContent = t("status.sdr_enable", { name: info.display_name || id });
     const status = document.createElement("span");
     status.className = "sdr-backend-status";
     status.dataset.backendId = id;
@@ -801,14 +841,14 @@ async function refreshBackendLibraryStatus(backendId) {
   try {
     const st = await invoke("get_backend_library_status", { backendId });
     if (st.available) {
-      span.textContent = "OK";
+      span.textContent = t("status.sdr_lib_ok");
       span.classList.remove("warn");
     } else {
-      span.textContent = st.message || "Bibliothèque manquante";
+      span.textContent = st.message || t("status.lib_missing");
       span.classList.add("warn");
     }
   } catch (err) {
-    span.textContent = "Statut indisponible";
+    span.textContent = t("status.lib_status_unavail");
     span.classList.add("warn");
   }
 }
@@ -1057,7 +1097,7 @@ function buildFreqRow(direction, backendId, caps, cfg) {
   const maxMhz = range ? (range[1] / 1e6) : 6000;
   const label = document.createElement("label");
   label.className = "pluto-field";
-  label.textContent = direction === "rx" ? "Fréquence RX (MHz) : " : "Fréquence TX (MHz) : ";
+  label.textContent = t(direction === "rx" ? "rx.dev_freq_rx" : "rx.dev_freq_tx");
   const input = document.createElement("input");
   input.type = "number";
   input.id = `sdr-${direction}-freq-${backendId}`;
@@ -1081,7 +1121,7 @@ function buildAgcRow(direction, backendId, caps, cfg) {
   const row = makeRow();
   const label = document.createElement("label");
   label.className = "pluto-field";
-  label.textContent = "AGC : ";
+  label.textContent = t("rx.dev_agc");
   const sel = document.createElement("select");
   sel.id = `sdr-${direction}-agc-${backendId}`;
   sel.dataset.backend = backendId;
@@ -1189,7 +1229,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
     const r = shape.DbContinuous;
     const label = document.createElement("label");
     label.className = "pluto-field";
-    label.textContent = direction === "rx" ? "Gain RX (dB) : " : "Gain TX (dB) : ";
+    label.textContent = t(direction === "rx" ? "rx.dev_gain_rx" : "rx.dev_gain_tx");
     const input = document.createElement("input");
     input.type = "number";
     input.id = `sdr-${direction}-gain-db-${backendId}`;
@@ -1206,7 +1246,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
     const r = shape.LnaPlusIf;
     const lnaLabel = document.createElement("label");
     lnaLabel.className = "pluto-field";
-    lnaLabel.textContent = "LNA state : ";
+    lnaLabel.textContent = t("rx.dev_lna");
     const lnaInput = document.createElement("input");
     lnaInput.type = "number";
     lnaInput.id = `sdr-${direction}-gain-lna-${backendId}`;
@@ -1225,7 +1265,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
 
     const ifLabel = document.createElement("label");
     ifLabel.className = "pluto-field";
-    ifLabel.textContent = "IF gRdB : ";
+    ifLabel.textContent = t("rx.dev_if");
     const ifInput = document.createElement("input");
     ifInput.type = "number";
     ifInput.id = `sdr-${direction}-gain-if-${backendId}`;
@@ -1246,7 +1286,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
     const r = shape.DbDiscrete;
     const label = document.createElement("label");
     label.className = "pluto-field";
-    label.textContent = direction === "rx" ? "Gain RX (dB) : " : "Gain TX (dB) : ";
+    label.textContent = t(direction === "rx" ? "rx.dev_gain_rx" : "rx.dev_gain_tx");
     const sel = document.createElement("select");
     sel.id = `sdr-${direction}-gain-step-${backendId}`;
     sel.disabled = isAgc;
@@ -1296,7 +1336,7 @@ function buildAntennaRow(backendId, caps, cfg) {
 
 function buildFeatureRow(direction, backendId, caps, cfg) {
   const row = makeRow();
-  if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", "Bias-T (+5 V vers préampli)", !!cfg.bias_t));
+  if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", t("rx.dev_bias_t"), !!cfg.bias_t));
   if (caps.features.fm_notch) row.appendChild(makeCheckbox(backendId, "fm_notch", "Filtre rejet FM (88-108 MHz)", !!cfg.fm_notch));
   if (caps.features.dab_notch) row.appendChild(makeCheckbox(backendId, "dab_notch", "Filtre rejet DAB (174-240 MHz)", !!cfg.dab_notch));
   return row;
@@ -1318,7 +1358,7 @@ function makeCheckbox(backendId, fieldName, labelText, checked) {
 
 function buildDeviationRow(direction, backendId, cfg) {
   const row = makeRow();
-  row.appendChild(makeFieldLabel(direction === "rx" ? "Déviation RX :" : "Déviation TX :"));
+  row.appendChild(makeFieldLabel(t(direction === "rx" ? "rx.dev_dev_rx" : "rx.dev_dev_tx")));
   const fieldHz = direction === "rx" ? "max_deviation_hz" : "tx_deviation_hz";
   const cur = cfg[fieldHz] != null ? cfg[fieldHz] : 5000;
   for (const v of [5000, 2500]) {
@@ -1353,7 +1393,7 @@ function buildCtcssRow(backendId, cfg) {
   row.appendChild(cbLabel);
   const toneLabel = document.createElement("label");
   toneLabel.className = "pluto-field";
-  toneLabel.textContent = "Tonalité : ";
+  toneLabel.textContent = t("rx.dev_tone");
   const sel = document.createElement("select");
   sel.id = `sdr-tx-ctcss-tone-${backendId}`;
   for (const f of EIA_CTCSS_TONES_HZ) {
@@ -1386,7 +1426,7 @@ function buildTxAttenuationRow(backendId, cfg) {
   const row = makeRow();
   const label = document.createElement("label");
   label.className = "pluto-field";
-  label.textContent = "Atténuation TX (dB) : ";
+  label.textContent = t("rx.dev_atten_tx");
   const input = document.createElement("input");
   input.type = "number";
   input.id = `sdr-tx-att-${backendId}`;
@@ -1712,11 +1752,11 @@ function populateOneProfileSelect(selId, allowExperimental, rich) {
     opt.value = p.name;
     if (rich) {
       opt.textContent = p.experimental
-        ? `⚠ ${p.label} [EXPÉRIMENTAL]`
+        ? t("tx.experimental_label", { label: p.label })
         : p.label;
     } else {
       opt.textContent = p.experimental
-        ? `⚠ ${p.name} [EXPÉRIMENTAL]`
+        ? t("tx.experimental_name", { name: p.name })
         : p.name;
     }
     if (p.experimental) opt.classList.add("experimental-option");
@@ -1862,14 +1902,14 @@ async function loadSerialPorts() {
   if (ports.length === 0) {
     const opt = document.createElement("option");
     opt.value = "";
-    opt.textContent = "— aucun port détecté —";
+    opt.textContent = t("status.no_port_detected");
     sel.appendChild(opt);
   } else {
     if (saved && !ports.includes(saved)) {
       // Keep the saved value even when absent, to make it visible.
       const opt = document.createElement("option");
       opt.value = saved;
-      opt.textContent = `${saved} (introuvable)`;
+      opt.textContent = t("status.port_missing", { name: saved });
       sel.appendChild(opt);
     }
     for (const name of ports) {
@@ -1940,9 +1980,9 @@ async function persistSettings() {
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
-    if (statusEl) statusEl.textContent = `sauvegardé ${now()}`;
+    if (statusEl) statusEl.textContent = t("status.saved_at", { time: now() });
   } catch (err) {
-    if (statusEl) statusEl.textContent = `erreur : ${err}`;
+    if (statusEl) statusEl.textContent = t("status.error_prefix", { err });
   }
 }
 
@@ -2088,7 +2128,7 @@ async function startCapture() {
   const deviceName = select ? select.value : "";
   const status = document.getElementById("status");
   if (!deviceName) {
-    status.textContent = "sélectionner une carte RX dans Paramètres";
+    status.textContent = t("status.select_rx_in_settings");
     status.style.color = "#ef5350";
     return;
   }
@@ -2099,8 +2139,8 @@ async function startCapture() {
   try {
     await invoke("start_capture", { deviceName, profile, forced });
     status.textContent = forced
-      ? `capture en cours (mode forcé : ${profile})`
-      : "capture en cours";
+      ? t("status.capture_forced", { profile })
+      : t("status.capture_running");
     status.style.color = "#ffb74d";
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
@@ -2111,7 +2151,7 @@ async function startCapture() {
     refreshDuplexTxBar();
     logEvent("start", { device: deviceName, profile, forced });
   } catch (err) {
-    status.textContent = `erreur start : ${err}`;
+    status.textContent = t("status.error_start", { err });
     status.style.color = "#ef5350";
     logEvent("error", { message: String(err) });
   }
@@ -2171,11 +2211,11 @@ async function startCaptureFromWav(file) {
   // and avoids spending seconds reading the file for nothing.
   const stopBtn = document.getElementById("btn-stop");
   if (stopBtn && !stopBtn.disabled) {
-    status.textContent = "arrêter d'abord la capture en cours";
+    status.textContent = t("status.stop_capture_first");
     status.style.color = "#ef5350";
     return;
   }
-  status.textContent = `chargement ${file.name}…`;
+  status.textContent = t("status.loading_file", { name: file.name });
   status.style.color = "#90caf9";
   try {
     const buf = await file.arrayBuffer();
@@ -2187,7 +2227,7 @@ async function startCaptureFromWav(file) {
     const forced = !!currentSettings.rx_force_mode;
     const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
     await invoke("start_capture_from_wav", { args: { bytes, profile, forced } });
-    status.textContent = `lecture WAV : ${file.name}`;
+    status.textContent = t("status.wav_playback", { name: file.name });
     status.style.color = "#ffb74d";
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
@@ -2198,7 +2238,7 @@ async function startCaptureFromWav(file) {
     refreshDuplexTxBar();
     logEvent("wav_playback_start", { file: file.name, profile, forced });
   } catch (err) {
-    status.textContent = `erreur lecture WAV : ${err}`;
+    status.textContent = t("status.wav_playback_error", { err });
     status.style.color = "#ef5350";
     logEvent("wav_playback_error", { message: String(err) });
   }
@@ -2209,7 +2249,7 @@ async function stopCapture() {
   const status = document.getElementById("status");
   try {
     await invoke("stop_capture");
-    status.textContent = "arrêté";
+    status.textContent = t("status.stopped");
     status.style.color = "#9ccc65";
     document.getElementById("btn-stop").disabled = true;
     const rxSel = document.getElementById("rx-device-select");
@@ -2226,7 +2266,7 @@ async function stopCapture() {
     await refreshRawRecordingState();
     logEvent("stop", null);
   } catch (err) {
-    status.textContent = `erreur stop : ${err}`;
+    status.textContent = t("status.error_stop", { err });
     status.style.color = "#ef5350";
   }
 }
@@ -2238,10 +2278,10 @@ function setRawButtonState(recording) {
   const btn = document.getElementById("btn-raw");
   if (recording) {
     btn.classList.add("recording");
-    btn.textContent = "⏹ arrêter capture";
+    btn.textContent = t("status.stop_capture_btn");
   } else {
     btn.classList.remove("recording");
-    btn.textContent = "⏺ capture brute";
+    btn.textContent = t("rx.raw");
   }
 }
 
@@ -2297,7 +2337,7 @@ function maybeOfferCaptureSubmit(captureInfo) {
     meta.textContent = `${captureInfo.duration_sec.toFixed(1)} s · ~${sizeMb} MB · ${captureInfo.path}`;
   }
   const status = document.getElementById("csp-status");
-  if (status) status.textContent = `prêt à soumettre vers ${url}`;
+  if (status) status.textContent = t("status.ready_to_submit", { url });
   const submit = document.getElementById("csp-submit");
   const dismiss = document.getElementById("csp-dismiss");
   if (submit) submit.disabled = false;
@@ -2319,7 +2359,7 @@ async function submitPendingCapture() {
   if (panel) panel.classList.add("busy");
   if (submit) submit.disabled = true;
   if (dismiss) dismiss.disabled = true;
-  if (status) status.textContent = "envoi en cours…";
+  if (status) status.textContent = t("status.submitting");
   try {
     const result = await invoke("submit_capture", {
       args: {
@@ -2336,19 +2376,19 @@ async function submitPendingCapture() {
     const base = (currentSettings.collector_url || "").replace(/\/+$/, "");
     const fullUrl = base + (result.url || "");
     if (status) {
-      status.innerHTML = `envoyé : <a href="${escapeHtml(fullUrl)}" target="_blank">${escapeHtml(result.folder)}</a> ` +
-        `(${(result.bytes_uploaded / (1024 * 1024)).toFixed(1)} MB)`;
+      status.innerHTML = t("status.send_collector_done", { url: escapeHtml(fullUrl), folder: escapeHtml(result.folder) })
+        + `(${(result.bytes_uploaded / (1024 * 1024)).toFixed(1)} MB)`;
     }
     if (dismiss) {
       dismiss.disabled = false;
-      dismiss.textContent = "Fermer";
+      dismiss.textContent = t("status.close");
     }
     logEvent("capture_submit_ok", { folder: result.folder, bytes: result.bytes_uploaded });
     pendingCapture = null;
   } catch (err) {
     panel.classList.remove("busy");
     panel.classList.add("error");
-    if (status) status.textContent = `erreur : ${err}`;
+    if (status) status.textContent = t("status.error_prefix", { err });
     if (submit) submit.disabled = false;
     if (dismiss) dismiss.disabled = false;
     logEvent("capture_submit_error", { message: String(err) });
@@ -2362,7 +2402,7 @@ function dismissCapturePrompt() {
     panel.classList.remove("busy", "success", "error");
   }
   const dismiss = document.getElementById("csp-dismiss");
-  if (dismiss) dismiss.textContent = "Ignorer";
+  if (dismiss) dismiss.textContent = t("rx.dismiss");
   pendingCapture = null;
 }
 
@@ -2536,7 +2576,7 @@ async function pickOverlayLogo(file) {
     commitOverlayChange();
   } catch (err) {
     console.error("overlays_import_logo", err);
-    alert(`Import logo échoué : ${err}`);
+    alert(t("status.error_import_logo", { err }));
   }
 }
 
@@ -2664,7 +2704,7 @@ function refreshRxRealtimeChip() {
   if (!rxRealtimeActive || !lastRxRealtime) {
     chip.classList.remove("rt-ok", "rt-warn", "rt-err");
     chip.classList.add("rt-off");
-    chip.title = "Marge temps-réel RX — capture inactive";
+    chip.title = t("rt.inactive");
     return;
   }
   const p = lastRxRealtime;
@@ -2680,13 +2720,13 @@ function refreshRxRealtimeChip() {
   chip.classList.remove("rt-off", "rt-ok", "rt-warn", "rt-err");
   chip.classList.add(`rt-${state}`);
   const lines = [
-    `Marge temps-réel RX (${state.toUpperCase()})`,
-    `lag wall-clock : ${p.lag_ms.toFixed(0)} ms`,
-    `dernier batch  : ${p.last_batch_ms.toFixed(0)} ms (cible < 500)`,
-    `pic 2 s        : ${p.max_batch_ms.toFixed(0)} ms`,
-    `session_buffer : ${p.session_buf_ms.toFixed(0)} ms`,
-    `samples perdus capture (ring 30 s overflow) : ${p.dropped_samples}`
-      + (recentDrop ? " ⚠ brickwall récent → flush+idle" : ""),
+    t("rt.active", { state: state.toUpperCase() }),
+    t("rt.lag", { ms: p.lag_ms.toFixed(0) }),
+    t("rt.last_batch", { ms: p.last_batch_ms.toFixed(0) }),
+    t("rt.peak_2s", { ms: p.max_batch_ms.toFixed(0) }),
+    t("rt.session_buf", { ms: p.session_buf_ms.toFixed(0) }),
+    t("rt.dropped", { n: p.dropped_samples })
+      + (recentDrop ? t("rt.brickwall_suffix") : ""),
   ];
   chip.title = lines.join("\n");
 }
@@ -2800,17 +2840,17 @@ function updateFountainStatus(partial) {
   const missingTail = next.decoded
     ? ""
     : missing > 0
-    ? ` · manque ${missing}`
-    : ` · manque 0 (décodable)`;
-  counter.textContent = `${r} / ${k} blocs${missingTail}`;
+    ? t("fountain.missing_n", { n: missing })
+    : t("fountain.missing_zero");
+  counter.textContent = t("fountain.received_blocks", { r, k, tail: missingTail });
   const pctVal = k > 0 ? Math.min(100, Math.round((r * 100) / k)) : 0;
   pct.textContent = next.decoded
-    ? "décodé ✓"
+    ? t("fountain.decoded_ok")
     : next.capReached
-    ? `${pctVal} % (canal saturé)`
+    ? t("fountain.saturated", { pct: pctVal })
     : `${pctVal} %`;
   if (next.sessionId != null) {
-    sess.textContent = `session ${next.sessionId.toString(16).padStart(8, "0")}`;
+    sess.textContent = t("fountain.session", { id: next.sessionId.toString(16).padStart(8, "0") });
   }
   el.dataset.decoded = next.decoded ? "true" : "false";
 }
@@ -3523,15 +3563,15 @@ function refreshTxButtons() {
 
   // TX button label + color depending on state.
   if (txState.txActive) {
-    btnTx.textContent = "TX en cours…";
-    btnTx.title = "émission en cours";
+    btnTx.textContent = t("tx.btn_running");
+    btnTx.title = t("status.tx_in_progress");
   } else if (tooBig) {
-    btnTx.textContent = `TX ✖ image > 100 ko`;
-    btnTx.title = `${(bytes / 1024).toFixed(1)} Kio dépasse la limite 100 Kio (images)`;
+    btnTx.textContent = t("tx.btn_too_big");
+    btnTx.title = t("status.tx_oversize_kio", { size: (bytes / 1024).toFixed(1) });
   } else if (tooLong) {
     const limMin = isFile ? 10 : 5;
-    btnTx.textContent = `TX ✖ > ${limMin} min`;
-    btnTx.title = `durée estimée ${fmtSeconds(dur)} dépasse la limite ${limMin} min`;
+    btnTx.textContent = t("tx.btn_too_long", { limit: limMin });
+    btnTx.title = t("status.tx_oversize_time", { dur: fmtSeconds(dur), limit: limMin });
   } else if (warn) {
     btnTx.textContent = `TX ⚠ ${fmtSeconds(dur)}`;
     btnTx.title = txButtonTitle(est, dur, true);
@@ -3566,15 +3606,15 @@ function txFormatBytes(n) {
 // seconds) instead of "18.453123…".
 function txButtonTitle(est, dur, longTx) {
   if (!est) return "";
-  const base = longTx ? `transmission longue (> 2 min) — durée ` : `durée `;
+  const base = longTx ? t("tx.dur_long") : t("tx.dur");
   const k = est.k_source;
   const n = est.n_initial ?? est.total_blocks;
-  const parts = [`${base}${fmtSeconds(dur)}, ${n} blocs émis`];
+  const parts = [t("tx.dur_blocks", { base, dur: fmtSeconds(dur), n })];
   if (k != null && k !== n) {
-    parts.push(`K=${k} nécessaires au décodage`);
+    parts.push(t("tx.parts_with_k", { k }));
   }
   if (est.duration_s_k != null) {
-    parts.push(`seuil ${fmtSeconds(est.duration_s_k)} si aucune perte`);
+    parts.push(t("tx.threshold_lossless", { dur: fmtSeconds(est.duration_s_k) }));
   }
   return parts.join(" · ");
 }
@@ -3584,10 +3624,10 @@ function moreButtonTitle() {
   const est = txState.estimate;
   const count = computeMoreCount();
   if (!est || !est.seconds_per_cw) {
-    return `émettre +${count} blocs RaptorQ`;
+    return t("tx.emit_n_more", { count });
   }
   const dur = est.seconds_per_cw * count;
-  return `+${count} blocs · ~${fmtSeconds(dur)}`;
+  return t("tx.emit_n_more_dur", { count, dur: fmtSeconds(dur) });
 }
 
 function txFitInto(w, h, maxW, maxH) {
@@ -3647,13 +3687,13 @@ function refreshTxPreview() {
   if (srcSize) srcSize.textContent = txFormatBytes(txState.sourceSize);
   if (cmpSize) {
     if (txState.compressing && txState.compressedBytes == null) {
-      cmpSize.textContent = "compression…";
+      cmpSize.textContent = t("tx.compressing");
       cmpSize.classList.remove("tx-stale");
     } else if (txState.compressedBytes != null) {
       const ratio = txState.sourceSize > 0
         ? ` (${(txState.compressedBytes / txState.sourceSize * 100).toFixed(1)}%)`
         : "";
-      const staleTag = txState.compressDirty ? " · obsolète" : "";
+      const staleTag = txState.compressDirty ? t("tx.compress_stale_suffix") : "";
       cmpSize.textContent = `${txFormatBytes(txState.compressedBytes)}${ratio}${staleTag}`;
       cmpSize.classList.toggle("tx-stale", txState.compressDirty);
     } else {
@@ -3901,10 +3941,10 @@ function applyTxModeUI() {
   if (hint) {
     if (file) {
       hint.hidden = false;
-      hint.textContent = "Fichier non-image → compression zstd sans perte";
+      hint.textContent = t("tx.file_zstd_hint");
     } else if (passthrough) {
       hint.hidden = false;
-      hint.textContent = "AVIF natif → passthrough (pas de ré-encodage)";
+      hint.textContent = t("tx.passthrough_short");
     } else {
       hint.hidden = true;
     }
@@ -3963,7 +4003,7 @@ async function loadTxFileFromPath(path) {
   // and piled `_runTxCompressImpl` calls on `_compressChain` until the
   // WebView ran out of memory.
   if (txState.loading || txState.compressing) {
-    logEvent("tx_drop_ignored", { message: "chargement ou compression déjà en cours", path });
+    logEvent("tx_drop_ignored", { message: "loading or compression already in progress", path });
     return;
   }
   txState.loading = true;
@@ -4032,7 +4072,7 @@ async function loadTxFile(file) {
   // this guard, picking a new image during a long ravif encode crashed
   // the WebView via piled-up `_compressChain` impls.
   if (txState.loading || txState.compressing) {
-    logEvent("tx_pick_ignored", { message: "chargement ou compression déjà en cours" });
+    logEvent("tx_pick_ignored", { message: "loading or compression already in progress" });
     return;
   }
   txState.loading = true;
@@ -4273,11 +4313,11 @@ function setupTxTab() {
   const speedVal = document.getElementById("tx-speed-val");
   const speedHint = document.getElementById("tx-speed-hint");
   const speedLabel = (v) => {
-    if (v <= 2) return "très lent · meilleure compression";
-    if (v <= 4) return "lent · bonne compression";
-    if (v <= 6) return "équilibré";
-    if (v <= 8) return "rapide · fichier plus gros";
-    return "très rapide · fichier + gros";
+    if (v <= 2) return t("tx.speed_very_slow");
+    if (v <= 4) return t("tx.speed_slow");
+    if (v <= 6) return t("tx.speed_balanced_2");
+    if (v <= 8) return t("tx.speed_fast");
+    return t("tx.speed_very_fast");
   };
   speed.value = String(txState.speed);
   speedVal.textContent = String(txState.speed);
@@ -4542,16 +4582,21 @@ function updateTxProgressText() {
       const k = est.k_source != null ? est.k_source : est.total_blocks;
       const n = est.n_initial != null ? est.n_initial : est.total_blocks;
       const dur = fmtSeconds(est.duration_s);
-      const durK = est.duration_s_k != null ? ` (seuil K : ${fmtSeconds(est.duration_s_k)})` : "";
-      txt.textContent = `— / ${n} blocs · ${k} nécessaires · durée ~${dur}${durK}`;
+      const durK = est.duration_s_k != null ? t("tx.k_threshold_suffix", { dur: fmtSeconds(est.duration_s_k) }) : "";
+      txt.textContent = t("tx.fountain_summary", { n, k, dur, durK });
     } else {
       txt.textContent = "—";
     }
     return;
   }
   const kTail = est && est.k_source != null ? ` · K=${est.k_source}` : "";
-  txt.textContent =
-    `TX ${p.blocks_sent} / ${p.total_blocks} blocs${kTail} · ${fmtSeconds(p.elapsed_s)} / ${fmtSeconds(p.duration_s)}`;
+  txt.textContent = t("tx.progress_blocks", {
+    sent: p.blocks_sent,
+    total: p.total_blocks,
+    tail: kTail,
+    elapsed: fmtSeconds(p.elapsed_s),
+    dur: fmtSeconds(p.duration_s),
+  });
 }
 
 // ──────────────────────────── Full-duplex TX progress bar
@@ -4697,11 +4742,11 @@ async function applyAttenuation(db, source) {
     }
     if (status) {
       status.textContent = source
-        ? `${source} → ${v.toFixed(1)} dB sauvegardé ${now()}`
-        : `${v.toFixed(1)} dB sauvegardé ${now()}`;
+        ? t("att.applied", { source, db: v.toFixed(1), time: now() })
+        : t("att.applied_no_source", { db: v.toFixed(1), time: now() });
     }
   } catch (err) {
-    if (status) status.textContent = `erreur : ${err}`;
+    if (status) status.textContent = t("status.error_prefix", { err });
   }
 }
 
@@ -4803,7 +4848,7 @@ function setupChannelTab() {
     applyBtn.addEventListener("click", () => {
       const vals = cascadeFeedback.map(r => r.db);
       const m = median(vals);
-      if (m !== null) applyAttenuation(m, "médiane cascade");
+      if (m !== null) applyAttenuation(m, t("channel.cascade_median_source"));
     });
   }
   if (clearBtn) {
@@ -4851,7 +4896,7 @@ function renderHistoryColumn(items, kind) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
-    empty.textContent = kind === "tx" ? "Aucun fichier émis." : "Aucun fichier reçu.";
+    empty.textContent = t(kind === "tx" ? "history.tx_empty" : "history.rx_empty");
     list.appendChild(empty);
     return;
   }
@@ -4927,11 +4972,8 @@ function renderHistoryColumn(items, kind) {
     actions.className = "history-card-actions";
     const relayBtn = document.createElement("button");
     relayBtn.className = "btn-relay";
-    relayBtn.textContent = kind === "tx" ? "↻ Renvoyer" : "↻ Relayer";
-    relayBtn.title =
-      kind === "tx"
-        ? "Recharger ce fichier dans l'onglet TX"
-        : "Relayer ce fichier reçu (radio-secours)";
+    relayBtn.textContent = t(kind === "tx" ? "history.btn_relay_tx" : "history.btn_relay_rx");
+    relayBtn.title = t(kind === "tx" ? "history.relay_tx_tip" : "history.relay_rx_tip");
     const relayPath = kind === "tx" ? item.file_path : item.relay_path;
     relayBtn.addEventListener("click", () => relayHistoryItem(relayPath));
     actions.appendChild(relayBtn);
@@ -4939,10 +4981,10 @@ function renderHistoryColumn(items, kind) {
     const delBtn = document.createElement("button");
     delBtn.className = "btn-delete";
     delBtn.textContent = "🗑";
-    delBtn.title = "Supprimer cette entrée";
+    delBtn.title = t("history.delete_tip");
     delBtn.addEventListener("click", () => {
-      const label = item.filename || "cette entrée";
-      if (!confirm(`Supprimer ${label} de l'historique ?`)) return;
+      const label = item.filename || t("history.delete_default");
+      if (!confirm(t("history.delete_confirm", { what: label }))) return;
       const key = kind === "tx" ? item.file_path : item.session_id;
       deleteHistoryItem(kind, key);
     });
@@ -5060,6 +5102,11 @@ async function setupAppVersionChip() {
 }
 
 async function init() {
+  // Load translations first so every subsequent setup* that reads
+  // a `t(...)` (or HTML data-i18n) gets the right language out of
+  // the gate — avoids a visible FR→EN flicker on EN-first launches.
+  try { await initI18n(); } catch (err) { console.error("i18n", err); }
+  setupLangSelect();
   setupKioskMode();
   setupSelectPicker();
   setupVirtKeyboard();
@@ -5862,7 +5909,7 @@ async function runSounderTxEmit() {
   if (!txDevice) {
     setSounderStatus(
       "sounder-tx-status",
-      "Choisir un périphérique TX dans Paramètres",
+      t("sounder.tx_pick_in_settings"),
       "err",
     );
     return;
@@ -5871,9 +5918,9 @@ async function runSounderTxEmit() {
   const oldText = btn ? btn.textContent : null;
   if (btn) {
     btn.disabled = true;
-    btn.textContent = "Émission en cours…";
+    btn.textContent = t("sounder.tx_emitting");
   }
-  setSounderStatus("sounder-tx-status", "préparation…");
+  setSounderStatus("sounder-tx-status", t("sounder.preparing"));
   try {
     const request = buildStandardSoundingRequest();
     const res = await invoke("sounding_tx_emit", {
@@ -5884,23 +5931,23 @@ async function runSounderTxEmit() {
     if (est) est.textContent = res.duration_s.toFixed(0);
     setSounderStatus(
       "sounder-tx-status",
-      `émission ${res.duration_s.toFixed(0)} s…`,
+      t("sounder.emitting_s", { s: res.duration_s.toFixed(0) }),
     );
     // Re-enable the button after the airtime + a small safety margin.
     const reenableMs = Math.ceil(res.duration_s * 1000) + 500;
     setTimeout(() => {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+        btn.textContent = oldText ?? t("channel.sounder_tx_emit");
       }
-      setSounderStatus("sounder-tx-status", `terminé ${now()}`, "ok");
+      setSounderStatus("sounder-tx-status", t("sounder.done_at", { time: now() }), "ok");
     }, reenableMs);
   } catch (err) {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+      btn.textContent = oldText ?? t("channel.sounder_tx_emit");
     }
-    setSounderStatus("sounder-tx-status", `erreur : ${err}`, "err");
+    setSounderStatus("sounder-tx-status", t("status.error_prefix", { err }), "err");
   }
 }
 
@@ -5912,7 +5959,7 @@ async function runSounderTxEmit() {
 async function runSounderTxRender() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke } = window.__TAURI__.core;
-  setSounderStatus("sounder-an-status", "génération…");
+  setSounderStatus("sounder-an-status", t("sounder.generating"));
   try {
     const request = buildStandardSoundingRequest();
     const res = await invoke("sounding_tx_render", { request });
@@ -5920,11 +5967,11 @@ async function runSounderTxRender() {
     if (sched) sched.value = res.schedule_json;
     setSounderStatus(
       "sounder-an-status",
-      `référence régénérée (${res.duration_s.toFixed(0)} s)`,
+      t("sounder.ref_regenerated", { s: res.duration_s.toFixed(0) }),
       "ok",
     );
   } catch (err) {
-    setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
+    setSounderStatus("sounder-an-status", t("status.error_prefix", { err }), "err");
   }
 }
 
@@ -5977,14 +6024,14 @@ async function runSounderAnalyze() {
     document.getElementById("sounder-an-schedule")?.value || ""
   ).trim();
   if (!capture) {
-    setSounderStatus("sounder-an-status", "aucune capture (cliquez Démarrer)", "err");
+    setSounderStatus("sounder-an-status", t("sounder.no_capture"), "err");
     return;
   }
   // Auto-regenerate the reference schedule if the user didn't already
   // produce one. The generator is deterministic so re-running on the
   // RX side gives bit-identical bytes to whatever the TX side built.
   if (!schedule) {
-    setSounderStatus("sounder-an-status", "génération de la référence…");
+    setSounderStatus("sounder-an-status", t("sounder.gen_ref"));
     try {
       const request = buildStandardSoundingRequest();
       const ref = await invoke("sounding_tx_render", { request });
@@ -5992,14 +6039,14 @@ async function runSounderAnalyze() {
       const sched = document.getElementById("sounder-an-schedule");
       if (sched) sched.value = schedule;
     } catch (err) {
-      setSounderStatus("sounder-an-status", `erreur ref: ${err}`, "err");
+      setSounderStatus("sounder-an-status", t("status.error_prefix", { err }), "err");
       return;
     }
   }
   const threshold =
     Number(document.getElementById("sounder-an-threshold")?.value) || 6;
   const { equipment, notes } = buildRxChainMetadata();
-  setSounderStatus("sounder-an-status", "analyse en cours…");
+  setSounderStatus("sounder-an-status", t("sounder.analyzing"));
   try {
     const sig = await invoke("sounding_analyze", {
       captureWav: capture,
@@ -6064,7 +6111,7 @@ async function runSounderAnalyze() {
         ? String(sig.capture_anchor_sample)
         : "—";
     document.getElementById("sounder-an-signature-path").textContent =
-      `signature.json écrite à côté du WAV (${sig.measurements?.length ?? 0} mesures)`;
+      t("sounder.signature_written", { n: sig.measurements?.length ?? 0 });
     // Verdict from the over-modulation analyser.
     const v = sig.verdict || {};
     const vEl = document.getElementById("sd-verdict");
@@ -6160,13 +6207,13 @@ async function runSounderCollectorSend() {
   };
   const callsign = (currentSettings && currentSettings.callsign || "").trim();
   if (!callsign) {
-    setStatus("indicatif vide (Paramètres → Indicatif)", "err");
+    setStatus(t("status.callsign_empty"), "err");
     return;
   }
   const collectorUrl =
     (currentSettings && currentSettings.collector_url || "").trim();
   if (!collectorUrl) {
-    setStatus("URL collecteur vide (Paramètres → Collecteur)", "err");
+    setStatus(t("status.collector_url_empty"), "err");
     return;
   }
   if (btn) btn.disabled = true;
@@ -6226,7 +6273,7 @@ async function runSounderRxCaptureToggle() {
     if (!deviceName) {
       setSounderStatus(
         "sounder-an-status",
-        "Sélectionner une carte RX dans Paramètres",
+        t("sounder.pick_rx_card"),
         "err",
       );
       return;
@@ -6239,16 +6286,16 @@ async function runSounderRxCaptureToggle() {
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = path;
       if (btn) {
-        btn.textContent = "⏹ Arrêter & analyser";
+        btn.textContent = t("channel.sounder_capture_stop");
         btn.classList.add("recording");
       }
       if (analyseBtn) analyseBtn.disabled = true;
       setSounderStatus(
         "sounder-an-status",
-        "capture en cours — émettez côté TX, puis cliquez pour arrêter",
+        t("sounder.capture_in_progress"),
       );
     } catch (err) {
-      setSounderStatus("sounder-an-status", `erreur capture : ${err}`, "err");
+      setSounderStatus("sounder-an-status", t("status.error_prefix", { err }), "err");
     }
   } else {
     try {
@@ -6257,13 +6304,13 @@ async function runSounderRxCaptureToggle() {
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = info.path;
       if (btn) {
-        btn.textContent = "⏺ Démarrer la capture";
+        btn.textContent = t("channel.sounder_capture_start");
         btn.classList.remove("recording");
       }
       if (analyseBtn) analyseBtn.disabled = false;
       setSounderStatus(
         "sounder-an-status",
-        `capture ${info.duration_sec.toFixed(0)} s — analyse…`,
+        t("sounder.capture_analyzing", { s: info.duration_sec.toFixed(0) }),
       );
       // Auto-fire the analyser. The function regenerates the
       // reference schedule itself if the field is empty.
@@ -6493,16 +6540,16 @@ function renderSounderPlots(sig) {
   const sweep = meas.find((m) => m.kind === "level_sweep");
   if (sweep && sweep.result && sweep.result.am_am_curve) {
     svgXY("sd-plot-amam", sweep.result.am_am_curve, {
-      xLabel: "Entrée (dBFS)",
-      yLabel: "Sortie (dBFS)",
+      xLabel: t("channel.axis_input_dbfs"),
+      yLabel: t("channel.axis_output_dbfs"),
       diagonal: true,
       sweet,
     });
     // (1bis) AM-PM curve overlay onto the AM-PM panel.
     if (sweep.result.am_pm_curve) {
       svgXY("sd-plot-ampm", sweep.result.am_pm_curve, {
-        xLabel: "Entrée (dBFS)",
-        yLabel: "Phase (rad)",
+        xLabel: t("channel.axis_input_dbfs"),
+        yLabel: t("channel.axis_phase_rad"),
         sweet,
       });
     }
@@ -6526,8 +6573,8 @@ function renderSounderPlots(sig) {
     .sort((a, b) => a[0] - b[0]);
   if (tts.length > 0) {
     svgXY("sd-plot-imd3", tts, {
-      xLabel: "Sortie f₁ (dBFS)",
-      yLabel: "IMD3 moyen (dBc)",
+      xLabel: t("channel.axis_out_f1_dbfs"),
+      yLabel: t("channel.axis_imd3_dbc"),
     });
   }
 
@@ -6549,8 +6596,8 @@ function renderSounderPlots(sig) {
   }
   if (mtPick && mtPick.result && mtPick.result.gain_db_per_freq) {
     svgXY("sd-plot-freq", mtPick.result.gain_db_per_freq, {
-      xLabel: "Fréquence (Hz)",
-      yLabel: "Gain (dB)",
+      xLabel: t("channel.axis_freq_hz"),
+      yLabel: t("channel.axis_gain_db"),
     });
   }
 
@@ -6562,8 +6609,8 @@ function renderSounderPlots(sig) {
   }
   if (chPick && chPick.result && chPick.result.group_delay_per_freq) {
     svgXY("sd-plot-gd", chPick.result.group_delay_per_freq, {
-      xLabel: "Fréquence (Hz)",
-      yLabel: "Δ group delay (µs)",
+      xLabel: t("channel.axis_freq_hz"),
+      yLabel: t("channel.axis_delta_gd_us"),
     });
   }
 
@@ -6591,8 +6638,8 @@ function renderSounderPlots(sig) {
       pts.push([(i / 48), dbc]); // x in ms (48k -> 48 samples per ms)
     }
     svgXY("sd-plot-ir", pts, {
-      xLabel: "Retard (ms)",
-      yLabel: "|h| (dBc)",
+      xLabel: t("channel.axis_delay_ms"),
+      yLabel: t("channel.axis_abs_h_dbc"),
       yMin: -40,
       yMax: 3,
     });
