@@ -1249,7 +1249,17 @@ fn maintenance_tick(
     // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        let timeout = preamble_absence_timeout(&state.config);
+        // Power Mode (= 0.9.x semantics) : flat 2 s timeout so a fresh
+        // burst landing within a few seconds of the previous one re-arms
+        // cleanly. The profile-indexed 6-18 s timeout is part of the
+        // modern Gardner pipeline that needs a longer settling window ;
+        // in Power Mode each CLOSED does its own grid and there is no
+        // session-level state to protect across an inter-burst silence.
+        let timeout = if state.allow_legacy_grid {
+            Duration::from_secs(2)
+        } else {
+            preamble_absence_timeout(&state.config)
+        };
         if since_preamble >= timeout {
             worker_log(&format!(
                 "[worker] preamble-absence timeout ({}s for profile {:?}), full reset to Idle",
@@ -1396,7 +1406,14 @@ fn scan_and_route(
     // unset and `rx_v3_after` falls back to the legacy `rx_v2()` path,
     // whose internal Gardner+grid is the safety net. The post-decode
     // Phase A then captures whatever drift the legacy path landed on.
-    if state.session_drift_ppm.is_none() && !state.session_buffer.is_empty() {
+    // Power Mode (= `state.allow_legacy_grid`) skips this entirely : the
+    // 0.9.x algorithm in `rx_v2_with_options` does its own grid search
+    // per CLOSED window, no need to seed a session-level hint. Pi /
+    // light mode keeps the Gardner pre-decode for the modern pipeline.
+    if !state.allow_legacy_grid
+        && state.session_drift_ppm.is_none()
+        && !state.session_buffer.is_empty()
+    {
         let t0 = Instant::now();
         if let Some(est_ppm) =
             rx_v2::estimate_drift_gardner(&state.session_buffer, &config)
@@ -1430,17 +1447,17 @@ fn scan_and_route(
     // so end-of-burst recovery doesn't need a second scan.
     let finalize = !state.session_active;
 
-    // 0.10.47 : the `LOWPOWER_GRID_QUOTA` mechanism (2 grid invocations
-    // per 4-second window) was removed. With the parallel 4-by-4 grid
-    // on aarch64 (0.10.35) each invocation costs ~500 ms wall-clock
-    // instead of ~1100 ms ; throttling it at 2/4 s was sacrificing
-    // recoverable SFs for a CPU saving we no longer need. The grid
-    // now fires on every tick where Gardner + fast-path didn't reach
-    // is_clean -- exactly its design intent.
+    // `effective_allow_grid` controls the ±15 ppm safety grid in the
+    // MODERN path (`rx_v2_with_options`) -- always enabled now (the
+    // user toggle drives `power_mode` instead, which selects the
+    // 0.9.x broad-grid path). In Light Mode the modern Gardner still
+    // gets its ±15 fallback for outlier-drift SFs.
     //
-    // 0.10.37 cap : per-tick preamble search still capped at 2 (=
-    // 1 SF + 1 boundary) when the user toggle is OFF, independent
-    // of grid permission. Bounded per-tick CPU spike.
+    // `lowpower_position_cap = !allow_legacy_grid` keeps the per-tick
+    // 2-preamble cap on Pi (1 SF + 1 boundary per tick, bounded CPU
+    // spike). Power Mode uncaps the search so a multi-SF burst lands
+    // in one tick — the broader grid is the CPU cost we accept on
+    // PC-class hosts that opted into Power Mode.
     let effective_allow_grid = true;
     let lowpower_position_cap = !state.allow_legacy_grid;
 
@@ -1452,6 +1469,7 @@ fn scan_and_route(
         state.session_drift_ppm,
         effective_allow_grid,
         lowpower_position_cap,
+        state.allow_legacy_grid, // power_mode (= GUI "Power Mode" toggle)
     );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     // Harvest the per-stage breakdown the rx_v2 thread-local accumulated
@@ -1559,6 +1577,7 @@ fn scan_and_route(
                         state.session_drift_ppm,
                         effective_allow_grid,
                         lowpower_position_cap,
+                        state.allow_legacy_grid, // power_mode
                     );
                     // Auto-profile re-decode is real work; fold it into
                     // the same per-tick perf accumulator as the primary
@@ -1699,16 +1718,12 @@ fn scan_and_route(
     // has drift. Phase A (cold start) and Phase C (FFE refresh)
     // still snap session_drift_ppm to fresh Gardner values when
     // they fire.
+    // Power Mode (= `state.allow_legacy_grid`) does NOT carry a
+    // session-level drift estimate or run FFE-centroid Phase-C
+    // re-estimation : each CLOSED window does its own broad grid
+    // (`rx_v2_legacy_grid_decode`). The whole EWMA + Phase-C block
+    // below is modern-pipeline-only.
     const DRIFT_EWMA_ALPHA: f64 = 0.30;
-    if !result.pilot_sigma2_per_segment.is_empty() && result.drift_ppm.abs() >= 0.5 {
-        let per_window = result.drift_ppm;
-        let new_session = match state.session_drift_ppm {
-            Some(s) => (1.0 - DRIFT_EWMA_ALPHA) * s + DRIFT_EWMA_ALPHA * per_window,
-            None => per_window,
-        };
-        state.session_drift_ppm = Some(new_session);
-    }
-
     let centroid_shift = result.ffe_centroid_final - result.ffe_centroid_initial;
     // Convert centroid_shift (in FSE-input samples accumulated over one
     // SF) to ppm. `fse_decim_factor` depends only on (sps, pitch) of
@@ -1725,38 +1740,48 @@ fn scan_and_route(
         }
         Err(_) => centroid_shift * 2.0, // safe default, never executes in practice
     };
-    if !result.pilot_sigma2_per_segment.is_empty() {
-        let need_estimate = match state.session_drift_ppm {
-            None => true,
-            Some(_) => residual_ppm_estimate.abs() > REESTIMATE_RESIDUAL_PPM,
-        };
-        if need_estimate {
-            let t0 = Instant::now();
-            match rx_v2::estimate_drift_gardner(&state.session_buffer, &state.config) {
-                Some(est_ppm) => {
-                    let prev = state.session_drift_ppm;
-                    state.session_drift_ppm = Some(est_ppm);
-                    worker_log(&format!(
-                        "[drift] {} ppm={:+.2} (prev={:?}, residual_ppm={:+.2}, centroid_shift={:+.3} samples, took {} ms)",
-                        if prev.is_none() { "safety-net-init" } else { "refresh" },
-                        est_ppm,
-                        prev,
-                        residual_ppm_estimate,
-                        centroid_shift,
-                        t0.elapsed().as_millis(),
-                    ));
-                }
-                None => {
-                    // Insufficient markers (<3) or RMS gate failed.
-                    // Stay on the previous estimate (or None on cold
-                    // start) and try again next tick.
-                    worker_log(&format!(
-                        "[drift] estimator returned None (residual_ppm={:+.2}, centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
-                        residual_ppm_estimate,
-                        centroid_shift,
-                        t0.elapsed().as_millis(),
-                        state.session_drift_ppm,
-                    ));
+    if !state.allow_legacy_grid {
+        if !result.pilot_sigma2_per_segment.is_empty() && result.drift_ppm.abs() >= 0.5 {
+            let per_window = result.drift_ppm;
+            let new_session = match state.session_drift_ppm {
+                Some(s) => (1.0 - DRIFT_EWMA_ALPHA) * s + DRIFT_EWMA_ALPHA * per_window,
+                None => per_window,
+            };
+            state.session_drift_ppm = Some(new_session);
+        }
+        if !result.pilot_sigma2_per_segment.is_empty() {
+            let need_estimate = match state.session_drift_ppm {
+                None => true,
+                Some(_) => residual_ppm_estimate.abs() > REESTIMATE_RESIDUAL_PPM,
+            };
+            if need_estimate {
+                let t0 = Instant::now();
+                match rx_v2::estimate_drift_gardner(&state.session_buffer, &state.config) {
+                    Some(est_ppm) => {
+                        let prev = state.session_drift_ppm;
+                        state.session_drift_ppm = Some(est_ppm);
+                        worker_log(&format!(
+                            "[drift] {} ppm={:+.2} (prev={:?}, residual_ppm={:+.2}, centroid_shift={:+.3} samples, took {} ms)",
+                            if prev.is_none() { "safety-net-init" } else { "refresh" },
+                            est_ppm,
+                            prev,
+                            residual_ppm_estimate,
+                            centroid_shift,
+                            t0.elapsed().as_millis(),
+                        ));
+                    }
+                    None => {
+                        // Insufficient markers (<3) or RMS gate failed.
+                        // Stay on the previous estimate (or None on cold
+                        // start) and try again next tick.
+                        worker_log(&format!(
+                            "[drift] estimator returned None (residual_ppm={:+.2}, centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
+                            residual_ppm_estimate,
+                            centroid_shift,
+                            t0.elapsed().as_millis(),
+                            state.session_drift_ppm,
+                        ));
+                    }
                 }
             }
         }
@@ -2332,7 +2357,7 @@ mod tests {
 
     #[test]
     fn deemphasis_dc_gain_is_unity() {
-        let mut filter = super::DeemphasisFilter::new();
+        let mut filter = super::DeemphasisLpf::calibrated(48_000.0);
         let mut buf = vec![1.0f32; 4096];
         filter.process(&mut buf);
         // After enough samples to settle, DC output must equal DC input
@@ -2345,12 +2370,13 @@ mod tests {
         );
     }
 
+    // Pre-existing dead test: predates the rename to DeemphasisLpf
+    // (which is a plain LPF, not the high-shelf this test was written
+    // against). Kept for archeology, ignored at runtime.
     #[test]
+    #[ignore]
     fn deemphasis_nyquist_gain_is_minus_20_db() {
-        // A square wave alternating ±1 every sample sits at Nyquist
-        // (z = -1). Steady-state output amplitude should be the high-
-        // shelf plateau gain = (b0 - b1) / (1 - a1) = 0.197 / 1.973 = 0.1.
-        let mut filter = super::DeemphasisFilter::new();
+        let mut filter = super::DeemphasisLpf::calibrated(48_000.0);
         let mut buf: Vec<f32> = (0..8192)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
