@@ -75,11 +75,16 @@ Dependency direction (no cycles): `modem-framing` ← `modem-core` ← `modem-wo
 
 When adding a new mode: edit `ProfileIndex::ALL` and the matching arm in `profile::config_by_name` (single source of truth — the GUI combos read `Modem::list_profiles()`).
 
-## Canal NBFM — paramètres de référence (défauts GNU Radio)
+## Canal NBFM — paramètres de référence
 
-- Déviation FM : ±5 kHz (défaut `analog.nbfm_tx`)
-- Pré-emphase/dé-emphase : 75 µs (défaut GNU Radio)
-- Bande audio utile mesurée (-3 dB) : ~100 Hz – 2600 Hz
-- Coupure raide au-delà de 2700 Hz (filtre audio du bloc `nbfm_rx`)
+**Réalité radio amateur (cible du projet) :**
+- Déviation : **±2,5 kHz** (NBFM amateur, canalisation 12,5 kHz)
+- Modulation effective : les transceivers amateurs font de la **PM** (phase modulation), pas de la FM pure
+- Conséquence : dé-emphase **6 dB/octave** imposée au RX sur toute la bande audio (pas la constante 75 µs des broadcast FM)
+- Bande audio utile mesurée (-3 dB) : ~300 Hz – 2200 Hz (HPF CTCSS + LPF transceiver)
+- Coupure raide au-delà de 2700 Hz
+
+**Simulateur GNU Radio (défauts à savoir, *ne reflètent pas la réalité amateur*) :**
+- `analog.nbfm_tx` par défaut : ±5 kHz, pré-emphase 75 µs — calibrer si on s'en sert
 - Échantillonnage audio : 48 kHz, IF : 480 kHz
 - Bruit modélisé en post-démodulation (audio blanc), SNR cible : 20 dB
