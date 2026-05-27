@@ -13,7 +13,6 @@
   "topbar.status_ready": "prêt",
   "topbar.app_version_tip": "Version de l'application",
   "topbar.kiosk_exit_tip": "Quitter (mode kiosk)",
-  "topbar.lang_tip": "Langue de l'interface",
 
   "tabs.rx": "RX",
   "tabs.tx": "TX",
@@ -93,6 +92,7 @@
 
   "settings.rx_warn_html": "⚠ Le RX est en cours. Pour modifier le périphérique RX ou la désemphase, il faut d'abord arrêter la réception.",
   "settings.stop_rx_btn": "Arrêter le RX",
+  "settings.legend_language": "Langue de l'interface",
   "settings.legend_callsign": "Indicatif",
   "settings.callsign_placeholder": "HB9TOB",
   "settings.callsign_hint": "Affiché dans les en-têtes transmis.",

@@ -13,7 +13,6 @@
   "topbar.status_ready": "ready",
   "topbar.app_version_tip": "Application version",
   "topbar.kiosk_exit_tip": "Exit (kiosk mode)",
-  "topbar.lang_tip": "Interface language",
 
   "tabs.rx": "RX",
   "tabs.tx": "TX",
@@ -93,6 +92,7 @@
 
   "settings.rx_warn_html": "⚠ RX is running. To change the RX device or de-emphasis you must first stop reception.",
   "settings.stop_rx_btn": "Stop RX",
+  "settings.legend_language": "Interface language",
   "settings.legend_callsign": "Callsign",
   "settings.callsign_placeholder": "HB9TOB",
   "settings.callsign_hint": "Shown in the transmitted headers.",

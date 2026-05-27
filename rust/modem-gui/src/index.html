@@ -31,10 +31,6 @@
     <button class="tab" data-tab="settings" data-i18n="tabs.settings">Paramètres</button>
     <button class="tab" data-tab="info" data-i18n="tabs.info">Info</button>
     <span id="app-version" class="app-version" data-i18n-title="topbar.app_version_tip" title="Version de l'application">…</span>
-    <select id="lang-select" class="lang-select" data-i18n-title="topbar.lang_tip" title="Langue de l'interface">
-      <option value="fr">FR</option>
-      <option value="en">EN</option>
-    </select>
     <button id="kiosk-exit" class="kiosk-only" data-i18n-title="topbar.kiosk_exit_tip" title="Quitter (mode kiosk)">✕</button>
   </nav>
   <main>
@@ -290,6 +286,13 @@
           </span>
           <button type="button" id="settings-stop-rx-btn" data-i18n="settings.stop_rx_btn">Arrêter le RX</button>
         </div>
+        <fieldset>
+          <legend data-i18n="settings.legend_language">Langue de l'interface</legend>
+          <select id="lang-select">
+            <option value="fr" data-i18n="lang.fr">Français</option>
+            <option value="en" data-i18n="lang.en">English</option>
+          </select>
+        </fieldset>
         <fieldset>
           <legend data-i18n="settings.legend_callsign">Indicatif</legend>
           <input type="text" id="callsign-input" data-i18n-placeholder="settings.callsign_placeholder" placeholder="HB9TOB" maxlength="12">

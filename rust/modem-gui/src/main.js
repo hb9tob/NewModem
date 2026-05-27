@@ -62,7 +62,7 @@ function logEvent(name, data) {
 }
 
 // ────────────────────────────────────────────────────────── Language
-// The <select id="lang-select"> in the top bar persists across
+// The <select id="lang-select"> in the Settings panel persists across
 // reloads (i18n.js localStorage). On change we let i18n.js rewalk
 // the DOM via applyI18n + fire `langchange`; everything dynamic
 // (sessions table, history list, status chips, etc.) re-renders
@@ -76,7 +76,8 @@ function setupLangSelect() {
   for (const lang of supportedLangs()) {
     const opt = document.createElement("option");
     opt.value = lang;
-    opt.textContent = lang.toUpperCase();
+    opt.setAttribute("data-i18n", `lang.${lang}`);
+    opt.textContent = t(`lang.${lang}`) || lang.toUpperCase();
     sel.appendChild(opt);
   }
   sel.value = getLang();

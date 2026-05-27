@@ -281,22 +281,6 @@ body {
   user-select: none;
   flex: 0 0 auto;
 }
-/* Language selector wedged between the version chip and the kiosk-exit
-   button. Tuned to match the version chip so the right edge of the tab
-   bar reads as one compact cluster. */
-.lang-select {
-  align-self: center;
-  margin: 0.25rem 0.25rem 0.25rem 0;
-  padding: 2px 6px;
-  font-size: 0.78rem;
-  color: #c8d4dc;
-  background: #2b3946;
-  border: 1px solid #3c4d5c;
-  border-radius: 4px;
-  letter-spacing: 0.02em;
-  flex: 0 0 auto;
-  cursor: pointer;
-}
 html, body {
   height: 100%;
   overflow: hidden;
