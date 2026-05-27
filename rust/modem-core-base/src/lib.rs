@@ -54,3 +54,12 @@ pub mod probe_analyze;
 // RaptorQ at TX and on the reassembled payload after RaptorQ at RX, to
 // whiten the bitstream regardless of user content.
 pub mod scrambler;
+
+// Streaming RX-side DSP pipeline (polyphase resampler + NCO downmix +
+// overlap-save RRC matched filter + decimation) and streaming
+// forward-FFE with on-demand LS retraining. Ported from
+// `feat/modem-2x`'s `modem-core2x`; placed here so the upcoming V3
+// streaming session in `modem-core::v3_session` and any future RX
+// work can pull both primitives from a single home.
+pub mod streaming_dsp;
+pub mod streaming_ffe;
