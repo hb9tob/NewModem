@@ -157,6 +157,13 @@ pub struct V3Session {
     /// Cumulative samples ingested since session start (anchors absolute
     /// positions emitted on events).
     total_samples: u64,
+    /// Externally-provided drift correction in ppm, forwarded to
+    /// `StreamingDsp::feed_audio` each chunk. Default = 0.0.
+    /// Phase 4 wires this from a coarse SOF LS estimator
+    /// ([[feedback-drift-architecture-one-shot-plus-fine-tracking]]
+    /// "coarse one-shot + fine tracker"); for Phase 2 it's set by
+    /// the caller (sweep tests, future worker hint).
+    drift_ppm: f64,
     sc: ScDetector,
     dsp: StreamingDsp,
     ffe: StreamingFfe,
@@ -182,10 +189,23 @@ impl V3Session {
             audio_buffer: Vec::with_capacity(retain),
             audio_drained_samples: 0,
             total_samples: 0,
+            drift_ppm: 0.0,
             sc,
             dsp,
             ffe,
         }
+    }
+
+    /// Set the drift hint (ppm) forwarded to the streaming resampler
+    /// every chunk. Positive ⇒ TX clock is fast (audio arrives
+    /// stretched); the resampler will compress to recover the
+    /// nominal rate.
+    pub fn set_drift_ppm(&mut self, ppm: f64) {
+        self.drift_ppm = ppm;
+    }
+
+    pub fn drift_ppm(&self) -> f64 {
+        self.drift_ppm
     }
 
     pub fn profile_name(&self) -> &str {
@@ -253,12 +273,14 @@ impl V3Session {
         }
 
         // 2. Drive the streaming RX-DSP pipeline forward, then drain
-        //    new symbols into the streaming FFE. Drift = 0 in Phase 2;
-        //    Phase 4 wires the coarse-drift one-shot from the SOF LS
-        //    estimator + the fine phase tracker.
-        let _ = self
-            .dsp
-            .feed_audio(&self.audio_buffer, self.audio_drained_samples, 0.0);
+        //    new symbols into the streaming FFE. Drift comes from
+        //    `set_drift_ppm` (caller-provided in Phase 2; Phase 4
+        //    wires a coarse SOF LS estimator).
+        let _ = self.dsp.feed_audio(
+            &self.audio_buffer,
+            self.audio_drained_samples,
+            self.drift_ppm,
+        );
         let new_syms = self.dsp.drain_symbols();
         if !new_syms.is_empty() {
             self.ffe.push_raw(&new_syms);
@@ -510,6 +532,30 @@ mod tests {
         modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz)
     }
 
+    /// Linear-interp resample to simulate `ppm` of clock drift on the
+    /// audio. `ppm > 0` ⇒ TX-perceived-fast (audio comes out stretched,
+    /// more samples per unit time). `ppm < 0` ⇒ TX-perceived-slow.
+    /// Test-only helper; the RX-side `StreamingDsp` does proper
+    /// polyphase-Kaiser interpolation.
+    fn apply_drift(samples: &[f32], ppm: f64) -> Vec<f32> {
+        if samples.is_empty() {
+            return Vec::new();
+        }
+        let stretch = 1.0 + ppm * 1e-6;
+        let n_in = samples.len();
+        let n_out = ((n_in as f64) * stretch) as usize;
+        let mut out = Vec::with_capacity(n_out);
+        for k in 0..n_out {
+            let src = k as f64 / stretch;
+            let i0 = (src.floor() as usize).min(n_in - 1);
+            let i1 = (i0 + 1).min(n_in - 1);
+            let frac = src - src.floor();
+            let s = samples[i0] as f64 * (1.0 - frac) + samples[i1] as f64 * frac;
+            out.push(s as f32);
+        }
+        out
+    }
+
     #[test]
     fn cycle_period_samples_high_plus_is_integer_multiple_of_sps() {
         let cfg = high_plus_config();
@@ -715,6 +761,58 @@ mod tests {
         // refine the MF_DELAY_SYM constant in try_validate_marker_at.
         eprintln!("first decoded marker at sym index {best_pos}");
     }
+
+    #[test]
+    fn drift_sweep_marker_validates_with_correction() {
+        // Phase 2 baseline: across +/-200 ppm drift sweep, when the
+        // caller provides the matching `set_drift_ppm` correction,
+        // V3Session must still reach Locked. Validates that the
+        // ported StreamingDsp resampler correctly compensates drift
+        // through the V3Session pipeline end-to-end.
+        //
+        // Payload kept small (~1 kB) so the test stays under a few
+        // minutes total — Phase 4's coarse-drift one-shot will
+        // remove the need for an external drift hint and the sweep
+        // moves to the worker-level CW-decode test.
+        let cfg = high_plus_config();
+        let base_audio = build_v3_burst_audio(&cfg, 1000, 0xCAFEBABE);
+        // Skip 0 (covered by the clean-burst test) and concentrate on
+        // the asymmetric extremes that historically broke modem-2x
+        // (cf. modem-2x-drift-loop-bug / META-CW negative-drift bug).
+        for &ppm in &[-200.0_f64, -30.0, 30.0, 200.0] {
+            let drifted = apply_drift(&base_audio, ppm);
+            let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
+            session.set_drift_ppm(ppm);
+            let mut got_validated = false;
+            for c in drifted.chunks(2400) {
+                let events = session.process_audio_chunk(c);
+                if events
+                    .iter()
+                    .any(|e| matches!(e, V3SessionEvent::MarkerValidated { .. }))
+                {
+                    got_validated = true;
+                }
+            }
+            assert!(
+                got_validated,
+                "no MarkerValidated at drift {ppm} ppm with matching correction",
+            );
+            assert!(
+                matches!(session.state(), V3SessionState::Locked { .. }),
+                "FSM not Locked at drift {ppm} ppm",
+            );
+        }
+    }
+
+    // NOTE: a sanity test that "drift correction is required for
+    // marker validation at high drift" was tried and rejected — at
+    // ±200 ppm the *first* marker still decodes without correction
+    // because 200 ppm × MARKER_SYNC_LEN = 0.006 sym intra-marker drift
+    // is negligible. The real drift cliff only surfaces over multi-
+    // cycle decode (Phase 3+), where cumulative drift across cycles
+    // causes the predicted next-marker position to slip past the
+    // narrow search radius and the FFE's LS taps to mistrack. That
+    // test will land alongside CW decode wiring.
 
     #[test]
     fn finalize_returns_to_idle() {
