@@ -6,7 +6,7 @@
 # - pi4+5-sdrplay (with SDR, kiosk)
 set -eu -o pipefail
 
-BASE_VER="0.13.3"
+BASE_VER="0.13.4"
 OUT_DIR="$HOME/nbfm-debs"
 REPO="$HOME/git/NewModem"
 SRC_TAURI="$REPO/rust/modem-gui/src-tauri"
