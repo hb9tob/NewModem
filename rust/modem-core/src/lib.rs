@@ -31,3 +31,4 @@ pub mod gate;
 
 pub mod traits;
 pub mod v3_modem;
+pub mod v3_session;
