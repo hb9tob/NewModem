@@ -111,16 +111,32 @@ pub enum V3SessionState {
 
 #[derive(Debug, Clone)]
 pub enum V3SessionEvent {
+    /// SC pair-marker detector fired (informational).
     SofProbeFired {
         marker_at_abs: u64,
         metric: f64,
     },
+    /// A marker's control payload passed Golay + CRC at the position
+    /// pinned by `find_sync_in_window`. The session is now `Locked`.
+    /// `cycle_idx` is `0` for the first marker we validate in this burst
+    /// (NOT the wire-format `seg_id`, which can wrap).
+    MarkerValidated {
+        marker_at_abs: u64,
+        marker_sym_pos_abs: u64,
+        cycle_idx: u32,
+        seg_id: u16,
+        session_id_low: u8,
+        base_esi: u32,
+        is_meta: bool,
+    },
+    /// EOT marker observed.
     EotSeen,
+    /// Session aborted (timeout, channel close, etc.).
     SessionLost {
         reason: String,
     },
-    // Phase 3: SessionArmed, CwConverged, CwFailed, PayloadAssembled,
-    // SessionFinalised.
+    // Phase 3: SessionArmed (preamble+header anchored), CwConverged,
+    // CwFailed, PayloadAssembled, SessionFinalised.
 }
 
 pub struct V3Session {
@@ -217,49 +233,49 @@ impl V3Session {
 
     pub fn process_audio_chunk(&mut self, samples: &[f32]) -> Vec<V3SessionEvent> {
         let mut events = Vec::new();
+        let mut pending_sc: Vec<(u64, f64)> = Vec::new();
 
-        // 1. Ingest into rolling audio buffer + SC detector (per-sample).
+        // 1. Ingest into audio buffer + SC detector. Defer SC-fire
+        //    handling until after the streaming pipeline has produced
+        //    the corresponding symbols (otherwise marker validation
+        //    would read a stale sym_buffer).
         for &s in samples {
             self.audio_buffer.push(s);
             self.total_samples += 1;
             if let Some(metric) = self.sc.push(s) {
-                if metric >= SC_THRESHOLD {
-                    let marker_at_abs = self
-                        .total_samples
-                        .saturating_sub(self.sc.window_samples as u64);
-                    self.handle_sof_probe(marker_at_abs, metric);
-                    events.push(V3SessionEvent::SofProbeFired {
-                        marker_at_abs,
-                        metric,
-                    });
-                }
+                // sc.push returns Some only on the rising threshold
+                // crossing — already gated, no need to re-check.
+                let marker_at_abs = self
+                    .total_samples
+                    .saturating_sub(self.sc.window_samples as u64);
+                pending_sc.push((marker_at_abs, metric));
             }
         }
 
-        // 2. Drive the streaming RX-DSP pipeline forward. Drift = 0 in
-        //    Phase 2; Phase 4 wires the coarse-drift one-shot from the
-        //    SOF LS estimator + the fine phase tracker.
-        let sym_count_before = self.dsp.sym_buffer().len();
-        let _new_syms_in_dsp = self
+        // 2. Drive the streaming RX-DSP pipeline forward, then drain
+        //    new symbols into the streaming FFE. Drift = 0 in Phase 2;
+        //    Phase 4 wires the coarse-drift one-shot from the SOF LS
+        //    estimator + the fine phase tracker.
+        let _ = self
             .dsp
             .feed_audio(&self.audio_buffer, self.audio_drained_samples, 0.0);
-
-        // 3. Drain new symbols from the DSP into the streaming FFE.
-        //    `drain_symbols` is destructive but the DSP keeps its own
-        //    state internally — only the per-call symbol delta is
-        //    returned to the caller.
-        if self.dsp.sym_buffer().len() > sym_count_before {
-            let new_syms = self.dsp.drain_symbols();
-            if !new_syms.is_empty() {
-                self.ffe.push_raw(&new_syms);
-            }
+        let new_syms = self.dsp.drain_symbols();
+        if !new_syms.is_empty() {
+            self.ffe.push_raw(&new_syms);
         }
 
-        // 4. Trim the rolling audio buffer. The StreamingDsp tracks its
-        //    own resampler cursor; once we've fed `audio_buffer` to
-        //    `feed_audio`, we only need to retain the last
-        //    `AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples` samples so
-        //    the next call has a window the resampler can advance into.
+        // 3. Handle SC fires now that the sym_buffer is up-to-date.
+        for (marker_at_abs, metric) in pending_sc {
+            events.push(V3SessionEvent::SofProbeFired {
+                marker_at_abs,
+                metric,
+            });
+            self.handle_sc_fire(marker_at_abs, metric, &mut events);
+        }
+
+        // 4. Trim the rolling audio buffer. StreamingDsp tracks its own
+        //    resampler cursor; we keep the last AUDIO_BUFFER_RETAIN_CYCLES
+        //    cycles so the next call has a window to advance into.
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * self.cycle_samples;
         if self.audio_buffer.len() > retain {
             let drop = self.audio_buffer.len() - retain;
@@ -282,13 +298,113 @@ impl V3Session {
         events
     }
 
-    fn handle_sof_probe(&mut self, marker_at_abs: u64, metric: f64) {
+    fn handle_sc_fire(
+        &mut self,
+        marker_at_abs: u64,
+        metric: f64,
+        events: &mut Vec<V3SessionEvent>,
+    ) {
+        // Try to validate a marker at the SC-located audio position. On
+        // Golay+CRC success we promote the FSM to `Locked` and emit
+        // `MarkerValidated`; otherwise we record the candidate in
+        // `Acquiring` so the next chunk can retry as more symbols
+        // arrive (or a later SC fire on the same burst overrides).
+        if let Some((marker_sym_pos_abs, payload)) =
+            self.try_validate_marker_at(marker_at_abs)
+        {
+            let cycle_idx = match &self.state {
+                V3SessionState::Locked { cycle_idx, .. } => cycle_idx.saturating_add(1),
+                _ => 0,
+            };
+            events.push(V3SessionEvent::MarkerValidated {
+                marker_at_abs,
+                marker_sym_pos_abs,
+                cycle_idx,
+                seg_id: payload.seg_id,
+                session_id_low: payload.session_id_low,
+                base_esi: payload.base_esi,
+                is_meta: payload.is_meta(),
+            });
+            self.state = V3SessionState::Locked {
+                cycle_idx,
+                anchor_marker_abs: marker_at_abs,
+            };
+            return;
+        }
         if matches!(self.state, V3SessionState::Idle) {
             self.state = V3SessionState::Acquiring {
                 marker_at_abs,
                 sc_metric: metric,
             };
         }
+    }
+
+    /// Search the FFE's raw symbol buffer around the SC-located audio
+    /// position for a marker whose Golay+CRC validates. Returns the
+    /// absolute symbol position and decoded payload on success.
+    ///
+    /// Two offsets sit between the SC fire's `marker_at_abs_audio` and
+    /// the actual marker position in `raw_sym_buffer`:
+    ///
+    /// 1. **RRC matched-filter delay**: the streaming MF is symmetric
+    ///    RRC of length `RRC_SPAN_SYM * sps + 1`; its peak response to
+    ///    a unit-input at audio index 0 lands at MF index ≈
+    ///    `RRC_SPAN_SYM/2 * sps` = 6 syms in the decimated buffer.
+    ///
+    /// 2. **SC fire position bias**: the SC detector reports
+    ///    `total_samples - W` on the rising-edge crossing, which sits
+    ///    on the *leading slope* of the M peak rather than its apex.
+    ///    A wide search radius (32 syms) absorbs this plus any
+    ///    sub-sample/sub-symbol decimation phase residue.
+    fn try_validate_marker_at(
+        &self,
+        marker_at_abs_audio: u64,
+    ) -> Option<(u64, marker::MarkerPayload)> {
+        let (sps, _) = rrc::check_integer_constraints(
+            AUDIO_RATE,
+            self.cfg.symbol_rate,
+            self.cfg.tau,
+        )
+        .ok()?;
+        // RRC MF half-delay in symbols (RRC_SPAN_SYM=12 ⇒ 6 syms).
+        const MF_DELAY_SYM: u64 = (crate::types::RRC_SPAN_SYM / 2) as u64;
+        let sym_pos_abs_estimate = (marker_at_abs_audio / sps as u64) + MF_DELAY_SYM;
+        let raw_start_abs = self.ffe.start_abs();
+        if sym_pos_abs_estimate < raw_start_abs {
+            return None;
+        }
+        let raw = self.ffe.raw_buf();
+        if raw.len() < marker::MARKER_LEN {
+            return None;
+        }
+        let center_rel = (sym_pos_abs_estimate - raw_start_abs) as usize;
+        // Bootstrap search: scan the FULL audio-position uncertainty
+        // window (~1 cycle on each side). The SC detector's
+        // rising-edge fire can land anywhere between the start of
+        // marker N's SYNC and the start of marker N+1, depending on
+        // the M slope shape. Once `Locked`, Phase 3 narrows the
+        // search to ±MARKER_SYNC_LEN around the predicted next
+        // position.
+        let search_radius = self.cycle_data_sym;
+        let start = center_rel.saturating_sub(search_radius);
+        let end = (center_rel + search_radius).min(raw.len().saturating_sub(marker::MARKER_LEN));
+        if start >= end {
+            return None;
+        }
+        let window = end - start;
+        // Pick the highest-correlation position above 0.5 self-corr
+        // ratio. We do NOT trust the find result alone — false-positive
+        // Golay+CRC passes on random/warmup symbols carry ≈ 1/2^8
+        // probability per position, so scanning ~1000 positions
+        // produces several "decodes" that aren't real markers.
+        // Anchoring on the SYNC-correlation peak filters those out.
+        let (best_pos, _gain) = marker::find_sync_in_window(raw, start, window, 0.5)?;
+        if best_pos + marker::MARKER_LEN > raw.len() {
+            return None;
+        }
+        let payload =
+            marker::decode_marker_at(&raw[best_pos..best_pos + marker::MARKER_LEN])?;
+        Some((raw_start_abs + best_pos as u64, payload))
     }
 }
 
@@ -305,11 +421,18 @@ impl V3Session {
 /// ```
 ///
 /// `M ≥ SC_THRESHOLD` ⇒ two markers fit in the buffer at offset L.
+///
+/// Edge-triggered: only the RISING crossing of the threshold reports a
+/// fire. Inside an active burst `M` stays ≥ threshold for many samples
+/// (e.g. a periodic signal at lag L gives `M ≈ 1` everywhere), and the
+/// FSM only needs the bootstrap event — subsequent cycle advancement
+/// happens on the symbol-stream marker probe, not on new SC fires.
 struct ScDetector {
     cycle_samples: usize,
     window_samples: usize,
     capacity: usize,
     delay_line: VecDeque<f32>,
+    above_threshold: bool,
 }
 
 impl ScDetector {
@@ -320,9 +443,11 @@ impl ScDetector {
             window_samples,
             capacity,
             delay_line: VecDeque::with_capacity(capacity),
+            above_threshold: false,
         }
     }
 
+    /// Returns `Some(metric)` only on the rising threshold crossing.
     fn push(&mut self, s: f32) -> Option<f64> {
         if self.delay_line.len() == self.capacity {
             self.delay_line.pop_front();
@@ -344,17 +469,45 @@ impl ScDetector {
             p2 += y2 * y2;
         }
         let denom = (p1 * p2).max(1e-30);
-        Some((r * r) / denom)
+        let metric = (r * r) / denom;
+        let now_above = metric >= SC_THRESHOLD;
+        let edge = now_above && !self.above_threshold;
+        self.above_threshold = now_above;
+        if edge {
+            Some(metric)
+        } else {
+            None
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame;
+    use crate::modulator;
     use crate::profile::ProfileIndex;
+    use crate::rrc as rrc_mod;
+    use crate::types::RRC_SPAN_SYM;
 
     fn high_plus_config() -> ModemConfig {
         ProfileIndex::HighPlus.to_config()
+    }
+
+    /// Build a clean V3 burst (preamble + first cycles + EOT trailer) at
+    /// audio rate. Used by Phase 2 integration tests; mirrors the path
+    /// V3Modem::encode_to_samples takes but stays in-process so the
+    /// test doesn't depend on the higher-level workflow.
+    fn build_v3_burst_audio(cfg: &ModemConfig, payload_bytes: usize, session_id: u32) -> Vec<f32> {
+        let payload = vec![0xAA_u8; payload_bytes];
+        let n_packets = ((payload_bytes + 31) / 32) as u32; // arbitrary
+        let symbols = frame::build_superframe_v3_range(
+            &payload, cfg, session_id, 0x01, 0x1234, 0, n_packets,
+        );
+        let (sps, pitch) =
+            rrc_mod::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+        let taps = rrc_mod::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+        modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz)
     }
 
     #[test]
@@ -480,6 +633,87 @@ mod tests {
             cap
         );
         assert_eq!(session.total_samples(), 20 * cycle as u64);
+    }
+
+    #[test]
+    fn clean_v3_burst_yields_marker_validated() {
+        // Integration: full V3 superframe through the streaming
+        // pipeline, fed in cpal-sized chunks. At least one
+        // `MarkerValidated` event must fire — the FSM transitions to
+        // Locked at the first clean marker the SC detector flags.
+        //
+        // Payload sized so the superframe carries several full data
+        // cycles (the SC pair-marker detector needs two markers in the
+        // delay line, which means the burst must be ≥ 2 × cycle_samples
+        // past the preamble/header).
+        let cfg = high_plus_config();
+        let audio = build_v3_burst_audio(&cfg, 5000, 0xDEAD_BEEF);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut got_validated = false;
+        let mut locked_after = None;
+        let mut sc_fires = 0usize;
+        let chunk = 2400; // 50 ms at 48 kHz
+        for c in audio.chunks(chunk) {
+            let events = session.process_audio_chunk(c);
+            for e in events {
+                match e {
+                    V3SessionEvent::SofProbeFired { .. } => sc_fires += 1,
+                    V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
+                        got_validated = true;
+                        locked_after.get_or_insert(cycle_idx);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            got_validated,
+            "no MarkerValidated event on a clean V3 burst (sc_fires={sc_fires})",
+        );
+        assert!(matches!(session.state(), V3SessionState::Locked { .. }));
+        assert_eq!(locked_after, Some(0));
+    }
+
+    #[test]
+    fn sym_buffer_contains_decodable_marker() {
+        // Lower-level sanity: feed the burst monolithically and verify
+        // the FFE's raw_buf has a decodable marker SOMEWHERE in the
+        // range we'd expect (preamble + header + LMS warmup ≈ 352 syms
+        // in, plus MF delay ≈ 6 syms ≈ 358). Wide search to localise
+        // the actual marker position empirically — used to diagnose
+        // off-by-N sym position estimates in `try_validate_marker_at`.
+        let cfg = high_plus_config();
+        let audio = build_v3_burst_audio(&cfg, 5000, 0xDEAD_BEEF);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        session.process_audio_chunk(&audio);
+        let raw = session.raw_sym_buffer();
+        assert!(
+            raw.len() > 500,
+            "sym_buffer too short ({}); need ≥ 500 to hit a marker",
+            raw.len()
+        );
+        // Slide MARKER_LEN window across the whole buffer; record the
+        // best correlation and accept if Golay+CRC validates anywhere.
+        let mut best_pos = 0usize;
+        let mut best_decoded = None;
+        let max_start = raw.len().saturating_sub(marker::MARKER_LEN);
+        for pos in 0..=max_start {
+            if let Some(p) =
+                marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])
+            {
+                best_decoded = Some((pos, p));
+                best_pos = pos;
+                break;
+            }
+        }
+        assert!(
+            best_decoded.is_some(),
+            "no marker decodes anywhere in {} syms of sym_buffer",
+            raw.len()
+        );
+        // Report the empirical position so future test failures can
+        // refine the MF_DELAY_SYM constant in try_validate_marker_at.
+        eprintln!("first decoded marker at sym index {best_pos}");
     }
 
     #[test]
