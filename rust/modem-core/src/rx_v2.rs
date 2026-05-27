@@ -2061,7 +2061,7 @@ pub fn rx_v3_after(
 /// `bits_per_sym == 2` because QPSK decisions are reliable enough at typical
 /// operating SNR (no feedback amplification of decision noise), whereas on
 /// 16-APSK (FTN) the decisions are too marginal and would hurt more than help.
-fn track_segment(
+pub(crate) fn track_segment(
     seg_syms: &[Complex64],
     pattern: &crate::profile::PilotPattern,
     pll: &mut DdPll,

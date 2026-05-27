@@ -40,10 +40,16 @@
 
 use std::collections::VecDeque;
 
+use crate::constellation::Constellation;
+use crate::frame::{self, V2_CODEWORDS_PER_SEGMENT};
 use crate::interleaver;
+use crate::ldpc::decoder::LdpcDecoder;
 use crate::marker;
+use crate::pll::DdPll;
 use crate::profile::ModemConfig;
 use crate::rrc;
+use crate::rx_v2;
+use crate::soft_demod;
 use crate::types::AUDIO_RATE;
 use modem_core_base::streaming_dsp::StreamingDsp;
 use modem_core_base::streaming_ffe::StreamingFfe;
@@ -135,14 +141,26 @@ pub enum V3SessionEvent {
     SessionLost {
         reason: String,
     },
-    // Phase 3: SessionArmed (preamble+header anchored), CwConverged,
-    // CwFailed, PayloadAssembled, SessionFinalised.
+    /// A codeword belonging to a Locked cycle was sliced from the equalised
+    /// sym_buffer, passed through soft demod + LDPC. `converged` is the
+    /// LDPC parity-check result; `bytes` carries the first `k/8` info bytes
+    /// whether or not LDPC converged (caller decides what to do with
+    /// non-converged CWs). Emitted once per CW per cycle.
+    CwDecoded {
+        cycle_idx: u32,
+        cw_idx: usize,
+        esi: u32,
+        is_meta: bool,
+        converged: bool,
+        bytes: Vec<u8>,
+        sigma2: f64,
+    },
+    // Phase 3b+: PayloadAssembled, SessionFinalised.
 }
 
 pub struct V3Session {
     /// Stored verbatim for Phase 3+ — drives the constellation, RRC,
     /// pilot pattern, LDPC rate, warmup at PLS/Header validation time.
-    #[allow(dead_code)]
     cfg: ModemConfig,
     profile_name: String,
     state: V3SessionState,
@@ -167,6 +185,42 @@ pub struct V3Session {
     sc: ScDetector,
     dsp: StreamingDsp,
     ffe: StreamingFfe,
+    // ---- Phase 3a: per-cycle CW decode -------------------------------
+    /// Persistent DD-PLL kept alive across cycles — phase advance
+    /// across a Locked burst is continuous, so we don't want to reset
+    /// per cycle.
+    pll: DdPll,
+    decoder: LdpcDecoder,
+    constellation: Constellation,
+    /// `padded_n / bps`: symbols per LDPC codeword for this profile.
+    syms_per_cw: usize,
+    /// `decoder.k() / 8`: info bytes per codeword.
+    k_bytes: usize,
+    /// Deinterleave permutation table sized to the padded codeword bit
+    /// count. Precomputed once at session start.
+    deinterleave_perm: Vec<usize>,
+    /// Pending cycle awaiting enough symbols to slice + decode. Set when
+    /// `handle_sc_fire` validates a marker; consumed once
+    /// `try_decode_pending_cycle` sees the full segment.
+    pending_decode: Option<PendingDecode>,
+    /// Phase 3b: predicted absolute symbol position of the next marker
+    /// after the cycle currently being / just decoded. Populated once
+    /// `try_decode_pending_cycle` consumes a `PendingDecode` ; consumed
+    /// (validated or failed) by `try_advance_to_next_marker`. None while
+    /// the FSM is Idle / Acquiring.
+    next_marker_sym_pos_pred: Option<u64>,
+}
+
+/// Bookkeeping for a cycle whose marker has been validated but whose
+/// data segment hasn't fully arrived in the equalised sym_buffer yet.
+#[derive(Debug, Clone, Copy)]
+struct PendingDecode {
+    /// Absolute symbol index where the MARKER starts. Data segment
+    /// begins at `marker_sym_pos_abs + MARKER_LEN`.
+    marker_sym_pos_abs: u64,
+    cycle_idx: u32,
+    base_esi: u32,
+    is_meta: bool,
 }
 
 impl V3Session {
@@ -180,6 +234,20 @@ impl V3Session {
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
         let dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
         let ffe = StreamingFfe::new(V3_FFE_LEN, cycle_data_sym, V3_FFE_TRAINING_LEN);
+        // Decode bookkeeping mirrors `rx_v2_single` (rx_v2.rs:1218-1228):
+        // padded_n compensates the bps-alignment pad TX adds on codeword
+        // bits that aren't divisible by bits-per-symbol (e.g. APSK32 with
+        // 2304 % 5).
+        let decoder = LdpcDecoder::new(cfg.ldpc_rate, 50);
+        let constellation = frame::make_constellation(&cfg);
+        let bps = cfg.constellation.bits_per_sym();
+        let padded_n = interleaver::padded_cw_bits(decoder.n(), cfg.constellation);
+        let syms_per_cw = padded_n / bps;
+        let k_bytes = decoder.k() / 8;
+        let deinterleave_perm = interleaver::deinterleave_table(padded_n, cfg.constellation);
+        let pll_alpha = 0.05f64;
+        let pll_beta = pll_alpha * pll_alpha * 0.25;
+        let pll = DdPll::new(pll_alpha, pll_beta);
         Self {
             cfg,
             profile_name,
@@ -193,6 +261,14 @@ impl V3Session {
             sc,
             dsp,
             ffe,
+            pll,
+            decoder,
+            constellation,
+            syms_per_cw,
+            k_bytes,
+            deinterleave_perm,
+            pending_decode: None,
+            next_marker_sym_pos_pred: None,
         }
     }
 
@@ -295,7 +371,22 @@ impl V3Session {
             self.handle_sc_fire(marker_at_abs, metric, &mut events);
         }
 
-        // 4. Trim the rolling audio buffer. StreamingDsp tracks its own
+        // 4. Drain the decode + advance loop until no more progress
+        //    can be made on this chunk. A single chunk may carry
+        //    several cycles' worth of symbols (e.g. a long monolithic
+        //    feed in tests), so we keep alternating decode → advance
+        //    until both are no-ops. The loop is bounded by the number
+        //    of cycles physically present in the rolling sym_buffer,
+        //    so termination is guaranteed.
+        loop {
+            let decoded = self.try_decode_pending_cycle(&mut events);
+            let advanced = self.try_advance_to_next_marker(&mut events);
+            if !decoded && !advanced {
+                break;
+            }
+        }
+
+        // 5. Trim the rolling audio buffer. StreamingDsp tracks its own
         //    resampler cursor; we keep the last AUDIO_BUFFER_RETAIN_CYCLES
         //    cycles so the next call has a window to advance into.
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * self.cycle_samples;
@@ -326,6 +417,18 @@ impl V3Session {
         metric: f64,
         events: &mut Vec<V3SessionEvent>,
     ) {
+        // Phase 3b: SC is BOOTSTRAP-only. The detector edge-fires once
+        // per cycle on a clean periodic burst (M peaks at every two-
+        // marker alignment); once we're Locked the predictive
+        // `try_advance_to_next_marker` owns marker advancement. Re-
+        // entering handle_sc_fire from Locked would either (a) duplicate
+        // MarkerValidated events at the same cycle_idx if the SC's wide
+        // bootstrap radius happens to land on the next marker the
+        // predictor already tracked, or (b) skip cycles if it lands on
+        // a marker further ahead. Both corrupt the cycle index sequence.
+        if !matches!(self.state, V3SessionState::Idle | V3SessionState::Acquiring { .. }) {
+            return;
+        }
         // Try to validate a marker at the SC-located audio position. On
         // Golay+CRC success we promote the FSM to `Locked` and emit
         // `MarkerValidated`; otherwise we record the candidate in
@@ -334,10 +437,9 @@ impl V3Session {
         if let Some((marker_sym_pos_abs, payload)) =
             self.try_validate_marker_at(marker_at_abs)
         {
-            let cycle_idx = match &self.state {
-                V3SessionState::Locked { cycle_idx, .. } => cycle_idx.saturating_add(1),
-                _ => 0,
-            };
+            // First validated marker of the burst — always cycle_idx 0.
+            let cycle_idx = 0u32;
+            let is_meta = payload.is_meta();
             events.push(V3SessionEvent::MarkerValidated {
                 marker_at_abs,
                 marker_sym_pos_abs,
@@ -345,12 +447,21 @@ impl V3Session {
                 seg_id: payload.seg_id,
                 session_id_low: payload.session_id_low,
                 base_esi: payload.base_esi,
-                is_meta: payload.is_meta(),
+                is_meta,
             });
             self.state = V3SessionState::Locked {
                 cycle_idx,
                 anchor_marker_abs: marker_at_abs,
             };
+            // Queue the cycle for CW decode. `try_decode_pending_cycle`
+            // runs at the end of every `process_audio_chunk` and consumes
+            // this once the equalised sym_buffer covers the full segment.
+            self.pending_decode = Some(PendingDecode {
+                marker_sym_pos_abs,
+                cycle_idx,
+                base_esi: payload.base_esi,
+                is_meta,
+            });
             return;
         }
         if matches!(self.state, V3SessionState::Idle) {
@@ -427,6 +538,261 @@ impl V3Session {
         let payload =
             marker::decode_marker_at(&raw[best_pos..best_pos + marker::MARKER_LEN])?;
         Some((raw_start_abs + best_pos as u64, payload))
+    }
+
+    /// Segment span in symbols PAST a marker — i.e. data symbols +
+    /// interleaved pilot groups. Total marker-to-next-marker spacing is
+    /// `MARKER_LEN + seg_sym_len_past_marker(is_meta)`.
+    fn seg_sym_len_past_marker(&self, is_meta: bool) -> usize {
+        let n_cw = if is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+        let data_sym_count = n_cw * self.syms_per_cw;
+        let d_syms = self.cfg.pilot_pattern.d_syms;
+        let p_syms = self.cfg.pilot_pattern.p_syms;
+        let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
+        data_sym_count + n_pilot_groups * p_syms
+    }
+
+    /// Phase 3a: slice the data segment that follows the most recently
+    /// validated marker from the equalised sym_buffer, run pilot
+    /// tracking + per-CW soft demod + LDPC, emit `CwDecoded` events.
+    ///
+    /// No-op if there's no pending cycle, or if the sym_buffer hasn't
+    /// yet caught up to the full segment length. Idempotent — clears
+    /// `pending_decode` on completion so the next chunk waits for the
+    /// next marker. Returns `true` iff a cycle was consumed (made
+    /// progress) so the outer loop knows to try `try_advance_to_next_marker`.
+    fn try_decode_pending_cycle(&mut self, events: &mut Vec<V3SessionEvent>) -> bool {
+        let Some(pending) = self.pending_decode else {
+            return false;
+        };
+        let n_cw = if pending.is_meta {
+            1
+        } else {
+            V2_CODEWORDS_PER_SEGMENT
+        };
+        let data_sym_count = n_cw * self.syms_per_cw;
+        let seg_sym_len = self.seg_sym_len_past_marker(pending.is_meta);
+
+        // Segment starts right after MARKER_LEN symbols past the
+        // marker. Wait until the equalised sym_buffer fully covers it.
+        let seg_start_abs = pending.marker_sym_pos_abs + marker::MARKER_LEN as u64;
+        let sym_start_abs = self.ffe.start_abs();
+        let sym_end_abs = sym_start_abs + self.ffe.out_buf().len() as u64;
+        if seg_start_abs < sym_start_abs {
+            // The segment has already been trimmed out of the sym_buffer
+            // before we could decode it — abandon. (Should not happen
+            // with a properly sized AUDIO_BUFFER_RETAIN_CYCLES; surface
+            // as a SessionLost for diagnostic purposes.) State stays
+            // Locked so a fresh SC bootstrap doesn't double-fire on the
+            // same burst; explicit `finalize()` resets the FSM.
+            self.pending_decode = None;
+            self.next_marker_sym_pos_pred = None;
+            events.push(V3SessionEvent::SessionLost {
+                reason: format!(
+                    "cycle {} segment trimmed before decode (seg_start={} < sym_start={})",
+                    pending.cycle_idx, seg_start_abs, sym_start_abs,
+                ),
+            });
+            return true;
+        }
+        if seg_start_abs + seg_sym_len as u64 > sym_end_abs {
+            // Not enough symbols yet — wait for the next chunk.
+            return false;
+        }
+
+        let seg_off = (seg_start_abs - sym_start_abs) as usize;
+        let seg_syms = &self.ffe.out_buf()[seg_off..seg_off + seg_sym_len];
+        // track_segment mutates pll + sigma2 accumulators ; we keep
+        // pll persistent (continuous burst phase) and use local sigma2
+        // scratch since LLR scaling is per-segment.
+        let mut sigma2_sum = 0.0f64;
+        let mut sigma2_count: usize = 0;
+        let mut pilot_x3_sum = 0.0f64;
+        let mut pilot_x4_sum = 0.0f64;
+        let (seg_data_syms, _pilot_phases) = rx_v2::track_segment(
+            seg_syms,
+            &self.cfg.pilot_pattern,
+            &mut self.pll,
+            &self.constellation,
+            &mut sigma2_sum,
+            &mut sigma2_count,
+            &mut pilot_x3_sum,
+            &mut pilot_x4_sum,
+        );
+        // Per-segment pilot σ² (stacked Re/Im) → LLR scale. Matches
+        // rx_v2_single's sigma2_for_llr derivation (rx_v2.rs:1386-1479).
+        let seg_pilots = sigma2_count;
+        let sigma2 = if seg_pilots > 0 {
+            let n2 = (2 * seg_pilots) as f64;
+            (sigma2_sum / n2) * 2.0
+        } else {
+            0.1
+        };
+        let sigma2_for_llr = sigma2.max(1e-6);
+
+        // Some segments arrive with fewer data symbols than expected
+        // (last cycle truncation). Skip CW decode but clear pending
+        // so we don't loop on it forever.
+        if seg_data_syms.len() < data_sym_count {
+            self.pending_decode = None;
+            return true;
+        }
+
+        for cw_idx in 0..n_cw {
+            let off = cw_idx * self.syms_per_cw;
+            let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
+            let llr = soft_demod::llr_maxlog(cw_syms, &self.constellation, sigma2_for_llr);
+            let llr_deint =
+                interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
+            let llr_for_ldpc = &llr_deint[..self.decoder.n()];
+            let (info_bytes, converged) = self.decoder.decode_to_bytes(llr_for_ldpc);
+            let bytes = info_bytes[..self.k_bytes].to_vec();
+            // ESI per CW: META carries 1 CW at base_esi ; data segments
+            // walk V2_CODEWORDS_PER_SEGMENT consecutive ESIs starting at
+            // base_esi (matches rx_v2_single's per-marker indexing).
+            let esi = pending.base_esi + cw_idx as u32;
+            events.push(V3SessionEvent::CwDecoded {
+                cycle_idx: pending.cycle_idx,
+                cw_idx,
+                esi,
+                is_meta: pending.is_meta,
+                converged,
+                bytes,
+                sigma2,
+            });
+        }
+        // Predict the next marker position. Spacing is
+        // MARKER_LEN + seg_sym_len(this cycle's is_meta) symbols after
+        // the current marker. Phase 3b: drives the narrow-radius
+        // validation in `try_advance_to_next_marker`.
+        let next_pred = pending.marker_sym_pos_abs
+            + marker::MARKER_LEN as u64
+            + seg_sym_len as u64;
+        self.next_marker_sym_pos_pred = Some(next_pred);
+        self.pending_decode = None;
+        true
+    }
+
+    /// Phase 3b: predict-and-validate the next marker via a narrow
+    /// ±MARKER_SYNC_LEN search around `next_marker_sym_pos_pred`.
+    ///
+    /// On success, promotes the FSM to the next cycle and queues the
+    /// new segment for `try_decode_pending_cycle`. On failure (the
+    /// search window is fully covered by sym_buffer but no Golay+CRC
+    /// validates), emits `SessionLost` — Phase 3b is single-shot, no
+    /// skip-and-retry. Cycle-skipping recovery is a refinement deferred
+    /// to a later slice. Returns `true` iff the prediction was
+    /// consumed (validated or failed).
+    fn try_advance_to_next_marker(&mut self, events: &mut Vec<V3SessionEvent>) -> bool {
+        let Some(pred) = self.next_marker_sym_pos_pred else {
+            return false;
+        };
+        let radius = marker::MARKER_SYNC_LEN as u64;
+        let window_start_abs = pred.saturating_sub(radius);
+        let window_end_abs = pred + radius + marker::MARKER_LEN as u64;
+
+        let raw_start_abs = self.ffe.start_abs();
+        let raw_end_abs = raw_start_abs + self.ffe.raw_buf().len() as u64;
+
+        // Not enough symbols to fully cover the search + marker yet —
+        // wait. Important: NEVER count this as a failure, the marker
+        // simply hasn't arrived.
+        if window_end_abs > raw_end_abs {
+            return false;
+        }
+        // Window scrolled out of the rolling buffer — diagnostic only.
+        // State stays Locked so an SC re-fire doesn't cycle the FSM
+        // back through bootstrap on the same burst.
+        if window_start_abs < raw_start_abs {
+            self.next_marker_sym_pos_pred = None;
+            events.push(V3SessionEvent::SessionLost {
+                reason: format!(
+                    "next-marker window trimmed (pred={pred} < raw_start={raw_start_abs})",
+                ),
+            });
+            return true;
+        }
+
+        let raw = self.ffe.raw_buf();
+        let start_rel = (window_start_abs - raw_start_abs) as usize;
+        let total_len = (window_end_abs - window_start_abs) as usize;
+        let search_len = total_len.saturating_sub(marker::MARKER_LEN);
+        let validated = if search_len > 0 {
+            marker::find_sync_in_window(raw, start_rel, search_len, 0.5).and_then(
+                |(pos, _)| {
+                    marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])
+                        .map(|payload| (pos, payload))
+                },
+            )
+        } else {
+            None
+        };
+
+        match validated {
+            Some((pos, payload)) => {
+                self.next_marker_sym_pos_pred = None;
+                let marker_sym_pos_abs = raw_start_abs + pos as u64;
+                let cycle_idx = match &self.state {
+                    V3SessionState::Locked { cycle_idx, .. } => {
+                        cycle_idx.saturating_add(1)
+                    }
+                    // Should not happen — we got here from a Locked
+                    // state, but stay defensive.
+                    _ => 0,
+                };
+                let is_meta = payload.is_meta();
+                // Audio-domain marker position approximated from sym
+                // position so the event payload stays consistent with
+                // the SC-bootstrap path. Not used for further decoding,
+                // diagnostic only.
+                let (sps, _) = rrc::check_integer_constraints(
+                    AUDIO_RATE,
+                    self.cfg.symbol_rate,
+                    self.cfg.tau,
+                )
+                .expect("profile config has valid integer sps");
+                let marker_at_abs = marker_sym_pos_abs * sps as u64;
+                events.push(V3SessionEvent::MarkerValidated {
+                    marker_at_abs,
+                    marker_sym_pos_abs,
+                    cycle_idx,
+                    seg_id: payload.seg_id,
+                    session_id_low: payload.session_id_low,
+                    base_esi: payload.base_esi,
+                    is_meta,
+                });
+                self.state = V3SessionState::Locked {
+                    cycle_idx,
+                    anchor_marker_abs: marker_at_abs,
+                };
+                self.pending_decode = Some(PendingDecode {
+                    marker_sym_pos_abs,
+                    cycle_idx,
+                    base_esi: payload.base_esi,
+                    is_meta,
+                });
+                // EOT detection lives in the protocol header (re-inserted
+                // before EOT meta frames) — wired in Phase 3d alongside
+                // AppHeader + RaptorQ assembly.
+                true
+            }
+            None => {
+                // End-of-burst is the normal case here (no more markers
+                // exist). Clear the prediction so the loop terminates
+                // and leave state Locked so a fresh SC fire on this
+                // same buffer doesn't double-bootstrap. The next
+                // `finalize()` resets the FSM cleanly.
+                self.next_marker_sym_pos_pred = None;
+                events.push(V3SessionEvent::SessionLost {
+                    reason: format!(
+                        "next-marker validation failed at sym pos {pred} (\
+                        end-of-burst or drift slip past ±{} sym radius)",
+                        marker::MARKER_SYNC_LEN,
+                    ),
+                });
+                true
+            }
+        }
     }
 }
 
@@ -813,6 +1179,263 @@ mod tests {
     // causes the predicted next-marker position to slip past the
     // narrow search radius and the FFE's LS taps to mistrack. That
     // test will land alongside CW decode wiring.
+
+    /// Helper used by the cliff comparison test — runs a drifted burst
+    /// through V3Session with the given correction (0.0 = no correction)
+    /// and returns (validated_cycles_count, converged_unique_cycles).
+    fn run_drift_burst(
+        cfg: &ModemConfig,
+        base_audio: &[f32],
+        ppm: f64,
+        correction_ppm: f64,
+    ) -> (usize, usize) {
+        let drifted = apply_drift(base_audio, ppm);
+        let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
+        session.set_drift_ppm(correction_ppm);
+        let mut validated = 0usize;
+        let mut converged = std::collections::HashSet::<u32>::new();
+        for c in drifted.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                match e {
+                    V3SessionEvent::MarkerValidated { .. } => validated += 1,
+                    V3SessionEvent::CwDecoded {
+                        cycle_idx,
+                        converged: true,
+                        ..
+                    } => {
+                        converged.insert(cycle_idx);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (validated, converged.len())
+    }
+
+    #[test]
+    fn drift_uncorrected_at_high_ppm_underperforms_corrected() {
+        // The cliff promised in the Phase 2 HEAD commit message: at
+        // ±200 ppm without a matching `set_drift_ppm`, cumulative
+        // drift across cycles slips the MF symbol grid and the
+        // pilot/data LS gains drift, so converged-CW count drops
+        // markedly vs the corrected baseline. Documents that
+        // correction is REQUIRED for multi-cycle decode at high drift,
+        // even though the first marker decodes either way.
+        //
+        // Asserts a strict inequality (corrected > uncorrected) rather
+        // than a specific cliff height — the exact drop varies with
+        // profile, FFE state, and pilot density. Phase 4's coarse SOF
+        // LS estimator will source the correction automatically; this
+        // test exists to prove the correction matters end-to-end.
+        let cfg = high_plus_config();
+        let base_audio = build_v3_burst_audio(&cfg, 800, 0xFEED_FACE);
+        for &ppm in &[-200.0_f64, 200.0] {
+            let (val_corr, conv_corr) = run_drift_burst(&cfg, &base_audio, ppm, ppm);
+            let (val_uncorr, conv_uncorr) = run_drift_burst(&cfg, &base_audio, ppm, 0.0);
+            // Baseline sanity: with correction we hit the same
+            // ≥(N-1) converged-cycles target as the with-correction
+            // sweep test.
+            assert!(
+                conv_corr >= val_corr - 1,
+                "corrected baseline regressed at {ppm} ppm: \
+                 {conv_corr}/{val_corr} converged",
+            );
+            // The cliff: uncorrected gets strictly fewer converged
+            // cycles than corrected. (`<` not `≤` so a "no
+            // degradation" outcome fails loudly and forces us to
+            // re-examine assumptions.)
+            assert!(
+                conv_uncorr < conv_corr,
+                "no drift cliff at {ppm} ppm: corrected={conv_corr}/{val_corr}, \
+                 uncorrected={conv_uncorr}/{val_uncorr}",
+            );
+            eprintln!(
+                "drift {ppm:+.0} ppm: corrected={conv_corr}/{val_corr}, \
+                 uncorrected={conv_uncorr}/{val_uncorr}",
+            );
+        }
+    }
+
+    #[test]
+    fn drift_sweep_multi_cycle_decodes_with_correction() {
+        // Phase 3c milestone: extend the Phase 2 first-marker sweep to
+        // full multi-cycle CW decode. With the matching `set_drift_ppm`
+        // correction, the StreamingDsp resampler compensates the source
+        // clock offset end-to-end, so each cycle's data segment lands
+        // at the expected symbol position and LDPC converges. Sweeps
+        // the same ppm extremes as the Phase 2 baseline (±30, ±200).
+        //
+        // Payload sized for ≥3 data cycles at HIGH+ so the predictive
+        // marker-advance loop has to walk at least cycles 1, 2 past
+        // the SC bootstrap on cycle 0.
+        let cfg = high_plus_config();
+        let base_audio = build_v3_burst_audio(&cfg, 800, 0x1357_2468);
+        for &ppm in &[-200.0_f64, -30.0, 30.0, 200.0] {
+            let drifted = apply_drift(&base_audio, ppm);
+            let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
+            session.set_drift_ppm(ppm);
+            let mut validated_cycles = Vec::<u32>::new();
+            let mut converged_cycles = std::collections::HashSet::<u32>::new();
+            for c in drifted.chunks(2400) {
+                for e in session.process_audio_chunk(c) {
+                    match e {
+                        V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
+                            validated_cycles.push(cycle_idx);
+                        }
+                        V3SessionEvent::CwDecoded {
+                            cycle_idx,
+                            converged: true,
+                            ..
+                        } => {
+                            converged_cycles.insert(cycle_idx);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(
+                validated_cycles.len() >= 3,
+                "drift {ppm} ppm: only {} cycles validated ({validated_cycles:?})",
+                validated_cycles.len(),
+            );
+            for w in validated_cycles.windows(2) {
+                assert!(
+                    w[1] > w[0],
+                    "drift {ppm} ppm: cycle_idx not strictly increasing: \
+                     {validated_cycles:?}",
+                );
+            }
+            // Tolerate one cycle without converged CW (typically the
+            // last/partial one or a meta cycle whose LDPC noise margin
+            // is smaller). Anything more = drift cliff and the
+            // correction failed.
+            assert!(
+                converged_cycles.len() >= validated_cycles.len() - 1,
+                "drift {ppm} ppm: only {} of {} cycles converged",
+                converged_cycles.len(),
+                validated_cycles.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn clean_v3_burst_decodes_first_cycle_cw() {
+        // Phase 3a milestone: once the FSM hits Locked on the first
+        // marker, V3Session must slice the data segment from the
+        // equalised sym_buffer and LDPC-decode at least one CW with
+        // `converged = true`. Validates the wiring of track_segment +
+        // soft_demod + LDPC at the session boundary.
+        //
+        // Note: the streaming FFE is pass-through (untrained) at this
+        // slice; track_segment's per-pilot-group LS gain absorbs the
+        // unequalised global gain. Drift = 0, high SNR, so this is the
+        // happy-path baseline.
+        let cfg = high_plus_config();
+        let audio = build_v3_burst_audio(&cfg, 5000, 0xC0FFEE_42);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut got_converged = false;
+        let mut cw_events = 0usize;
+        let mut first_cycle_seen: Option<u32> = None;
+        for c in audio.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                if let V3SessionEvent::CwDecoded {
+                    cycle_idx,
+                    converged,
+                    ..
+                } = e
+                {
+                    cw_events += 1;
+                    first_cycle_seen.get_or_insert(cycle_idx);
+                    if converged {
+                        got_converged = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            cw_events >= 1,
+            "no CwDecoded events emitted (sym_buffer={}, state={:?})",
+            session.sym_buffer().len(),
+            session.state(),
+        );
+        assert!(
+            got_converged,
+            "no CW converged in cycle 0 (cw_events={cw_events})",
+        );
+        // First decoded cycle must be cycle_idx 0 — Phase 3a only
+        // decodes the cycle whose marker just validated, not multi-cycle.
+        assert_eq!(first_cycle_seen, Some(0));
+    }
+
+    #[test]
+    fn clean_v3_burst_decodes_multiple_cycles() {
+        // Phase 3b milestone: with predictive marker advance, V3Session
+        // must keep emitting MarkerValidated + CwDecoded events past
+        // cycle 0 until the burst ends. Compare against the Phase 3a
+        // baseline (cycle 0 only) to confirm the loop actually walks.
+        //
+        // Payload sized so the burst covers ≥ 4 data cycles at HIGH+
+        // (~5300 bps × ~0.2 s/cycle ⇒ ~130 bytes/cycle ⇒ 800 B = 6 cyc).
+        let cfg = high_plus_config();
+        let audio = build_v3_burst_audio(&cfg, 800, 0xBADC_0FFE);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut validated_cycles = Vec::<u32>::new();
+        let mut converged_per_cycle = std::collections::HashMap::<u32, usize>::new();
+        let mut session_lost: Option<String> = None;
+        for c in audio.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                match e {
+                    V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
+                        validated_cycles.push(cycle_idx);
+                    }
+                    V3SessionEvent::CwDecoded {
+                        cycle_idx,
+                        converged,
+                        ..
+                    } => {
+                        if converged {
+                            *converged_per_cycle.entry(cycle_idx).or_insert(0) += 1;
+                        }
+                    }
+                    V3SessionEvent::SessionLost { reason } => {
+                        session_lost.get_or_insert(reason);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Cycle 0 from SC bootstrap, then 3b's predictive advance must
+        // have produced cycles 1, 2, 3, ... at minimum.
+        assert!(
+            validated_cycles.len() >= 3,
+            "expected ≥3 MarkerValidated events, got {validated_cycles:?}",
+        );
+        // Cycles must be strictly increasing — no skipping, no
+        // duplicates from re-running the SC path.
+        for w in validated_cycles.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "cycle_idx not strictly increasing: {:?}",
+                validated_cycles
+            );
+        }
+        // At least one CW per validated DATA cycle must converge.
+        // (Meta cycles also count but are sparser; checking ≥ N-1 lets
+        // the test tolerate one trailing partial / meta cycle.)
+        let converged_cycles = converged_per_cycle.len();
+        assert!(
+            converged_cycles >= validated_cycles.len() - 1,
+            "only {} of {} cycles had a converged CW (lost={:?})",
+            converged_cycles,
+            validated_cycles.len(),
+            session_lost,
+        );
+        // End-of-burst SessionLost is expected (no more markers past
+        // the last cycle), but it must come AFTER the cycles, not
+        // mid-burst. We allow it but don't require it (the burst may
+        // simply run out of samples first).
+        let _ = session_lost;
+    }
 
     #[test]
     fn finalize_returns_to_idle() {
