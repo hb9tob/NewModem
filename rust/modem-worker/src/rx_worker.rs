@@ -632,6 +632,44 @@ fn preamble_absence_timeout(config: &modem_core::profile::ModemConfig) -> Durati
     Duration::from_secs(secs)
 }
 
+/// Minimum trailing audio retained in the active session buffer after a
+/// successful `scan_and_route` truncation. Scales per profile so that
+/// every scan tick sees at least two consecutive preambles in the
+/// session buffer — i.e. ≥ 1 CLOSED window for `rx_v3_after` to feed to
+/// `rx_v2_legacy_grid_decode` (Power Mode) or `rx_v2_with_options` /
+/// `rx_v2_with_hint` (Light Mode). Both decoders depend on the
+/// closed-pair geometry for drift compensation: the broad ±80 ppm grid
+/// in Power Mode, the per-window Gardner estimate in Light Mode.
+///
+/// Without this floor the post-scan drain at `last_preamble_offset
+/// - TRUNCATE_MARGIN` collapses the buffer to ≈ 1 preamble worth of
+/// audio. The next preamble lands `V3_PREAMBLE_PERIOD_S = 4 s` later,
+/// so every intermediate tick only sees positions.len() = 1 →
+/// OPEN-only. In active state `finalize = false` skips OPEN windows
+/// (line ~2008 of `rx_v2.rs`), so 3 out of every 4 ticks decode
+/// nothing. Worst-affected profile: ULTRA (sps=96) which needs the
+/// broad ±80 ppm grid more often than fast profiles because its low
+/// symbol rate amplifies the cost of a single missed CLOSED window.
+///
+/// Inspired by 0.9.2rc5's flat `CAPTURE_WINDOW_SECONDS = 15`, narrowed
+/// here to per-profile values so fast profiles don't pay the linear
+/// `downmix + matched_filter` cost on audio they don't need:
+///   - 8 s  for sps=32 (NORMAL/HIGH/MEGA/FAST/HIGH+/HIGH++/HIGH56/HIGH+56)
+///   - 10 s for sps=48 (ROBUST) — +2 s for marker-jitter slack at half rate
+///   - 12 s for sps=96 (ULTRA)  — +4 s so 3 preambles are visible at all
+///                                 times, giving the broad-grid search
+///                                 two CLOSED windows to score across
+fn min_active_buffer_seconds(config: &modem_core::profile::ModemConfig) -> usize {
+    let sps = (AUDIO_RATE as f64 / config.symbol_rate).round() as usize;
+    if sps >= 96 {
+        12
+    } else if sps >= 48 {
+        10
+    } else {
+        8
+    }
+}
+
 /// Late-entry recovery (lowpower path only, `!allow_legacy_grid`).
 ///
 /// When a CLOSED SF's Gardner-pass produces a one-off outlier estimate
@@ -1909,11 +1947,17 @@ fn scan_and_route(
         // window stalls the worker indefinitely.
         //
         // Mirrors the drain logic at line ~2050 (the success path).
+        // Per-profile floor (`min_active_buffer_seconds`) prevents the
+        // drain from collapsing the buffer below 2-3 preamble periods,
+        // so the next tick still sees a CLOSED window without waiting
+        // a full V3_PREAMBLE_PERIOD_S for a fresh preamble to arrive.
         if let Some(p_last) = result.last_preamble_offset {
             let margin = AUDIO_RATE as usize * TRUNCATE_MARGIN_MS / 1000;
+            let min_keep = AUDIO_RATE as usize * min_active_buffer_seconds(&state.config);
+            let max_drain = state.session_buffer.len().saturating_sub(min_keep);
             let drain_end = p_last
                 .saturating_sub(margin)
-                .min(state.session_buffer.len());
+                .min(max_drain);
             if drain_end > 0 {
                 state.session_buffer.drain(..drain_end);
             }
@@ -2078,11 +2122,21 @@ fn scan_and_route(
     // this, the buffer would either grow without bound (memory) or
     // need a fixed-size scan window (which fails when scan_window
     // ≈ V3_PREAMBLE_PERIOD_S, see history note above the constants).
+    //
+    // Per-profile floor (`min_active_buffer_seconds`) capping the drain:
+    // ULTRA/ROBUST need 2-3 preambles visible at all times so the broad
+    // ±80 ppm grid (Power Mode) or per-window Gardner (Light Mode) has
+    // a CLOSED window to score on every tick — not just one tick per
+    // V3_PREAMBLE_PERIOD_S. Mirrors 0.9.2rc5's `CAPTURE_WINDOW_SECONDS`
+    // intent without its flat 15 s cap that caused the 2026-05-06
+    // HIGH+ realtime-debt cascade.
     if let Some(p_last) = result.last_preamble_offset {
         let margin = AUDIO_RATE as usize * TRUNCATE_MARGIN_MS / 1000;
+        let min_keep = AUDIO_RATE as usize * min_active_buffer_seconds(&state.config);
+        let max_drain = state.session_buffer.len().saturating_sub(min_keep);
         let drain_end = p_last
             .saturating_sub(margin)
-            .min(state.session_buffer.len());
+            .min(max_drain);
         if drain_end > 0 {
             state.session_buffer.drain(..drain_end);
         }
