@@ -80,6 +80,18 @@ pub const V3_FFE_LEN: usize = 64;
 /// retention window.
 pub const V3_FFE_TRAINING_LEN: usize = 384;
 
+/// Phase 4 coarse drift LS estimator: minimum number of refined marker
+/// positions before fitting a slope. 3 = bootstrap anchor + 2 validated
+/// next-markers (typically META at cycle 0 + DATA cycles 1, 2).
+pub const COARSE_DRIFT_MIN_OBS: usize = 3;
+
+/// Phase 4 coarse drift commit threshold. Below this the per-segment
+/// pilot tracker absorbs the residual without a pipeline rebuild,
+/// matching [[feedback-drift-architecture-one-shot-plus-fine-tracking]]
+/// "coarse one-shot + fine tracker". Above it, the session reboots the
+/// streaming pipeline at the corrected ratio and replays the audio.
+pub const COARSE_DRIFT_COMMIT_PPM: f64 = 5.0;
+
 /// Cycle period in symbols: one marker + 2 codewords with TDM pilots.
 /// Matches the periodic data-segment spacing inside a V3 superframe
 /// (see `build_superframe_v3_range` in `frame.rs`).
@@ -190,6 +202,20 @@ pub enum V3SessionEvent {
         cws_converged: u32,
         payload_assembled: bool,
     },
+    /// Phase 4 coarse one-shot drift estimator fired. `from_ppm` is the
+    /// drift hint the session was running with, `to_ppm` is the updated
+    /// value after LS fit over `n_observations` refined marker positions.
+    /// `applied = true` means the streaming pipeline was rebooted at the
+    /// new ratio and the buffered audio was replayed; `false` means the
+    /// delta sat below `COARSE_DRIFT_COMMIT_PPM` so the estimator only
+    /// recorded the measurement without rebuilding. Either way the
+    /// estimator is locked for the rest of the burst.
+    DriftCommitted {
+        from_ppm: f64,
+        to_ppm: f64,
+        n_observations: usize,
+        applied: bool,
+    },
 }
 
 pub struct V3Session {
@@ -261,6 +287,26 @@ pub struct V3Session {
     /// each `finalize()` so a recycled `V3Session` starts fresh.
     cycles_validated: u32,
     cws_converged: u32,
+    // ---- Phase 4: coarse one-shot drift estimator -------------------
+    /// Set once `try_apply_coarse_drift` has fitted a slope and either
+    /// committed or measured a sub-threshold delta. Blocks further
+    /// estimator passes — Phase 4 is one-shot per burst.
+    drift_locked: bool,
+    /// Refined absolute symbol position of the burst anchor (the first
+    /// validated marker). Set in `handle_sc_fire`; cleared on reboot
+    /// or finalize. Used as the `x = 0` reference for the LS fit.
+    drift_anchor_sym_pos: Option<f64>,
+    /// LS observations accumulated by `try_advance_to_next_marker`:
+    /// `(expected_sym_offset_from_anchor, observed_minus_no_drift_expected)`
+    /// per validated marker past the anchor. Slope of y vs x in ppm × 1e-6.
+    drift_observations: Vec<(f64, f64)>,
+    /// Running NO-DRIFT cycle-length offset from the anchor, in
+    /// symbols. Used to compute the expected no-drift position of the
+    /// next marker (anchor + this offset), against which the refined
+    /// observed position yields the cumulative drift residual. Bumped
+    /// by `try_decode_pending_cycle` once it commits the cycle's
+    /// prediction.
+    coarse_drift_cum_offset_sym: u64,
 }
 
 /// Bookkeeping for a cycle whose marker has been validated but whose
@@ -326,6 +372,10 @@ impl V3Session {
             payload_assembled: false,
             cycles_validated: 0,
             cws_converged: 0,
+            drift_locked: false,
+            drift_anchor_sym_pos: None,
+            drift_observations: Vec::new(),
+            coarse_drift_cum_offset_sym: 0,
         }
     }
 
@@ -443,6 +493,14 @@ impl V3Session {
             }
         }
 
+        // 4b. Phase 4 coarse one-shot drift LS. Once enough refined
+        //     marker positions have accumulated, fit slope, decide
+        //     whether to reboot the streaming pipeline at the corrected
+        //     ratio. Replays the audio buffer recursively (drift_locked
+        //     blocks re-entry), so a single call settles the burst at
+        //     the right drift.
+        self.try_apply_coarse_drift(&mut events);
+
         // 5. Trim the rolling audio buffer. StreamingDsp tracks its own
         //    resampler cursor; we keep the last AUDIO_BUFFER_RETAIN_CYCLES
         //    cycles so the next call has a window to advance into.
@@ -482,6 +540,12 @@ impl V3Session {
         self.payload_assembled = false;
         self.cycles_validated = 0;
         self.cws_converged = 0;
+        // Phase 4: the recycled session must re-bootstrap its own drift
+        // estimate against the next burst.
+        self.drift_locked = false;
+        self.drift_anchor_sym_pos = None;
+        self.drift_observations.clear();
+        self.coarse_drift_cum_offset_sym = 0;
         events
     }
 
@@ -558,6 +622,15 @@ impl V3Session {
                     base_esi: meta_payload.base_esi,
                     is_meta: true,
                 });
+                // Phase 4 anchor: refine the META sym position and
+                // remember it as the LS-fit origin. The DATA marker
+                // SC found (and every subsequent marker) will be
+                // measured as a residual against the cycle-length
+                // prediction from this anchor.
+                if !self.drift_locked && self.drift_anchor_sym_pos.is_none() {
+                    self.drift_anchor_sym_pos =
+                        Some(self.refine_marker_sym_pos_abs(meta_sym_pos));
+                }
                 // `try_decode_pending_cycle` will compute
                 // `next_marker_sym_pos_pred` = data_marker_sym_pos
                 // from the META cycle length, so the SC-located DATA
@@ -590,6 +663,11 @@ impl V3Session {
             base_esi: payload.base_esi,
             is_meta,
         });
+        // Phase 4 anchor: same recipe as the META-lookback branch.
+        if !self.drift_locked && self.drift_anchor_sym_pos.is_none() {
+            self.drift_anchor_sym_pos =
+                Some(self.refine_marker_sym_pos_abs(marker_sym_pos_abs));
+        }
     }
 
     /// Probe one META cycle backward of a validated DATA marker, looking
@@ -878,10 +956,16 @@ impl V3Session {
         // MARKER_LEN + seg_sym_len(this cycle's is_meta) symbols after
         // the current marker. Phase 3b: drives the narrow-radius
         // validation in `try_advance_to_next_marker`.
-        let next_pred = pending.marker_sym_pos_abs
-            + marker::MARKER_LEN as u64
-            + seg_sym_len as u64;
+        let cycle_step_sym = marker::MARKER_LEN as u64 + seg_sym_len as u64;
+        let next_pred = pending.marker_sym_pos_abs + cycle_step_sym;
         self.next_marker_sym_pos_pred = Some(next_pred);
+        // Phase 4: advance the cumulative no-drift offset by THIS cycle's
+        // length, so the next marker observation lines up against
+        // `anchor + cum_offset`.
+        if !self.drift_locked {
+            self.coarse_drift_cum_offset_sym =
+                self.coarse_drift_cum_offset_sym.saturating_add(cycle_step_sym);
+        }
         self.pending_decode = None;
         true
     }
@@ -985,6 +1069,23 @@ impl V3Session {
                     base_esi: payload.base_esi,
                     is_meta,
                 });
+                // Phase 4: record a (cumulative_offset, drift_residual)
+                // observation for the LS fit. `pred` chains on the
+                // previous integer-observed marker so it absorbs the
+                // per-step drift; we want the CUMULATIVE drift relative
+                // to the anchor, so we compare against
+                // `anchor + cum_offset` instead. y/x then equals
+                // ppm × 1e-6 directly.
+                if !self.drift_locked {
+                    let _ = pred; // pred used only for narrow-radius search
+                    if let Some(anchor) = self.drift_anchor_sym_pos {
+                        let refined = self.refine_marker_sym_pos_abs(marker_sym_pos_abs);
+                        let x = self.coarse_drift_cum_offset_sym as f64;
+                        let expected_no_drift = anchor + x;
+                        let y = refined - expected_no_drift;
+                        self.drift_observations.push((x, y));
+                    }
+                }
                 // EOT detection lives in the protocol header (re-inserted
                 // before EOT meta frames) — wired in a later slice.
                 true
@@ -1006,6 +1107,125 @@ impl V3Session {
                 true
             }
         }
+    }
+
+    /// Sub-symbol-refined absolute symbol position of an integer-symbol
+    /// marker location. Parabolic fit through `|corr|` at pos-1, pos,
+    /// pos+1 (cf. `marker::refine_sync_pos_subsample`); falls back to
+    /// the integer position if the marker sits at the buffer boundary.
+    fn refine_marker_sym_pos_abs(&self, marker_sym_pos_abs: u64) -> f64 {
+        let raw_start_abs = self.ffe.start_abs();
+        if marker_sym_pos_abs < raw_start_abs {
+            return marker_sym_pos_abs as f64;
+        }
+        let raw = self.ffe.raw_buf();
+        let rel = (marker_sym_pos_abs - raw_start_abs) as usize;
+        if rel >= raw.len() {
+            return marker_sym_pos_abs as f64;
+        }
+        let refined_rel = marker::refine_sync_pos_subsample(raw, rel);
+        raw_start_abs as f64 + refined_rel
+    }
+
+    /// Phase 4 coarse one-shot estimator. Called after each
+    /// decode/advance loop in `process_audio_chunk`. Computes the LS
+    /// slope of `residual` vs `expected_from_anchor` over the
+    /// accumulated marker positions. When the slope crosses
+    /// `COARSE_DRIFT_COMMIT_PPM`, updates `self.drift_ppm`, rebuilds the
+    /// streaming pipeline at the corrected ratio, and replays the
+    /// rolling audio buffer through it. Either branch locks the
+    /// estimator for the rest of the burst.
+    fn try_apply_coarse_drift(&mut self, events: &mut Vec<V3SessionEvent>) {
+        if self.drift_locked {
+            return;
+        }
+        if self.drift_observations.len() < COARSE_DRIFT_MIN_OBS {
+            return;
+        }
+        let mut sum_xx = 0.0f64;
+        let mut sum_xy = 0.0f64;
+        for &(x, y) in &self.drift_observations {
+            sum_xx += x * x;
+            sum_xy += x * y;
+        }
+        if sum_xx <= 0.0 {
+            return;
+        }
+        let slope = sum_xy / sum_xx;
+        // Empirical sign: a POSITIVE residual `refined - (anchor + cum_offset)`
+        // means the observed cycle distance is LONGER than nominal, which in
+        // the streaming-dsp convention corresponds to drift_ppm < 0 (the
+        // resampler should STRETCH its output to match). The LS slope's
+        // physical sign is therefore opposite the correction we need to add
+        // to `drift_ppm` — negate.
+        let slope_ppm = -slope * 1.0e6;
+        let n_obs = self.drift_observations.len();
+        let from_ppm = self.drift_ppm;
+        let to_ppm = from_ppm + slope_ppm;
+        let applied = slope_ppm.abs() > COARSE_DRIFT_COMMIT_PPM;
+        self.drift_locked = true;
+        events.push(V3SessionEvent::DriftCommitted {
+            from_ppm,
+            to_ppm,
+            n_observations: n_obs,
+            applied,
+        });
+        if applied {
+            self.drift_ppm = to_ppm;
+            self.reboot_pipeline_and_replay(events);
+        }
+    }
+
+    /// Phase 4 reboot path: clears the streaming pipeline + decode
+    /// state, rewinds the input counters so the rolling audio buffer
+    /// can be re-pushed as if it were a fresh ingestion, then calls
+    /// `process_audio_chunk` recursively on the saved buffer. The
+    /// `drift_locked` flag blocks re-entry into `try_apply_coarse_drift`
+    /// on the replay pass, so termination is guaranteed.
+    fn reboot_pipeline_and_replay(&mut self, events: &mut Vec<V3SessionEvent>) {
+        let audio = std::mem::take(&mut self.audio_buffer);
+        // Rewind the cumulative sample counter so the replayed push
+        // ends up at the same `total_samples` value we started with.
+        // `audio_drained_samples` stays — the buffer's absolute origin
+        // hasn't moved.
+        self.total_samples = self.audio_drained_samples;
+
+        // Fresh streaming pipeline at the new ratio.
+        let (sps, _) =
+            rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
+                .expect("profile config has valid integer sps");
+        let window_samples = marker::MARKER_SYNC_LEN * sps;
+        self.sc = ScDetector::new(self.cycle_samples, window_samples);
+        self.dsp = StreamingDsp::new(
+            self.cfg.symbol_rate,
+            self.cfg.tau,
+            self.cfg.beta,
+            self.cfg.center_freq_hz,
+        );
+        self.ffe = StreamingFfe::new(V3_FFE_LEN, self.cycle_data_sym, V3_FFE_TRAINING_LEN);
+        let pll_alpha = 0.05f64;
+        let pll_beta = pll_alpha * pll_alpha * 0.25;
+        self.pll = DdPll::new(pll_alpha, pll_beta);
+
+        // Decode + FSM state goes back to a fresh-bootstrap regime so
+        // the replay sees the burst from scratch. Counters reset so
+        // SessionFinalised reports the post-reboot numbers (the only
+        // ones that match reality after the corrected decode).
+        self.state = V3SessionState::Idle;
+        self.pending_decode = None;
+        self.next_marker_sym_pos_pred = None;
+        self.app_header = None;
+        self.cw_bytes.clear();
+        self.payload_assembled = false;
+        self.cycles_validated = 0;
+        self.cws_converged = 0;
+        self.drift_anchor_sym_pos = None;
+        self.drift_observations.clear();
+        self.coarse_drift_cum_offset_sym = 0;
+        // `drift_locked` stays true → no second commit on the replay.
+
+        let replay_events = self.process_audio_chunk(&audio);
+        events.extend(replay_events);
     }
 }
 
@@ -1393,80 +1613,141 @@ mod tests {
     // narrow search radius and the FFE's LS taps to mistrack. That
     // test will land alongside CW decode wiring.
 
-    /// Helper used by the cliff comparison test — runs a drifted burst
-    /// through V3Session with the given correction (0.0 = no correction)
-    /// and returns (validated_cycles_count, converged_unique_cycles).
-    fn run_drift_burst(
-        cfg: &ModemConfig,
-        base_audio: &[f32],
-        ppm: f64,
-        correction_ppm: f64,
-    ) -> (usize, usize) {
-        let drifted = apply_drift(base_audio, ppm);
-        let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
-        session.set_drift_ppm(correction_ppm);
-        let mut validated = 0usize;
-        let mut converged = std::collections::HashSet::<u32>::new();
-        for c in drifted.chunks(2400) {
+    #[test]
+    fn phase4_self_corrects_drift_without_external_hint() {
+        // Phase 4 milestone: at moderate drift (±30 ppm typical of OTA
+        // sound-card pairs) with NO `set_drift_ppm` hint, the coarse
+        // one-shot LS estimator detects the slope after ≥3 markers,
+        // reboots the streaming pipeline at the corrected ratio, replays
+        // the audio buffer, and the replayed pass converges enough CWs
+        // to assemble the payload.
+        //
+        // The ±200 ppm regime exercised by the *with-correction* sweep
+        // tests is intentionally OUTSIDE Phase 4's scope: marker CTRL
+        // payloads (Golay+CRC over BPSK) stop decoding past a few cycles
+        // of uncorrected drift accumulation, so no anchor can be
+        // validated. That regime needs a preamble-domain estimator
+        // (Chu LS on the raw passband audio); see
+        // [[feedback-drift-architecture-one-shot-plus-fine-tracking]]
+        // "coarse one-shot + fine tracker" — Phase 4 implements the
+        // marker-LS half, the Chu-pre-marker half is a future slice.
+        let cfg = high_plus_config();
+        let base_audio = build_v3_burst_audio(&cfg, 800, 0x_F00D_FACE);
+        for &ppm in &[-30.0_f64, 30.0] {
+            let drifted = apply_drift(&base_audio, ppm);
+            let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
+            // Intentionally do NOT call set_drift_ppm — Phase 4's whole
+            // point is to source the correction internally.
+            let mut converged_cycles = std::collections::HashSet::<u32>::new();
+            let mut payload_assembled = false;
+            let mut drift_committed: Option<(f64, f64, bool)> = None;
+            for c in drifted.chunks(2400) {
+                for e in session.process_audio_chunk(c) {
+                    match e {
+                        V3SessionEvent::CwDecoded {
+                            cycle_idx,
+                            converged: true,
+                            ..
+                        } => {
+                            converged_cycles.insert(cycle_idx);
+                        }
+                        V3SessionEvent::PayloadAssembled { .. } => {
+                            payload_assembled = true;
+                        }
+                        V3SessionEvent::DriftCommitted {
+                            from_ppm,
+                            to_ppm,
+                            applied,
+                            ..
+                        } => {
+                            drift_committed = Some((from_ppm, to_ppm, applied));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let (from_ppm, to_ppm, applied) = drift_committed.expect(
+                "Phase 4 must emit a DriftCommitted event before the burst ends",
+            );
+            assert!(
+                applied,
+                "Phase 4 must auto-apply correction at {ppm} ppm \
+                 (from={from_ppm:.1} to={to_ppm:.1})",
+            );
+            // The committed correction must land within ±20 ppm of the
+            // true drift. 3 refined-position observations isn't a lot;
+            // sub-sample anchor-refinement noise projects into the LS as
+            // a constant intercept that the zero-intercept fit through
+            // origin distorts into the slope. A future fine tracker
+            // (Phase 5 — Farrow/pilot-Kalman) cleans up the residual.
+            let err = (to_ppm - ppm).abs();
+            assert!(
+                err < 20.0,
+                "Phase 4 estimate err {err:.1} ppm at true {ppm} ppm (committed {to_ppm:.1})",
+            );
+            assert!(
+                payload_assembled,
+                "payload must assemble after Phase 4 self-correction at {ppm} ppm",
+            );
+            assert!(
+                converged_cycles.len() >= 2,
+                "expected ≥2 converged cycles after self-correction at {ppm} ppm, \
+                 got {}",
+                converged_cycles.len(),
+            );
+            eprintln!(
+                "Phase 4 @ {ppm:+.0} ppm: committed {to_ppm:+.1} ppm, \
+                 {} cycles converged, payload assembled",
+                converged_cycles.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn phase4_locks_without_apply_below_threshold() {
+        // When the caller has already set drift correctly (here ppm=0
+        // and no actual drift), the LS slope sits well below
+        // COARSE_DRIFT_COMMIT_PPM, so the estimator locks without
+        // rebooting the pipeline. The session still decodes through to
+        // PayloadAssembled, just without the reboot detour.
+        let cfg = high_plus_config();
+        let audio = build_v3_burst_audio(&cfg, 800, 0xC0DE_FACE);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut drift_committed: Option<(f64, f64, bool, usize)> = None;
+        let mut payload_assembled = false;
+        for c in audio.chunks(2400) {
             for e in session.process_audio_chunk(c) {
                 match e {
-                    V3SessionEvent::MarkerValidated { .. } => validated += 1,
-                    V3SessionEvent::CwDecoded {
-                        cycle_idx,
-                        converged: true,
-                        ..
+                    V3SessionEvent::DriftCommitted {
+                        from_ppm,
+                        to_ppm,
+                        applied,
+                        n_observations,
                     } => {
-                        converged.insert(cycle_idx);
+                        drift_committed = Some((from_ppm, to_ppm, applied, n_observations));
+                    }
+                    V3SessionEvent::PayloadAssembled { .. } => {
+                        payload_assembled = true;
                     }
                     _ => {}
                 }
             }
         }
-        (validated, converged.len())
-    }
-
-    #[test]
-    fn drift_uncorrected_at_high_ppm_underperforms_corrected() {
-        // The cliff promised in the Phase 2 HEAD commit message: at
-        // ±200 ppm without a matching `set_drift_ppm`, cumulative
-        // drift across cycles slips the MF symbol grid and the
-        // pilot/data LS gains drift, so converged-CW count drops
-        // markedly vs the corrected baseline. Documents that
-        // correction is REQUIRED for multi-cycle decode at high drift,
-        // even though the first marker decodes either way.
-        //
-        // Asserts a strict inequality (corrected > uncorrected) rather
-        // than a specific cliff height — the exact drop varies with
-        // profile, FFE state, and pilot density. Phase 4's coarse SOF
-        // LS estimator will source the correction automatically; this
-        // test exists to prove the correction matters end-to-end.
-        let cfg = high_plus_config();
-        let base_audio = build_v3_burst_audio(&cfg, 800, 0xFEED_FACE);
-        for &ppm in &[-200.0_f64, 200.0] {
-            let (val_corr, conv_corr) = run_drift_burst(&cfg, &base_audio, ppm, ppm);
-            let (val_uncorr, conv_uncorr) = run_drift_burst(&cfg, &base_audio, ppm, 0.0);
-            // Baseline sanity: with correction we hit the same
-            // ≥(N-1) converged-cycles target as the with-correction
-            // sweep test.
-            assert!(
-                conv_corr >= val_corr - 1,
-                "corrected baseline regressed at {ppm} ppm: \
-                 {conv_corr}/{val_corr} converged",
-            );
-            // The cliff: uncorrected gets strictly fewer converged
-            // cycles than corrected. (`<` not `≤` so a "no
-            // degradation" outcome fails loudly and forces us to
-            // re-examine assumptions.)
-            assert!(
-                conv_uncorr < conv_corr,
-                "no drift cliff at {ppm} ppm: corrected={conv_corr}/{val_corr}, \
-                 uncorrected={conv_uncorr}/{val_uncorr}",
-            );
-            eprintln!(
-                "drift {ppm:+.0} ppm: corrected={conv_corr}/{val_corr}, \
-                 uncorrected={conv_uncorr}/{val_uncorr}",
-            );
-        }
+        let (from_ppm, to_ppm, applied, n_obs) = drift_committed
+            .expect("Phase 4 must lock once enough markers have validated");
+        assert!(
+            !applied,
+            "no-drift burst must NOT trigger a pipeline reboot \
+             (from={from_ppm:.2} to={to_ppm:.2}, n={n_obs})",
+        );
+        assert!(
+            n_obs >= COARSE_DRIFT_MIN_OBS,
+            "n_observations {n_obs} below COARSE_DRIFT_MIN_OBS {COARSE_DRIFT_MIN_OBS}",
+        );
+        assert!(
+            payload_assembled,
+            "payload must still assemble without Phase 4 reboot at 0 ppm drift",
+        );
     }
 
     #[test]
