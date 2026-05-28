@@ -36,9 +36,12 @@
 //!
 //! Phase 3 wires PLS/Header validation: when SC fires + a marker probe
 //! on the FFE'd sym_buffer at the SC-located position succeeds, the
-//! FSM promotes to `Locked` and CW decode begins.
+//! FSM promotes to `Locked` and CW decode begins. Phase 3b layers
+//! AppHeader recovery + RaptorQ assembly on top of the per-CW decode,
+//! emitting `AppHeaderRecovered` / `PayloadAssembled` as soon as the
+//! fountain converges.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::constellation::Constellation;
 use crate::frame::{self, V2_CODEWORDS_PER_SEGMENT};
@@ -54,6 +57,8 @@ use crate::types::AUDIO_RATE;
 use modem_core_base::streaming_dsp::StreamingDsp;
 use modem_core_base::streaming_ffe::StreamingFfe;
 use modem_core_base::types::Complex64;
+use modem_framing::app_header::{decode_meta_payload, AppHeader};
+use modem_framing::raptorq_codec;
 
 /// Schmidl-Cox metric threshold for accepting a marker-pair lock.
 /// 0.5 floor recipe inherited from feat/modem-2x preamble Phase 3
@@ -155,7 +160,36 @@ pub enum V3SessionEvent {
         bytes: Vec<u8>,
         sigma2: f64,
     },
-    // Phase 3b+: PayloadAssembled, SessionFinalised.
+    /// A META codeword decoded and its 4-copy redundant payload yielded a
+    /// CRC-valid AppHeader. Fires at most once per session (first valid
+    /// recovery wins; subsequent META decodes are ignored).
+    AppHeaderRecovered {
+        session_id: u32,
+        file_size: u32,
+        k_symbols: u16,
+        t_bytes: u8,
+        mode_code: u8,
+        mime_type: u8,
+        hash_short: u16,
+    },
+    /// RaptorQ fountain converged: enough unique-ESI data CWs collected
+    /// to recover the full payload. Fires at most once per session.
+    /// `bytes` length is `file_size` (RaptorQ-internal padding stripped).
+    PayloadAssembled {
+        session_id: u32,
+        file_size: u32,
+        mime_type: u8,
+        hash_short: u16,
+        bytes: Vec<u8>,
+    },
+    /// `finalize()` was called from a non-Idle state. Carries the burst-
+    /// scoped counters so the caller can log a one-line summary without
+    /// having to count events itself.
+    SessionFinalised {
+        cycles_validated: u32,
+        cws_converged: u32,
+        payload_assembled: bool,
+    },
 }
 
 pub struct V3Session {
@@ -209,6 +243,24 @@ pub struct V3Session {
     /// (validated or failed) by `try_advance_to_next_marker`. None while
     /// the FSM is Idle / Acquiring.
     next_marker_sym_pos_pred: Option<u64>,
+    // ---- Phase 3b: AppHeader recovery + RaptorQ assembly ------------
+    /// First CRC-valid AppHeader decoded from a META codeword. None
+    /// until a META CW converges AND its 4-copy redundant payload
+    /// passes CRC.
+    app_header: Option<AppHeader>,
+    /// Map ESI → converged data-CW info bytes, fed to the RaptorQ
+    /// fountain decoder once we have ≥ k_symbols unique entries.
+    /// META CW bytes are NOT inserted here (they carry the header,
+    /// not a fountain packet).
+    cw_bytes: HashMap<u32, Vec<u8>>,
+    /// Set once the fountain decoder yields a full payload — guards
+    /// against re-attempting the (expensive) RaptorQ decode on every
+    /// subsequent CW.
+    payload_assembled: bool,
+    /// Burst-scoped counters reported by `SessionFinalised`. Reset on
+    /// each `finalize()` so a recycled `V3Session` starts fresh.
+    cycles_validated: u32,
+    cws_converged: u32,
 }
 
 /// Bookkeeping for a cycle whose marker has been validated but whose
@@ -269,6 +321,11 @@ impl V3Session {
             deinterleave_perm,
             pending_decode: None,
             next_marker_sym_pos_pred: None,
+            app_header: None,
+            cw_bytes: HashMap::new(),
+            payload_assembled: false,
+            cycles_validated: 0,
+            cws_converged: 0,
         }
     }
 
@@ -400,14 +457,31 @@ impl V3Session {
     }
 
     pub fn finalize(&mut self) -> Vec<V3SessionEvent> {
-        let events = Vec::new();
-        if matches!(
+        let mut events = Vec::new();
+        let was_active = matches!(
             self.state,
-            V3SessionState::Locked { .. } | V3SessionState::Acquiring { .. }
-        ) {
-            self.state = V3SessionState::Finalising;
+            V3SessionState::Locked { .. }
+                | V3SessionState::Acquiring { .. }
+                | V3SessionState::Finalising,
+        );
+        if was_active {
+            events.push(V3SessionEvent::SessionFinalised {
+                cycles_validated: self.cycles_validated,
+                cws_converged: self.cws_converged,
+                payload_assembled: self.payload_assembled,
+            });
         }
+        // Reset burst-scoped state so a recycled `V3Session` instance
+        // can decode the next burst without leaking stale ESI bytes /
+        // header / counters.
         self.state = V3SessionState::Idle;
+        self.pending_decode = None;
+        self.next_marker_sym_pos_pred = None;
+        self.app_header = None;
+        self.cw_bytes.clear();
+        self.payload_assembled = false;
+        self.cycles_validated = 0;
+        self.cws_converged = 0;
         events
     }
 
@@ -434,42 +508,130 @@ impl V3Session {
         // `MarkerValidated`; otherwise we record the candidate in
         // `Acquiring` so the next chunk can retry as more symbols
         // arrive (or a later SC fire on the same burst overrides).
-        if let Some((marker_sym_pos_abs, payload)) =
-            self.try_validate_marker_at(marker_at_abs)
-        {
-            // First validated marker of the burst — always cycle_idx 0.
-            let cycle_idx = 0u32;
-            let is_meta = payload.is_meta();
-            events.push(V3SessionEvent::MarkerValidated {
-                marker_at_abs,
-                marker_sym_pos_abs,
-                cycle_idx,
-                seg_id: payload.seg_id,
-                session_id_low: payload.session_id_low,
-                base_esi: payload.base_esi,
-                is_meta,
-            });
-            self.state = V3SessionState::Locked {
-                cycle_idx,
-                anchor_marker_abs: marker_at_abs,
-            };
-            // Queue the cycle for CW decode. `try_decode_pending_cycle`
-            // runs at the end of every `process_audio_chunk` and consumes
-            // this once the equalised sym_buffer covers the full segment.
-            self.pending_decode = Some(PendingDecode {
-                marker_sym_pos_abs,
-                cycle_idx,
-                base_esi: payload.base_esi,
-                is_meta,
-            });
+        let Some((marker_sym_pos_abs, payload)) = self.try_validate_marker_at(marker_at_abs)
+        else {
+            if matches!(self.state, V3SessionState::Idle) {
+                self.state = V3SessionState::Acquiring {
+                    marker_at_abs,
+                    sc_metric: metric,
+                };
+            }
             return;
+        };
+        // The SC pair detector only fires on (DATA, DATA) pairs (META
+        // and DATA cycles have different periods), so the bootstrap
+        // normally lands on a DATA marker even though every V3 burst
+        // starts with a META segment carrying the AppHeader. Probe
+        // exactly one META-cycle backward to recover the header before
+        // promoting the FSM. If META is found and validates, it
+        // becomes cycle_idx 0 and the SC-located DATA marker becomes
+        // cycle_idx 1 (validated lazily by `try_advance_to_next_marker`
+        // once we transition out of the META cycle).
+        if !payload.is_meta() {
+            if let Some((meta_sym_pos, meta_payload)) =
+                self.try_validate_meta_lookback(marker_sym_pos_abs)
+            {
+                let (sps, _) = rrc::check_integer_constraints(
+                    AUDIO_RATE,
+                    self.cfg.symbol_rate,
+                    self.cfg.tau,
+                )
+                .expect("profile config has valid integer sps");
+                let meta_at_abs = meta_sym_pos * sps as u64;
+                events.push(V3SessionEvent::MarkerValidated {
+                    marker_at_abs: meta_at_abs,
+                    marker_sym_pos_abs: meta_sym_pos,
+                    cycle_idx: 0,
+                    seg_id: meta_payload.seg_id,
+                    session_id_low: meta_payload.session_id_low,
+                    base_esi: meta_payload.base_esi,
+                    is_meta: true,
+                });
+                self.cycles_validated = self.cycles_validated.saturating_add(1);
+                self.state = V3SessionState::Locked {
+                    cycle_idx: 0,
+                    anchor_marker_abs: meta_at_abs,
+                };
+                self.pending_decode = Some(PendingDecode {
+                    marker_sym_pos_abs: meta_sym_pos,
+                    cycle_idx: 0,
+                    base_esi: meta_payload.base_esi,
+                    is_meta: true,
+                });
+                // `try_decode_pending_cycle` will compute
+                // `next_marker_sym_pos_pred` = data_marker_sym_pos
+                // from the META cycle length, so the SC-located DATA
+                // marker is the next one `try_advance_to_next_marker`
+                // attempts. No need to set the prediction here.
+                return;
+            }
         }
-        if matches!(self.state, V3SessionState::Idle) {
-            self.state = V3SessionState::Acquiring {
-                marker_at_abs,
-                sc_metric: metric,
-            };
+        // META not found (or SC landed on META directly) — promote the
+        // validated marker as cycle 0.
+        let cycle_idx = 0u32;
+        let is_meta = payload.is_meta();
+        events.push(V3SessionEvent::MarkerValidated {
+            marker_at_abs,
+            marker_sym_pos_abs,
+            cycle_idx,
+            seg_id: payload.seg_id,
+            session_id_low: payload.session_id_low,
+            base_esi: payload.base_esi,
+            is_meta,
+        });
+        self.cycles_validated = self.cycles_validated.saturating_add(1);
+        self.state = V3SessionState::Locked {
+            cycle_idx,
+            anchor_marker_abs: marker_at_abs,
+        };
+        self.pending_decode = Some(PendingDecode {
+            marker_sym_pos_abs,
+            cycle_idx,
+            base_esi: payload.base_esi,
+            is_meta,
+        });
+    }
+
+    /// Probe one META cycle backward of a validated DATA marker, looking
+    /// for the META segment that carries the AppHeader. Search radius is
+    /// narrow (±MARKER_SYNC_LEN) since we know the exact expected position
+    /// — anything wider risks picking up a stray DATA marker. Returns
+    /// `Some((sym_pos, payload))` only if Golay+CRC validates AND the
+    /// payload's META flag is set (false-positive guard against landing
+    /// on a previous DATA marker in a multi-burst capture).
+    fn try_validate_meta_lookback(
+        &self,
+        data_marker_sym_pos: u64,
+    ) -> Option<(u64, marker::MarkerPayload)> {
+        let meta_cycle_len =
+            marker::MARKER_LEN as u64 + self.seg_sym_len_past_marker(true) as u64;
+        let pred = data_marker_sym_pos.checked_sub(meta_cycle_len)?;
+        let radius = marker::MARKER_SYNC_LEN as u64;
+        let raw_start_abs = self.ffe.start_abs();
+        if pred < raw_start_abs.saturating_add(radius) {
+            return None;
         }
+        let window_start_abs = pred - radius;
+        let window_end_abs = pred + radius + marker::MARKER_LEN as u64;
+        let raw = self.ffe.raw_buf();
+        if window_end_abs > raw_start_abs + raw.len() as u64 {
+            return None;
+        }
+        let start_rel = (window_start_abs - raw_start_abs) as usize;
+        let total_len = (window_end_abs - window_start_abs) as usize;
+        let search_len = total_len.saturating_sub(marker::MARKER_LEN);
+        if search_len == 0 {
+            return None;
+        }
+        let (pos, _) = marker::find_sync_in_window(raw, start_rel, search_len, 0.5)?;
+        if pos + marker::MARKER_LEN > raw.len() {
+            return None;
+        }
+        let payload = marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])?;
+        if !payload.is_meta() {
+            return None;
+        }
+        Some((raw_start_abs + pos as u64, payload))
     }
 
     /// Search the FFE's raw symbol buffer around the SC-located audio
@@ -651,6 +813,32 @@ impl V3Session {
             // walk V2_CODEWORDS_PER_SEGMENT consecutive ESIs starting at
             // base_esi (matches rx_v2_single's per-marker indexing).
             let esi = pending.base_esi + cw_idx as u32;
+            // Phase 3b: feed assembly state BEFORE moving `bytes` into
+            // the CwDecoded event so we don't have to double-clone.
+            // META: try to recover the AppHeader (first valid copy wins).
+            // DATA: insert into ESI map for RaptorQ — only converged
+            //       CWs go in, mirroring rx_v2.rs:1503-1516.
+            if converged {
+                self.cws_converged = self.cws_converged.saturating_add(1);
+                if pending.is_meta {
+                    if self.app_header.is_none() {
+                        if let Some(h) = decode_meta_payload(&bytes) {
+                            events.push(V3SessionEvent::AppHeaderRecovered {
+                                session_id: h.session_id,
+                                file_size: h.file_size,
+                                k_symbols: h.k_symbols,
+                                t_bytes: h.t_bytes,
+                                mode_code: h.mode_code,
+                                mime_type: h.mime_type,
+                                hash_short: h.hash_short,
+                            });
+                            self.app_header = Some(h);
+                        }
+                    }
+                } else {
+                    self.cw_bytes.insert(esi, bytes.clone());
+                }
+            }
             events.push(V3SessionEvent::CwDecoded {
                 cycle_idx: pending.cycle_idx,
                 cw_idx,
@@ -660,6 +848,31 @@ impl V3Session {
                 bytes,
                 sigma2,
             });
+        }
+        // Phase 3b: once the header is known and we've accumulated
+        // ≥ k_symbols unique data CWs, try the fountain decode. The
+        // raptorq Decoder rebuilds itself on each call (O(N) feed), so
+        // gating on the K threshold avoids work that can't possibly
+        // succeed yet. `payload_assembled` is a one-shot guard.
+        if !self.payload_assembled {
+            if let Some(h) = self.app_header.clone() {
+                if self.cw_bytes.len() >= h.k_symbols as usize {
+                    if let Some(payload) = raptorq_codec::try_decode(
+                        &self.cw_bytes,
+                        h.file_size,
+                        h.t_bytes as u16,
+                    ) {
+                        events.push(V3SessionEvent::PayloadAssembled {
+                            session_id: h.session_id,
+                            file_size: h.file_size,
+                            mime_type: h.mime_type,
+                            hash_short: h.hash_short,
+                            bytes: payload,
+                        });
+                        self.payload_assembled = true;
+                    }
+                }
+            }
         }
         // Predict the next marker position. Spacing is
         // MARKER_LEN + seg_sym_len(this cycle's is_meta) symbols after
@@ -761,6 +974,7 @@ impl V3Session {
                     base_esi: payload.base_esi,
                     is_meta,
                 });
+                self.cycles_validated = self.cycles_validated.saturating_add(1);
                 self.state = V3SessionState::Locked {
                     cycle_idx,
                     anchor_marker_abs: marker_at_abs,
@@ -772,8 +986,7 @@ impl V3Session {
                     is_meta,
                 });
                 // EOT detection lives in the protocol header (re-inserted
-                // before EOT meta frames) — wired in Phase 3d alongside
-                // AppHeader + RaptorQ assembly.
+                // before EOT meta frames) — wired in a later slice.
                 true
             }
             None => {
@@ -1435,6 +1648,90 @@ mod tests {
         // mid-burst. We allow it but don't require it (the burst may
         // simply run out of samples first).
         let _ = session_lost;
+    }
+
+    #[test]
+    fn clean_v3_burst_assembles_payload() {
+        // Phase 3b milestone: the META cycle yields an AppHeader, then
+        // accumulated data CWs feed the RaptorQ fountain until the full
+        // payload comes back out. `build_v3_burst_audio` always packs
+        // `[0xAA; payload_bytes]`, so the recovered bytes must match
+        // exactly (RaptorQ-internal padding is stripped to `file_size`).
+        let cfg = high_plus_config();
+        let payload_size = 800usize;
+        let session_id = 0xAB12_3456u32;
+        let audio = build_v3_burst_audio(&cfg, payload_size, session_id);
+        let expected = vec![0xAA_u8; payload_size];
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut header_file_size: Option<u32> = None;
+        let mut header_session_id: Option<u32> = None;
+        let mut assembled: Option<Vec<u8>> = None;
+        let mut assembled_file_size: Option<u32> = None;
+        let mut assembled_session_id: Option<u32> = None;
+        for c in audio.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                match e {
+                    V3SessionEvent::AppHeaderRecovered {
+                        file_size,
+                        session_id,
+                        ..
+                    } => {
+                        header_file_size.get_or_insert(file_size);
+                        header_session_id.get_or_insert(session_id);
+                    }
+                    V3SessionEvent::PayloadAssembled {
+                        bytes,
+                        file_size,
+                        session_id,
+                        ..
+                    } => {
+                        assembled = Some(bytes);
+                        assembled_file_size = Some(file_size);
+                        assembled_session_id = Some(session_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(header_file_size, Some(payload_size as u32));
+        assert_eq!(header_session_id, Some(session_id));
+        assert_eq!(assembled_file_size, Some(payload_size as u32));
+        assert_eq!(assembled_session_id, Some(session_id));
+        let bytes = assembled.expect("PayloadAssembled never fired");
+        assert_eq!(bytes.len(), payload_size);
+        assert_eq!(bytes, expected, "assembled payload mismatch");
+    }
+
+    #[test]
+    fn finalize_after_assembly_reports_counters() {
+        // SessionFinalised carries the burst-scoped counters so callers
+        // can log a one-line summary without counting events themselves.
+        // Sanity-check that all three fields are populated coherently.
+        let cfg = high_plus_config();
+        let audio = build_v3_burst_audio(&cfg, 800, 0xBEEF_BABE);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        for c in audio.chunks(2400) {
+            let _ = session.process_audio_chunk(c);
+        }
+        let events = session.finalize();
+        let summary = events.iter().find_map(|e| {
+            if let V3SessionEvent::SessionFinalised {
+                cycles_validated,
+                cws_converged,
+                payload_assembled,
+            } = e
+            {
+                Some((*cycles_validated, *cws_converged, *payload_assembled))
+            } else {
+                None
+            }
+        });
+        let (cv, cc, pa) =
+            summary.expect("SessionFinalised not emitted by finalize() on active burst");
+        assert!(cv >= 3, "expected ≥3 cycles validated, got {cv}");
+        assert!(cc >= 2, "expected ≥2 CWs converged, got {cc}");
+        assert!(pa, "expected payload_assembled=true after full burst");
+        assert!(matches!(session.state(), V3SessionState::Idle));
     }
 
     #[test]
