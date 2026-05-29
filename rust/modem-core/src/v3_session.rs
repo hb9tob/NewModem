@@ -139,6 +139,18 @@ pub const COARSE_DRIFT_MIN_OBS: usize = 3;
 /// streaming pipeline at the corrected ratio and replays the audio.
 pub const COARSE_DRIFT_COMMIT_PPM: f64 = 5.0;
 
+/// Per-cycle timing-poursuite integral gain. After the coarse grid locks
+/// the bulk drift, each validated marker's residual timing error (refined
+/// observed − predicted, in symbols) is converted to a ppm slip over the
+/// cycle and integrated into `drift_ppm` at this gain. `StreamingDsp`
+/// applies the updated `drift_ppm` to NEW output only (no rebuild), so the
+/// polyphase resampler tracks the residual drift continuously across the
+/// burst — the fine half of the coarse-one-shot + fine-tracking architecture
+/// ([[feedback-drift-architecture-one-shot-plus-fine-tracking]]). Slow
+/// (≪1) so per-cycle marker-position noise averages out instead of being
+/// chased. Disable with env `V3_NO_POURSUITE` for A/B.
+const POURSUITE_KI: f64 = 0.30;
+
 /// Cycle period in symbols: one marker + 2 codewords with TDM pilots.
 /// Matches the periodic data-segment spacing inside a V3 superframe
 /// (see `build_superframe_v3_range` in `frame.rs`).
@@ -679,6 +691,23 @@ impl V3Session {
             let drop = self.audio_buffer.len() - retain;
             self.audio_buffer.drain(..drop);
             self.audio_drained_samples += drop as u64;
+        }
+
+        if std::env::var_os("V3_LOG_CHUNK").is_some() {
+            let st = match &self.state {
+                V3SessionState::Idle => "Idle".to_string(),
+                V3SessionState::Acquiring { .. } => "Acq".to_string(),
+                V3SessionState::Locked { cycle_idx, .. } => format!("Lk{cycle_idx}"),
+                V3SessionState::Finalising => "Fin".to_string(),
+            };
+            eprintln!(
+                "[chunk] tot={} state={st} drift={:.2} ffe_start={} out_len={} raw_len={} \
+                 pend={} pred={:?} aud_buf={} aud_drain={}",
+                self.total_samples, self.drift_ppm, self.ffe.start_abs(),
+                self.ffe.out_buf().len(), self.ffe.raw_buf().len(),
+                self.pending_decode.is_some(), self.next_marker_sym_pos_pred,
+                self.audio_buffer.len(), self.audio_drained_samples,
+            );
         }
 
         events
@@ -1257,6 +1286,14 @@ impl V3Session {
         } else {
             cycle_step_sym
         };
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[sync] predict from={marker_pos_abs} this_meta={this_is_meta} \
+                 elapsed={} period={} boundary_due={boundary_due} next_pred={} next_meta={boundary_due}",
+                self.elapsed_since_preamble_sym, self.superframe_period_sym,
+                marker_pos_abs + advance_sym,
+            );
+        }
         // Phase 4: advance the cumulative no-drift offset by the SAME amount
         // (incl. the PRE+HDR at a boundary) so the next observation lines up
         // against `anchor + cum_offset`.
@@ -1307,20 +1344,47 @@ impl V3Session {
             return true;
         }
 
-        let raw = self.ffe.raw_buf();
-        let start_rel = (window_start_abs - raw_start_abs) as usize;
-        let total_len = (window_end_abs - window_start_abs) as usize;
-        let search_len = total_len.saturating_sub(marker::MARKER_LEN);
-        let validated = if search_len > 0 {
-            marker::find_sync_in_window(raw, start_rel, search_len, 0.5).and_then(
-                |(pos, _)| {
-                    marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])
-                        .map(|payload| (pos, payload))
-                },
-            )
-        } else {
-            None
+        let search_window = |raw: &[Complex64], start_abs: u64, end_abs: u64| {
+            let start_rel = (start_abs - raw_start_abs) as usize;
+            let len = (end_abs - start_abs) as usize;
+            let search_len = len.saturating_sub(marker::MARKER_LEN);
+            if search_len == 0 {
+                return None;
+            }
+            marker::find_sync_in_window(raw, start_rel, search_len, 0.5).and_then(|(pos, _)| {
+                marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])
+                    .map(|payload| (pos, payload))
+            })
         };
+        let mut validated = search_window(self.ffe.raw_buf(), window_start_abs, window_end_abs);
+
+        // Boundary-offset fallback. If the normal prediction missed, a
+        // re-inserted PRE+HDR+META may sit `superframe_header_offset_sym`
+        // further out: our `elapsed` counter mispredicted the superframe
+        // boundary (e.g. a drift-reboot re-bootstrap landed on a DATA marker,
+        // so the counter is offset from the TX superframe phase → it predicts
+        // a normal marker where the TX actually inserted the boundary). One
+        // targeted Golay-gated search there (NOT a wide scan) — a hit IS the
+        // boundary META, and committing it resyncs `elapsed` (is_meta=true →
+        // the next `advance_prediction` resets the counter), ending the churn.
+        if validated.is_none() {
+            let b_pred = pred + self.superframe_header_offset_sym;
+            let b_start = b_pred.saturating_sub(radius);
+            let b_end = b_pred + radius + marker::MARKER_LEN as u64;
+            if b_end > raw_end_abs {
+                // Boundary window not fully arrived — wait before ruling the
+                // miss in or out, so we never escalate prematurely AT a
+                // boundary. (True end-of-burst then waits → the worker
+                // no-progress timer / EOT silence-gate finalizes.)
+                return false;
+            }
+            if b_start >= raw_start_abs {
+                validated = search_window(self.ffe.raw_buf(), b_start, b_end);
+                if validated.is_some() && std::env::var_os("V3_LOG_SYNC").is_some() {
+                    eprintln!("[sync] boundary-fallback HIT at b_pred={b_pred} (normal pred={pred})");
+                }
+            }
+        }
 
         match validated {
             Some((pos, payload)) => {
@@ -1338,6 +1402,13 @@ impl V3Session {
                     _ => 0,
                 };
                 let is_meta = payload.is_meta();
+                if std::env::var_os("V3_LOG_SYNC").is_some() {
+                    eprintln!(
+                        "[sync] OK cycle={cycle_idx} is_meta={is_meta} pred={pred} \
+                         obs={marker_sym_pos_abs} err={}",
+                        marker_sym_pos_abs as i64 - pred as i64,
+                    );
+                }
                 // Audio-domain marker position approximated from sym
                 // position so the event payload stays consistent with
                 // the SC-bootstrap path. Not used for further decoding,
@@ -1386,11 +1457,39 @@ impl V3Session {
                         self.drift_observations.push((x, y));
                     }
                 }
+                // Per-cycle timing poursuite (fine tracking). Once the coarse
+                // grid has locked the bulk drift, integrate each marker's
+                // residual timing error into `drift_ppm` so the resampler
+                // tracks the leftover drift across the burst (the one-shot
+                // grid alone leaves a few-ppm residual that slides the symbol
+                // sampling over 28 s → sync loss). The resampler applies the
+                // updated ratio to new output only — no rebuild.
+                // GATED OFF by default (set env `V3_POURSUITE` to enable): the
+                // v1 integral loop DIVERGES (σ² blows up at ±30, regresses
+                // 0 ppm) — wrong sign / too-high Ki / symbol-rate TED too
+                // noisy. Needs a focused tuning pass: sign, Ki, and a 48 kHz
+                // sub-symbol marker TED (parabolic on the oversampled SYNC
+                // correlation) before it can be trusted on by default.
+                if self.drift_locked && std::env::var_os("V3_POURSUITE").is_some() {
+                    let refined = self.refine_marker_sym_pos_abs(marker_sym_pos_abs);
+                    // Slip of the OBSERVED marker vs the PREDICTED position,
+                    // accumulated over one cycle of `cycle_data_sym` symbols.
+                    let err_sym = refined - pred as f64;
+                    let delta_ppm = err_sym / self.cycle_data_sym as f64 * 1.0e6;
+                    self.drift_ppm =
+                        (self.drift_ppm + POURSUITE_KI * delta_ppm).clamp(-300.0, 300.0);
+                }
                 // EOT detection lives in the protocol header (re-inserted
                 // before EOT meta frames) — wired in a later slice.
                 true
             }
             None => {
+                if std::env::var_os("V3_LOG_SYNC").is_some() {
+                    eprintln!(
+                        "[sync] MISS pred={pred} next_meta={} consec={} raw_end={raw_end_abs}",
+                        self.next_marker_is_meta, self.consecutive_miss + 1,
+                    );
+                }
                 // The predicted marker's window is fully present but no
                 // Golay+CRC marker validated there. Two cases:
                 self.consecutive_miss += 1;
