@@ -188,6 +188,11 @@ fn rx(args: &[String]) {
                 V3SessionEvent::SessionLost { reason } => {
                     first_lost.get_or_insert(reason);
                 }
+                V3SessionEvent::DriftCommitted { from_ppm, to_ppm, applied, n_observations } => {
+                    println!(
+                        "diag: DriftCommitted from={from_ppm:.2} to={to_ppm:.2} applied={applied} n_obs={n_observations}"
+                    );
+                }
                 _ => {}
             }
         }
@@ -230,16 +235,58 @@ fn rx(args: &[String]) {
     }
 }
 
+/// Probe the FFT preamble matched filter against a WAV: report the best
+/// (position, metric) — used to check whether acquisition can lock on the
+/// real (possibly channel-colored) signal before wiring it into V3Session.
+fn probe(args: &[String]) {
+    let wav = &args[0];
+    let cfg = ProfileIndex::HighPlus.to_config();
+    // Known preamble passband template (same as the TX emits).
+    let pre_syms = modem_core::preamble::make_preamble_for_config(&cfg);
+    let (sps, pitch) =
+        modem_core::rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+    let taps = modem_core::rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+    let template = modem_core::modulator::modulate(&pre_syms, sps, pitch, &taps, cfg.center_freq_hz);
+    let samples = read_wav(wav);
+
+    let win = 65_536usize;
+    let step = win - template.len() - 64; // ensure the preamble fits whole in some window
+    let mf = modem_core::fd_acquire::PreambleMatchedFilter::new(&template, win);
+    let (mut best_pos, mut best_m) = (0u64, 0.0f64);
+    let mut start = 0usize;
+    while start < samples.len() {
+        let end = (start + win).min(samples.len());
+        if end - start >= template.len() {
+            if let Some((lag, m)) = mf.best_match(&samples[start..end]) {
+                if m > best_m {
+                    best_m = m;
+                    best_pos = (start + lag) as u64;
+                }
+            }
+        }
+        if end == samples.len() {
+            break;
+        }
+        start += step;
+    }
+    println!(
+        "probe {wav}: template={} samples, best metric={best_m:.4} at sample {best_pos} ({:.2}s)",
+        template.len(),
+        best_pos as f64 / AUDIO_RATE as f64,
+    );
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 {
-        eprintln!("usage: turbo_sim <tx|rx> <wav> [bytes] [seed] [repair_pct(tx)]");
+        eprintln!("usage: turbo_sim <tx|rx|probe> <wav> [bytes] [seed] [repair_pct(tx)]");
         std::process::exit(64);
     }
     let rest = &argv[2..];
     match argv[1].as_str() {
         "tx" => tx(rest),
         "rx" => rx(rest),
+        "probe" => probe(rest),
         other => {
             eprintln!("unknown subcommand {other:?} (expected tx|rx)");
             std::process::exit(64);

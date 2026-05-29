@@ -269,6 +269,8 @@ def main():
                          "0=desactive)")
     ap.add_argument("--audio-noise", type=float, default=AUDIO_NOISE_RMS,
                     help=f"RMS bruit audio post-demod (defaut {AUDIO_NOISE_RMS})")
+    ap.add_argument("--post-lpf", type=float, default=POST_LPF,
+                    help=f"Coupure LPF audio RX (Hz, defaut {POST_LPF}, 0=desactive)")
     args = ap.parse_args()
 
     audio_in, sr = load_wav(args.input_wav)
@@ -278,6 +280,7 @@ def main():
 
     audio_out = simulate(audio_in, if_noise_voltage=args.if_noise,
                          sub_audio_hpf=args.hpf,
+                         post_lpf=args.post_lpf,
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,

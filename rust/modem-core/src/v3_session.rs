@@ -1459,27 +1459,29 @@ impl V3Session {
         if self.drift_observations.len() < COARSE_DRIFT_MIN_OBS {
             return;
         }
-        let mut sum_xx = 0.0f64;
-        let mut sum_xy = 0.0f64;
-        for &(x, y) in &self.drift_observations {
-            sum_xx += x * x;
-            sum_xy += x * y;
-        }
-        if sum_xx <= 0.0 {
-            return;
-        }
-        let slope = sum_xy / sum_xx;
-        // Empirical sign: a POSITIVE residual `refined - (anchor + cum_offset)`
-        // means the observed cycle distance is LONGER than nominal, which in
-        // the streaming-dsp convention corresponds to drift_ppm < 0 (the
-        // resampler should STRETCH its output to match). The LS slope's
-        // physical sign is therefore opposite the correction we need to add
-        // to `drift_ppm` — negate.
-        let slope_ppm = -slope * 1.0e6;
+        // Entry drift via the proven V3-normal grid (`estimate_drift_gardner`,
+        // the same estimator rx_worker feeds to rx_v2_with_hint), run ONCE on
+        // the buffered entry window. The marker-LS slope (3 short markers,
+        // symbol-rate parabolic) was too imprecise — it estimated a bogus
+        // −6 ppm on a true-0-drift channel and committing it ramped the
+        // phase (σ² 0.01→0.09, decode FAIL). The grid picks the drift that
+        // actually DECODES, so it's immune to position-precision noise:
+        // ~0 ppm at true 0, accurate at real drift. The accumulated
+        // `drift_observations` count (≥ COARSE_DRIFT_MIN_OBS, checked above)
+        // is just the "enough buffer present" proxy — preamble + a few
+        // markers are in `audio_buffer` for the grid to lock onto.
         let n_obs = self.drift_observations.len();
         let from_ppm = self.drift_ppm;
-        let to_ppm = from_ppm + slope_ppm;
-        let applied = slope_ppm.abs() > COARSE_DRIFT_COMMIT_PPM;
+        // `estimate_drift_gardner` measures the ABSOLUTE drift in the raw
+        // passband, so the new target IS that estimate — NOT `from_ppm +
+        // estimate` (which double-counts when a mid-burst re-acquire
+        // re-estimates the same raw audio: −30 → −61). Apply only when it
+        // changes the current ratio by more than the commit threshold.
+        let to_ppm = match rx_v2::estimate_drift_gardner(&self.audio_buffer, &self.cfg) {
+            Some(ppm) => ppm,
+            None => return, // not enough/clean buffer yet — retry next chunk
+        };
+        let applied = (to_ppm - from_ppm).abs() > COARSE_DRIFT_COMMIT_PPM;
         self.drift_locked = true;
         events.push(V3SessionEvent::DriftCommitted {
             from_ppm,
