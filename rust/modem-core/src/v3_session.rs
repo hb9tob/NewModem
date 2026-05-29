@@ -36,12 +36,13 @@
 //!
 //! Phase 3 wires PLS/Header validation: when SC fires + a marker probe
 //! on the FFE'd sym_buffer at the SC-located position succeeds, the
-//! FSM promotes to `Locked` and CW decode begins. Phase 3b layers
-//! AppHeader recovery + RaptorQ assembly on top of the per-CW decode,
-//! emitting `AppHeaderRecovered` / `PayloadAssembled` as soon as the
-//! fountain converges.
+//! FSM promotes to `Locked` and CW decode begins. AppHeader recovery is
+//! layered on top of the per-CW decode, emitting `AppHeaderRecovered`
+//! from the META segment. Fountain assembly (RaptorQ) is NOT done here:
+//! the modem emits `CwDecoded` per codeword and the worker accumulates by
+//! ESI + decodes — same contract `rx_v2` has with `session_store`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::constellation::Constellation;
 use crate::frame::{self, V2_CODEWORDS_PER_SEGMENT};
@@ -59,7 +60,6 @@ use modem_core_base::streaming_dsp::StreamingDsp;
 use modem_core_base::streaming_ffe::StreamingFfe;
 use modem_core_base::types::Complex64;
 use modem_framing::app_header::{decode_meta_payload, AppHeader};
-use modem_framing::raptorq_codec;
 
 /// Schmidl-Cox metric threshold for accepting a marker-pair lock.
 /// 0.5 floor recipe inherited from feat/modem-2x preamble Phase 3
@@ -223,23 +223,14 @@ pub enum V3SessionEvent {
         mime_type: u8,
         hash_short: u16,
     },
-    /// RaptorQ fountain converged: enough unique-ESI data CWs collected
-    /// to recover the full payload. Fires at most once per session.
-    /// `bytes` length is `file_size` (RaptorQ-internal padding stripped).
-    PayloadAssembled {
-        session_id: u32,
-        file_size: u32,
-        mime_type: u8,
-        hash_short: u16,
-        bytes: Vec<u8>,
-    },
     /// `finalize()` was called from a non-Idle state. Carries the burst-
     /// scoped counters so the caller can log a one-line summary without
-    /// having to count events itself.
+    /// having to count events itself. Fountain assembly (RaptorQ) lives a
+    /// layer up — the worker accumulates `CwDecoded` by ESI exactly as
+    /// `session_store` does for `rx_v2` — so no payload-assembled flag.
     SessionFinalised {
         cycles_validated: u32,
         cws_converged: u32,
-        payload_assembled: bool,
     },
     /// Phase 4 coarse one-shot drift estimator fired. `from_ppm` is the
     /// drift hint the session was running with, `to_ppm` is the updated
@@ -308,20 +299,12 @@ pub struct V3Session {
     /// (validated or failed) by `try_advance_to_next_marker`. None while
     /// the FSM is Idle / Acquiring.
     next_marker_sym_pos_pred: Option<u64>,
-    // ---- Phase 3b: AppHeader recovery + RaptorQ assembly ------------
+    // ---- Phase 3b: AppHeader recovery -------------------------------
     /// First CRC-valid AppHeader decoded from a META codeword. None
     /// until a META CW converges AND its 4-copy redundant payload
-    /// passes CRC.
+    /// passes CRC. Parsed (not assembled) — the OTI it carries is what
+    /// the worker needs to RaptorQ-decode the accumulated data CWs.
     app_header: Option<AppHeader>,
-    /// Map ESI → converged data-CW info bytes, fed to the RaptorQ
-    /// fountain decoder once we have ≥ k_symbols unique entries.
-    /// META CW bytes are NOT inserted here (they carry the header,
-    /// not a fountain packet).
-    cw_bytes: HashMap<u32, Vec<u8>>,
-    /// Set once the fountain decoder yields a full payload — guards
-    /// against re-attempting the (expensive) RaptorQ decode on every
-    /// subsequent CW.
-    payload_assembled: bool,
     /// Burst-scoped counters reported by `SessionFinalised`. Reset on
     /// each `finalize()` so a recycled `V3Session` starts fresh.
     cycles_validated: u32,
@@ -427,8 +410,6 @@ impl V3Session {
             pending_decode: None,
             next_marker_sym_pos_pred: None,
             app_header: None,
-            cw_bytes: HashMap::new(),
-            payload_assembled: false,
             cycles_validated: 0,
             cws_converged: 0,
             drift_locked: false,
@@ -668,18 +649,15 @@ impl V3Session {
             events.push(V3SessionEvent::SessionFinalised {
                 cycles_validated: self.cycles_validated,
                 cws_converged: self.cws_converged,
-                payload_assembled: self.payload_assembled,
             });
         }
         // Reset burst-scoped state so a recycled `V3Session` instance
-        // can decode the next burst without leaking stale ESI bytes /
-        // header / counters.
+        // can decode the next burst without leaking stale header /
+        // counters.
         self.state = V3SessionState::Idle;
         self.pending_decode = None;
         self.next_marker_sym_pos_pred = None;
         self.app_header = None;
-        self.cw_bytes.clear();
-        self.payload_assembled = false;
         self.cycles_validated = 0;
         self.cws_converged = 0;
         // Phase 4: the recycled session must re-bootstrap its own drift
@@ -1124,9 +1102,10 @@ impl V3Session {
             let esi = pending.base_esi + cw_idx as u32;
             // Phase 3b: feed assembly state BEFORE moving `bytes` into
             // the CwDecoded event so we don't have to double-clone.
-            // META: try to recover the AppHeader (first valid copy wins).
-            // DATA: insert into ESI map for RaptorQ — only converged
-            //       CWs go in, mirroring rx_v2.rs:1503-1516.
+            // META: try to recover the AppHeader (first valid copy wins)
+            // and detect the EOT sentinel. DATA: nothing to do here — the
+            // worker accumulates converged data CWs by ESI off `CwDecoded`
+            // and runs RaptorQ, mirroring rx_v2 + session_store.
             if converged {
                 self.cws_converged = self.cws_converged.saturating_add(1);
                 if pending.is_meta {
@@ -1171,8 +1150,6 @@ impl V3Session {
                             self.app_header = Some(h);
                         }
                     }
-                } else {
-                    self.cw_bytes.insert(esi, bytes.clone());
                 }
             }
             events.push(V3SessionEvent::CwDecoded {
@@ -1184,31 +1161,6 @@ impl V3Session {
                 bytes,
                 sigma2,
             });
-        }
-        // Phase 3b: once the header is known and we've accumulated
-        // ≥ k_symbols unique data CWs, try the fountain decode. The
-        // raptorq Decoder rebuilds itself on each call (O(N) feed), so
-        // gating on the K threshold avoids work that can't possibly
-        // succeed yet. `payload_assembled` is a one-shot guard.
-        if !self.payload_assembled {
-            if let Some(h) = self.app_header.clone() {
-                if self.cw_bytes.len() >= h.k_symbols as usize {
-                    if let Some(payload) = raptorq_codec::try_decode(
-                        &self.cw_bytes,
-                        h.file_size,
-                        h.t_bytes as u16,
-                    ) {
-                        events.push(V3SessionEvent::PayloadAssembled {
-                            session_id: h.session_id,
-                            file_size: h.file_size,
-                            mime_type: h.mime_type,
-                            hash_short: h.hash_short,
-                            bytes: payload,
-                        });
-                        self.payload_assembled = true;
-                    }
-                }
-            }
         }
         // Predict the next marker position. Spacing is
         // MARKER_LEN + seg_sym_len(this cycle's is_meta) symbols after
@@ -1473,8 +1425,6 @@ impl V3Session {
         self.pending_decode = None;
         self.next_marker_sym_pos_pred = None;
         self.app_header = None;
-        self.cw_bytes.clear();
-        self.payload_assembled = false;
         self.cycles_validated = 0;
         self.cws_converged = 0;
         self.drift_anchor_sym_pos = None;
@@ -1624,6 +1574,73 @@ mod tests {
             out.push(s as f32);
         }
         out
+    }
+
+    /// Reproduce the worker's role (the modem itself no longer assembles):
+    /// feed `audio` through `session` in cpal-sized chunks, accumulate
+    /// converged DATA codewords by ESI (first copy wins, like
+    /// `session_store`) and capture the OTI from `AppHeaderRecovered`,
+    /// then run the RaptorQ fountain exactly as the worker does for
+    /// `rx_v2`. Mirrors the Slice-B wiring so the modem tests still cover
+    /// end-to-end payload recovery.
+    struct AssembleOutcome {
+        payload: Option<Vec<u8>>,
+        file_size: Option<u32>,
+        session_id: Option<u32>,
+        converged_cycles: std::collections::HashSet<u32>,
+        drift_committed: Option<(f64, f64, bool, usize)>,
+    }
+
+    fn run_session_and_assemble(session: &mut V3Session, audio: &[f32]) -> AssembleOutcome {
+        use modem_framing::raptorq_codec;
+        let mut cw_bytes = std::collections::HashMap::<u32, Vec<u8>>::new();
+        let mut converged_cycles = std::collections::HashSet::<u32>::new();
+        let mut oti: Option<(u32, u8, u32)> = None; // (file_size, t_bytes, session_id)
+        let mut drift_committed = None;
+        for c in audio.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                match e {
+                    V3SessionEvent::CwDecoded {
+                        cycle_idx,
+                        esi,
+                        is_meta: false,
+                        converged: true,
+                        bytes,
+                        ..
+                    } => {
+                        converged_cycles.insert(cycle_idx);
+                        cw_bytes.entry(esi).or_insert(bytes);
+                    }
+                    V3SessionEvent::AppHeaderRecovered {
+                        file_size,
+                        t_bytes,
+                        session_id,
+                        ..
+                    } => {
+                        oti.get_or_insert((file_size, t_bytes, session_id));
+                    }
+                    V3SessionEvent::DriftCommitted {
+                        from_ppm,
+                        to_ppm,
+                        applied,
+                        n_observations,
+                    } => {
+                        drift_committed = Some((from_ppm, to_ppm, applied, n_observations));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let payload = oti.and_then(|(file_size, t_bytes, _)| {
+            raptorq_codec::try_decode(&cw_bytes, file_size, t_bytes as u16)
+        });
+        AssembleOutcome {
+            payload,
+            file_size: oti.map(|(fs, _, _)| fs),
+            session_id: oti.map(|(_, _, sid)| sid),
+            converged_cycles,
+            drift_committed,
+        }
     }
 
     #[test]
@@ -1909,35 +1926,10 @@ mod tests {
             let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
             // Intentionally do NOT call set_drift_ppm — Phase 4's whole
             // point is to source the correction internally.
-            let mut converged_cycles = std::collections::HashSet::<u32>::new();
-            let mut payload_assembled = false;
-            let mut drift_committed: Option<(f64, f64, bool)> = None;
-            for c in drifted.chunks(2400) {
-                for e in session.process_audio_chunk(c) {
-                    match e {
-                        V3SessionEvent::CwDecoded {
-                            cycle_idx,
-                            converged: true,
-                            ..
-                        } => {
-                            converged_cycles.insert(cycle_idx);
-                        }
-                        V3SessionEvent::PayloadAssembled { .. } => {
-                            payload_assembled = true;
-                        }
-                        V3SessionEvent::DriftCommitted {
-                            from_ppm,
-                            to_ppm,
-                            applied,
-                            ..
-                        } => {
-                            drift_committed = Some((from_ppm, to_ppm, applied));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let (from_ppm, to_ppm, applied) = drift_committed.expect(
+            let outcome = run_session_and_assemble(&mut session, &drifted);
+            let converged_cycles = outcome.converged_cycles;
+            let payload_assembled = outcome.payload.is_some();
+            let (from_ppm, to_ppm, applied, _) = outcome.drift_committed.expect(
                 "Phase 4 must emit a DriftCommitted event before the burst ends",
             );
             assert!(
@@ -1979,32 +1971,16 @@ mod tests {
         // When the caller has already set drift correctly (here ppm=0
         // and no actual drift), the LS slope sits well below
         // COARSE_DRIFT_COMMIT_PPM, so the estimator locks without
-        // rebooting the pipeline. The session still decodes through to
-        // PayloadAssembled, just without the reboot detour.
+        // rebooting the pipeline. The session still decodes enough CWs to
+        // assemble (via the worker-emulating helper), just without the
+        // reboot detour.
         let cfg = high_plus_config();
         let audio = build_v3_burst_audio(&cfg, 800, 0xC0DE_FACE);
         let mut session = V3Session::new(cfg, "HIGH+".to_string());
-        let mut drift_committed: Option<(f64, f64, bool, usize)> = None;
-        let mut payload_assembled = false;
-        for c in audio.chunks(2400) {
-            for e in session.process_audio_chunk(c) {
-                match e {
-                    V3SessionEvent::DriftCommitted {
-                        from_ppm,
-                        to_ppm,
-                        applied,
-                        n_observations,
-                    } => {
-                        drift_committed = Some((from_ppm, to_ppm, applied, n_observations));
-                    }
-                    V3SessionEvent::PayloadAssembled { .. } => {
-                        payload_assembled = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let (from_ppm, to_ppm, applied, n_obs) = drift_committed
+        let outcome = run_session_and_assemble(&mut session, &audio);
+        let payload_assembled = outcome.payload.is_some();
+        let (from_ppm, to_ppm, applied, n_obs) = outcome
+            .drift_committed
             .expect("Phase 4 must lock once enough markers have validated");
         assert!(
             !applied,
@@ -2277,52 +2253,25 @@ mod tests {
 
     #[test]
     fn clean_v3_burst_assembles_payload() {
-        // Phase 3b milestone: the META cycle yields an AppHeader, then
-        // accumulated data CWs feed the RaptorQ fountain until the full
-        // payload comes back out. `build_v3_burst_audio` always packs
-        // `[0xAA; payload_bytes]`, so the recovered bytes must match
-        // exactly (RaptorQ-internal padding is stripped to `file_size`).
+        // The META cycle yields an AppHeader (file_size + session_id +
+        // OTI), and the worker-emulating helper feeds the accumulated data
+        // CWs into the RaptorQ fountain until the full payload comes back
+        // out. `build_v3_burst_audio` always packs `[0xAA; payload_bytes]`,
+        // so the recovered bytes must match exactly (RaptorQ-internal
+        // padding is stripped to `file_size`). The modem itself no longer
+        // assembles — this exercises the modem→worker contract.
         let cfg = high_plus_config();
         let payload_size = 800usize;
         let session_id = 0xAB12_3456u32;
         let audio = build_v3_burst_audio(&cfg, payload_size, session_id);
         let expected = vec![0xAA_u8; payload_size];
         let mut session = V3Session::new(cfg, "HIGH+".to_string());
-        let mut header_file_size: Option<u32> = None;
-        let mut header_session_id: Option<u32> = None;
-        let mut assembled: Option<Vec<u8>> = None;
-        let mut assembled_file_size: Option<u32> = None;
-        let mut assembled_session_id: Option<u32> = None;
-        for c in audio.chunks(2400) {
-            for e in session.process_audio_chunk(c) {
-                match e {
-                    V3SessionEvent::AppHeaderRecovered {
-                        file_size,
-                        session_id,
-                        ..
-                    } => {
-                        header_file_size.get_or_insert(file_size);
-                        header_session_id.get_or_insert(session_id);
-                    }
-                    V3SessionEvent::PayloadAssembled {
-                        bytes,
-                        file_size,
-                        session_id,
-                        ..
-                    } => {
-                        assembled = Some(bytes);
-                        assembled_file_size = Some(file_size);
-                        assembled_session_id = Some(session_id);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(header_file_size, Some(payload_size as u32));
-        assert_eq!(header_session_id, Some(session_id));
-        assert_eq!(assembled_file_size, Some(payload_size as u32));
-        assert_eq!(assembled_session_id, Some(session_id));
-        let bytes = assembled.expect("PayloadAssembled never fired");
+        let outcome = run_session_and_assemble(&mut session, &audio);
+        assert_eq!(outcome.file_size, Some(payload_size as u32));
+        assert_eq!(outcome.session_id, Some(session_id));
+        let bytes = outcome
+            .payload
+            .expect("RaptorQ fountain never assembled the payload");
         assert_eq!(bytes.len(), payload_size);
         assert_eq!(bytes, expected, "assembled payload mismatch");
     }
@@ -2331,7 +2280,7 @@ mod tests {
     fn finalize_after_assembly_reports_counters() {
         // SessionFinalised carries the burst-scoped counters so callers
         // can log a one-line summary without counting events themselves.
-        // Sanity-check that all three fields are populated coherently.
+        // Sanity-check that both counters are populated coherently.
         let cfg = high_plus_config();
         let audio = build_v3_burst_audio(&cfg, 800, 0xBEEF_BABE);
         let mut session = V3Session::new(cfg, "HIGH+".to_string());
@@ -2343,19 +2292,17 @@ mod tests {
             if let V3SessionEvent::SessionFinalised {
                 cycles_validated,
                 cws_converged,
-                payload_assembled,
             } = e
             {
-                Some((*cycles_validated, *cws_converged, *payload_assembled))
+                Some((*cycles_validated, *cws_converged))
             } else {
                 None
             }
         });
-        let (cv, cc, pa) =
+        let (cv, cc) =
             summary.expect("SessionFinalised not emitted by finalize() on active burst");
         assert!(cv >= 3, "expected ≥3 cycles validated, got {cv}");
         assert!(cc >= 2, "expected ≥2 CWs converged, got {cc}");
-        assert!(pa, "expected payload_assembled=true after full burst");
         assert!(matches!(session.state(), V3SessionState::Idle));
     }
 
