@@ -104,6 +104,20 @@ struct AppState {
     /// `tx_preview.zst`). Filled in by compress_image / compress_file_zstd.
     /// `tx_start` reads this path to drive the CLI.
     tx_payload_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Re-entrance guard for the TX encoding pipeline (`compress_image`
+    /// AVIF and `compress_file_zstd`). Tauri 2 dispatches each command
+    /// on its own task, so two clicks on "Recalculer" while a long
+    /// ravif/rav1e encode is in flight would otherwise spawn a second
+    /// encoder in parallel — pushing the resident set past the OOM
+    /// threshold and getting the whole process SIGKILL'd by the kernel
+    /// (observed via "Gdk-Message: Error reading events from display:
+    /// Broken pipe" from a surviving WebKit subprocess). `try_lock` at
+    /// the top of each encoding command refuses the second call with a
+    /// clean error string instead of starting a competing encode. The
+    /// JS-side guards (`txState.compressing`) catch most of these but
+    /// can miss a path that bypasses the disabled-button state ; this
+    /// is the backstop.
+    tx_compressing: Mutex<()>,
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
     sounder_capture: Mutex<Option<SounderCapture>>,
@@ -1325,25 +1339,111 @@ fn compress_image(
     opts: CompressOpts,
     state: State<'_, AppState>,
 ) -> Result<CompressResult, String> {
+    // Backstop re-entrance guard. JS already gates the button on
+    // `txState.compressing`, but a second click that races past the
+    // disabled-button state (re-click on Recalculer while a long
+    // speed=1 rav1e encode is in flight, drag-drop landing during
+    // compression, …) would spawn a 2nd ravif on the same source.
+    // Two rav1e instances easily overshoot RAM on a 50 MP source and
+    // the kernel OOM-kills the whole process. `try_lock` here turns
+    // the race into a clean error string for the JS side.
+    let _busy = state
+        .tx_compressing
+        .try_lock()
+        .map_err(|_| "compression déjà en cours".to_string())?;
     let source = {
         let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
         slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
     };
-    let result = compress_avif(&source, &opts)?;
+    // Move the cloned source into compress_avif so it can drop the
+    // compressed JPEG/PNG bytes once `image::load_from_memory` has
+    // produced the decoded pixel buffer — keeps the resident set
+    // bounded to one full pixel buffer at the ravif stage instead of
+    // two (decoded) + one (compressed source) + one (rgba copy).
+    let result = compress_avif(source, &opts)?;
+    eprintln!("[compress_image] back from compress_avif, byte_len={}", result.byte_len);
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("tx_preview.avif");
-    std::fs::write(&path, &result.avif_bytes).map_err(|e| format!("write: {e}"))?;
+    let avif_path = dir.join("tx_preview.avif");
+    let png_path = dir.join("tx_preview.png");
+    // Atomic write helper : tmp + fsync + rename. Either-old-or-new on
+    // disk, never partial. Used for both AVIF (radio payload) and PNG
+    // (WebKit-friendly preview).
+    let atomic_write = |dst: &std::path::Path, bytes: &[u8]| -> Result<(), String> {
+        use std::io::Write;
+        let ext = dst
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin");
+        let tmp = dst.with_extension(format!("{ext}.tmp"));
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, dst).map_err(|e| format!("rename: {e}"))
+    };
+    atomic_write(&avif_path, &result.avif_bytes)?;
+    eprintln!(
+        "[compress_image] wrote AVIF {} bytes to {}",
+        result.byte_len,
+        avif_path.display()
+    );
+    // Sibling PNG generated from the same RGBA buffer used for the AVIF
+    // encode (cf. tx_encode.rs:CompressedImage.png_bytes). The PNG is
+    // the path returned as `preview_path` to JS — WebKitGTK + libavif
+    // crashes the WebProcess on every AVIF preview render on this
+    // distro, so we display PNG and keep AVIF strictly for the radio
+    // transmission. Empty `png_bytes` (passthrough branch) falls back to
+    // the AVIF path — the operator already saw a working preview from
+    // their drag-drop before, so this only affects relayed sources.
+    let preview_path = if !result.png_bytes.is_empty() {
+        atomic_write(&png_path, &result.png_bytes)?;
+        eprintln!(
+            "[compress_image] wrote PNG {} bytes to {}",
+            result.png_bytes.len(),
+            png_path.display()
+        );
+        png_path
+    } else {
+        avif_path.clone()
+    };
     if let Ok(mut p) = state.tx_payload_path.lock() {
-        *p = Some(path.clone());
+        // tx_payload_path always points at the AVIF — that's what
+        // tx_start reads to drive the modem CLI. Preview path is
+        // separate.
+        *p = Some(avif_path.clone());
     }
+    // Capture the scalars we need to return BEFORE dropping the rest of
+    // CompressedImage — its avif_bytes / png_bytes are large transient
+    // buffers we want gone before malloc_trim.
+    let source_w = result.source_w;
+    let source_h = result.source_h;
+    let actual_w = result.actual_w;
+    let actual_h = result.actual_h;
+    let byte_len = result.byte_len;
+    drop(result);
+    // Force glibc to return the just-freed transient buffers back to
+    // the kernel — decoded source RGB at 6000×4000 ≈ 72 MB, resized
+    // RGBA ≈ 6 MB, PNG output ≈ 3 MB. Without this, glibc keeps those
+    // blocks in its main arena for reuse and the per-encode baseline
+    // RSS creeps by ~70 MB until WebKitGTK SIGSEGVs the WebProcess
+    // (observed 2026-05-29 : 3rd–5th encode dies regardless of format).
+    // `malloc_trim(0)` releases unused arena pages ; the next encode
+    // mmaps fresh ones. Cost ~1 ms. glibc-specific, hence the cfg gate.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    eprintln!("[compress_image] returning to Tauri runtime");
     Ok(CompressResult {
-        preview_path: path.to_string_lossy().into_owned(),
-        source_w: result.source_w,
-        source_h: result.source_h,
-        actual_w: result.actual_w,
-        actual_h: result.actual_h,
-        byte_len: result.byte_len,
+        preview_path: preview_path.to_string_lossy().into_owned(),
+        source_w,
+        source_h,
+        actual_w,
+        actual_h,
+        byte_len,
     })
 }
 
@@ -1359,6 +1459,14 @@ struct CompressFileResult {
 /// files (text, archives, etc.) that require lossless transmission.
 #[tauri::command]
 fn compress_file_zstd(state: State<'_, AppState>) -> Result<CompressFileResult, String> {
+    // Same re-entrance guard as `compress_image` — zstd is faster than
+    // ravif but a concurrent invocation would still double the working
+    // set on a large file source, and we want a single TX-encoding
+    // pipeline at a time as a global invariant.
+    let _busy = state
+        .tx_compressing
+        .try_lock()
+        .map_err(|_| "compression déjà en cours".to_string())?;
     let source = {
         let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
         slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
@@ -1858,7 +1966,75 @@ impl EventSink for TauriEventSink {
     }
 }
 
+/// Install a process-wide panic hook that mirrors the panic info and a
+/// full backtrace to stderr AND to `<save_dir>/panic.log` before the
+/// abort fires. Called once at the very top of `main()`.
+///
+/// Why this exists : `profile.release` in the workspace `Cargo.toml`
+/// is `panic = "abort"`, so the first panic kills the GUI process
+/// outright — no unwind, no destructors, no chance to surface the
+/// reason through Tauri's IPC. The default panic hook does write a
+/// `thread 'X' panicked at …` line to stderr, but only with a useful
+/// backtrace if `RUST_BACKTRACE` is set, and only visible to a user
+/// who launched from a terminal. Most users launch from the desktop
+/// menu, where stderr goes to `/dev/null`. This hook :
+///
+///   - forces `std::backtrace::Backtrace::force_capture()` so the
+///     trace is always there regardless of env vars ;
+///   - writes a timestamped block to a file under the canonical save
+///     dir (same place RX/TX outputs land), so the next launch can
+///     report or attach it ;
+///   - mirrors to stderr for terminal launches.
+fn install_panic_hook() {
+    let prior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Let the default hook print its usual one-liner to stderr first.
+        prior(info);
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let log_path = default_save_dir().join("panic.log");
+        // Best-effort dir creation — if it fails we still try the file
+        // open below, which will return an error we ignore. The hook
+        // must not itself panic.
+        let _ = std::fs::create_dir_all(default_save_dir());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "==== panic @ unix={ts} ====");
+            let _ = writeln!(f, "{info}");
+            let _ = writeln!(f, "Backtrace:");
+            let _ = writeln!(f, "{backtrace}");
+            let _ = writeln!(f);
+        }
+
+        // Echo the backtrace to stderr too — the default hook only
+        // emits it when RUST_BACKTRACE is set, and we want it
+        // unconditionally on terminal launches.
+        eprintln!("Backtrace:\n{backtrace}");
+        eprintln!("(also written to {})", log_path.display());
+    }));
+}
+
 fn main() {
+    // Capture panics to stderr + a log file before the abort hits.
+    // `profile.release` is built with `panic = "abort"` (Cargo.toml), so
+    // a panic anywhere (a Rust-side Tauri command, a worker thread, a
+    // ravif/rav1e OOM on a long AVIF encode, …) kills the whole process
+    // *immediately* on the panic line. The default hook prints
+    // "thread 'X' panicked at …" to stderr, but the GUI is typically
+    // launched from a .desktop entry with stderr → /dev/null, so the
+    // user sees nothing — "intermittent crashes, no logs". Hook
+    // installs before anything else so it catches early-init panics too.
+    install_panic_hook();
+
     // Work around a WebKitGTK + Mesa V3D bug on Raspberry Pi 4/5 where the
     // DMA-BUF renderer leaves the toplevel surface corrupted ("scrambled
     // Canal+" bands) after a fullscreen transition, tab switch, or image
@@ -1866,6 +2042,23 @@ fn main() {
     // be set before any webview is created, hence at the very top of main.
     #[cfg(target_os = "linux")]
     std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+
+    // Force the X11 (XWayland) backend instead of native Wayland. Direct
+    // Wayland under WebKitGTK 2.46+ has an unresolved race in the surface
+    // commit / IPC pipeline that drops the connection to the compositor
+    // mid-render — observed 2026-05-29 as repeated "Lost connection to
+    // Wayland compositor" / "Error flushing display: Broken pipe" the
+    // instant the WebView fetches the post-compress preview image, even
+    // after we switched the preview from AVIF (libavif crash) to PNG.
+    // XWayland adds one X11→Wayland translation hop and slightly more
+    // CPU but is the stable path for WebKitGTK on this distro. Doesn't
+    // honour an existing GDK_BACKEND set by the user (rare) ; if they
+    // really need native Wayland they can `unset GDK_BACKEND` before
+    // launch — but realistically we should just default to what works.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
 
     let save_dir = default_save_dir();
     let _ = std::fs::create_dir_all(&save_dir);
@@ -1928,6 +2121,7 @@ fn main() {
                 wav_sink: Arc::new(Mutex::new(None)),
                 tx_source: Arc::new(Mutex::new(None)),
                 tx_payload_path: Arc::new(Mutex::new(None)),
+                tx_compressing: Mutex::new(()),
                 tx_handle: Mutex::new(None),
                 ptt,
                 sounder_capture: Mutex::new(None),

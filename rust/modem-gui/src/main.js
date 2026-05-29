@@ -3841,7 +3841,18 @@ async function _runTxCompressImpl() {
       txState.compressedUrl = url;
       txState.compressDirty = false;
       const previewImg = document.getElementById("tx-preview-img");
-      if (previewImg) previewImg.src = url;
+      if (previewImg) {
+        // Explicitly evict the previous decoded image from WebKit's image
+        // cache before assigning the new src. Each Recalculer click bumps
+        // `?v=Date.now()` so WebKit treats every URL as a brand-new
+        // resource and would otherwise accumulate decoded AVIF buffers
+        // in the WebProcess across encodes — observed 2026-05-29 :
+        // 1-3 successful previews then a Wayland "Broken pipe" / WebKit
+        // crash. `removeAttribute("src")` forces WebKit to drop the
+        // previous decoded surface before the new fetch starts.
+        previewImg.removeAttribute("src");
+        previewImg.src = url;
+      }
       logEvent("tx_compress_done", {
         mode: "avif",
         source_w: result.source_w,
@@ -3859,10 +3870,32 @@ async function _runTxCompressImpl() {
   } finally {
     if (seq === txState.compressSeq) {
       txState.compressing = false;
-      const el = document.getElementById("tx-preview");
-      if (el) el.classList.remove("compressing");
-      refreshTxPreview();
-      refreshTxButtons();
+      // Defer the lock release until the new preview image has finished
+      // decoding in WebKit. Setting `previewImg.src = url` above only
+      // *kicks off* an async fetch+decode in the WebProcess ; if we drop
+      // `body.compressing-lock` right here, any clicks that piled up
+      // during compression (when pointer-events were blocked from JS but
+      // still queued at the WebKit event-pump level) get dispatched
+      // simultaneously with libavif rendering — racing into a
+      // WebProcess crash on WebKitGTK + libavif (observed 2026-05-29).
+      // Waiting on the `load` event gives the decoder a clean window.
+      // Falls back to a 1 s safety timer in case the image never fires
+      // load/error (e.g. AVIF parse error swallowed silently).
+      const release = () => {
+        hideTxBusyOverlay();
+        refreshTxPreview();
+        refreshTxButtons();
+      };
+      const previewImg = document.getElementById("tx-preview-img");
+      if (previewImg && previewImg.getAttribute("src") && !previewImg.complete) {
+        let done = false;
+        const wrapped = () => { if (!done) { done = true; release(); } };
+        previewImg.addEventListener("load", wrapped, { once: true });
+        previewImg.addEventListener("error", wrapped, { once: true });
+        setTimeout(wrapped, 1000);
+      } else {
+        release();
+      }
     }
   }
 }
@@ -3986,10 +4019,21 @@ function showTxBusyOverlay() {
     preview.hidden = false;
     preview.classList.add("compressing");
   }
+  // Block ALL pointer events on the page during compression. Without
+  // this, any click anywhere (a tab switch, a settings input, an
+  // unrelated button) fired while WebKit is also handling the ravif/
+  // libavif decoder for the new preview triggers a WebProcess crash
+  // on this distro (observed 2026-05-29 : Wayland "Broken pipe" or
+  // "Lost connection to compositor" after exactly one interaction
+  // during the encode window). Keyboard still works (lets the user
+  // cancel via Ctrl-W / Alt-F4 if they need). Cursor switches to
+  // `progress` so it's obvious why clicks are ignored.
+  document.body.classList.add("compressing-lock");
 }
 function hideTxBusyOverlay() {
   const preview = document.getElementById("tx-preview");
   if (preview) preview.classList.remove("compressing");
+  document.body.classList.remove("compressing-lock");
 }
 
 // Load a file from a disk path (native Tauri drag-drop). The backend

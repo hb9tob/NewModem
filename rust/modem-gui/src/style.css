@@ -642,6 +642,16 @@ main {
   0%   { background-position: 0 0; }
   100% { background-position: 40px 40px; }
 }
+/* Global click-block during AVIF compression. Any user interaction
+   while ravif/libavif is decoding the new preview in WebKit triggers
+   a WebProcess crash on this distro — we just refuse all pointer events
+   on the body until `hideTxBusyOverlay()` removes the class. The
+   `cursor: progress` makes the lock state obvious. Keyboard events
+   are unaffected, so the user can still close the window. */
+body.compressing-lock {
+  pointer-events: none;
+  cursor: progress;
+}
 .tx-preview-overlay {
   position: absolute;
   bottom: 8px;

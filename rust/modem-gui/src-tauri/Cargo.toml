@@ -54,3 +54,11 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1", features = ["fs"] }
+
+# glibc-only : malloc_trim(0) after compress_image to release the
+# large transient buffers (decoded source RGB at 6000×4000 ≈ 72 MB)
+# back to the kernel. Without this, glibc keeps them in its arena and
+# the resident-set creeps by ~70 MB per encode until WebKitGTK gets
+# squeezed and the WebProcess dies.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

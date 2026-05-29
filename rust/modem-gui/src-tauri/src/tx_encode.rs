@@ -2,10 +2,53 @@ use crate::overlay::{apply_overlay, Overlay};
 use exif::{In, Reader as ExifReader, Tag};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
-use ravif::{Encoder, Img};
+use image::ImageFormat;
+use ravif::{BitDepth, Encoder, Img};
 use rgb::FromSlice;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+
+/// Read `/proc/meminfo` and return the `MemAvailable` value in MiB. Linux
+/// only — Windows / macOS return None and skip the pre-flight check below.
+#[cfg(target_os = "linux")]
+fn meminfo_available_mib() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kib: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kib / 1024);
+        }
+    }
+    None
+}
+#[cfg(not(target_os = "linux"))]
+fn meminfo_available_mib() -> Option<u64> { None }
+
+/// Read this process' resident set size in MiB from `/proc/self/status`.
+/// Linux only.
+#[cfg(target_os = "linux")]
+fn self_rss_mib() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kib: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kib / 1024);
+        }
+    }
+    None
+}
+#[cfg(not(target_os = "linux"))]
+fn self_rss_mib() -> Option<u64> { None }
+
+/// Trace one line on stderr with the current RSS / available memory at
+/// a named compression phase. Cheap (4 file reads), unconditional so the
+/// trace is there when launched from a terminal — invaluable for
+/// post-mortem diagnosis of OOM-kill events that bypass our panic hook.
+fn mem_trace(phase: &str) {
+    let rss = self_rss_mib().map(|v| format!("{v}")).unwrap_or_else(|| "?".into());
+    let avail = meminfo_available_mib().map(|v| format!("{v}")).unwrap_or_else(|| "?".into());
+    eprintln!("[compress_avif/{phase}] rss={rss}MiB avail={avail}MiB");
+}
 
 /// Read the EXIF Orientation tag (1..=8) from a buffer that may contain EXIF
 /// metadata (JPEG, TIFF, HEIF). Returns 1 (NoTransforms) when no EXIF block
@@ -51,6 +94,16 @@ pub struct CompressOpts {
 #[derive(Debug, Serialize)]
 pub struct CompressedImage {
     pub avif_bytes: Vec<u8>,
+    /// PNG bytes encoded from the same post-resize-+-overlay RGBA buffer
+    /// that produced the AVIF. The caller writes this alongside the AVIF
+    /// so the WebKit preview loads a universally-supported PNG instead of
+    /// ravif's mandatory 4:4:4 AVIF — observed 2026-05-29 that
+    /// WebKitGTK's libavif stack kills the WebProcess on every preview
+    /// regardless of bit depth or cache-busting, even with the UI
+    /// completely idle. `byte_len` keeps reporting the AVIF size — it's
+    /// what matters for radio transmission. Empty Vec on the passthrough
+    /// branch since we don't have the pixel buffer in that path.
+    pub png_bytes: Vec<u8>,
     pub source_w: u32,
     pub source_h: u32,
     pub actual_w: u32,
@@ -83,7 +136,7 @@ pub fn compress_zstd(source_bytes: &[u8]) -> Result<CompressedFile, String> {
     })
 }
 
-pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<CompressedImage, String> {
+pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<CompressedImage, String> {
     // Passthrough: the source is already an AVIF (direct drop or relay from
     // history). We don't touch the bytes - no re-encode, hence no loss and
     // no CPU cycles. We don't decode the AVIF on the Rust side to read the
@@ -94,7 +147,11 @@ pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<Compres
     if opts.passthrough {
         let byte_len = source_bytes.len();
         return Ok(CompressedImage {
-            avif_bytes: source_bytes.to_vec(),
+            avif_bytes: source_bytes,
+            // Passthrough path doesn't have the decoded pixel buffer ;
+            // the caller (`compress_image` in main.rs) detects empty
+            // png_bytes and keeps the existing preview src in that case.
+            png_bytes: Vec::new(),
             source_w: opts.target_w,
             source_h: opts.target_h,
             actual_w: opts.target_w,
@@ -103,13 +160,58 @@ pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<Compres
         });
     }
 
-    let mut img = image::load_from_memory(source_bytes).map_err(|e| format!("decode: {e}"))?;
+    mem_trace("start");
+
+    // Pre-flight memory check. The decode phase below briefly holds the
+    // FULL-RESOLUTION decoded buffer (image::DynamicImage uses ~ w·h·3
+    // for RGB sources or w·h·4 for RGBA). On a 50 MP phone JPEG that's
+    // ~150-200 MB *before* the resize even starts. If the system can't
+    // grant that allocation, the kernel SIGKILLs us — no panic, no
+    // recovery, just a Gdk "Broken pipe" message from the surviving
+    // WebKit subprocess. Peek the dimensions from the source header
+    // (cheap, no decode), estimate the peak working set, and refuse
+    // upfront with a friendly error if MemAvailable is below it.
+    //
+    // Estimate : worst-case 4 bytes/pixel (RGBA) × 3 transient copies
+    //   (decoded → orientation rotated → resized intermediate) + 64 MB
+    //   ravif baseline. Conservative on purpose : we'd rather refuse a
+    //   marginal encode than gamble against the OOM-killer.
+    {
+        let reader = image::ImageReader::new(std::io::Cursor::new(&source_bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("format probe: {e}"))?;
+        if let Ok((w, h)) = reader.into_dimensions() {
+            let pixel_mib = (w as u64 * h as u64 * 4) / (1024 * 1024);
+            let required_mib = pixel_mib.saturating_mul(3).saturating_add(64);
+            if let Some(avail_mib) = meminfo_available_mib() {
+                eprintln!(
+                    "[compress_avif/probe] source={}×{} pixel_mib={} required~{}MiB avail={}MiB",
+                    w, h, pixel_mib, required_mib, avail_mib,
+                );
+                if avail_mib < required_mib {
+                    return Err(format!(
+                        "mémoire insuffisante : {avail_mib} MiB dispo, \
+                         ~{required_mib} MiB requis pour décoder {w}×{h}. \
+                         Ferme d'autres applications ou utilise une image plus petite."
+                    ));
+                }
+            }
+        }
+    }
+
+    // Decode + read EXIF orientation, then drop the compressed input
+    // before ravif kicks in. On a 50 MP phone JPEG that's ~10-30 MB of
+    // compressed input we no longer need once the pixel buffer exists.
+    let mut img = image::load_from_memory(&source_bytes).map_err(|e| format!("decode: {e}"))?;
+    let orientation_tag = exif_orientation(&source_bytes);
+    drop(source_bytes);
+    mem_trace("decoded");
     // Bake EXIF orientation into the pixels before resize/encode. AVIF can
     // express rotation via `irot`/`imir` boxes, but ravif doesn't emit them,
     // so the only way to keep portrait shots upright after re-encode is to
     // rotate the buffer here. Read dimensions *after* the transform, since
     // rotations 90/270 swap width and height.
-    if let Some(orientation) = Orientation::from_exif(exif_orientation(source_bytes)) {
+    if let Some(orientation) = Orientation::from_exif(orientation_tag) {
         img.apply_orientation(orientation);
     }
     let (src_w, src_h) = (img.width(), img.height());
@@ -123,10 +225,16 @@ pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<Compres
     let speed = opts.speed.unwrap_or(6).clamp(1, 10);
     let filter = if speed >= 7 { FilterType::Triangle } else { FilterType::Lanczos3 };
     let mut resized = if needs_resize {
-        img.resize_exact(opts.target_w, opts.target_h, filter)
+        let r = img.resize_exact(opts.target_w, opts.target_h, filter);
+        // `img` (full-resolution decoded buffer) is dropped here when the
+        // resize returns its new allocation — important on large phone
+        // photos where it doubles the resident set otherwise.
+        drop(img);
+        r
     } else {
         img
     };
+    mem_trace("resized");
 
     // Bake the active overlay (text + logo) into the resized buffer so
     // both preview and transmit share the exact same pixels. Skipped when
@@ -135,19 +243,54 @@ pub fn compress_avif(source_bytes: &[u8], opts: &CompressOpts) -> Result<Compres
         apply_overlay(&mut resized, overlay);
     }
 
-    let rgba = resized.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    let pixels = rgba.as_raw().as_rgba();
+    // RGBA conversion + ravif encode, scoped so `resized` (DynamicImage)
+    // and `rgba` (ImageBuffer copy) are both dropped before we return —
+    // otherwise rav1e's working set lands on top of two redundant pixel
+    // buffers, which is what makes long-speed encodes OOM-abort on
+    // multi-megapixel sources.
+    let (encoded_bytes, png_bytes, w, h) = {
+        let rgba = resized.to_rgba8();
+        drop(resized); // pixel data now lives in `rgba` alone
+        mem_trace("rgba");
+        let (w, h) = (rgba.width(), rgba.height());
 
-    let encoded = Encoder::new()
-        .with_quality(opts.quality.clamp(1.0, 100.0))
-        .with_speed(speed)
-        .encode_rgba(Img::new(pixels, w as usize, h as usize))
-        .map_err(|e| format!("encode: {e}"))?;
+        // PNG encode FIRST (cheap, ~50 ms on a 1.5 MP buffer) so we have
+        // a WebKit-friendly preview format alongside the radio AVIF.
+        // Same pixel buffer feeds both — preview matches what gets
+        // transmitted byte-for-byte after `apply_overlay`.
+        let png_bytes: Vec<u8> = {
+            let mut out: Vec<u8> = Vec::new();
+            rgba.write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
+                .map_err(|e| format!("png encode: {e}"))?;
+            out
+        };
+        mem_trace("png_encoded");
 
-    let byte_len = encoded.avif_file.len();
+        let encoded = {
+            let pixels = rgba.as_raw().as_rgba();
+            // ravif's `BitDepth::Auto` defaults to **10-bit** ; combined
+            // with its mandatory 4:4:4 chroma (YUV444), the output is a
+            // high-quality but **poorly-compatible** AVIF. Forcing 8-bit
+            // improves compatibility somewhat but doesn't fully fix
+            // WebKitGTK crashes on render — hence the PNG sibling we
+            // generate above for preview purposes. The AVIF here is
+            // what goes over the air.
+            Encoder::new()
+                .with_quality(opts.quality.clamp(1.0, 100.0))
+                .with_speed(speed)
+                .with_bit_depth(BitDepth::Eight)
+                .encode_rgba(Img::new(pixels, w as usize, h as usize))
+                .map_err(|e| format!("encode: {e}"))?
+        };
+        mem_trace("encoded");
+        // rgba drops here at scope exit; encoded.avif_file is moved out.
+        (encoded.avif_file, png_bytes, w, h)
+    };
+
+    let byte_len = encoded_bytes.len();
     Ok(CompressedImage {
-        avif_bytes: encoded.avif_file,
+        avif_bytes: encoded_bytes,
+        png_bytes,
         source_w: src_w,
         source_h: src_h,
         actual_w: w,
