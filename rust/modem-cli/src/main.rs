@@ -304,6 +304,9 @@ fn main() {
                 config.center_freq_hz,
             );
 
+            // Tone -> data back-to-back (no AGC-killing silence gap, cf.
+            // v3_modem.rs comment). Layout : tone + data + 200ms silence
+            // + EOT + 100ms silence ; or data + 200ms + EOT in VOX=0.
             let samples = if vox > 0.0 {
                 let mut out = Vec::new();
                 out.extend_from_slice(&modem_core::modulator::tone(
@@ -311,7 +314,6 @@ fn main() {
                     vox,
                     0.5,
                 ));
-                out.extend_from_slice(&modem_core::modulator::silence(0.05));
                 out.append(&mut modulated);
                 out.extend_from_slice(&modem_core::modulator::silence(0.2));
                 out.append(&mut eot_modulated);
@@ -450,6 +452,7 @@ fn main() {
                 &taps,
                 config.center_freq_hz,
             );
+            // Same tone -> data back-to-back layout as the Tx branch.
             let samples = if vox > 0.0 {
                 let mut out = Vec::new();
                 out.extend_from_slice(&modem_core::modulator::tone(
@@ -457,7 +460,6 @@ fn main() {
                     vox,
                     0.5,
                 ));
-                out.extend_from_slice(&modem_core::modulator::silence(0.05));
                 out.append(&mut modulated);
                 out.extend_from_slice(&modem_core::modulator::silence(0.2));
                 out.append(&mut eot_modulated);
