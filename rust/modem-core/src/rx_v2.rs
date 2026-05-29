@@ -2008,14 +2008,34 @@ pub fn rx_v3_after(
             if !(finalize || eot_seen) {
                 continue;
             }
-            // Power Mode = 0.9.x algorithm : OPEN windows decode at
-            // 0 ppm via `rx_v2_single` (no hint cascade, no Gardner).
-            // The CLOSED windows that just ran did the broad-grid
-            // search ; trailing OPEN headers are typically <3 markers
-            // so a per-window grid would mostly cost without paying off.
-            // Matches 0.9.2rc5 OPEN semantics exactly.
+            // Power Mode = 0.9.x algorithm. Two OPEN paths :
+            //
+            // - Cold-start idle activation (`finalize && !eot_seen` and
+            //   no CLOSED window in this scan) — the single SOF in the
+            //   buffer is the ONLY shot at acquiring the new burst
+            //   before the next preamble lands V3_PREAMBLE_PERIOD_S
+            //   (4 s) later. Run the broad ±80 ppm grid here, same
+            //   path CLOSED uses (`rx_v2_legacy_grid_decode`), so a
+            //   drifted cold start activates immediately instead of
+            //   the modem waiting 4 s for a second SOF to make a
+            //   CLOSED pair. Cost : ~13 rx_v2_single passes for this
+            //   one window per activation, no recurring cost on
+            //   subsequent ticks once the session is active.
+            //
+            // - Active-session trailing OPEN (`eot_seen`) — only
+            //   reached because an earlier CLOSED window in this same
+            //   scan carried the EOT marker. That CLOSED already ran
+            //   the broad grid, so the trailing OPEN inherits a
+            //   well-locked channel ; stay at 0 ppm via `rx_v2_single`
+            //   like 0.9.2rc5 did. The OPEN tail has typically <3
+            //   markers, so a redundant per-window grid would be
+            //   wasted CPU.
             if power_mode {
-                rx_v2_single(window, config)
+                if finalize && !eot_seen && !have_hint {
+                    rx_v2_legacy_grid_decode(window, config)
+                } else {
+                    rx_v2_single(window, config)
+                }
             } else if have_hint {
                 // Hint priority for the OPEN: latest CLOSED of this scan
                 // (most local) > session-wide hint (still valid prior) >
