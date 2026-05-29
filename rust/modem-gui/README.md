@@ -10,6 +10,21 @@ Pour la conception du modem et la caractérisation du canal : voir le
 
 ---
 
+## Distributions supportées
+
+- **Debian 12 (bookworm)** et **Debian 13 (trixie)** : support officiel via le `.deb`
+  publié dans les releases GitHub. C'est ce qui tourne sur les Raspberry Pi 4/5
+  de référence et sur le poste Windows en virtuel.
+- **Autres distributions Linux** (Ubuntu, Linux Mint, Fedora, Arch…) : utilise
+  l'**AppImage**. Le `.deb` peut s'installer ailleurs sans erreur apparente, mais
+  les libs WebKit/GStreamer/AVIF du système ne sont pas garanties iso-Debian et
+  certains visuels peuvent casser. Cas connu : sous **Linux Mint**, les images
+  AVIF (preview TX, RX décodée) ne s'affichent pas avec le `.deb` parce que le
+  `libwebkit2gtk-4.1-0` du dépôt Mint ne tire pas `libavif` à l'usage ;
+  l'**AppImage**, qui embarque ses propres `.so`, fonctionne sans config.
+
+---
+
 ## Onglets
 
 | Onglet | Rôle |
