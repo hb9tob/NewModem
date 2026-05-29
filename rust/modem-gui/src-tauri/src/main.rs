@@ -1365,50 +1365,28 @@ fn compress_image(
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let avif_path = dir.join("tx_preview.avif");
-    let png_path = dir.join("tx_preview.png");
-    // Atomic write helper : tmp + fsync + rename. Either-old-or-new on
-    // disk, never partial. Used for both AVIF (radio payload) and PNG
-    // (WebKit-friendly preview).
-    let atomic_write = |dst: &std::path::Path, bytes: &[u8]| -> Result<(), String> {
+    // Atomic write : tmp + fsync + rename. Either-old-or-new on disk,
+    // never partial. A SIGKILL between `File::create` and the last
+    // `write()` syscall would otherwise leave a truncated AVIF with
+    // a valid `ftyp avif` magic that fools `file` but breaks every
+    // decoder.
+    {
         use std::io::Write;
-        let ext = dst
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin");
-        let tmp = dst.with_extension(format!("{ext}.tmp"));
+        let tmp = avif_path.with_extension("avif.tmp");
         let mut f = std::fs::File::create(&tmp)
             .map_err(|e| format!("create {}: {e}", tmp.display()))?;
-        f.write_all(bytes)
+        f.write_all(&result.avif_bytes)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         drop(f);
-        std::fs::rename(&tmp, dst).map_err(|e| format!("rename: {e}"))
-    };
-    atomic_write(&avif_path, &result.avif_bytes)?;
+        std::fs::rename(&tmp, &avif_path).map_err(|e| format!("rename: {e}"))?;
+    }
     eprintln!(
         "[compress_image] wrote AVIF {} bytes to {}",
         result.byte_len,
         avif_path.display()
     );
-    // Sibling PNG generated from the same RGBA buffer used for the AVIF
-    // encode (cf. tx_encode.rs:CompressedImage.png_bytes). The PNG is
-    // the path returned as `preview_path` to JS — WebKitGTK + libavif
-    // crashes the WebProcess on every AVIF preview render on this
-    // distro, so we display PNG and keep AVIF strictly for the radio
-    // transmission. Empty `png_bytes` (passthrough branch) falls back to
-    // the AVIF path — the operator already saw a working preview from
-    // their drag-drop before, so this only affects relayed sources.
-    let preview_path = if !result.png_bytes.is_empty() {
-        atomic_write(&png_path, &result.png_bytes)?;
-        eprintln!(
-            "[compress_image] wrote PNG {} bytes to {}",
-            result.png_bytes.len(),
-            png_path.display()
-        );
-        png_path
-    } else {
-        avif_path.clone()
-    };
+    let preview_path = avif_path.clone();
     if let Ok(mut p) = state.tx_payload_path.lock() {
         // tx_payload_path always points at the AVIF — that's what
         // tx_start reads to drive the modem CLI. Preview path is

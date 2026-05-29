@@ -2,7 +2,6 @@ use crate::overlay::{apply_overlay, Overlay};
 use exif::{In, Reader as ExifReader, Tag};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
-use image::ImageFormat;
 use ravif::{BitDepth, Encoder, Img};
 use rgb::FromSlice;
 use serde::{Deserialize, Serialize};
@@ -94,16 +93,6 @@ pub struct CompressOpts {
 #[derive(Debug, Serialize)]
 pub struct CompressedImage {
     pub avif_bytes: Vec<u8>,
-    /// PNG bytes encoded from the same post-resize-+-overlay RGBA buffer
-    /// that produced the AVIF. The caller writes this alongside the AVIF
-    /// so the WebKit preview loads a universally-supported PNG instead of
-    /// ravif's mandatory 4:4:4 AVIF — observed 2026-05-29 that
-    /// WebKitGTK's libavif stack kills the WebProcess on every preview
-    /// regardless of bit depth or cache-busting, even with the UI
-    /// completely idle. `byte_len` keeps reporting the AVIF size — it's
-    /// what matters for radio transmission. Empty Vec on the passthrough
-    /// branch since we don't have the pixel buffer in that path.
-    pub png_bytes: Vec<u8>,
     pub source_w: u32,
     pub source_h: u32,
     pub actual_w: u32,
@@ -148,10 +137,6 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
         let byte_len = source_bytes.len();
         return Ok(CompressedImage {
             avif_bytes: source_bytes,
-            // Passthrough path doesn't have the decoded pixel buffer ;
-            // the caller (`compress_image` in main.rs) detects empty
-            // png_bytes and keeps the existing preview src in that case.
-            png_bytes: Vec::new(),
             source_w: opts.target_w,
             source_h: opts.target_h,
             actual_w: opts.target_w,
@@ -248,33 +233,19 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
     // otherwise rav1e's working set lands on top of two redundant pixel
     // buffers, which is what makes long-speed encodes OOM-abort on
     // multi-megapixel sources.
-    let (encoded_bytes, png_bytes, w, h) = {
+    let (encoded_bytes, w, h) = {
         let rgba = resized.to_rgba8();
         drop(resized); // pixel data now lives in `rgba` alone
         mem_trace("rgba");
         let (w, h) = (rgba.width(), rgba.height());
 
-        // PNG encode FIRST (cheap, ~50 ms on a 1.5 MP buffer) so we have
-        // a WebKit-friendly preview format alongside the radio AVIF.
-        // Same pixel buffer feeds both — preview matches what gets
-        // transmitted byte-for-byte after `apply_overlay`.
-        let png_bytes: Vec<u8> = {
-            let mut out: Vec<u8> = Vec::new();
-            rgba.write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
-                .map_err(|e| format!("png encode: {e}"))?;
-            out
-        };
-        mem_trace("png_encoded");
-
         let encoded = {
             let pixels = rgba.as_raw().as_rgba();
-            // ravif's `BitDepth::Auto` defaults to **10-bit** ; combined
-            // with its mandatory 4:4:4 chroma (YUV444), the output is a
-            // high-quality but **poorly-compatible** AVIF. Forcing 8-bit
-            // improves compatibility somewhat but doesn't fully fix
-            // WebKitGTK crashes on render — hence the PNG sibling we
-            // generate above for preview purposes. The AVIF here is
-            // what goes over the air.
+            // Force `BitDepth::Eight` instead of the `Auto = Ten` default.
+            // 8-bit + the mandatory 4:4:4 chroma (ravif 0.11 won't do
+            // 4:2:0 — by design) reads cleanly in every modern AVIF
+            // decoder we tested ; the previous 10-bit YUV444 default
+            // crashed WebKitGTK's libavif renderer on this distro.
             Encoder::new()
                 .with_quality(opts.quality.clamp(1.0, 100.0))
                 .with_speed(speed)
@@ -284,13 +255,12 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
         };
         mem_trace("encoded");
         // rgba drops here at scope exit; encoded.avif_file is moved out.
-        (encoded.avif_file, png_bytes, w, h)
+        (encoded.avif_file, w, h)
     };
 
     let byte_len = encoded_bytes.len();
     Ok(CompressedImage {
         avif_bytes: encoded_bytes,
-        png_bytes,
         source_w: src_w,
         source_h: src_h,
         actual_w: w,
