@@ -109,6 +109,14 @@ const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
 /// (`frame::build_eot_frame`).
 const N_HEADER_SYM: u64 = 96;
 
+/// Consecutive predicted-marker misses tolerated before the session
+/// concludes the TX has desynced (random next position, or a TxMore stream
+/// that never reached EOT) and returns to Idle for a late-entry re-acquire.
+/// Below this, a miss is treated as a minor OTA incident (QRM): skip the
+/// corrupted marker and keep predicting forward. 3 ≈ ride through up to
+/// ~0.6 s of corruption at HIGH+ before giving up.
+const MAX_CONSECUTIVE_MISS: u32 = 3;
+
 /// FFE filter length. Matches the modem-2x value (`RX2X_FFE_LEN = 64`),
 /// validated OTA on the same sound-card chain V3 will target.
 pub const V3_FFE_LEN: usize = 64;
@@ -256,6 +264,32 @@ pub struct V3Session {
     state: V3SessionState,
     cycle_samples: usize,
     cycle_data_sym: usize,
+    /// Superframe period in symbols (`V3_PREAMBLE_PERIOD_S × Rs`), mirroring
+    /// the TX's PRE+HDR re-insertion cadence (`build_superframe_v3_range`).
+    superframe_period_sym: u64,
+    /// PRE+HDR block length prepended at each superframe boundary
+    /// (`N_PREAMBLE + lms_warmup + N_HEADER_SYM`) — how much further out the
+    /// next marker sits when a boundary is due.
+    superframe_header_offset_sym: u64,
+    /// Running symbol count since the last superframe PRE+HDR, mirroring the
+    /// TX `elapsed_since_preamble_sym`. Lets the next-marker prediction land
+    /// on the boundary META deterministically (NORMAL flow across
+    /// superframes). Reset to a META segment's length whenever a META is
+    /// decoded; accumulates per DATA segment.
+    elapsed_since_preamble_sym: u64,
+    /// Whether the marker currently predicted at `next_marker_sym_pos_pred`
+    /// is a superframe-boundary META (`true`) or an in-superframe DATA
+    /// marker (`false`). Lets skip-and-continue advance the prediction past
+    /// a missed marker of the correct type without decoding it.
+    next_marker_is_meta: bool,
+    /// Consecutive predicted markers that failed to validate. A minor OTA
+    /// incident (QRM) corrupts one marker while the TX stays in sync, so we
+    /// skip it and keep predicting forward (lost CWs → RaptorQ repairs).
+    /// Once this reaches `MAX_CONSECUTIVE_MISS` the TX is presumed desynced
+    /// / at a random position (or a never-EOT'd TxMore stream), and we
+    /// return to Idle for a late-entry re-acquire. Reset on any validated
+    /// marker.
+    consecutive_miss: u32,
     /// Rolling audio buffer (linear `Vec` because `StreamingDsp::feed_audio`
     /// reads a `&[f32]` slice). Trimmed to
     /// `AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples` each chunk; the
@@ -367,6 +401,14 @@ impl V3Session {
     pub fn new(cfg: ModemConfig, profile_name: String) -> Self {
         let cycle_samples = cycle_period_samples(&cfg);
         let cycle_data_sym = cycle_period_data_sym(&cfg);
+        // Superframe cadence, mirrored from the TX
+        // (`build_superframe_v3_range`): a fresh PRE+HDR is inserted once
+        // `V3_PREAMBLE_PERIOD_S` of marker+segment symbols have elapsed, and
+        // the PRE+HDR is preamble + LMS warmup + header symbols long.
+        let superframe_period_sym = (frame::V3_PREAMBLE_PERIOD_S * cfg.symbol_rate) as u64;
+        let superframe_header_offset_sym = crate::types::N_PREAMBLE as u64
+            + cfg.lms_warmup_syms() as u64
+            + N_HEADER_SYM;
         let (sps, _) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
             .expect("profile config has valid integer sps");
         let window_samples = marker::MARKER_SYNC_LEN * sps;
@@ -394,6 +436,11 @@ impl V3Session {
             state: V3SessionState::Idle,
             cycle_samples,
             cycle_data_sym,
+            superframe_period_sym,
+            superframe_header_offset_sym,
+            elapsed_since_preamble_sym: 0,
+            next_marker_is_meta: false,
+            consecutive_miss: 0,
             audio_buffer: Vec::with_capacity(retain),
             audio_drained_samples: 0,
             total_samples: 0,
@@ -666,6 +713,16 @@ impl V3Session {
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
+        self.elapsed_since_preamble_sym = 0;
+        self.next_marker_is_meta = false;
+        self.consecutive_miss = 0;
+        // Re-arm the SC detector latch so a mid-transmission finalize (the
+        // worker no-progress timer, or a consecutive-miss escalation) can
+        // late-entry re-acquire: with the signal still present `M` is
+        // already high, so without clearing the rising-edge latch
+        // `handle_sc_fire` would never fire again. In silence/noise `M` is
+        // low, so this can't cause a spurious bootstrap.
+        self.sc.rearm();
         // NB: the silence/EOT-watch fields (`burst_energy_ref`,
         // `silence_run`, `eot_watch_remaining`) are deliberately NOT reset
         // here. The data-burst silence gate finalizes the burst → Idle but
@@ -1162,22 +1219,52 @@ impl V3Session {
                 sigma2,
             });
         }
-        // Predict the next marker position. Spacing is
-        // MARKER_LEN + seg_sym_len(this cycle's is_meta) symbols after
-        // the current marker. Phase 3b: drives the narrow-radius
-        // validation in `try_advance_to_next_marker`.
-        let cycle_step_sym = marker::MARKER_LEN as u64 + seg_sym_len as u64;
-        let next_pred = pending.marker_sym_pos_abs + cycle_step_sym;
+        // Predict the next marker (deterministic superframe-aware advance).
+        let (next_pred, next_is_meta) =
+            self.advance_prediction(pending.marker_sym_pos_abs, pending.is_meta);
         self.next_marker_sym_pos_pred = Some(next_pred);
-        // Phase 4: advance the cumulative no-drift offset by THIS cycle's
-        // length, so the next marker observation lines up against
-        // `anchor + cum_offset`.
-        if !self.drift_locked {
-            self.coarse_drift_cum_offset_sym =
-                self.coarse_drift_cum_offset_sym.saturating_add(cycle_step_sym);
-        }
+        self.next_marker_is_meta = next_is_meta;
         self.pending_decode = None;
         true
+    }
+
+    /// Advance the next-marker prediction past a segment at
+    /// `marker_pos_abs` of type `this_is_meta`, mirroring the TX's superframe
+    /// cadence EXACTLY (`build_superframe_v3_range`). Returns
+    /// `(next_pred_abs, next_is_meta)`.
+    ///
+    /// Within a superframe the spacing is `MARKER_LEN + seg_sym_len`. At the
+    /// periodic boundary the TX prepends a fresh PRE+HDR, so the next marker
+    /// sits an extra `superframe_header_offset_sym` further out and is a META
+    /// — predicting that boundary deterministically is NORMAL flow (params
+    /// carry forward untouched), not a re-acquisition. Used both after a
+    /// decode and to skip-and-continue past a missed marker (the segment
+    /// still counts toward `elapsed`, so the chain stays phase-locked).
+    fn advance_prediction(&mut self, marker_pos_abs: u64, this_is_meta: bool) -> (u64, bool) {
+        let seg_sym_len = self.seg_sym_len_past_marker(this_is_meta);
+        let cycle_step_sym = marker::MARKER_LEN as u64 + seg_sym_len as u64;
+        // Mirror TX: a META segment starts a superframe (counter resets to
+        // its own length); a DATA segment accumulates.
+        if this_is_meta {
+            self.elapsed_since_preamble_sym = cycle_step_sym;
+        } else {
+            self.elapsed_since_preamble_sym =
+                self.elapsed_since_preamble_sym.saturating_add(cycle_step_sym);
+        }
+        let boundary_due = self.elapsed_since_preamble_sym >= self.superframe_period_sym;
+        let advance_sym = if boundary_due {
+            cycle_step_sym + self.superframe_header_offset_sym
+        } else {
+            cycle_step_sym
+        };
+        // Phase 4: advance the cumulative no-drift offset by the SAME amount
+        // (incl. the PRE+HDR at a boundary) so the next observation lines up
+        // against `anchor + cum_offset`.
+        if !self.drift_locked {
+            self.coarse_drift_cum_offset_sym =
+                self.coarse_drift_cum_offset_sym.saturating_add(advance_sym);
+        }
+        (marker_pos_abs + advance_sym, boundary_due)
     }
 
     /// Phase 3b: predict-and-validate the next marker via a narrow
@@ -1238,6 +1325,9 @@ impl V3Session {
         match validated {
             Some((pos, payload)) => {
                 self.next_marker_sym_pos_pred = None;
+                // A validated marker = the TX is in sync here; clear the
+                // skip-and-continue miss counter.
+                self.consecutive_miss = 0;
                 let marker_sym_pos_abs = raw_start_abs + pos as u64;
                 let cycle_idx = match &self.state {
                     V3SessionState::Locked { cycle_idx, .. } => {
@@ -1301,19 +1391,36 @@ impl V3Session {
                 true
             }
             None => {
-                // End-of-burst is the normal case here (no more markers
-                // exist). Clear the prediction so the loop terminates
-                // and leave state Locked so a fresh SC fire on this
-                // same buffer doesn't double-bootstrap. The next
-                // `finalize()` resets the FSM cleanly.
-                self.next_marker_sym_pos_pred = None;
-                events.push(V3SessionEvent::SessionLost {
-                    reason: format!(
-                        "next-marker validation failed at sym pos {pred} (\
-                        end-of-burst or drift slip past ±{} sym radius)",
-                        marker::MARKER_SYNC_LEN,
-                    ),
-                });
+                // The predicted marker's window is fully present but no
+                // Golay+CRC marker validated there. Two cases:
+                self.consecutive_miss += 1;
+                if self.consecutive_miss >= MAX_CONSECUTIVE_MISS {
+                    // Persistent miss: the TX has likely desynced (random
+                    // next position) or this is a TxMore stream we never
+                    // EOT'd. Give up the prediction chain and return to Idle
+                    // for a late-entry re-acquire (`finalize` re-arms the SC
+                    // latch so the next high-metric sample re-bootstraps on
+                    // whatever SOF is currently on air). The worker no-
+                    // progress timer is the outer net if even that stalls.
+                    events.push(V3SessionEvent::SessionLost {
+                        reason: format!(
+                            "lost sync: {} consecutive missed markers (pred {pred}) \
+                             → Idle + late-entry re-acquire",
+                            self.consecutive_miss,
+                        ),
+                    });
+                    events.extend(self.finalize());
+                    return true;
+                }
+                // Minor OTA incident (QRM) with the TX still in sync: the
+                // next SOF position is still ~known, so SKIP the corrupted
+                // marker and keep predicting forward (its CWs are lost →
+                // RaptorQ repairs). The missed segment still counts toward
+                // the superframe `elapsed`, so the chain stays phase-locked.
+                let (next_pred, next_is_meta) =
+                    self.advance_prediction(pred, self.next_marker_is_meta);
+                self.next_marker_sym_pos_pred = Some(next_pred);
+                self.next_marker_is_meta = next_is_meta;
                 true
             }
         }
@@ -1430,6 +1537,9 @@ impl V3Session {
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
+        self.elapsed_since_preamble_sym = 0;
+        self.next_marker_is_meta = false;
+        self.consecutive_miss = 0;
         self.burst_energy_ref = 0.0;
         self.silence_run = 0;
         self.pending_silence_finalize = false;
@@ -1483,6 +1593,13 @@ impl ScDetector {
             above_threshold: false,
             last_energy: 0.0,
         }
+    }
+
+    /// Clear the rising-edge latch so the next sample with `M ≥
+    /// SC_THRESHOLD` reports a fresh fire. Used by `finalize()` to enable a
+    /// late-entry re-acquire after a mid-transmission reset.
+    fn rearm(&mut self) {
+        self.above_threshold = false;
     }
 
     /// Returns `Some(metric)` only on the rising threshold crossing.
@@ -1870,23 +1987,24 @@ mod tests {
             let drifted = apply_drift(&base_audio, ppm);
             let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
             session.set_drift_ppm(ppm);
-            let mut got_validated = false;
+            let mut n_validated = 0usize;
             for c in drifted.chunks(2400) {
-                let events = session.process_audio_chunk(c);
-                if events
-                    .iter()
-                    .any(|e| matches!(e, V3SessionEvent::MarkerValidated { .. }))
-                {
-                    got_validated = true;
+                for e in session.process_audio_chunk(c) {
+                    if matches!(e, V3SessionEvent::MarkerValidated { .. }) {
+                        n_validated += 1;
+                    }
                 }
             }
+            // The drift correction must let the burst decode multiple
+            // cycles, not just bootstrap one — a healthy count also proves
+            // skip-and-continue / escalation didn't tear the burst down
+            // mid-stream at the extremes. We no longer assert Locked at the
+            // END: end-of-burst now escalates to Idle (consecutive-miss →
+            // late-entry re-acquire), so a finished burst legitimately sits
+            // Idle once the trailing markers run out.
             assert!(
-                got_validated,
-                "no MarkerValidated at drift {ppm} ppm with matching correction",
-            );
-            assert!(
-                matches!(session.state(), V3SessionState::Locked { .. }),
-                "FSM not Locked at drift {ppm} ppm",
+                n_validated >= 3,
+                "only {n_validated} markers validated at drift {ppm} ppm with matching correction",
             );
         }
     }
@@ -2176,6 +2294,99 @@ mod tests {
         // mid-burst. We allow it but don't require it (the burst may
         // simply run out of samples first).
         let _ = session_lost;
+    }
+
+    #[test]
+    fn normal_flow_continues_across_superframe_boundaries() {
+        // A transmission long enough to span several periodic PRE+HDR
+        // superframe boundaries (V3_PREAMBLE_PERIOD_S = 4 s). This is NORMAL
+        // flow, not re-acquisition: the deterministic superframe-period
+        // mirror lets the predicted next-SOF land on the boundary META, so
+        // cycle_idx climbs monotonically across every boundary (no reset, no
+        // re-bootstrap) and parameters carry forward.
+        let cfg = high_plus_config();
+        // ~4500 B at HIGH+ (~5.3 kb/s) ⇒ well over 8 s ⇒ ≥ 2 boundaries.
+        let audio = build_v3_burst_audio(&cfg, 4500, 0xC0DE_D00D);
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut validated = Vec::<u32>::new();
+        let mut boundary_meta = false;
+        for c in audio.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                if let V3SessionEvent::MarkerValidated {
+                    cycle_idx, is_meta, ..
+                } = e
+                {
+                    validated.push(cycle_idx);
+                    // A META validated PAST cycle 0 is a periodic
+                    // superframe-boundary PRE+HDR+META — proof the boundary
+                    // was predicted and crossed in normal flow.
+                    if is_meta && cycle_idx > 0 {
+                        boundary_meta = true;
+                    }
+                }
+            }
+        }
+        for w in validated.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "cycle_idx reset → boundary NOT crossed in normal flow: {validated:?}",
+            );
+        }
+        assert!(
+            boundary_meta,
+            "no superframe-boundary META crossed — flow stalled at the first block: {validated:?}",
+        );
+        assert!(
+            validated.len() >= 8,
+            "only {} cycles validated across a multi-superframe burst",
+            validated.len(),
+        );
+    }
+
+    #[test]
+    fn rides_through_short_qrm_without_re_bootstrap() {
+        // Minor OTA incident (QRM): a short burst of noise corrupts ~one
+        // segment mid-transmission while the TX stays in sync. The session
+        // must SKIP the corrupted marker and keep predicting forward
+        // (cycle_idx climbs monotonically, NO reset-to-0 / re-bootstrap),
+        // not tear down. The corrupted CWs are simply lost.
+        let cfg = high_plus_config();
+        let mut audio = build_v3_burst_audio(&cfg, 1500, 0x1234_5678);
+        let cycle = cycle_period_samples(&cfg);
+        // Corrupt ~one cycle of samples near the middle with pseudo-noise.
+        let start = audio.len() / 2;
+        let end = (start + cycle).min(audio.len());
+        let mut s: u64 = 0xBEEF;
+        for x in &mut audio[start..end] {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *x = (((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 0.4;
+        }
+
+        let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        let mut validated = Vec::<u32>::new();
+        for c in audio.chunks(2400) {
+            for e in session.process_audio_chunk(c) {
+                if let V3SessionEvent::MarkerValidated { cycle_idx, .. } = e {
+                    validated.push(cycle_idx);
+                }
+            }
+        }
+        // Strictly increasing ⇒ no mid-burst re-bootstrap: the QRM was
+        // skipped, not recovered via a full Idle re-acquire.
+        for w in validated.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "cycle_idx reset → QRM forced a re-bootstrap instead of skip-and-continue: {validated:?}",
+            );
+        }
+        // And it kept going well past the corrupted segment.
+        let max = validated.iter().copied().max().unwrap_or(0);
+        assert!(
+            max >= 4,
+            "session did not ride through the QRM (max cycle_idx {max}): {validated:?}",
+        );
     }
 
     #[test]

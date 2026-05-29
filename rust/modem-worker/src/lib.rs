@@ -15,6 +15,7 @@
 
 pub mod event_sink;
 pub mod ptt;
+pub mod rx_v3_worker;
 pub mod rx_worker;
 pub mod session_store;
 pub mod tx_worker;

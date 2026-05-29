@@ -513,23 +513,41 @@ pub fn spawn(
     forced: bool,
     deemphasis_enabled: bool,
     allow_legacy_grid: bool,
+    turbo: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        run_worker(
-            samples,
-            sink,
-            save_dir,
-            wav_sink,
-            profile,
-            forced,
-            deemphasis_enabled,
-            allow_legacy_grid,
-            dropped_samples,
-            stop_thread,
-        );
+        // The main worker forks by mode: turbo runs the stateful
+        // fully-streaming V3Session path; legacy runs the sliding-window
+        // rx_v2 path. Both share the same capture-side plumbing
+        // (Receiver, WAV tee, de-emphasis, audio-level telemetry).
+        if turbo {
+            run_turbo_worker(
+                samples,
+                sink,
+                save_dir,
+                wav_sink,
+                profile,
+                deemphasis_enabled,
+                dropped_samples,
+                stop_thread,
+            );
+        } else {
+            run_worker(
+                samples,
+                sink,
+                save_dir,
+                wav_sink,
+                profile,
+                forced,
+                deemphasis_enabled,
+                allow_legacy_grid,
+                dropped_samples,
+                stop_thread,
+            );
+        }
     });
     WorkerHandle {
         stop,
@@ -881,6 +899,108 @@ impl WorkerState {
 // ---------------------------------------------------------------------------
 // Worker main
 // ---------------------------------------------------------------------------
+
+/// Turbo RX worker loop — the streaming fork of the main worker.
+///
+/// Owns a single `RxV3Worker` (stateful `V3Session`) for the whole capture
+/// and pushes the live sample stream straight through it: no
+/// `BATCH_TARGET_SAMPLES` batching, no re-accumulated `session_buffer`, no
+/// `scan_and_route` sliding window. Each `Receiver` delivery is forwarded
+/// verbatim to the session — the only "buffering" is the session's own
+/// bounded rolling buffer, which is O(1) per sample with persistent state
+/// ([[feedback-streaming-only-no-exceptions]]).
+///
+/// End-of-burst within a capture is the session's own job (the inter-frame
+/// silence gate + EOT re-acquisition landed in `V3Session`). Here we only
+/// handle the capture-level lifecycle: a ring-buffer overflow flushes the
+/// session to Idle (brickwall parity), and a stream disconnect finalizes.
+fn run_turbo_worker(
+    samples: Receiver<Vec<f32>>,
+    sink: Arc<dyn EventSink>,
+    save_dir: Arc<Mutex<PathBuf>>,
+    wav_sink: SharedWavSink,
+    profile: ProfileIndex,
+    deemphasis_enabled: bool,
+    dropped_samples: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = std::fs::remove_file(log_path());
+    worker_log(&format!("[turbo] start V3 profile={profile:?}"));
+    let mut driver =
+        match crate::rx_v3_worker::RxV3Worker::new(profile, save_dir.clone(), sink.clone()) {
+            Ok(d) => d,
+            Err(e) => {
+                worker_log(&format!("[turbo] driver init failed: {e}"));
+                return;
+            }
+        };
+    let mut deemph = deemphasis_enabled.then(DeemphasisFilter::new);
+    let mut total_samples: u64 = 0;
+    let mut last_dropped: u64 = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut chunk = match samples.recv_timeout(Duration::from_millis(200)) {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Capture-side brickwall parity: a producer-ring overflow leaves a
+        // hole in the stream the matched filter can't bridge. Flush the
+        // session to Idle and request a clean restart, dropping the
+        // corrupted in-flight delivery.
+        let cur_dropped = dropped_samples.load(Ordering::Relaxed);
+        if cur_dropped > last_dropped {
+            let delta = cur_dropped - last_dropped;
+            last_dropped = cur_dropped;
+            worker_log(&format!(
+                "[turbo] BRICKWALL capture: +{delta} samples dropped → finalize + idle"
+            ));
+            let _ = driver.finalize();
+            sink.emit(
+                "worker_requests_restart",
+                WorkerRequestsRestartPayload {
+                    reason: "capture-brickwall",
+                },
+            );
+            continue;
+        }
+
+        // Raw capture tee (if armed) — before de-emphasis so the WAV holds
+        // what the radio actually delivered.
+        if let Ok(mut guard) = wav_sink.lock() {
+            if let Some(ref mut s) = *guard {
+                s.write_chunk(&chunk);
+            }
+        }
+
+        total_samples += chunk.len() as u64;
+        let (peak, rms, crest_db) = compute_audio_stats(&chunk);
+        let overdrive =
+            rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
+        sink.emit(
+            "audio_level",
+            AudioLevelPayload {
+                rms,
+                peak,
+                total_samples,
+                overdrive,
+                crest_db,
+            },
+        );
+
+        // Optional NBFM de-emphasis, AFTER the raw tee + level metric and
+        // BEFORE the modem sees the samples (matches the legacy path).
+        if let Some(f) = deemph.as_mut() {
+            f.process(&mut chunk);
+        }
+
+        driver.push_samples(&chunk);
+    }
+
+    let _ = driver.finalize();
+    worker_log("[turbo] stop");
+}
 
 fn run_worker(
     samples: Receiver<Vec<f32>>,
