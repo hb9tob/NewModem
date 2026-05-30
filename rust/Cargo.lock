@@ -2985,6 +2985,7 @@ dependencies = [
 name = "modem-io"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "cpal",
  "libc",
  "rtrb",

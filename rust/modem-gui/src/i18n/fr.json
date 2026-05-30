@@ -107,6 +107,8 @@
   "settings.legend_tx_device": "Périphérique émission (TX)",
   "settings.tx_preemphasis": "Pré-emphase PM +6 dB/oct (radio FM legacy)",
   "settings.tx_preemphasis_hint": "Pente montante +6 dB/oct au-dessus de 300 Hz (~+10 dB à 1 kHz, ~+19 dB à 2.7 kHz). Émule la pré-emphase ±6 dB/oct intrinsèque d'une radio PM. Le signal est re-normalisé après filtrage pour ne pas écrêter la sortie TX. À activer uniquement si la radio fait du vrai FM (sans le ±6 dB/oct PM natif) — toujours en duo avec la désemphase RX côté récepteur.",
+  "settings.tx_hwvol": "Niveau sortie carte son (matériel)",
+  "settings.tx_hwvol_hint": "Règle le gain matériel de la carte son USB (contrôle « Speaker »). C'est le niveau injecté dans l'émetteur — à baisser pour ne pas surmoduler. Distinct de l'atténuation logicielle de l'onglet Canal.",
   "settings.tx_save_wav": "Sauver le WAV émis dans tx_history/",
   "settings.tx_save_wav_hint": "Écrit l'audio synthétisé (mono 48 kHz int16, post pré-emphase et atténuation) à côté du fichier source archivé. Désactivé par défaut.",
   "settings.legend_ptt": "PTT (RTS/DTR sur port série)",

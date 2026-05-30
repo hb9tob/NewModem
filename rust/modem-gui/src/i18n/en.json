@@ -107,6 +107,8 @@
   "settings.legend_tx_device": "Transmit device (TX)",
   "settings.tx_preemphasis": "PM pre-emphasis +6 dB/oct (legacy FM radio)",
   "settings.tx_preemphasis_hint": "Rising slope +6 dB/oct above 300 Hz (~+10 dB at 1 kHz, ~+19 dB at 2.7 kHz). Emulates the ±6 dB/oct pre-emphasis intrinsic to a PM radio. The signal is re-normalised after filtering so the TX output does not clip. Enable only if the radio is true FM (no native ±6 dB/oct PM) — always paired with RX de-emphasis on the receiver side.",
+  "settings.tx_hwvol": "Sound-card output level (hardware)",
+  "settings.tx_hwvol_hint": "Sets the USB sound card's hardware gain (the \"Speaker\" control). This is the level fed into the transceiver — lower it to avoid over-modulating. Distinct from the software attenuation on the Channel tab.",
   "settings.tx_save_wav": "Save the transmitted WAV in tx_history/",
   "settings.tx_save_wav_hint": "Writes the synthesised audio (mono 48 kHz int16, post pre-emphasis and attenuation) next to the archived source file. Disabled by default.",
   "settings.legend_ptt": "PTT (RTS/DTR on serial port)",

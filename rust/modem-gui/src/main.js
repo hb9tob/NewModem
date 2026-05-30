@@ -1644,6 +1644,7 @@ async function loadDevices() {
       prefetchCapsForSelected("tx-device-select"),
     ]);
     refreshSdrPanels();
+    refreshTxHwVolume();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
@@ -1987,6 +1988,34 @@ async function persistSettings() {
   }
 }
 
+// Show/sync the Pi-only hardware playback-volume slider for the current
+// TX device. Hidden unless the device exposes a controllable ALSA mixer
+// (`tx_device_has_mixer`); when shown, seeds the slider from the card's
+// live "Speaker" level (`get_tx_volume`). No-op on non-Tauri / non-Linux
+// hosts (the commands return false/None and the row stays hidden).
+async function refreshTxHwVolume() {
+  const row = document.getElementById("tx-hwvol-row");
+  if (!row) return;
+  if (!window.__TAURI__ || !window.__TAURI__.core) { row.hidden = true; return; }
+  const { invoke } = window.__TAURI__.core;
+  const dev = ((currentSettings && currentSettings.tx_device) || "").trim();
+  if (!dev) { row.hidden = true; return; }
+  try {
+    const hasMixer = await invoke("tx_device_has_mixer", { deviceName: dev });
+    if (!hasMixer) { row.hidden = true; return; }
+    const pct = await invoke("get_tx_volume", { deviceName: dev });
+    if (pct == null) { row.hidden = true; return; }
+    const slider = document.getElementById("tx-hwvol");
+    const label = document.getElementById("tx-hwvol-val");
+    if (slider) slider.value = String(pct);
+    if (label) label.textContent = `${pct}%`;
+    row.hidden = false;
+  } catch (err) {
+    console.warn("refreshTxHwVolume failed:", err);
+    row.hidden = true;
+  }
+}
+
 function setupSettingsTab() {
   const call = document.getElementById("callsign-input");
   const rxSel = document.getElementById("rx-device-select");
@@ -2020,6 +2049,27 @@ function setupSettingsTab() {
       await prefetchCapsForSelected("tx-device-select");
       refreshSdrPanels();
       persistSettings();
+      refreshTxHwVolume();
+    });
+  }
+  // Hardware playback-volume slider (Pi/ALSA only). Shown when the
+  // selected TX device exposes a controllable mixer; drives the codec's
+  // "Speaker" attenuator live (no settings round-trip — it's a hardware
+  // mixer value, not a persisted app setting).
+  const hwvol = document.getElementById("tx-hwvol");
+  if (hwvol) {
+    const label = document.getElementById("tx-hwvol-val");
+    const paint = () => { if (label) label.textContent = `${hwvol.value}%`; };
+    hwvol.addEventListener("input", paint);
+    hwvol.addEventListener("change", async () => {
+      paint();
+      const dev = ((currentSettings && currentSettings.tx_device) || "").trim();
+      if (!dev) return;
+      try {
+        await invoke("set_tx_volume", { deviceName: dev, pct: Number(hwvol.value) });
+      } catch (err) {
+        console.warn("set_tx_volume failed:", err);
+      }
     });
   }
   // SDR-specific inputs are wired up at row-build time inside

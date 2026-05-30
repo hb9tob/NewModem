@@ -586,6 +586,20 @@ fn run_playback(
     }
     let total_samples = samples.len();
 
+    // Force the sound card's "Auto Gain Control" OFF before every burst.
+    // On the Pi reference chain a USB codec's playback AGC applies a
+    // *time-varying* gain that destroys the APSK amplitude rings and
+    // fights the operator's deliberate level setting — the root cause of
+    // "TX does garbage / chunks missing / RX reopens old sessions". The
+    // call is a no-op for non-ALSA-card devices (SDR composites, HDMI)
+    // and for cards without an AGC control; idempotent and best-effort,
+    // so a mixer error never aborts the transmission.
+    match modem_io::alsa_mixer::disable_agc(device_name) {
+        Ok(true) => eprintln!("[tx] AGC disabled on '{device_name}'"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[tx] AGC disable failed on '{device_name}': {e}"),
+    }
+
     // PTT: switch to TX BEFORE opening the audio stream, then wait
     // 200 ms for the transceiver to commute. The single-step
     // SampleSink::play_buffer combines lookup+build+play, so a missing

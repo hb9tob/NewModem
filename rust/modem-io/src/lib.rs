@@ -9,6 +9,7 @@
 //! phase 3a of the layered-arch refactor — same code, new home, same
 //! public surface so existing callers compile unchanged.
 
+pub mod alsa_mixer;
 pub mod cpal_capture;
 pub mod cpal_sink;
 pub mod devices;

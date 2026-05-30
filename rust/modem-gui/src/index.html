@@ -360,6 +360,23 @@
           <select id="tx-device-select">
             <option data-i18n="settings.loading">Chargement…</option>
           </select>
+          <!-- Pi-only hardware playback level (drives the USB codec's
+               linear "Speaker" attenuator via ALSA). Hidden unless the
+               selected TX device exposes a controllable ALSA mixer. This
+               is the on-air level knob; distinct from the software TX
+               attenuation on the Channel tab. -->
+          <div id="tx-hwvol-row" style="margin-top: 0.6rem;" hidden>
+            <label for="tx-hwvol" data-i18n="settings.tx_hwvol">Niveau sortie carte son (matériel)</label>
+            <div style="display:flex; align-items:center; gap:0.6rem;">
+              <input type="range" id="tx-hwvol" min="0" max="100" step="1" value="50" style="flex:1;">
+              <span id="tx-hwvol-val" style="min-width:3ch; text-align:right;">50%</span>
+            </div>
+            <p class="tx-hint" style="margin: 0.3rem 0 0;" data-i18n="settings.tx_hwvol_hint">
+              Règle le gain matériel de la carte son USB (contrôle « Speaker »).
+              C'est le niveau injecté dans l'émetteur — à baisser pour ne pas
+              surmoduler. Distinct de l'atténuation logicielle de l'onglet Canal.
+            </p>
+          </div>
           <label class="ptt-row" style="margin-top: 0.5rem;">
             <input type="checkbox" id="tx-preemphasis-enabled">
             <span data-i18n="settings.tx_preemphasis">Pré-emphase PM +6 dB/oct (radio FM legacy)</span>

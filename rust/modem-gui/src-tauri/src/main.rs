@@ -151,6 +151,35 @@ fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_output_devices().map_err(|e| e.to_string())
 }
 
+/// Read the TX sound card's hardware playback level as a 0..=100 %.
+///
+/// Returns `None` when `device_name` isn't a controllable ALSA hardware
+/// card (SDR composite, HDMI, non-Linux host, or a card without a
+/// playback volume control) — the frontend hides the Pi volume slider in
+/// that case. The slider drives the codec's linear `Speaker` attenuator,
+/// which is the operator's on-air level knob; it is deliberately distinct
+/// from the software `tx_attenuation_db` cascade setting.
+#[tauri::command]
+fn get_tx_volume(device_name: String) -> Result<Option<u8>, String> {
+    modem_io::alsa_mixer::playback_volume_pct(&device_name)
+}
+
+/// Set the TX sound card's hardware playback level from a 0..=100 %.
+/// `Ok(false)` when the device has no controllable volume (frontend
+/// keeps the slider hidden / disabled). Linux/ALSA only — a no-op
+/// elsewhere.
+#[tauri::command]
+fn set_tx_volume(device_name: String, pct: u8) -> Result<bool, String> {
+    modem_io::alsa_mixer::set_playback_volume_pct(&device_name, pct)
+}
+
+/// Whether the given TX device exposes an ALSA hardware mixer the GUI can
+/// drive (gates the Pi-only volume slider in the frontend).
+#[tauri::command]
+fn tx_device_has_mixer(device_name: String) -> bool {
+    modem_io::alsa_mixer::is_alsa_card(&device_name)
+}
+
 /// Per-backend descriptor shipped to the GUI frontend at startup.
 /// Each compiled-in `SdrBackend` produces one entry; the frontend
 /// caches the list keyed by `id` and reads `capabilities` to
@@ -2168,6 +2197,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
+            get_tx_volume,
+            set_tx_volume,
+            tx_device_has_mixer,
             list_sdr_backends,
             list_sdr_devices,
             get_backend_library_status,
