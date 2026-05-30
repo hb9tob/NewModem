@@ -47,8 +47,12 @@ unsigned_is_multiple_of`.
 Always invoke cargo via the absolute rustup path for builds on this box:
 
 ```bash
-/home/hb3xek/.cargo/bin/cargo build --release -p modem-worker
+~/.cargo/bin/cargo build --release -p modem-worker
 ```
+
+(The cargo binary lives under the invoking user's home, e.g.
+`/home/hb9tob/.cargo/bin/cargo` — use `~/.cargo/bin/cargo` so the path is
+correct whichever account builds on the box.)
 
 Or source the env once per shell: `. "$HOME/.cargo/env"`.
 
