@@ -104,6 +104,8 @@
   "settings.rx_deemphasis_hint": "Pente descendante −6 dB/oct au-dessus de 300 Hz (~−10 dB à 1 kHz, ~−19 dB à 2.7 kHz). Symétrique exacte de la pré-emphase TX ci-dessous : ensemble, ils émulent le ±6 dB/oct intrinsèque d'une radio PM. Capture WAV brute et level-meter inchangés — seul le démod modem voit le signal filtré. À activer uniquement si la radio fait du vrai FM (sans le ±6 dB/oct PM natif).",
   "settings.rx_power_mode": "Power Mode",
   "settings.rx_power_mode_hint_html": "Algorithme RX 0.9.x — balayage de drift complet ±80 ppm par fenêtre (coarse 20 ppm + fine ±10 ppm). Décode robuste éprouvé. Timeout preamble-absence flat 6 s pour tous profils (strict 0.9.2rc5). Recommandé sur PC moderne, à décocher sur Pi ou vieux PC où le worker peut prendre du retard temps-réel. <em>Désactivé par défaut sur Raspberry Pi.</em>",
+  "settings.audio_backend_alsa": "ALSA direct (hw:)",
+  "settings.audio_backend_alsa_hint_html": "Accès direct à la carte son en <code>hw:</code> — contourne la couche cpal/<code>plug</code> qui peut rééchantillonner en douce (bug libspeexdsp, fatal pour le modem). Recommandé sur Raspberry Pi. Décocher pour revenir au backend cpal si la carte refuse l'ouverture directe. Sans effet hors Linux.",
   "settings.legend_tx_device": "Périphérique émission (TX)",
   "settings.tx_preemphasis": "Pré-emphase PM +6 dB/oct (radio FM legacy)",
   "settings.tx_preemphasis_hint": "Pente montante +6 dB/oct au-dessus de 300 Hz (~+10 dB à 1 kHz, ~+19 dB à 2.7 kHz). Émule la pré-emphase ±6 dB/oct intrinsèque d'une radio PM. Le signal est re-normalisé après filtrage pour ne pas écrêter la sortie TX. À activer uniquement si la radio fait du vrai FM (sans le ±6 dB/oct PM natif) — toujours en duo avec la désemphase RX côté récepteur.",

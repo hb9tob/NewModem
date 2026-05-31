@@ -92,6 +92,15 @@ pub struct Settings {
     #[serde(default = "default_rx_allow_legacy_grid")]
     pub rx_allow_legacy_grid: bool,
 
+    /// Audio backend for TX playback + RX capture: `"alsa"` (direct
+    /// `hw:` PCM — the Linux/Pi default, bypasses cpal's resampling
+    /// `plug` layer) or `"cpal"` (the cross-platform fallback, kept
+    /// selectable from Settings for setups where the direct path
+    /// misbehaves). Parsed via `modem_io::AudioBackend::from_setting`;
+    /// no-op on non-Linux where both resolve to cpal.
+    #[serde(default = "default_audio_backend")]
+    pub audio_backend: String,
+
     /// Base URL of the Phase-D collector. Pre-filled with
     /// [`DEFAULT_COLLECTOR_URL`] so out-of-the-box installs talk to the
     /// shared aggregator at `hb9tob.duckdns.org`. The user can override
@@ -305,6 +314,11 @@ fn default_tx_quality() -> u32 {
 fn default_rx_allow_legacy_grid() -> bool {
     !cfg!(target_arch = "aarch64")
 }
+/// Platform default audio backend: direct ALSA on Linux, cpal elsewhere.
+/// Single source of truth lives in `modem_io::AudioBackend`.
+fn default_audio_backend() -> String {
+    modem_io::AudioBackend::platform_default().as_str().to_string()
+}
 fn default_tx_repair_pct() -> u32 {
     5
 }
@@ -351,6 +365,7 @@ impl Default for Settings {
             tx_preemphasis_enabled: false,
             rx_deemphasis_enabled: false,
             rx_allow_legacy_grid: default_rx_allow_legacy_grid(),
+            audio_backend: default_audio_backend(),
             collector_url: default_collector_url(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),

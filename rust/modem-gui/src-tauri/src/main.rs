@@ -10,9 +10,9 @@ mod tx_encode;
 use modem_worker::session_store;
 use modem_worker::{rx_worker, tx_worker, EventSink};
 
-use modem_io::cpal_capture::{self, CaptureHandle};
+use modem_io::cpal_capture::CaptureHandle;
 use modem_io::devices::{list_input_devices, list_output_devices, DeviceInfo};
-use modem_io::{CpalSink, SampleSink};
+use modem_io::SampleSink;
 use modem_sdr::{DeviceDescriptor, SdrCaptureHandle, SdrDevice};
 use ptt::SharedPtt;
 use settings::Settings;
@@ -477,7 +477,11 @@ fn resolve_tx_sink(device_name: &str, cfg: &Settings) -> Result<Arc<dyn SampleSi
             .tx_sink()
             .ok_or_else(|| format!("{} est RX uniquement", backend.id()))
     } else {
-        Ok(Arc::new(CpalSink))
+        // Sound-card TX: pick ALSA-direct vs cpal per the persisted
+        // audio_backend setting (Linux only; cpal everywhere else).
+        Ok(modem_io::make_sink(modem_io::AudioBackend::from_setting(
+            &cfg.audio_backend,
+        )))
     }
 }
 
@@ -589,7 +593,10 @@ fn build_capture_session(
                 true,
             )
         } else {
-            let (h, rx) = cpal_capture::start(device_name)?;
+            // Sound-card capture: ALSA-direct vs cpal per the persisted
+            // audio_backend setting (Linux only; cpal everywhere else).
+            let backend = modem_io::AudioBackend::from_setting(&cfg.audio_backend);
+            let (h, rx) = modem_io::start_capture(backend, device_name)?;
             let dropped = h.dropped_samples.clone();
             (CaptureKind::Cpal(h), rx, dropped, false)
         };
@@ -1776,7 +1783,8 @@ fn sounding_rx_start_capture(
             .map_err(|e| format!("{}: {e}", backend.id()))?;
         (CaptureKind::Sdr(device, cap_handle), rx)
     } else {
-        let (h, rx) = cpal_capture::start(&device_name)?;
+        let backend = modem_io::AudioBackend::from_setting(&cfg.audio_backend);
+        let (h, rx) = modem_io::start_capture(backend, &device_name)?;
         (CaptureKind::Cpal(h), rx)
     };
 

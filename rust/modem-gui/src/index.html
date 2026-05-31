@@ -345,6 +345,17 @@
             vieux PC où le worker peut prendre du retard temps-réel.
             <em>Désactivé par défaut sur Raspberry Pi.</em>
           </p>
+          <label class="ptt-row" style="margin-top: 0.7rem;">
+            <input type="checkbox" id="audio-backend-alsa">
+            <span data-i18n="settings.audio_backend_alsa">ALSA direct (hw:)</span>
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n-html="settings.audio_backend_alsa_hint_html">
+            Accès direct à la carte son en <code>hw:</code> — contourne la
+            couche cpal/<code>plug</code> qui peut rééchantillonner en
+            douce (bug libspeexdsp, fatal pour le modem). Recommandé sur
+            Raspberry Pi. Décocher pour revenir au backend cpal si la carte
+            refuse l'ouverture directe. Sans effet hors Linux.
+          </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
                in main.js fills this from `BackendCapabilities` of the
                currently-selected SDR backend. Adding a new backend is
