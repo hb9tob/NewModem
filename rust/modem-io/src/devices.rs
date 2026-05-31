@@ -56,16 +56,21 @@ fn alsa_card_descriptions() -> std::collections::HashMap<String, String> {
 }
 
 fn friendly(name: &str, cards: &std::collections::HashMap<String, String>) -> String {
+    // Direct-hardware PCMs (`hw:CARD=…,DEV=0`) are the ones the ALSA-direct
+    // backend opens untouched — tag them so the combo makes the difference
+    // obvious. The virtual aliases below route through the sound server
+    // (PulseAudio/PipeWire/dmix), which can resample and which the
+    // ALSA-direct backend refuses; flag them as such.
     if let Some(rest) = name.strip_prefix("hw:CARD=") {
         let card_id = rest.split(',').next().unwrap_or(rest);
         if let Some(desc) = cards.get(card_id) {
-            return format!("{desc} ({card_id})");
+            return format!("{desc} ({card_id}) · ALSA direct (hw:)");
         }
     }
     match name {
-        "default" => "Système (default ALSA)".into(),
-        "pulse" => "PulseAudio".into(),
-        "pipewire" => "PipeWire".into(),
+        "default" => "Système (default ALSA) · via serveur son".into(),
+        "pulse" => "PulseAudio · via serveur son".into(),
+        "pipewire" => "PipeWire · via serveur son".into(),
         _ => name.to_string(),
     }
 }
