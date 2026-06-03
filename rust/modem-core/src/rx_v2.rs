@@ -1277,16 +1277,83 @@ pub fn rx_v2_single_cancellable(
     // LMS adapts on the actual data density BEFORE the first meta CW,
     // which is then no longer the first encounter of the DD switch on
     // 64-APSK.
-    let mut preamble_training: Vec<(usize, Complex64)> = preamble_syms
+    let mu_train = 0.10;
+    let mu_dd = 0.02;
+    let header_start = N_PREAMBLE + warmup_len;
+    let header_end = header_start + header_sym_count;
+
+    // --- Phase 1: read the protocol header with a preamble-ONLY trained FFE.
+    //
+    // The warmup symbols' constellation is unknown until profile_index is
+    // read. In auto-detect the worker runs this first pass under the family-A
+    // anchor (NORMAL/8PSK), so the warmup reference would be 8PSK while the
+    // air warmup is the real profile's APSK. Supervised-training the FFE on
+    // that wrong reference corrupts the QPSK Golay header — observed as HIGH+
+    // never reading profile_index and never activating. The header is QPSK
+    // and needs no warmup adaptation, so train on the preamble alone, just
+    // far enough to reach the header.
+    let preamble_only: Vec<(usize, Complex64)> = preamble_syms
         .iter()
         .enumerate()
         .map(|(k, &s)| (k, s))
         .collect();
-    for (k, &s) in warmup_syms.iter().enumerate() {
+    let hdr_pass_syms = (header_end + 1).min(max_syms);
+    let (hdr_rx_syms, _) = {
+        let _t = StageTimer::new(PerfStage::FfeLms);
+        ffe::apply_ffe_lms_with_training(
+            &fse_input,
+            &ffe_initial,
+            fse_start,
+            pitch_fse,
+            hdr_pass_syms,
+            &preamble_only,
+            &constellation,
+            mu_train,
+            mu_dd,
+        )
+    };
+    if cancelled() {
+        return None;
+    }
+    if hdr_rx_syms.len() < header_end {
+        return None;
+    }
+    let hdr_gain = {
+        let mut num = Complex64::new(0.0, 0.0);
+        let mut den = 0.0f64;
+        for k in 0..N_PREAMBLE {
+            num += hdr_rx_syms[k] * preamble_syms[k].conj();
+            den += preamble_syms[k].norm_sqr();
+        }
+        if den > 1e-12 {
+            num / den
+        } else {
+            Complex64::new(1.0, 0.0)
+        }
+    };
+    let header_syms: Vec<Complex64> = hdr_rx_syms[header_start..header_end]
+        .iter()
+        .map(|&s| s / hdr_gain)
+        .collect();
+    let decoded_header = header::decode_header_symbols(&header_syms)?;
+    if decoded_header.version != HEADER_VERSION_V3 {
+        return None;
+    }
+
+    // --- Phase 2: rewind, retrain the FFE on preamble + the CORRECT warmup.
+    //
+    // profile_index is now known, so rebuild the warmup reference from the
+    // actual profile (not the possibly-anchor `config`): the LMS guard
+    // interval then adapts on the true data constellation before the first
+    // CW, which is what 64-APSK (HIGH++) relies on. The warmup symbol *count*
+    // is uniform (32) across family A, so header/data offsets are unchanged.
+    let warmup_syms_eff = crate::profile::ProfileIndex::from_u8(decoded_header.profile_index)
+        .map(|p| preamble::make_lms_warmup_for_config(&p.to_config()))
+        .unwrap_or_else(|| warmup_syms.clone());
+    let mut preamble_training = preamble_only;
+    for (k, &s) in warmup_syms_eff.iter().enumerate() {
         preamble_training.push((N_PREAMBLE + k, s));
     }
-    let mu_train = 0.10;
-    let mu_dd = 0.02;
     let (all_rx_syms, final_taps) = {
         let _t = StageTimer::new(PerfStage::FfeLms);
         ffe::apply_ffe_lms_with_training(
@@ -1305,11 +1372,11 @@ pub fn rx_v2_single_cancellable(
     if cancelled() {
         return None;
     }
-    if all_rx_syms.len() < N_PREAMBLE + warmup_len + header_sym_count {
+    if all_rx_syms.len() < header_end {
         return None;
     }
 
-    // Global gain LS from preamble
+    // Global gain LS from preamble (data pass)
     let gain = {
         let mut num = Complex64::new(0.0, 0.0);
         let mut den = 0.0f64;
@@ -1324,16 +1391,6 @@ pub fn rx_v2_single_cancellable(
         }
     };
     let corrected: Vec<Complex64> = all_rx_syms.iter().map(|&s| s / gain).collect();
-
-    // Protocol header (v2 or v3 — same structure ; v3 only adds periodic
-    // preamble+header insertions before each meta segment, transparent to
-    // the marker-based segment walker below).
-    let header_start = N_PREAMBLE + warmup_len;
-    let header_syms = &corrected[header_start..header_start + header_sym_count];
-    let decoded_header = header::decode_header_symbols(header_syms)?;
-    if decoded_header.version != HEADER_VERSION_V3 {
-        return None;
-    }
 
     // Walk data region segment by segment
     let data_region_start = header_start + header_sym_count;
@@ -1401,6 +1458,11 @@ pub fn rx_v2_single_cancellable(
     // (multi-round merging is a higher-layer concern, handled in phase 2.5).
     let mut session_id_low_lock: Option<u8> = None;
 
+    // Set once any decoded marker carries the last-segment (EOT) flag. Folded
+    // into `eot_seen` so the session ends on EOT read in this (CLOSED) window
+    // rather than waiting for the trailing EOT frame's skipped OPEN window.
+    let mut saw_last_marker = false;
+
     // Sliding marker detection: at each expected marker position, search within
     // a small window for the sync-pattern correlation peak. This tolerates
     // TCXO drift on long OTA transmissions and a few lost/added samples after
@@ -1440,6 +1502,7 @@ pub fn rx_v2_single_cancellable(
             }
         };
         consecutive_fails = 0;
+        saw_last_marker |= marker_payload.is_last();
         // Snap cursor to the detected marker so downstream segment extraction
         // uses the correct position.
         cursor = marker_pos;
@@ -1693,7 +1756,7 @@ pub fn rx_v2_single_cancellable(
     };
 
     let data_blocks_recovered = cw_bytes.len();
-    let eot_seen = decoded_header.flags & header::FLAG_EOT != 0;
+    let eot_seen = (decoded_header.flags & header::FLAG_EOT != 0) || saw_last_marker;
     record_stage(PerfStage::PassDone, 0);
     Some(RxV2Result {
         data: assembled,
@@ -3049,6 +3112,47 @@ mod tests {
         // The main burst's real file_size must win despite the EOT's zero
         // marker being present in a later window.
         assert_eq!(ah.file_size as usize, data.len());
+        assert_eq!(&result.data[..data.len()], &data[..]);
+    }
+
+    /// EOT must be detected from the last-segment marker (CLOSED window), not
+    /// only from the trailing EOT frame. Reproduces the ACTIVE-worker path:
+    /// decode with `finalize = false`, so the EOT frame's trailing OPEN window
+    /// is SKIPPED. `eot_seen` must still be true — set by the main burst's
+    /// final-segment marker (`LAST_FLAG_BIT`), which the EOT frame's preamble
+    /// closes into a decodable CLOSED window. Without the marker flag this
+    /// would be false and the worker would fall back to the absence timeout.
+    #[test]
+    fn loopback_v3_eot_from_marker_when_open_window_skipped() {
+        let config = profile_high();
+        let data: Vec<u8> = (0..2_000)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) as u8)
+            .collect();
+        let session = 0x1234_5678u32;
+        let (sps, pitch) =
+            rrc::check_integer_constraints(AUDIO_RATE, config.symbol_rate, config.tau)
+                .expect("profile");
+        let taps = rrc_taps(config.beta, RRC_SPAN_SYM, sps);
+        let main_syms = frame::build_superframe_v3(
+            &data, &config, session, modem_framing::app_header::mime::BINARY, make_session_hash(&data),
+        );
+        let main_audio = crate::modulator::modulate(&main_syms, sps, pitch, &taps, config.center_freq_hz);
+        let eot_syms = frame::build_eot_frame(&config, session);
+        let eot_audio = crate::modulator::modulate(&eot_syms, sps, pitch, &taps, config.center_freq_hz);
+        let silence = vec![0.0f32; (AUDIO_RATE as f64 * 0.2) as usize];
+        let mut combined = main_audio;
+        combined.extend_from_slice(&silence);
+        combined.extend_from_slice(&eot_audio);
+
+        // finalize=false → trailing OPEN (EOT frame) is skipped, as in an
+        // active session. eot_seen must come from the CLOSED main burst's
+        // last-segment marker.
+        let result = rx_v3_after(&combined, &config, 0, false, None, true, false, false)
+            .expect("rx_v3_after should decode the CLOSED main burst");
+        assert!(
+            result.eot_seen,
+            "last-segment marker must set eot_seen even when the EOT OPEN window is skipped"
+        );
         assert_eq!(&result.data[..data.len()], &data[..]);
     }
 

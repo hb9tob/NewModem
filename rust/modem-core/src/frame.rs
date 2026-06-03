@@ -15,7 +15,7 @@ use crate::constellation::{self, Constellation};
 use crate::header::{self, Header, FLAG_EOT, FLAG_LAST};
 use crate::interleaver;
 use crate::ldpc::encoder::LdpcEncoder;
-use crate::marker::{self, MarkerPayload, META_FLAG_BIT};
+use crate::marker::{self, MarkerPayload, LAST_FLAG_BIT, META_FLAG_BIT};
 use crate::pilot;
 use crate::preamble;
 use crate::profile::{ConstellationType, ModemConfig};
@@ -28,8 +28,8 @@ pub const HEADER_VERSION_V3: u8 = 3;
 /// segment durations roughly to 0.77 s at 16-APSK / 1 s at 8PSK / 2.3 s at QPSK.
 pub const V2_CODEWORDS_PER_SEGMENT: usize = 2;
 
-/// Round `n_packets` up to the smallest count that fills every data segment
-/// completely (multiple of `V2_CODEWORDS_PER_SEGMENT`).
+/// Round `n_packets` up to a multiple of `PACKET_QUANTUM` (= two full data
+/// segments).
 ///
 /// The TX walks data in segments of `V2_CODEWORDS_PER_SEGMENT` codewords ; the
 /// RX always reads that many CW + their pilots when stepping past a marker.
@@ -37,17 +37,26 @@ pub const V2_CODEWORDS_PER_SEGMENT: usize = 2;
 /// observed OTA), the final segment would carry only 1 CW while the RX still
 /// reads 2 — the trailing runout (~160 sym) doesn't cover the missing CW, so
 /// `cursor + seg_sym_len > data_region.len()` triggers the `break` and the
-/// last segment is dropped. Always emitting an even number of packets keeps
+/// last segment is dropped. Rounding to a whole number of segments keeps
 /// every segment full.
+///
+/// We round to a multiple of FOUR (two segments), not two: it keeps each
+/// burst — and every `tx-more` increment — a whole number of segment pairs,
+/// so the final superframe is complete and its last-segment marker (which
+/// carries `LAST_FLAG_BIT`) lands in a cleanly CLOSED window for EOT detection.
 ///
 /// Multi-burst callers (`tx-more`) must use this helper to compute the
 /// `esi_start` of the next burst : if burst 1 was asked for N packets, it
 /// actually emitted `effective_packet_count(N)`, and burst 2 must start at
 /// that ESI to avoid duplication or gaps.
 pub fn effective_packet_count(n_packets: u32) -> u32 {
-    let m = V2_CODEWORDS_PER_SEGMENT as u32;
+    let m = PACKET_QUANTUM as u32;
     n_packets.div_ceil(m) * m
 }
+
+/// Packet-count granularity: two full data segments. See
+/// [`effective_packet_count`] for the rationale.
+pub const PACKET_QUANTUM: usize = 2 * V2_CODEWORDS_PER_SEGMENT;
 
 /// v3 target period between periodic preamble+header insertions, in seconds.
 /// The builder inserts PRE+HDR+META at the next segment boundary after this
@@ -284,11 +293,15 @@ pub fn build_superframe_v3_range(
         for i in 0..cw_take {
             seg_data.extend_from_slice(&data_cw_syms[data_cursor + i]);
         }
+        // Flag the final data segment of this burst: the EOT frame that
+        // follows closes its window, so the RX reads this marker in a CLOSED
+        // window and ends the session on EOT instead of the absence timeout.
+        let is_last_segment = data_cursor + cw_take >= n_data_cw;
         let payload = MarkerPayload {
             seg_id,
             session_id_low,
             base_esi: esi_start + data_cursor as u32,
-            flags: 0,
+            flags: if is_last_segment { LAST_FLAG_BIT } else { 0 },
             reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));

@@ -49,6 +49,14 @@ pub const MARKER_CTRL_BYTES: usize = 12;
 /// meta_flag bit position inside the flags byte.
 pub const META_FLAG_BIT: u8 = 0x01;
 
+/// last-segment flag bit inside the flags byte: this marker belongs to the
+/// final data segment of the burst (EOT follows). The RX uses it to end the
+/// session on an EOT decoded in a CLOSED window — reliable, unlike the
+/// trailing EOT frame whose OPEN window is skipped during an active session.
+/// Backward compatible: older decoders test only `META_FLAG_BIT` and ignore
+/// this bit; older encoders leave it clear.
+pub const LAST_FLAG_BIT: u8 = 0x02;
+
 /// Fixed sync-pattern phase table (32 QPSK symbols).
 /// Values in {0,1,2,3}, mapped to `exp(j*(pi/4 + q*pi/2))` to match the
 /// preamble convention.
@@ -81,6 +89,11 @@ pub struct MarkerPayload {
 impl MarkerPayload {
     pub fn is_meta(&self) -> bool {
         self.flags & META_FLAG_BIT != 0
+    }
+
+    /// `true` if this marker carries the last-segment (EOT) flag.
+    pub fn is_last(&self) -> bool {
+        self.flags & LAST_FLAG_BIT != 0
     }
 
     /// Serialize to 12 bytes: seg_id(2) + session(1) + base_esi(3) + flags(1)
