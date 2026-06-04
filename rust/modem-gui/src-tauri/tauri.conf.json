@@ -31,6 +31,7 @@
     "active": true,
     "targets": ["deb", "appimage", "nsis"],
     "externalBin": ["binaries/nbfm-modem"],
+    "resources": ["rtlsdr.dll"],
     "category": "Utility",
     "shortDescription": "NBFM modem audio receiver",
     "longDescription": "GUI receiver for NBFM audio modem (amateur radio image transmission).",
