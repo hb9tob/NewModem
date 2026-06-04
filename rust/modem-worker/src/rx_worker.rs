@@ -2367,6 +2367,7 @@ fn unique_path(dir: &Path, filename: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::unique_path;
+    use modem_core::profile::ProfileIndex as ProfileIndexT;
     use std::fs;
     use std::path::PathBuf;
 
@@ -2455,5 +2456,176 @@ mod tests {
         let mut buf = original.clone();
         // No call to filter.process -> buffer unchanged.
         assert_eq!(buf, original);
+    }
+
+    /// Deterministic Box-Muller-ish AWGN (sum-of-uniforms) — a local copy of
+    /// the channel-sim noise helper (the modem-core one is test-private). Adds
+    /// Gaussian noise scaled to `noise_rms`.
+    fn add_awgn(samples: &mut [f32], noise_rms: f32, seed: u64) {
+        let mut s = seed | 1;
+        let mut next = || {
+            // xorshift64* → uniform in [0,1)
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            (((s.wrapping_mul(0x2545_F491_4F6C_DD1D)) >> 11) as f64 / (1u64 << 53) as f64) as f32
+        };
+        for v in samples.iter_mut() {
+            let g = (0..12).map(|_| next()).sum::<f32>() - 6.0; // ~N(0,1)
+            *v += g * noise_rms;
+        }
+    }
+
+    /// V4 end-to-end validation through the RX worker: synthesise a V4
+    /// stream for `profile_name`, pass it through a (mild AWGN) channel, and
+    /// inject it into `rx_worker::spawn` **chunk by chunk** in auto-detect mode
+    /// (`forced = false`, anchor = NORMAL). The worker must auto-activate the
+    /// profile from the bootstrap marker's `profile_index` (the V4 headerless
+    /// path) and recover the payload bit-exact — exactly the flow that regressed
+    /// in V3 (project_high_highplus_ota_regression). `payload_len` is sized per
+    /// profile so the burst clears the 8 s active-buffer floor and spans ≥2
+    /// preamble re-insertions.
+    fn run_v4_worker_sim(profile_name: &str, profile_index: ProfileIndexT, payload_len: usize) {
+        use crate::event_sink::RecordingSink;
+        use modem_core::traits::{EncodeRequest, Modem};
+        use modem_core::v3_modem::V3Modem;
+        use modem_framing::payload_envelope::PayloadEnvelope;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let payload: Vec<u8> = (0..payload_len as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let envelope =
+            PayloadEnvelope::new("v4test.bin", "TEST", payload.clone()).expect("envelope");
+        let wire = envelope.encode();
+        let cfg = modem_core::profile::config_by_name(profile_name)
+            .unwrap_or_else(|| panic!("{profile_name} config"));
+        let k_bytes = modem_core::ldpc::LdpcEncoder::new(cfg.ldpc_rate).k() / 8;
+        let k_source = modem_framing::raptorq_codec::k_from_payload(wire.len(), k_bytes) as u32;
+        // The TX builder rounds the packet count up to a whole segment-pair
+        // (PACKET_QUANTUM) via `effective_packet_count`, so this is the exact
+        // number of DATA codewords actually emitted on the air.
+        let n_packets = modem_core::frame::effective_packet_count(
+            k_source + modem_framing::raptorq_codec::n_repair_default(k_source),
+        );
+        let session_id = modem_framing::app_header::compute_session_id(
+            &wire,
+            cfg.mode_code(),
+            profile_index.as_u8(),
+        );
+        let req = EncodeRequest {
+            profile: profile_name,
+            wire_payload: &wire,
+            session_id,
+            mime_type: modem_framing::app_header::mime::BINARY,
+            hash_short: 0,
+            esi_start: 0,
+            n_packets,
+            vox_seconds: 0.0,
+        };
+        let mut samples = V3Modem.encode_to_samples(&req).expect("encode_to_samples");
+
+        // --- Channel: mild AWGN (clean-ish; SNR sweeps are a separate study) ---
+        add_awgn(&mut samples, 0.02, 0xC0FF_EE42);
+        // Trailing quiet so the worker scans the full buffer (incl. the EOT
+        // frame) before the channel disconnects.
+        samples.extend(std::iter::repeat(0.0f32).take(3 * 48_000));
+
+        // --- Inject chunk-by-chunk into the worker, AUTO-detect ---
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let sink = Arc::new(RecordingSink::new());
+        // Unique dir per profile so the (parallel) tests don't collide.
+        let dir = std::env::temp_dir().join(format!(
+            "nbfm_v4_harness_{}_{}",
+            profile_index.as_u8(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = Arc::new(Mutex::new(dir.clone()));
+        let wav_sink: super::SharedWavSink = Arc::new(Mutex::new(None));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut handle = super::spawn(
+            rx,
+            sink.clone(),
+            save_dir,
+            wav_sink,
+            ProfileIndexT::Normal, // anchor — auto-detect must override
+            false,                 // forced = false → auto-detect
+            false,                 // deemphasis disabled
+            true,                  // allow_legacy_grid
+            dropped,
+        );
+        let burst_secs = samples.len() as f64 / 48_000.0;
+        // Feed in 0.5 s (24 000-sample) batches paced at real time — exactly how
+        // the GUI's WAV playback drives the worker. Real-time pacing is what lets
+        // the wall-clock-gated scan fire and the session state machine track the
+        // burst (detect → accumulate → decode → EOT-finalise) the way it does
+        // live; dumping the whole buffer at once confuses the cadence logic.
+        for chunk in samples.chunks(24_000) {
+            tx.send(chunk.to_vec()).expect("send chunk");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        drop(tx); // EOF → worker exits on Disconnected.
+        if let Some(t) = handle.thread.take() {
+            let _ = t.join();
+        }
+
+        // --- Assert: auto-detected + decoded + payload recovered ---
+        let events = sink.events();
+        let names: Vec<String> = events.iter().map(|(n, _)| n.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "session_decoded" || n == "file_complete"),
+            "{profile_name}: worker did not decode the auto-detected V4 stream \
+             (burst {burst_secs:.1}s); events: {names:?}"
+        );
+        let saved = std::fs::read(dir.join("v4test.bin")).unwrap_or_else(|e| {
+            panic!("{profile_name}: decoded file missing: {e} (burst {burst_secs:.1}s); events: {names:?}")
+        });
+        assert_eq!(saved, payload, "{profile_name}: decoded payload mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Codeword-loss diagnostic, RX vs TX. The TX emitted exactly
+        // `n_packets` DATA codewords (k_source + RaptorQ repair). Compare that
+        // to the unique DATA ESIs the RX actually LDPC-converged (the cumulative
+        // `v2_progress.blocks_converged` = unique_esis). lost = emitted -
+        // recovered; any value > 0 means CWs were dropped and RaptorQ repair (or
+        // re-anchored re-scan) made up the difference. `blocks_expected` is the
+        // RaptorQ K (decode threshold).
+        let (rx_unique, k_needed) = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "v2_progress")
+            .map(|(_, v)| {
+                (
+                    v.get("blocks_converged").and_then(|x| x.as_u64()).unwrap_or(0),
+                    v.get("blocks_expected").and_then(|x| x.as_u64()).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        let lost = (n_packets as u64).saturating_sub(rx_unique);
+        eprintln!(
+            "[v4 cw] {profile_name}: TX emitted {n_packets} DATA CW (K={k_needed}); \
+             RX converged {rx_unique} unique → lost {lost} \
+             ({})",
+            if lost == 0 { "ALL CW passed" } else { "recovered via RaptorQ repair" }
+        );
+        eprintln!("[v4 harness] {profile_name} OK (burst {burst_secs:.1}s)");
+    }
+
+    #[test]
+    fn v4_chunked_worker_auto_detects_high() {
+        run_v4_worker_sim("HIGH", ProfileIndexT::High, 1800);
+    }
+
+    #[test]
+    fn v4_chunked_worker_auto_detects_high_plus() {
+        run_v4_worker_sim("HIGH+", ProfileIndexT::HighPlus, 3500);
+    }
+
+    #[test]
+    fn v4_chunked_worker_auto_detects_high_plus_plus() {
+        run_v4_worker_sim("HIGH++", ProfileIndexT::HighPlusPlus, 4500);
     }
 }

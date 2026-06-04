@@ -19,10 +19,17 @@
 //!   seg_id          : 2 B   segment counter (wraps at 65536)
 //!   session_id_low  : 1 B   session fingerprint for fast change detection
 //!   base_ESI[hi..lo]: 3 B   RaptorQ ESI of this segment's first codeword
-//!   flags           : 1 B   bit 0 = meta_flag; bits 1..7 reserved
-//!   reserved        : 4 B   must be zero; available for future extensions
+//!   flags           : 1 B   bit0 meta, bit1 last-segment, bit2 EOT-frame
+//!   profile_index   : 1 B   modulation profile (V4: replaces the dropped header)
+//!   fmt_version     : 1 B   wire-format version (= WIRE_FMT_V4)
+//!   reserved        : 2 B   must be zero; available for future extensions
 //!   CRC8            : 1 B   CCITT over the preceding 11 bytes (sanity)
 //! ```
+//!
+//! V4 (headerless): the marker is the sole profile-agnostic bootstrap anchor.
+//! It carries `profile_index` (the modulation, formerly in the protocol header)
+//! so the RX learns the constellation *before* the LMS warmup, and a per-segment
+//! `fmt_version` for forward negotiation. See `V4_WIRE_FORMAT_PLAN.md`.
 //!
 //! Decoding uses the 32-symbol sync pattern as a known-reference LS probe to
 //! compute a *local* complex gain, then normalises the ctrl symbols by that
@@ -57,6 +64,16 @@ pub const META_FLAG_BIT: u8 = 0x01;
 /// this bit; older encoders leave it clear.
 pub const LAST_FLAG_BIT: u8 = 0x02;
 
+/// EOT-frame flag bit: this marker belongs to the standalone end-of-transmission
+/// frame (V4: the EOT frame has no header, so the marker flags it). Distinct from
+/// `LAST_FLAG_BIT`, which marks the last *data* segment of the main burst.
+pub const EOT_FRAME_BIT: u8 = 0x04;
+
+/// Wire-format version stamped into every marker (`fmt_version`). V4 = headerless,
+/// marker-bootstrap layout. The RX rejects markers whose `fmt_version` it doesn't
+/// understand, giving a clean hard break against V3 (≤ 0.13.18) peers.
+pub const WIRE_FMT_V4: u8 = 4;
+
 /// Fixed sync-pattern phase table (32 QPSK symbols).
 /// Values in {0,1,2,3}, mapped to `exp(j*(pi/4 + q*pi/2))` to match the
 /// preamble convention.
@@ -83,7 +100,9 @@ pub struct MarkerPayload {
     pub session_id_low: u8,
     pub base_esi: u32, // 24-bit value, upper 8 bits must be zero
     pub flags: u8,
-    pub reserved: u32, // 32-bit reserved for future extensions
+    pub profile_index: u8, // modulation profile (V4: replaces the header)
+    pub fmt_version: u8,   // wire-format version (= WIRE_FMT_V4)
+    pub reserved: u16,     // reserved for future extensions, must be zero
 }
 
 impl MarkerPayload {
@@ -96,8 +115,13 @@ impl MarkerPayload {
         self.flags & LAST_FLAG_BIT != 0
     }
 
+    /// `true` if this marker belongs to the standalone EOT frame.
+    pub fn is_eot_frame(&self) -> bool {
+        self.flags & EOT_FRAME_BIT != 0
+    }
+
     /// Serialize to 12 bytes: seg_id(2) + session(1) + base_esi(3) + flags(1)
-    /// + reserved(4) + crc8(1).
+    /// + profile_index(1) + fmt_version(1) + reserved(2) + crc8(1).
     pub fn to_bytes(&self) -> [u8; MARKER_CTRL_BYTES] {
         assert!(self.base_esi < (1 << 24), "base_esi must fit in 24 bits");
         let mut buf = [0u8; MARKER_CTRL_BYTES];
@@ -107,7 +131,9 @@ impl MarkerPayload {
         buf[4] = ((self.base_esi >> 8) & 0xFF) as u8;
         buf[5] = (self.base_esi & 0xFF) as u8;
         buf[6] = self.flags;
-        buf[7..11].copy_from_slice(&self.reserved.to_be_bytes());
+        buf[7] = self.profile_index;
+        buf[8] = self.fmt_version;
+        buf[9..11].copy_from_slice(&self.reserved.to_be_bytes());
         buf[11] = crc8(&buf[0..11]);
         buf
     }
@@ -121,12 +147,16 @@ impl MarkerPayload {
         let session_id_low = buf[2];
         let base_esi = ((buf[3] as u32) << 16) | ((buf[4] as u32) << 8) | (buf[5] as u32);
         let flags = buf[6];
-        let reserved = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
+        let profile_index = buf[7];
+        let fmt_version = buf[8];
+        let reserved = u16::from_be_bytes([buf[9], buf[10]]);
         Some(MarkerPayload {
             seg_id,
             session_id_low,
             base_esi,
             flags,
+            profile_index,
+            fmt_version,
             reserved,
         })
     }
@@ -359,7 +389,9 @@ mod tests {
             session_id_low: 0xAB,
             base_esi: 0x00F0_F0F0,
             flags: META_FLAG_BIT,
-            reserved: 0xDEAD_BEEF,
+            profile_index: 5,
+            fmt_version: WIRE_FMT_V4,
+            reserved: 0xBEEF,
         };
         let bytes = p.to_bytes();
         let p2 = MarkerPayload::from_bytes(&bytes).expect("CRC valid");
@@ -373,6 +405,8 @@ mod tests {
             session_id_low: 2,
             base_esi: 3,
             flags: 0,
+            profile_index: 0,
+            fmt_version: WIRE_FMT_V4,
             reserved: 0,
         };
         let mut bytes = p.to_bytes();
@@ -387,6 +421,8 @@ mod tests {
             session_id_low: 0x5A,
             base_esi: 0x123456,
             flags: META_FLAG_BIT,
+            profile_index: 7,
+            fmt_version: WIRE_FMT_V4,
             reserved: 0,
         };
         let syms = encode_control_symbols(&p);
@@ -402,6 +438,8 @@ mod tests {
             session_id_low: 0,
             base_esi: 0,
             flags: 0,
+            profile_index: 0,
+            fmt_version: WIRE_FMT_V4,
             reserved: 0,
         };
         let m = make_marker(&p);
@@ -415,11 +453,16 @@ mod tests {
             session_id_low: 0,
             base_esi: 0,
             flags: 0,
+            profile_index: 0,
+            fmt_version: WIRE_FMT_V4,
             reserved: 0,
         };
         assert!(!p.is_meta());
         p.flags |= META_FLAG_BIT;
         assert!(p.is_meta());
+        assert!(!p.is_eot_frame());
+        p.flags |= EOT_FRAME_BIT;
+        assert!(p.is_eot_frame());
     }
 
     #[test]
@@ -454,7 +497,9 @@ mod tests {
             session_id_low: 0x99,
             base_esi: 0x000ABC,
             flags: 0,
-            reserved: 0x1111_2222,
+            profile_index: 3,
+            fmt_version: WIRE_FMT_V4,
+            reserved: 0x1122,
         };
         let mut syms = encode_control_symbols(&p);
         // Corrupt 4 symbols across different Golay blocks. Each QPSK symbol

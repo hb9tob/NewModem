@@ -20,7 +20,7 @@ use crate::frame::{self, HEADER_VERSION_V3, V2_CODEWORDS_PER_SEGMENT};
 use crate::header;
 use crate::interleaver;
 use crate::ldpc::decoder::LdpcDecoder;
-use crate::marker::{self, MarkerPayload, MARKER_CTRL_LEN, MARKER_LEN, MARKER_SYNC_LEN};
+use crate::marker::{self, MARKER_LEN};
 use crate::pilot;
 use crate::pll::DdPll;
 use crate::preamble;
@@ -1012,8 +1012,9 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     };
     // Global gain normalisation from preamble LS (so marker scan threshold is meaningful)
     let warmup_len = config.lms_warmup_syms();
-    let header_end = N_PREAMBLE + warmup_len + 96;
-    if all_rx_syms.len() < header_end {
+    // V4: the data region (first marker) begins right after the preamble.
+    let data_region_start = N_PREAMBLE;
+    if all_rx_syms.len() < data_region_start + MARKER_LEN {
         return None;
     }
     let gain = {
@@ -1026,7 +1027,7 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
         if den > 1e-12 { num / den } else { Complex64::new(1.0, 0.0) }
     };
     let corrected: Vec<Complex64> = all_rx_syms.iter().map(|&s| s / gain).collect();
-    let data_region = &corrected[header_end..];
+    let data_region = &corrected[data_region_start..];
 
     // Walk markers with the standard scan, but only collect symbol-domain
     // positions + meta flags (no payload decode needed here; we just
@@ -1056,7 +1057,9 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
                 let data_sym_count = n_cw * syms_per_cw;
                 let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
                 let seg_sym_len = data_sym_count + n_pilot_groups * p_syms;
-                cursor = pos + MARKER_LEN + seg_sym_len;
+                // V4: a META marker is followed by the warmup guard before its CW.
+                let warmup_gap = if p.is_meta() { warmup_len } else { 0 };
+                cursor = pos + MARKER_LEN + warmup_gap + seg_sym_len;
             }
             None => cursor += MARKER_LEN,
         }
@@ -1090,8 +1093,18 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
     };
 
     for (i, &(_int_pos_sym, is_meta)) in markers.iter().enumerate() {
+        // A META marker after the first is a periodic re-anchor: the TX
+        // reinserted a full preamble immediately before it (V4:
+        // preamble → marker → warmup → meta). The nominal cumulative must
+        // account for that preamble, or every post-reinsertion marker's
+        // expected position is short by N_PREAMBLE and the OLS fit blows up
+        // (high RMS → estimator bails → coarse fallback). The warmup that
+        // follows the marker is added in the advance step below.
+        if is_meta && i > 0 {
+            cumulative_sym += N_PREAMBLE;
+        }
         // Expected audio position for marker[i] in mf
-        let expected_audio = (sync_pos + (header_end + cumulative_sym) * pitch) as i64;
+        let expected_audio = (sync_pos + (data_region_start + cumulative_sym) * pitch) as i64;
 
         // Search a small ±pitch window for the actual peak, then
         // parabolic refine.
@@ -1126,12 +1139,13 @@ pub fn estimate_drift_gardner(samples: &[f32], config: &ModemConfig) -> Option<f
 
         data.push((expected_audio as f64, refined));
 
-        // Advance cumulative by this marker's segment size
+        // Advance cumulative by this marker's segment size (+ warmup guard for meta).
         let n_cw = if is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
         let data_sym_count = n_cw * syms_per_cw;
         let n_pilot_groups = (data_sym_count + d_syms - 1) / d_syms;
         let seg_sym_len = data_sym_count + n_pilot_groups * p_syms;
-        cumulative_sym += MARKER_LEN + seg_sym_len;
+        let warmup_gap = if is_meta { warmup_len } else { 0 };
+        cumulative_sym += MARKER_LEN + warmup_gap + seg_sym_len;
     }
 
     // OLS slope of observed_audio vs expected_audio. slope ≈ 1 + ε, so
@@ -1223,8 +1237,9 @@ pub fn rx_v2_single_cancellable(
     };
 
     let preamble_syms = preamble::make_preamble_for_config(config);
+    // Anchor-config warmup; only a fallback — the effective warmup is rebuilt
+    // from the profile_index read off the bootstrap marker (see Phase 2).
     let warmup_syms = preamble::make_lms_warmup_for_config(config);
-    let warmup_len = warmup_syms.len();
     let sync_pos = {
         let _t = StageTimer::new(PerfStage::FindPreamble);
         sync::find_preamble(&mf, &preamble_syms, sps, pitch, config.beta)?
@@ -1246,8 +1261,6 @@ pub fn rx_v2_single_cancellable(
     if n_ff % 2 == 0 {
         n_ff += 1;
     }
-
-    let header_sym_count = 96;
 
     let training_positions: Vec<usize> = (0..N_PREAMBLE)
         .map(|k| fse_start + k * pitch_fse)
@@ -1279,33 +1292,36 @@ pub fn rx_v2_single_cancellable(
     // 64-APSK.
     let mu_train = 0.10;
     let mu_dd = 0.02;
-    let header_start = N_PREAMBLE + warmup_len;
-    let header_end = header_start + header_sym_count;
+    // V4 layout offsets: preamble | bootstrap marker | warmup | data segments…
+    let marker0_start = N_PREAMBLE;
+    let marker0_end = marker0_start + MARKER_LEN;
+    let warmup_start = marker0_end;
 
-    // --- Phase 1: read the protocol header with a preamble-ONLY trained FFE.
+    // --- Phase 1: read profile_index from the bootstrap MARKER with a
+    // preamble-ONLY trained FFE.
     //
-    // The warmup symbols' constellation is unknown until profile_index is
-    // read. In auto-detect the worker runs this first pass under the family-A
-    // anchor (NORMAL/8PSK), so the warmup reference would be 8PSK while the
-    // air warmup is the real profile's APSK. Supervised-training the FFE on
-    // that wrong reference corrupts the QPSK Golay header — observed as HIGH+
-    // never reading profile_index and never activating. The header is QPSK
-    // and needs no warmup adaptation, so train on the preamble alone, just
-    // far enough to reach the header.
+    // The marker self-equalises via its own 32-sym sync LS-gain, so it decodes
+    // robustly with just the preamble-trained FFE — and, unlike the dropped V3
+    // header, it carries no dependency on the (still unknown) data
+    // constellation. This removes the anchor-profile guessing that supervised-
+    // trained the FFE on a wrong-constellation warmup and corrupted the V3
+    // header — the root cause of HIGH+ never activating in auto-detect
+    // (see project_high_highplus_ota_regression). We only need the FFE far
+    // enough to reach the end of the bootstrap marker.
     let preamble_only: Vec<(usize, Complex64)> = preamble_syms
         .iter()
         .enumerate()
         .map(|(k, &s)| (k, s))
         .collect();
-    let hdr_pass_syms = (header_end + 1).min(max_syms);
-    let (hdr_rx_syms, _) = {
+    let marker_pass_syms = (marker0_end + 1).min(max_syms);
+    let (boot_rx_syms, _) = {
         let _t = StageTimer::new(PerfStage::FfeLms);
         ffe::apply_ffe_lms_with_training(
             &fse_input,
             &ffe_initial,
             fse_start,
             pitch_fse,
-            hdr_pass_syms,
+            marker_pass_syms,
             &preamble_only,
             &constellation,
             mu_train,
@@ -1315,44 +1331,30 @@ pub fn rx_v2_single_cancellable(
     if cancelled() {
         return None;
     }
-    if hdr_rx_syms.len() < header_end {
+    if boot_rx_syms.len() < marker0_end {
         return None;
     }
-    let hdr_gain = {
-        let mut num = Complex64::new(0.0, 0.0);
-        let mut den = 0.0f64;
-        for k in 0..N_PREAMBLE {
-            num += hdr_rx_syms[k] * preamble_syms[k].conj();
-            den += preamble_syms[k].norm_sqr();
-        }
-        if den > 1e-12 {
-            num / den
-        } else {
-            Complex64::new(1.0, 0.0)
-        }
-    };
-    let header_syms: Vec<Complex64> = hdr_rx_syms[header_start..header_end]
-        .iter()
-        .map(|&s| s / hdr_gain)
-        .collect();
-    let decoded_header = header::decode_header_symbols(&header_syms)?;
-    if decoded_header.version != HEADER_VERSION_V3 {
+    let boot_marker = marker::decode_marker_at(&boot_rx_syms[marker0_start..marker0_end])?;
+    // Reject foreign / pre-V4 frames cleanly (no header where V3 expects one →
+    // a V3 peer simply fails to decode; here we reject unknown fmt_version).
+    if boot_marker.fmt_version != marker::WIRE_FMT_V4 || !boot_marker.is_meta() {
         return None;
     }
+    let profile_index = boot_marker.profile_index;
 
-    // --- Phase 2: rewind, retrain the FFE on preamble + the CORRECT warmup.
-    //
-    // profile_index is now known, so rebuild the warmup reference from the
-    // actual profile (not the possibly-anchor `config`): the LMS guard
-    // interval then adapts on the true data constellation before the first
-    // CW, which is what 64-APSK (HIGH++) relies on. The warmup symbol *count*
-    // is uniform (32) across family A, so header/data offsets are unchanged.
-    let warmup_syms_eff = crate::profile::ProfileIndex::from_u8(decoded_header.profile_index)
+    // --- Phase 2: retrain the FFE on preamble + the CORRECT warmup, then
+    // decode the whole window. profile_index is now known, so the warmup
+    // reference is rebuilt from the actual profile (not the possibly-anchor
+    // `config`): the LMS guard adapts on the true data constellation before the
+    // first CW, which is what 64-APSK (HIGH++) relies on. The warmup sits AFTER
+    // the bootstrap marker (offset `warmup_start`).
+    let warmup_syms_eff = crate::profile::ProfileIndex::from_u8(profile_index)
         .map(|p| preamble::make_lms_warmup_for_config(&p.to_config()))
         .unwrap_or_else(|| warmup_syms.clone());
+    let meta_warmup_skip = warmup_syms_eff.len();
     let mut preamble_training = preamble_only;
     for (k, &s) in warmup_syms_eff.iter().enumerate() {
-        preamble_training.push((N_PREAMBLE + k, s));
+        preamble_training.push((warmup_start + k, s));
     }
     let (all_rx_syms, final_taps) = {
         let _t = StageTimer::new(PerfStage::FfeLms);
@@ -1372,7 +1374,7 @@ pub fn rx_v2_single_cancellable(
     if cancelled() {
         return None;
     }
-    if all_rx_syms.len() < header_end {
+    if all_rx_syms.len() < marker0_end {
         return None;
     }
 
@@ -1392,8 +1394,10 @@ pub fn rx_v2_single_cancellable(
     };
     let corrected: Vec<Complex64> = all_rx_syms.iter().map(|&s| s / gain).collect();
 
-    // Walk data region segment by segment
-    let data_region_start = header_start + header_sym_count;
+    // Walk data region segment by segment. V4: the data region begins at the
+    // bootstrap marker (right after the preamble); the meta segment's CW sits
+    // after the warmup guard, which the walker skips when it sees a META marker.
+    let data_region_start = N_PREAMBLE;
     let data_region = &corrected[data_region_start..];
 
     let bps = config.constellation.bits_per_sym();
@@ -1462,6 +1466,9 @@ pub fn rx_v2_single_cancellable(
     // into `eot_seen` so the session ends on EOT read in this (CLOSED) window
     // rather than waiting for the trailing EOT frame's skipped OPEN window.
     let mut saw_last_marker = false;
+    // Set once a decoded marker carries the EOT_FRAME flag (V4: the standalone
+    // EOT frame is headerless, so the flag rides in its bootstrap marker).
+    let mut saw_eot_frame = false;
 
     // Sliding marker detection: at each expected marker position, search within
     // a small window for the sync-pattern correlation peak. This tolerates
@@ -1503,6 +1510,7 @@ pub fn rx_v2_single_cancellable(
         };
         consecutive_fails = 0;
         saw_last_marker |= marker_payload.is_last();
+        saw_eot_frame |= marker_payload.is_eot_frame();
         // Snap cursor to the detected marker so downstream segment extraction
         // uses the correct position.
         cursor = marker_pos;
@@ -1519,6 +1527,13 @@ pub fn rx_v2_single_cancellable(
         }
 
         cursor += MARKER_LEN;
+
+        // V4: a META marker (bootstrap, periodic re-anchor, or EOT frame) is
+        // followed by the LMS warmup guard before its codeword — skip it. Data
+        // markers sit directly before their CW.
+        if marker_payload.is_meta() {
+            cursor += meta_warmup_skip;
+        }
 
         // Segment length: meta is always 1 CW; data segments always carry
         // V2_CODEWORDS_PER_SEGMENT codewords (TX guarantees this except on
@@ -1733,13 +1748,14 @@ pub fn rx_v2_single_cancellable(
             assembled.truncate(h.file_size as usize);
         }
     } else {
-        // No AppHeader recovered : fall back to ESI-sorted concat.
+        // No AppHeader recovered : fall back to ESI-sorted concat. V4 has no
+        // header payload_length to trim to, so we keep the full concat (this is
+        // already the degraded "no AppHeader" path used only for OTA debugging).
         let mut esis: Vec<u32> = cw_bytes.keys().cloned().collect();
         esis.sort();
         for esi in esis {
             assembled.extend_from_slice(&cw_bytes[&esi]);
         }
-        assembled.truncate(decoded_header.payload_length as usize);
     }
 
     let sigma2 = if sigma2_count > 0 {
@@ -1756,7 +1772,19 @@ pub fn rx_v2_single_cancellable(
     };
 
     let data_blocks_recovered = cw_bytes.len();
-    let eot_seen = (decoded_header.flags & header::FLAG_EOT != 0) || saw_last_marker;
+    let eot_seen = saw_last_marker || saw_eot_frame;
+    // V4 has no protocol header: synthesise a result header from the bootstrap
+    // marker (profile_index, EOT flag) + the decoded profile so the worker and
+    // the rx_v3 merger keep their existing `result.header` access paths.
+    let decoded_header = header::Header {
+        version: HEADER_VERSION_V3,
+        mode_code: config.mode_code(),
+        frame_counter: 0,
+        payload_length: 0,
+        flags: if saw_eot_frame { header::FLAG_EOT } else { 0 },
+        freq_offset: 0,
+        profile_index,
+    };
     record_stage(PerfStage::PassDone, 0);
     Some(RxV2Result {
         data: assembled,
@@ -2722,12 +2750,15 @@ mod tests {
         // Clean signal: 0.10.24+ runs Gardner unconditionally (per-window
         // estimator surfaces the actual channel state, not just "no
         // correction applied"). Gardner's OLS on synthetic markers has
-        // a ~1 ppm noise floor even on a literally drift-free stream,
-        // so we accept anything within ±2 ppm. The point is "no large
-        // bogus drift" -- we used to require literally 0 here, but
-        // that contract conflicted with the 2026-05-13 fix that made
-        // the estimator visible per-SF.
-        assert!(r.drift_ppm.abs() < 2.0, "clean: drift_ppm={:+.2}", r.drift_ppm);
+        // a small noise floor even on a literally drift-free stream.
+        // V4 widened it slightly: the bootstrap marker now sits directly
+        // after the preamble, and RRC-tail leakage from the (strong) preamble
+        // into its first sync symbols biases that marker's sub-sample peak by a
+        // fraction of a sample. As the leftmost OLS point it tilts the slope by
+        // ~3 ppm on this clean HIGH+ case. Harmless for decoding (payload is
+        // bit-exact above) and dwarfed by real drift; keep it in the fit for the
+        // baseline leverage it provides on short bursts. Accept ±4 ppm.
+        assert!(r.drift_ppm.abs() < 4.0, "clean: drift_ppm={:+.2}", r.drift_ppm);
     }
 
     /// Marker-fit drift estimator (Phase 1) on HIGH+ with injected
