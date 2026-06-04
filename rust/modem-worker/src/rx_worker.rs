@@ -670,6 +670,24 @@ fn min_active_buffer_seconds(config: &modem_core::profile::ModemConfig) -> usize
     }
 }
 
+/// `true` for the slow QPSK profiles (ROBUST sps=48, ULTRA sps=96) whose
+/// 2-CW data segment is longer than the windows the sliding-window worker
+/// was tuned for (family A sps=32, segment ≈0.77 s). A ROBUST segment is
+/// ≈2.6 s, an ULTRA one ≈5 s, so these profiles need:
+///   - a pre-activation idle buffer ≥ one superframe (not the flat 2 s
+///     PREROLL that can't even hold one data segment),
+///   - `finalize=true` decoding kept on while active (decode the trailing
+///     OPEN window like the CLI's full-file `rx_v3` does, instead of
+///     waiting for a 2-preamble CLOSED window that the reset cycle tears
+///     down first),
+///   - the sps-scaled preamble-absence timeout even in Power Mode (the
+///     flat 6 s is shorter than one ULTRA superframe).
+/// The fast/validated-OTA profiles (NORMAL/HIGH/MEGA/HIGH+/HIGH++/FAST,
+/// all sps ≤ 32) are excluded so their behaviour is byte-for-byte unchanged.
+fn is_slow_profile(config: &modem_core::profile::ModemConfig) -> bool {
+    (AUDIO_RATE as f64 / config.symbol_rate).round() as usize >= 48
+}
+
 /// Late-entry recovery (lowpower path only, `!allow_legacy_grid`).
 ///
 /// When a CLOSED SF's Gardner-pass produces a one-off outlier estimate
@@ -1136,11 +1154,23 @@ fn run_worker(
                 continue;
             }
         } else {
-            // Idle: keep a rolling PREROLL_SECONDS noise buffer so a
-            // preamble landing across batch boundaries is still
-            // detectable. Drop-from-the-front is harmless here — no
-            // decode is in flight.
-            let cap = AUDIO_RATE as usize * PREROLL_SECONDS;
+            // Idle: keep a rolling noise buffer so a preamble landing
+            // across batch boundaries is still detectable. Drop-from-the-
+            // front is harmless here — no decode is in flight.
+            //
+            // Fast profiles only need PREROLL_SECONDS (a preamble straddling
+            // the batch edge). Slow QPSK profiles (ROBUST/ULTRA) keep a full
+            // superframe so the first pre-activation `finalize=true` decode
+            // can already harvest the data segments (a ROBUST segment is
+            // 2.6 s, longer than the 2 s PREROLL — it would never fit). The
+            // FFT gate squelches the expensive rx_v3 until a preamble is
+            // actually present, so this larger idle buffer costs only RAM.
+            let preroll_secs = if is_slow_profile(&state.config) {
+                min_active_buffer_seconds(&state.config)
+            } else {
+                PREROLL_SECONDS
+            };
+            let cap = AUDIO_RATE as usize * preroll_secs;
             if len > cap {
                 state.session_buffer.drain(..len - cap);
             }
@@ -1295,7 +1325,13 @@ fn maintenance_tick(
         // pipeline needs to lock on ULTRA. Light Mode keeps the
         // sps-scaled timeout (6/9/18 s) which was added in ac9c5d1
         // specifically for the Gardner lock requirement.
-        let timeout = if state.allow_legacy_grid {
+        // Power Mode reproduces the strict 0.9.2rc5 flat 6 s timeout — but
+        // ONLY for fast profiles. A ROBUST superframe is ~4.3 s and an ULTRA
+        // one ~5-6 s, so a flat 6 s tears the session down before a CLOSED
+        // (2-preamble) window can form, even though the burst is plainly
+        // on-air. Slow profiles always use the sps-scaled timeout
+        // (9 s ROBUST / 18 s ULTRA) regardless of Power Mode.
+        let timeout = if state.allow_legacy_grid && !is_slow_profile(&state.config) {
             Duration::from_secs(6)
         } else {
             preamble_absence_timeout(&state.config)
@@ -1485,7 +1521,14 @@ fn scan_and_route(
     // unclosed window). `rx_v3_after` auto-escalates back to a decode
     // if a CLOSED window of this same buffer carries an EOT marker,
     // so end-of-burst recovery doesn't need a second scan.
-    let finalize = !state.session_active;
+    //
+    // Slow QPSK profiles (ROBUST/ULTRA) keep finalize=true even when active:
+    // their data segments (2.6 s / 5 s) are long enough that waiting for a
+    // 2-preamble CLOSED window loses most of the burst, and the CLI's
+    // full-file `rx_v3` (finalize=true) proves OPEN-window decoding recovers
+    // them losslessly at relay SNR. Fast profiles keep the original
+    // active→finalize=false policy that the validated-OTA modes rely on.
+    let finalize = !state.session_active || is_slow_profile(&state.config);
 
     // `effective_allow_grid` controls the ±15 ppm safety grid in the
     // MODERN path (`rx_v2_with_options`) -- always enabled now (the
@@ -1961,6 +2004,15 @@ fn scan_and_route(
             if drain_end > 0 {
                 state.session_buffer.drain(..drain_end);
             }
+        }
+        // Slow QPSK profiles: a preamble found by `find_all_preambles` is
+        // itself proof the burst is still live, even when this OPEN-window
+        // tick produced no decodable header/AppHeader yet (the meta CW needs
+        // a CLOSED window). Refresh the absence timer on that detection so
+        // the slow CLOSED-window cadence isn't torn down mid-burst. Fast
+        // profiles keep the stricter "header decoded = live" rule.
+        if is_slow_profile(&state.config) && result.last_preamble_offset.is_some() {
+            state.last_preamble_seen_at = Instant::now();
         }
         if eot_seen {
             state.trim_buffer_to_preroll();
