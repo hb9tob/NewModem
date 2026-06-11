@@ -2064,7 +2064,11 @@ fn scan_and_route(
             // Re-announce of an already-decoded session : we don't have
             // a running mean (this is a peek, not a fresh decode), so
             // pass the current window's sigma2_data as a best-effort.
-            emit_decoded_file(sink, save_dir, &df, result.sigma2, result.sigma2_data);
+            if let Some((sid, path)) =
+                emit_decoded_file(sink, save_dir, &df, result.sigma2, result.sigma2_data)
+            {
+                state.store.record_saved_path(sid, &path);
+            }
         }
     }
 
@@ -2132,7 +2136,11 @@ fn scan_and_route(
             .get(&df.session_id)
             .map(|&(sum, n)| if n > 0 { sum / n as f64 } else { result.sigma2_data })
             .unwrap_or(result.sigma2_data);
-        emit_decoded_file(sink, save_dir, &df, result.sigma2, avg_sigma2_data);
+        if let Some((sid, path)) =
+            emit_decoded_file(sink, save_dir, &df, result.sigma2, avg_sigma2_data)
+        {
+            state.store.record_saved_path(sid, &path);
+        }
     }
 
     // Free the in-memory audio buffer only once the TX explicitly signalled
@@ -2258,13 +2266,18 @@ fn scan_and_route(
 /// the sender's filename. Shared between the fresh-decode path and the
 /// re-announce path (peek_decoded on a session that was already decoded in a
 /// previous capture episode).
+/// Emit the decode events and write the root copy under the sender's
+/// filename. Returns `Some((session_id, path))` when a NEW root copy was
+/// written and the caller should record it on the session (so the history
+/// references the exact file). Returns `None` when an already-recorded copy
+/// was reused (re-announce) or when nothing was written (error).
 fn emit_decoded_file(
     sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     df: &session_store::DecodedFile,
     sigma2: f64,
     sigma2_data_avg: f64,
-) {
+) -> Option<(u32, PathBuf)> {
     if let Some(fname) = df.meta.filename.clone() {
         sink.emit(
             "envelope",
@@ -2310,36 +2323,51 @@ fn emit_decoded_file(
                         message: format!("zstd decode: {e}"),
                     },
                 );
-                return;
+                return None;
             }
         }
     } else {
         (content, df.meta.mime_type)
     };
-    match save_file(&dir, &fname, &final_content) {
-        Ok(path) => {
-            sink.emit(
-                "file_complete",
-                FileCompletePayload {
-                    filename: fname,
-                    callsign,
-                    mime_type: final_mime,
-                    saved_path: path.to_string_lossy().into_owned(),
-                    sigma2,
-                    sigma2_data_avg,
-                    size: final_content.len(),
-                },
-            );
-        }
-        Err(e) => {
-            sink.emit(
-                "error",
-                ErrorPayload {
-                    message: format!("save failed: {e}"),
-                },
-            );
-        }
-    }
+    // Re-announce of an already-decoded session : reuse the root copy we
+    // wrote the first time instead of writing a second copy under a "(1)"
+    // suffix. Fresh decodes have `saved_path == None` and fall through to
+    // `save_file`, which picks a unique path so two sessions sharing the
+    // same filename never overwrite each other.
+    let reuse = df
+        .meta
+        .saved_path
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| p.exists());
+    let (saved_path, newly_saved) = match reuse {
+        Some(p) => (p, false),
+        None => match save_file(&dir, &fname, &final_content) {
+            Ok(path) => (path, true),
+            Err(e) => {
+                sink.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!("save failed: {e}"),
+                    },
+                );
+                return None;
+            }
+        },
+    };
+    sink.emit(
+        "file_complete",
+        FileCompletePayload {
+            filename: fname,
+            callsign,
+            mime_type: final_mime,
+            saved_path: saved_path.to_string_lossy().into_owned(),
+            sigma2,
+            sigma2_data_avg,
+            size: final_content.len(),
+        },
+    );
+    newly_saved.then_some((df.session_id, saved_path))
 }
 
 // ---------------------------------------------------------------------------

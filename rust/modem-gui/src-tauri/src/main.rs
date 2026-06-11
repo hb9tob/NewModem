@@ -1239,7 +1239,18 @@ fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, Str
         let display_filename = meta.filename.clone().unwrap_or_else(|| {
             format!("session-{:08x}.bin", meta.session_id)
         });
-        let root_copy = save_dir.join(&display_filename);
+        // Prefer the exact path the worker wrote for THIS session. Two
+        // sessions sharing the same logical filename (e.g. the same image
+        // re-sent at a higher resolution) write distinct files
+        // (`photo.jpg` vs `photo (1).jpg`); reconstructing
+        // `save_dir.join(filename)` would collapse both onto the first one.
+        // Legacy sessions (decoded before saved_path existed) fall back to
+        // the reconstruction.
+        let root_copy = meta
+            .saved_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| save_dir.join(&display_filename));
         // Preview AND relay: we always use the root copy written by
         // `rx_worker::emit_decoded_file`. That is the ONLY version that
         // contains the file extracted from the PayloadEnvelope (= pure

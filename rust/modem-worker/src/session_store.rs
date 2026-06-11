@@ -62,6 +62,22 @@ pub struct SessionMeta {
     pub filename: Option<String>,
     #[serde(default)]
     pub decoded: bool,
+    /// Number of unique ESIs accumulated on disk for this session. NOT a
+    /// persisted truth — it is recomputed from `packets.blob` by `list_all`
+    /// so the Sessions tab shows real progress (e.g. 247/250) for a session
+    /// that hasn't decoded yet, instead of collapsing every not-yet-decoded
+    /// session to 0 %. May exceed `k_symbols` once repair packets land.
+    #[serde(default)]
+    pub received_esis: u32,
+    /// Absolute path of the root copy the worker actually wrote to
+    /// `<save_dir>/` for this session. Stored because `unique_path` may
+    /// disambiguate two sessions that share the same logical `filename`
+    /// (e.g. the same image re-sent at a higher resolution → distinct
+    /// `session_id`, same `photo.jpg` name → second copy is `photo (1).jpg`).
+    /// Without this, the history would reconstruct `save_dir.join(filename)`
+    /// and both entries would collide on the first-written file.
+    #[serde(default)]
+    pub saved_path: Option<String>,
 }
 
 impl SessionMeta {
@@ -83,6 +99,8 @@ impl SessionMeta {
             callsign: None,
             filename: None,
             decoded: false,
+            received_esis: 0,
+            saved_path: None,
         }
     }
 }
@@ -395,7 +413,26 @@ impl SessionStore {
         })
     }
 
-    /// Read all sessions currently on disk (for UI listing / debug).
+    /// Record the absolute path of the root copy the worker wrote to
+    /// `<save_dir>/` for a decoded session. Persists `meta.json` so the
+    /// history references the exact file even when two sessions share the
+    /// same logical `filename`. No-op if the session isn't cached or the
+    /// path is already recorded.
+    pub fn record_saved_path(&mut self, session_id: u32, path: &Path) {
+        let Some(state) = self.sessions.get_mut(&session_id) else { return; };
+        let s = path.to_string_lossy().into_owned();
+        if state.meta.saved_path.as_deref() == Some(s.as_str()) {
+            return;
+        }
+        state.meta.saved_path = Some(s);
+        if let Err(e) = state.persist_meta() {
+            eprintln!("[session_store] persist saved_path: {e}");
+        }
+    }
+
+    /// Read all sessions currently on disk (for UI listing / debug). The
+    /// `received_esis` field is recomputed from each session's `packets.blob`
+    /// so partially-received sessions report real progress, not 0 %.
     pub fn list_all(&self) -> Vec<SessionMeta> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(&self.root) else { return out; };
@@ -403,7 +440,8 @@ impl SessionStore {
             let path = entry.path();
             let meta_path = path.join("meta.json");
             if let Ok(s) = fs::read_to_string(&meta_path) {
-                if let Ok(m) = serde_json::from_str::<SessionMeta>(&s) {
+                if let Ok(mut m) = serde_json::from_str::<SessionMeta>(&s) {
+                    m.received_esis = count_unique_esis(&path.join("packets.blob"), m.t_bytes);
                     out.push(m);
                 }
             }
@@ -414,6 +452,24 @@ impl SessionStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+/// Count the distinct ESIs present in a `packets.blob`. Entry layout is
+/// `(u32 LE ESI)(t_bytes payload)`. Returns 0 if the blob is absent,
+/// unreadable, or `t_bytes` is 0.
+fn count_unique_esis(blob_path: &Path, t_bytes: u8) -> u32 {
+    if t_bytes == 0 {
+        return 0;
+    }
+    let Ok(mut f) = File::open(blob_path) else { return 0; };
+    let entry_size = 4 + t_bytes as usize;
+    let mut buf = vec![0u8; entry_size];
+    let mut seen = HashSet::new();
+    while f.read_exact(&mut buf).is_ok() {
+        let esi = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        seen.insert(esi);
+    }
+    seen.len() as u32
 }
 
 /// Pack the K-bit "source ESI seen" bitmap from the session's seen set.
@@ -567,6 +623,36 @@ mod tests {
             assert_eq!(&df.payload[..data.len()], &data[..]);
             assert!(df.meta.decoded);
         }
+    }
+
+    #[test]
+    fn list_all_reports_partial_progress_from_blob() {
+        let save = tmp_dir("partial_progress");
+        let t: u16 = 16;
+        let data: Vec<u8> = (0..200).map(|i| (i as u8).wrapping_mul(13)).collect();
+        let packets = raptorq_codec::encode_packets(&data, t, 30);
+        let k = raptorq_codec::k_from_payload(data.len(), t as usize) as u32;
+        let ah = sample_ah(data.len() as u32, k as u16, t as u8);
+
+        // Feed K-1 packets : not enough to decode, but progress must NOT be 0.
+        let partial = k - 1;
+        let mut store = SessionStore::new(&save).unwrap();
+        let mut map = HashMap::new();
+        for (i, p) in packets.iter().take(partial as usize).enumerate() {
+            map.insert(i as u32, p.clone());
+        }
+        let outcome = store.accept_packets(&ah, ProfileIndex::High, &map);
+        assert!(outcome.decoded.is_none(), "must not decode below K");
+
+        // A fresh store reading purely from disk must report the real count.
+        let store2 = SessionStore::new(&save).unwrap();
+        let metas = store2.list_all();
+        let m = metas
+            .iter()
+            .find(|m| m.session_id == ah.session_id)
+            .expect("session listed");
+        assert_eq!(m.received_esis, partial, "partial progress recomputed from blob");
+        assert!(!m.decoded);
     }
 
     #[test]

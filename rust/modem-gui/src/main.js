@@ -172,12 +172,17 @@ async function refreshSessions() {
     const list = await invoke("list_sessions");
     sessionRegistry.clear();
     for (const meta of list) {
-      // The backend doesn't track "received / needed" in meta.json (that
-      // requires scanning the blob) — initialise from what we know, and let
-      // the next session_progress event fill in the live numbers.
+      // `received_esis` is recomputed from the on-disk blob by the backend,
+      // so a partially-received session shows its real progress (e.g.
+      // 247/250) instead of collapsing to 0 %. Live session_progress events
+      // still refine it during an active reception. Fall back to the old
+      // decoded ? k : 0 heuristic for metas without the field (legacy).
+      const received = Number.isFinite(meta.received_esis)
+        ? meta.received_esis
+        : (meta.decoded ? meta.k_symbols : 0);
       sessionRegistry.set(meta.session_id, {
         ...meta,
-        received: meta.decoded ? meta.k_symbols : 0,
+        received,
         cap_reached: false,
       });
     }
@@ -3836,9 +3841,24 @@ async function _runTxCompressImpl() {
   refreshTxPreview();
   refreshTxButtons();
   // Force the browser to paint the loader before launching invoke().
-  await new Promise((r) =>
-    requestAnimationFrame(() => requestAnimationFrame(r)),
-  );
+  // Cap the wait with a timeout: on WebKitGTK (Linux) requestAnimationFrame
+  // can stall right after a native drag-drop until the next user
+  // interaction. Without the fallback, the compression hangs here forever —
+  // `compressedBytes` is never set and the TX button stays disabled until
+  // the operator clicks "Compresser" again (which generates the frame that
+  // unblocks rAF). The timeout lets the compression proceed regardless;
+  // worst case the spinner paints one frame late. Same defensive rationale
+  // as the 1 s `load`-event fallback in the `finally` below.
+  await new Promise((r) => {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      r();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(go));
+    setTimeout(go, 100);
+  });
   try {
     if (txState.fileMode) {
       logEvent("tx_compress_start", { mode: "zstd", source_len: txState.sourceSize });
