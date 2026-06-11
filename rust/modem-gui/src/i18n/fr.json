@@ -363,6 +363,8 @@
   "history.btn_relay_tx": "↻ Renvoyer",
   "history.btn_relay_rx": "↻ Relayer",
   "history.relay_tx_tip": "Recharger ce fichier dans l'onglet TX",
+  "history.btn_resume_tx": "⊕ Compléter",
+  "history.resume_tx_tip": "Reprendre cette session et envoyer plus de blocs (compléter les destinataires partiels), sans rembobiner l'ESI",
 
   "rt.lag": "lag wall-clock : {ms} ms",
   "rt.last_batch": "dernier batch  : {ms} ms (cible < 500)",

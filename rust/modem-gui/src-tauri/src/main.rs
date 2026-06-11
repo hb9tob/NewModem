@@ -19,7 +19,7 @@ use settings::Settings;
 use modem_worker::tx_worker::TxHandle;
 use modem_worker::rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, compress_zstd, CompressOpts};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -968,7 +968,7 @@ fn tx_start(
     args: TxStartArgs,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
     if tx_guard.is_some() {
         return Err("TX déjà en cours".into());
@@ -1004,15 +1004,18 @@ fn tx_start(
     // sneaking through the call chain.
     let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let archive_sink = TauriEventSink(app.clone());
-    tx_worker::archive_payload(
+    let archive_path = tx_worker::archive_payload(
         &save_dir,
         &payload_path,
         &args.mode,
+        &args.callsign.trim().to_uppercase(),
         &args.filename,
         repair_pct,
         history_max,
         &archive_sink,
-    );
+    )
+    .map(|p| p.to_string_lossy().into_owned())
+    .unwrap_or_default();
     let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn(
         payload_path,
@@ -1030,7 +1033,9 @@ fn tx_start(
         save_wav_dir,
     );
     *tx_guard = Some(handle);
-    Ok(())
+    // The archive path lets the GUI persist this session's ESI high-water
+    // (tx_set_next_esi) and resume it later (tx_resume).
+    Ok(archive_path)
 }
 
 #[derive(serde::Deserialize)]
@@ -1102,6 +1107,108 @@ fn tx_more(
     );
     *tx_guard = Some(handle);
     Ok(())
+}
+
+/// Resolve the `<save_dir>/tx_history/<stem>.json` twin of an archived
+/// payload path, guarding against any path that escapes `tx_history/`.
+fn tx_history_meta_path(save_dir: &Path, archive_path: &str) -> Result<PathBuf, String> {
+    let history_dir = save_dir.join("tx_history");
+    let p = PathBuf::from(archive_path);
+    if !p.starts_with(&history_dir) {
+        return Err("chemin hors tx_history/".into());
+    }
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "nom d'archive invalide".to_string())?;
+    Ok(history_dir.join(format!("{stem}.json")))
+}
+
+/// Persist the ESI high-water for a TX-history session, in place in its
+/// meta JSON. Called by the GUI after every burst (initial, "more", or a
+/// resumed full burst) so the fountain can be continued later — even after
+/// an app restart — without ever rewinding the ESI.
+#[tauri::command]
+fn tx_set_next_esi(
+    archive_path: String,
+    next_esi: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let meta_path = tx_history_meta_path(&save_dir, &archive_path)?;
+    let raw = std::fs::read_to_string(&meta_path)
+        .map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse meta: {e}"))?;
+    v["next_esi"] = serde_json::json!(next_esi);
+    std::fs::write(&meta_path, v.to_string())
+        .map_err(|e| format!("write {}: {e}", meta_path.display()))
+}
+
+#[derive(serde::Serialize)]
+struct TxResumeInfo {
+    mode: String,
+    callsign: String,
+    filename: String,
+    mime_type: u8,
+    is_image: bool,
+    /// ESI high-water: the next ESI to emit. 0 means nothing emitted yet.
+    next_esi: u32,
+    repair_pct: u32,
+    byte_len: u64,
+    /// Deterministic session_id (hex), informational / for logging.
+    session_id: Option<String>,
+    /// Absolute path of the archived payload (= preview source).
+    archive_path: String,
+}
+
+/// Resume a TX-history session: point the backend payload at the archived
+/// (bit-exact) file so a subsequent `tx_more` re-encodes the identical
+/// bytes — hence the identical `session_id` — and return everything the GUI
+/// needs to restore the TX tab (mode, callsign, filename, ESI high-water).
+#[tauri::command]
+fn tx_resume(
+    archive_path: String,
+    state: State<'_, AppState>,
+) -> Result<TxResumeInfo, String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let meta_path = tx_history_meta_path(&save_dir, &archive_path)?;
+    let payload = PathBuf::from(&archive_path);
+    if !payload.exists() {
+        return Err(format!("payload archivé absent ({})", payload.display()));
+    }
+    let raw = std::fs::read_to_string(&meta_path)
+        .map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse meta: {e}"))?;
+    let bytes = std::fs::read(&payload)
+        .map_err(|e| format!("read {}: {e}", payload.display()))?;
+    let byte_len = bytes.len() as u64;
+    // Point the TX pipeline at the archived bytes (no recompression — that
+    // could perturb the AVIF and change the session_id).
+    *state.tx_payload_path.lock().map_err(|e| e.to_string())? = Some(payload.clone());
+    *state.tx_source.lock().map_err(|e| e.to_string())? = Some(bytes);
+
+    let mime_type = v.get("mime_type").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+    let is_image = mime_type == modem_framing::app_header::mime::IMAGE_AVIF
+        || mime_type == modem_framing::app_header::mime::IMAGE_JPEG
+        || mime_type == modem_framing::app_header::mime::IMAGE_PNG;
+    let session_id = v
+        .get("session_id")
+        .and_then(|x| x.as_u64())
+        .map(|n| format!("{:08x}", n as u32));
+    Ok(TxResumeInfo {
+        mode: v.get("mode").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        callsign: v.get("callsign").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        filename: v.get("filename").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        mime_type,
+        is_image,
+        next_esi: v.get("next_esi").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        repair_pct: v.get("repair_pct").and_then(|x| x.as_u64()).unwrap_or(30) as u32,
+        byte_len,
+        session_id,
+        archive_path,
+    })
 }
 
 #[tauri::command]
@@ -2255,6 +2362,8 @@ fn main() {
             tx_estimate,
             tx_start,
             tx_more,
+            tx_set_next_esi,
+            tx_resume,
             tx_stop,
             tx_reset,
             list_sessions,

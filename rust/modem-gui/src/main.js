@@ -3517,6 +3517,17 @@ const txState = {
   // successive "More" bursts so we can continue ESI without overlapping
   // packets already emitted. Reset when image or mode change.
   lastTx: null,  // { esiMax, mode }
+  // Path of the tx_history archive backing the CURRENT session, learnt from
+  // tx_start's return value (fresh TX) or tx_resume (resumed session). Used
+  // to persist the ESI high-water (tx_set_next_esi) after every burst so the
+  // fountain can be continued later. Null = not archived yet.
+  archivePath: null,
+  // When a session is resumed from history, the callsign that was used at
+  // the original TX. It MUST be reused for the continuation bursts, else the
+  // session_id (which depends on the callsign) wouldn't match and the RX
+  // would treat the extra blocks as a brand-new session. Null = use the
+  // current settings callsign (fresh sessions).
+  resumeCallsign: null,
   compressedBytes: null,
   compressedUrl: null,
   compressing: false,
@@ -3537,6 +3548,15 @@ const txState = {
   progress: null,
   restartRxAfter: false,
 };
+
+// Invalidate the current TX session reference. Called whenever the source
+// or mode changes (= a different session_id), so a stale archivePath /
+// resumeCallsign / ESI high-water never leaks into the next transmission.
+function clearTxSessionRef() {
+  txState.lastTx = null;
+  txState.archivePath = null;
+  txState.resumeCallsign = null;
+}
 
 // Promise chain to serialize AVIF compressions. Without it, dropping an
 // image while a compression is running launches a 2nd ravif speed-1
@@ -3797,7 +3817,7 @@ async function refreshTxEstimate() {
     const est = await invoke("tx_estimate", {
       payloadBytes: txState.compressedBytes,
       mode: txState.mode,
-      callsign: currentSettings.callsign || "HB9XXX",
+      callsign: txState.resumeCallsign || currentSettings.callsign || "HB9XXX",
       filename: getTxFilename(),
       repairPct: txState.repairPct,
     });
@@ -4146,7 +4166,7 @@ async function loadTxFileFromPath(path) {
     txState.compressedBytes = null;
     txState.compressedUrl = null;
     txState.compressDirty = false;
-    txState.lastTx = null;
+    clearTxSessionRef();
     if (isImage) {
       // Load the image as preview via asset://.
       const img = new Image();
@@ -4219,7 +4239,7 @@ async function loadTxFile(file) {
   const url = URL.createObjectURL(file);
   txState.sourceUrl = url;
   const finishLoad = async () => {
-    txState.lastTx = null;
+    clearTxSessionRef();
     document.getElementById("tx-drop-zone").hidden = true;
     const preview = document.getElementById("tx-preview");
     const previewImg = document.getElementById("tx-preview-img");
@@ -4281,6 +4301,7 @@ async function resetTxFile() {
   txState.compressedBytes = null;
   txState.compressedUrl = null;
   txState.compressDirty = false;
+  clearTxSessionRef();
   txState.compressSeq++;
   if (txState.compressTimer) {
     clearTimeout(txState.compressTimer);
@@ -4353,7 +4374,7 @@ function setupTxTab() {
   document.getElementById("tx-mode").addEventListener("change", (ev) => {
     txState.mode = ev.target.value;
     // New mode -> new session (RaptorQ session_id depends on the mode).
-    txState.lastTx = null;
+    clearTxSessionRef();
     currentSettings.tx_mode = txState.mode;
     persistSettings();
     refreshTxPreview();
@@ -4565,26 +4586,52 @@ async function txStart() {
     tx_device: currentSettings.tx_device,
     estimate: txState.estimate,
   });
+  // The ESI never rewinds. A plain "TX" emits a full initial burst worth of
+  // FRESH blocks (n_initial = K + repair) starting at the session's ESI
+  // high-water: 0 for a brand-new image (identical to the historical initial
+  // burst), or the continuation point for a re-sent / resumed session. This
+  // guarantees every TX (and every TX more) adds NEW fountain symbols rather
+  // than re-emitting packets recipients already hold.
+  const callsign = txState.resumeCallsign || currentSettings.callsign || "";
+  const filename = getTxFilename();
+  const nInitial = computeNInitial() || 1;
+  const prior =
+    txState.lastTx && txState.lastTx.mode === txState.mode
+      ? txState.lastTx.esiMax + 1
+      : 0;
   try {
-    await invoke("tx_start", {
-      args: {
-        mode: txState.mode,
-        callsign: currentSettings.callsign || "",
-        filename: getTxFilename(),
-        tx_device: currentSettings.tx_device || "",
-        repair_pct: txState.repairPct,
-      },
-    });
-    // After an initial TX, we remember the session state to enable "More".
-    // The initial burst emits K + floor(K * pct / 100) packets (cf. CLI
-    // main.rs, Rust integer division). Must match exactly to avoid an
-    // ESI gap between the initial burst and the first More.
-    const k = computeK();
-    if (k) {
-      const pct = txState.repairPct || 0;
-      const emitted = k + Math.floor((k * pct) / 100);
-      txState.lastTx = { mode: txState.mode, esiMax: emitted - 1 };
+    if (prior > 0) {
+      // Continue the fountain through the existing (OTA-validated) tx_more
+      // path — same session_id, fresh ESIs starting at `prior`. `nInitial`
+      // is a whole PACKET_QUANTUM, so no extra rounding shifts the high-water.
+      logEvent("tx_start_continue", { esi_start: prior, count: nInitial });
+      await invoke("tx_more", {
+        args: {
+          mode: txState.mode,
+          callsign,
+          filename,
+          tx_device: currentSettings.tx_device || "",
+          esi_start: prior,
+          count: nInitial,
+        },
+      });
+      txState.lastTx = { mode: txState.mode, esiMax: prior + nInitial - 1 };
+    } else {
+      // Fresh session: tx_start archives the payload and returns the archive
+      // path, against which we persist the ESI high-water for later resume.
+      const archivePath = await invoke("tx_start", {
+        args: {
+          mode: txState.mode,
+          callsign,
+          filename,
+          tx_device: currentSettings.tx_device || "",
+          repair_pct: txState.repairPct,
+        },
+      });
+      if (archivePath) txState.archivePath = archivePath;
+      txState.lastTx = { mode: txState.mode, esiMax: nInitial - 1 };
     }
+    await persistNextEsi();
   } catch (err) {
     logEvent("tx_start_error", { message: String(err) });
     txState.txActive = false;
@@ -4603,6 +4650,35 @@ function computeK() {
   if (est.k_source != null) return Math.max(4, est.k_source);
   if (est.total_blocks != null) return Math.max(4, est.total_blocks);
   return null;
+}
+
+// Full initial-burst block count = the number a plain "TX" emits. Prefer
+// the backend's authoritative `n_initial` (already rounded up to a whole
+// PACKET_QUANTUM via effective_packet_count); fall back to the K + repair
+// approximation for an older backend that doesn't expose it.
+function computeNInitial() {
+  const est = txState.estimate;
+  if (est && est.n_initial != null) return est.n_initial;
+  const k = computeK();
+  if (!k) return null;
+  const pct = txState.repairPct || 0;
+  return k + Math.floor((k * pct) / 100);
+}
+
+// Persist the current session's ESI high-water onto its tx_history archive
+// so the fountain can be continued later (even after an app restart). No-op
+// until the session has an archive path (set by tx_start / tx_resume).
+async function persistNextEsi() {
+  if (!txState.archivePath || !txState.lastTx) return;
+  try {
+    const { invoke } = window.__TAURI__.core;
+    await invoke("tx_set_next_esi", {
+      archivePath: txState.archivePath,
+      nextEsi: txState.lastTx.esiMax + 1,
+    });
+  } catch (err) {
+    logEvent("tx_next_esi_error", { message: String(err) });
+  }
 }
 
 // Number of additional blocks to emit in a "More" burst. Read directly
@@ -4655,13 +4731,16 @@ async function txMore() {
     await invoke("tx_more", {
       args: {
         mode: txState.mode,
-        callsign: currentSettings.callsign || "",
+        // Reuse the original callsign on a resumed session, else the
+        // session_id wouldn't match (see resumeCallsign).
+        callsign: txState.resumeCallsign || currentSettings.callsign || "",
         filename: getTxFilename(),
         tx_device: currentSettings.tx_device || "",
         esi_start: esiStart,
         count: count,
       },
     });
+    await persistNextEsi();
   } catch (err) {
     logEvent("tx_more_error", { message: String(err) });
     txState.txActive = false;
@@ -5098,6 +5177,18 @@ function renderHistoryColumn(items, kind) {
     relayBtn.addEventListener("click", () => relayHistoryItem(relayPath));
     actions.appendChild(relayBtn);
 
+    // TX cards only: resume the SAME session and continue its fountain
+    // (top up partial / late recipients). Distinct from "Relais", which
+    // starts a fresh full re-transmission.
+    if (kind === "tx") {
+      const resumeBtn = document.createElement("button");
+      resumeBtn.className = "btn-resume";
+      resumeBtn.textContent = t("history.btn_resume_tx");
+      resumeBtn.title = t("history.resume_tx_tip");
+      resumeBtn.addEventListener("click", () => resumeTxFromHistory(item.file_path));
+      actions.appendChild(resumeBtn);
+    }
+
     const delBtn = document.createElement("button");
     delBtn.className = "btn-delete";
     delBtn.textContent = "🗑";
@@ -5124,6 +5215,77 @@ async function relayHistoryItem(absolutePath) {
   } catch (err) {
     logEvent("history_relay_error", { path: absolutePath, message: String(err) });
   }
+}
+
+// Resume a past TX session (TX history card "Compléter" button): reload the
+// bit-exact archived payload WITHOUT recompressing, restore mode / callsign /
+// filename / ESI high-water, and arm both TX and TX more on the SAME session.
+// Clicking TX then emits a full fresh burst from where we left off; partial
+// or late recipients top up their fountain. The session_id is reproduced
+// automatically by the deterministic envelope (same payload + filename +
+// callsign + mode).
+async function resumeTxFromHistory(archivePath) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke, convertFileSrc } = window.__TAURI__.core;
+  const txBtn = document.querySelector('.tab-bar .tab[data-tab="tx"]');
+  if (txBtn) txBtn.click();
+  let info;
+  try {
+    info = await invoke("tx_resume", { archivePath });
+  } catch (err) {
+    logEvent("tx_resume_error", { path: archivePath, message: String(err) });
+    alert(`Reprise impossible : ${err}`);
+    return;
+  }
+  if (txState.sourceUrl) {
+    URL.revokeObjectURL(txState.sourceUrl);
+    txState.sourceUrl = null;
+  }
+  // Restore the session into txState. We do NOT recompress: the archive IS
+  // the wire payload, and the backend tx_payload_path now points at it.
+  txState.mode = info.mode;
+  const modeSel = document.getElementById("tx-mode");
+  if (modeSel) modeSel.value = info.mode;
+  txState.sourceFile = { name: info.filename, size: info.byte_len };
+  txState.sourceSize = info.byte_len;
+  txState.sourceImage = null;
+  txState.fileMode = !info.is_image;
+  txState.avifPassthrough = info.is_image; // archived images are AVIF
+  txState.compressedBytes = info.byte_len;
+  txState.compressedUrl = null;
+  txState.compressDirty = false;
+  txState.repairPct = Number.isFinite(info.repair_pct) ? info.repair_pct : txState.repairPct;
+  // Continuation state: reuse the archived callsign + ESI high-water.
+  txState.archivePath = info.archive_path || archivePath;
+  txState.resumeCallsign = info.callsign || null;
+  txState.lastTx = info.next_esi > 0
+    ? { mode: info.mode, esiMax: info.next_esi - 1 }
+    : null;
+  // UI restore.
+  applyPassthroughUI();
+  applyFileModeUI();
+  refreshTxExperimentalWarn();
+  const dropZone = document.getElementById("tx-drop-zone");
+  if (dropZone) dropZone.hidden = true;
+  const preview = document.getElementById("tx-preview");
+  const previewImg = document.getElementById("tx-preview-img");
+  if (previewImg) {
+    previewImg.removeAttribute("src");
+    previewImg.src = info.is_image ? `${convertFileSrc(archivePath)}?v=${Date.now()}` : "";
+  }
+  if (preview) preview.hidden = false;
+  const repairEl = document.getElementById("tx-repair-pct");
+  if (repairEl) repairEl.value = String(txState.repairPct);
+  refreshTxPreview();
+  // The estimate (re)enables the TX button and gives n_initial for the
+  // continuation burst; it reads txState.compressedBytes set above.
+  await refreshTxEstimate();
+  refreshTxButtons();
+  logEvent("tx_resumed", {
+    session_id: info.session_id,
+    next_esi: info.next_esi,
+    mode: info.mode,
+  });
 }
 
 async function deleteHistoryItem(kind, key) {

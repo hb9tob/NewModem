@@ -212,6 +212,24 @@ fn profile_index_for(name: &str) -> Option<u8> {
     ProfileIndex::from_name(name).map(ProfileIndex::as_u8)
 }
 
+/// Compute the deterministic `session_id` for a payload, exactly as
+/// `encode_in_process` does. Same `(payload, filename, callsign, mode)`
+/// always yields the same id, which is what lets a later "send more" (or a
+/// resumed session) land its fresh ESIs in the same RX disk session.
+/// Returns `None` for an unknown profile or an over-large envelope.
+pub fn session_id_for(
+    payload: &[u8],
+    mode: &str,
+    callsign: &str,
+    filename: &str,
+) -> Option<u32> {
+    let envelope = PayloadEnvelope::new(filename, callsign, payload.to_vec())?;
+    let wire = envelope.encode();
+    let cfg = parse_profile(mode).ok()?;
+    let profile_index = profile_index_for(mode)?;
+    Some(app_header::compute_session_id(&wire, cfg.mode_code(), profile_index))
+}
+
 /// Burst variant : initial (`esi_start=None`) or "More" (`esi_start=Some,
 /// pct`). Both paths share `run_playback` for the cpal stream.
 /// Continuation burst (RaptorQ "More"): encodes `count` packets starting
@@ -698,19 +716,25 @@ fn run_playback(
 /// `payload_path` must point at an existing file (`tx_preview.avif` or
 /// `tx_preview.zst`). `filename` is the original name chosen by the
 /// user, preserved as-is in the metadata for thumbnail display.
+///
+/// Returns the path of the archived payload file (the bit-exact copy),
+/// which the caller hands back to the GUI so it can later persist the
+/// session's ESI high-water on this entry (`next_esi`) and resume it.
+/// Returns `None` if the directory or the copy could not be created.
 pub fn archive_payload(
     save_dir: &Path,
     payload_path: &Path,
     mode: &str,
+    callsign: &str,
     filename: &str,
     repair_pct: u32,
     max_items: u32,
     sink: &dyn EventSink,
-) {
+) -> Option<PathBuf> {
     let history_dir = save_dir.join("tx_history");
     if let Err(e) = std::fs::create_dir_all(&history_dir) {
         eprintln!("[tx_history] mkdir {:?}: {e}", history_dir);
-        return;
+        return None;
     }
     let ext = payload_path
         .extension()
@@ -732,20 +756,31 @@ pub fn archive_payload(
 
     if let Err(e) = std::fs::copy(payload_path, &archive_path) {
         eprintln!("[tx_history] copy {:?}: {e}", payload_path);
-        return;
+        return None;
     }
+    // Deterministic session_id of this transmission, stored so a later
+    // resume can prove (and re-derive) the same RX session.
+    let session_id = std::fs::read(payload_path)
+        .ok()
+        .and_then(|bytes| session_id_for(&bytes, mode, callsign, filename));
     let meta = serde_json::json!({
         "timestamp": ts,
         "mode": mode,
         "mime_type": mime_type,
         "filename": filename,
+        "callsign": callsign,
         "repair_pct": repair_pct,
+        // ESI high-water for resume: 0 until the GUI persists it after the
+        // initial burst. `tx_set_next_esi` updates this in place.
+        "next_esi": 0,
+        "session_id": session_id,
     });
     if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
         eprintln!("[tx_history] write meta {:?}: {e}", meta_path);
     }
     purge_history(&history_dir, max_items);
     sink.emit("tx_archived", ());
+    Some(archive_path)
 }
 
 /// Cap the `tx_history/` folder to `max_items` file+json pairs. Sort
@@ -808,5 +843,28 @@ fn sanitize_filename(name: &str) -> String {
         trimmed.chars().take(80).collect()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The TX-resume / "complete later" feature relies on session_id being a
+    // pure function of (payload, mode, callsign, filename): reloading the
+    // bit-exact archived payload must reproduce the SAME id so the extra ESIs
+    // land in the recipient's existing session. Lock that contract here.
+    #[test]
+    fn session_id_is_deterministic_and_content_sensitive() {
+        let payload = b"hello world, this is a test payload";
+        let a = session_id_for(payload, "HIGH", "HB9TOB", "photo.avif").unwrap();
+        let b = session_id_for(payload, "HIGH", "HB9TOB", "photo.avif").unwrap();
+        assert_eq!(a, b, "same inputs must yield the same session_id");
+
+        // Any change to payload / callsign / filename / mode is a new session.
+        assert_ne!(a, session_id_for(b"other payload", "HIGH", "HB9TOB", "photo.avif").unwrap());
+        assert_ne!(a, session_id_for(payload, "HIGH", "HB9XYZ", "photo.avif").unwrap());
+        assert_ne!(a, session_id_for(payload, "HIGH", "HB9TOB", "photo2.avif").unwrap());
+        assert_ne!(a, session_id_for(payload, "NORMAL", "HB9TOB", "photo.avif").unwrap());
     }
 }

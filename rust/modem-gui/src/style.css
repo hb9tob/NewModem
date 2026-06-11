@@ -2101,6 +2101,13 @@ body.compressing-lock {
 .history-card-actions .btn-relay:hover {
   background: #2a3a2a;
 }
+.history-card-actions .btn-resume {
+  border-color: #4a6a8a;
+  color: #aad0ff;
+}
+.history-card-actions .btn-resume:hover {
+  background: #1f2c3a;
+}
 .history-card-actions .btn-delete {
   flex: 0 0 auto;
   border-color: #6a2a2a;

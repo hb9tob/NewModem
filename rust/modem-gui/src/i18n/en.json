@@ -363,6 +363,8 @@
   "history.btn_relay_tx": "↻ Resend",
   "history.btn_relay_rx": "↻ Relay",
   "history.relay_tx_tip": "Reload this file in the TX tab",
+  "history.btn_resume_tx": "⊕ Top up",
+  "history.resume_tx_tip": "Resume this session and send more blocks (complete partial recipients), without rewinding the ESI",
 
   "rt.lag": "wall-clock lag: {ms} ms",
   "rt.last_batch": "last batch    : {ms} ms (target < 500)",
