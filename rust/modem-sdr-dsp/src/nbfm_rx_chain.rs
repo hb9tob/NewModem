@@ -152,6 +152,13 @@ pub struct NbfmRxChain {
     /// Scratch buffer for the per-chunk demod stage so the audio
     /// path doesn't have to allocate per call.
     audio_scratch: Vec<f32>,
+    /// Input I/Q sample rate, in Hz. Cached so [`Self::set_channel_freq`]
+    /// can retune the NCO without the caller re-supplying it.
+    input_rate_hz: f32,
+    /// Mean `|baseband|²` of the most recent [`Self::process`] call —
+    /// the channel-selected power just before the discriminator. Feeds
+    /// the GUI S-meter. `0.0` until the first non-empty `process`.
+    last_channel_power: f32,
 }
 
 impl NbfmRxChain {
@@ -210,7 +217,43 @@ impl NbfmRxChain {
             deemph,
             hpf,
             audio_scratch: Vec::new(),
+            input_rate_hz: cfg.input_rate_hz as f32,
+            last_channel_power: 0.0,
         }
+    }
+
+    /// Live-retune the channel-select NCO to pull a different frequency
+    /// out of the captured band down to DC, **without** rebuilding the
+    /// FIR or resetting state — the rotation stays continuous so the
+    /// audio has no glitch (this is the digital "DDC" fine-tune used by
+    /// the Radio tab).
+    ///
+    /// `center_hz` is the frequency *in the input I/Q spectrum* that
+    /// gets translated to DC, i.e. `displayed_rf − current_LO` (same
+    /// sign convention as the `center` argument the constructor derives
+    /// from `lo_offset_hz`, see the module docs). Positive = above the
+    /// LO. The caller (the tuning state machine) owns the policy of when
+    /// a move stays digital vs forces a hardware LO retune.
+    #[inline]
+    pub fn set_channel_freq(&mut self, center_hz: f32) {
+        self.xlating.set_center_freq(center_hz, self.input_rate_hz);
+    }
+
+    /// Mean `|baseband|²` of the last [`Self::process`] call — the
+    /// channel-filtered power, in linear units (square of unit-scaled
+    /// magnitude). Convert to dBFS with `10·log10(p)`. Drives the
+    /// S-meter; reflects the wanted channel only, not the wideband
+    /// energy across the SDR bandwidth.
+    #[inline]
+    pub fn last_channel_power(&self) -> f32 {
+        self.last_channel_power
+    }
+
+    /// Input I/Q sample rate in Hz (== captured RF span for the wideband
+    /// spectrum display).
+    #[inline]
+    pub fn input_rate_hz(&self) -> f32 {
+        self.input_rate_hz
     }
 
     /// Number of FIR taps in the channel-select filter. Surface used
@@ -239,6 +282,13 @@ impl NbfmRxChain {
             return Vec::new();
         }
 
+        // Channel power for the S-meter: mean |baseband|² over this
+        // chunk. Cheap (one pass over the already-decimated 48 kHz
+        // stream) and measures exactly the wanted channel after the
+        // adjacent-channel filter.
+        let power_sum: f32 = baseband.iter().map(|c| c.re * c.re + c.im * c.im).sum();
+        self.last_channel_power = power_sum / baseband.len() as f32;
+
         // Stage 2: FM discriminator at 48 kHz.
         if self.audio_scratch.len() < baseband.len() {
             self.audio_scratch.resize(baseband.len(), 0.0);
@@ -266,6 +316,7 @@ impl NbfmRxChain {
         self.deemph.reset();
         self.hpf.reset();
         self.audio_scratch.clear();
+        self.last_channel_power = 0.0;
     }
 }
 
@@ -497,6 +548,39 @@ mod tests {
                 "audio mismatch at sample {i}: a={x} b={y}"
             );
         }
+    }
+
+    /// Digital fine-tune: an NBFM signal sitting at +d Hz in the I/Q
+    /// (Pluto convention, LO on the user freq, signal offset by the
+    /// digital tune) is recovered when `set_channel_freq(d)` translates
+    /// it back to DC. Mirrors the static `lo_offset` path but exercises
+    /// the runtime retune. Catches a sign error in `set_channel_freq`.
+    #[test]
+    fn digital_fine_tune_recovers_offset_signal() {
+        let fs = 576_000.0_f32;
+        let max_dev = 5_000.0_f32;
+        let f_audio = 1_000.0_f32;
+        let amp = 0.1_f32;
+        let d = 40_000.0_f32; // signal parked +40 kHz above DC.
+        let n = 12 * 4_000;
+        let iq = synth_nbfm_iq(fs, f_audio, max_dev, d, amp, n);
+
+        // Build with lo_offset = 0 (NCO at DC), then digitally tune the
+        // channel to +d so the signal lands at DC for the discriminator.
+        let mut chain = NbfmRxChain::new(NbfmRxChainConfig::new(fs as u32, max_dev, 0.0));
+        chain.set_channel_freq(d);
+        let audio = chain.process(&iq);
+
+        let steady = &audio[300..];
+        let rms: f32 = (steady.iter().map(|v| v * v).sum::<f32>() / steady.len() as f32).sqrt();
+        let expected_rms = PhaseMod::DEFAULT_K_P * 300.0 / max_dev * amp / 2.0_f32.sqrt();
+        let err_db = 20.0 * (rms / expected_rms).log10();
+        assert!(
+            err_db.abs() < 3.0,
+            "digitally-tuned RMS {rms} (expected ≈ {expected_rms}, err {err_db:.2} dB)"
+        );
+        // Channel power must be non-trivial now that the signal is in band.
+        assert!(chain.last_channel_power() > 0.0, "channel power not tracked");
     }
 
     /// Pluto fallback rate (2304 kS/s, ÷48). Same chain, just a higher

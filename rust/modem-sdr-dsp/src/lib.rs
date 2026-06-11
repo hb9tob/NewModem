@@ -50,8 +50,10 @@ pub mod freq_xlating;
 pub mod interpolator;
 pub mod nbfm_rx_chain;
 pub mod pm_mod;
+pub mod spectrum;
 
 pub use nbfm_rx_chain::{NbfmRxChain, NbfmRxChainConfig};
+pub use spectrum::SpectrumAnalyzer;
 
 /// Audio sample rate the modem core expects, in Hz. Mirrors
 /// `modem_core::types::AUDIO_RATE`. Re-exported so SDR backends can

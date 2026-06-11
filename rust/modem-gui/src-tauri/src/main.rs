@@ -8,6 +8,7 @@ mod settings;
 mod tx_encode;
 
 use modem_worker::session_store;
+use modem_worker::radio::{self, RadioSessionHandle, RadioTuner, RadioUiCommand};
 use modem_worker::{rx_worker, tx_worker, EventSink};
 
 use modem_io::cpal_capture::CaptureHandle;
@@ -81,6 +82,21 @@ struct CaptureSession {
     /// here.
     profile: Option<String>,
     forced: bool,
+    /// Radio-tab session (SDR sources only). Sits between the capture
+    /// thread and the rx_worker: forwards telemetry, tees the monitor,
+    /// applies tuning. `None` for soundcard / WAV. Held only for its
+    /// `Drop` (stops the session thread + monitor when the
+    /// `CaptureSession` is torn down) — never read by name.
+    #[allow(dead_code)]
+    radio_session: Option<RadioSessionHandle>,
+}
+
+/// GUI-facing radio control for the active SDR session. Holds the
+/// command channel into the running [`RadioSessionHandle`]. Lives in
+/// [`AppState`] so the per-control Tauri commands can reach it without
+/// touching the session lock.
+struct RadioControl {
+    ui_tx: std::sync::mpsc::Sender<RadioUiCommand>,
 }
 
 /// Standalone sound-card → WAV capture used exclusively by the
@@ -121,6 +137,9 @@ struct AppState {
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
     sounder_capture: Mutex<Option<SounderCapture>>,
+    /// Radio-tab control channel for the active SDR session. `Some` only
+    /// while an SDR capture with Radio support is running.
+    radio: Mutex<Option<RadioControl>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -572,6 +591,10 @@ fn build_capture_session(
     // don't need it — we still pass an Arc to keep `rx_worker::spawn`'s
     // signature uniform; the SDR-side counter just stays at zero and
     // the GUI chip never lights up for that reason.
+    // Radio-tab session, set up only for SDR sources that expose the
+    // telemetry/control channels (Pluto today). Built below, after the
+    // capture branch, because it needs the EventSink + tuner caps.
+    let mut radio_setup: Option<RadioSetup> = None;
     let (capture, samples, dropped_samples, is_sdr_source) =
         if let Some((backend, device_id)) = sdr_registry::parse_composite_name(device_name) {
             let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
@@ -583,9 +606,24 @@ fn build_capture_session(
             let mut device = backend
                 .open(&descriptor, &sdr_cfg)
                 .map_err(|e| format!("{}: {e}", backend.id()))?;
-            let (cap_handle, rx) = device
+            let (mut cap_handle, rx) = device
                 .start_rx()
                 .map_err(|e| format!("{}: {e}", backend.id()))?;
+            // Pull the Radio-tab channels out of the handle before it is
+            // moved into `CaptureKind::Sdr`. Both `Some` only when the
+            // backend wired the Radio path (Pluto via `with_radio`).
+            if let (Some(telemetry), Some(control)) =
+                (cap_handle.take_telemetry(), cap_handle.control().cloned())
+            {
+                let tuning = device.capabilities().radio_tuning.clone();
+                let input_rate = device.capabilities().sample_rate_strategy.host_iq_rate_hz as u32;
+                let tuner = RadioTuner::new(&tuning, sdr_cfg.rx_freq_hz, input_rate);
+                radio_setup = Some(RadioSetup {
+                    telemetry,
+                    control,
+                    tuner,
+                });
+            }
             (
                 CaptureKind::Sdr(device, cap_handle),
                 rx,
@@ -613,8 +651,34 @@ fn build_capture_session(
         );
     }
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
+
+    // Insert the Radio session between the capture and the decode worker
+    // when the source supports it. The session forwards each audio chunk
+    // through unchanged (the worker sees the same stream), tees a copy to
+    // the monitor, forwards telemetry, and applies tuning commands.
+    let (worker_samples, radio_session) = if let Some(setup) = radio_setup {
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel::<RadioUiCommand>();
+        let (handle, audio_rx) = radio::spawn_session(
+            samples,
+            setup.telemetry,
+            setup.control,
+            ui_rx,
+            sink.clone(),
+            setup.tuner,
+        );
+        if let Ok(mut r) = state.radio.lock() {
+            *r = Some(RadioControl { ui_tx });
+        }
+        (audio_rx, Some(handle))
+    } else {
+        if let Ok(mut r) = state.radio.lock() {
+            *r = None;
+        }
+        (samples, None)
+    };
+
     let worker = rx_worker::spawn(
-        samples,
+        worker_samples,
         sink,
         state.save_dir.clone(),
         state.wav_sink.clone(),
@@ -630,7 +694,95 @@ fn build_capture_session(
         device_name: device_name.to_string(),
         profile,
         forced,
+        radio_session,
     })
+}
+
+/// Radio-tab channels pulled from an [`SdrCaptureHandle`] plus the
+/// seeded tuner, carried from the capture branch to the worker-spawn
+/// site inside `build_capture_session`.
+struct RadioSetup {
+    telemetry: std::sync::mpsc::Receiver<modem_sdr::RadioTelemetry>,
+    control: std::sync::mpsc::Sender<modem_sdr::RadioCommand>,
+    tuner: RadioTuner,
+}
+
+/// Forward a [`RadioUiCommand`] to the active SDR session. Returns a
+/// French error string when no Radio-capable SDR capture is running (the
+/// GUI surfaces it as a soft notice, never a crash).
+fn send_radio_cmd(state: &State<'_, AppState>, cmd: RadioUiCommand) -> Result<(), String> {
+    let guard = state.radio.lock().map_err(|e| e.to_string())?;
+    match guard.as_ref() {
+        Some(ctrl) => ctrl
+            .ui_tx
+            .send(cmd)
+            .map_err(|_| "session radio terminée".to_string()),
+        None => Err("Radio indisponible : la source RX active n'est pas une SDR".to_string()),
+    }
+}
+
+/// Tune the receiver to an absolute RF frequency (Hz). The session's
+/// `RadioTuner` decides digital fine-tune vs hardware LO retune.
+#[tauri::command]
+fn set_radio_freq(hz: u64, state: State<'_, AppState>) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::SetFreq(hz))
+}
+
+/// Recenter the hardware LO at the current displayed frequency (brings
+/// the digital offset back to nominal).
+#[tauri::command]
+fn recenter_lo(state: State<'_, AppState>) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::Recenter)
+}
+
+/// Set RX gain. `agc_mode = "manual"` uses `gain_db`; any other value is
+/// taken as a backend AGC-mode id.
+#[tauri::command]
+fn set_rx_gain(agc_mode: String, gain_db: i32, state: State<'_, AppState>) -> Result<(), String> {
+    use modem_sdr::config::{GainSetting, ManualGainValue};
+    let gain = if agc_mode == "manual" {
+        GainSetting::Manual(ManualGainValue::Db { db: gain_db })
+    } else {
+        GainSetting::AgcMode {
+            id: agc_mode,
+            lna_state: None,
+        }
+    };
+    send_radio_cmd(&state, RadioUiCommand::SetGain(gain))
+}
+
+/// Select an antenna port by capability id (no-op on single-port SDRs).
+#[tauri::command]
+fn set_antenna(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::SetAntenna(id))
+}
+
+/// Set the NBFM max deviation (Hz), e.g. 2500 or 5000 — rebuilds the
+/// channel filter / discriminator.
+#[tauri::command]
+fn set_deviation(hz: f32, state: State<'_, AppState>) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::SetDeviation(hz))
+}
+
+/// Set the audio squelch. `enabled = false` disables it; otherwise mute
+/// when channel power falls below `dbfs`.
+#[tauri::command]
+fn set_squelch(dbfs: f32, enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let threshold = if enabled { dbfs } else { f32::NEG_INFINITY };
+    send_radio_cmd(&state, RadioUiCommand::SetSquelch(threshold))
+}
+
+/// Start / stop / redirect audio monitoring. Empty or `None` stops it.
+#[tauri::command]
+fn set_monitor_output(device: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let dev = device.filter(|d| !d.is_empty());
+    send_radio_cmd(&state, RadioUiCommand::SetMonitorDevice(dev))
+}
+
+/// Set monitor playback gain (1.0 = unity).
+#[tauri::command]
+fn set_monitor_volume(gain: f32, state: State<'_, AppState>) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::SetVolume(gain))
 }
 
 /// Resolve a profile name (case-insensitive, accepts both
@@ -798,7 +950,12 @@ fn start_capture_from_wav(
         // session state is uniform.
         profile: args.profile.clone(),
         forced,
+        radio_session: None,
     });
+    // WAV replay is not an SDR source — clear any stale radio control.
+    if let Ok(mut r) = state.radio.lock() {
+        *r = None;
+    }
     Ok(())
 }
 
@@ -811,6 +968,11 @@ fn stop_capture(state: State<'_, AppState>) -> Result<(), String> {
         // the worker's recv() returns and the thread exits naturally.
         session.capture.stop();
         session.worker.stop();
+        // `session.radio_session` (if any) drops here, stopping the
+        // radio thread and any audio monitoring.
+    }
+    if let Ok(mut r) = state.radio.lock() {
+        *r = None;
     }
     // If a raw recording was still armed, finalize it now so the WAV is
     // closed properly. We don't error out if it fails — audio capture is
@@ -2258,6 +2420,7 @@ fn main() {
                 tx_handle: Mutex::new(None),
                 ptt,
                 sounder_capture: Mutex::new(None),
+                radio: Mutex::new(None),
             });
             // Auto-kiosk on tiny touchscreens (e.g. Pi 7" 800x480) or
             // when `NBFM_KIOSK=1` is set in the environment. Both paths
@@ -2371,6 +2534,14 @@ fn main() {
             list_tx_history,
             list_rx_history,
             delete_history_item,
+            set_radio_freq,
+            recenter_lo,
+            set_rx_gain,
+            set_antenna,
+            set_deviation,
+            set_squelch,
+            set_monitor_output,
+            set_monitor_volume,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

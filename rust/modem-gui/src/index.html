@@ -24,6 +24,7 @@
   <nav class="tab-bar">
     <button class="tab active" data-tab="rx" data-i18n="tabs.rx">RX</button>
     <button class="tab" data-tab="tx" data-i18n="tabs.tx">TX</button>
+    <button class="tab" id="tab-btn-radio" data-tab="radio" data-i18n="tabs.radio" hidden>Radio</button>
     <button class="tab" data-tab="sessions" data-i18n="tabs.sessions">Sessions</button>
     <button class="tab" data-tab="history" data-i18n="tabs.history">Historique</button>
     <button class="tab" data-tab="channel" data-i18n="tabs.channel">Canal</button>
@@ -838,6 +839,99 @@
         </div>
       </div>
     </section>
+    <section id="tab-radio" class="tab-panel radio-layout">
+      <div class="radio-top">
+        <!-- Top-left: analogue needle S-meter -->
+        <div class="radio-card radio-smeter-card">
+          <div class="radio-card-title" data-i18n="radio.smeter">S-mètre</div>
+          <canvas id="radio-smeter" class="radio-smeter"></canvas>
+          <div id="radio-smeter-label" class="radio-smeter-label">—</div>
+        </div>
+        <!-- Top-middle: frequency display + entry + band presets -->
+        <div class="radio-card radio-freq-card">
+          <div class="radio-card-title" data-i18n="radio.freq">Fréquence</div>
+          <div id="radio-freq-display" class="radio-freq-display">—.------ MHz</div>
+          <div class="radio-freq-entry">
+            <input type="number" id="radio-freq-input" step="0.001" min="0"
+                   data-i18n-title="radio.freq_input_tip"
+                   title="Fréquence d'écoute en MHz" />
+            <span class="radio-unit">MHz</span>
+            <button id="radio-freq-set" data-i18n="radio.tune">Accorder</button>
+          </div>
+          <div class="radio-step-row">
+            <button class="radio-step" data-step="-25000">−25k</button>
+            <button class="radio-step" data-step="-12500">−12.5k</button>
+            <button class="radio-step" data-step="-1000">−1k</button>
+            <button class="radio-step" data-step="1000">+1k</button>
+            <button class="radio-step" data-step="12500">+12.5k</button>
+            <button class="radio-step" data-step="25000">+25k</button>
+          </div>
+          <div id="radio-band-presets" class="radio-band-presets">
+            <button class="radio-band" data-freq="145500000">2 m</button>
+            <button class="radio-band" data-freq="433500000">70 cm</button>
+            <button class="radio-band" data-freq="1296000000">23 cm</button>
+            <button id="radio-recenter" data-i18n="radio.recenter"
+                    data-i18n-title="radio.recenter_tip"
+                    title="Recentrer l'oscillateur local">Recentrer OL</button>
+          </div>
+          <div id="radio-tune-info" class="radio-tune-info">—</div>
+        </div>
+        <!-- Top-right: audio spectrum + monitoring -->
+        <div class="radio-card radio-audio-card">
+          <div class="radio-card-title" data-i18n="radio.audio_spectrum">Spectre audio</div>
+          <canvas id="radio-audio-fft" class="radio-audio-fft"></canvas>
+          <div class="radio-monitor-row">
+            <select id="radio-monitor-out" data-i18n-title="radio.monitor_out"
+                    title="Sortie audio de monitoring">
+              <option value="" data-i18n="radio.monitor_off">— Écoute désactivée —</option>
+            </select>
+          </div>
+          <div class="radio-monitor-row">
+            <span data-i18n="radio.volume">Volume</span>
+            <input type="range" id="radio-volume" min="0" max="150" value="80" />
+            <span id="radio-volume-label">80 %</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom: RF spectrum + waterfall, with controls -->
+      <div class="radio-bottom">
+        <div class="radio-controls">
+          <label class="radio-ctl">
+            <span data-i18n="radio.gain">Gain RX</span>
+            <select id="radio-gain-mode">
+              <option value="manual" data-i18n="radio.gain_manual">Manuel</option>
+              <option value="slow_attack" data-i18n="radio.gain_agc">AGC</option>
+            </select>
+            <input type="range" id="radio-gain-db" min="-3" max="71" value="30" />
+            <span id="radio-gain-label">30 dB</span>
+          </label>
+          <label class="radio-ctl">
+            <span data-i18n="radio.width">Largeur</span>
+            <select id="radio-deviation">
+              <option value="2500" data-i18n="radio.width_25">±2,5 kHz</option>
+              <option value="5000" selected data-i18n="radio.width_5">±5 kHz</option>
+            </select>
+          </label>
+          <label class="radio-ctl">
+            <input type="checkbox" id="radio-squelch-on" />
+            <span data-i18n="radio.squelch">Squelch</span>
+            <input type="range" id="radio-squelch-db" min="-120" max="0" value="-80" />
+            <span id="radio-squelch-label">−80 dB</span>
+          </label>
+          <label class="radio-ctl">
+            <span data-i18n="radio.level_zoom">Niveaux</span>
+            <input type="range" id="radio-level-min" min="-140" max="-20" value="-120" />
+            <input type="range" id="radio-level-max" min="-120" max="20" value="-20" />
+          </label>
+        </div>
+        <div class="radio-spectrum-wrap">
+          <canvas id="radio-rf-fft" class="radio-rf-fft"></canvas>
+          <canvas id="radio-waterfall" class="radio-waterfall"></canvas>
+        </div>
+      </div>
+    </section>
+
     <section id="tab-info" class="tab-panel">
       <ul id="event-log"></ul>
     </section>

@@ -64,6 +64,47 @@ pub struct BackendCapabilities {
     /// Sample-rate selection — for now informational, but the GUI
     /// could surface it in a "Diagnostics" panel.
     pub sample_rate_strategy: SampleRateStrategy,
+
+    /// Radio-tab tuning capabilities. Describes how the hybrid
+    /// digital-NCO + hardware-LO tuner may move the receiver within the
+    /// captured band before a hardware retune is forced, and whether
+    /// the channel may sit on DC.
+    #[serde(default)]
+    pub radio_tuning: RadioTuning,
+}
+
+/// Tuning parameters for the Radio tab's hybrid tuner. Defaults to a
+/// conservative "no digital window, DC-safe" shape so a backend that
+/// hasn't opted into the Radio tab behaves sanely.
+#[derive(Clone, Debug, Serialize)]
+pub struct RadioTuning {
+    /// Whether the channel may sit on DC. `true` for backends with
+    /// hardware DC compensation (Pluto AD9363); `false` for zero-IF
+    /// tuners (SDRplay / RTL) that show a DC spike.
+    pub dc_tunable: bool,
+    /// Deliberate LO offset, in Hz, that keeps the wanted channel off
+    /// DC on `!dc_tunable` backends. `0` on Pluto. Matches
+    /// `NbfmRxChainConfig::lo_offset_hz`.
+    pub lo_offset_hz: f64,
+    /// Usable half-width of the digital fine-tune window, in Hz. A move
+    /// keeping `|displayed_rf − lo| ≤ digital_window_hz` stays digital;
+    /// beyond it the LO is retuned. Conservatively < captured_band/2.
+    pub digital_window_hz: f64,
+    /// Minimum `|digital offset|`, in Hz, allowed on `!dc_tunable`
+    /// backends so the channel never lands on DC. `0` when
+    /// `dc_tunable`.
+    pub dc_guard_hz: f64,
+}
+
+impl Default for RadioTuning {
+    fn default() -> Self {
+        Self {
+            dc_tunable: true,
+            lo_offset_hz: 0.0,
+            digital_window_hz: 0.0,
+            dc_guard_hz: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -19,10 +19,12 @@ pub mod backend;
 pub mod cpal_capture;
 pub mod cpal_sink;
 pub mod devices;
+pub mod monitor;
 pub mod traits;
 
 pub use backend::{make_sink, start_capture, AudioBackend};
 pub use cpal_sink::CpalSink;
+pub use monitor::AudioMonitor;
 pub use traits::{IoError, PlaybackHandle, SampleSink};
 
 #[cfg(target_os = "linux")]

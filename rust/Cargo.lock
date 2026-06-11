@@ -3032,6 +3032,7 @@ name = "modem-sdr-dsp"
 version = "0.1.0"
 dependencies = [
  "num-complex",
+ "rustfft",
 ]
 
 [[package]]
@@ -3057,6 +3058,7 @@ dependencies = [
  "modem-core",
  "modem-framing",
  "modem-io",
+ "modem-sdr",
  "modem-sdr-dsp",
  "serde",
  "serde_json",

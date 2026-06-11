@@ -52,6 +52,7 @@ fn dummy_caps() -> BackendCapabilities {
             host_iq_rate_hz: 576_000,
             audio_decim_ratio: 12,
         },
+        radio_tuning: Default::default(),
     }
 }
 

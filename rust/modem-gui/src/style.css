@@ -2684,3 +2684,142 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 .sounder-plot-svg .point {
   fill: #4a9eff;
 }
+
+/* ───────────────────────────── Radio tab ─────────────────────────── */
+.radio-layout {
+  gap: 0.6rem;
+  padding: 0.6rem;
+  overflow: hidden;
+}
+.radio-top {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(240px, 1.3fr) minmax(240px, 1.3fr);
+  gap: 0.6rem;
+  flex: 0 0 auto;
+  min-height: 200px;
+}
+.radio-card {
+  background: #15171c;
+  border: 1px solid #2a2d34;
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.radio-card-title {
+  font-size: 0.78rem;
+  color: #7fd1ff;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.radio-smeter {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 120px;
+}
+.radio-smeter-label {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: #cfd2d8;
+  font-size: 0.85rem;
+}
+.radio-freq-display {
+  font-size: 1.7rem;
+  font-variant-numeric: tabular-nums;
+  color: #e8ffe8;
+  text-align: center;
+  font-weight: 600;
+}
+.radio-freq-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.radio-freq-entry input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.radio-unit {
+  color: #9aa0aa;
+}
+.radio-step-row,
+.radio-band-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.radio-step,
+.radio-band {
+  flex: 1 1 auto;
+  padding: 0.25rem 0.3rem;
+  font-size: 0.8rem;
+}
+.radio-tune-info {
+  font-size: 0.72rem;
+  color: #8a909a;
+  font-variant-numeric: tabular-nums;
+}
+.radio-audio-fft {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 90px;
+  background: #0a0a0a;
+  border-radius: 4px;
+}
+.radio-monitor-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.radio-monitor-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.radio-monitor-row input[type="range"] {
+  flex: 1 1 auto;
+}
+.radio-bottom {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 0;
+}
+.radio-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.4rem;
+  align-items: center;
+}
+.radio-ctl {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: #cfd2d8;
+}
+.radio-ctl input[type="range"] {
+  width: 110px;
+}
+.radio-spectrum-wrap {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid #2a2d34;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.radio-rf-fft {
+  width: 100%;
+  flex: 0 0 35%;
+  background: #0a0a0a;
+}
+.radio-waterfall {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: #000;
+}

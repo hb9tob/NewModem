@@ -4,6 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 num-complex = "0.4"
+rustfft = "6"
 thiserror = "2"
 hound = "3.5"
 clap = { version = "4", features = ["derive"] }

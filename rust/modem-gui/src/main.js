@@ -113,6 +113,8 @@ function setupTabs() {
       if (target === "history") refreshHistory();
       if (target === "channel") stopRxAndTxForChannelTab();
       if (target === "settings") refreshSettingsRxWarn();
+      if (target === "radio") startRadioRender();
+      else stopRadioRender();
     });
   }
 }
@@ -2042,6 +2044,7 @@ function setupSettingsTab() {
     rxSel.addEventListener("change", async () => {
       refreshRxDeviceLabel();
       refreshStartButtonFromRx();
+      refreshRadioTabVisibility();
       // Re-render once with the (possibly stale) cached caps so the
       // panel updates immediately, then again once the per-device
       // caps come back over IPC. Backends without device-aware caps
@@ -3472,6 +3475,29 @@ function wireEvents() {
   listen("tx_archived", () => {
     // Emitted by tx_worker::archive_payload at the start of every transmission.
     refreshHistory().catch(() => {});
+  });
+
+  // ── Radio tab telemetry (SDR sources only). The capture thread emits
+  // these via the worker's radio session; we cache the latest frame and
+  // the RAF loop (only running while the Radio tab is active) paints.
+  listen("radio_spectrum", (event) => {
+    radioState.rf = event.payload;
+  });
+  listen("radio_audio_spectrum", (event) => {
+    radioState.audio = event.payload;
+  });
+  listen("radio_smeter", (event) => {
+    const p = event.payload || {};
+    // EMA-smooth so the needle doesn't jitter.
+    const v = p.channel_power_dbfs;
+    if (typeof v === "number" && isFinite(v)) {
+      radioState.smeterDb =
+        radioState.smeterDb === null ? v : radioState.smeterDb * 0.7 + v * 0.3;
+    }
+  });
+  listen("radio_tune_state", (event) => {
+    radioState.tune = event.payload;
+    updateRadioTuneDisplay();
   });
 }
 
@@ -5383,6 +5409,371 @@ async function setupAppVersionChip() {
   }
 }
 
+// ───────────────────────────────────────────────────────── Radio tab
+//
+// SDR-only receiver cockpit: needle S-meter, frequency control with
+// hybrid digital/LO tuning (handled backend-side), audio spectrum +
+// soundcard monitoring, wideband RF spectrum + waterfall. The backend
+// streams telemetry events (radio_spectrum / radio_audio_spectrum /
+// radio_smeter / radio_tune_state) which `wireEvents` caches into
+// `radioState`; a RAF loop (only alive while the tab is visible) paints.
+
+const radioState = {
+  rf: null, // latest RF SpectrumFrame {bins_db, center_hz, span_hz, seq}
+  audio: null, // latest audio SpectrumFrame
+  smeterDb: null, // EMA-smoothed channel power, dBFS
+  tune: null, // latest TuneState
+  rafId: null,
+  waterfallInit: false,
+};
+
+// Waterfall colour LUT: black → blue → cyan → green → yellow → red →
+// white. 256 entries of [r,g,b].
+const RADIO_WF_PALETTE = (() => {
+  const p = new Uint8ClampedArray(256 * 3);
+  const stops = [
+    [0, 0, 0, 0],
+    [0.15, 0, 0, 80],
+    [0.35, 0, 120, 180],
+    [0.5, 0, 200, 160],
+    [0.65, 120, 220, 40],
+    [0.8, 240, 200, 0],
+    [0.92, 240, 60, 0],
+    [1.0, 255, 255, 255],
+  ];
+  for (let i = 0; i < 256; i++) {
+    const f = i / 255;
+    let a = stops[0];
+    let b = stops[stops.length - 1];
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (f >= stops[s][0] && f <= stops[s + 1][0]) {
+        a = stops[s];
+        b = stops[s + 1];
+        break;
+      }
+    }
+    const span = b[0] - a[0] || 1;
+    const u = (f - a[0]) / span;
+    p[i * 3] = a[1] + (b[1] - a[1]) * u;
+    p[i * 3 + 1] = a[2] + (b[2] - a[2]) * u;
+    p[i * 3 + 2] = a[3] + (b[3] - a[3]) * u;
+  }
+  return p;
+})();
+
+function radioLevelRange() {
+  const lo = parseFloat(document.getElementById("radio-level-min")?.value ?? "-120");
+  const hi = parseFloat(document.getElementById("radio-level-max")?.value ?? "-20");
+  return hi > lo ? [lo, hi] : [lo, lo + 1];
+}
+
+function sizeRadioCanvas(canvas) {
+  if (!canvas) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    radioState.waterfallInit = false; // RF/waterfall geometry changed
+  }
+  return canvas.getContext("2d");
+}
+
+async function invokeRadio(cmd, args) {
+  try {
+    const { invoke } = window.__TAURI__.core;
+    await invoke(cmd, args || {});
+  } catch (err) {
+    // No active SDR session yet (capture not started) → soft-ignore.
+    if (!String(err).includes("Radio indisponible")) {
+      console.warn(`[radio] ${cmd}`, err);
+    }
+  }
+}
+
+function refreshRadioTabVisibility() {
+  const btn = document.getElementById("tab-btn-radio");
+  if (!btn) return;
+  const isSdr = getSelectedBackendId("rx-device-select") !== null;
+  btn.hidden = !isSdr;
+  if (!isSdr) {
+    // If we were on the Radio tab and the source changed to non-SDR,
+    // fall back to RX.
+    if (btn.classList.contains("active")) {
+      document.querySelector('.tab-bar .tab[data-tab="rx"]')?.click();
+    }
+  }
+}
+
+function updateRadioTuneDisplay() {
+  const t = radioState.tune;
+  const disp = document.getElementById("radio-freq-display");
+  const info = document.getElementById("radio-tune-info");
+  if (t && disp) {
+    disp.textContent = `${(t.displayed_rf_hz / 1e6).toFixed(6)} MHz`;
+  }
+  if (t && info) {
+    const off = t.digital_offset_hz;
+    const offStr = `${off >= 0 ? "+" : ""}${(off / 1000).toFixed(2)} kHz`;
+    info.textContent = `OL ${(t.lo_hz / 1e6).toFixed(4)} MHz · décalage num. ${offStr} · span ${(t.input_rate_hz / 1000).toFixed(0)} kHz`;
+  }
+}
+
+function currentRadioHz() {
+  if (radioState.tune) return radioState.tune.displayed_rf_hz;
+  const v = parseFloat(document.getElementById("radio-freq-input")?.value);
+  return isFinite(v) ? Math.round(v * 1e6) : 145_500_000;
+}
+
+function tuneRadioTo(hz) {
+  const clamped = Math.max(0, Math.round(hz));
+  const input = document.getElementById("radio-freq-input");
+  if (input) input.value = (clamped / 1e6).toFixed(6);
+  invokeRadio("set_radio_freq", { hz: clamped });
+}
+
+async function setupRadioTab() {
+  // Frequency entry + tune button.
+  document.getElementById("radio-freq-set")?.addEventListener("click", () => {
+    const v = parseFloat(document.getElementById("radio-freq-input").value);
+    if (isFinite(v)) tuneRadioTo(v * 1e6);
+  });
+  document.getElementById("radio-freq-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const v = parseFloat(e.target.value);
+      if (isFinite(v)) tuneRadioTo(v * 1e6);
+    }
+  });
+  // Step buttons (digital fine-tune in the common case).
+  for (const b of document.querySelectorAll(".radio-step")) {
+    b.addEventListener("click", () => {
+      tuneRadioTo(currentRadioHz() + Number(b.dataset.step));
+    });
+  }
+  // Amateur-band presets.
+  for (const b of document.querySelectorAll(".radio-band")) {
+    b.addEventListener("click", () => tuneRadioTo(Number(b.dataset.freq)));
+  }
+  document.getElementById("radio-recenter")?.addEventListener("click", () => {
+    invokeRadio("recenter_lo");
+  });
+
+  // RX gain.
+  const gainMode = document.getElementById("radio-gain-mode");
+  const gainDb = document.getElementById("radio-gain-db");
+  const gainLabel = document.getElementById("radio-gain-label");
+  const sendGain = () => {
+    const manual = gainMode.value === "manual";
+    if (gainDb) gainDb.disabled = !manual;
+    if (gainLabel) gainLabel.textContent = manual ? `${gainDb.value} dB` : "AGC";
+    invokeRadio("set_rx_gain", {
+      agcMode: gainMode.value,
+      gainDb: Number(gainDb.value),
+    });
+  };
+  gainMode?.addEventListener("change", sendGain);
+  gainDb?.addEventListener("input", () => {
+    if (gainLabel) gainLabel.textContent = `${gainDb.value} dB`;
+  });
+  gainDb?.addEventListener("change", sendGain);
+
+  // Deviation / channel width.
+  document.getElementById("radio-deviation")?.addEventListener("change", (e) => {
+    invokeRadio("set_deviation", { hz: Number(e.target.value) });
+  });
+
+  // Squelch.
+  const sqOn = document.getElementById("radio-squelch-on");
+  const sqDb = document.getElementById("radio-squelch-db");
+  const sqLabel = document.getElementById("radio-squelch-label");
+  const sendSquelch = () => {
+    if (sqLabel) sqLabel.textContent = `${sqDb.value} dB`;
+    invokeRadio("set_squelch", {
+      dbfs: Number(sqDb.value),
+      enabled: !!sqOn.checked,
+    });
+  };
+  sqOn?.addEventListener("change", sendSquelch);
+  sqDb?.addEventListener("input", () => {
+    if (sqLabel) sqLabel.textContent = `${sqDb.value} dB`;
+  });
+  sqDb?.addEventListener("change", sendSquelch);
+
+  // Monitor output device list + selection.
+  const monSel = document.getElementById("radio-monitor-out");
+  if (monSel) {
+    try {
+      const { invoke } = window.__TAURI__.core;
+      const outs = await invoke("list_output_audio_devices");
+      for (const d of outs || []) {
+        const o = document.createElement("option");
+        o.value = d.name;
+        o.textContent = d.name;
+        monSel.appendChild(o);
+      }
+    } catch (err) {
+      console.warn("[radio] list_output_audio_devices", err);
+    }
+    monSel.addEventListener("change", () => {
+      invokeRadio("set_monitor_output", { device: monSel.value || null });
+      // Push the current volume right after enabling a device.
+      if (monSel.value) {
+        const vol = Number(document.getElementById("radio-volume")?.value ?? 80) / 100;
+        invokeRadio("set_monitor_volume", { gain: vol });
+      }
+    });
+  }
+  const vol = document.getElementById("radio-volume");
+  const volLabel = document.getElementById("radio-volume-label");
+  vol?.addEventListener("input", () => {
+    if (volLabel) volLabel.textContent = `${vol.value} %`;
+    invokeRadio("set_monitor_volume", { gain: Number(vol.value) / 100 });
+  });
+}
+
+function startRadioRender() {
+  refreshRadioTabVisibility();
+  if (radioState.rafId !== null) return;
+  radioState.waterfallInit = false;
+  const loop = () => {
+    renderRadio();
+    radioState.rafId = requestAnimationFrame(loop);
+  };
+  radioState.rafId = requestAnimationFrame(loop);
+}
+
+function stopRadioRender() {
+  if (radioState.rafId !== null) {
+    cancelAnimationFrame(radioState.rafId);
+    radioState.rafId = null;
+  }
+}
+
+function renderRadio() {
+  drawRadioSmeter();
+  drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6");
+  drawRadioRf();
+}
+
+function drawRadioSmeter() {
+  const canvas = document.getElementById("radio-smeter");
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2;
+  const cy = h * 0.92;
+  const r = Math.min(w * 0.42, h * 0.78);
+  // Dial arc.
+  ctx.strokeStyle = "#888";
+  ctx.lineWidth = Math.max(1, w * 0.004);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, Math.PI * 1.15, Math.PI * 1.85);
+  ctx.stroke();
+  // Ticks S0..S9 then +20/+40/+60.
+  ctx.fillStyle = "#aaa";
+  ctx.font = `${Math.max(8, Math.round(h * 0.08))}px sans-serif`;
+  ctx.textAlign = "center";
+  const labels = ["1", "3", "5", "7", "9", "+20", "+40", "+60"];
+  for (let i = 0; i < labels.length; i++) {
+    const frac = i / (labels.length - 1);
+    const ang = Math.PI * 1.15 + frac * (Math.PI * 0.7);
+    const x1 = cx + Math.cos(ang) * r;
+    const y1 = cy + Math.sin(ang) * r;
+    const x2 = cx + Math.cos(ang) * (r * 0.9);
+    const y2 = cy + Math.sin(ang) * (r * 0.9);
+    ctx.strokeStyle = i >= 5 ? "#e53935" : "#888";
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    const lx = cx + Math.cos(ang) * (r * 0.78);
+    const ly = cy + Math.sin(ang) * (r * 0.78);
+    ctx.fillText(labels[i], lx, ly);
+  }
+  // Needle: map dBFS [-110 .. -10] → fraction [0 .. 1].
+  const db = radioState.smeterDb;
+  const frac = db === null ? 0 : Math.max(0, Math.min(1, (db + 110) / 100));
+  const ang = Math.PI * 1.15 + frac * (Math.PI * 0.7);
+  ctx.strokeStyle = "#e0e0e0";
+  ctx.lineWidth = Math.max(1.5, w * 0.008);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(ang) * r * 0.95, cy + Math.sin(ang) * r * 0.95);
+  ctx.stroke();
+  const label = document.getElementById("radio-smeter-label");
+  if (label) label.textContent = db === null ? "—" : `${db.toFixed(0)} dBFS`;
+}
+
+// Generic line/area spectrum painter. `frame.bins_db` are dBFS bins.
+function drawRadioSpectrum(canvasId, frame, color) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0a0a0a";
+  ctx.fillRect(0, 0, w, h);
+  if (!frame || !frame.bins_db || !frame.bins_db.length) return;
+  const bins = frame.bins_db;
+  const n = bins.length;
+  const [lo, hi] = radioLevelRange();
+  const span = hi - lo;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x < w; x++) {
+    const bi = Math.min(n - 1, Math.floor((x / w) * n));
+    const v = Math.max(0, Math.min(1, (bins[bi] - lo) / span));
+    const y = h - v * h;
+    if (x === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawRadioRf() {
+  // Top: line spectrum. Bottom: scrolling waterfall, both fed by the
+  // same RF frame.
+  drawRadioSpectrum("radio-rf-fft", radioState.rf, "#9CCC65");
+  const canvas = document.getElementById("radio-waterfall");
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  if (!radioState.waterfallInit) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    radioState.waterfallInit = true;
+    radioState.lastWfSeq = -1;
+  }
+  const frame = radioState.rf;
+  if (!frame || !frame.bins_db || !frame.bins_db.length) return;
+  if (frame.seq === radioState.lastWfSeq) return; // no new frame
+  radioState.lastWfSeq = frame.seq;
+  // Scroll everything up by one pixel, then draw the newest row at the
+  // bottom (scroll-blit + single new row — never a full re-render).
+  ctx.drawImage(canvas, 0, 0, w, h, 0, -1, w, h);
+  const bins = frame.bins_db;
+  const n = bins.length;
+  const [lo, hi] = radioLevelRange();
+  const span = hi - lo;
+  const row = ctx.createImageData(w, 1);
+  for (let x = 0; x < w; x++) {
+    const bi = Math.min(n - 1, Math.floor((x / w) * n));
+    const v = Math.max(0, Math.min(1, (bins[bi] - lo) / span));
+    const idx = Math.min(255, Math.max(0, Math.round(v * 255)));
+    row.data[x * 4] = RADIO_WF_PALETTE[idx * 3];
+    row.data[x * 4 + 1] = RADIO_WF_PALETTE[idx * 3 + 1];
+    row.data[x * 4 + 2] = RADIO_WF_PALETTE[idx * 3 + 2];
+    row.data[x * 4 + 3] = 255;
+  }
+  ctx.putImageData(row, 0, h - 1);
+}
+
 async function init() {
   // Load translations first so every subsequent setup* that reads
   // a `t(...)` (or HTML data-i18n) gets the right language out of
@@ -5407,6 +5798,8 @@ async function init() {
   setupChannelTab();
   setupSounderTab();
   await loadDevices();
+  setupRadioTab();
+  refreshRadioTabVisibility();
   await loadSerialPorts();
   await loadSaveDir();
   // Display the initial PTT state (computed by the backend at setup).
