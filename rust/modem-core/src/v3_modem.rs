@@ -14,8 +14,6 @@ const FAMILY: &str = "NBFM-V3";
 /// Inter-frame silence between the data superframe and the EOT frame.
 /// Hard-coded both with and without the VOX prefix in the legacy CLI.
 const INTER_FRAME_SILENCE_S: f64 = 0.2;
-/// Silence right after the VOX preamble tone, before the data frame.
-const VOX_TAIL_SILENCE_S: f64 = 0.05;
 /// VOX preamble carrier amplitude (matches the CLI literal).
 const VOX_AMPLITUDE: f32 = 0.5;
 /// Trailing silence after the EOT frame when VOX is on (matches the CLI).
@@ -85,8 +83,18 @@ impl Modem for V3Modem {
             modulator::modulate(&eot_symbols, sps, pitch, &taps, cfg.center_freq_hz);
 
         // Layout matches `nbfm-modem tx` (modem-cli/src/main.rs ~line 307):
-        // - vox > 0:  tone(vox) + 50ms silence + data + 200ms silence + EOT + 100ms silence
+        // - vox > 0:  tone(vox) + data + 200ms silence + EOT + 100ms silence
         // - vox == 0: data + 200ms silence + EOT
+        //
+        // The tone -> data transition is back-to-back: no silence gap
+        // between them. The previous 50 ms `VOX_TAIL_SILENCE_S` made the
+        // radio's AGC ramp down (no signal during the gap), then ramp up
+        // again on the preamble, leaving SF1's first codeword landing in
+        // the AGC re-settling transient — observed loss on the very
+        // first SF that was systematically worse than 0.9.2rc5. Going
+        // tone -> data straight keeps the AGC stably locked across the
+        // entire pre-data + preamble window. See the 2026-05-11 note in
+        // `rx_v2.rs` about the preamble→data transient.
         let out = if req.vox_seconds > 0.0 {
             let mut out = Vec::new();
             out.extend_from_slice(&modulator::tone(
@@ -94,7 +102,6 @@ impl Modem for V3Modem {
                 req.vox_seconds,
                 VOX_AMPLITUDE,
             ));
-            out.extend_from_slice(&modulator::silence(VOX_TAIL_SILENCE_S));
             out.append(&mut data_modulated);
             out.extend_from_slice(&modulator::silence(INTER_FRAME_SILENCE_S));
             out.append(&mut eot_modulated);

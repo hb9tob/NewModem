@@ -16,9 +16,12 @@ tauri-build = { version = "2", features = [] }
 # this. A reduced "windows-min" build can `--no-default-features
 # --features pluto` once Phase E removes the direct-named-backend
 # code paths from main.rs / settings.rs.
-default = ["pluto", "sdrplay"]
+default = ["pluto", "sdrplay", "rtlsdr"]
 pluto = ["dep:modem-pluto"]
 sdrplay = ["dep:modem-sdrplay"]
+# RTL-SDR is loaded at runtime via libloading — safe to enable in the
+# default set even when librtlsdr.so isn't installed on the target.
+rtlsdr = ["dep:modem-rtlsdr"]
 windows-min = ["pluto"]
 
 [dependencies]
@@ -28,6 +31,7 @@ modem-io = { path = "../../modem-io" }
 modem-sdr = { path = "../../modem-sdr" }
 modem-pluto = { path = "../../modem-pluto", optional = true }
 modem-sdrplay = { path = "../../modem-sdrplay", optional = true }
+modem-rtlsdr = { path = "../../modem-rtlsdr", optional = true }
 modem-worker = { path = "../../modem-worker" }
 modem-worker-base = { path = "../../modem-worker-base" }
 modem-core-base = { path = "../../modem-core-base" }
@@ -50,3 +54,11 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1", features = ["fs"] }
+
+# glibc-only : malloc_trim(0) after compress_image to release the
+# large transient buffers (decoded source RGB at 6000×4000 ≈ 72 MB)
+# back to the kernel. Without this, glibc keeps them in its arena and
+# the resident-set creeps by ~70 MB per encode until WebKitGTK gets
+# squeezed and the WebProcess dies.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

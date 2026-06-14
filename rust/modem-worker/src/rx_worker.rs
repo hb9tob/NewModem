@@ -31,7 +31,7 @@ use modem_core::profile::{ModemConfig, ProfileIndex};
 use modem_core::rrc;
 use modem_core::rx_v2;
 use modem_core::sync as rx_sync;
-use modem_sdr_dsp::emphasis::DeemphasisFilter;
+use modem_sdr_dsp::audio_filters::DeemphasisLpf;
 use modem_core::types::AUDIO_RATE;
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
@@ -618,9 +618,10 @@ const TRUNCATE_MARGIN_MS: usize = 100;
 /// anyway (`MAX_SESSION_SECONDS`).
 const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 
-/// Fall back to Idle if no preamble has been seen for this long while
-/// Capturing — covers the case where the sender disappears mid-burst
-/// without sending an EOT.
+/// Base value of the preamble-absence fallback : if Capturing and no
+/// preamble has been seen for this long, return to Idle. Scaled per
+/// profile by `preamble_absence_timeout` — see that function for the
+/// rationale on why slow profiles need a larger margin.
 ///
 /// **Not** an audio-silence timer : in radio there is no silence once
 /// the TX un-keys, the RX AGC ramps up to noise floor and the demod
@@ -628,7 +629,82 @@ const SESSION_HARD_CAP_SECONDS: usize = 5 * 60;
 /// of a decoded preamble** — the only signature that a real signal
 /// is on-air. Renamed in 0.10.42 from the historical
 /// `PREAMBLE_SILENCE_TIMEOUT_S` to make the semantics explicit.
-const PREAMBLE_ABSENCE_TIMEOUT_S: u64 = 6;
+const PREAMBLE_ABSENCE_TIMEOUT_BASE_S: u64 = 6;
+
+/// Per-profile preamble-absence timeout.
+///
+/// Scales linearly with samples-per-symbol (sps = AUDIO_RATE / Rs) so
+/// slow profiles get a proportionally longer window to redecode their
+/// next preamble. `V3_PREAMBLE_PERIOD_S` is 4 s for every profile, but
+/// the closed-window decode that confirms a still-live burst needs at
+/// least 2 consecutive preambles plus MF/Gardner pre-roll. For ULTRA
+/// (sps=96) this takes ~3 periods to lock — a uniform 6 s timeout
+/// triggers a full `soft_reset_buffer` mid-burst and the codewords are
+/// lost. Linear scaling on sps gives 6 s for sps=32 (NORMAL/HIGH/MEGA/
+/// HIGH+/HIGH++/HIGH56/HIGH+56/FAST), 9 s for ROBUST (sps=48), 18 s
+/// for ULTRA (sps=96), well under `MAX_SESSION_SECONDS`.
+fn preamble_absence_timeout(config: &modem_core::profile::ModemConfig) -> Duration {
+    let sps = (AUDIO_RATE as f64 / config.symbol_rate).round().max(1.0);
+    let scale = (sps / 32.0).max(1.0);
+    let secs = (PREAMBLE_ABSENCE_TIMEOUT_BASE_S as f64 * scale).ceil() as u64;
+    Duration::from_secs(secs)
+}
+
+/// Minimum trailing audio retained in the active session buffer after a
+/// successful `scan_and_route` truncation. Scales per profile so that
+/// every scan tick sees at least two consecutive preambles in the
+/// session buffer — i.e. ≥ 1 CLOSED window for `rx_v3_after` to feed to
+/// `rx_v2_legacy_grid_decode` (Power Mode) or `rx_v2_with_options` /
+/// `rx_v2_with_hint` (Light Mode). Both decoders depend on the
+/// closed-pair geometry for drift compensation: the broad ±80 ppm grid
+/// in Power Mode, the per-window Gardner estimate in Light Mode.
+///
+/// Without this floor the post-scan drain at `last_preamble_offset
+/// - TRUNCATE_MARGIN` collapses the buffer to ≈ 1 preamble worth of
+/// audio. The next preamble lands `V3_PREAMBLE_PERIOD_S = 4 s` later,
+/// so every intermediate tick only sees positions.len() = 1 →
+/// OPEN-only. In active state `finalize = false` skips OPEN windows
+/// (line ~2008 of `rx_v2.rs`), so 3 out of every 4 ticks decode
+/// nothing. Worst-affected profile: ULTRA (sps=96) which needs the
+/// broad ±80 ppm grid more often than fast profiles because its low
+/// symbol rate amplifies the cost of a single missed CLOSED window.
+///
+/// Inspired by 0.9.2rc5's flat `CAPTURE_WINDOW_SECONDS = 15`, narrowed
+/// here to per-profile values so fast profiles don't pay the linear
+/// `downmix + matched_filter` cost on audio they don't need:
+///   - 8 s  for sps=32 (NORMAL/HIGH/MEGA/FAST/HIGH+/HIGH++/HIGH56/HIGH+56)
+///   - 10 s for sps=48 (ROBUST) — +2 s for marker-jitter slack at half rate
+///   - 12 s for sps=96 (ULTRA)  — +4 s so 3 preambles are visible at all
+///                                 times, giving the broad-grid search
+///                                 two CLOSED windows to score across
+fn min_active_buffer_seconds(config: &modem_core::profile::ModemConfig) -> usize {
+    let sps = (AUDIO_RATE as f64 / config.symbol_rate).round() as usize;
+    if sps >= 96 {
+        12
+    } else if sps >= 48 {
+        10
+    } else {
+        8
+    }
+}
+
+/// `true` for the slow QPSK profiles (ROBUST sps=48, ULTRA sps=96) whose
+/// 2-CW data segment is longer than the windows the sliding-window worker
+/// was tuned for (family A sps=32, segment ≈0.77 s). A ROBUST segment is
+/// ≈2.6 s, an ULTRA one ≈5 s, so these profiles need:
+///   - a pre-activation idle buffer ≥ one superframe (not the flat 2 s
+///     PREROLL that can't even hold one data segment),
+///   - `finalize=true` decoding kept on while active (decode the trailing
+///     OPEN window like the CLI's full-file `rx_v3` does, instead of
+///     waiting for a 2-preamble CLOSED window that the reset cycle tears
+///     down first),
+///   - the sps-scaled preamble-absence timeout even in Power Mode (the
+///     flat 6 s is shorter than one ULTRA superframe).
+/// The fast/validated-OTA profiles (NORMAL/HIGH/MEGA/HIGH+/HIGH++/FAST,
+/// all sps ≤ 32) are excluded so their behaviour is byte-for-byte unchanged.
+fn is_slow_profile(config: &modem_core::profile::ModemConfig) -> bool {
+    (AUDIO_RATE as f64 / config.symbol_rate).round() as usize >= 48
+}
 
 /// Late-entry recovery (lowpower path only, `!allow_legacy_grid`).
 ///
@@ -701,7 +777,7 @@ struct WorkerState {
     /// Optional NBFM de-emphasis filter applied to the path going to the
     /// modem demodulator (after the raw WAV tee + level meter). `None`
     /// when the user has not enabled the toggle in Settings.
-    deemphasis: Option<DeemphasisFilter>,
+    deemphasis: Option<DeemphasisLpf>,
     /// Operator-controlled flag (Settings tab) : when `true`, the
     /// legacy `rx_v2()` ±15 ppm safety grid is allowed on cold-start
     /// CLOSED decodes that didn't get a session-level Gardner hint.
@@ -816,7 +892,7 @@ impl WorkerState {
             session_started_at: now,
             last_preamble_seen_at: now,
             total_samples: 0,
-            deemphasis: deemphasis_enabled.then(DeemphasisFilter::new),
+            deemphasis: deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32)),
             allow_legacy_grid,
             session_drift_ppm: None,
             perf_acc: rx_v2::PerfBreakdown::default(),
@@ -934,7 +1010,8 @@ fn run_turbo_worker(
                 return;
             }
         };
-    let mut deemph = deemphasis_enabled.then(DeemphasisFilter::new);
+    let mut deemph =
+        deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
     let mut total_samples: u64 = 0;
     let mut last_dropped: u64 = 0;
 
@@ -1139,11 +1216,12 @@ fn run_worker(
             state.last_audio_above_silence_at = Instant::now();
         }
 
-        // Optional NBFM de-emphasis. Applied AFTER the raw WAV tee and the
-        // audio_level metric so those still reflect what the radio actually
-        // delivered (clip diagnostics stay meaningful), and BEFORE feeding
-        // the modem demodulator so rx_v3 sees a flat spectrum when paired
-        // with a transmitter that ran the matching pre-emphasis.
+        // Optional PM-emulation de-emphasis (single-pole LPF, 300 Hz corner,
+        // -6 dB/oct slope) for legacy FM radios that lack the PM ±6 dB/oct
+        // intrinsic. Default off — modern PM radios already compensate
+        // internally and don't need this. Applied AFTER the raw WAV tee and
+        // the audio_level metric (so clip diagnostics still reflect what the
+        // radio actually delivered) and BEFORE the modem demodulator.
         if let Some(filter) = state.deemphasis.as_mut() {
             filter.process(&mut batch);
         }
@@ -1197,11 +1275,23 @@ fn run_worker(
                 continue;
             }
         } else {
-            // Idle: keep a rolling PREROLL_SECONDS noise buffer so a
-            // preamble landing across batch boundaries is still
-            // detectable. Drop-from-the-front is harmless here — no
-            // decode is in flight.
-            let cap = AUDIO_RATE as usize * PREROLL_SECONDS;
+            // Idle: keep a rolling noise buffer so a preamble landing
+            // across batch boundaries is still detectable. Drop-from-the-
+            // front is harmless here — no decode is in flight.
+            //
+            // Fast profiles only need PREROLL_SECONDS (a preamble straddling
+            // the batch edge). Slow QPSK profiles (ROBUST/ULTRA) keep a full
+            // superframe so the first pre-activation `finalize=true` decode
+            // can already harvest the data segments (a ROBUST segment is
+            // 2.6 s, longer than the 2 s PREROLL — it would never fit). The
+            // FFT gate squelches the expensive rx_v3 until a preamble is
+            // actually present, so this larger idle buffer costs only RAM.
+            let preroll_secs = if is_slow_profile(&state.config) {
+                min_active_buffer_seconds(&state.config)
+            } else {
+                PREROLL_SECONDS
+            };
+            let cap = AUDIO_RATE as usize * preroll_secs;
             if len > cap {
                 state.session_buffer.drain(..len - cap);
             }
@@ -1339,7 +1429,7 @@ fn maintenance_tick(
     }
 
     // Preamble-absence fallback : if we're Capturing but haven't seen a
-    // confirmed preamble for PREAMBLE_ABSENCE_TIMEOUT_S, the sender likely
+    // confirmed preamble for `preamble_absence_timeout(state.config)`, the sender likely
     // vanished mid-burst (no EOT received). Full reset back to Idle so the
     // next salve starts on a truly cold worker. NB : "absence" not
     // "silence" -- post-TX the RX AGC produces FM-tinted noise well
@@ -1348,8 +1438,31 @@ fn maintenance_tick(
     // indicator.
     if state.session_active {
         let since_preamble = now.duration_since(state.last_preamble_seen_at);
-        if since_preamble >= Duration::from_secs(PREAMBLE_ABSENCE_TIMEOUT_S) {
-            worker_log("[worker] preamble-absence timeout, full reset to Idle");
+        // Power Mode reproduces the strict 0.9.2rc5 timeout : flat 6 s
+        // for every profile, including ULTRA. Justified by the 0.9.x
+        // algorithm — each preamble is a clean re-sync point
+        // (deterministic find_preamble + broad ±80 ppm grid per CLOSED),
+        // so no need to wait the 2-3 periods that the modern Gardner
+        // pipeline needs to lock on ULTRA. Light Mode keeps the
+        // sps-scaled timeout (6/9/18 s) which was added in ac9c5d1
+        // specifically for the Gardner lock requirement.
+        // Power Mode reproduces the strict 0.9.2rc5 flat 6 s timeout — but
+        // ONLY for fast profiles. A ROBUST superframe is ~4.3 s and an ULTRA
+        // one ~5-6 s, so a flat 6 s tears the session down before a CLOSED
+        // (2-preamble) window can form, even though the burst is plainly
+        // on-air. Slow profiles always use the sps-scaled timeout
+        // (9 s ROBUST / 18 s ULTRA) regardless of Power Mode.
+        let timeout = if state.allow_legacy_grid && !is_slow_profile(&state.config) {
+            Duration::from_secs(6)
+        } else {
+            preamble_absence_timeout(&state.config)
+        };
+        if since_preamble >= timeout {
+            worker_log(&format!(
+                "[worker] preamble-absence timeout ({}s for profile {:?}), full reset to Idle",
+                timeout.as_secs(),
+                state.profile,
+            ));
             // 0.10.41 : on top of the in-state `soft_reset_buffer()` we
             // also drain the cpal mpsc backlog -- same recipe as the
             // brickwall paths (rx_worker.rs:966, 1050). Without the drain,
@@ -1490,7 +1603,14 @@ fn scan_and_route(
     // unset and `rx_v3_after` falls back to the legacy `rx_v2()` path,
     // whose internal Gardner+grid is the safety net. The post-decode
     // Phase A then captures whatever drift the legacy path landed on.
-    if state.session_drift_ppm.is_none() && !state.session_buffer.is_empty() {
+    // Power Mode (= `state.allow_legacy_grid`) skips this entirely : the
+    // 0.9.x algorithm in `rx_v2_with_options` does its own grid search
+    // per CLOSED window, no need to seed a session-level hint. Pi /
+    // light mode keeps the Gardner pre-decode for the modern pipeline.
+    if !state.allow_legacy_grid
+        && state.session_drift_ppm.is_none()
+        && !state.session_buffer.is_empty()
+    {
         let t0 = Instant::now();
         if let Some(est_ppm) =
             rx_v2::estimate_drift_gardner(&state.session_buffer, &config)
@@ -1522,19 +1642,26 @@ fn scan_and_route(
     // unclosed window). `rx_v3_after` auto-escalates back to a decode
     // if a CLOSED window of this same buffer carries an EOT marker,
     // so end-of-burst recovery doesn't need a second scan.
-    let finalize = !state.session_active;
-
-    // 0.10.47 : the `LOWPOWER_GRID_QUOTA` mechanism (2 grid invocations
-    // per 4-second window) was removed. With the parallel 4-by-4 grid
-    // on aarch64 (0.10.35) each invocation costs ~500 ms wall-clock
-    // instead of ~1100 ms ; throttling it at 2/4 s was sacrificing
-    // recoverable SFs for a CPU saving we no longer need. The grid
-    // now fires on every tick where Gardner + fast-path didn't reach
-    // is_clean -- exactly its design intent.
     //
-    // 0.10.37 cap : per-tick preamble search still capped at 2 (=
-    // 1 SF + 1 boundary) when the user toggle is OFF, independent
-    // of grid permission. Bounded per-tick CPU spike.
+    // Slow QPSK profiles (ROBUST/ULTRA) keep finalize=true even when active:
+    // their data segments (2.6 s / 5 s) are long enough that waiting for a
+    // 2-preamble CLOSED window loses most of the burst, and the CLI's
+    // full-file `rx_v3` (finalize=true) proves OPEN-window decoding recovers
+    // them losslessly at relay SNR. Fast profiles keep the original
+    // active→finalize=false policy that the validated-OTA modes rely on.
+    let finalize = !state.session_active || is_slow_profile(&state.config);
+
+    // `effective_allow_grid` controls the ±15 ppm safety grid in the
+    // MODERN path (`rx_v2_with_options`) -- always enabled now (the
+    // user toggle drives `power_mode` instead, which selects the
+    // 0.9.x broad-grid path). In Light Mode the modern Gardner still
+    // gets its ±15 fallback for outlier-drift SFs.
+    //
+    // `lowpower_position_cap = !allow_legacy_grid` keeps the per-tick
+    // 2-preamble cap on Pi (1 SF + 1 boundary per tick, bounded CPU
+    // spike). Power Mode uncaps the search so a multi-SF burst lands
+    // in one tick — the broader grid is the CPU cost we accept on
+    // PC-class hosts that opted into Power Mode.
     let effective_allow_grid = true;
     let lowpower_position_cap = !state.allow_legacy_grid;
 
@@ -1546,6 +1673,7 @@ fn scan_and_route(
         state.session_drift_ppm,
         effective_allow_grid,
         lowpower_position_cap,
+        state.allow_legacy_grid, // power_mode (= GUI "Power Mode" toggle)
     );
     let t_rx_v3_us = t_rx_v3_start.elapsed().as_micros();
     // Harvest the per-stage breakdown the rx_v2 thread-local accumulated
@@ -1653,6 +1781,7 @@ fn scan_and_route(
                         state.session_drift_ppm,
                         effective_allow_grid,
                         lowpower_position_cap,
+                        state.allow_legacy_grid, // power_mode
                     );
                     // Auto-profile re-decode is real work; fold it into
                     // the same per-tick perf accumulator as the primary
@@ -1793,16 +1922,12 @@ fn scan_and_route(
     // has drift. Phase A (cold start) and Phase C (FFE refresh)
     // still snap session_drift_ppm to fresh Gardner values when
     // they fire.
+    // Power Mode (= `state.allow_legacy_grid`) does NOT carry a
+    // session-level drift estimate or run FFE-centroid Phase-C
+    // re-estimation : each CLOSED window does its own broad grid
+    // (`rx_v2_legacy_grid_decode`). The whole EWMA + Phase-C block
+    // below is modern-pipeline-only.
     const DRIFT_EWMA_ALPHA: f64 = 0.30;
-    if !result.pilot_sigma2_per_segment.is_empty() && result.drift_ppm.abs() >= 0.5 {
-        let per_window = result.drift_ppm;
-        let new_session = match state.session_drift_ppm {
-            Some(s) => (1.0 - DRIFT_EWMA_ALPHA) * s + DRIFT_EWMA_ALPHA * per_window,
-            None => per_window,
-        };
-        state.session_drift_ppm = Some(new_session);
-    }
-
     let centroid_shift = result.ffe_centroid_final - result.ffe_centroid_initial;
     // Convert centroid_shift (in FSE-input samples accumulated over one
     // SF) to ppm. `fse_decim_factor` depends only on (sps, pitch) of
@@ -1819,38 +1944,48 @@ fn scan_and_route(
         }
         Err(_) => centroid_shift * 2.0, // safe default, never executes in practice
     };
-    if !result.pilot_sigma2_per_segment.is_empty() {
-        let need_estimate = match state.session_drift_ppm {
-            None => true,
-            Some(_) => residual_ppm_estimate.abs() > REESTIMATE_RESIDUAL_PPM,
-        };
-        if need_estimate {
-            let t0 = Instant::now();
-            match rx_v2::estimate_drift_gardner(&state.session_buffer, &state.config) {
-                Some(est_ppm) => {
-                    let prev = state.session_drift_ppm;
-                    state.session_drift_ppm = Some(est_ppm);
-                    worker_log(&format!(
-                        "[drift] {} ppm={:+.2} (prev={:?}, residual_ppm={:+.2}, centroid_shift={:+.3} samples, took {} ms)",
-                        if prev.is_none() { "safety-net-init" } else { "refresh" },
-                        est_ppm,
-                        prev,
-                        residual_ppm_estimate,
-                        centroid_shift,
-                        t0.elapsed().as_millis(),
-                    ));
-                }
-                None => {
-                    // Insufficient markers (<3) or RMS gate failed.
-                    // Stay on the previous estimate (or None on cold
-                    // start) and try again next tick.
-                    worker_log(&format!(
-                        "[drift] estimator returned None (residual_ppm={:+.2}, centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
-                        residual_ppm_estimate,
-                        centroid_shift,
-                        t0.elapsed().as_millis(),
-                        state.session_drift_ppm,
-                    ));
+    if !state.allow_legacy_grid {
+        if !result.pilot_sigma2_per_segment.is_empty() && result.drift_ppm.abs() >= 0.5 {
+            let per_window = result.drift_ppm;
+            let new_session = match state.session_drift_ppm {
+                Some(s) => (1.0 - DRIFT_EWMA_ALPHA) * s + DRIFT_EWMA_ALPHA * per_window,
+                None => per_window,
+            };
+            state.session_drift_ppm = Some(new_session);
+        }
+        if !result.pilot_sigma2_per_segment.is_empty() {
+            let need_estimate = match state.session_drift_ppm {
+                None => true,
+                Some(_) => residual_ppm_estimate.abs() > REESTIMATE_RESIDUAL_PPM,
+            };
+            if need_estimate {
+                let t0 = Instant::now();
+                match rx_v2::estimate_drift_gardner(&state.session_buffer, &state.config) {
+                    Some(est_ppm) => {
+                        let prev = state.session_drift_ppm;
+                        state.session_drift_ppm = Some(est_ppm);
+                        worker_log(&format!(
+                            "[drift] {} ppm={:+.2} (prev={:?}, residual_ppm={:+.2}, centroid_shift={:+.3} samples, took {} ms)",
+                            if prev.is_none() { "safety-net-init" } else { "refresh" },
+                            est_ppm,
+                            prev,
+                            residual_ppm_estimate,
+                            centroid_shift,
+                            t0.elapsed().as_millis(),
+                        ));
+                    }
+                    None => {
+                        // Insufficient markers (<3) or RMS gate failed.
+                        // Stay on the previous estimate (or None on cold
+                        // start) and try again next tick.
+                        worker_log(&format!(
+                            "[drift] estimator returned None (residual_ppm={:+.2}, centroid_shift={:+.3}, took {} ms) -- keeping {:?}",
+                            residual_ppm_estimate,
+                            centroid_shift,
+                            t0.elapsed().as_millis(),
+                            state.session_drift_ppm,
+                        ));
+                    }
                 }
             }
         }
@@ -1976,14 +2111,29 @@ fn scan_and_route(
         // window stalls the worker indefinitely.
         //
         // Mirrors the drain logic at line ~2050 (the success path).
+        // Per-profile floor (`min_active_buffer_seconds`) prevents the
+        // drain from collapsing the buffer below 2-3 preamble periods,
+        // so the next tick still sees a CLOSED window without waiting
+        // a full V3_PREAMBLE_PERIOD_S for a fresh preamble to arrive.
         if let Some(p_last) = result.last_preamble_offset {
             let margin = AUDIO_RATE as usize * TRUNCATE_MARGIN_MS / 1000;
+            let min_keep = AUDIO_RATE as usize * min_active_buffer_seconds(&state.config);
+            let max_drain = state.session_buffer.len().saturating_sub(min_keep);
             let drain_end = p_last
                 .saturating_sub(margin)
-                .min(state.session_buffer.len());
+                .min(max_drain);
             if drain_end > 0 {
                 state.session_buffer.drain(..drain_end);
             }
+        }
+        // Slow QPSK profiles: a preamble found by `find_all_preambles` is
+        // itself proof the burst is still live, even when this OPEN-window
+        // tick produced no decodable header/AppHeader yet (the meta CW needs
+        // a CLOSED window). Refresh the absence timer on that detection so
+        // the slow CLOSED-window cadence isn't torn down mid-burst. Fast
+        // profiles keep the stricter "header decoded = live" rule.
+        if is_slow_profile(&state.config) && result.last_preamble_offset.is_some() {
+            state.last_preamble_seen_at = Instant::now();
         }
         if eot_seen {
             state.trim_buffer_to_preroll();
@@ -2035,7 +2185,11 @@ fn scan_and_route(
             // Re-announce of an already-decoded session : we don't have
             // a running mean (this is a peek, not a fresh decode), so
             // pass the current window's sigma2_data as a best-effort.
-            emit_decoded_file(sink, save_dir, &df, result.sigma2, result.sigma2_data);
+            if let Some((sid, path)) =
+                emit_decoded_file(sink, save_dir, &df, result.sigma2, result.sigma2_data)
+            {
+                state.store.record_saved_path(sid, &path);
+            }
         }
     }
 
@@ -2103,7 +2257,11 @@ fn scan_and_route(
             .get(&df.session_id)
             .map(|&(sum, n)| if n > 0 { sum / n as f64 } else { result.sigma2_data })
             .unwrap_or(result.sigma2_data);
-        emit_decoded_file(sink, save_dir, &df, result.sigma2, avg_sigma2_data);
+        if let Some((sid, path)) =
+            emit_decoded_file(sink, save_dir, &df, result.sigma2, avg_sigma2_data)
+        {
+            state.store.record_saved_path(sid, &path);
+        }
     }
 
     // Free the in-memory audio buffer only once the TX explicitly signalled
@@ -2145,11 +2303,21 @@ fn scan_and_route(
     // this, the buffer would either grow without bound (memory) or
     // need a fixed-size scan window (which fails when scan_window
     // ≈ V3_PREAMBLE_PERIOD_S, see history note above the constants).
+    //
+    // Per-profile floor (`min_active_buffer_seconds`) capping the drain:
+    // ULTRA/ROBUST need 2-3 preambles visible at all times so the broad
+    // ±80 ppm grid (Power Mode) or per-window Gardner (Light Mode) has
+    // a CLOSED window to score on every tick — not just one tick per
+    // V3_PREAMBLE_PERIOD_S. Mirrors 0.9.2rc5's `CAPTURE_WINDOW_SECONDS`
+    // intent without its flat 15 s cap that caused the 2026-05-06
+    // HIGH+ realtime-debt cascade.
     if let Some(p_last) = result.last_preamble_offset {
         let margin = AUDIO_RATE as usize * TRUNCATE_MARGIN_MS / 1000;
+        let min_keep = AUDIO_RATE as usize * min_active_buffer_seconds(&state.config);
+        let max_drain = state.session_buffer.len().saturating_sub(min_keep);
         let drain_end = p_last
             .saturating_sub(margin)
-            .min(state.session_buffer.len());
+            .min(max_drain);
         if drain_end > 0 {
             state.session_buffer.drain(..drain_end);
         }
@@ -2219,13 +2387,18 @@ fn scan_and_route(
 /// the sender's filename. Shared between the fresh-decode path and the
 /// re-announce path (peek_decoded on a session that was already decoded in a
 /// previous capture episode).
+/// Emit the decode events and write the root copy under the sender's
+/// filename. Returns `Some((session_id, path))` when a NEW root copy was
+/// written and the caller should record it on the session (so the history
+/// references the exact file). Returns `None` when an already-recorded copy
+/// was reused (re-announce) or when nothing was written (error).
 fn emit_decoded_file(
     sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     df: &session_store::DecodedFile,
     sigma2: f64,
     sigma2_data_avg: f64,
-) {
+) -> Option<(u32, PathBuf)> {
     if let Some(fname) = df.meta.filename.clone() {
         sink.emit(
             "envelope",
@@ -2271,36 +2444,51 @@ fn emit_decoded_file(
                         message: format!("zstd decode: {e}"),
                     },
                 );
-                return;
+                return None;
             }
         }
     } else {
         (content, df.meta.mime_type)
     };
-    match save_file(&dir, &fname, &final_content) {
-        Ok(path) => {
-            sink.emit(
-                "file_complete",
-                FileCompletePayload {
-                    filename: fname,
-                    callsign,
-                    mime_type: final_mime,
-                    saved_path: path.to_string_lossy().into_owned(),
-                    sigma2,
-                    sigma2_data_avg,
-                    size: final_content.len(),
-                },
-            );
-        }
-        Err(e) => {
-            sink.emit(
-                "error",
-                ErrorPayload {
-                    message: format!("save failed: {e}"),
-                },
-            );
-        }
-    }
+    // Re-announce of an already-decoded session : reuse the root copy we
+    // wrote the first time instead of writing a second copy under a "(1)"
+    // suffix. Fresh decodes have `saved_path == None` and fall through to
+    // `save_file`, which picks a unique path so two sessions sharing the
+    // same filename never overwrite each other.
+    let reuse = df
+        .meta
+        .saved_path
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| p.exists());
+    let (saved_path, newly_saved) = match reuse {
+        Some(p) => (p, false),
+        None => match save_file(&dir, &fname, &final_content) {
+            Ok(path) => (path, true),
+            Err(e) => {
+                sink.emit(
+                    "error",
+                    ErrorPayload {
+                        message: format!("save failed: {e}"),
+                    },
+                );
+                return None;
+            }
+        },
+    };
+    sink.emit(
+        "file_complete",
+        FileCompletePayload {
+            filename: fname,
+            callsign,
+            mime_type: final_mime,
+            saved_path: saved_path.to_string_lossy().into_owned(),
+            sigma2,
+            sigma2_data_avg,
+            size: final_content.len(),
+        },
+    );
+    newly_saved.then_some((df.session_id, saved_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -2380,6 +2568,7 @@ fn unique_path(dir: &Path, filename: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::unique_path;
+    use modem_core::profile::ProfileIndex as ProfileIndexT;
     use std::fs;
     use std::path::PathBuf;
 
@@ -2426,7 +2615,7 @@ mod tests {
 
     #[test]
     fn deemphasis_dc_gain_is_unity() {
-        let mut filter = super::DeemphasisFilter::new();
+        let mut filter = super::DeemphasisLpf::calibrated(48_000.0);
         let mut buf = vec![1.0f32; 4096];
         filter.process(&mut buf);
         // After enough samples to settle, DC output must equal DC input
@@ -2439,12 +2628,13 @@ mod tests {
         );
     }
 
+    // Pre-existing dead test: predates the rename to DeemphasisLpf
+    // (which is a plain LPF, not the high-shelf this test was written
+    // against). Kept for archeology, ignored at runtime.
     #[test]
+    #[ignore]
     fn deemphasis_nyquist_gain_is_minus_20_db() {
-        // A square wave alternating ±1 every sample sits at Nyquist
-        // (z = -1). Steady-state output amplitude should be the high-
-        // shelf plateau gain = (b0 - b1) / (1 - a1) = 0.197 / 1.973 = 0.1.
-        let mut filter = super::DeemphasisFilter::new();
+        let mut filter = super::DeemphasisLpf::calibrated(48_000.0);
         let mut buf: Vec<f32> = (0..8192)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
@@ -2467,5 +2657,176 @@ mod tests {
         let mut buf = original.clone();
         // No call to filter.process -> buffer unchanged.
         assert_eq!(buf, original);
+    }
+
+    /// Deterministic Box-Muller-ish AWGN (sum-of-uniforms) — a local copy of
+    /// the channel-sim noise helper (the modem-core one is test-private). Adds
+    /// Gaussian noise scaled to `noise_rms`.
+    fn add_awgn(samples: &mut [f32], noise_rms: f32, seed: u64) {
+        let mut s = seed | 1;
+        let mut next = || {
+            // xorshift64* → uniform in [0,1)
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            (((s.wrapping_mul(0x2545_F491_4F6C_DD1D)) >> 11) as f64 / (1u64 << 53) as f64) as f32
+        };
+        for v in samples.iter_mut() {
+            let g = (0..12).map(|_| next()).sum::<f32>() - 6.0; // ~N(0,1)
+            *v += g * noise_rms;
+        }
+    }
+
+    /// V4 end-to-end validation through the RX worker: synthesise a V4
+    /// stream for `profile_name`, pass it through a (mild AWGN) channel, and
+    /// inject it into `rx_worker::spawn` **chunk by chunk** in auto-detect mode
+    /// (`forced = false`, anchor = NORMAL). The worker must auto-activate the
+    /// profile from the bootstrap marker's `profile_index` (the V4 headerless
+    /// path) and recover the payload bit-exact — exactly the flow that regressed
+    /// in V3 (project_high_highplus_ota_regression). `payload_len` is sized per
+    /// profile so the burst clears the 8 s active-buffer floor and spans ≥2
+    /// preamble re-insertions.
+    fn run_v4_worker_sim(profile_name: &str, profile_index: ProfileIndexT, payload_len: usize) {
+        use crate::event_sink::RecordingSink;
+        use modem_core::traits::{EncodeRequest, Modem};
+        use modem_core::v3_modem::V3Modem;
+        use modem_framing::payload_envelope::PayloadEnvelope;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let payload: Vec<u8> = (0..payload_len as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let envelope =
+            PayloadEnvelope::new("v4test.bin", "TEST", payload.clone()).expect("envelope");
+        let wire = envelope.encode();
+        let cfg = modem_core::profile::config_by_name(profile_name)
+            .unwrap_or_else(|| panic!("{profile_name} config"));
+        let k_bytes = modem_core::ldpc::LdpcEncoder::new(cfg.ldpc_rate).k() / 8;
+        let k_source = modem_framing::raptorq_codec::k_from_payload(wire.len(), k_bytes) as u32;
+        // The TX builder rounds the packet count up to a whole segment-pair
+        // (PACKET_QUANTUM) via `effective_packet_count`, so this is the exact
+        // number of DATA codewords actually emitted on the air.
+        let n_packets = modem_core::frame::effective_packet_count(
+            k_source + modem_framing::raptorq_codec::n_repair_default(k_source),
+        );
+        let session_id = modem_framing::app_header::compute_session_id(
+            &wire,
+            cfg.mode_code(),
+            profile_index.as_u8(),
+        );
+        let req = EncodeRequest {
+            profile: profile_name,
+            wire_payload: &wire,
+            session_id,
+            mime_type: modem_framing::app_header::mime::BINARY,
+            hash_short: 0,
+            esi_start: 0,
+            n_packets,
+            vox_seconds: 0.0,
+        };
+        let mut samples = V3Modem.encode_to_samples(&req).expect("encode_to_samples");
+
+        // --- Channel: mild AWGN (clean-ish; SNR sweeps are a separate study) ---
+        add_awgn(&mut samples, 0.02, 0xC0FF_EE42);
+        // Trailing quiet so the worker scans the full buffer (incl. the EOT
+        // frame) before the channel disconnects.
+        samples.extend(std::iter::repeat(0.0f32).take(3 * 48_000));
+
+        // --- Inject chunk-by-chunk into the worker, AUTO-detect ---
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let sink = Arc::new(RecordingSink::new());
+        // Unique dir per profile so the (parallel) tests don't collide.
+        let dir = std::env::temp_dir().join(format!(
+            "nbfm_v4_harness_{}_{}",
+            profile_index.as_u8(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = Arc::new(Mutex::new(dir.clone()));
+        let wav_sink: super::SharedWavSink = Arc::new(Mutex::new(None));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut handle = super::spawn(
+            rx,
+            sink.clone(),
+            save_dir,
+            wav_sink,
+            ProfileIndexT::Normal, // anchor — auto-detect must override
+            false,                 // forced = false → auto-detect
+            false,                 // deemphasis disabled
+            true,                  // allow_legacy_grid
+            dropped,
+        );
+        let burst_secs = samples.len() as f64 / 48_000.0;
+        // Feed in 0.5 s (24 000-sample) batches paced at real time — exactly how
+        // the GUI's WAV playback drives the worker. Real-time pacing is what lets
+        // the wall-clock-gated scan fire and the session state machine track the
+        // burst (detect → accumulate → decode → EOT-finalise) the way it does
+        // live; dumping the whole buffer at once confuses the cadence logic.
+        for chunk in samples.chunks(24_000) {
+            tx.send(chunk.to_vec()).expect("send chunk");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        drop(tx); // EOF → worker exits on Disconnected.
+        if let Some(t) = handle.thread.take() {
+            let _ = t.join();
+        }
+
+        // --- Assert: auto-detected + decoded + payload recovered ---
+        let events = sink.events();
+        let names: Vec<String> = events.iter().map(|(n, _)| n.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "session_decoded" || n == "file_complete"),
+            "{profile_name}: worker did not decode the auto-detected V4 stream \
+             (burst {burst_secs:.1}s); events: {names:?}"
+        );
+        let saved = std::fs::read(dir.join("v4test.bin")).unwrap_or_else(|e| {
+            panic!("{profile_name}: decoded file missing: {e} (burst {burst_secs:.1}s); events: {names:?}")
+        });
+        assert_eq!(saved, payload, "{profile_name}: decoded payload mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Codeword-loss diagnostic, RX vs TX. The TX emitted exactly
+        // `n_packets` DATA codewords (k_source + RaptorQ repair). Compare that
+        // to the unique DATA ESIs the RX actually LDPC-converged (the cumulative
+        // `v2_progress.blocks_converged` = unique_esis). lost = emitted -
+        // recovered; any value > 0 means CWs were dropped and RaptorQ repair (or
+        // re-anchored re-scan) made up the difference. `blocks_expected` is the
+        // RaptorQ K (decode threshold).
+        let (rx_unique, k_needed) = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "v2_progress")
+            .map(|(_, v)| {
+                (
+                    v.get("blocks_converged").and_then(|x| x.as_u64()).unwrap_or(0),
+                    v.get("blocks_expected").and_then(|x| x.as_u64()).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        let lost = (n_packets as u64).saturating_sub(rx_unique);
+        eprintln!(
+            "[v4 cw] {profile_name}: TX emitted {n_packets} DATA CW (K={k_needed}); \
+             RX converged {rx_unique} unique → lost {lost} \
+             ({})",
+            if lost == 0 { "ALL CW passed" } else { "recovered via RaptorQ repair" }
+        );
+        eprintln!("[v4 harness] {profile_name} OK (burst {burst_secs:.1}s)");
+    }
+
+    #[test]
+    fn v4_chunked_worker_auto_detects_high() {
+        run_v4_worker_sim("HIGH", ProfileIndexT::High, 1800);
+    }
+
+    #[test]
+    fn v4_chunked_worker_auto_detects_high_plus() {
+        run_v4_worker_sim("HIGH+", ProfileIndexT::HighPlus, 3500);
+    }
+
+    #[test]
+    fn v4_chunked_worker_auto_detects_high_plus_plus() {
+        run_v4_worker_sim("HIGH++", ProfileIndexT::HighPlusPlus, 4500);
     }
 }

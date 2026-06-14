@@ -262,6 +262,25 @@ body {
   border-bottom-color: #1e1e1e;
   margin-bottom: -1px;
 }
+/* Version chip pinned at the right of the tab bar. Always visible — the
+   user explicitly asked for the version to stay readable at a glance,
+   so we don't hide it in kiosk mode (just shrink it). Sits between the
+   Info tab and the kiosk-exit ✕ button when both are present. */
+.app-version {
+  align-self: center;
+  margin: 0.25rem 0.25rem 0.25rem 0.5rem;
+  padding: 2px 8px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.78rem;
+  color: #c8d4dc;
+  background: #2b3946;
+  border: 1px solid #3c4d5c;
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  user-select: none;
+  flex: 0 0 auto;
+}
 html, body {
   height: 100%;
   overflow: hidden;
@@ -622,6 +641,16 @@ main {
 @keyframes mire-scroll {
   0%   { background-position: 0 0; }
   100% { background-position: 40px 40px; }
+}
+/* Global click-block during AVIF compression. Any user interaction
+   while ravif/libavif is decoding the new preview in WebKit triggers
+   a WebProcess crash on this distro — we just refuse all pointer events
+   on the body until `hideTxBusyOverlay()` removes the class. The
+   `cursor: progress` makes the lock state obvious. Keyboard events
+   are unaffected, so the user can still close the window. */
+body.compressing-lock {
+  pointer-events: none;
+  cursor: progress;
 }
 .tx-preview-overlay {
   position: absolute;
@@ -1052,6 +1081,27 @@ main {
   font-size: 0.85rem;
   padding: 0 0.4rem;
   letter-spacing: 0.02em;
+}
+.sdr-backends-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.sdr-backends-list label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+.sdr-backends-list .sdr-backend-status {
+  font-size: 0.8rem;
+  color: #888;
+  margin-left: auto;
+  font-style: italic;
+}
+.sdr-backends-list .sdr-backend-status.warn {
+  color: #e6a700;
+  font-style: normal;
 }
 .settings-form input[type="text"] {
   width: 100%;
@@ -2051,6 +2101,13 @@ main {
 .history-card-actions .btn-relay:hover {
   background: #2a3a2a;
 }
+.history-card-actions .btn-resume {
+  border-color: #4a6a8a;
+  color: #aad0ff;
+}
+.history-card-actions .btn-resume:hover {
+  background: #1f2c3a;
+}
 .history-card-actions .btn-delete {
   flex: 0 0 auto;
   border-color: #6a2a2a;
@@ -2194,6 +2251,15 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
     text-overflow: ellipsis;
   }
   .tab-bar .tab[data-tab="info"] { display: none; }
+
+  /* Version chip compact on the 800×480 panel: shaves ~12 px so the
+     7 tabs + chip + kiosk-exit fit without truncating tab labels. */
+  .app-version {
+    font-size: 9.5px;
+    padding: 1px 5px;
+    margin: 2px 2px 2px 4px;
+    letter-spacing: 0;
+  }
 
   /* Top bar — compact, never wraps (height stays ~22 px). */
   .top-bar {

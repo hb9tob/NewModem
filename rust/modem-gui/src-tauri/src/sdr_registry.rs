@@ -31,6 +31,8 @@ pub fn registered_backends() -> Vec<Arc<dyn SdrBackend>> {
     v.push(Arc::new(modem_pluto::backend::PlutoBackend));
     #[cfg(feature = "sdrplay")]
     v.push(Arc::new(modem_sdrplay::backend::SdrplayBackend));
+    #[cfg(feature = "rtlsdr")]
+    v.push(Arc::new(modem_rtlsdr::backend::RtlsdrBackend));
     v
 }
 

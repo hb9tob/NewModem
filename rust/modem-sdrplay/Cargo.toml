@@ -11,6 +11,11 @@ modem-sdr = { path = "../modem-sdr" }
 modem-io = { path = "../modem-io" }
 num-complex = { workspace = true }
 thiserror = { workspace = true }
+# libloading is used by bindgen's `dynamic_library_name` output —
+# the generated SdrplayApi wrapper opens libsdrplay_api at runtime
+# rather than via an ELF NEEDED dependency, so the GUI binary
+# launches on hosts without the SDRplay SDK installed.
+libloading = "0.8"
 
 [dev-dependencies]
 serde_json = "1"

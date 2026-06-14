@@ -2957,11 +2957,13 @@ dependencies = [
  "image",
  "imageproc",
  "kamadak-exif",
+ "libc",
  "modem-core",
  "modem-core-base",
  "modem-framing",
  "modem-io",
  "modem-pluto",
+ "modem-rtlsdr",
  "modem-sdr",
  "modem-sdrplay",
  "modem-worker",
@@ -2984,6 +2986,7 @@ dependencies = [
 name = "modem-io"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "cpal",
  "libc",
  "rtrb",
@@ -3000,6 +3003,18 @@ dependencies = [
  "modem-sdr-dsp",
  "num-complex",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "modem-rtlsdr"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "modem-io",
+ "modem-sdr",
+ "modem-sdr-dsp",
+ "num-complex",
  "thiserror 2.0.18",
 ]
 
@@ -3025,6 +3040,7 @@ name = "modem-sdrplay"
 version = "0.1.0"
 dependencies = [
  "bindgen 0.69.5",
+ "libloading 0.8.9",
  "modem-io",
  "modem-sdr",
  "modem-sdr-dsp",

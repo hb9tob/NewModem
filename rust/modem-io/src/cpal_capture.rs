@@ -111,10 +111,12 @@ fn log(msg: &str) {
 
 pub struct CaptureHandle {
     pub stop: Arc<AtomicBool>,
-    /// Two threads to join: (capture, reader). Capture owns the cpal
-    /// `Stream` (not `Send` on Windows) and parks on `stop`. Reader
-    /// drains the ring into the worker mpsc.
-    pub threads: Option<(JoinHandle<()>, JoinHandle<()>)>,
+    /// Background threads to join on stop. The cpal backend uses two
+    /// (capture owns the `Stream` — not `Send` on Windows — and parks on
+    /// `stop`; reader drains the ring into the worker mpsc); the direct
+    /// ALSA backend (`alsa_capture`) uses a single blocking-read thread.
+    /// A `Vec` keeps `CaptureHandle` shared across both backends.
+    pub threads: Option<Vec<JoinHandle<()>>>,
     pub sample_rate: u32,
     pub channels: u16,
     /// Cumulative mono-sample-equivalent count that the 30 s SPSC ring
@@ -128,9 +130,10 @@ pub struct CaptureHandle {
 impl CaptureHandle {
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some((t_cap, t_read)) = self.threads.take() {
-            let _ = t_cap.join();
-            let _ = t_read.join();
+        if let Some(threads) = self.threads.take() {
+            for t in threads {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -208,7 +211,7 @@ pub fn start(device_name: &str) -> Result<(CaptureHandle, Receiver<Vec<f32>>), S
     Ok((
         CaptureHandle {
             stop,
-            threads: Some((capture_thread, reader_thread)),
+            threads: Some(vec![capture_thread, reader_thread]),
             sample_rate,
             channels,
             dropped_samples,

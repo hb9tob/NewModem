@@ -57,6 +57,8 @@ cargo tauri --version   # expect: tauri-cli 2.x.y
 git clone <REPO_URL> NewModem
 cd NewModem/rust/modem-gui/src-tauri
 
+# (Optional) collector HMAC secret — see step 4a below.
+
 # Full bundle (deb + appimage).
 cargo tauri build
 
@@ -66,6 +68,34 @@ cargo tauri build --bundles deb
 
 First build downloads and compiles all Tauri + cpal deps: **10–20 min**
 on a modern machine, longer on slow disk.
+
+### 4a. Collector secret (only for Phase D submissions)
+
+The GUI signs collector uploads with an HMAC-SHA256 secret read at
+**compile time** via `include_str!("../secret.txt")`. The file is
+gitignored. You only need this if the build will push captures to a
+collector server — for local TX/RX you can skip it entirely.
+
+If `secret.txt` is missing, `build.rs` writes a 64-zero placeholder so
+the build still succeeds; the binary runs fine but refuses every
+submission with "secret HMAC non configuré". To enable submissions,
+generate a real secret **before** building and install the *same* value
+on both the GUI and the collector:
+
+```bash
+# From .../modem-gui/src-tauri (current dir of step 4)
+openssl rand -hex 32 > secret.txt
+
+# Mirror the exact same value on the collector side
+cp secret.txt ../../newmodem-collector/secret.txt
+```
+
+Constraints (enforced by `checked_secret()` in
+`src/collector_client.rs`): ≥ 32 chars, not all zeros. Because the value
+is baked in by `include_str!`, re-run `cargo tauri build` after changing
+it. A mismatch between the two sides makes the collector reject the POST.
+See [README.md](README.md#soumission-au-collecteur--phase-d) for the
+runtime flow.
 
 ## 5. Locate artifacts
 

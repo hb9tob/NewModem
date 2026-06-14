@@ -1,6 +1,8 @@
 // NBFM Modem GUI — 3-tab layout (RX / TX / Info) with per-block progress and
 // live constellation display.
 
+import { initI18n, setLang, getLang, supportedLangs, t, applyI18n } from "./i18n.js";
+
 // Mapping aligned with modem-core/src/app_header.rs :: mime
 //   0 = BINARY, 1 = TEXT, 2 = IMAGE_AVIF, 3 = IMAGE_JPEG, 4 = IMAGE_PNG,
 //   5 = ZSTD (non-image file decompressed RX-side by the Rust worker).
@@ -57,6 +59,41 @@ function logEvent(name, data) {
   li.appendChild(body);
   log.insertBefore(li, log.firstChild);
   while (log.children.length > 500) log.removeChild(log.lastChild);
+}
+
+// ────────────────────────────────────────────────────────── Language
+// The <select id="lang-select"> in the Settings panel persists across
+// reloads (i18n.js localStorage). On change we let i18n.js rewalk
+// the DOM via applyI18n + fire `langchange`; everything dynamic
+// (sessions table, history list, status chips, etc.) re-renders
+// itself by listening on that event.
+function setupLangSelect() {
+  const sel = document.getElementById("lang-select");
+  if (!sel) return;
+  // Pre-select the active language and seed the visible options
+  // from supportedLangs() so adding a 3rd language is a JSON drop.
+  sel.innerHTML = "";
+  for (const lang of supportedLangs()) {
+    const opt = document.createElement("option");
+    opt.value = lang;
+    opt.setAttribute("data-i18n", `lang.${lang}`);
+    opt.textContent = t(`lang.${lang}`) || lang.toUpperCase();
+    sel.appendChild(opt);
+  }
+  sel.value = getLang();
+  sel.addEventListener("change", async () => {
+    try { await setLang(sel.value); } catch (err) { console.error("setLang", err); }
+  });
+  document.addEventListener("langchange", () => {
+    // Keep the visible value in sync if setLang was invoked programmatically.
+    sel.value = getLang();
+    // Re-render every list/table that builds its own DOM and would
+    // otherwise still show the previous language. Wrapped because
+    // some renderers run before their backing state has loaded.
+    try { renderSessionsTable(); } catch (_) {}
+    try { refreshHistory(); } catch (_) {}
+    try { renderSdrBackendsList(); } catch (_) {}
+  });
 }
 
 // ────────────────────────────────────────────────────────────── Tabs
@@ -135,12 +172,17 @@ async function refreshSessions() {
     const list = await invoke("list_sessions");
     sessionRegistry.clear();
     for (const meta of list) {
-      // The backend doesn't track "received / needed" in meta.json (that
-      // requires scanning the blob) — initialise from what we know, and let
-      // the next session_progress event fill in the live numbers.
+      // `received_esis` is recomputed from the on-disk blob by the backend,
+      // so a partially-received session shows its real progress (e.g.
+      // 247/250) instead of collapsing to 0 %. Live session_progress events
+      // still refine it during an active reception. Fall back to the old
+      // decoded ? k : 0 heuristic for metas without the field (legacy).
+      const received = Number.isFinite(meta.received_esis)
+        ? meta.received_esis
+        : (meta.decoded ? meta.k_symbols : 0);
       sessionRegistry.set(meta.session_id, {
         ...meta,
-        received: meta.decoded ? meta.k_symbols : 0,
+        received,
         cap_reached: false,
       });
     }
@@ -165,9 +207,13 @@ function renderSessionsTable() {
     (a, b) => (b.created_at || 0) - (a.created_at || 0)
   );
   countEl.textContent =
-    entries.length === 0 ? "0 session" : `${entries.length} session${entries.length > 1 ? "s" : ""}`;
+    entries.length === 0
+      ? t("sessions.count_zero")
+      : entries.length === 1
+        ? t("sessions.count_one")
+        : t("sessions.count_many", { n: entries.length });
   if (entries.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" class="sessions-empty">Aucune session.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="sessions-empty">${escapeHtml(t("sessions.empty"))}</td></tr>`;
     return;
   }
   tbody.innerHTML = entries.map(renderSessionRow).join("");
@@ -176,7 +222,7 @@ function renderSessionsTable() {
     btn.addEventListener("click", async (ev) => {
       const id = parseInt(ev.currentTarget.dataset.sid, 10);
       if (!Number.isFinite(id)) return;
-      if (!confirm(`Supprimer la session ${id.toString(16).padStart(8, "0")} ?`)) {
+      if (!confirm(t("sessions.delete_confirm", { id: id.toString(16).padStart(8, "0") }))) {
         return;
       }
       try {
@@ -203,15 +249,15 @@ function renderSessionRow(s) {
   if (s.decoded) {
     fillClass = " done";
     statusClass = "done";
-    statusText = "décodé";
+    statusText = t("sessions.status_decoded");
   } else if (s.cap_reached) {
     fillClass = " cap-reached";
     statusClass = "cap-reached";
-    statusText = "cap 3× atteint";
+    statusText = t("sessions.status_cap_reached");
   } else if (ratio >= 2.0) {
     fillClass = " cap-warn";
     statusClass = "cap-warn";
-    statusText = "canal dégradé";
+    statusText = t("sessions.status_degraded");
   }
   const filename = s.filename || "—";
   const callsign = s.callsign || "—";
@@ -229,7 +275,7 @@ function renderSessionRow(s) {
         <span style="margin-left:8px;color:#888">${pct}%</span>
       </td>
       <td><span class="status-chip ${statusClass}">${statusText}</span></td>
-      <td><button class="btn-session-delete" data-sid="${s.session_id}" title="Supprimer le dossier session">✕</button></td>
+      <td><button class="btn-session-delete" data-sid="${s.session_id}" title="${escapeHtml(t("sessions.delete_tip"))}">✕</button></td>
     </tr>`;
 }
 
@@ -553,6 +599,7 @@ let currentSettings = {
   tx_save_wav: false,
   rx_deemphasis_enabled: false,
   rx_allow_legacy_grid: true,
+  audio_backend: "alsa",
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,
@@ -631,7 +678,7 @@ function populateDeviceSelect(selectId, devices, savedName, backendDevices, dire
   })();
   if (audio.length === 0 && sdrCount === 0) {
     const opt = document.createElement("option");
-    opt.textContent = "aucun périphérique détecté";
+    opt.textContent = t("status.no_device");
     opt.value = "";
     select.appendChild(opt);
     return null;
@@ -715,6 +762,101 @@ async function loadSdrBackends() {
   } catch (err) {
     console.error("list_sdr_backends:", err);
     sdrBackends = new Map();
+  }
+}
+
+/// Read the per-backend `enabled` flag from settings (defaults to
+/// `false`). Single source of truth for "should the GUI bother
+/// enumerating this backend".
+function isBackendEnabled(backendId) {
+  if (!currentSettings.sdr_settings) return false;
+  const entry = currentSettings.sdr_settings.backends &&
+    currentSettings.sdr_settings.backends[backendId];
+  return entry ? entry.enabled === true : false;
+}
+
+/// Build the "Backends SDR" checkbox section in Paramètres. One row
+/// per registered backend, status text fed by
+/// `get_backend_library_status`. Toggling a checkbox persists the new
+/// `enabled` flag and triggers an immediate `loadDevices()` so the
+/// device dropdown reflects the change without a tab refresh.
+async function renderSdrBackendsList() {
+  const host = document.getElementById("sdr-backends-list");
+  if (!host) return;
+  if (!sdrBackends || sdrBackends.size === 0) {
+    host.innerHTML = `<span class="tx-hint">${escapeHtml(t("status.no_sdr_backends"))}</span>`;
+    return;
+  }
+  host.innerHTML = "";
+  const { invoke } = window.__TAURI__.core;
+  for (const [id, info] of sdrBackends.entries()) {
+    // Seed the settings entry so the persisted bool round-trips
+    // even when the user hasn't touched the checkbox yet.
+    ensureBackendEntry(id);
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.backendId = id;
+    cb.checked = isBackendEnabled(id);
+    const name = document.createElement("span");
+    name.textContent = t("status.sdr_enable", { name: info.display_name || id });
+    const status = document.createElement("span");
+    status.className = "sdr-backend-status";
+    status.dataset.backendId = id;
+    status.textContent = "";
+    label.appendChild(cb);
+    label.appendChild(name);
+    label.appendChild(status);
+    host.appendChild(label);
+
+    cb.addEventListener("change", async () => {
+      const entry = ensureBackendEntry(id);
+      entry.enabled = cb.checked;
+      try {
+        await invoke("save_settings", { settings: currentSettings });
+      } catch (err) {
+        console.error("save_settings (backend enable):", err);
+      }
+      // Refresh both the inline status (re-attempts the dlopen when
+      // turning on) and the device dropdown.
+      await refreshBackendLibraryStatus(id);
+      await loadDevices();
+    });
+  }
+  // Initial status sweep — only ping enabled backends so we don't
+  // dlopen vendor libraries just to render the panel.
+  for (const id of sdrBackends.keys()) {
+    if (isBackendEnabled(id)) await refreshBackendLibraryStatus(id);
+  }
+}
+
+/// Ping `get_backend_library_status` for one backend and update the
+/// inline status span. Called on tab open + after every checkbox
+/// toggle.
+async function refreshBackendLibraryStatus(backendId) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke } = window.__TAURI__.core;
+  const span = document.querySelector(
+    `.sdr-backend-status[data-backend-id="${backendId}"]`
+  );
+  if (!span) return;
+  if (!isBackendEnabled(backendId)) {
+    span.textContent = "";
+    span.classList.remove("warn");
+    return;
+  }
+  try {
+    const st = await invoke("get_backend_library_status", { backendId });
+    if (st.available) {
+      span.textContent = t("status.sdr_lib_ok");
+      span.classList.remove("warn");
+    } else {
+      span.textContent = st.message || t("status.lib_missing");
+      span.classList.add("warn");
+    }
+  } catch (err) {
+    span.textContent = t("status.lib_status_unavail");
+    span.classList.add("warn");
   }
 }
 
@@ -849,6 +991,23 @@ function makeDefaultSdrConfig(backendId) {
       backend_extras: { tuner: "B", decimation: 4 },
     };
   }
+  if (backendId === "rtlsdr") {
+    // Mirrors `default_sdr_config_for("rtlsdr")` in settings.rs.
+    // Step 22 ≈ 40.2 dB on the R820T-family ladder — enough head-room
+    // for typical 2 m signals out of the box; the operator drops it
+    // via the gain dropdown when receiving a strong neighbour.
+    return {
+      backend_id: "rtlsdr", device_id: "",
+      rx_freq_hz: 145_500_000, tx_freq_hz: 145_500_000,
+      gain: { kind: "manual", shape: "discrete", step_idx: 22 },
+      max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
+      antenna: "",
+      bias_t: false, fm_notch: false, dab_notch: false,
+      ctcss_freq_hz: 0.0, ctcss_level: 0.1,
+      rf_bandwidth_hz: null,
+      backend_extras: { ppm_correction: 0, direct_sampling: false },
+    };
+  }
   return {
     backend_id: backendId, device_id: "",
     rx_freq_hz: 0, tx_freq_hz: 0,
@@ -945,7 +1104,7 @@ function buildFreqRow(direction, backendId, caps, cfg) {
   const maxMhz = range ? (range[1] / 1e6) : 6000;
   const label = document.createElement("label");
   label.className = "pluto-field";
-  label.textContent = direction === "rx" ? "Fréquence RX (MHz) : " : "Fréquence TX (MHz) : ";
+  label.textContent = t(direction === "rx" ? "rx.dev_freq_rx" : "rx.dev_freq_tx");
   const input = document.createElement("input");
   input.type = "number";
   input.id = `sdr-${direction}-freq-${backendId}`;
@@ -969,7 +1128,7 @@ function buildAgcRow(direction, backendId, caps, cfg) {
   const row = makeRow();
   const label = document.createElement("label");
   label.className = "pluto-field";
-  label.textContent = "AGC : ";
+  label.textContent = t("rx.dev_agc");
   const sel = document.createElement("select");
   sel.id = `sdr-${direction}-agc-${backendId}`;
   sel.dataset.backend = backendId;
@@ -1077,7 +1236,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
     const r = shape.DbContinuous;
     const label = document.createElement("label");
     label.className = "pluto-field";
-    label.textContent = direction === "rx" ? "Gain RX (dB) : " : "Gain TX (dB) : ";
+    label.textContent = t(direction === "rx" ? "rx.dev_gain_rx" : "rx.dev_gain_tx");
     const input = document.createElement("input");
     input.type = "number";
     input.id = `sdr-${direction}-gain-db-${backendId}`;
@@ -1094,7 +1253,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
     const r = shape.LnaPlusIf;
     const lnaLabel = document.createElement("label");
     lnaLabel.className = "pluto-field";
-    lnaLabel.textContent = "LNA state : ";
+    lnaLabel.textContent = t("rx.dev_lna");
     const lnaInput = document.createElement("input");
     lnaInput.type = "number";
     lnaInput.id = `sdr-${direction}-gain-lna-${backendId}`;
@@ -1113,7 +1272,7 @@ function buildGainRow(direction, backendId, caps, cfg) {
 
     const ifLabel = document.createElement("label");
     ifLabel.className = "pluto-field";
-    ifLabel.textContent = "IF gRdB : ";
+    ifLabel.textContent = t("rx.dev_if");
     const ifInput = document.createElement("input");
     ifInput.type = "number";
     ifInput.id = `sdr-${direction}-gain-if-${backendId}`;
@@ -1126,6 +1285,38 @@ function buildGainRow(direction, backendId, caps, cfg) {
     ifInput.addEventListener("change", onSdrFieldChange);
     ifLabel.appendChild(ifInput);
     row.appendChild(ifLabel);
+  } else if (shape && shape.DbDiscrete) {
+    // RTL-SDR-style ladder: one `<select>` of "<N> dB" options, indexed
+    // by step_idx so the backend resolves the matching tenths-of-dB
+    // gain value internally. Disabled when AGC is engaged (the tuner
+    // drives the IF gain itself).
+    const r = shape.DbDiscrete;
+    const label = document.createElement("label");
+    label.className = "pluto-field";
+    label.textContent = t(direction === "rx" ? "rx.dev_gain_rx" : "rx.dev_gain_tx");
+    const sel = document.createElement("select");
+    sel.id = `sdr-${direction}-gain-step-${backendId}`;
+    sel.disabled = isAgc;
+    for (let i = 0; i < r.steps_db.length; i++) {
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = `${r.steps_db[i]} dB`;
+      sel.appendChild(opt);
+    }
+    let curIdx = 0;
+    if (
+      cfg.gain && cfg.gain.kind === "manual" && cfg.gain.shape === "discrete" &&
+      Number.isFinite(cfg.gain.step_idx)
+    ) {
+      curIdx = Math.min(Math.max(0, cfg.gain.step_idx), r.steps_db.length - 1);
+    }
+    sel.value = String(curIdx);
+    sel.dataset.sdrField = "gain.step_idx";
+    sel.dataset.sdrTransform = "manual_step_idx";
+    sel.dataset.backend = backendId;
+    sel.addEventListener("change", onSdrFieldChange);
+    label.appendChild(sel);
+    row.appendChild(label);
   }
   return row;
 }
@@ -1152,7 +1343,7 @@ function buildAntennaRow(backendId, caps, cfg) {
 
 function buildFeatureRow(direction, backendId, caps, cfg) {
   const row = makeRow();
-  if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", "Bias-T (+5 V vers préampli)", !!cfg.bias_t));
+  if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", t("rx.dev_bias_t"), !!cfg.bias_t));
   if (caps.features.fm_notch) row.appendChild(makeCheckbox(backendId, "fm_notch", "Filtre rejet FM (88-108 MHz)", !!cfg.fm_notch));
   if (caps.features.dab_notch) row.appendChild(makeCheckbox(backendId, "dab_notch", "Filtre rejet DAB (174-240 MHz)", !!cfg.dab_notch));
   return row;
@@ -1174,7 +1365,7 @@ function makeCheckbox(backendId, fieldName, labelText, checked) {
 
 function buildDeviationRow(direction, backendId, cfg) {
   const row = makeRow();
-  row.appendChild(makeFieldLabel(direction === "rx" ? "Déviation RX :" : "Déviation TX :"));
+  row.appendChild(makeFieldLabel(t(direction === "rx" ? "rx.dev_dev_rx" : "rx.dev_dev_tx")));
   const fieldHz = direction === "rx" ? "max_deviation_hz" : "tx_deviation_hz";
   const cur = cfg[fieldHz] != null ? cfg[fieldHz] : 5000;
   for (const v of [5000, 2500]) {
@@ -1209,7 +1400,7 @@ function buildCtcssRow(backendId, cfg) {
   row.appendChild(cbLabel);
   const toneLabel = document.createElement("label");
   toneLabel.className = "pluto-field";
-  toneLabel.textContent = "Tonalité : ";
+  toneLabel.textContent = t("rx.dev_tone");
   const sel = document.createElement("select");
   sel.id = `sdr-tx-ctcss-tone-${backendId}`;
   for (const f of EIA_CTCSS_TONES_HZ) {
@@ -1242,7 +1433,7 @@ function buildTxAttenuationRow(backendId, cfg) {
   const row = makeRow();
   const label = document.createElement("label");
   label.className = "pluto-field";
-  label.textContent = "Atténuation TX (dB) : ";
+  label.textContent = t("rx.dev_atten_tx");
   const input = document.createElement("input");
   input.type = "number";
   input.id = `sdr-tx-att-${backendId}`;
@@ -1355,6 +1546,13 @@ function applySdrFieldUpdate(cfg, field, transform, el) {
       }
       break;
     }
+    case "manual_step_idx": {
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) {
+        cfg.gain = { kind: "manual", shape: "discrete", step_idx: v };
+      }
+      break;
+    }
     case "extras_float": {
       const v = parseFloat(el.value);
       const key = field.split(".")[1];
@@ -1410,20 +1608,27 @@ async function loadDevices() {
     ]);
     const backendDevices = new Map();
     const backendTags = [];
+    // Only enumerate backends the operator opted into via the
+    // Paramètres checkboxes — keeps the GUI from triggering vendor-
+    // library dlopens at startup on hosts that don't have the
+    // hardware. The Tauri-side `list_sdr_devices` enforces the same
+    // gate as defence-in-depth.
     await Promise.all(
-      Array.from(sdrBackends.keys()).map(async (id) => {
-        try {
-          const list = await invoke("list_sdr_devices", { backendId: id });
-          backendDevices.set(id, list);
-          if (list.length > 0) {
-            const info = sdrBackends.get(id);
-            backendTags.push(` · ${list.length} ${info ? info.display_name : id}`);
+      Array.from(sdrBackends.keys())
+        .filter((id) => isBackendEnabled(id))
+        .map(async (id) => {
+          try {
+            const list = await invoke("list_sdr_devices", { backendId: id });
+            backendDevices.set(id, list);
+            if (list.length > 0) {
+              const info = sdrBackends.get(id);
+              backendTags.push(` · ${list.length} ${info ? info.display_name : id}`);
+            }
+          } catch (err) {
+            console.warn(`list_sdr_devices(${id}):`, err);
+            backendDevices.set(id, []);
           }
-        } catch (err) {
-          console.warn(`list_sdr_devices(${id}):`, err);
-          backendDevices.set(id, []);
-        }
-      })
+        })
     );
     populateDeviceSelect(
       "rx-device-select", rxDevices, currentSettings.rx_device, backendDevices, "rx",
@@ -1445,6 +1650,7 @@ async function loadDevices() {
       prefetchCapsForSelected("tx-device-select"),
     ]);
     refreshSdrPanels();
+    refreshTxHwVolume();
   } catch (err) {
     status.textContent = `erreur : ${err}`;
     status.style.color = "#ef5350";
@@ -1463,7 +1669,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, audio_backend: "alsa", collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -1493,6 +1699,8 @@ async function loadSettings() {
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
   const grid = document.getElementById("rx-allow-legacy-grid");
   if (grid) grid.checked = !!currentSettings.rx_allow_legacy_grid;
+  const alsaBackend = document.getElementById("audio-backend-alsa");
+  if (alsaBackend) alsaBackend.checked = (currentSettings.audio_backend || "alsa") !== "cpal";
   const fdx = document.getElementById("full-duplex-enabled");
   if (fdx) fdx.checked = !!currentSettings.full_duplex_enabled;
 
@@ -1554,11 +1762,11 @@ function populateOneProfileSelect(selId, allowExperimental, rich) {
     opt.value = p.name;
     if (rich) {
       opt.textContent = p.experimental
-        ? `⚠ ${p.label} [EXPÉRIMENTAL]`
+        ? t("tx.experimental_label", { label: p.label })
         : p.label;
     } else {
       opt.textContent = p.experimental
-        ? `⚠ ${p.name} [EXPÉRIMENTAL]`
+        ? t("tx.experimental_name", { name: p.name })
         : p.name;
     }
     if (p.experimental) opt.classList.add("experimental-option");
@@ -1704,14 +1912,14 @@ async function loadSerialPorts() {
   if (ports.length === 0) {
     const opt = document.createElement("option");
     opt.value = "";
-    opt.textContent = "— aucun port détecté —";
+    opt.textContent = t("status.no_port_detected");
     sel.appendChild(opt);
   } else {
     if (saved && !ports.includes(saved)) {
       // Keep the saved value even when absent, to make it visible.
       const opt = document.createElement("option");
       opt.value = saved;
-      opt.textContent = `${saved} (introuvable)`;
+      opt.textContent = t("status.port_missing", { name: saved });
       sel.appendChild(opt);
     }
     for (const name of ports) {
@@ -1774,6 +1982,8 @@ async function persistSettings() {
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
   const grid = document.getElementById("rx-allow-legacy-grid");
   if (grid) currentSettings.rx_allow_legacy_grid = !!grid.checked;
+  const alsaBackend = document.getElementById("audio-backend-alsa");
+  if (alsaBackend) currentSettings.audio_backend = alsaBackend.checked ? "alsa" : "cpal";
 
   // SDR-specific config is mutated directly on
   // `currentSettings.sdr_settings.backends[id].config` by the
@@ -1782,9 +1992,37 @@ async function persistSettings() {
   const statusEl = document.getElementById("settings-status");
   try {
     await invoke("save_settings", { settings: currentSettings });
-    if (statusEl) statusEl.textContent = `sauvegardé ${now()}`;
+    if (statusEl) statusEl.textContent = t("status.saved_at", { time: now() });
   } catch (err) {
-    if (statusEl) statusEl.textContent = `erreur : ${err}`;
+    if (statusEl) statusEl.textContent = t("status.error_prefix", { err });
+  }
+}
+
+// Show/sync the Pi-only hardware playback-volume slider for the current
+// TX device. Hidden unless the device exposes a controllable ALSA mixer
+// (`tx_device_has_mixer`); when shown, seeds the slider from the card's
+// live "Speaker" level (`get_tx_volume`). No-op on non-Tauri / non-Linux
+// hosts (the commands return false/None and the row stays hidden).
+async function refreshTxHwVolume() {
+  const row = document.getElementById("tx-hwvol-row");
+  if (!row) return;
+  if (!window.__TAURI__ || !window.__TAURI__.core) { row.hidden = true; return; }
+  const { invoke } = window.__TAURI__.core;
+  const dev = ((currentSettings && currentSettings.tx_device) || "").trim();
+  if (!dev) { row.hidden = true; return; }
+  try {
+    const hasMixer = await invoke("tx_device_has_mixer", { deviceName: dev });
+    if (!hasMixer) { row.hidden = true; return; }
+    const pct = await invoke("get_tx_volume", { deviceName: dev });
+    if (pct == null) { row.hidden = true; return; }
+    const slider = document.getElementById("tx-hwvol");
+    const label = document.getElementById("tx-hwvol-val");
+    if (slider) slider.value = String(pct);
+    if (label) label.textContent = `${pct}%`;
+    row.hidden = false;
+  } catch (err) {
+    console.warn("refreshTxHwVolume failed:", err);
+    row.hidden = true;
   }
 }
 
@@ -1821,6 +2059,27 @@ function setupSettingsTab() {
       await prefetchCapsForSelected("tx-device-select");
       refreshSdrPanels();
       persistSettings();
+      refreshTxHwVolume();
+    });
+  }
+  // Hardware playback-volume slider (Pi/ALSA only). Shown when the
+  // selected TX device exposes a controllable mixer; drives the codec's
+  // "Speaker" attenuator live (no settings round-trip — it's a hardware
+  // mixer value, not a persisted app setting).
+  const hwvol = document.getElementById("tx-hwvol");
+  if (hwvol) {
+    const label = document.getElementById("tx-hwvol-val");
+    const paint = () => { if (label) label.textContent = `${hwvol.value}%`; };
+    hwvol.addEventListener("input", paint);
+    hwvol.addEventListener("change", async () => {
+      paint();
+      const dev = ((currentSettings && currentSettings.tx_device) || "").trim();
+      if (!dev) return;
+      try {
+        await invoke("set_tx_volume", { deviceName: dev, pct: Number(hwvol.value) });
+      } catch (err) {
+        console.warn("set_tx_volume failed:", err);
+      }
     });
   }
   // SDR-specific inputs are wired up at row-build time inside
@@ -1930,7 +2189,7 @@ async function startCapture() {
   const deviceName = select ? select.value : "";
   const status = document.getElementById("status");
   if (!deviceName) {
-    status.textContent = "sélectionner une carte RX dans Paramètres";
+    status.textContent = t("status.select_rx_in_settings");
     status.style.color = "#ef5350";
     return;
   }
@@ -1941,8 +2200,8 @@ async function startCapture() {
   try {
     await invoke("start_capture", { deviceName, profile, forced });
     status.textContent = forced
-      ? `capture en cours (mode forcé : ${profile})`
-      : "capture en cours";
+      ? t("status.capture_forced", { profile })
+      : t("status.capture_running");
     status.style.color = "#ffb74d";
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
@@ -1953,7 +2212,7 @@ async function startCapture() {
     refreshDuplexTxBar();
     logEvent("start", { device: deviceName, profile, forced });
   } catch (err) {
-    status.textContent = `erreur start : ${err}`;
+    status.textContent = t("status.error_start", { err });
     status.style.color = "#ef5350";
     logEvent("error", { message: String(err) });
   }
@@ -2013,11 +2272,11 @@ async function startCaptureFromWav(file) {
   // and avoids spending seconds reading the file for nothing.
   const stopBtn = document.getElementById("btn-stop");
   if (stopBtn && !stopBtn.disabled) {
-    status.textContent = "arrêter d'abord la capture en cours";
+    status.textContent = t("status.stop_capture_first");
     status.style.color = "#ef5350";
     return;
   }
-  status.textContent = `chargement ${file.name}…`;
+  status.textContent = t("status.loading_file", { name: file.name });
   status.style.color = "#90caf9";
   try {
     const buf = await file.arrayBuffer();
@@ -2029,7 +2288,7 @@ async function startCaptureFromWav(file) {
     const forced = !!currentSettings.rx_force_mode;
     const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
     await invoke("start_capture_from_wav", { args: { bytes, profile, forced } });
-    status.textContent = `lecture WAV : ${file.name}`;
+    status.textContent = t("status.wav_playback", { name: file.name });
     status.style.color = "#ffb74d";
     document.getElementById("btn-start").disabled = true;
     document.getElementById("btn-stop").disabled = false;
@@ -2040,7 +2299,7 @@ async function startCaptureFromWav(file) {
     refreshDuplexTxBar();
     logEvent("wav_playback_start", { file: file.name, profile, forced });
   } catch (err) {
-    status.textContent = `erreur lecture WAV : ${err}`;
+    status.textContent = t("status.wav_playback_error", { err });
     status.style.color = "#ef5350";
     logEvent("wav_playback_error", { message: String(err) });
   }
@@ -2051,7 +2310,7 @@ async function stopCapture() {
   const status = document.getElementById("status");
   try {
     await invoke("stop_capture");
-    status.textContent = "arrêté";
+    status.textContent = t("status.stopped");
     status.style.color = "#9ccc65";
     document.getElementById("btn-stop").disabled = true;
     const rxSel = document.getElementById("rx-device-select");
@@ -2068,7 +2327,7 @@ async function stopCapture() {
     await refreshRawRecordingState();
     logEvent("stop", null);
   } catch (err) {
-    status.textContent = `erreur stop : ${err}`;
+    status.textContent = t("status.error_stop", { err });
     status.style.color = "#ef5350";
   }
 }
@@ -2080,10 +2339,10 @@ function setRawButtonState(recording) {
   const btn = document.getElementById("btn-raw");
   if (recording) {
     btn.classList.add("recording");
-    btn.textContent = "⏹ arrêter capture";
+    btn.textContent = t("status.stop_capture_btn");
   } else {
     btn.classList.remove("recording");
-    btn.textContent = "⏺ capture brute";
+    btn.textContent = t("rx.raw");
   }
 }
 
@@ -2139,7 +2398,7 @@ function maybeOfferCaptureSubmit(captureInfo) {
     meta.textContent = `${captureInfo.duration_sec.toFixed(1)} s · ~${sizeMb} MB · ${captureInfo.path}`;
   }
   const status = document.getElementById("csp-status");
-  if (status) status.textContent = `prêt à soumettre vers ${url}`;
+  if (status) status.textContent = t("status.ready_to_submit", { url });
   const submit = document.getElementById("csp-submit");
   const dismiss = document.getElementById("csp-dismiss");
   if (submit) submit.disabled = false;
@@ -2161,7 +2420,7 @@ async function submitPendingCapture() {
   if (panel) panel.classList.add("busy");
   if (submit) submit.disabled = true;
   if (dismiss) dismiss.disabled = true;
-  if (status) status.textContent = "envoi en cours…";
+  if (status) status.textContent = t("status.submitting");
   try {
     const result = await invoke("submit_capture", {
       args: {
@@ -2178,19 +2437,19 @@ async function submitPendingCapture() {
     const base = (currentSettings.collector_url || "").replace(/\/+$/, "");
     const fullUrl = base + (result.url || "");
     if (status) {
-      status.innerHTML = `envoyé : <a href="${escapeHtml(fullUrl)}" target="_blank">${escapeHtml(result.folder)}</a> ` +
-        `(${(result.bytes_uploaded / (1024 * 1024)).toFixed(1)} MB)`;
+      status.innerHTML = t("status.send_collector_done", { url: escapeHtml(fullUrl), folder: escapeHtml(result.folder) })
+        + `(${(result.bytes_uploaded / (1024 * 1024)).toFixed(1)} MB)`;
     }
     if (dismiss) {
       dismiss.disabled = false;
-      dismiss.textContent = "Fermer";
+      dismiss.textContent = t("status.close");
     }
     logEvent("capture_submit_ok", { folder: result.folder, bytes: result.bytes_uploaded });
     pendingCapture = null;
   } catch (err) {
     panel.classList.remove("busy");
     panel.classList.add("error");
-    if (status) status.textContent = `erreur : ${err}`;
+    if (status) status.textContent = t("status.error_prefix", { err });
     if (submit) submit.disabled = false;
     if (dismiss) dismiss.disabled = false;
     logEvent("capture_submit_error", { message: String(err) });
@@ -2204,7 +2463,7 @@ function dismissCapturePrompt() {
     panel.classList.remove("busy", "success", "error");
   }
   const dismiss = document.getElementById("csp-dismiss");
-  if (dismiss) dismiss.textContent = "Ignorer";
+  if (dismiss) dismiss.textContent = t("rx.dismiss");
   pendingCapture = null;
 }
 
@@ -2378,7 +2637,7 @@ async function pickOverlayLogo(file) {
     commitOverlayChange();
   } catch (err) {
     console.error("overlays_import_logo", err);
-    alert(`Import logo échoué : ${err}`);
+    alert(t("status.error_import_logo", { err }));
   }
 }
 
@@ -2506,7 +2765,7 @@ function refreshRxRealtimeChip() {
   if (!rxRealtimeActive || !lastRxRealtime) {
     chip.classList.remove("rt-ok", "rt-warn", "rt-err");
     chip.classList.add("rt-off");
-    chip.title = "Marge temps-réel RX — capture inactive";
+    chip.title = t("rt.inactive");
     return;
   }
   const p = lastRxRealtime;
@@ -2522,13 +2781,13 @@ function refreshRxRealtimeChip() {
   chip.classList.remove("rt-off", "rt-ok", "rt-warn", "rt-err");
   chip.classList.add(`rt-${state}`);
   const lines = [
-    `Marge temps-réel RX (${state.toUpperCase()})`,
-    `lag wall-clock : ${p.lag_ms.toFixed(0)} ms`,
-    `dernier batch  : ${p.last_batch_ms.toFixed(0)} ms (cible < 500)`,
-    `pic 2 s        : ${p.max_batch_ms.toFixed(0)} ms`,
-    `session_buffer : ${p.session_buf_ms.toFixed(0)} ms`,
-    `samples perdus capture (ring 30 s overflow) : ${p.dropped_samples}`
-      + (recentDrop ? " ⚠ brickwall récent → flush+idle" : ""),
+    t("rt.active", { state: state.toUpperCase() }),
+    t("rt.lag", { ms: p.lag_ms.toFixed(0) }),
+    t("rt.last_batch", { ms: p.last_batch_ms.toFixed(0) }),
+    t("rt.peak_2s", { ms: p.max_batch_ms.toFixed(0) }),
+    t("rt.session_buf", { ms: p.session_buf_ms.toFixed(0) }),
+    t("rt.dropped", { n: p.dropped_samples })
+      + (recentDrop ? t("rt.brickwall_suffix") : ""),
   ];
   chip.title = lines.join("\n");
 }
@@ -2560,7 +2819,12 @@ function updateV2State(state) {
   chip.textContent = state.replace(/_/g, " ");
   if (state === "idle") {
     document.getElementById("v2-marker-info").textContent = "—";
-    resetRxVisuals();
+    // Do NOT clear lastProgress / fountain / constellation / pilot phases
+    // here: the worker goes idle every time it loses the preamble, even
+    // mid-burst while waiting for a late re-entry. Wiping the stats then
+    // would make the operator believe everything is lost. The visuals are
+    // cleared instead when a *new* session_id arrives (genuinely new
+    // transmission, see the session_armed handler).
     noteProfileFromHeader(null);
   }
 }
@@ -2637,17 +2901,17 @@ function updateFountainStatus(partial) {
   const missingTail = next.decoded
     ? ""
     : missing > 0
-    ? ` · manque ${missing}`
-    : ` · manque 0 (décodable)`;
-  counter.textContent = `${r} / ${k} blocs${missingTail}`;
+    ? t("fountain.missing_n", { n: missing })
+    : t("fountain.missing_zero");
+  counter.textContent = t("fountain.received_blocks", { r, k, tail: missingTail });
   const pctVal = k > 0 ? Math.min(100, Math.round((r * 100) / k)) : 0;
   pct.textContent = next.decoded
-    ? "décodé ✓"
+    ? t("fountain.decoded_ok")
     : next.capReached
-    ? `${pctVal} % (canal saturé)`
+    ? t("fountain.saturated", { pct: pctVal })
     : `${pctVal} %`;
   if (next.sessionId != null) {
-    sess.textContent = `session ${next.sessionId.toString(16).padStart(8, "0")}`;
+    sess.textContent = t("fountain.session", { id: next.sessionId.toString(16).padStart(8, "0") });
   }
   el.dataset.decoded = next.decoded ? "true" : "false";
 }
@@ -3135,6 +3399,18 @@ function wireEvents() {
   });
   listen("session_armed", (event) => {
     const p = event.payload || {};
+    // A different session_id means a genuinely new transmission is
+    // starting — clear the previous burst's visuals so stale progress
+    // bars / constellation / pilots don't linger over the new data.
+    // A re-armed identical session_id (e.g. a worker restart on the same
+    // burst) keeps the existing display so the operator doesn't lose
+    // already-converged blocks visually.
+    if (
+      fountainState.sessionId != null &&
+      fountainState.sessionId !== p.session_id
+    ) {
+      resetRxVisuals();
+    }
     upsertSession({
       session_id: p.session_id,
       k_symbols: p.k,
@@ -3241,6 +3517,17 @@ const txState = {
   // successive "More" bursts so we can continue ESI without overlapping
   // packets already emitted. Reset when image or mode change.
   lastTx: null,  // { esiMax, mode }
+  // Path of the tx_history archive backing the CURRENT session, learnt from
+  // tx_start's return value (fresh TX) or tx_resume (resumed session). Used
+  // to persist the ESI high-water (tx_set_next_esi) after every burst so the
+  // fountain can be continued later. Null = not archived yet.
+  archivePath: null,
+  // When a session is resumed from history, the callsign that was used at
+  // the original TX. It MUST be reused for the continuation bursts, else the
+  // session_id (which depends on the callsign) wouldn't match and the RX
+  // would treat the extra blocks as a brand-new session. Null = use the
+  // current settings callsign (fresh sessions).
+  resumeCallsign: null,
   compressedBytes: null,
   compressedUrl: null,
   compressing: false,
@@ -3261,6 +3548,15 @@ const txState = {
   progress: null,
   restartRxAfter: false,
 };
+
+// Invalidate the current TX session reference. Called whenever the source
+// or mode changes (= a different session_id), so a stale archivePath /
+// resumeCallsign / ESI high-water never leaks into the next transmission.
+function clearTxSessionRef() {
+  txState.lastTx = null;
+  txState.archivePath = null;
+  txState.resumeCallsign = null;
+}
 
 // Promise chain to serialize AVIF compressions. Without it, dropping an
 // image while a compression is running launches a 2nd ravif speed-1
@@ -3348,15 +3644,15 @@ function refreshTxButtons() {
 
   // TX button label + color depending on state.
   if (txState.txActive) {
-    btnTx.textContent = "TX en cours…";
-    btnTx.title = "émission en cours";
+    btnTx.textContent = t("tx.btn_running");
+    btnTx.title = t("status.tx_in_progress");
   } else if (tooBig) {
-    btnTx.textContent = `TX ✖ image > 100 ko`;
-    btnTx.title = `${(bytes / 1024).toFixed(1)} Kio dépasse la limite 100 Kio (images)`;
+    btnTx.textContent = t("tx.btn_too_big");
+    btnTx.title = t("status.tx_oversize_kio", { size: (bytes / 1024).toFixed(1) });
   } else if (tooLong) {
     const limMin = isFile ? 10 : 5;
-    btnTx.textContent = `TX ✖ > ${limMin} min`;
-    btnTx.title = `durée estimée ${fmtSeconds(dur)} dépasse la limite ${limMin} min`;
+    btnTx.textContent = t("tx.btn_too_long", { limit: limMin });
+    btnTx.title = t("status.tx_oversize_time", { dur: fmtSeconds(dur), limit: limMin });
   } else if (warn) {
     btnTx.textContent = `TX ⚠ ${fmtSeconds(dur)}`;
     btnTx.title = txButtonTitle(est, dur, true);
@@ -3391,15 +3687,15 @@ function txFormatBytes(n) {
 // seconds) instead of "18.453123…".
 function txButtonTitle(est, dur, longTx) {
   if (!est) return "";
-  const base = longTx ? `transmission longue (> 2 min) — durée ` : `durée `;
+  const base = longTx ? t("tx.dur_long") : t("tx.dur");
   const k = est.k_source;
   const n = est.n_initial ?? est.total_blocks;
-  const parts = [`${base}${fmtSeconds(dur)}, ${n} blocs émis`];
+  const parts = [t("tx.dur_blocks", { base, dur: fmtSeconds(dur), n })];
   if (k != null && k !== n) {
-    parts.push(`K=${k} nécessaires au décodage`);
+    parts.push(t("tx.parts_with_k", { k }));
   }
   if (est.duration_s_k != null) {
-    parts.push(`seuil ${fmtSeconds(est.duration_s_k)} si aucune perte`);
+    parts.push(t("tx.threshold_lossless", { dur: fmtSeconds(est.duration_s_k) }));
   }
   return parts.join(" · ");
 }
@@ -3409,10 +3705,10 @@ function moreButtonTitle() {
   const est = txState.estimate;
   const count = computeMoreCount();
   if (!est || !est.seconds_per_cw) {
-    return `émettre +${count} blocs RaptorQ`;
+    return t("tx.emit_n_more", { count });
   }
   const dur = est.seconds_per_cw * count;
-  return `+${count} blocs · ~${fmtSeconds(dur)}`;
+  return t("tx.emit_n_more_dur", { count, dur: fmtSeconds(dur) });
 }
 
 function txFitInto(w, h, maxW, maxH) {
@@ -3472,13 +3768,13 @@ function refreshTxPreview() {
   if (srcSize) srcSize.textContent = txFormatBytes(txState.sourceSize);
   if (cmpSize) {
     if (txState.compressing && txState.compressedBytes == null) {
-      cmpSize.textContent = "compression…";
+      cmpSize.textContent = t("tx.compressing");
       cmpSize.classList.remove("tx-stale");
     } else if (txState.compressedBytes != null) {
       const ratio = txState.sourceSize > 0
         ? ` (${(txState.compressedBytes / txState.sourceSize * 100).toFixed(1)}%)`
         : "";
-      const staleTag = txState.compressDirty ? " · obsolète" : "";
+      const staleTag = txState.compressDirty ? t("tx.compress_stale_suffix") : "";
       cmpSize.textContent = `${txFormatBytes(txState.compressedBytes)}${ratio}${staleTag}`;
       cmpSize.classList.toggle("tx-stale", txState.compressDirty);
     } else {
@@ -3521,7 +3817,7 @@ async function refreshTxEstimate() {
     const est = await invoke("tx_estimate", {
       payloadBytes: txState.compressedBytes,
       mode: txState.mode,
-      callsign: currentSettings.callsign || "HB9XXX",
+      callsign: txState.resumeCallsign || currentSettings.callsign || "HB9XXX",
       filename: getTxFilename(),
       repairPct: txState.repairPct,
     });
@@ -3565,9 +3861,24 @@ async function _runTxCompressImpl() {
   refreshTxPreview();
   refreshTxButtons();
   // Force the browser to paint the loader before launching invoke().
-  await new Promise((r) =>
-    requestAnimationFrame(() => requestAnimationFrame(r)),
-  );
+  // Cap the wait with a timeout: on WebKitGTK (Linux) requestAnimationFrame
+  // can stall right after a native drag-drop until the next user
+  // interaction. Without the fallback, the compression hangs here forever —
+  // `compressedBytes` is never set and the TX button stays disabled until
+  // the operator clicks "Compresser" again (which generates the frame that
+  // unblocks rAF). The timeout lets the compression proceed regardless;
+  // worst case the spinner paints one frame late. Same defensive rationale
+  // as the 1 s `load`-event fallback in the `finally` below.
+  await new Promise((r) => {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      r();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(go));
+    setTimeout(go, 100);
+  });
   try {
     if (txState.fileMode) {
       logEvent("tx_compress_start", { mode: "zstd", source_len: txState.sourceSize });
@@ -3625,7 +3936,18 @@ async function _runTxCompressImpl() {
       txState.compressedUrl = url;
       txState.compressDirty = false;
       const previewImg = document.getElementById("tx-preview-img");
-      if (previewImg) previewImg.src = url;
+      if (previewImg) {
+        // Explicitly evict the previous decoded image from WebKit's image
+        // cache before assigning the new src. Each Recalculer click bumps
+        // `?v=Date.now()` so WebKit treats every URL as a brand-new
+        // resource and would otherwise accumulate decoded AVIF buffers
+        // in the WebProcess across encodes — observed 2026-05-29 :
+        // 1-3 successful previews then a Wayland "Broken pipe" / WebKit
+        // crash. `removeAttribute("src")` forces WebKit to drop the
+        // previous decoded surface before the new fetch starts.
+        previewImg.removeAttribute("src");
+        previewImg.src = url;
+      }
       logEvent("tx_compress_done", {
         mode: "avif",
         source_w: result.source_w,
@@ -3643,10 +3965,32 @@ async function _runTxCompressImpl() {
   } finally {
     if (seq === txState.compressSeq) {
       txState.compressing = false;
-      const el = document.getElementById("tx-preview");
-      if (el) el.classList.remove("compressing");
-      refreshTxPreview();
-      refreshTxButtons();
+      // Defer the lock release until the new preview image has finished
+      // decoding in WebKit. Setting `previewImg.src = url` above only
+      // *kicks off* an async fetch+decode in the WebProcess ; if we drop
+      // `body.compressing-lock` right here, any clicks that piled up
+      // during compression (when pointer-events were blocked from JS but
+      // still queued at the WebKit event-pump level) get dispatched
+      // simultaneously with libavif rendering — racing into a
+      // WebProcess crash on WebKitGTK + libavif (observed 2026-05-29).
+      // Waiting on the `load` event gives the decoder a clean window.
+      // Falls back to a 1 s safety timer in case the image never fires
+      // load/error (e.g. AVIF parse error swallowed silently).
+      const release = () => {
+        hideTxBusyOverlay();
+        refreshTxPreview();
+        refreshTxButtons();
+      };
+      const previewImg = document.getElementById("tx-preview-img");
+      if (previewImg && previewImg.getAttribute("src") && !previewImg.complete) {
+        let done = false;
+        const wrapped = () => { if (!done) { done = true; release(); } };
+        previewImg.addEventListener("load", wrapped, { once: true });
+        previewImg.addEventListener("error", wrapped, { once: true });
+        setTimeout(wrapped, 1000);
+      } else {
+        release();
+      }
     }
   }
 }
@@ -3726,10 +4070,10 @@ function applyTxModeUI() {
   if (hint) {
     if (file) {
       hint.hidden = false;
-      hint.textContent = "Fichier non-image → compression zstd sans perte";
+      hint.textContent = t("tx.file_zstd_hint");
     } else if (passthrough) {
       hint.hidden = false;
-      hint.textContent = "AVIF natif → passthrough (pas de ré-encodage)";
+      hint.textContent = t("tx.passthrough_short");
     } else {
       hint.hidden = true;
     }
@@ -3770,10 +4114,21 @@ function showTxBusyOverlay() {
     preview.hidden = false;
     preview.classList.add("compressing");
   }
+  // Block ALL pointer events on the page during compression. Without
+  // this, any click anywhere (a tab switch, a settings input, an
+  // unrelated button) fired while WebKit is also handling the ravif/
+  // libavif decoder for the new preview triggers a WebProcess crash
+  // on this distro (observed 2026-05-29 : Wayland "Broken pipe" or
+  // "Lost connection to compositor" after exactly one interaction
+  // during the encode window). Keyboard still works (lets the user
+  // cancel via Ctrl-W / Alt-F4 if they need). Cursor switches to
+  // `progress` so it's obvious why clicks are ignored.
+  document.body.classList.add("compressing-lock");
 }
 function hideTxBusyOverlay() {
   const preview = document.getElementById("tx-preview");
   if (preview) preview.classList.remove("compressing");
+  document.body.classList.remove("compressing-lock");
 }
 
 // Load a file from a disk path (native Tauri drag-drop). The backend
@@ -3788,7 +4143,7 @@ async function loadTxFileFromPath(path) {
   // and piled `_runTxCompressImpl` calls on `_compressChain` until the
   // WebView ran out of memory.
   if (txState.loading || txState.compressing) {
-    logEvent("tx_drop_ignored", { message: "chargement ou compression déjà en cours", path });
+    logEvent("tx_drop_ignored", { message: "loading or compression already in progress", path });
     return;
   }
   txState.loading = true;
@@ -3811,7 +4166,7 @@ async function loadTxFileFromPath(path) {
     txState.compressedBytes = null;
     txState.compressedUrl = null;
     txState.compressDirty = false;
-    txState.lastTx = null;
+    clearTxSessionRef();
     if (isImage) {
       // Load the image as preview via asset://.
       const img = new Image();
@@ -3857,7 +4212,7 @@ async function loadTxFile(file) {
   // this guard, picking a new image during a long ravif encode crashed
   // the WebView via piled-up `_compressChain` impls.
   if (txState.loading || txState.compressing) {
-    logEvent("tx_pick_ignored", { message: "chargement ou compression déjà en cours" });
+    logEvent("tx_pick_ignored", { message: "loading or compression already in progress" });
     return;
   }
   txState.loading = true;
@@ -3884,7 +4239,7 @@ async function loadTxFile(file) {
   const url = URL.createObjectURL(file);
   txState.sourceUrl = url;
   const finishLoad = async () => {
-    txState.lastTx = null;
+    clearTxSessionRef();
     document.getElementById("tx-drop-zone").hidden = true;
     const preview = document.getElementById("tx-preview");
     const previewImg = document.getElementById("tx-preview-img");
@@ -3946,6 +4301,7 @@ async function resetTxFile() {
   txState.compressedBytes = null;
   txState.compressedUrl = null;
   txState.compressDirty = false;
+  clearTxSessionRef();
   txState.compressSeq++;
   if (txState.compressTimer) {
     clearTimeout(txState.compressTimer);
@@ -4018,7 +4374,7 @@ function setupTxTab() {
   document.getElementById("tx-mode").addEventListener("change", (ev) => {
     txState.mode = ev.target.value;
     // New mode -> new session (RaptorQ session_id depends on the mode).
-    txState.lastTx = null;
+    clearTxSessionRef();
     currentSettings.tx_mode = txState.mode;
     persistSettings();
     refreshTxPreview();
@@ -4098,11 +4454,11 @@ function setupTxTab() {
   const speedVal = document.getElementById("tx-speed-val");
   const speedHint = document.getElementById("tx-speed-hint");
   const speedLabel = (v) => {
-    if (v <= 2) return "très lent · meilleure compression";
-    if (v <= 4) return "lent · bonne compression";
-    if (v <= 6) return "équilibré";
-    if (v <= 8) return "rapide · fichier plus gros";
-    return "très rapide · fichier + gros";
+    if (v <= 2) return t("tx.speed_very_slow");
+    if (v <= 4) return t("tx.speed_slow");
+    if (v <= 6) return t("tx.speed_balanced_2");
+    if (v <= 8) return t("tx.speed_fast");
+    return t("tx.speed_very_fast");
   };
   speed.value = String(txState.speed);
   speedVal.textContent = String(txState.speed);
@@ -4230,26 +4586,52 @@ async function txStart() {
     tx_device: currentSettings.tx_device,
     estimate: txState.estimate,
   });
+  // The ESI never rewinds. A plain "TX" emits a full initial burst worth of
+  // FRESH blocks (n_initial = K + repair) starting at the session's ESI
+  // high-water: 0 for a brand-new image (identical to the historical initial
+  // burst), or the continuation point for a re-sent / resumed session. This
+  // guarantees every TX (and every TX more) adds NEW fountain symbols rather
+  // than re-emitting packets recipients already hold.
+  const callsign = txState.resumeCallsign || currentSettings.callsign || "";
+  const filename = getTxFilename();
+  const nInitial = computeNInitial() || 1;
+  const prior =
+    txState.lastTx && txState.lastTx.mode === txState.mode
+      ? txState.lastTx.esiMax + 1
+      : 0;
   try {
-    await invoke("tx_start", {
-      args: {
-        mode: txState.mode,
-        callsign: currentSettings.callsign || "",
-        filename: getTxFilename(),
-        tx_device: currentSettings.tx_device || "",
-        repair_pct: txState.repairPct,
-      },
-    });
-    // After an initial TX, we remember the session state to enable "More".
-    // The initial burst emits K + floor(K * pct / 100) packets (cf. CLI
-    // main.rs, Rust integer division). Must match exactly to avoid an
-    // ESI gap between the initial burst and the first More.
-    const k = computeK();
-    if (k) {
-      const pct = txState.repairPct || 0;
-      const emitted = k + Math.floor((k * pct) / 100);
-      txState.lastTx = { mode: txState.mode, esiMax: emitted - 1 };
+    if (prior > 0) {
+      // Continue the fountain through the existing (OTA-validated) tx_more
+      // path — same session_id, fresh ESIs starting at `prior`. `nInitial`
+      // is a whole PACKET_QUANTUM, so no extra rounding shifts the high-water.
+      logEvent("tx_start_continue", { esi_start: prior, count: nInitial });
+      await invoke("tx_more", {
+        args: {
+          mode: txState.mode,
+          callsign,
+          filename,
+          tx_device: currentSettings.tx_device || "",
+          esi_start: prior,
+          count: nInitial,
+        },
+      });
+      txState.lastTx = { mode: txState.mode, esiMax: prior + nInitial - 1 };
+    } else {
+      // Fresh session: tx_start archives the payload and returns the archive
+      // path, against which we persist the ESI high-water for later resume.
+      const archivePath = await invoke("tx_start", {
+        args: {
+          mode: txState.mode,
+          callsign,
+          filename,
+          tx_device: currentSettings.tx_device || "",
+          repair_pct: txState.repairPct,
+        },
+      });
+      if (archivePath) txState.archivePath = archivePath;
+      txState.lastTx = { mode: txState.mode, esiMax: nInitial - 1 };
     }
+    await persistNextEsi();
   } catch (err) {
     logEvent("tx_start_error", { message: String(err) });
     txState.txActive = false;
@@ -4268,6 +4650,35 @@ function computeK() {
   if (est.k_source != null) return Math.max(4, est.k_source);
   if (est.total_blocks != null) return Math.max(4, est.total_blocks);
   return null;
+}
+
+// Full initial-burst block count = the number a plain "TX" emits. Prefer
+// the backend's authoritative `n_initial` (already rounded up to a whole
+// PACKET_QUANTUM via effective_packet_count); fall back to the K + repair
+// approximation for an older backend that doesn't expose it.
+function computeNInitial() {
+  const est = txState.estimate;
+  if (est && est.n_initial != null) return est.n_initial;
+  const k = computeK();
+  if (!k) return null;
+  const pct = txState.repairPct || 0;
+  return k + Math.floor((k * pct) / 100);
+}
+
+// Persist the current session's ESI high-water onto its tx_history archive
+// so the fountain can be continued later (even after an app restart). No-op
+// until the session has an archive path (set by tx_start / tx_resume).
+async function persistNextEsi() {
+  if (!txState.archivePath || !txState.lastTx) return;
+  try {
+    const { invoke } = window.__TAURI__.core;
+    await invoke("tx_set_next_esi", {
+      archivePath: txState.archivePath,
+      nextEsi: txState.lastTx.esiMax + 1,
+    });
+  } catch (err) {
+    logEvent("tx_next_esi_error", { message: String(err) });
+  }
 }
 
 // Number of additional blocks to emit in a "More" burst. Read directly
@@ -4320,13 +4731,16 @@ async function txMore() {
     await invoke("tx_more", {
       args: {
         mode: txState.mode,
-        callsign: currentSettings.callsign || "",
+        // Reuse the original callsign on a resumed session, else the
+        // session_id wouldn't match (see resumeCallsign).
+        callsign: txState.resumeCallsign || currentSettings.callsign || "",
         filename: getTxFilename(),
         tx_device: currentSettings.tx_device || "",
         esi_start: esiStart,
         count: count,
       },
     });
+    await persistNextEsi();
   } catch (err) {
     logEvent("tx_more_error", { message: String(err) });
     txState.txActive = false;
@@ -4367,16 +4781,21 @@ function updateTxProgressText() {
       const k = est.k_source != null ? est.k_source : est.total_blocks;
       const n = est.n_initial != null ? est.n_initial : est.total_blocks;
       const dur = fmtSeconds(est.duration_s);
-      const durK = est.duration_s_k != null ? ` (seuil K : ${fmtSeconds(est.duration_s_k)})` : "";
-      txt.textContent = `— / ${n} blocs · ${k} nécessaires · durée ~${dur}${durK}`;
+      const durK = est.duration_s_k != null ? t("tx.k_threshold_suffix", { dur: fmtSeconds(est.duration_s_k) }) : "";
+      txt.textContent = t("tx.fountain_summary", { n, k, dur, durK });
     } else {
       txt.textContent = "—";
     }
     return;
   }
   const kTail = est && est.k_source != null ? ` · K=${est.k_source}` : "";
-  txt.textContent =
-    `TX ${p.blocks_sent} / ${p.total_blocks} blocs${kTail} · ${fmtSeconds(p.elapsed_s)} / ${fmtSeconds(p.duration_s)}`;
+  txt.textContent = t("tx.progress_blocks", {
+    sent: p.blocks_sent,
+    total: p.total_blocks,
+    tail: kTail,
+    elapsed: fmtSeconds(p.elapsed_s),
+    dur: fmtSeconds(p.duration_s),
+  });
 }
 
 // ──────────────────────────── Full-duplex TX progress bar
@@ -4522,11 +4941,11 @@ async function applyAttenuation(db, source) {
     }
     if (status) {
       status.textContent = source
-        ? `${source} → ${v.toFixed(1)} dB sauvegardé ${now()}`
-        : `${v.toFixed(1)} dB sauvegardé ${now()}`;
+        ? t("att.applied", { source, db: v.toFixed(1), time: now() })
+        : t("att.applied_no_source", { db: v.toFixed(1), time: now() });
     }
   } catch (err) {
-    if (status) status.textContent = `erreur : ${err}`;
+    if (status) status.textContent = t("status.error_prefix", { err });
   }
 }
 
@@ -4628,7 +5047,7 @@ function setupChannelTab() {
     applyBtn.addEventListener("click", () => {
       const vals = cascadeFeedback.map(r => r.db);
       const m = median(vals);
-      if (m !== null) applyAttenuation(m, "médiane cascade");
+      if (m !== null) applyAttenuation(m, t("channel.cascade_median_source"));
     });
   }
   if (clearBtn) {
@@ -4676,7 +5095,7 @@ function renderHistoryColumn(items, kind) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
-    empty.textContent = kind === "tx" ? "Aucun fichier émis." : "Aucun fichier reçu.";
+    empty.textContent = t(kind === "tx" ? "history.tx_empty" : "history.rx_empty");
     list.appendChild(empty);
     return;
   }
@@ -4752,22 +5171,31 @@ function renderHistoryColumn(items, kind) {
     actions.className = "history-card-actions";
     const relayBtn = document.createElement("button");
     relayBtn.className = "btn-relay";
-    relayBtn.textContent = kind === "tx" ? "↻ Renvoyer" : "↻ Relayer";
-    relayBtn.title =
-      kind === "tx"
-        ? "Recharger ce fichier dans l'onglet TX"
-        : "Relayer ce fichier reçu (radio-secours)";
+    relayBtn.textContent = t(kind === "tx" ? "history.btn_relay_tx" : "history.btn_relay_rx");
+    relayBtn.title = t(kind === "tx" ? "history.relay_tx_tip" : "history.relay_rx_tip");
     const relayPath = kind === "tx" ? item.file_path : item.relay_path;
     relayBtn.addEventListener("click", () => relayHistoryItem(relayPath));
     actions.appendChild(relayBtn);
 
+    // TX cards only: resume the SAME session and continue its fountain
+    // (top up partial / late recipients). Distinct from "Relais", which
+    // starts a fresh full re-transmission.
+    if (kind === "tx") {
+      const resumeBtn = document.createElement("button");
+      resumeBtn.className = "btn-resume";
+      resumeBtn.textContent = t("history.btn_resume_tx");
+      resumeBtn.title = t("history.resume_tx_tip");
+      resumeBtn.addEventListener("click", () => resumeTxFromHistory(item.file_path));
+      actions.appendChild(resumeBtn);
+    }
+
     const delBtn = document.createElement("button");
     delBtn.className = "btn-delete";
     delBtn.textContent = "🗑";
-    delBtn.title = "Supprimer cette entrée";
+    delBtn.title = t("history.delete_tip");
     delBtn.addEventListener("click", () => {
-      const label = item.filename || "cette entrée";
-      if (!confirm(`Supprimer ${label} de l'historique ?`)) return;
+      const label = item.filename || t("history.delete_default");
+      if (!confirm(t("history.delete_confirm", { what: label }))) return;
       const key = kind === "tx" ? item.file_path : item.session_id;
       deleteHistoryItem(kind, key);
     });
@@ -4787,6 +5215,77 @@ async function relayHistoryItem(absolutePath) {
   } catch (err) {
     logEvent("history_relay_error", { path: absolutePath, message: String(err) });
   }
+}
+
+// Resume a past TX session (TX history card "Compléter" button): reload the
+// bit-exact archived payload WITHOUT recompressing, restore mode / callsign /
+// filename / ESI high-water, and arm both TX and TX more on the SAME session.
+// Clicking TX then emits a full fresh burst from where we left off; partial
+// or late recipients top up their fountain. The session_id is reproduced
+// automatically by the deterministic envelope (same payload + filename +
+// callsign + mode).
+async function resumeTxFromHistory(archivePath) {
+  if (!window.__TAURI__ || !window.__TAURI__.core) return;
+  const { invoke, convertFileSrc } = window.__TAURI__.core;
+  const txBtn = document.querySelector('.tab-bar .tab[data-tab="tx"]');
+  if (txBtn) txBtn.click();
+  let info;
+  try {
+    info = await invoke("tx_resume", { archivePath });
+  } catch (err) {
+    logEvent("tx_resume_error", { path: archivePath, message: String(err) });
+    alert(`Reprise impossible : ${err}`);
+    return;
+  }
+  if (txState.sourceUrl) {
+    URL.revokeObjectURL(txState.sourceUrl);
+    txState.sourceUrl = null;
+  }
+  // Restore the session into txState. We do NOT recompress: the archive IS
+  // the wire payload, and the backend tx_payload_path now points at it.
+  txState.mode = info.mode;
+  const modeSel = document.getElementById("tx-mode");
+  if (modeSel) modeSel.value = info.mode;
+  txState.sourceFile = { name: info.filename, size: info.byte_len };
+  txState.sourceSize = info.byte_len;
+  txState.sourceImage = null;
+  txState.fileMode = !info.is_image;
+  txState.avifPassthrough = info.is_image; // archived images are AVIF
+  txState.compressedBytes = info.byte_len;
+  txState.compressedUrl = null;
+  txState.compressDirty = false;
+  txState.repairPct = Number.isFinite(info.repair_pct) ? info.repair_pct : txState.repairPct;
+  // Continuation state: reuse the archived callsign + ESI high-water.
+  txState.archivePath = info.archive_path || archivePath;
+  txState.resumeCallsign = info.callsign || null;
+  txState.lastTx = info.next_esi > 0
+    ? { mode: info.mode, esiMax: info.next_esi - 1 }
+    : null;
+  // UI restore.
+  applyPassthroughUI();
+  applyFileModeUI();
+  refreshTxExperimentalWarn();
+  const dropZone = document.getElementById("tx-drop-zone");
+  if (dropZone) dropZone.hidden = true;
+  const preview = document.getElementById("tx-preview");
+  const previewImg = document.getElementById("tx-preview-img");
+  if (previewImg) {
+    previewImg.removeAttribute("src");
+    previewImg.src = info.is_image ? `${convertFileSrc(archivePath)}?v=${Date.now()}` : "";
+  }
+  if (preview) preview.hidden = false;
+  const repairEl = document.getElementById("tx-repair-pct");
+  if (repairEl) repairEl.value = String(txState.repairPct);
+  refreshTxPreview();
+  // The estimate (re)enables the TX button and gives n_initial for the
+  // continuation burst; it reads txState.compressedBytes set above.
+  await refreshTxEstimate();
+  refreshTxButtons();
+  logEvent("tx_resumed", {
+    session_id: info.session_id,
+    next_esi: info.next_esi,
+    mode: info.mode,
+  });
 }
 
 async function deleteHistoryItem(kind, key) {
@@ -4865,11 +5364,36 @@ function setupKioskMode() {
   });
 }
 
+// Resolve the running app version from the Tauri backend (which reads it
+// from tauri.conf.json — same string that ends up in the .deb) and paint
+// it into the right-pinned chip in the tab bar. Fire-and-forget; on
+// failure we fall back to the literal "?" so it's obvious the chip is
+// live and just couldn't talk to the backend.
+async function setupAppVersionChip() {
+  const el = document.getElementById("app-version");
+  if (!el) return;
+  try {
+    const { invoke } = window.__TAURI__.core;
+    const v = await invoke("get_app_version");
+    el.textContent = `v${v}`;
+    el.title = `Version de l'application : ${v}`;
+  } catch (e) {
+    console.error("get_app_version", e);
+    el.textContent = "v?";
+  }
+}
+
 async function init() {
+  // Load translations first so every subsequent setup* that reads
+  // a `t(...)` (or HTML data-i18n) gets the right language out of
+  // the gate — avoids a visible FR→EN flicker on EN-first launches.
+  try { await initI18n(); } catch (err) { console.error("i18n", err); }
+  setupLangSelect();
   setupKioskMode();
   setupSelectPicker();
   setupVirtKeyboard();
   setupTabs();
+  setupAppVersionChip();
   setupLightbox();
   setupTxTab();
   setupSettingsTab();
@@ -4878,6 +5402,7 @@ async function init() {
   setupHistoryTab();
   await loadSettings();
   await loadSdrBackends();
+  await renderSdrBackendsList();
   applyOverlaysToUI();
   setupChannelTab();
   setupSounderTab();
@@ -5666,7 +6191,7 @@ async function runSounderTxEmit() {
   if (!txDevice) {
     setSounderStatus(
       "sounder-tx-status",
-      "Choisir un périphérique TX dans Paramètres",
+      t("sounder.tx_pick_in_settings"),
       "err",
     );
     return;
@@ -5675,9 +6200,9 @@ async function runSounderTxEmit() {
   const oldText = btn ? btn.textContent : null;
   if (btn) {
     btn.disabled = true;
-    btn.textContent = "Émission en cours…";
+    btn.textContent = t("sounder.tx_emitting");
   }
-  setSounderStatus("sounder-tx-status", "préparation…");
+  setSounderStatus("sounder-tx-status", t("sounder.preparing"));
   try {
     const request = buildStandardSoundingRequest();
     const res = await invoke("sounding_tx_emit", {
@@ -5688,23 +6213,23 @@ async function runSounderTxEmit() {
     if (est) est.textContent = res.duration_s.toFixed(0);
     setSounderStatus(
       "sounder-tx-status",
-      `émission ${res.duration_s.toFixed(0)} s…`,
+      t("sounder.emitting_s", { s: res.duration_s.toFixed(0) }),
     );
     // Re-enable the button after the airtime + a small safety margin.
     const reenableMs = Math.ceil(res.duration_s * 1000) + 500;
     setTimeout(() => {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+        btn.textContent = oldText ?? t("channel.sounder_tx_emit");
       }
-      setSounderStatus("sounder-tx-status", `terminé ${now()}`, "ok");
+      setSounderStatus("sounder-tx-status", t("sounder.done_at", { time: now() }), "ok");
     }, reenableMs);
   } catch (err) {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = oldText ?? "▶ Émettre la séquence de sondage";
+      btn.textContent = oldText ?? t("channel.sounder_tx_emit");
     }
-    setSounderStatus("sounder-tx-status", `erreur : ${err}`, "err");
+    setSounderStatus("sounder-tx-status", t("status.error_prefix", { err }), "err");
   }
 }
 
@@ -5716,7 +6241,7 @@ async function runSounderTxEmit() {
 async function runSounderTxRender() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke } = window.__TAURI__.core;
-  setSounderStatus("sounder-an-status", "génération…");
+  setSounderStatus("sounder-an-status", t("sounder.generating"));
   try {
     const request = buildStandardSoundingRequest();
     const res = await invoke("sounding_tx_render", { request });
@@ -5724,11 +6249,11 @@ async function runSounderTxRender() {
     if (sched) sched.value = res.schedule_json;
     setSounderStatus(
       "sounder-an-status",
-      `référence régénérée (${res.duration_s.toFixed(0)} s)`,
+      t("sounder.ref_regenerated", { s: res.duration_s.toFixed(0) }),
       "ok",
     );
   } catch (err) {
-    setSounderStatus("sounder-an-status", `erreur : ${err}`, "err");
+    setSounderStatus("sounder-an-status", t("status.error_prefix", { err }), "err");
   }
 }
 
@@ -5781,14 +6306,14 @@ async function runSounderAnalyze() {
     document.getElementById("sounder-an-schedule")?.value || ""
   ).trim();
   if (!capture) {
-    setSounderStatus("sounder-an-status", "aucune capture (cliquez Démarrer)", "err");
+    setSounderStatus("sounder-an-status", t("sounder.no_capture"), "err");
     return;
   }
   // Auto-regenerate the reference schedule if the user didn't already
   // produce one. The generator is deterministic so re-running on the
   // RX side gives bit-identical bytes to whatever the TX side built.
   if (!schedule) {
-    setSounderStatus("sounder-an-status", "génération de la référence…");
+    setSounderStatus("sounder-an-status", t("sounder.gen_ref"));
     try {
       const request = buildStandardSoundingRequest();
       const ref = await invoke("sounding_tx_render", { request });
@@ -5796,14 +6321,14 @@ async function runSounderAnalyze() {
       const sched = document.getElementById("sounder-an-schedule");
       if (sched) sched.value = schedule;
     } catch (err) {
-      setSounderStatus("sounder-an-status", `erreur ref: ${err}`, "err");
+      setSounderStatus("sounder-an-status", t("status.error_prefix", { err }), "err");
       return;
     }
   }
   const threshold =
     Number(document.getElementById("sounder-an-threshold")?.value) || 6;
   const { equipment, notes } = buildRxChainMetadata();
-  setSounderStatus("sounder-an-status", "analyse en cours…");
+  setSounderStatus("sounder-an-status", t("sounder.analyzing"));
   try {
     const sig = await invoke("sounding_analyze", {
       captureWav: capture,
@@ -5868,7 +6393,7 @@ async function runSounderAnalyze() {
         ? String(sig.capture_anchor_sample)
         : "—";
     document.getElementById("sounder-an-signature-path").textContent =
-      `signature.json écrite à côté du WAV (${sig.measurements?.length ?? 0} mesures)`;
+      t("sounder.signature_written", { n: sig.measurements?.length ?? 0 });
     // Verdict from the over-modulation analyser.
     const v = sig.verdict || {};
     const vEl = document.getElementById("sd-verdict");
@@ -5964,13 +6489,13 @@ async function runSounderCollectorSend() {
   };
   const callsign = (currentSettings && currentSettings.callsign || "").trim();
   if (!callsign) {
-    setStatus("indicatif vide (Paramètres → Indicatif)", "err");
+    setStatus(t("status.callsign_empty"), "err");
     return;
   }
   const collectorUrl =
     (currentSettings && currentSettings.collector_url || "").trim();
   if (!collectorUrl) {
-    setStatus("URL collecteur vide (Paramètres → Collecteur)", "err");
+    setStatus(t("status.collector_url_empty"), "err");
     return;
   }
   if (btn) btn.disabled = true;
@@ -6030,7 +6555,7 @@ async function runSounderRxCaptureToggle() {
     if (!deviceName) {
       setSounderStatus(
         "sounder-an-status",
-        "Sélectionner une carte RX dans Paramètres",
+        t("sounder.pick_rx_card"),
         "err",
       );
       return;
@@ -6043,16 +6568,16 @@ async function runSounderRxCaptureToggle() {
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = path;
       if (btn) {
-        btn.textContent = "⏹ Arrêter & analyser";
+        btn.textContent = t("channel.sounder_capture_stop");
         btn.classList.add("recording");
       }
       if (analyseBtn) analyseBtn.disabled = true;
       setSounderStatus(
         "sounder-an-status",
-        "capture en cours — émettez côté TX, puis cliquez pour arrêter",
+        t("sounder.capture_in_progress"),
       );
     } catch (err) {
-      setSounderStatus("sounder-an-status", `erreur capture : ${err}`, "err");
+      setSounderStatus("sounder-an-status", t("status.error_prefix", { err }), "err");
     }
   } else {
     try {
@@ -6061,13 +6586,13 @@ async function runSounderRxCaptureToggle() {
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = info.path;
       if (btn) {
-        btn.textContent = "⏺ Démarrer la capture";
+        btn.textContent = t("channel.sounder_capture_start");
         btn.classList.remove("recording");
       }
       if (analyseBtn) analyseBtn.disabled = false;
       setSounderStatus(
         "sounder-an-status",
-        `capture ${info.duration_sec.toFixed(0)} s — analyse…`,
+        t("sounder.capture_analyzing", { s: info.duration_sec.toFixed(0) }),
       );
       // Auto-fire the analyser. The function regenerates the
       // reference schedule itself if the field is empty.
@@ -6297,16 +6822,16 @@ function renderSounderPlots(sig) {
   const sweep = meas.find((m) => m.kind === "level_sweep");
   if (sweep && sweep.result && sweep.result.am_am_curve) {
     svgXY("sd-plot-amam", sweep.result.am_am_curve, {
-      xLabel: "Entrée (dBFS)",
-      yLabel: "Sortie (dBFS)",
+      xLabel: t("channel.axis_input_dbfs"),
+      yLabel: t("channel.axis_output_dbfs"),
       diagonal: true,
       sweet,
     });
     // (1bis) AM-PM curve overlay onto the AM-PM panel.
     if (sweep.result.am_pm_curve) {
       svgXY("sd-plot-ampm", sweep.result.am_pm_curve, {
-        xLabel: "Entrée (dBFS)",
-        yLabel: "Phase (rad)",
+        xLabel: t("channel.axis_input_dbfs"),
+        yLabel: t("channel.axis_phase_rad"),
         sweet,
       });
     }
@@ -6330,8 +6855,8 @@ function renderSounderPlots(sig) {
     .sort((a, b) => a[0] - b[0]);
   if (tts.length > 0) {
     svgXY("sd-plot-imd3", tts, {
-      xLabel: "Sortie f₁ (dBFS)",
-      yLabel: "IMD3 moyen (dBc)",
+      xLabel: t("channel.axis_out_f1_dbfs"),
+      yLabel: t("channel.axis_imd3_dbc"),
     });
   }
 
@@ -6353,8 +6878,8 @@ function renderSounderPlots(sig) {
   }
   if (mtPick && mtPick.result && mtPick.result.gain_db_per_freq) {
     svgXY("sd-plot-freq", mtPick.result.gain_db_per_freq, {
-      xLabel: "Fréquence (Hz)",
-      yLabel: "Gain (dB)",
+      xLabel: t("channel.axis_freq_hz"),
+      yLabel: t("channel.axis_gain_db"),
     });
   }
 
@@ -6366,8 +6891,8 @@ function renderSounderPlots(sig) {
   }
   if (chPick && chPick.result && chPick.result.group_delay_per_freq) {
     svgXY("sd-plot-gd", chPick.result.group_delay_per_freq, {
-      xLabel: "Fréquence (Hz)",
-      yLabel: "Δ group delay (µs)",
+      xLabel: t("channel.axis_freq_hz"),
+      yLabel: t("channel.axis_delta_gd_us"),
     });
   }
 
@@ -6395,8 +6920,8 @@ function renderSounderPlots(sig) {
       pts.push([(i / 48), dbc]); // x in ms (48k -> 48 samples per ms)
     }
     svgXY("sd-plot-ir", pts, {
-      xLabel: "Retard (ms)",
-      yLabel: "|h| (dBc)",
+      xLabel: t("channel.axis_delay_ms"),
+      yLabel: t("channel.axis_abs_h_dbc"),
       yMin: -40,
       yMax: 3,
     });

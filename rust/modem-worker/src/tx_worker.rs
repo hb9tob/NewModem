@@ -34,7 +34,7 @@ use modem_framing::{
     raptorq_codec::k_from_payload,
 };
 use modem_io::SampleSink;
-use modem_sdr_dsp::emphasis::preemphasis_nbfm_48k;
+use modem_sdr_dsp::audio_filters::PreemphasisHpf;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,6 +210,24 @@ fn infer_mime(path: &Path) -> u8 {
 /// name; callers report it as a tx_error.
 fn profile_index_for(name: &str) -> Option<u8> {
     ProfileIndex::from_name(name).map(ProfileIndex::as_u8)
+}
+
+/// Compute the deterministic `session_id` for a payload, exactly as
+/// `encode_in_process` does. Same `(payload, filename, callsign, mode)`
+/// always yields the same id, which is what lets a later "send more" (or a
+/// resumed session) land its fresh ESIs in the same RX disk session.
+/// Returns `None` for an unknown profile or an over-large envelope.
+pub fn session_id_for(
+    payload: &[u8],
+    mode: &str,
+    callsign: &str,
+    filename: &str,
+) -> Option<u32> {
+    let envelope = PayloadEnvelope::new(filename, callsign, payload.to_vec())?;
+    let wire = envelope.encode();
+    let cfg = parse_profile(mode).ok()?;
+    let profile_index = profile_index_for(mode)?;
+    Some(app_header::compute_session_id(&wire, cfg.mode_code(), profile_index))
 }
 
 /// Burst variant : initial (`esi_start=None`) or "More" (`esi_start=Some,
@@ -544,13 +562,17 @@ fn run_playback(
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
 ) {
-    // Optional NBFM pre-emphasis (+6 dB/oct, tau = 750 us). Applied
-    // BEFORE the attenuation so that the re-normalized peak still
-    // respects the ATT setpoint. The shelf strongly lifts the high audio
-    // frequencies (+13 dB at 1 kHz, +18 dB at 2.7 kHz, plateau +20 dB):
-    // without re-normalization the signal would clip the sound card.
+    // Optional PM-emulation pre-emphasis (+6 dB/oct, 300 Hz zero /
+    // 12 kHz pole). Symmetric counterpart of the RX-side
+    // `DeemphasisLpf::calibrated` toggle: a legacy FM radio that lacks
+    // the PM ±6 dB/oct intrinsic gets the rising slope painted on by
+    // the modem so the over-the-air signal matches what a PM radio
+    // would produce. Applied BEFORE the attenuation so the re-
+    // normalized peak still respects the ATT setpoint. In-band gain
+    // tops out around +18 dB at 2.6 kHz, so re-normalization is still
+    // required to avoid sound-card clipping.
     if preemphasis_enabled {
-        preemphasis_nbfm_48k(&mut samples);
+        PreemphasisHpf::calibrated(AUDIO_RATE as f32).process(&mut samples);
         // Re-peak-normalize back to the modem-cli output level
         // (PEAK_NORMALIZE = 0.9 in modem-core::types). Keeps ~0.9 dB of
         // headroom before int16/F32 saturation regardless of the shelf
@@ -581,6 +603,20 @@ fn run_playback(
         write_tx_wav(&wav_path, &samples);
     }
     let total_samples = samples.len();
+
+    // Force the sound card's "Auto Gain Control" OFF before every burst.
+    // On the Pi reference chain a USB codec's playback AGC applies a
+    // *time-varying* gain that destroys the APSK amplitude rings and
+    // fights the operator's deliberate level setting — the root cause of
+    // "TX does garbage / chunks missing / RX reopens old sessions". The
+    // call is a no-op for non-ALSA-card devices (SDR composites, HDMI)
+    // and for cards without an AGC control; idempotent and best-effort,
+    // so a mixer error never aborts the transmission.
+    match modem_io::alsa_mixer::disable_agc(device_name) {
+        Ok(true) => eprintln!("[tx] AGC disabled on '{device_name}'"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[tx] AGC disable failed on '{device_name}': {e}"),
+    }
 
     // PTT: switch to TX BEFORE opening the audio stream, then wait
     // 200 ms for the transceiver to commute. The single-step
@@ -680,19 +716,25 @@ fn run_playback(
 /// `payload_path` must point at an existing file (`tx_preview.avif` or
 /// `tx_preview.zst`). `filename` is the original name chosen by the
 /// user, preserved as-is in the metadata for thumbnail display.
+///
+/// Returns the path of the archived payload file (the bit-exact copy),
+/// which the caller hands back to the GUI so it can later persist the
+/// session's ESI high-water on this entry (`next_esi`) and resume it.
+/// Returns `None` if the directory or the copy could not be created.
 pub fn archive_payload(
     save_dir: &Path,
     payload_path: &Path,
     mode: &str,
+    callsign: &str,
     filename: &str,
     repair_pct: u32,
     max_items: u32,
     sink: &dyn EventSink,
-) {
+) -> Option<PathBuf> {
     let history_dir = save_dir.join("tx_history");
     if let Err(e) = std::fs::create_dir_all(&history_dir) {
         eprintln!("[tx_history] mkdir {:?}: {e}", history_dir);
-        return;
+        return None;
     }
     let ext = payload_path
         .extension()
@@ -714,20 +756,31 @@ pub fn archive_payload(
 
     if let Err(e) = std::fs::copy(payload_path, &archive_path) {
         eprintln!("[tx_history] copy {:?}: {e}", payload_path);
-        return;
+        return None;
     }
+    // Deterministic session_id of this transmission, stored so a later
+    // resume can prove (and re-derive) the same RX session.
+    let session_id = std::fs::read(payload_path)
+        .ok()
+        .and_then(|bytes| session_id_for(&bytes, mode, callsign, filename));
     let meta = serde_json::json!({
         "timestamp": ts,
         "mode": mode,
         "mime_type": mime_type,
         "filename": filename,
+        "callsign": callsign,
         "repair_pct": repair_pct,
+        // ESI high-water for resume: 0 until the GUI persists it after the
+        // initial burst. `tx_set_next_esi` updates this in place.
+        "next_esi": 0,
+        "session_id": session_id,
     });
     if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
         eprintln!("[tx_history] write meta {:?}: {e}", meta_path);
     }
     purge_history(&history_dir, max_items);
     sink.emit("tx_archived", ());
+    Some(archive_path)
 }
 
 /// Cap the `tx_history/` folder to `max_items` file+json pairs. Sort
@@ -790,5 +843,28 @@ fn sanitize_filename(name: &str) -> String {
         trimmed.chars().take(80).collect()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The TX-resume / "complete later" feature relies on session_id being a
+    // pure function of (payload, mode, callsign, filename): reloading the
+    // bit-exact archived payload must reproduce the SAME id so the extra ESIs
+    // land in the recipient's existing session. Lock that contract here.
+    #[test]
+    fn session_id_is_deterministic_and_content_sensitive() {
+        let payload = b"hello world, this is a test payload";
+        let a = session_id_for(payload, "HIGH", "HB9TOB", "photo.avif").unwrap();
+        let b = session_id_for(payload, "HIGH", "HB9TOB", "photo.avif").unwrap();
+        assert_eq!(a, b, "same inputs must yield the same session_id");
+
+        // Any change to payload / callsign / filename / mode is a new session.
+        assert_ne!(a, session_id_for(b"other payload", "HIGH", "HB9TOB", "photo.avif").unwrap());
+        assert_ne!(a, session_id_for(payload, "HIGH", "HB9XYZ", "photo.avif").unwrap());
+        assert_ne!(a, session_id_for(payload, "HIGH", "HB9TOB", "photo2.avif").unwrap());
+        assert_ne!(a, session_id_for(payload, "NORMAL", "HB9TOB", "photo.avif").unwrap());
     }
 }

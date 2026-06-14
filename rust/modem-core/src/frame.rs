@@ -1,21 +1,21 @@
-//! Superframe assembly for TX (V3 frame format, sliding-window friendly).
+//! Superframe assembly for TX (V4 frame format, sliding-window friendly).
 //!
-//! Structure:
-//! [Preamble 256 sym QPSK] [Header 96 sym QPSK]
-//! [Marker 128][Meta segment (AppHeader)] [Marker][Data segment (2 CW)] ...
-//! ... every `V3_PREAMBLE_PERIOD_S` seconds, PRE+HDR+Meta are reinserted at
-//! the next data-segment boundary to provide a fresh sliding-window anchor.
+//! Structure (V4, headerless — the bootstrap marker carries `profile_index`):
+//! [Preamble 256 sym QPSK] [Marker 128 (profile_index, META)] [LMS warmup]
+//! [Meta segment (AppHeader)] [Marker][Data segment (2 CW)] ...
+//! ... every `V3_PREAMBLE_PERIOD_S` seconds, Preamble+Marker+Warmup+Meta are
+//! reinserted at the next data-segment boundary as a fresh sliding-window anchor.
 //!
 //! Data flow:
 //! input bytes → split into LDPC info blocks → LDPC encode → interleave → symbol map
-//!             → TDM pilot insertion → prepend preamble + header
+//!             → TDM pilot insertion → prepend preamble + bootstrap marker + warmup
 
 use modem_framing::app_header::{self, AppHeader};
 use crate::constellation::{self, Constellation};
-use crate::header::{self, Header, FLAG_EOT, FLAG_LAST};
+use crate::header;
 use crate::interleaver;
 use crate::ldpc::encoder::LdpcEncoder;
-use crate::marker::{self, MarkerPayload, META_FLAG_BIT};
+use crate::marker::{self, MarkerPayload, LAST_FLAG_BIT, META_FLAG_BIT};
 use crate::pilot;
 use crate::preamble;
 use crate::profile::{ConstellationType, ModemConfig};
@@ -28,8 +28,8 @@ pub const HEADER_VERSION_V3: u8 = 3;
 /// segment durations roughly to 0.77 s at 16-APSK / 1 s at 8PSK / 2.3 s at QPSK.
 pub const V2_CODEWORDS_PER_SEGMENT: usize = 2;
 
-/// Round `n_packets` up to the smallest count that fills every data segment
-/// completely (multiple of `V2_CODEWORDS_PER_SEGMENT`).
+/// Round `n_packets` up to a multiple of `PACKET_QUANTUM` (= two full data
+/// segments).
 ///
 /// The TX walks data in segments of `V2_CODEWORDS_PER_SEGMENT` codewords ; the
 /// RX always reads that many CW + their pilots when stepping past a marker.
@@ -37,17 +37,26 @@ pub const V2_CODEWORDS_PER_SEGMENT: usize = 2;
 /// observed OTA), the final segment would carry only 1 CW while the RX still
 /// reads 2 — the trailing runout (~160 sym) doesn't cover the missing CW, so
 /// `cursor + seg_sym_len > data_region.len()` triggers the `break` and the
-/// last segment is dropped. Always emitting an even number of packets keeps
+/// last segment is dropped. Rounding to a whole number of segments keeps
 /// every segment full.
+///
+/// We round to a multiple of FOUR (two segments), not two: it keeps each
+/// burst — and every `tx-more` increment — a whole number of segment pairs,
+/// so the final superframe is complete and its last-segment marker (which
+/// carries `LAST_FLAG_BIT`) lands in a cleanly CLOSED window for EOT detection.
 ///
 /// Multi-burst callers (`tx-more`) must use this helper to compute the
 /// `esi_start` of the next burst : if burst 1 was asked for N packets, it
 /// actually emitted `effective_packet_count(N)`, and burst 2 must start at
 /// that ESI to avoid duplication or gaps.
 pub fn effective_packet_count(n_packets: u32) -> u32 {
-    let m = V2_CODEWORDS_PER_SEGMENT as u32;
+    let m = PACKET_QUANTUM as u32;
     n_packets.div_ceil(m) * m
 }
+
+/// Packet-count granularity: two full data segments. See
+/// [`effective_packet_count`] for the rationale.
+pub const PACKET_QUANTUM: usize = 2 * V2_CODEWORDS_PER_SEGMENT;
 
 /// v3 target period between periodic preamble+header insertions, in seconds.
 /// The builder inserts PRE+HDR+META at the next segment boundary after this
@@ -212,21 +221,19 @@ pub fn build_superframe_v3_range(
         &constellation_,
     );
 
-    // Pre-encode the preamble + protocol header bundle inserted before each
-    // periodic meta. Same content every time → encode once, reuse.
+    // Pre-encode the preamble + LMS warmup reused at each periodic re-anchor.
+    // V4 is headerless: the bootstrap marker carries profile_index, so there is
+    // no protocol-header block here (see V4_WIRE_FORMAT_PLAN.md).
     let preamble_syms = preamble::make_preamble_for_config(config);
-    // LMS guard interval: sweeps every 64-APSK point so the FFE pre-adapts
-    // to the constellation density before the first data CW. Empty for
-    // other profiles (compat).
+    // LMS guard interval: sweeps every 64-APSK point so the FFE pre-adapts to
+    // the constellation density before the first data CW. In V4 it sits AFTER
+    // the bootstrap marker, so the RX already knows the profile when it trains
+    // on the warmup. Empty for profiles with no warmup (compat).
     let warmup_syms = preamble::make_lms_warmup_for_config(config);
-    let mut hdr = Header::from_config(config, 0, data.len() as u16, FLAG_LAST);
-    hdr.version = HEADER_VERSION_V3;
-    let header_syms = header::encode_header_symbols(&hdr);
+    let profile_index = header::derive_profile_index(config);
 
     let mut all_symbols: Vec<Complex64> = Vec::new();
     all_symbols.extend_from_slice(&preamble_syms);
-    all_symbols.extend_from_slice(&warmup_syms);
-    all_symbols.extend_from_slice(&header_syms);
 
     let session_id_low = (session_id & 0xFF) as u8;
     // Target period between periodic preamble reinsertions, expressed in
@@ -238,18 +245,22 @@ pub fn build_superframe_v3_range(
     let mut data_cursor: usize = 0;
     let mut elapsed_since_preamble_sym: usize = 0;
 
-    // Initial meta segment (covered by the leading preamble+header above).
+    // Initial meta segment. V4 layout: bootstrap MARKER (carries profile_index)
+    // → LMS warmup (trained on the now-known constellation) → meta codeword.
     {
         let payload = MarkerPayload {
             seg_id,
             session_id_low,
             base_esi: esi_start + data_cursor as u32,
             flags: META_FLAG_BIT,
+            profile_index,
+            fmt_version: marker::WIRE_FMT_V4,
             reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));
+        all_symbols.extend_from_slice(&warmup_syms);
         let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms, &config.pilot_pattern);
-        elapsed_since_preamble_sym += marker::MARKER_LEN + with_pilots.len();
+        elapsed_since_preamble_sym += marker::MARKER_LEN + warmup_syms.len() + with_pilots.len();
         all_symbols.extend(with_pilots);
         seg_id = seg_id.wrapping_add(1);
     }
@@ -259,23 +270,25 @@ pub fn build_superframe_v3_range(
         // period has elapsed. Insertion on a segment boundary guarantees
         // codeword alignment (every data segment = whole CWs).
         if elapsed_since_preamble_sym >= preamble_period_sym {
+            // V4 re-anchor: preamble → bootstrap marker (profile_index) → warmup → meta.
             all_symbols.extend_from_slice(&preamble_syms);
-            all_symbols.extend_from_slice(&warmup_syms);
-            all_symbols.extend_from_slice(&header_syms);
 
             let payload = MarkerPayload {
                 seg_id,
                 session_id_low,
                 base_esi: esi_start + data_cursor as u32,
                 flags: META_FLAG_BIT,
+                profile_index,
+                fmt_version: marker::WIRE_FMT_V4,
                 reserved: 0,
             };
             all_symbols.extend(marker::make_marker(&payload));
+            all_symbols.extend_from_slice(&warmup_syms);
             let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms, &config.pilot_pattern);
             let pilots_len = with_pilots.len();
             all_symbols.extend(with_pilots);
             seg_id = seg_id.wrapping_add(1);
-            elapsed_since_preamble_sym = marker::MARKER_LEN + pilots_len;
+            elapsed_since_preamble_sym = marker::MARKER_LEN + warmup_syms.len() + pilots_len;
             continue;
         }
 
@@ -284,11 +297,17 @@ pub fn build_superframe_v3_range(
         for i in 0..cw_take {
             seg_data.extend_from_slice(&data_cw_syms[data_cursor + i]);
         }
+        // Flag the final data segment of this burst: the EOT frame that
+        // follows closes its window, so the RX reads this marker in a CLOSED
+        // window and ends the session on EOT instead of the absence timeout.
+        let is_last_segment = data_cursor + cw_take >= n_data_cw;
         let payload = MarkerPayload {
             seg_id,
             session_id_low,
             base_esi: esi_start + data_cursor as u32,
-            flags: 0,
+            flags: if is_last_segment { LAST_FLAG_BIT } else { 0 },
+            profile_index,
+            fmt_version: marker::WIRE_FMT_V4,
             reserved: 0,
         };
         all_symbols.extend(marker::make_marker(&payload));
@@ -351,23 +370,22 @@ pub fn superframe_total_symbols(config: &ModemConfig, n_data_cw: u32) -> usize {
     };
     let cw_with_pilots = cw_data_syms + pilots_for(cw_data_syms);
     let two_cw_with_pilots = 2 * cw_data_syms + pilots_for(2 * cw_data_syms);
-    let header_syms = 96; // QPSK + Golay: 192 bits -> 96 symbols, fixed
     let marker = marker::MARKER_LEN;
-    // LMS guard interval (HIGH++ only, otherwise 0). Inserted between
-    // preamble and header at each (re-)anchoring.
+    // LMS guard interval (HIGH++ only, otherwise 0). V4: inserted between the
+    // bootstrap marker and the meta CW at each (re-)anchoring.
     let warmup_syms = config.lms_warmup_syms();
 
-    // Preamble + warmup + header + initial meta.
-    let mut total = crate::types::N_PREAMBLE + warmup_syms + header_syms + marker + cw_with_pilots;
-    let mut elapsed = marker + cw_with_pilots;
+    // V4 anchor block: preamble + bootstrap marker + warmup + initial meta.
+    let mut total = crate::types::N_PREAMBLE + marker + warmup_syms + cw_with_pilots;
+    let mut elapsed = marker + warmup_syms + cw_with_pilots;
     let preamble_period_sym = (V3_PREAMBLE_PERIOD_S * config.symbol_rate) as usize;
 
     let mut data_cursor = 0;
     while data_cursor < n_data_cw {
         if elapsed >= preamble_period_sym {
-            // Re-insertion: pre + warmup + hdr + new meta.
-            total += crate::types::N_PREAMBLE + warmup_syms + header_syms + marker + cw_with_pilots;
-            elapsed = marker + cw_with_pilots;
+            // V4 re-insertion: preamble + bootstrap marker + warmup + new meta.
+            total += crate::types::N_PREAMBLE + marker + warmup_syms + cw_with_pilots;
+            elapsed = marker + warmup_syms + cw_with_pilots;
             continue;
         }
         let cw_take = V2_CODEWORDS_PER_SEGMENT.min(n_data_cw - data_cursor);
@@ -394,10 +412,10 @@ pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
     let pp = &config.pilot_pattern;
     let n_groups = (cw_data_syms + pp.d_syms - 1) / pp.d_syms;
     let cw_with_pilots = cw_data_syms + n_groups * pp.p_syms;
+    // V4: preamble + bootstrap marker + warmup + meta CW + runout (no header).
     crate::types::N_PREAMBLE
-        + config.lms_warmup_syms()
-        + 96
         + marker::MARKER_LEN
+        + config.lms_warmup_syms()
         + cw_with_pilots
         + 4 * (pp.d_syms + pp.p_syms)
         + 24
@@ -405,14 +423,15 @@ pub fn eot_frame_symbols(config: &ModemConfig) -> usize {
 
 /// Build a minimal end-of-transmission frame.
 ///
-/// Layout : preamble + header(FLAG_LAST|FLAG_EOT) + 1 meta segment (AppHeader
-/// pointing at `session_id`, data fields zeroed) + pilot runout. No data
-/// codewords.
+/// Layout (V4): preamble + bootstrap marker(`EOT_FRAME` flag) + LMS warmup +
+/// 1 meta segment (AppHeader pointing at `session_id`, data fields zeroed) +
+/// pilot runout. No header, no data codewords.
 ///
-/// The RX sees this as a normal V3 window whose header carries `FLAG_EOT` and
-/// whose data segment count is zero. It can trim its in-memory buffer without
-/// waiting on the preamble-absence timeout, and the already-persistent packet store on
-/// disk is untouched (session_id is the same as the main burst).
+/// The RX sees this as a normal V4 window whose bootstrap marker carries the
+/// `EOT_FRAME` flag and whose data segment count is zero. It can trim its
+/// in-memory buffer without waiting on the preamble-absence timeout, and the
+/// already-persistent packet store on disk is untouched (session_id is the same
+/// as the main burst).
 pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> {
     let encoder = LdpcEncoder::new(config.ldpc_rate);
     let constellation_ = make_constellation(config);
@@ -424,9 +443,7 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
 
     let preamble_syms = preamble::make_preamble_for_config(config);
     let warmup_syms = preamble::make_lms_warmup_for_config(config);
-    let mut hdr = Header::from_config(config, 0, 0, FLAG_LAST | FLAG_EOT);
-    hdr.version = HEADER_VERSION_V3;
-    let header_syms = header::encode_header_symbols(&hdr);
+    let profile_index = header::derive_profile_index(config);
 
     let app_hdr = AppHeader {
         session_id,
@@ -447,17 +464,20 @@ pub fn build_eot_frame(config: &ModemConfig, session_id: u32) -> Vec<Complex64> 
 
     let mut all_symbols: Vec<Complex64> = Vec::new();
     all_symbols.extend_from_slice(&preamble_syms);
-    all_symbols.extend_from_slice(&warmup_syms);
-    all_symbols.extend_from_slice(&header_syms);
 
+    // V4 EOT frame: no header — the bootstrap marker is flagged EOT_FRAME, then
+    // warmup + a zeroed meta CW (same shape as a normal anchor block).
     let payload = MarkerPayload {
         seg_id: 0,
         session_id_low: (session_id & 0xFF) as u8,
         base_esi: 0,
-        flags: META_FLAG_BIT,
+        flags: META_FLAG_BIT | marker::EOT_FRAME_BIT,
+        profile_index,
+        fmt_version: marker::WIRE_FMT_V4,
         reserved: 0,
     };
     all_symbols.extend(marker::make_marker(&payload));
+    all_symbols.extend_from_slice(&warmup_syms);
     let (with_pilots, _) = pilot::interleave_data_pilots(&meta_syms, &config.pilot_pattern);
     all_symbols.extend(with_pilots);
 
@@ -487,7 +507,7 @@ mod tests {
     use crate::profile::profile_normal;
 
     #[test]
-    fn superframe_v3_starts_with_preamble_and_header() {
+    fn superframe_v4_starts_with_preamble_and_bootstrap_marker() {
         let config = profile_normal();
         let data = vec![0x42u8; 200];
         let symbols =
@@ -496,32 +516,25 @@ mod tests {
         for (i, (&actual, &expected)) in symbols.iter().zip(preamble.iter()).enumerate() {
             assert!((actual - expected).norm() < 1e-10, "preamble mismatch at {i}");
         }
-        // After 0.10.16 every profile carries a 32-sym LMS warmup between
-        // preamble and header (see `ModemConfig::lms_warmup_syms`).
-        let hdr_start = 256 + config.lms_warmup_syms();
-        let header_syms = &symbols[hdr_start..hdr_start + 96];
-        let hdr = header::decode_header_symbols(header_syms).expect("header should decode");
-        assert_eq!(hdr.version, HEADER_VERSION_V3);
-        assert_eq!(hdr.payload_length, 200);
+        // V4: the bootstrap marker sits directly after the preamble and carries
+        // profile_index + fmt_version (no protocol header).
+        let marker_syms = &symbols[256..256 + crate::marker::MARKER_LEN];
+        let m = crate::marker::decode_marker_at(marker_syms).expect("bootstrap marker decodes");
+        assert_eq!(m.fmt_version, crate::marker::WIRE_FMT_V4);
+        assert!(m.is_meta(), "bootstrap marker must be META");
+        assert_eq!(m.profile_index, header::derive_profile_index(&config));
     }
 
     #[test]
-    fn eot_frame_carries_eot_flag_in_header() {
+    fn eot_frame_marked_by_marker_flag() {
         let config = profile_normal();
         let symbols = build_eot_frame(&config, 0xDEAD_BEEF);
-        let hdr_start = 256 + config.lms_warmup_syms();
-        let header_syms = &symbols[hdr_start..hdr_start + 96];
-        let hdr = header::decode_header_symbols(header_syms).expect("header decodes");
-        assert_eq!(hdr.version, HEADER_VERSION_V3);
-        assert!(
-            hdr.flags & FLAG_EOT != 0,
-            "EOT frame must carry FLAG_EOT (flags=0x{:02X})",
-            hdr.flags
-        );
-        assert_eq!(
-            hdr.payload_length, 0,
-            "EOT carries no payload codewords"
-        );
+        // V4: EOT frame is headerless — its bootstrap marker carries EOT_FRAME.
+        let marker_syms = &symbols[256..256 + crate::marker::MARKER_LEN];
+        let m = crate::marker::decode_marker_at(marker_syms).expect("EOT marker decodes");
+        assert_eq!(m.fmt_version, crate::marker::WIRE_FMT_V4);
+        assert!(m.is_eot_frame(), "EOT frame marker must carry EOT_FRAME flag");
+        assert!(m.is_meta(), "EOT frame marker is also META");
     }
 
     #[test]
@@ -589,14 +602,15 @@ mod tests {
     }
 
     #[test]
-    fn superframe_v3_has_marker_after_header() {
+    fn superframe_v4_bootstrap_marker_at_256() {
         let config = profile_normal();
         let data = vec![0x42u8; 200];
         let symbols =
             build_superframe_v3(&data, &config, 0xDEAD_BEEF, mime::BINARY, 0);
         let sync = crate::marker::make_sync_pattern();
-        // preamble[256] + warmup[lms_warmup_syms] + header[96] = marker base.
-        let cursor = 256 + config.lms_warmup_syms() + 96;
+        // V4: the bootstrap marker sits at a fixed offset right after the
+        // preamble (no warmup, no header in front of it).
+        let cursor = 256;
         let marker_syms = &symbols[cursor..cursor + crate::marker::MARKER_SYNC_LEN];
         for (i, (&a, &b)) in marker_syms.iter().zip(sync.iter()).enumerate() {
             assert!((a - b).norm() < 1e-10, "marker sync mismatch at index {i}");
@@ -607,5 +621,15 @@ mod tests {
         assert_eq!(p.seg_id, 0);
         assert_eq!(p.session_id_low, (0xDEAD_BEEFu32 & 0xFF) as u8);
         assert!(p.is_meta(), "first segment must be meta (session-init)");
+        assert_eq!(p.profile_index, header::derive_profile_index(&config));
+        // The LMS warmup follows the bootstrap marker, then the meta CW.
+        let warmup_start = cursor + crate::marker::MARKER_LEN;
+        let warmup = preamble::make_lms_warmup_for_config(&config);
+        for (i, &w) in warmup.iter().enumerate() {
+            assert!(
+                (symbols[warmup_start + i] - w).norm() < 1e-10,
+                "warmup mismatch at {i} (must follow the bootstrap marker)"
+            );
+        }
     }
 }

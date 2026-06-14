@@ -1,0 +1,20 @@
+[package]
+name = "modem-rtlsdr"
+version = "0.1.0"
+edition = "2021"
+description = "RTL-SDR (RTL2832U + Rafael Micro tuners, including the RTL-SDR Blog V4) backend for the NBFM modem. Loads librtlsdr at runtime via libloading so the GUI binary still launches on machines where the driver isn't installed — list_devices() degrades to an empty list and the Paramètres panel surfaces a 'Bibliothèque manquante' status."
+publish = false
+
+[dependencies]
+modem-sdr-dsp = { path = "../modem-sdr-dsp" }
+modem-sdr = { path = "../modem-sdr" }
+modem-io = { path = "../modem-io" }
+num-complex = { workspace = true }
+thiserror = { workspace = true }
+libloading = "0.8"
+
+# Raw FFI on librtlsdr is small (15 functions) but unavoidable —
+# C callback + void* context + raw struct pointer. Every unsafe block
+# carries a SAFETY: comment. Lint stays off at the crate level so the
+# usual `unsafe_code = "forbid"` would block the FFI shim; we confine
+# unsafe to `ffi.rs` instead.

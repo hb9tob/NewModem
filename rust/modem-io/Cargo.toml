@@ -17,5 +17,11 @@ rtrb = "0.3"
 # `sched_setscheduler(SCHED_FIFO, …)` best-effort RT-priority lift for
 # the reader thread on Linux. We never panic if it fails (typical
 # unprivileged user) — just log once and continue at normal priority.
+#
+# `alsa` (0.9) drives the hardware mixer in `alsa_mixer`: force the USB
+# card's "Auto Gain Control" off before each TX burst and expose its
+# playback volume to the GUI. cpal already pulls `alsa-sys` transitively
+# on Linux; this is the safe high-level wrapper.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+alsa = "0.9"

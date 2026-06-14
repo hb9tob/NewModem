@@ -10,16 +10,16 @@ mod tx_encode;
 use modem_worker::session_store;
 use modem_worker::{rx_worker, tx_worker, EventSink};
 
-use modem_io::cpal_capture::{self, CaptureHandle};
+use modem_io::cpal_capture::CaptureHandle;
 use modem_io::devices::{list_input_devices, list_output_devices, DeviceInfo};
-use modem_io::{CpalSink, SampleSink};
+use modem_io::SampleSink;
 use modem_sdr::{DeviceDescriptor, SdrCaptureHandle, SdrDevice};
 use ptt::SharedPtt;
 use settings::Settings;
 use modem_worker::tx_worker::TxHandle;
 use modem_worker::rx_worker::{SharedWavSink, WavSink, WorkerHandle};
 use tx_encode::{compress_avif, compress_zstd, CompressOpts};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -104,6 +104,20 @@ struct AppState {
     /// `tx_preview.zst`). Filled in by compress_image / compress_file_zstd.
     /// `tx_start` reads this path to drive the CLI.
     tx_payload_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Re-entrance guard for the TX encoding pipeline (`compress_image`
+    /// AVIF and `compress_file_zstd`). Tauri 2 dispatches each command
+    /// on its own task, so two clicks on "Recalculer" while a long
+    /// ravif/rav1e encode is in flight would otherwise spawn a second
+    /// encoder in parallel — pushing the resident set past the OOM
+    /// threshold and getting the whole process SIGKILL'd by the kernel
+    /// (observed via "Gdk-Message: Error reading events from display:
+    /// Broken pipe" from a surviving WebKit subprocess). `try_lock` at
+    /// the top of each encoding command refuses the second call with a
+    /// clean error string instead of starting a competing encode. The
+    /// JS-side guards (`txState.compressing`) catch most of these but
+    /// can miss a path that bypasses the disabled-button state ; this
+    /// is the backstop.
+    tx_compressing: Mutex<()>,
     tx_handle: Mutex<Option<TxHandle>>,
     ptt: SharedPtt,
     sounder_capture: Mutex<Option<SounderCapture>>,
@@ -135,6 +149,35 @@ fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
 #[tauri::command]
 fn list_output_audio_devices() -> Result<Vec<DeviceInfo>, String> {
     list_output_devices().map_err(|e| e.to_string())
+}
+
+/// Read the TX sound card's hardware playback level as a 0..=100 %.
+///
+/// Returns `None` when `device_name` isn't a controllable ALSA hardware
+/// card (SDR composite, HDMI, non-Linux host, or a card without a
+/// playback volume control) — the frontend hides the Pi volume slider in
+/// that case. The slider drives the codec's linear `Speaker` attenuator,
+/// which is the operator's on-air level knob; it is deliberately distinct
+/// from the software `tx_attenuation_db` cascade setting.
+#[tauri::command]
+fn get_tx_volume(device_name: String) -> Result<Option<u8>, String> {
+    modem_io::alsa_mixer::playback_volume_pct(&device_name)
+}
+
+/// Set the TX sound card's hardware playback level from a 0..=100 %.
+/// `Ok(false)` when the device has no controllable volume (frontend
+/// keeps the slider hidden / disabled). Linux/ALSA only — a no-op
+/// elsewhere.
+#[tauri::command]
+fn set_tx_volume(device_name: String, pct: u8) -> Result<bool, String> {
+    modem_io::alsa_mixer::set_playback_volume_pct(&device_name, pct)
+}
+
+/// Whether the given TX device exposes an ALSA hardware mixer the GUI can
+/// drive (gates the Pi-only volume slider in the frontend).
+#[tauri::command]
+fn tx_device_has_mixer(device_name: String) -> bool {
+    modem_io::alsa_mixer::is_alsa_card(&device_name)
 }
 
 /// Per-backend descriptor shipped to the GUI frontend at startup.
@@ -169,13 +212,98 @@ fn list_sdr_backends() -> Vec<SdrBackendInfo> {
 }
 
 /// List the live devices visible to one specific SDR backend.
-/// Returns an empty `Vec` (not an error) when the backend itself is
-/// reachable but no hardware is plugged in — the GUI surfaces this
-/// as an empty group, not a red banner.
+/// Returns an empty `Vec` (not an error) when:
+///   - the backend is disabled in Paramètres (defence-in-depth — the
+///     frontend already skips disabled backends, but a stray call must
+///     not trigger a library load as a side effect)
+///   - the backend is reachable but no hardware is plugged in
+///   - the backend's runtime library couldn't be loaded (the GUI
+///     surfaces that via `get_backend_library_status` instead)
 #[tauri::command]
 fn list_sdr_devices(backend_id: String) -> Result<Vec<DeviceDescriptor>, String> {
+    // Gate on the operator's opt-in checkbox. Reads the on-disk
+    // settings — cheap (one ~few-KiB JSON parse), no I/O on the hot
+    // path since this is only called when the dropdown refreshes.
+    let settings = settings::load();
+    let enabled = settings
+        .sdr_settings
+        .backends
+        .get(&backend_id)
+        .map(|bs| bs.enabled)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(Vec::new());
+    }
     let backend = sdr_registry::backend_by_id(&backend_id).map_err(|e| e.to_string())?;
     backend.list_devices().map_err(|e| e.to_string())
+}
+
+/// Report whether a backend's runtime library is loadable on this
+/// host, so the GUI can paint an inline "Bibliothèque manquante"
+/// hint next to the Paramètres checkbox.
+///
+/// `available = true` means:
+///   - Pluto: always (pure-Rust TCP transport, no native lib needed)
+///   - SDRplay: `libsdrplay_api.so.3` (Linux) / `sdrplay_api.dll`
+///     (Windows, registry-discovered) is loadable
+///   - RTL-SDR: `librtlsdr.so.0` (Linux) / `rtlsdr.dll` (Windows)
+///     is loadable
+///
+/// Triggers the one-shot dlopen the first time it's called for a
+/// runtime-loaded backend — that's the natural moment (the user just
+/// ticked the checkbox). Subsequent calls read the cached result.
+#[derive(Debug, Clone, serde::Serialize)]
+struct BackendLibraryStatus {
+    available: bool,
+    /// Optional French label for the GUI to surface inline. `None`
+    /// when `available = true` (no diagnostic needed).
+    message: Option<String>,
+}
+
+#[tauri::command]
+fn get_backend_library_status(backend_id: String) -> BackendLibraryStatus {
+    match backend_id.as_str() {
+        "pluto" => BackendLibraryStatus {
+            available: true,
+            message: None,
+        },
+        #[cfg(feature = "sdrplay")]
+        "sdrplay" => {
+            let ok = modem_sdrplay::backend::SdrplayBackend.library_available();
+            BackendLibraryStatus {
+                available: ok,
+                message: if ok {
+                    None
+                } else {
+                    Some(
+                        "Bibliothèque libsdrplay_api introuvable — installer \
+                         le SDK depuis https://www.sdrplay.com/api/."
+                            .into(),
+                    )
+                },
+            }
+        }
+        #[cfg(feature = "rtlsdr")]
+        "rtlsdr" => {
+            let ok = modem_rtlsdr::backend::RtlsdrBackend.library_available();
+            BackendLibraryStatus {
+                available: ok,
+                message: if ok {
+                    None
+                } else {
+                    Some(
+                        "Bibliothèque librtlsdr introuvable — installer le \
+                         paquet `librtlsdr0`."
+                            .into(),
+                    )
+                },
+            }
+        }
+        _ => BackendLibraryStatus {
+            available: false,
+            message: Some(format!("Backend inconnu : {backend_id}")),
+        },
+    }
 }
 
 /// Return per-device capabilities for the device identified by its
@@ -221,6 +349,15 @@ fn get_sdr_device_capabilities(
 fn list_modem_profiles() -> Vec<modem_core::traits::ProfileDescriptor> {
     use modem_core::traits::Modem;
     modem_core::v3_modem::V3Modem.list_profiles()
+}
+
+/// Single source of truth for the user-visible app version: read it from
+/// `tauri.conf.json` via `package_info()` so the chip in the tab bar
+/// stays in sync with the .deb / installer version automatically (no
+/// hard-coded string in the frontend to drift after a release bump).
+#[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
 }
 
 #[tauri::command]
@@ -340,7 +477,11 @@ fn resolve_tx_sink(device_name: &str, cfg: &Settings) -> Result<Arc<dyn SampleSi
             .tx_sink()
             .ok_or_else(|| format!("{} est RX uniquement", backend.id()))
     } else {
-        Ok(Arc::new(CpalSink))
+        // Sound-card TX: pick ALSA-direct vs cpal per the persisted
+        // audio_backend setting (Linux only; cpal everywhere else).
+        Ok(modem_io::make_sink(modem_io::AudioBackend::from_setting(
+            &cfg.audio_backend,
+        )))
     }
 }
 
@@ -431,7 +572,7 @@ fn build_capture_session(
     // don't need it — we still pass an Arc to keep `rx_worker::spawn`'s
     // signature uniform; the SDR-side counter just stays at zero and
     // the GUI chip never lights up for that reason.
-    let (capture, samples, dropped_samples) =
+    let (capture, samples, dropped_samples, is_sdr_source) =
         if let Some((backend, device_id)) = sdr_registry::parse_composite_name(device_name) {
             let sdr_cfg = cfg.sdr_config_for(backend.id(), device_id);
             let descriptor = DeviceDescriptor::new(
@@ -449,12 +590,28 @@ fn build_capture_session(
                 CaptureKind::Sdr(device, cap_handle),
                 rx,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
             )
         } else {
-            let (h, rx) = cpal_capture::start(device_name)?;
+            // Sound-card capture: ALSA-direct vs cpal per the persisted
+            // audio_backend setting (Linux only; cpal everywhere else).
+            let backend = modem_io::AudioBackend::from_setting(&cfg.audio_backend);
+            let (h, rx) = modem_io::start_capture(backend, device_name)?;
             let dropped = h.dropped_samples.clone();
-            (CaptureKind::Cpal(h), rx, dropped)
+            (CaptureKind::Cpal(h), rx, dropped, false)
         };
+    // SDR backends apply `DeemphasisLpf` unconditionally inside
+    // `NbfmRxChain` (modem-sdr-dsp/nbfm_rx_chain.rs:250). Forcing the
+    // worker-side toggle off when the source is SDR avoids the double-
+    // deemph that would over-attenuate the modem passband — the GUI
+    // checkbox is a soundcard-only knob in practice.
+    let effective_deemphasis = cfg.rx_deemphasis_enabled && !is_sdr_source;
+    if is_sdr_source && cfg.rx_deemphasis_enabled {
+        eprintln!(
+            "[rx] device '{device_name}' is SDR — ignoring rx_deemphasis_enabled \
+             (NbfmRxChain already applies DeemphasisLpf in-chain)"
+        );
+    }
     let sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app.clone()));
     let worker = rx_worker::spawn(
         samples,
@@ -463,7 +620,7 @@ fn build_capture_session(
         state.wav_sink.clone(),
         profile_idx,
         forced,
-        cfg.rx_deemphasis_enabled,
+        effective_deemphasis,
         cfg.rx_allow_legacy_grid,
         cfg.rx_turbo,
         dropped_samples,
@@ -813,7 +970,7 @@ fn tx_start(
     args: TxStartArgs,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
     if tx_guard.is_some() {
         return Err("TX déjà en cours".into());
@@ -849,15 +1006,18 @@ fn tx_start(
     // sneaking through the call chain.
     let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let archive_sink = TauriEventSink(app.clone());
-    tx_worker::archive_payload(
+    let archive_path = tx_worker::archive_payload(
         &save_dir,
         &payload_path,
         &args.mode,
+        &args.callsign.trim().to_uppercase(),
         &args.filename,
         repair_pct,
         history_max,
         &archive_sink,
-    );
+    )
+    .map(|p| p.to_string_lossy().into_owned())
+    .unwrap_or_default();
     let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
     let handle = tx_worker::spawn(
         payload_path,
@@ -875,7 +1035,9 @@ fn tx_start(
         save_wav_dir,
     );
     *tx_guard = Some(handle);
-    Ok(())
+    // The archive path lets the GUI persist this session's ESI high-water
+    // (tx_set_next_esi) and resume it later (tx_resume).
+    Ok(archive_path)
 }
 
 #[derive(serde::Deserialize)]
@@ -947,6 +1109,108 @@ fn tx_more(
     );
     *tx_guard = Some(handle);
     Ok(())
+}
+
+/// Resolve the `<save_dir>/tx_history/<stem>.json` twin of an archived
+/// payload path, guarding against any path that escapes `tx_history/`.
+fn tx_history_meta_path(save_dir: &Path, archive_path: &str) -> Result<PathBuf, String> {
+    let history_dir = save_dir.join("tx_history");
+    let p = PathBuf::from(archive_path);
+    if !p.starts_with(&history_dir) {
+        return Err("chemin hors tx_history/".into());
+    }
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "nom d'archive invalide".to_string())?;
+    Ok(history_dir.join(format!("{stem}.json")))
+}
+
+/// Persist the ESI high-water for a TX-history session, in place in its
+/// meta JSON. Called by the GUI after every burst (initial, "more", or a
+/// resumed full burst) so the fountain can be continued later — even after
+/// an app restart — without ever rewinding the ESI.
+#[tauri::command]
+fn tx_set_next_esi(
+    archive_path: String,
+    next_esi: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let meta_path = tx_history_meta_path(&save_dir, &archive_path)?;
+    let raw = std::fs::read_to_string(&meta_path)
+        .map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse meta: {e}"))?;
+    v["next_esi"] = serde_json::json!(next_esi);
+    std::fs::write(&meta_path, v.to_string())
+        .map_err(|e| format!("write {}: {e}", meta_path.display()))
+}
+
+#[derive(serde::Serialize)]
+struct TxResumeInfo {
+    mode: String,
+    callsign: String,
+    filename: String,
+    mime_type: u8,
+    is_image: bool,
+    /// ESI high-water: the next ESI to emit. 0 means nothing emitted yet.
+    next_esi: u32,
+    repair_pct: u32,
+    byte_len: u64,
+    /// Deterministic session_id (hex), informational / for logging.
+    session_id: Option<String>,
+    /// Absolute path of the archived payload (= preview source).
+    archive_path: String,
+}
+
+/// Resume a TX-history session: point the backend payload at the archived
+/// (bit-exact) file so a subsequent `tx_more` re-encodes the identical
+/// bytes — hence the identical `session_id` — and return everything the GUI
+/// needs to restore the TX tab (mode, callsign, filename, ESI high-water).
+#[tauri::command]
+fn tx_resume(
+    archive_path: String,
+    state: State<'_, AppState>,
+) -> Result<TxResumeInfo, String> {
+    let save_dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
+    let meta_path = tx_history_meta_path(&save_dir, &archive_path)?;
+    let payload = PathBuf::from(&archive_path);
+    if !payload.exists() {
+        return Err(format!("payload archivé absent ({})", payload.display()));
+    }
+    let raw = std::fs::read_to_string(&meta_path)
+        .map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse meta: {e}"))?;
+    let bytes = std::fs::read(&payload)
+        .map_err(|e| format!("read {}: {e}", payload.display()))?;
+    let byte_len = bytes.len() as u64;
+    // Point the TX pipeline at the archived bytes (no recompression — that
+    // could perturb the AVIF and change the session_id).
+    *state.tx_payload_path.lock().map_err(|e| e.to_string())? = Some(payload.clone());
+    *state.tx_source.lock().map_err(|e| e.to_string())? = Some(bytes);
+
+    let mime_type = v.get("mime_type").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+    let is_image = mime_type == modem_framing::app_header::mime::IMAGE_AVIF
+        || mime_type == modem_framing::app_header::mime::IMAGE_JPEG
+        || mime_type == modem_framing::app_header::mime::IMAGE_PNG;
+    let session_id = v
+        .get("session_id")
+        .and_then(|x| x.as_u64())
+        .map(|n| format!("{:08x}", n as u32));
+    Ok(TxResumeInfo {
+        mode: v.get("mode").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        callsign: v.get("callsign").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        filename: v.get("filename").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        mime_type,
+        is_image,
+        next_esi: v.get("next_esi").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        repair_pct: v.get("repair_pct").and_then(|x| x.as_u64()).unwrap_or(30) as u32,
+        byte_len,
+        session_id,
+        archive_path,
+    })
 }
 
 #[tauri::command]
@@ -1084,7 +1348,18 @@ fn list_rx_history(state: State<'_, AppState>) -> Result<Vec<RxHistoryItem>, Str
         let display_filename = meta.filename.clone().unwrap_or_else(|| {
             format!("session-{:08x}.bin", meta.session_id)
         });
-        let root_copy = save_dir.join(&display_filename);
+        // Prefer the exact path the worker wrote for THIS session. Two
+        // sessions sharing the same logical filename (e.g. the same image
+        // re-sent at a higher resolution) write distinct files
+        // (`photo.jpg` vs `photo (1).jpg`); reconstructing
+        // `save_dir.join(filename)` would collapse both onto the first one.
+        // Legacy sessions (decoded before saved_path existed) fall back to
+        // the reconstruction.
+        let root_copy = meta
+            .saved_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| save_dir.join(&display_filename));
         // Preview AND relay: we always use the root copy written by
         // `rx_worker::emit_decoded_file`. That is the ONLY version that
         // contains the file extracted from the PayloadEnvelope (= pure
@@ -1220,25 +1495,89 @@ fn compress_image(
     opts: CompressOpts,
     state: State<'_, AppState>,
 ) -> Result<CompressResult, String> {
+    // Backstop re-entrance guard. JS already gates the button on
+    // `txState.compressing`, but a second click that races past the
+    // disabled-button state (re-click on Recalculer while a long
+    // speed=1 rav1e encode is in flight, drag-drop landing during
+    // compression, …) would spawn a 2nd ravif on the same source.
+    // Two rav1e instances easily overshoot RAM on a 50 MP source and
+    // the kernel OOM-kills the whole process. `try_lock` here turns
+    // the race into a clean error string for the JS side.
+    let _busy = state
+        .tx_compressing
+        .try_lock()
+        .map_err(|_| "compression déjà en cours".to_string())?;
     let source = {
         let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
         slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
     };
-    let result = compress_avif(&source, &opts)?;
+    // Move the cloned source into compress_avif so it can drop the
+    // compressed JPEG/PNG bytes once `image::load_from_memory` has
+    // produced the decoded pixel buffer — keeps the resident set
+    // bounded to one full pixel buffer at the ravif stage instead of
+    // two (decoded) + one (compressed source) + one (rgba copy).
+    let result = compress_avif(source, &opts)?;
+    eprintln!("[compress_image] back from compress_avif, byte_len={}", result.byte_len);
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("tx_preview.avif");
-    std::fs::write(&path, &result.avif_bytes).map_err(|e| format!("write: {e}"))?;
-    if let Ok(mut p) = state.tx_payload_path.lock() {
-        *p = Some(path.clone());
+    let avif_path = dir.join("tx_preview.avif");
+    // Atomic write : tmp + fsync + rename. Either-old-or-new on disk,
+    // never partial. A SIGKILL between `File::create` and the last
+    // `write()` syscall would otherwise leave a truncated AVIF with
+    // a valid `ftyp avif` magic that fools `file` but breaks every
+    // decoder.
+    {
+        use std::io::Write;
+        let tmp = avif_path.with_extension("avif.tmp");
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(&result.avif_bytes)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, &avif_path).map_err(|e| format!("rename: {e}"))?;
     }
+    eprintln!(
+        "[compress_image] wrote AVIF {} bytes to {}",
+        result.byte_len,
+        avif_path.display()
+    );
+    let preview_path = avif_path.clone();
+    if let Ok(mut p) = state.tx_payload_path.lock() {
+        // tx_payload_path always points at the AVIF — that's what
+        // tx_start reads to drive the modem CLI. Preview path is
+        // separate.
+        *p = Some(avif_path.clone());
+    }
+    // Capture the scalars we need to return BEFORE dropping the rest of
+    // CompressedImage — its avif_bytes / png_bytes are large transient
+    // buffers we want gone before malloc_trim.
+    let source_w = result.source_w;
+    let source_h = result.source_h;
+    let actual_w = result.actual_w;
+    let actual_h = result.actual_h;
+    let byte_len = result.byte_len;
+    drop(result);
+    // Force glibc to return the just-freed transient buffers back to
+    // the kernel — decoded source RGB at 6000×4000 ≈ 72 MB, resized
+    // RGBA ≈ 6 MB, PNG output ≈ 3 MB. Without this, glibc keeps those
+    // blocks in its main arena for reuse and the per-encode baseline
+    // RSS creeps by ~70 MB until WebKitGTK SIGSEGVs the WebProcess
+    // (observed 2026-05-29 : 3rd–5th encode dies regardless of format).
+    // `malloc_trim(0)` releases unused arena pages ; the next encode
+    // mmaps fresh ones. Cost ~1 ms. glibc-specific, hence the cfg gate.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    eprintln!("[compress_image] returning to Tauri runtime");
     Ok(CompressResult {
-        preview_path: path.to_string_lossy().into_owned(),
-        source_w: result.source_w,
-        source_h: result.source_h,
-        actual_w: result.actual_w,
-        actual_h: result.actual_h,
-        byte_len: result.byte_len,
+        preview_path: preview_path.to_string_lossy().into_owned(),
+        source_w,
+        source_h,
+        actual_w,
+        actual_h,
+        byte_len,
     })
 }
 
@@ -1254,6 +1593,14 @@ struct CompressFileResult {
 /// files (text, archives, etc.) that require lossless transmission.
 #[tauri::command]
 fn compress_file_zstd(state: State<'_, AppState>) -> Result<CompressFileResult, String> {
+    // Same re-entrance guard as `compress_image` — zstd is faster than
+    // ravif but a concurrent invocation would still double the working
+    // set on a large file source, and we want a single TX-encoding
+    // pipeline at a time as a global invariant.
+    let _busy = state
+        .tx_compressing
+        .try_lock()
+        .map_err(|_| "compression déjà en cours".to_string())?;
     let source = {
         let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
         slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
@@ -1556,7 +1903,8 @@ fn sounding_rx_start_capture(
             .map_err(|e| format!("{}: {e}", backend.id()))?;
         (CaptureKind::Sdr(device, cap_handle), rx)
     } else {
-        let (h, rx) = cpal_capture::start(&device_name)?;
+        let backend = modem_io::AudioBackend::from_setting(&cfg.audio_backend);
+        let (h, rx) = modem_io::start_capture(backend, &device_name)?;
         (CaptureKind::Cpal(h), rx)
     };
 
@@ -1753,7 +2101,75 @@ impl EventSink for TauriEventSink {
     }
 }
 
+/// Install a process-wide panic hook that mirrors the panic info and a
+/// full backtrace to stderr AND to `<save_dir>/panic.log` before the
+/// abort fires. Called once at the very top of `main()`.
+///
+/// Why this exists : `profile.release` in the workspace `Cargo.toml`
+/// is `panic = "abort"`, so the first panic kills the GUI process
+/// outright — no unwind, no destructors, no chance to surface the
+/// reason through Tauri's IPC. The default panic hook does write a
+/// `thread 'X' panicked at …` line to stderr, but only with a useful
+/// backtrace if `RUST_BACKTRACE` is set, and only visible to a user
+/// who launched from a terminal. Most users launch from the desktop
+/// menu, where stderr goes to `/dev/null`. This hook :
+///
+///   - forces `std::backtrace::Backtrace::force_capture()` so the
+///     trace is always there regardless of env vars ;
+///   - writes a timestamped block to a file under the canonical save
+///     dir (same place RX/TX outputs land), so the next launch can
+///     report or attach it ;
+///   - mirrors to stderr for terminal launches.
+fn install_panic_hook() {
+    let prior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Let the default hook print its usual one-liner to stderr first.
+        prior(info);
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let log_path = default_save_dir().join("panic.log");
+        // Best-effort dir creation — if it fails we still try the file
+        // open below, which will return an error we ignore. The hook
+        // must not itself panic.
+        let _ = std::fs::create_dir_all(default_save_dir());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "==== panic @ unix={ts} ====");
+            let _ = writeln!(f, "{info}");
+            let _ = writeln!(f, "Backtrace:");
+            let _ = writeln!(f, "{backtrace}");
+            let _ = writeln!(f);
+        }
+
+        // Echo the backtrace to stderr too — the default hook only
+        // emits it when RUST_BACKTRACE is set, and we want it
+        // unconditionally on terminal launches.
+        eprintln!("Backtrace:\n{backtrace}");
+        eprintln!("(also written to {})", log_path.display());
+    }));
+}
+
 fn main() {
+    // Capture panics to stderr + a log file before the abort hits.
+    // `profile.release` is built with `panic = "abort"` (Cargo.toml), so
+    // a panic anywhere (a Rust-side Tauri command, a worker thread, a
+    // ravif/rav1e OOM on a long AVIF encode, …) kills the whole process
+    // *immediately* on the panic line. The default hook prints
+    // "thread 'X' panicked at …" to stderr, but the GUI is typically
+    // launched from a .desktop entry with stderr → /dev/null, so the
+    // user sees nothing — "intermittent crashes, no logs". Hook
+    // installs before anything else so it catches early-init panics too.
+    install_panic_hook();
+
     // Work around a WebKitGTK + Mesa V3D bug on Raspberry Pi 4/5 where the
     // DMA-BUF renderer leaves the toplevel surface corrupted ("scrambled
     // Canal+" bands) after a fullscreen transition, tab switch, or image
@@ -1761,6 +2177,23 @@ fn main() {
     // be set before any webview is created, hence at the very top of main.
     #[cfg(target_os = "linux")]
     std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+
+    // Force the X11 (XWayland) backend instead of native Wayland. Direct
+    // Wayland under WebKitGTK 2.46+ has an unresolved race in the surface
+    // commit / IPC pipeline that drops the connection to the compositor
+    // mid-render — observed 2026-05-29 as repeated "Lost connection to
+    // Wayland compositor" / "Error flushing display: Broken pipe" the
+    // instant the WebView fetches the post-compress preview image, even
+    // after we switched the preview from AVIF (libavif crash) to PNG.
+    // XWayland adds one X11→Wayland translation hop and slightly more
+    // CPU but is the stable path for WebKitGTK on this distro. Doesn't
+    // honour an existing GDK_BACKEND set by the user (rare) ; if they
+    // really need native Wayland they can `unset GDK_BACKEND` before
+    // launch — but realistically we should just default to what works.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
 
     let save_dir = default_save_dir();
     let _ = std::fs::create_dir_all(&save_dir);
@@ -1823,6 +2256,7 @@ fn main() {
                 wav_sink: Arc::new(Mutex::new(None)),
                 tx_source: Arc::new(Mutex::new(None)),
                 tx_payload_path: Arc::new(Mutex::new(None)),
+                tx_compressing: Mutex::new(()),
                 tx_handle: Mutex::new(None),
                 ptt,
                 sounder_capture: Mutex::new(None),
@@ -1891,10 +2325,15 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             list_output_audio_devices,
+            get_tx_volume,
+            set_tx_volume,
+            tx_device_has_mixer,
             list_sdr_backends,
             list_sdr_devices,
+            get_backend_library_status,
             get_sdr_device_capabilities,
             list_modem_profiles,
+            get_app_version,
             list_serial_ports,
             ptt_status,
             get_settings,
@@ -1925,6 +2364,8 @@ fn main() {
             tx_estimate,
             tx_start,
             tx_more,
+            tx_set_next_esi,
+            tx_resume,
             tx_stop,
             tx_reset,
             list_sessions,
