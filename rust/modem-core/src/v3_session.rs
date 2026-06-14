@@ -76,6 +76,12 @@ const MF_ACQ_THRESHOLD: f64 = 0.15;
 /// AND lets the SC detector see two consecutive markers comfortably.
 pub const AUDIO_BUFFER_RETAIN_CYCLES: usize = 4;
 
+/// Batch size `replay_from_anchor` feeds its borrowed history slice back in,
+/// so the FSM advances the same bounded-work-per-call way the live capture
+/// path drives it (a single multi-second chunk would under-process the burst).
+/// 2400 samples = 50 ms @ 48 kHz.
+const REPLAY_BATCH_SAMPLES: usize = 2400;
+
 /// Inter-frame silence gate. The TX separates the data burst from the
 /// EOT trailer with `INTER_FRAME_SILENCE_S` (200 ms) of silence
 /// (`v3_modem.rs:104`). A Locked session that doesn't reset across that
@@ -118,15 +124,48 @@ const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
 /// ~0.6 s of corruption at HIGH+ before giving up.
 const MAX_CONSECUTIVE_MISS: u32 = 3;
 
-/// FFE filter length. Matches the modem-2x value (`RX2X_FFE_LEN = 64`),
-/// validated OTA on the same sound-card chain V3 will target.
-pub const V3_FFE_LEN: usize = 64;
-
 /// Worst-case FFE training reference span behind a SOF: V3 preamble
 /// (256 sym) + a generous LMS warmup margin. The actual training pull
 /// at PLHEADER time can use fewer refs without overflowing the
 /// retention window.
 pub const V3_FFE_TRAINING_LEN: usize = 384;
+
+/// DD-LMS learning rates for the streaming FFE, matching the `rx_v2` batch
+/// path (`rx_v2.rs`): `mu_train` at known preamble/warmup references,
+/// `mu_dd` on the data-constellation slicer decisions.
+const V3_FFE_MU_TRAIN: f64 = 0.10;
+const V3_FFE_MU_DD: f64 = 0.02;
+
+/// Fractional FFE geometry for a profile, mirroring the `rx_v2` batch path
+/// (`sync::decimate_for_fse` + the `n_ff` selection in `rx_v2_single`).
+/// Returns `(pitch_fse, n_ff, mf_delay_frac)`: the number of T/d_fse
+/// samples per symbol the `StreamingDsp` emits, the fractional FFE length,
+/// and the MF group-delay shift (fractional samples) that centres the FFE
+/// window on the symbol's MF peak. For tau = 1 this is `(2, 17, 12)` — a
+/// T/2 equaliser spanning ~8 symbols, the fractional resolution that lets
+/// the FFE absorb sub-symbol timing (the streaming-vs-batch MER gap the
+/// symbol-spaced FFE could not close).
+pub fn fse_geometry(cfg: &ModemConfig) -> (usize, usize, usize) {
+    let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
+        .expect("profile config has valid integer sps");
+    let d_fse = crate::sync::fse_decim_factor(sps, pitch);
+    let pitch_fse = pitch / d_fse;
+    let sps_fse = sps / d_fse;
+    let tau_eff = pitch_fse as f64 / sps_fse as f64;
+    let mut n_ff = if tau_eff >= 0.99 {
+        8 * sps_fse + 1
+    } else {
+        4 * sps_fse + 1
+    };
+    if n_ff % 2 == 0 {
+        n_ff += 1;
+    }
+    // MF group delay = RRC_SPAN_SYM/2 symbols; in fractional samples that is
+    // (RRC_SPAN_SYM/2) * (sps / d_fse). The FFE absorbs the sub-symbol
+    // residual; this integer shift only needs to land the window on the peak.
+    let mf_delay_frac = (crate::types::RRC_SPAN_SYM / 2) * (sps / d_fse);
+    (pitch_fse, n_ff, mf_delay_frac)
+}
 
 /// Phase 4 coarse drift LS estimator: minimum number of refined marker
 /// positions before fitting a slope. 3 = bootstrap anchor + 2 validated
@@ -266,6 +305,21 @@ pub enum V3SessionEvent {
         to_ppm: f64,
         n_observations: usize,
         applied: bool,
+    },
+    /// The streaming drift estimate changed by more than the in-session 4-cycle
+    /// `audio_buffer` can correct on its own (étage B / C1): the equaliser taps,
+    /// MF delay, symbol grid and PLL are all tied to the resampler ratio, so the
+    /// only consistent fix is to re-run the pipeline at `new_drift_ppm` from a
+    /// known anchor. The session does NOT hold enough audio to reach back to the
+    /// preamble; it emits this request and the worker (which owns the
+    /// source-agnostic rolling history) replies by borrowing
+    /// `history[anchor_abs_sample .. now]` and calling
+    /// [`V3Session::replay_from_anchor`]. A bare session with no history owner
+    /// (direct/diag use) simply ignores it — the coarse one-shot already
+    /// self-corrected over the internal buffer.
+    RewindRequest {
+        anchor_abs_sample: u64,
+        new_drift_ppm: f64,
     },
 }
 
@@ -454,13 +508,30 @@ impl V3Session {
             crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
         let dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
-        let ffe = StreamingFfe::new(V3_FFE_LEN, cycle_data_sym, V3_FFE_TRAINING_LEN);
+        let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&cfg);
+        let mut ffe = StreamingFfe::new(
+            n_ff,
+            cycle_data_sym,
+            V3_FFE_TRAINING_LEN,
+            pitch_fse,
+            mf_delay_frac,
+        );
         // Decode bookkeeping mirrors `rx_v2_single` (rx_v2.rs:1218-1228):
         // padded_n compensates the bps-alignment pad TX adds on codeword
         // bits that aren't divisible by bits-per-symbol (e.g. APSK32 with
         // 2304 % 5).
         let decoder = LdpcDecoder::new(cfg.ldpc_rate, 50);
         let constellation = frame::make_constellation(&cfg);
+        // Continuous forward DD-LMS keeps the taps tracking through the DATA
+        // cycles between META anchors (mirrors the batch path's whole-burst
+        // LMS); the slicer owns its own constellation copy.
+        {
+            let cons = constellation.clone();
+            ffe.set_forward_lms(
+                Box::new(move |y| cons.points[cons.slice_nearest(&[y])[0]]),
+                V3_FFE_MU_DD,
+            );
+        }
         let bps = cfg.constellation.bits_per_sym();
         let padded_n = interleaver::padded_cw_bits(decoder.n(), cfg.constellation);
         let syms_per_cw = padded_n / bps;
@@ -645,9 +716,11 @@ impl V3Session {
             self.audio_drained_samples,
             self.drift_ppm,
         );
-        let new_syms = self.dsp.drain_symbols();
-        if !new_syms.is_empty() {
-            self.ffe.push_raw(&new_syms);
+        // `drain_symbols` now yields the T/2 (fse) stream; the FFE keeps a
+        // symbol-spaced output interface (see StreamingFfe docs).
+        let new_fse = self.dsp.drain_symbols();
+        if !new_fse.is_empty() {
+            self.ffe.push_raw(&new_fse);
         }
 
         // 3. Handle SC fires now that the sym_buffer is up-to-date.
@@ -1021,7 +1094,15 @@ impl V3Session {
             + marker::MARKER_LEN
             + self.cfg.lms_warmup_syms()
             + self.seg_sym_len_past_marker(true);
-        self.ffe.train_at(preamble_sym_ffe, &refs, reeq);
+        let cons = &self.constellation;
+        self.ffe.train_lms_at(
+            preamble_sym_ffe,
+            &refs,
+            reeq,
+            |y| cons.points[cons.slice_nearest(&[y])[0]],
+            V3_FFE_MU_TRAIN,
+            V3_FFE_MU_DD,
+        );
         // Commit only if the marker actually validates at the implied position.
         let validated = self.try_validate_marker_at(marker_at_abs_audio);
         if std::env::var_os("V3_LOG_ACQ").is_some() {
@@ -1246,7 +1327,15 @@ impl V3Session {
             + warmup_syms.len()
             + self.seg_sym_len_past_marker(true)
             + self.cycle_data_sym;
-        self.ffe.train_at(preamble_start_abs, &refs, cycle_period);
+        let cons = &self.constellation;
+        self.ffe.train_lms_at(
+            preamble_start_abs,
+            &refs,
+            cycle_period,
+            |y| cons.points[cons.slice_nearest(&[y])[0]],
+            V3_FFE_MU_TRAIN,
+            V3_FFE_MU_DD,
+        );
     }
 
     /// progress) so the outer loop knows to try `try_advance_to_next_marker`.
@@ -1789,8 +1878,21 @@ impl V3Session {
         // `audio_drained_samples` stays — the buffer's absolute origin
         // hasn't moved.
         self.total_samples = self.audio_drained_samples;
+        self.reset_pipeline_and_fsm();
+        let replay_events = self.process_audio_chunk(&audio);
+        events.extend(replay_events);
+    }
 
-        // Fresh streaming pipeline at the new ratio.
+    /// Rebuild a fresh streaming pipeline (resampler/MF DSP, fractional FFE,
+    /// PLL, SC detector) at the CURRENT `drift_ppm`/config and reset the decode
+    /// FSM + per-burst counters to a bootstrap regime, so a subsequent replay
+    /// sees the burst from scratch at the (possibly new) resampler ratio. The
+    /// audio buffers and absolute counters (`total_samples`,
+    /// `audio_drained_samples`, `audio_buffer`) are NOT touched here — the
+    /// caller sets them up for whichever replay it drives. `drift_locked` is
+    /// likewise preserved by design (the coarse one-shot must not re-commit on
+    /// its own replay).
+    fn reset_pipeline_and_fsm(&mut self) {
         let (sps, _) =
             rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
                 .expect("profile config has valid integer sps");
@@ -1802,7 +1904,21 @@ impl V3Session {
             self.cfg.beta,
             self.cfg.center_freq_hz,
         );
-        self.ffe = StreamingFfe::new(V3_FFE_LEN, self.cycle_data_sym, V3_FFE_TRAINING_LEN);
+        let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&self.cfg);
+        self.ffe = StreamingFfe::new(
+            n_ff,
+            self.cycle_data_sym,
+            V3_FFE_TRAINING_LEN,
+            pitch_fse,
+            mf_delay_frac,
+        );
+        {
+            let cons = self.constellation.clone();
+            self.ffe.set_forward_lms(
+                Box::new(move |y| cons.points[cons.slice_nearest(&[y])[0]]),
+                V3_FFE_MU_DD,
+            );
+        }
         let pll_alpha = 0.05f64;
         let pll_beta = pll_alpha * pll_alpha * 0.25;
         self.pll = DdPll::new(pll_alpha, pll_beta);
@@ -1827,10 +1943,45 @@ impl V3Session {
         self.silence_run = 0;
         self.pending_silence_finalize = false;
         self.eot_watch_remaining = 0;
-        // `drift_locked` stays true → no second commit on the replay.
+    }
 
-        let replay_events = self.process_audio_chunk(&audio);
-        events.extend(replay_events);
+    /// Worker-driven rewind (étage B / C1): re-run the streaming pipeline at
+    /// `new_drift_ppm` over `audio` — a borrowed view of the worker's rolling
+    /// capture history starting exactly at `anchor_abs_sample` (a preamble
+    /// boundary) and running to the live head. The session keeps no copy: the
+    /// slice is owned by the worker and lent for the duration of the call.
+    ///
+    /// Absolute-index contract: after this returns, `total_samples ==
+    /// anchor_abs_sample + audio.len()`, i.e. the live head the worker is about
+    /// to continue pushing from — so the stream stays seamless. Unlike the
+    /// coarse one-shot's [`reboot_pipeline_and_replay`], this can reach back
+    /// arbitrarily far (limited only by the worker's history depth), which the
+    /// internal 4-cycle `audio_buffer` cannot.
+    ///
+    /// Returns the events the replay produced (corrected `CwDecoded`,
+    /// `AppHeaderRecovered`, …) for the caller to route. The store dedups by
+    /// ESI, so re-routing codewords already accepted pre-rewind is idempotent.
+    pub fn replay_from_anchor(
+        &mut self,
+        audio: &[f32],
+        anchor_abs_sample: u64,
+        new_drift_ppm: f64,
+    ) -> Vec<V3SessionEvent> {
+        self.drift_ppm = new_drift_ppm;
+        self.audio_drained_samples = anchor_abs_sample;
+        self.total_samples = anchor_abs_sample;
+        self.audio_buffer.clear();
+        self.reset_pipeline_and_fsm();
+        // Feed the slice back in live-sized batches, NOT as one giant chunk:
+        // the FSM advances by bounded steps per `process_audio_chunk` (one SC
+        // fire / marker advance / cycle decode), so a single huge call would
+        // under-process the burst. 2400 samples = 50 ms @ 48 kHz, comfortably
+        // within the per-call work envelope the live path delivers.
+        let mut events = Vec::new();
+        for c in audio.chunks(REPLAY_BATCH_SAMPLES) {
+            events.extend(self.process_audio_chunk(c));
+        }
+        events
     }
 }
 
@@ -2742,6 +2893,68 @@ mod tests {
         assert!(
             finalised >= 2,
             "expected ≥2 SessionFinalised (data gap + EOT), got {finalised}",
+        );
+    }
+
+    #[test]
+    fn replay_from_anchor_resets_and_redecodes() {
+        // The worker-driven drift rewind: after some live audio has been
+        // pushed, `replay_from_anchor` must wipe the pipeline + FSM and re-run
+        // the burst from an absolute anchor over a borrowed slice, recovering
+        // the burst again and leaving the absolute counter at `anchor + len`
+        // (so the worker's live stream stays seamless). Here we anchor at 0 and
+        // replay the whole burst, which is the equivalent of a fresh decode.
+        let cfg = high_plus_config();
+        let session_id = 0x5151_FFEE;
+        let audio = build_v3_burst_audio(&cfg, 800, session_id);
+
+        // Reference: a straight full push recovers the header + ≥1 data CW.
+        let mut base = V3Session::new(cfg.clone(), "HIGH+".to_string());
+        let mut base_esis: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut base_hdr = false;
+        for c in audio.chunks(2400) {
+            for e in base.process_audio_chunk(c) {
+                match e {
+                    V3SessionEvent::AppHeaderRecovered { .. } => base_hdr = true,
+                    V3SessionEvent::CwDecoded { converged: true, is_meta: false, esi, .. } => {
+                        base_esis.insert(esi);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(base_hdr && !base_esis.is_empty(), "reference burst did not decode");
+
+        // Push a short partial (one chunk — below the coarse-drift observation
+        // floor, so no premature commit/lock), then rewind to sample 0 over the
+        // full slice. `reset_pipeline_and_fsm` must wipe that partial state so
+        // the replay decodes the burst as if fresh.
+        let mut sess = V3Session::new(cfg, "HIGH+".to_string());
+        let _ = sess.process_audio_chunk(&audio[..2400.min(audio.len())]);
+        let replay = sess.replay_from_anchor(&audio, 0, 0.0);
+
+        let mut esis: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut hdr = false;
+        for e in replay {
+            match e {
+                V3SessionEvent::AppHeaderRecovered { .. } => hdr = true,
+                V3SessionEvent::CwDecoded { converged: true, is_meta: false, esi, .. } => {
+                    esis.insert(esi);
+                }
+                _ => {}
+            }
+        }
+        assert!(hdr, "replay_from_anchor did not recover the AppHeader");
+        assert!(
+            !esis.is_empty(),
+            "replay_from_anchor recovered no data codewords after reset",
+        );
+        // Absolute-index contract: the head sits exactly at anchor + replayed
+        // length, so the worker can keep pushing live samples seamlessly.
+        assert_eq!(
+            sess.total_samples,
+            audio.len() as u64,
+            "replay_from_anchor left total_samples off the live head",
         );
     }
 

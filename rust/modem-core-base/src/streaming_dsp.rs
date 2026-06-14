@@ -141,6 +141,16 @@ pub struct StreamingDsp {
     mf_output_start_abs: u64,
     mf_output: Vec<Complex64>,
 
+    /// Fractional decimation factor (MF samples between two fse outputs).
+    /// `sym_buffer` is decimated at this spacing, so it carries `pitch_fse
+    /// = sps / d_fse` samples per symbol (T/d_fse fractional spacing — T/2
+    /// for tau = 1). The on-symbol subsamples land at fse index
+    /// `s * pitch_fse` and equal the old symbol-spaced decimation exactly
+    /// (`fse[s * pitch_fse] == mf_output[s * sps]`); the extra subsamples
+    /// give the downstream `StreamingFfe` the fractional resolution it
+    /// needs to correct sub-symbol timing.
+    d_fse: usize,
+    pitch_fse: usize,
     decimation_cursor_abs: u64,
     sym_buffer: Vec<Complex64>,
     sym_buffer_start_abs: u64,
@@ -152,8 +162,10 @@ impl StreamingDsp {
     /// the RRC roll-off, `center_freq_hz` is the carrier the NCO
     /// downmixes against.
     pub fn new(symbol_rate: f64, tau: f64, beta: f64, center_freq_hz: f64) -> Self {
-        let (sps, _) = rrc::check_integer_constraints(AUDIO_RATE, symbol_rate, tau)
+        let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, symbol_rate, tau)
             .expect("profile must have integer sps");
+        let d_fse = crate::sync::fse_decim_factor(sps, pitch);
+        let pitch_fse = pitch / d_fse;
         let mf_taps = rrc_taps(beta, RRC_SPAN_SYM, sps);
         let mf_state_len = mf_taps.len().saturating_sub(1);
         Self {
@@ -171,6 +183,8 @@ impl StreamingDsp {
             mf_state: vec![Complex64::new(0.0, 0.0); mf_state_len],
             mf_output_start_abs: 0,
             mf_output: Vec::new(),
+            d_fse,
+            pitch_fse,
             decimation_cursor_abs: 0,
             sym_buffer: Vec::new(),
             sym_buffer_start_abs: 0,
@@ -179,6 +193,13 @@ impl StreamingDsp {
 
     pub fn sps(&self) -> usize {
         self.sps
+    }
+
+    /// Number of fse samples per symbol in `sym_buffer` (= `sps / d_fse`).
+    /// 2 for tau = 1 (T/2). The downstream FFE reads on-symbol grid points
+    /// at fse index `s * pitch_fse`.
+    pub fn pitch_fse(&self) -> usize {
+        self.pitch_fse
     }
 
     pub fn sym_buffer(&self) -> &[Complex64] {
@@ -341,7 +362,12 @@ impl StreamingDsp {
         while self.decimation_cursor_abs < mf_end_abs {
             let rel = (self.decimation_cursor_abs - self.mf_output_start_abs) as usize;
             self.sym_buffer.push(self.mf_output[rel]);
-            self.decimation_cursor_abs += self.sps as u64;
+            // Fractional decimation: step by d_fse (= sps / pitch_fse), so
+            // sym_buffer carries pitch_fse samples per symbol (T/2 for
+            // tau = 1). The cursor starts at 0, so on-symbol grid points
+            // land at fse index s * pitch_fse — identical samples to the
+            // old `+= sps` symbol decimation.
+            self.decimation_cursor_abs += self.d_fse as u64;
         }
     }
 
@@ -428,21 +454,22 @@ mod tests {
     }
 
     #[test]
-    fn sym_buffer_grows_at_symbol_rate_at_zero_drift() {
+    fn sym_buffer_grows_at_fse_rate_at_zero_drift() {
         // One second of audio at zero drift should produce
-        // ≈ symbol_rate symbols.
+        // ≈ symbol_rate * pitch_fse fse samples (T/2 → 2× the symbol rate).
         let mut dsp = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
         let n = AUDIO_RATE as usize;
         let buf: Vec<f32> = (0..n)
             .map(|i| (2.0 * std::f64::consts::PI * TEST_FC * i as f64 / AUDIO_RATE as f64).cos() as f32)
             .collect();
         dsp.feed_audio(&buf, 0, 0.0);
-        let n_syms = dsp.sym_buffer().len();
-        let expected = TEST_SYMBOL_RATE as usize;
+        let n_fse = dsp.sym_buffer().len();
+        let expected = TEST_SYMBOL_RATE as usize * dsp.pitch_fse();
         let tol = expected / 20; // ±5% (pipeline startup transient eats a few)
         assert!(
-            n_syms.abs_diff(expected) <= tol,
-            "n_syms = {n_syms}, expected ≈ {expected}",
+            n_fse.abs_diff(expected) <= tol,
+            "n_fse = {n_fse}, expected ≈ {expected} (pitch_fse={})",
+            dsp.pitch_fse(),
         );
     }
 

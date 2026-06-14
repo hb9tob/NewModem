@@ -27,11 +27,12 @@
 //!   (same `session_id`, via the periodic META re-insertion or a `TxMore`
 //!   continuation) merges and decodes across burst and restart boundaries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use modem_core::profile::ProfileIndex;
+use modem_core::types::AUDIO_RATE;
 use modem_core::v3_session::{V3Session, V3SessionEvent};
 use modem_framing::app_header::AppHeader;
 
@@ -49,6 +50,15 @@ use crate::session_store::{DecodedFile, SessionStore};
 /// brickwall. A burst whose re-insertion crossing transiently fails also
 /// trips this and cleanly re-acquires on the next re-inserted preamble.
 const END_OF_BURST_NOPROGRESS_SAMPLES: u64 = (modem_core::types::AUDIO_RATE as u64) * 2;
+
+/// Depth of the source-agnostic rolling capture history the driver retains so a
+/// drift-rewind (`V3SessionEvent::RewindRequest`) can re-run the pipeline from a
+/// preamble anchor that lies further back than the session's own 4-cycle
+/// `audio_buffer`. 30 s comfortably spans several inter-preamble periods at every
+/// profile. This lives here — at the single funnel every source (cpal sound card,
+/// SDR runtime, WAV/sim replay) feeds through — NOT in the cpal-only 30 s capture
+/// ring (which is a drained SPSC transit pipe, empty for SDR sources).
+const HISTORY_SAMPLES: usize = 30 * AUDIO_RATE as usize;
 
 /// Outcome summary returned by [`RxV3Worker::push_samples`] / [`finalize`] so
 /// a caller (the turbo worker loop, an integration test) can react without
@@ -86,6 +96,14 @@ pub struct RxV3Worker {
     /// Samples pushed since the last validated marker. Drives the
     /// worker-side end-of-burst (`END_OF_BURST_NOPROGRESS_SAMPLES`).
     samples_since_progress: u64,
+    /// Source-agnostic rolling capture history (mono f32 @ 48 kHz), capped at
+    /// `HISTORY_SAMPLES`. Appended every `push_samples`; lent (zero-copy, via
+    /// `mem::take`) to `V3Session::replay_from_anchor` on a drift rewind.
+    history: VecDeque<f32>,
+    /// Absolute stream index (cumulative mono samples pushed) of `history[0]`.
+    /// `history_origin + history.len()` is the live head. Maps a
+    /// `RewindRequest.anchor_abs_sample` to its offset inside `history`.
+    history_origin: u64,
 }
 
 impl RxV3Worker {
@@ -108,6 +126,8 @@ impl RxV3Worker {
             pending_cw: HashMap::new(),
             active: false,
             samples_since_progress: 0,
+            history: VecDeque::with_capacity(HISTORY_SAMPLES),
+            history_origin: 0,
         })
     }
 
@@ -125,6 +145,14 @@ impl RxV3Worker {
         self.samples_since_progress = self
             .samples_since_progress
             .saturating_add(samples.len() as u64);
+        // Append to the rolling history first, so a rewind triggered while
+        // routing this chunk's events can reach right up to the live head.
+        self.history.extend(samples.iter().copied());
+        if self.history.len() > HISTORY_SAMPLES {
+            let drop = self.history.len() - HISTORY_SAMPLES;
+            self.history.drain(..drop);
+            self.history_origin += drop as u64;
+        }
         let events = self.session.process_audio_chunk(samples);
         let mut outcome = self.route(events);
         // Worker-driven end-of-burst: a locked burst that has gone silent on
@@ -147,7 +175,8 @@ impl RxV3Worker {
 
     fn route(&mut self, events: Vec<V3SessionEvent>) -> PushOutcome {
         let mut outcome = PushOutcome::default();
-        for e in events {
+        let mut queue: VecDeque<V3SessionEvent> = events.into();
+        while let Some(e) = queue.pop_front() {
             match e {
                 V3SessionEvent::MarkerValidated { .. } => {
                     // Forward sync progress — arms the burst and resets the
@@ -224,6 +253,38 @@ impl RxV3Worker {
                     self.pending_cw.clear();
                     self.active = false;
                     self.samples_since_progress = 0;
+                }
+                V3SessionEvent::RewindRequest {
+                    anchor_abs_sample,
+                    new_drift_ppm,
+                } => {
+                    // The drift estimate moved enough to invalidate the taps:
+                    // re-run the pipeline at the new ratio from the preamble
+                    // anchor, over a borrowed view of the rolling history (lent
+                    // via mem::take — no copy). The store dedups by ESI so
+                    // re-routing the corrected codewords is idempotent. Skip if
+                    // the anchor has already aged out of the history window.
+                    if anchor_abs_sample >= self.history_origin {
+                        let lo = (anchor_abs_sample - self.history_origin) as usize;
+                        let mut hist = std::mem::take(&mut self.history);
+                        let replay = {
+                            let buf = hist.make_contiguous();
+                            if lo <= buf.len() {
+                                self.session.replay_from_anchor(
+                                    &buf[lo..],
+                                    anchor_abs_sample,
+                                    new_drift_ppm,
+                                )
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        self.history = hist;
+                        // Route the corrected decode in this same pass.
+                        for re in replay {
+                            queue.push_back(re);
+                        }
+                    }
                 }
                 _ => {}
             }
