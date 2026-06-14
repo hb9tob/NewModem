@@ -2756,6 +2756,7 @@ mod tests {
             false,                 // forced = false → auto-detect
             false,                 // deemphasis disabled
             true,                  // allow_legacy_grid
+            false,                 // turbo = false → legacy sliding-window path
             dropped,
         );
         let burst_secs = samples.len() as f64 / 48_000.0;

@@ -104,10 +104,6 @@ const EOT_POST_GAP_WATCH_SAMPLES: u64 = (AUDIO_RATE as u64) * 2 / 5;
 /// (Σ|raw|²·Σ|pre|²) ∈ [0,1]` threshold for declaring the EOT preamble
 /// found. Same 0.5 floor recipe as `SC_THRESHOLD`.
 const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
-/// Header length in symbols (`encode_header_symbols`: 96 QPSK). The EOT
-/// marker sits `N_PREAMBLE + lms_warmup + N_HEADER_SYM` past the preamble
-/// (`frame::build_eot_frame`).
-const N_HEADER_SYM: u64 = 96;
 
 /// Consecutive predicted-marker misses tolerated before the session
 /// concludes the TX has desynced (random next position, or a TxMore stream
@@ -418,9 +414,12 @@ impl V3Session {
         // `V3_PREAMBLE_PERIOD_S` of marker+segment symbols have elapsed, and
         // the PRE+HDR is preamble + LMS warmup + header symbols long.
         let superframe_period_sym = (frame::V3_PREAMBLE_PERIOD_S * cfg.symbol_rate) as u64;
-        let superframe_header_offset_sym = crate::types::N_PREAMBLE as u64
-            + cfg.lms_warmup_syms() as u64
-            + N_HEADER_SYM;
+        // V4 re-anchor: the periodic superframe boundary inserts only a fresh
+        // PREAMBLE before the (META) bootstrap marker — the V3 header block is
+        // gone and the LMS warmup now sits AFTER the marker (handled per
+        // segment via the meta warmup detach). So the boundary marker sits
+        // exactly N_PREAMBLE past where a normal in-superframe marker falls.
+        let superframe_header_offset_sym = crate::types::N_PREAMBLE as u64;
         let (sps, _) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
             .expect("profile config has valid integer sps");
         let window_samples = marker::MARKER_SYNC_LEN * sps;
@@ -900,8 +899,11 @@ impl V3Session {
         &self,
         data_marker_sym_pos: u64,
     ) -> Option<(u64, marker::MarkerPayload)> {
-        let meta_cycle_len =
-            marker::MARKER_LEN as u64 + self.seg_sym_len_past_marker(true) as u64;
+        // V4: the META segment spans MARKER + warmup + meta CW+pilots, so a
+        // DATA marker sits this far past the META marker that precedes it.
+        let meta_cycle_len = marker::MARKER_LEN as u64
+            + self.cfg.lms_warmup_syms() as u64
+            + self.seg_sym_len_past_marker(true) as u64;
         let pred = data_marker_sym_pos.checked_sub(meta_cycle_len)?;
         let radius = marker::MARKER_SYNC_LEN as u64;
         let raw_start_abs = self.ffe.start_abs();
@@ -988,10 +990,9 @@ impl V3Session {
                 .expect("profile config has valid integer sps");
         const MF_DELAY_SYM: u64 = (crate::types::RRC_SPAN_SYM / 2) as u64;
         let preamble_sym_abs = self.ffe.start_abs() + best_pos as u64;
-        let marker_sym_abs = preamble_sym_abs
-            + crate::types::N_PREAMBLE as u64
-            + self.cfg.lms_warmup_syms() as u64
-            + N_HEADER_SYM;
+        // V4 EOT frame: PREAMBLE → MARKER₀(EOT_FRAME) → warmup → meta. The
+        // marker sits directly after the preamble (warmup is now behind it).
+        let marker_sym_abs = preamble_sym_abs + crate::types::N_PREAMBLE as u64;
         let marker_at_abs_audio =
             marker_sym_abs.saturating_sub(MF_DELAY_SYM) * sps as u64;
         // Pre-check that the marker actually validates at the implied
@@ -1108,9 +1109,18 @@ impl V3Session {
         let data_sym_count = n_cw * self.syms_per_cw;
         let seg_sym_len = self.seg_sym_len_past_marker(pending.is_meta);
 
-        // Segment starts right after MARKER_LEN symbols past the
-        // marker. Wait until the equalised sym_buffer fully covers it.
-        let seg_start_abs = pending.marker_sym_pos_abs + marker::MARKER_LEN as u64;
+        // Segment starts past the marker. V4: a META segment (bootstrap /
+        // periodic re-anchor / EOT) is `MARKER → warmup → CW`, so its CW is
+        // detached from the marker by the LMS warmup; DATA segments are
+        // `MARKER → CW` with no warmup. Wait until the equalised sym_buffer
+        // fully covers it.
+        let warmup_detach = if pending.is_meta {
+            self.cfg.lms_warmup_syms() as u64
+        } else {
+            0
+        };
+        let seg_start_abs =
+            pending.marker_sym_pos_abs + marker::MARKER_LEN as u64 + warmup_detach;
         let sym_start_abs = self.ffe.start_abs();
         let sym_end_abs = sym_start_abs + self.ffe.out_buf().len() as u64;
         if seg_start_abs < sym_start_abs {
@@ -1271,7 +1281,18 @@ impl V3Session {
     /// still counts toward `elapsed`, so the chain stays phase-locked).
     fn advance_prediction(&mut self, marker_pos_abs: u64, this_is_meta: bool) -> (u64, bool) {
         let seg_sym_len = self.seg_sym_len_past_marker(this_is_meta);
-        let cycle_step_sym = marker::MARKER_LEN as u64 + seg_sym_len as u64;
+        // V4: a META segment physically spans MARKER + warmup + CW+pilots (the
+        // warmup sits between the marker and its CW); DATA segments have no
+        // warmup. Mirror the TX `elapsed_since_preamble_sym` accounting exactly
+        // (frame.rs build_superframe_v3_range) so the superframe-boundary
+        // prediction stays phase-locked over the whole burst.
+        let warmup_span = if this_is_meta {
+            self.cfg.lms_warmup_syms() as u64
+        } else {
+            0
+        };
+        let cycle_step_sym =
+            marker::MARKER_LEN as u64 + warmup_span + seg_sym_len as u64;
         // Mirror TX: a META segment starts a superframe (counter resets to
         // its own length); a DATA segment accumulates.
         if this_is_meta {

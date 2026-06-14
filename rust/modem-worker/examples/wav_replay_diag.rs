@@ -116,6 +116,7 @@ fn main() {
         forced,
         /* deemphasis_enabled */ false,
         /* allow_legacy_grid */ true,
+        /* turbo */ false,
         Arc::new(AtomicU64::new(0)),
     );
 
