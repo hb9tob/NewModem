@@ -126,6 +126,13 @@ fn rx(args: &[String]) {
     let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0xC0FFEE);
     let expected = gen_payload(bytes, seed);
     let samples = read_wav(wav);
+    // Diagnostic chunk size override (default = the live cpal 20 ms size).
+    // Lets us isolate chunk-size-dependent streaming bugs (TURBO_CHUNK=2400).
+    let diag_chunk: usize = std::env::var("TURBO_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CHUNK_SAMPLES);
     let n_chunks = samples.len().div_ceil(CHUNK_SAMPLES);
 
     // --- Primary path: through the worker driver (the "via worker" check) ---
@@ -160,7 +167,7 @@ fn rx(args: &[String]) {
     let mut cw_bytes = std::collections::HashMap::<u32, Vec<u8>>::new();
     let mut first_lost: Option<String> = None;
     let mut max_sigma2 = 0.0f64;
-    for chunk in samples.chunks(CHUNK_SAMPLES) {
+    for chunk in samples.chunks(diag_chunk) {
         for e in sess.process_audio_chunk(chunk) {
             match e {
                 V3SessionEvent::MarkerValidated { cycle_idx, .. } => {

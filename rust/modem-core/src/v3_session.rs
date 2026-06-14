@@ -1096,6 +1096,43 @@ impl V3Session {
     /// yet caught up to the full segment length. Idempotent — clears
     /// `pending_decode` on completion so the next chunk waits for the
     /// next marker. Returns `true` iff a cycle was consumed (made
+    /// V4: LS-train the streaming FFE from a META anchor's known references
+    /// — the preamble (`N_PREAMBLE` symbols ahead of the marker) plus the LMS
+    /// warmup right behind it — and re-equalise the in-buffer window. The
+    /// trained taps are then forward-applied to subsequent symbols by
+    /// `StreamingFfe::push_raw`, so the DATA segments between anchors are
+    /// cleaned by the most recent anchor's taps. Without this the streaming
+    /// FFE stays in pass-through and dense constellations never converge off
+    /// a clean channel (the "FFE off" σ² regression). Mirrors the rx_v2 V4
+    /// batch path (preamble-only bootstrap → preamble+warmup retrain).
+    fn train_ffe_at_meta(&mut self, marker_sym_pos_abs: u64) {
+        let n_pre = crate::types::N_PREAMBLE as u64;
+        if marker_sym_pos_abs < n_pre {
+            return;
+        }
+        let preamble_start_abs = marker_sym_pos_abs - n_pre;
+        let warmup_start_abs = marker_sym_pos_abs + marker::MARKER_LEN as u64;
+        let preamble_syms = preamble::make_preamble_for_config(&self.cfg);
+        let warmup_syms = preamble::make_lms_warmup_for_config(&self.cfg);
+        let mut refs: Vec<(u64, crate::types::Complex64)> =
+            Vec::with_capacity(preamble_syms.len() + warmup_syms.len());
+        for (k, &s) in preamble_syms.iter().enumerate() {
+            refs.push((preamble_start_abs + k as u64, s));
+        }
+        for (k, &s) in warmup_syms.iter().enumerate() {
+            refs.push((warmup_start_abs + k as u64, s));
+        }
+        // Re-equalise from the preamble through the META segment and the DATA
+        // cycle that follows it (those symbols were emitted with stale / no
+        // taps); everything further out is handled by the forward apply.
+        let cycle_period = n_pre as usize
+            + marker::MARKER_LEN
+            + warmup_syms.len()
+            + self.seg_sym_len_past_marker(true)
+            + self.cycle_data_sym;
+        self.ffe.train_at(preamble_start_abs, &refs, cycle_period);
+    }
+
     /// progress) so the outer loop knows to try `try_advance_to_next_marker`.
     fn try_decode_pending_cycle(&mut self, events: &mut Vec<V3SessionEvent>) -> bool {
         let Some(pending) = self.pending_decode else {
@@ -1143,6 +1180,14 @@ impl V3Session {
         if seg_start_abs + seg_sym_len as u64 > sym_end_abs {
             // Not enough symbols yet — wait for the next chunk.
             return false;
+        }
+
+        // V4: train the streaming FFE on this META anchor before slicing. The
+        // coverage check above guarantees the preamble, marker and warmup
+        // refs are all in the retained window. `train_at` only rewrites
+        // out_buf contents (not start/len), so `seg_off` stays valid.
+        if pending.is_meta {
+            self.train_ffe_at_meta(pending.marker_sym_pos_abs);
         }
 
         let seg_off = (seg_start_abs - sym_start_abs) as usize;
