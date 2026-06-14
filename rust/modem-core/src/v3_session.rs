@@ -66,6 +66,11 @@ use modem_framing::app_header::{decode_meta_payload, AppHeader};
 /// landing.
 pub const SC_THRESHOLD: f64 = 0.5;
 
+/// Matched-filter acquisition metric floor (`fd_acquire`). The Golay+CRC
+/// marker validation at the implied position is the hard false-positive gate,
+/// so this only needs to reject windows with no preamble-like correlation.
+const MF_ACQ_THRESHOLD: f64 = 0.15;
+
 /// Rolling audio buffer retained, in multiples of the data-cycle period.
 /// 4 cycles gives the streaming pipeline ample resampler-cursor margin
 /// AND lets the SC detector see two consecutive markers comfortably.
@@ -315,6 +320,14 @@ pub struct V3Session {
     /// the caller (sweep tests, future worker hint).
     drift_ppm: f64,
     sc: ScDetector,
+    /// FFT matched filter vs the KNOWN passband preamble — the always-on
+    /// acquisition trigger (no silence/energy gate; robust to noise/speech/QRM
+    /// on the channel between bursts). See `try_acquire_preamble`.
+    acq_mf: crate::fd_acquire::PreambleMatchedFilter,
+    /// Recent-audio span searched each acquisition pass (preamble + 1 cycle).
+    acq_search_len: usize,
+    /// Cached samples-per-symbol for acquisition audio↔symbol math.
+    acq_sps: usize,
     dsp: StreamingDsp,
     ffe: StreamingFfe,
     // ---- Phase 3a: per-cycle CW decode -------------------------------
@@ -424,6 +437,21 @@ impl V3Session {
             .expect("profile config has valid integer sps");
         let window_samples = marker::MARKER_SYNC_LEN * sps;
         let sc = ScDetector::new(cycle_samples, window_samples);
+        // Passband preamble template = exactly the waveform the TX emits
+        // (preamble symbols modulated onto the data passband). The FFT matched
+        // filter against it is the always-on acquisition trigger.
+        let (sps_pb, pitch_pb) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
+            .expect("profile config has valid integer sps");
+        let preamble_template = crate::modulator::modulate(
+            &preamble::make_preamble_for_config(&cfg),
+            sps_pb,
+            pitch_pb,
+            &rrc::rrc_taps(cfg.beta, crate::types::RRC_SPAN_SYM, sps_pb),
+            cfg.center_freq_hz,
+        );
+        let acq_search_len = preamble_template.len() + cycle_samples;
+        let acq_mf =
+            crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
         let dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
         let ffe = StreamingFfe::new(V3_FFE_LEN, cycle_data_sym, V3_FFE_TRAINING_LEN);
@@ -457,6 +485,9 @@ impl V3Session {
             total_samples: 0,
             drift_ppm: 0.0,
             sc,
+            acq_mf,
+            acq_search_len,
+            acq_sps: sps,
             dsp,
             ffe,
             pll,
@@ -627,6 +658,14 @@ impl V3Session {
             });
             self.handle_sc_fire(marker_at_abs, metric, &mut events);
         }
+
+        // 3c. Always-on preamble acquisition via the FFT matched filter. No
+        //     silence/energy gate — the channel between bursts may carry
+        //     noise, speech or QRM; only a real preamble correlates, and the
+        //     marker Golay+CRC at the implied position is the hard gate. This
+        //     is what locks on real colored NBFM captures where the lag-auto
+        //     ScDetector metric is too weak to pin the marker.
+        self.try_acquire_preamble(&mut events);
 
         // 3b. EOT re-acquisition. While the EOT-watch window is armed
         //     (100–300 ms of inter-frame silence, set by the per-sample
@@ -912,7 +951,7 @@ impl V3Session {
         }
         let window_start_abs = pred - radius;
         let window_end_abs = pred + radius + marker::MARKER_LEN as u64;
-        let raw = self.ffe.raw_buf();
+        let raw = self.ffe.out_buf();
         if window_end_abs > raw_start_abs + raw.len() as u64 {
             return None;
         }
@@ -931,6 +970,78 @@ impl V3Session {
             return None;
         }
         Some((raw_start_abs + pos as u64, payload))
+    }
+
+    /// Always-on preamble acquisition. While not Locked, FFT-correlate the
+    /// known passband preamble (`fd_acquire`) against the recent raw audio and,
+    /// on a peak above [`MF_ACQ_THRESHOLD`], drive `handle_sc_fire` at the
+    /// implied marker position. Unlike the lag-autocorrelation `ScDetector`
+    /// this has the full coherent processing gain of the 256-symbol preamble,
+    /// so it locks on real colored/noisy NBFM channels — and it needs no
+    /// silence/energy precondition, so noise/speech/QRM between bursts can't
+    /// suppress it. The marker Golay+CRC is the hard false-positive gate.
+    fn try_acquire_preamble(&mut self, events: &mut Vec<V3SessionEvent>) {
+        if matches!(self.state, V3SessionState::Locked { .. }) {
+            return;
+        }
+        if self.audio_buffer.len() < self.acq_mf.template_len() {
+            return;
+        }
+        let start_rel = self.audio_buffer.len().saturating_sub(self.acq_search_len);
+        let (lag, metric) = match self.acq_mf.best_match(&self.audio_buffer[start_rel..]) {
+            Some(v) => v,
+            None => return,
+        };
+        if metric < MF_ACQ_THRESHOLD {
+            return;
+        }
+        let sps = self.acq_sps as u64;
+        const MF_DELAY_SYM: u64 = (crate::types::RRC_SPAN_SYM / 2) as u64;
+        // Preamble start on the absolute AUDIO timeline → marker symbol
+        // position (the V4 bootstrap marker sits N_PREAMBLE symbols past the
+        // preamble) → the audio position `handle_sc_fire` expects (it re-adds
+        // the MF half-delay and searches a wide ±MARKER_SYNC window around it,
+        // absorbing the pipeline group delay and any residue).
+        let preamble_start_abs_audio = self.audio_drained_samples + (start_rel + lag) as u64;
+        let marker_sym_abs = preamble_start_abs_audio / sps + crate::types::N_PREAMBLE as u64;
+        let marker_at_abs_audio = marker_sym_abs.saturating_sub(MF_DELAY_SYM) * sps;
+        // Train the FFE on the located preamble (preamble-only LS, mirroring
+        // rx_v2's V4 Phase 1) BEFORE validating: off a real channel the marker
+        // only decodes on the equalised stream. The preamble sits N_PREAMBLE
+        // symbols ahead of the marker in the FFE symbol frame.
+        let marker_sym_ffe = marker_at_abs_audio / sps + MF_DELAY_SYM;
+        let preamble_sym_ffe = marker_sym_ffe.saturating_sub(crate::types::N_PREAMBLE as u64);
+        let preamble_syms = preamble::make_preamble_for_config(&self.cfg);
+        let refs: Vec<(u64, crate::types::Complex64)> = preamble_syms
+            .iter()
+            .enumerate()
+            .map(|(k, &s)| (preamble_sym_ffe + k as u64, s))
+            .collect();
+        let reeq = crate::types::N_PREAMBLE as usize
+            + marker::MARKER_LEN
+            + self.cfg.lms_warmup_syms()
+            + self.seg_sym_len_past_marker(true);
+        self.ffe.train_at(preamble_sym_ffe, &refs, reeq);
+        // Commit only if the marker actually validates at the implied position.
+        let validated = self.try_validate_marker_at(marker_at_abs_audio);
+        if std::env::var_os("V3_LOG_ACQ").is_some() {
+            let sps_u = self.acq_sps as u64;
+            let sym_est = marker_at_abs_audio / sps_u + (crate::types::RRC_SPAN_SYM / 2) as u64;
+            eprintln!(
+                "[acq] metric={metric:.3} marker_sym_est={sym_est} ffe[{}..{}] validated={}",
+                self.ffe.start_abs(),
+                self.ffe.start_abs() + self.ffe.raw_buf().len() as u64,
+                validated.is_some(),
+            );
+        }
+        if validated.is_none() {
+            return;
+        }
+        events.push(V3SessionEvent::SofProbeFired {
+            marker_at_abs: marker_at_abs_audio,
+            metric,
+        });
+        self.handle_sc_fire(marker_at_abs_audio, metric, events);
     }
 
     /// Short preamble correlator for EOT re-acquisition. Runs only while
@@ -955,7 +1066,7 @@ impl V3Session {
         }
         let pre = preamble::make_preamble_for_config(&self.cfg);
         let n_pre = pre.len();
-        let raw = self.ffe.raw_buf();
+        let raw = self.ffe.out_buf();
         if raw.len() < n_pre {
             return;
         }
@@ -1042,7 +1153,12 @@ impl V3Session {
         if sym_pos_abs_estimate < raw_start_abs {
             return None;
         }
-        let raw = self.ffe.raw_buf();
+        // Validate on the EQUALISED stream: off a real channel the marker
+        // SYNC won't correlate (nor Golay pass) on raw symbols — it needs at
+        // least the preamble-trained FFE (the acquisition path trains it
+        // before calling here). Until taps exist the FFE is pass-through, so on
+        // a clean loopback `out_buf == raw_buf` → no behaviour change.
+        let raw = self.ffe.out_buf();
         if raw.len() < marker::MARKER_LEN {
             return None;
         }
@@ -1422,7 +1538,7 @@ impl V3Session {
                     .map(|payload| (pos, payload))
             })
         };
-        let mut validated = search_window(self.ffe.raw_buf(), window_start_abs, window_end_abs);
+        let mut validated = search_window(self.ffe.out_buf(),window_start_abs, window_end_abs);
 
         // Boundary-offset fallback. If the normal prediction missed, a
         // re-inserted PRE+HDR+META may sit `superframe_header_offset_sym`
@@ -1445,7 +1561,7 @@ impl V3Session {
                 return false;
             }
             if b_start >= raw_start_abs {
-                validated = search_window(self.ffe.raw_buf(), b_start, b_end);
+                validated = search_window(self.ffe.out_buf(),b_start, b_end);
                 if validated.is_some() && std::env::var_os("V3_LOG_SYNC").is_some() {
                     eprintln!("[sync] boundary-fallback HIT at b_pred={b_pred} (normal pred={pred})");
                 }
@@ -1600,7 +1716,7 @@ impl V3Session {
         if marker_sym_pos_abs < raw_start_abs {
             return marker_sym_pos_abs as f64;
         }
-        let raw = self.ffe.raw_buf();
+        let raw = self.ffe.out_buf();
         let rel = (marker_sym_pos_abs - raw_start_abs) as usize;
         if rel >= raw.len() {
             return marker_sym_pos_abs as f64;

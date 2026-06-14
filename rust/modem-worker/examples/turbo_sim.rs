@@ -283,19 +283,157 @@ fn probe(args: &[String]) {
     );
 }
 
+fn parse_profile_index(s: &str) -> ProfileIndex {
+    match s.to_uppercase().as_str() {
+        "HIGH++" | "HIGHPLUSPLUS" => ProfileIndex::HighPlusPlus,
+        "HIGH+" | "HIGHPLUS" => ProfileIndex::HighPlus,
+        "HIGH" => ProfileIndex::High,
+        "MEGA" => ProfileIndex::Mega,
+        "NORMAL" => ProfileIndex::Normal,
+        "ROBUST" => ProfileIndex::Robust,
+        "ULTRA" => ProfileIndex::Ultra,
+        other => {
+            eprintln!("unknown profile {other:?}");
+            std::process::exit(64);
+        }
+    }
+}
+
+/// Decode a REAL OTA capture (no known payload, no PASS/FAIL): drive the turbo
+/// worker + a raw V3Session diag pass at the given profile, report sync / CW /
+/// σ² tallies, and write the assembled file out if the burst assembled.
+///   turbo_sim rxreal <wav> [profile=HIGH++]
+fn rxreal(args: &[String]) {
+    use modem_core::v3_session::{V3Session, V3SessionEvent};
+    let wav = &args[0];
+    let profile = args
+        .get(1)
+        .map(|s| parse_profile_index(s))
+        .unwrap_or(ProfileIndex::HighPlusPlus);
+    // The SDR radio chain already de-emphasises before recording, so the WAV
+    // is flat — do NOT re-apply de-emphasis here (would double-correct).
+    let samples = read_wav(wav);
+    let cfg = profile.to_config();
+    println!(
+        "rxreal: {} samples ({:.1}s) profile={}",
+        samples.len(),
+        samples.len() as f64 / AUDIO_RATE as f64,
+        profile.name(),
+    );
+
+    // --- Worker path (the live driver) ---
+    let tmp = std::env::temp_dir().join(format!("turbo_real_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut worker = RxV3Worker::new(profile, Arc::new(Mutex::new(tmp.clone())), Arc::new(NoopSink))
+        .expect("worker");
+    let mut w_payload: Option<Vec<u8>> = None;
+    let mut w_finalised = 0usize;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        let out = worker.push_samples(chunk);
+        w_finalised += out.bursts_finalised;
+        if let Some(df) = out.decoded {
+            w_payload.get_or_insert(df.payload);
+        }
+    }
+    if let Some(df) = worker.finalize().decoded {
+        w_payload.get_or_insert(df.payload);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // --- Diag path (raw V3Session, σ² / CW tallies) ---
+    let mut sess = V3Session::new(cfg, profile.name().to_string());
+    let (mut markers, mut cw_total, mut cw_conv, mut bootstraps) = (0u32, 0u32, 0u32, 0u32);
+    let mut hdr: Option<(u32, u8)> = None;
+    let mut cw_bytes = std::collections::HashMap::<u32, Vec<u8>>::new();
+    let (mut max_sigma2, mut sum_sigma2, mut n_sigma2) = (0.0f64, 0.0f64, 0u32);
+    let mut sc_fires = 0u32;
+    let mut best_sc_metric = 0.0f64;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        for e in sess.process_audio_chunk(chunk) {
+            match e {
+                V3SessionEvent::SofProbeFired { metric, .. } => {
+                    sc_fires += 1;
+                    if metric > best_sc_metric {
+                        best_sc_metric = metric;
+                    }
+                }
+                V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
+                    markers += 1;
+                    if cycle_idx == 0 {
+                        bootstraps += 1;
+                    }
+                }
+                V3SessionEvent::CwDecoded {
+                    converged, is_meta, esi, bytes, sigma2, ..
+                } => {
+                    cw_total += 1;
+                    if sigma2 > max_sigma2 {
+                        max_sigma2 = sigma2;
+                    }
+                    if sigma2 > 0.0 {
+                        sum_sigma2 += sigma2;
+                        n_sigma2 += 1;
+                    }
+                    if converged {
+                        cw_conv += 1;
+                        if !is_meta {
+                            cw_bytes.entry(esi).or_insert(bytes);
+                        }
+                    }
+                }
+                V3SessionEvent::AppHeaderRecovered { file_size, t_bytes, .. } => {
+                    hdr.get_or_insert((file_size, t_bytes));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mean_sigma2 = if n_sigma2 > 0 { sum_sigma2 / n_sigma2 as f64 } else { 0.0 };
+    let mer_db = if mean_sigma2 > 0.0 { -10.0 * mean_sigma2.log10() } else { 0.0 };
+    println!(
+        "rxreal diag: SC_fires={sc_fires} (best metric={best_sc_metric:.3}) bootstraps={bootstraps} \
+         markers={markers} CW={cw_conv}/{cw_total} uniqueDataESI={} appHdr={} \
+         meanσ²={mean_sigma2:.4} ({mer_db:.1} dB MER) maxσ²={max_sigma2:.4}",
+        cw_bytes.len(),
+        if hdr.is_some() { "Y" } else { "N" },
+    );
+
+    match w_payload {
+        Some(p) => {
+            let env = modem_framing::payload_envelope::PayloadEnvelope::decode_or_fallback(&p);
+            if env.version == 0 {
+                let out = "rxreal_out.bin";
+                std::fs::write(out, &p).ok();
+                println!("rxreal: WORKER assembled {} B (no envelope) -> {out}", p.len());
+            } else {
+                let out = format!("rxreal_{}", env.filename);
+                std::fs::write(&out, &env.content).ok();
+                println!(
+                    "rxreal: WORKER assembled OK — from={} file={} {} B -> {out}",
+                    env.callsign,
+                    env.filename,
+                    env.content.len(),
+                );
+            }
+        }
+        None => println!("rxreal: WORKER did not assemble ({w_finalised} finalises)"),
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 {
-        eprintln!("usage: turbo_sim <tx|rx|probe> <wav> [bytes] [seed] [repair_pct(tx)]");
+        eprintln!("usage: turbo_sim <tx|rx|rxreal|probe> <wav> [bytes|profile] [seed] [repair_pct(tx)]");
         std::process::exit(64);
     }
     let rest = &argv[2..];
     match argv[1].as_str() {
         "tx" => tx(rest),
         "rx" => rx(rest),
+        "rxreal" => rxreal(rest),
         "probe" => probe(rest),
         other => {
-            eprintln!("unknown subcommand {other:?} (expected tx|rx)");
+            eprintln!("unknown subcommand {other:?} (expected tx|rx|rxreal|probe)");
             std::process::exit(64);
         }
     }
