@@ -22,15 +22,47 @@
     <span id="status" class="status" data-i18n="topbar.status_ready">prêt</span>
   </header>
   <nav class="tab-bar">
-    <button class="tab active" data-tab="rx" data-i18n="tabs.rx">RX</button>
-    <button class="tab" data-tab="tx" data-i18n="tabs.tx">TX</button>
-    <button class="tab" id="tab-btn-radio" data-tab="radio" data-i18n="tabs.radio" hidden>Radio</button>
-    <button class="tab" data-tab="sessions" data-i18n="tabs.sessions">Sessions</button>
-    <button class="tab" data-tab="history" data-i18n="tabs.history">Historique</button>
-    <button class="tab" data-tab="channel" data-i18n="tabs.channel">Canal</button>
-    <button class="tab" data-tab="overlays" data-i18n="tabs.overlays">Overlays</button>
-    <button class="tab" data-tab="settings" data-i18n="tabs.settings">Paramètres</button>
-    <button class="tab" data-tab="info" data-i18n="tabs.info">Info</button>
+    <!-- Each tab carries an inline-SVG icon (shown only in the kiosk/narrow
+         layout) plus a text label. The label MUST live in its own span:
+         applyI18n() rewrites the element's textContent, which would wipe the
+         SVG if data-i18n sat on the button. data-i18n-title gives the
+         full-name tooltip, reusing the same tabs.* keys. -->
+    <button class="tab active" data-tab="rx" data-i18n-title="tabs.rx" title="RX">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m0 0l-4-4m4 4l4-4"/><path d="M5 20h14"/></svg>
+      <span class="tab-label" data-i18n="tabs.rx">RX</span>
+    </button>
+    <button class="tab" data-tab="tx" data-i18n-title="tabs.tx" title="TX">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V8m0 0l-4 4m4-4l4 4"/><path d="M5 4h14"/></svg>
+      <span class="tab-label" data-i18n="tabs.tx">TX</span>
+    </button>
+    <button class="tab" id="tab-btn-radio" data-tab="radio" data-i18n-title="tabs.radio" title="Radio" hidden>
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="14" r="2"/><path d="M12 16v4"/><path d="M8 8.5a5 5 0 018 0"/><path d="M5.5 6a8.5 8.5 0 0113 0"/></svg>
+      <span class="tab-label" data-i18n="tabs.radio">Radio</span>
+    </button>
+    <button class="tab" data-tab="sessions" data-i18n-title="tabs.sessions" title="Sessions">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>
+      <span class="tab-label" data-i18n="tabs.sessions">Sessions</span>
+    </button>
+    <button class="tab" data-tab="history" data-i18n-title="tabs.history" title="Historique">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 12a8.5 8.5 0 108.5-8.5A8.5 8.5 0 005 6.5M3.5 3.5v3.5H7"/><path d="M12 8v4l3 2"/></svg>
+      <span class="tab-label" data-i18n="tabs.history">Historique</span>
+    </button>
+    <button class="tab" data-tab="channel" data-i18n-title="tabs.channel" title="Canal">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12q3 -8 6 0t6 0t6 0"/></svg>
+      <span class="tab-label" data-i18n="tabs.channel">Canal</span>
+    </button>
+    <button class="tab" data-tab="overlays" data-i18n-title="tabs.overlays" title="Overlays">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 16l-5-5-7 7"/></svg>
+      <span class="tab-label" data-i18n="tabs.overlays">Overlays</span>
+    </button>
+    <button class="tab" data-tab="settings" data-i18n-title="tabs.settings" title="Paramètres">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
+      <span class="tab-label" data-i18n="tabs.settings">Paramètres</span>
+    </button>
+    <button class="tab" data-tab="info" data-i18n-title="tabs.info" title="Info">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+      <span class="tab-label" data-i18n="tabs.info">Info</span>
+    </button>
     <span id="app-version" class="app-version" data-i18n-title="topbar.app_version_tip" title="Version de l'application">…</span>
     <button id="kiosk-exit" class="kiosk-only" data-i18n-title="topbar.kiosk_exit_tip" title="Quitter (mode kiosk)">✕</button>
   </nav>
@@ -846,6 +878,11 @@
           <div class="radio-card-title" data-i18n="radio.smeter">S-mètre</div>
           <canvas id="radio-smeter" class="radio-smeter"></canvas>
           <div id="radio-smeter-label" class="radio-smeter-label">—</div>
+          <button id="radio-sdr-params-btn" class="radio-sdr-params-btn"
+                  data-i18n-title="radio.sdr_params_tip"
+                  title="Paramètres du récepteur SDR">
+            <span data-i18n="radio.sdr_params_btn">⚙ Réglages SDR</span>
+          </button>
         </div>
         <!-- Top-middle: frequency display + entry + band presets -->
         <div class="radio-card radio-freq-card">
@@ -897,15 +934,13 @@
       <!-- Bottom: RF spectrum + waterfall, with controls -->
       <div class="radio-bottom">
         <div class="radio-controls">
-          <label class="radio-ctl">
+          <!-- Backend-aware gain / AGC: filled by renderRadioGain() from the
+               active SDR's capabilities (continuous dB / LNA+IF / discrete
+               ladder + real AGC modes). Changes go live (set_radio_gain) and
+               persist to the backend config. -->
+          <div class="radio-ctl radio-gain-host" id="radio-gain-host">
             <span data-i18n="radio.gain">Gain RX</span>
-            <select id="radio-gain-mode">
-              <option value="manual" data-i18n="radio.gain_manual">Manuel</option>
-              <option value="slow_attack" data-i18n="radio.gain_agc">AGC</option>
-            </select>
-            <input type="range" id="radio-gain-db" min="-3" max="71" value="30" />
-            <span id="radio-gain-label">30 dB</span>
-          </label>
+          </div>
           <label class="radio-ctl">
             <span data-i18n="radio.width">Largeur</span>
             <select id="radio-deviation">
@@ -924,10 +959,17 @@
             <input type="range" id="radio-level-min" min="-140" max="-20" value="-120" />
             <input type="range" id="radio-level-max" min="-120" max="20" value="-20" />
           </label>
+          <label class="radio-ctl">
+            <span data-i18n="radio.cal_trim" data-i18n-title="radio.cal_trim_tip"
+                  title="Réglage fin du S-mètre">Cal S</span>
+            <input type="range" id="radio-cal-trim" min="-40" max="40" value="0" />
+            <span id="radio-cal-trim-label">0 dB</span>
+          </label>
         </div>
         <div class="radio-spectrum-wrap">
           <canvas id="radio-rf-fft" class="radio-rf-fft"></canvas>
           <canvas id="radio-waterfall" class="radio-waterfall"></canvas>
+          <canvas id="radio-freq-scale" class="radio-freq-scale"></canvas>
         </div>
       </div>
     </section>
@@ -936,6 +978,26 @@
       <ul id="event-log"></ul>
     </section>
   </main>
+  <!-- SDR parameters popover, opened from the Radio tab "⚙ Réglages SDR"
+       button. Reuses the same per-backend row builders as the Settings
+       tab; changes persist to the active RX backend's config. Most apply
+       only on the next RX start, hence the note + restart button. -->
+  <div id="radio-sdr-modal" class="radio-sdr-modal" hidden>
+    <div class="radio-sdr-panel">
+      <div class="radio-sdr-header">
+        <span class="radio-sdr-title" data-i18n="radio.sdr_params">Paramètres SDR</span>
+        <span class="radio-sdr-close" id="radio-sdr-close"
+              data-i18n-title="radio.sdr_close" title="Fermer">✕</span>
+      </div>
+      <div class="radio-sdr-rows" id="radio-sdr-rows"></div>
+      <p class="tx-hint" id="radio-sdr-note" data-i18n="radio.sdr_params_note">
+        Certains réglages ne s'appliquent qu'au redémarrage du RX.
+      </p>
+      <div class="radio-sdr-footer">
+        <button id="radio-sdr-restart" data-i18n="radio.sdr_restart">Redémarrer le RX</button>
+      </div>
+    </div>
+  </div>
   <!-- Global progress bar at the bottom of the window, a few pixels tall. -->
   <div id="rx-progress-bar" class="rx-progress-bar">
     <canvas id="progress-blocks"></canvas>

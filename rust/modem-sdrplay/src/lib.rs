@@ -55,6 +55,7 @@ pub mod api;
 pub mod backend;
 pub mod device;
 pub mod error;
+mod hardware;
 pub mod rx;
 mod runtime_guard;
 

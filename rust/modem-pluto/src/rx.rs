@@ -42,8 +42,9 @@ use std::time::Duration;
 use num_complex::Complex32;
 
 use modem_sdr::config::{GainSetting, ManualGainValue};
-use modem_sdr::telemetry::{RadioCommand, RadioTelemetry, SpectrumFrame, TuneState};
-use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig, SpectrumAnalyzer};
+use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
+use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
+use modem_sdr_radio::{RadioHardware, RadioInit, RadioRuntime};
 
 use crate::device::{self, NegotiatedRate, PlutoConfig, PlutoSession, RxGainMode};
 use crate::error::PlutoError;
@@ -87,21 +88,8 @@ const RX_S12_PEAK: f32 = 2047.0;
 /// USB hiccup doesn't flood the terminal.
 const STATUS_TICK_PERIOD: Duration = Duration::from_secs(2);
 
-/// FFT size for the wideband RF spectrum / waterfall. 2048 bins over a
-/// 576 kHz span ≈ 281 Hz/bin — fine enough to see individual NBFM
-/// channels, cheap enough to run several times a second.
-const RF_FFT_SIZE: usize = 2048;
-
-/// FFT size for the demodulated-audio spectrum. 1024 over the 0–24 kHz
-/// half-band ≈ 23 Hz/bin.
-const AUDIO_FFT_SIZE: usize = 1024;
-
-/// Minimum spacing between successive RF spectrum frames (~12 Hz).
-const RF_FRAME_PERIOD: Duration = Duration::from_millis(80);
-/// Minimum spacing between successive audio spectrum frames (~15 Hz).
-const AUDIO_FRAME_PERIOD: Duration = Duration::from_millis(66);
-/// Minimum spacing between successive S-meter frames (~10 Hz).
-const SMETER_PERIOD: Duration = Duration::from_millis(100);
+// Radio-tab FFT sizes and emit-rate throttles now live in the shared
+// `modem_sdr_radio::RadioRuntime`.
 
 /// The two channel ends the worker hands the capture thread to drive
 /// the Radio tab: telemetry out (spectra / S-meter / tune state) and
@@ -278,10 +266,33 @@ fn capture_loop(
         0.0,
     ));
 
-    // Radio-tab runtime: spectra / S-meter / tune-state telemetry and
-    // live retune. `None` for plain captures (CLI, loopback) — the loop
-    // costs nothing extra then.
-    let mut radio_rt = radio.map(|w| RadioRuntime::new(w, &session));
+    // Radio-tab runtime: spectra / S-meter / tune-state telemetry and live
+    // retune. `None` for plain captures (CLI, loopback) — the loop costs
+    // nothing extra then. The shared runtime owns the DSP/telemetry; the
+    // control receiver is drained inline below (this is a poll loop, not a
+    // callback, so it may safely touch the hardware) and the Pluto-specific
+    // LO/gain writes go through `PlutoHardware`. lo_offset = 0 (AD9363 DC
+    // comp), so digital_offset starts at 0 and displayed_rf = the LO.
+    let (mut radio_rt, mut radio_ctl, mut radio_hw) = match radio {
+        Some(w) => {
+            let init = RadioInit {
+                input_rate_hz: session.negotiated_rate.sample_rate_hz as u32,
+                lo_hz: session.config.rx_freq_hz,
+                digital_offset_hz: 0.0,
+                lo_offset_hz: 0.0,
+                max_deviation_hz: session.rx_max_deviation_hz,
+                dc_tunable: true,
+            };
+            (
+                Some(RadioRuntime::new(w.telemetry_tx, init)),
+                Some(w.control_rx),
+                Some(PlutoHardware {
+                    uri: session.config.uri.clone(),
+                }),
+            )
+        }
+        None => (None, None, None),
+    };
 
     // Pre-allocated I/Q wire-format scratch — one buffer worth of
     // bytes. iiod's `read_buffer_into` writes here; we reinterpret
@@ -335,8 +346,13 @@ fn capture_loop(
         // Radio control + wideband spectrum: drain any pending retune /
         // gain / squelch commands (may rebuild `chain`), then run the
         // RF FFT on the raw I/Q (before downmix). Both throttled inside.
-        if let Some(rt) = radio_rt.as_mut() {
-            rt.drain_commands(&mut chain, &session.config.uri);
+        if let (Some(rt), Some(ctl), Some(hw)) =
+            (radio_rt.as_mut(), radio_ctl.as_mut(), radio_hw.as_mut())
+        {
+            while let Ok(cmd) = ctl.try_recv() {
+                RadioRuntime::run_hardware(&cmd, hw);
+                rt.apply_command(cmd, &mut chain);
+            }
             rt.on_iq(&iq);
         }
 
@@ -388,197 +404,25 @@ fn capture_loop(
     Ok(session.negotiated_rate)
 }
 
-/// Per-capture Radio-tab state: owns the telemetry/control channels, the
-/// two FFT analyzers, the current tuning, the squelch threshold, and the
-/// emit-rate throttles. Lives on the capture thread; the worker talks to
-/// it only through the two mpsc channels.
-struct RadioRuntime {
-    telemetry_tx: Sender<RadioTelemetry>,
-    control_rx: Receiver<RadioCommand>,
-
-    rf_analyzer: SpectrumAnalyzer,
-    audio_analyzer: SpectrumAnalyzer,
-    rf_bins: Vec<f32>,
-    audio_bins: Vec<f32>,
-    /// Ring of the most recent audio samples, capped at [`AUDIO_FFT_SIZE`].
-    audio_accum: Vec<f32>,
-
-    /// Captured I/Q rate (= RF spectrum span), Hz.
-    input_rate_hz: u32,
-    /// Current hardware LO, Hz.
-    lo_hz: u64,
-    /// Current digital NCO offset (`displayed_rf − lo`), Hz.
-    digital_offset_hz: f64,
-    /// Current max FM deviation (Hz) — needed to rebuild the chain on a
-    /// `SetDeviation` command.
-    max_deviation_hz: f32,
-    /// Audio squelch threshold in dBFS of channel power.
-    /// `f32::NEG_INFINITY` = squelch off.
-    squelch_dbfs: f32,
-
-    rf_seq: u64,
-    audio_seq: u64,
-    smeter_seq: u64,
-    last_rf: std::time::Instant,
-    last_audio: std::time::Instant,
-    last_smeter: std::time::Instant,
+/// Live-tuning hardware shim for the Radio tab: turns the backend-agnostic
+/// [`RadioHardware`] calls into AD9361 iiod attribute writes over a
+/// transient control connection. The shared `RadioRuntime` owns the DSP /
+/// telemetry; only the LO / gain writes are Pluto-specific.
+struct PlutoHardware {
+    uri: String,
 }
 
-impl RadioRuntime {
-    fn new(wiring: RadioWiring, session: &PlutoSession) -> Self {
-        let now = std::time::Instant::now();
-        let mut rt = Self {
-            telemetry_tx: wiring.telemetry_tx,
-            control_rx: wiring.control_rx,
-            rf_analyzer: SpectrumAnalyzer::new(RF_FFT_SIZE),
-            audio_analyzer: SpectrumAnalyzer::new(AUDIO_FFT_SIZE),
-            rf_bins: Vec::with_capacity(RF_FFT_SIZE),
-            audio_bins: Vec::with_capacity(AUDIO_FFT_SIZE / 2),
-            audio_accum: Vec::with_capacity(AUDIO_FFT_SIZE),
-            input_rate_hz: session.negotiated_rate.sample_rate_hz as u32,
-            lo_hz: session.config.rx_freq_hz,
-            // Pluto's AD9363 has hardware DC comp, so the chain is built
-            // with lo_offset = 0 → the channel starts at DC.
-            digital_offset_hz: 0.0,
-            max_deviation_hz: session.rx_max_deviation_hz,
-            squelch_dbfs: f32::NEG_INFINITY,
-            rf_seq: 0,
-            audio_seq: 0,
-            smeter_seq: 0,
-            last_rf: now,
-            last_audio: now,
-            last_smeter: now,
-        };
-        rt.send_tune();
-        rt
-    }
-
-    /// Frequency the operator is actually listening to: `lo + offset`.
-    fn displayed_rf_hz(&self) -> u64 {
-        (self.lo_hz as f64 + self.digital_offset_hz).max(0.0) as u64
-    }
-
-    fn send_tune(&mut self) {
-        let _ = self.telemetry_tx.send(RadioTelemetry::Tune(TuneState {
-            displayed_rf_hz: self.displayed_rf_hz(),
-            lo_hz: self.lo_hz,
-            digital_offset_hz: self.digital_offset_hz,
-            input_rate_hz: self.input_rate_hz,
-            dc_tunable: true,
-        }));
-    }
-
-    /// Apply every queued control command. May rebuild `chain` (on a
-    /// deviation change) and perform live iiod writes (LO / gain).
-    fn drain_commands(&mut self, chain: &mut NbfmRxChain, uri: &str) {
-        while let Ok(cmd) = self.control_rx.try_recv() {
-            match cmd {
-                RadioCommand::SetDigitalOffset(d) => {
-                    chain.set_channel_freq(d);
-                    self.digital_offset_hz = d as f64;
-                    self.send_tune();
-                }
-                RadioCommand::RetuneLo {
-                    lo_hz,
-                    new_digital_offset_hz,
-                } => {
-                    if let Err(e) = live_lo_write(uri, lo_hz) {
-                        eprintln!("[pluto-rx] live LO write to {lo_hz} Hz failed: {e}");
-                    }
-                    // New LO ⇒ the old chain state (FIR history, NCO
-                    // phase, IIR) is stale; reset before re-applying the
-                    // digital offset.
-                    chain.reset();
-                    chain.set_channel_freq(new_digital_offset_hz);
-                    self.lo_hz = lo_hz;
-                    self.digital_offset_hz = new_digital_offset_hz as f64;
-                    self.send_tune();
-                }
-                RadioCommand::SetGain(g) => {
-                    if let Err(e) = apply_gain_live(uri, &g) {
-                        eprintln!("[pluto-rx] live gain change failed: {e}");
-                    }
-                }
-                RadioCommand::SetAntenna(_) => {
-                    // Pluto is single-antenna; nothing to switch.
-                }
-                RadioCommand::SetDeviation(dev) => {
-                    *chain = NbfmRxChain::new(NbfmRxChainConfig::new(
-                        self.input_rate_hz,
-                        dev,
-                        0.0,
-                    ));
-                    chain.set_channel_freq(self.digital_offset_hz as f32);
-                    self.max_deviation_hz = dev;
-                }
-                RadioCommand::SetSquelch(t) => {
-                    self.squelch_dbfs = t;
-                }
-            }
+impl RadioHardware for PlutoHardware {
+    fn retune_lo(&mut self, lo_hz: u64) {
+        if let Err(e) = live_lo_write(&self.uri, lo_hz) {
+            eprintln!("[pluto-rx] live LO write to {lo_hz} Hz failed: {e}");
         }
     }
 
-    /// Wideband RF spectrum from the raw I/Q, throttled to
-    /// [`RF_FRAME_PERIOD`].
-    fn on_iq(&mut self, iq: &[Complex32]) {
-        if iq.len() < RF_FFT_SIZE || self.last_rf.elapsed() < RF_FRAME_PERIOD {
-            return;
+    fn set_gain(&mut self, gain: &GainSetting) {
+        if let Err(e) = apply_gain_live(&self.uri, gain) {
+            eprintln!("[pluto-rx] live gain change failed: {e}");
         }
-        self.rf_analyzer
-            .process_complex(&iq[..RF_FFT_SIZE], &mut self.rf_bins);
-        self.rf_seq += 1;
-        let _ = self.telemetry_tx.send(RadioTelemetry::RfSpectrum(SpectrumFrame {
-            bins_db: self.rf_bins.clone(),
-            center_hz: self.displayed_rf_hz() as f64,
-            span_hz: self.input_rate_hz as f64,
-            seq: self.rf_seq,
-        }));
-        self.last_rf = std::time::Instant::now();
-    }
-
-    /// S-meter + audio spectrum from the demodulated audio. Returns
-    /// `true` when the chunk should be muted (channel power below the
-    /// squelch threshold).
-    fn on_audio(&mut self, audio: &[f32], channel_power_lin: f32) -> bool {
-        let power_dbfs = if channel_power_lin > 0.0 {
-            10.0 * channel_power_lin.log10()
-        } else {
-            -140.0
-        };
-
-        if self.last_smeter.elapsed() >= SMETER_PERIOD {
-            self.smeter_seq += 1;
-            let _ = self.telemetry_tx.send(RadioTelemetry::SMeter {
-                channel_power_dbfs: power_dbfs,
-                seq: self.smeter_seq,
-            });
-            self.last_smeter = std::time::Instant::now();
-        }
-
-        // Keep a ring of the most recent AUDIO_FFT_SIZE samples.
-        self.audio_accum.extend_from_slice(audio);
-        if self.audio_accum.len() > AUDIO_FFT_SIZE {
-            let drop = self.audio_accum.len() - AUDIO_FFT_SIZE;
-            self.audio_accum.drain(..drop);
-        }
-        if self.audio_accum.len() == AUDIO_FFT_SIZE
-            && self.last_audio.elapsed() >= AUDIO_FRAME_PERIOD
-        {
-            self.audio_analyzer
-                .process_real(&self.audio_accum, &mut self.audio_bins);
-            self.audio_seq += 1;
-            let _ = self
-                .telemetry_tx
-                .send(RadioTelemetry::AudioSpectrum(SpectrumFrame {
-                    bins_db: self.audio_bins.clone(),
-                    center_hz: (AUDIO_RATE as f64) / 4.0,
-                    span_hz: (AUDIO_RATE as f64) / 2.0,
-                    seq: self.audio_seq,
-                }));
-            self.last_audio = std::time::Instant::now();
-        }
-
-        self.squelch_dbfs.is_finite() && power_dbfs < self.squelch_dbfs
     }
 }
 

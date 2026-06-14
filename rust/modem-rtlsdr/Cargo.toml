@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 modem-sdr-dsp = { path = "../modem-sdr-dsp" }
 modem-sdr = { path = "../modem-sdr" }
+modem-sdr-radio = { path = "../modem-sdr-radio" }
 modem-io = { path = "../modem-io" }
 num-complex = { workspace = true }
 thiserror = { workspace = true }

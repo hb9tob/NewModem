@@ -1,0 +1,14 @@
+[package]
+name = "modem-sdr-radio"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-agnostic Radio-tab runtime for the NBFM modem: wideband RF + audio spectra, S-meter, and hybrid digital-NCO / hardware-LO tune-command application. Shared by every SDR backend (Pluto / SDRplay / RTL-SDR) so the GUI sees one uniform telemetry + control surface. Hardware LO / gain writes are delegated to the backend via the RadioHardware trait."
+publish = false
+
+[dependencies]
+modem-sdr = { path = "../modem-sdr" }
+modem-sdr-dsp = { path = "../modem-sdr-dsp" }
+num-complex = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -29,14 +29,16 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use num_complex::Complex32;
 
+use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
 use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
+use modem_sdr_radio::{RadioInit, RadioRuntime};
 
 use crate::api::{
     self, sdrplay_api_CallbackFnsT, sdrplay_api_EventParamsT, sdrplay_api_EventT,
@@ -44,6 +46,15 @@ use crate::api::{
 };
 use crate::device::{self, SdrplayConfig, SdrplaySession, DEFAULT_LO_OFFSET_HZ};
 use crate::error::SdrplayError;
+use crate::hardware::SdrplayRadioHw;
+
+/// The two channel ends the backend hands the capture path to drive the
+/// Radio tab: telemetry out (spectra / S-meter / tune state) and control in
+/// (retune / gain / squelch). `None` for plain captures (loopback / CLI).
+pub struct RadioWiring {
+    pub telemetry_tx: Sender<RadioTelemetry>,
+    pub control_rx: Receiver<RadioCommand>,
+}
 
 
 /// Audio rate the chain produces. Locked to the modem core's
@@ -117,6 +128,38 @@ struct CallbackState {
     /// Frame error / dropped-sample counter, surfaced over stderr at
     /// the throttled tick.
     frame_errors: u64,
+    /// Radio-tab runtime (RF/audio spectra, S-meter, tune-command apply).
+    /// `None` for plain captures. Shared between the stream callback
+    /// (on_iq / on_audio) and the supervisor thread (apply_command), both
+    /// behind this struct's mutex.
+    radio: Option<RadioRuntime>,
+}
+
+impl CallbackState {
+    /// Feed the raw I/Q to the RF spectrum analyzer (no-op without radio).
+    fn radio_on_iq(&mut self, iq: &[Complex32]) {
+        if let Some(rt) = self.radio.as_mut() {
+            rt.on_iq(iq);
+        }
+    }
+
+    /// Feed the demodulated audio to the S-meter / audio spectrum. Returns
+    /// `true` when the chunk should be squelch-muted.
+    fn radio_on_audio(&mut self, audio: &[f32]) -> bool {
+        match self.radio.as_mut() {
+            Some(rt) => rt.on_audio(audio, self.chain.last_channel_power()),
+            None => false,
+        }
+    }
+
+    /// Apply the DSP side of a Radio-tab command to the chain (no-op
+    /// without radio). Called from the supervisor thread under this mutex;
+    /// the hardware side runs separately, outside the lock.
+    fn apply_radio_command(&mut self, cmd: RadioCommand) {
+        if let Some(rt) = self.radio.as_mut() {
+            rt.apply_command(cmd, &mut self.chain);
+        }
+    }
 }
 
 /// Open an SDRplay device for receive, kick off the API stream, and
@@ -128,14 +171,16 @@ struct CallbackState {
 /// know it's talking to an RSPduo rather than a soundcard.
 pub fn start(config: &SdrplayConfig) -> Result<(CaptureHandle, Receiver<Vec<f32>>), SdrplayError> {
     let session = device::open(config)?;
-    start_on(session)
+    start_on(session, None)
 }
 
-/// Same as [`start`] but takes an already-opened [`SdrplaySession`].
-/// Lets a future loopback test reuse one open device for two
-/// directions; production callers should prefer [`start`].
+/// Same as [`start`] but takes an already-opened [`SdrplaySession`] and an
+/// optional [`RadioWiring`] (Radio-tab telemetry + control). `None` gives a
+/// plain capture (loopback / CLI); `Some` wires the shared [`RadioRuntime`]
+/// and drives live retune / gain from the supervisor thread.
 pub fn start_on(
     mut session: SdrplaySession,
+    radio: Option<RadioWiring>,
 ) -> Result<(CaptureHandle, Receiver<Vec<f32>>), SdrplayError> {
     let (sample_tx, sample_rx) = mpsc::channel::<Vec<f32>>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -153,12 +198,36 @@ pub fn start_on(
         session.config.max_deviation_hz,
         DEFAULT_LO_OFFSET_HZ as f32,
     ));
+
+    // Build the Radio-tab runtime (if wired). Zero-IF model: the LO is
+    // programmed `DEFAULT_LO_OFFSET_HZ` above the user frequency and the
+    // chain's NCO already sits at `-offset`, so seed `digital_offset =
+    // -offset` ⇒ `displayed_rf = user`. `control_rx` goes to the supervisor.
+    let (radio_rt, control_rx) = match radio {
+        Some(w) => {
+            let init = RadioInit {
+                input_rate_hz: host_iq_rate_hz as u32,
+                lo_hz: session.config.rf_freq_hz + DEFAULT_LO_OFFSET_HZ as u64,
+                digital_offset_hz: -(DEFAULT_LO_OFFSET_HZ as f64),
+                lo_offset_hz: DEFAULT_LO_OFFSET_HZ as f32,
+                max_deviation_hz: session.config.max_deviation_hz,
+                dc_tunable: false,
+            };
+            (
+                Some(RadioRuntime::new(w.telemetry_tx, init)),
+                Some(w.control_rx),
+            )
+        }
+        None => (None, None),
+    };
+
     let cb_state = Arc::new(Mutex::new(CallbackState {
         chain,
         pending: Vec::with_capacity(TARGET_CHUNK_SAMPLES * 2),
         sample_tx,
         total_iq_samples: 0,
         frame_errors: 0,
+        radio: radio_rt,
     }));
 
     // Kick off the daemon-side stream. The callback functions are
@@ -207,7 +276,7 @@ pub fn start_on(
     let cb_state_for_thread = cb_state.clone();
     let thread = thread::spawn(move || {
         let ctx = cb_ctx_addr as *mut std::ffi::c_void;
-        run_supervisor(&mut session, stop_thread, cb_state_for_thread, ctx);
+        run_supervisor(&mut session, stop_thread, cb_state_for_thread, ctx, control_rx);
     });
 
     Ok((
@@ -227,16 +296,42 @@ fn run_supervisor(
     stop: Arc<AtomicBool>,
     cb_state: Arc<Mutex<CallbackState>>,
     cb_ctx_ptr: *mut std::ffi::c_void,
+    control_rx: Option<Receiver<RadioCommand>>,
 ) {
+    // Live tuner control — built once from the open session. This thread is
+    // the only non-callback context that may call into the API, so live
+    // retune / gain via `sdrplay_api_Update` happens here, never in the
+    // daemon's stream callback.
+    let mut hw = match (&control_rx, api::api()) {
+        (Some(_), Ok(lib)) => Some(SdrplayRadioHw::new(session, lib)),
+        _ => None,
+    };
     let mut last_tick = std::time::Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        // The API delivers samples on its own thread; we wake every
-        // 200 ms only to print stats / honour the stop flag. The
-        // mpsc backpressure is handled callback-side.
-        thread::sleep(Duration::from_millis(200));
+        // Drain one Radio command (waking at most every 200 ms for stats /
+        // the stop flag). Without a control channel, just sleep — the API
+        // delivers samples on its own thread; mpsc backpressure is handled
+        // callback-side.
+        match control_rx.as_ref() {
+            Some(rx) => match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(cmd) => {
+                    // Hardware write (sdrplay_api_Update) OUTSIDE the lock so
+                    // the daemon stream callback never blocks on this mutex.
+                    if let Some(hw) = hw.as_mut() {
+                        RadioRuntime::run_hardware(&cmd, hw);
+                    }
+                    if let Ok(mut g) = cb_state.lock() {
+                        g.apply_radio_command(cmd);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => thread::sleep(Duration::from_millis(200)),
+        }
         if last_tick.elapsed() >= STATUS_TICK_PERIOD {
             if let Ok(g) = cb_state.lock() {
                 eprintln!(
@@ -328,9 +423,15 @@ unsafe extern "C" fn stream_a_callback(
         .collect();
 
     g.total_iq_samples = g.total_iq_samples.saturating_add(n as u64);
-    let audio = g.chain.process(&iq);
+    // Radio tab: wideband RF spectrum from the raw I/Q (before the chain).
+    g.radio_on_iq(&iq);
+    let mut audio = g.chain.process(&iq);
     if audio.is_empty() {
         return;
+    }
+    // Radio tab: S-meter + audio spectrum; mute the chunk under squelch.
+    if g.radio_on_audio(&audio) {
+        audio.iter_mut().for_each(|s| *s = 0.0);
     }
 
     // Accumulate, flush full TARGET_CHUNK_SAMPLES chunks. Same

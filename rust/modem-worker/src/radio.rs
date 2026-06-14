@@ -58,9 +58,14 @@ pub struct RadioTuner {
     nominal_digital_offset_hz: f64,
     dc_tunable: bool,
     dc_guard_hz: f64,
-    digital_window_hz: f64,
     input_rate_hz: u32,
 }
+
+/// Fraction of the captured span kept clear at each band edge: a move stays
+/// digital only while the channel sits inside the inner `1 − 2·EDGE_MARGIN`
+/// of the band, otherwise the LO retunes. So the digital half-window is
+/// `(0.5 − EDGE_MARGIN) · span`.
+const EDGE_MARGIN_FRAC: f64 = 0.15;
 
 impl RadioTuner {
     /// Seed the tuner from the backend's tuning capabilities and the
@@ -76,7 +81,6 @@ impl RadioTuner {
             nominal_digital_offset_hz: nominal,
             dc_tunable: tuning.dc_tunable,
             dc_guard_hz: tuning.dc_guard_hz,
-            digital_window_hz: tuning.digital_window_hz,
             input_rate_hz,
         }
     }
@@ -92,7 +96,10 @@ impl RadioTuner {
     /// internal model. Returns the command to send to the capture thread.
     pub fn tune_to(&mut self, target_rf_hz: u64) -> RadioCommand {
         let d = target_rf_hz as f64 - self.lo_hz as f64;
-        let within_window = d.abs() <= self.digital_window_hz;
+        // Digital half-window scales with the captured span: keep 15% clear
+        // at each edge, so anything inside ±(0.35 · span) stays digital.
+        let digital_window_hz = (0.5 - EDGE_MARGIN_FRAC) * self.input_rate_hz as f64;
+        let within_window = d.abs() <= digital_window_hz;
         let dc_ok = self.dc_tunable || d.abs() >= self.dc_guard_hz;
         if within_window && dc_ok {
             self.displayed_rf_hz = target_rf_hz;

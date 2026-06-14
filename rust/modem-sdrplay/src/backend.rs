@@ -401,8 +401,19 @@ impl SdrDevice for SdrplayDevice {
             backend: BACKEND_ID,
             detail: "device already started — re-open to RX again".into(),
         })?;
-        let (handle, rx) = rx::start_on(session).map_err(SdrError::backend)?;
-        Ok((SdrCaptureHandle::new(handle), rx))
+        // Always wire the Radio-tab channels: the telemetry/control overhead
+        // is negligible and the GUI decides whether to consume them.
+        let (telemetry_tx, telemetry_rx) = std::sync::mpsc::channel();
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let wiring = rx::RadioWiring {
+            telemetry_tx,
+            control_rx,
+        };
+        let (handle, rx) = rx::start_on(session, Some(wiring)).map_err(SdrError::backend)?;
+        Ok((
+            SdrCaptureHandle::with_radio(handle, telemetry_rx, control_tx),
+            rx,
+        ))
     }
 
     fn tx_sink(&self) -> Option<Arc<dyn modem_io::SampleSink>> {

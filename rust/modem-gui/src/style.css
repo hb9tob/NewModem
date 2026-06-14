@@ -255,6 +255,17 @@ body {
 .tab-bar .tab:hover {
   color: #e0e0e0;
 }
+/* Tab icons render only in the kiosk/narrow layout (see the
+   max-width:900px block); on the desktop the text labels carry the tabs.
+   Stroke follows the button colour so the active/hover states apply. */
+.tab-icon {
+  display: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .tab-bar .tab.active {
   color: #9ccc65;
   background: #1e1e1e;
@@ -2235,17 +2246,33 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   /* Baseline: smaller font, no enlarged controls. */
   body { font-size: 12px; }
 
-  /* Tab bar — 7 tabs (Info hidden) ~110 px each on 800 px wide. */
+  /* Tab bar — stacked icon + small label so the 8 tabs (Info hidden) fit
+     on one row at 800 px without truncating the French labels. Each tab is
+     a comfortable single-tap target (icon 22 px over a ~9 px caption). */
   .tab-bar {
     gap: 1px;
     padding: 1px;
     flex-wrap: nowrap;
   }
   .tab-bar .tab {
-    padding: 4px 4px;
-    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 3px 2px;
     min-width: 0;
     flex: 1 1 0;
+  }
+  .tab-bar .tab .tab-icon {
+    display: block;
+    width: 22px;
+    height: 22px;
+  }
+  .tab-bar .tab .tab-label {
+    max-width: 100%;
+    font-size: 8.5px;
+    line-height: 1.1;
+    letter-spacing: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2693,23 +2720,28 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 }
 .radio-top {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(240px, 1.3fr) minmax(240px, 1.3fr);
-  gap: 0.6rem;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(210px, 1.3fr) minmax(210px, 1.3fr);
+  gap: 0.4rem;
   flex: 0 0 auto;
-  min-height: 200px;
+  /* Hard cap: the top block must never exceed ~18% of the tab height so
+     the RF spectrum + waterfall below always keep the bulk of the screen. */
+  max-height: 18vh;
+  min-height: 0;
+  overflow: hidden;
 }
 .radio-card {
   background: #15171c;
   border: 1px solid #2a2d34;
   border-radius: 6px;
-  padding: 0.5rem 0.6rem;
+  padding: 0.25rem 0.45rem;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.2rem;
   min-width: 0;
+  overflow: hidden;
 }
 .radio-card-title {
-  font-size: 0.78rem;
+  font-size: 0.66rem;
   color: #7fd1ff;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -2717,16 +2749,83 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 .radio-smeter {
   width: 100%;
   flex: 1 1 auto;
-  min-height: 120px;
+  min-height: 48px;
 }
 .radio-smeter-label {
   text-align: center;
   font-variant-numeric: tabular-nums;
   color: #cfd2d8;
-  font-size: 0.85rem;
+  font-size: 0.72rem;
+}
+.radio-sdr-params-btn {
+  align-self: center;
+  padding: 0.12rem 0.5rem;
+  font-size: 0.7rem;
+  background: #1c2129;
+  color: #9ccc65;
+  border: 1px solid #2a3845;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.radio-sdr-params-btn:hover {
+  background: #243040;
+}
+/* SDR parameters popover — same overlay pattern as .select-picker-modal. */
+.radio-sdr-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.88);
+  z-index: 260;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+}
+.radio-sdr-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.7rem 0.8rem;
+  width: 100%;
+  max-width: 560px;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.radio-sdr-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.radio-sdr-title {
+  font-weight: 600;
+  color: #7fd1ff;
+  letter-spacing: 0.02em;
+}
+.radio-sdr-close {
+  font-size: 1.3rem;
+  color: #ef5350;
+  cursor: pointer;
+  padding: 0 0.4rem;
+  user-select: none;
+}
+.radio-sdr-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.radio-sdr-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+#radio-sdr-restart {
+  padding: 0.3rem 0.7rem;
 }
 .radio-freq-display {
-  font-size: 1.7rem;
+  font-size: 1rem;
   font-variant-numeric: tabular-nums;
   color: #e8ffe8;
   text-align: center;
@@ -2748,23 +2847,26 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 .radio-band-presets {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.3rem;
+  gap: 0.2rem;
 }
 .radio-step,
 .radio-band {
   flex: 1 1 auto;
-  padding: 0.25rem 0.3rem;
-  font-size: 0.8rem;
+  padding: 0.12rem 0.25rem;
+  font-size: 0.68rem;
 }
 .radio-tune-info {
-  font-size: 0.72rem;
+  font-size: 0.62rem;
   color: #8a909a;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .radio-audio-fft {
   width: 100%;
   flex: 1 1 auto;
-  min-height: 90px;
+  min-height: 56px;
   background: #0a0a0a;
   border-radius: 4px;
 }
@@ -2803,6 +2905,19 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 .radio-ctl input[type="range"] {
   width: 110px;
 }
+/* Backend-aware gain/AGC host: keep the dynamically-built pluto rows inline
+   and compact inside the horizontal control bar. */
+.radio-gain-host {
+  flex-wrap: wrap;
+}
+.radio-gain-host .pluto-row {
+  margin-top: 0;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+}
+.radio-gain-host .pluto-field input[type="number"] {
+  width: 4.5em;
+}
 .radio-spectrum-wrap {
   flex: 1 1 auto;
   display: flex;
@@ -2814,12 +2929,30 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 }
 .radio-rf-fft {
   width: 100%;
-  flex: 0 0 35%;
+  /* Fixed slice for the line spectrum; the waterfall takes everything
+     else so it fills the rest of the screen. */
+  flex: 0 0 26%;
+  min-height: 70px;
   background: #0a0a0a;
+  cursor: pointer;
 }
 .radio-waterfall {
   width: 100%;
   flex: 1 1 auto;
   min-height: 0;
   background: #000;
+  cursor: pointer;
+}
+/* Frequency ruler pinned at the very bottom, under the waterfall. The RF
+   spectrum and waterfall share its horizontal Hz mapping (center_hz ±
+   span_hz/2). Small, MHz labels. Height locked hard so it can never grow
+   and steal the waterfall's space. */
+.radio-freq-scale {
+  width: 100%;
+  height: 16px;
+  min-height: 16px;
+  max-height: 16px;
+  flex: 0 0 16px;
+  background: #101216;
+  border-top: 1px solid #2a2d34;
 }

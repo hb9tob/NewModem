@@ -141,15 +141,20 @@ function refreshSettingsRxWarn() {
   if (deemph) deemph.disabled = rxRunning;
 }
 
-// Channel tab: we stop RX and TX in progress on entry. The attenuation
-// setting applies to the next TX, and an RX running while we twiddle the
-// slider would risk being saturated by our own test signal later (phase B).
+// Channel tab: we stop TX in progress on entry (the attenuation setting
+// applies to the next TX, and a running TX would interfere with sounding).
+// RX is stopped too for sound-card sources — the standalone sounder capture
+// needs the audio device free. But an SDR receiver is KEPT running: the
+// sounder taps its live audio (raw-capture tee, see runSounderRxCaptureToggle)
+// instead of opening the device a second time, so the operator can sound the
+// channel with the SDR without losing reception.
 async function stopRxAndTxForChannelTab() {
   const stopBtn = document.getElementById("btn-stop");
   const txStopBtn = document.getElementById("tx-btn-stop");
   const rxRunning = stopBtn && !stopBtn.disabled;
   const txRunning = txStopBtn && !txStopBtn.disabled;
-  if (rxRunning) {
+  const rxIsSdr = getSelectedBackendId("rx-device-select") !== null;
+  if (rxRunning && !rxIsSdr) {
     try { await stopCapture(); } catch (err) {
       logEvent("channel_tab_stop_rx_error", { message: String(err) });
     }
@@ -630,7 +635,28 @@ let currentSettings = {
   full_duplex_enabled: false,
   overlays: [],
   active_overlay: 0,
+  // Radio-tab monitoring controls (mirror of the Rust RadioUiSettings).
+  radio: {
+    squelch_enabled: false,
+    squelch_dbfs: -80,
+    monitor_device: null,
+    monitor_volume: 0.80,
+    smeter_cal_trim_db: 0,
+  },
 };
+
+// Backfill the radio-settings block so the rest of the code can read
+// currentSettings.radio.* unconditionally — covers the get_settings
+// catch-fallback and any pre-`radio` settings file.
+function ensureRadioSettings() {
+  const r = currentSettings.radio || (currentSettings.radio = {});
+  if (typeof r.squelch_enabled !== "boolean") r.squelch_enabled = false;
+  if (!Number.isFinite(r.squelch_dbfs)) r.squelch_dbfs = -80;
+  if (r.monitor_device === undefined) r.monitor_device = null;
+  if (!Number.isFinite(r.monitor_volume)) r.monitor_volume = 0.80;
+  if (!Number.isFinite(r.smeter_cal_trim_db)) r.smeter_cal_trim_db = 0;
+  return r;
+}
 
 // Default empty overlay slots (mirrors `default_overlay_slots()` on the
 // Rust side). Slot 0 is the immutable "Aucun" entry.
@@ -1051,6 +1077,17 @@ function renderSdrPanel(direction) {
     if (hintEl) hintEl.textContent = "";
     return;
   }
+  // RX SDR parameters now live entirely on the Radio tab: tuning + the
+  // gain/AGC bar (renderRadioGain) + the "⚙ Réglages SDR" popover
+  // (renderRadioSdrParams). Keep the Settings RX device fieldset free of
+  // duplicate (and potentially conflicting) controls — show only a pointer.
+  if (direction === "rx") {
+    panel.hidden = false;
+    panel.dataset.backend = backendId;
+    rowsEl.innerHTML = "";
+    if (hintEl) hintEl.textContent = t("settings.rx_sdr_in_radio_tab");
+    return;
+  }
   panel.hidden = false;
   panel.dataset.backend = backendId;
   const cfg = ensureBackendConfig(backendId);
@@ -1080,6 +1117,11 @@ function renderSdrPanel(direction) {
 function refreshSdrPanels() {
   renderSdrPanel("rx");
   renderSdrPanel("tx");
+  // Keep the Radio-tab gain/AGC controls and the SDR popover in sync (e.g.
+  // an AGC change re-renders to enable/disable the gain inputs).
+  renderRadioGain();
+  const modal = document.getElementById("radio-sdr-modal");
+  if (modal && !modal.hidden) renderRadioSdrParams();
 }
 
 function hasFeatureToggles(caps) {
@@ -1681,6 +1723,7 @@ async function loadSettings() {
     };
   }
   ensureOverlaySlots();
+  ensureRadioSettings();
   const call = document.getElementById("callsign-input");
   if (call) call.value = currentSettings.callsign || "";
   // Fetch profile list from modem-core BEFORE any code that touches the
@@ -2213,6 +2256,12 @@ async function startCapture() {
     // RX just came up: if TX is also running and FDX is on, surface the
     // dedicated TX bar with whatever progress we already had buffered.
     refreshDuplexTxBar();
+    // Radio monitoring is independent of the active tab: once an SDR
+    // capture is up, its session exists, so resume the persisted squelch /
+    // monitor output / volume now. The operator hears the radio and gets
+    // squelch without first opening the Radio tab. Soft-ignored for non-SDR
+    // sources (no radio session → invokeRadio swallows "Radio indisponible").
+    pushRadioControlsLive();
     logEvent("start", { device: deviceName, profile, forced });
   } catch (err) {
     status.textContent = t("status.error_start", { err });
@@ -5467,6 +5516,64 @@ function radioLevelRange() {
   return hi > lo ? [lo, hi] : [lo, lo + 1];
 }
 
+// ── S-meter calibration (approximate). The backend reports the channel
+// power in dBFS; the S scale needs an absolute level in dBm at the SMA
+// input. The Pluto/AD9363 front-end is roughly linear in its manual
+// "hardwaregain", so:
+//
+//   P_dBm ≈ channel_power_dbfs − gain_dB + PLUTO_FS_DBM + trim_dB
+//
+// PLUTO_FS_DBM is the input power that drives the ADC to 0 dBFS at 0 dB
+// gain — taken as ~0 dBm, a coarse board constant. The operator nudges
+// `trim_dB` (the "Cal S" slider) to align the scale on a signal of known
+// level, which absorbs the per-unit offset we can't know a priori.
+const PLUTO_FS_DBM = 0; // input power for 0 dBFS at 0 dB gain (approx.)
+
+// IARU Region 1 S-meter standard above 30 MHz: S9 = −93 dBm, one S-unit
+// = 6 dB. All band presets here are VHF/UHF, so this is the reference.
+const SMETER_S9_DBM = -93;
+const SMETER_DB_PER_UNIT = 6;
+
+// Best-effort effective RX gain in dB, derived from the active backend's
+// current gain setting — feeds the S-meter dBFS→dBm conversion. Exactness
+// isn't critical (the "Cal S" trim absorbs the offset); we just want the
+// needle to track gain changes in roughly the right direction.
+function radioGainDb() {
+  const backendId = getSelectedBackendId("rx-device-select");
+  const cfg = backendId ? ensureBackendConfig(backendId) : null;
+  const g = cfg && cfg.gain;
+  if (g && g.kind === "manual") {
+    if (g.shape === "db" && Number.isFinite(g.db)) return g.db;
+    if (g.shape === "lna_plus_if" && Number.isFinite(g.if_grdb)) {
+      // gRdB is a gain *reduction* (20..59): higher = less gain. LNA state
+      // ignored (no gain table here) — the trim covers the residual.
+      return 59 - g.if_grdb;
+    }
+    if (g.shape === "discrete" && Number.isFinite(g.step_idx)) {
+      const ladder = getCapsForSelected("rx-device-select")?.manual_gain?.DbDiscrete?.steps_db;
+      if (ladder && ladder.length) {
+        return ladder[Math.min(Math.max(0, g.step_idx), ladder.length - 1)];
+      }
+    }
+  }
+  // AGC (or unknown shape): hardware gain isn't reported back — mid estimate.
+  return 30;
+}
+
+function radioCalTrimDb() {
+  return parseFloat(document.getElementById("radio-cal-trim")?.value ?? "0");
+}
+
+// dBFS channel power → estimated antenna power in dBm.
+function radioDbfsToDbm(dbfs) {
+  return dbfs - radioGainDb() + PLUTO_FS_DBM + radioCalTrimDb();
+}
+
+// dBm → continuous S-unit value (S9 = 9, S9+20 dB = 12.33, …).
+function radioDbmToSUnits(dbm) {
+  return 9 + (dbm - SMETER_S9_DBM) / SMETER_DB_PER_UNIT;
+}
+
 function sizeRadioCanvas(canvas) {
   if (!canvas) return null;
   const dpr = window.devicePixelRatio || 1;
@@ -5531,6 +5638,16 @@ function tuneRadioTo(hz) {
   const input = document.getElementById("radio-freq-input");
   if (input) input.value = (clamped / 1e6).toFixed(6);
   invokeRadio("set_radio_freq", { hz: clamped });
+  // Persist the dialed RF into the active RX backend's config so a later
+  // plain "Start RX" (which reads the saved SDR config) reuses the last
+  // frequency tuned here — the Settings RX panel no longer carries this
+  // field now that all SDR RX controls live on the Radio tab.
+  const backendId = getSelectedBackendId("rx-device-select");
+  if (backendId) {
+    const cfg = ensureBackendConfig(backendId);
+    cfg.rx_freq_hz = clamped;
+    persistSettings();
+  }
 }
 
 async function setupRadioTab() {
@@ -5559,28 +5676,26 @@ async function setupRadioTab() {
     invokeRadio("recenter_lo");
   });
 
-  // RX gain.
-  const gainMode = document.getElementById("radio-gain-mode");
-  const gainDb = document.getElementById("radio-gain-db");
-  const gainLabel = document.getElementById("radio-gain-label");
-  const sendGain = () => {
-    const manual = gainMode.value === "manual";
-    if (gainDb) gainDb.disabled = !manual;
-    if (gainLabel) gainLabel.textContent = manual ? `${gainDb.value} dB` : "AGC";
-    invokeRadio("set_rx_gain", {
-      agcMode: gainMode.value,
-      gainDb: Number(gainDb.value),
-    });
-  };
-  gainMode?.addEventListener("change", sendGain);
-  gainDb?.addEventListener("input", () => {
-    if (gainLabel) gainLabel.textContent = `${gainDb.value} dB`;
-  });
-  gainDb?.addEventListener("change", sendGain);
+  // RX gain / AGC — backend-aware controls built by renderRadioGain() from
+  // the active SDR's capabilities. A single delegated `change` listener on
+  // the host sends the new gain live (set_radio_gain): the builders mutate
+  // cfg.gain and bubble their change event up to us, so cfg is current here.
+  const gainHost = document.getElementById("radio-gain-host");
+  if (gainHost) gainHost.addEventListener("change", sendRadioGainLive);
+  renderRadioGain();
 
-  // Deviation / channel width.
+  // Deviation / channel width. Apply live and persist into the active RX
+  // backend's config (max_deviation_hz) — same rationale as tuneRadioTo:
+  // the Settings RX panel no longer carries this field.
   document.getElementById("radio-deviation")?.addEventListener("change", (e) => {
-    invokeRadio("set_deviation", { hz: Number(e.target.value) });
+    const hz = Number(e.target.value);
+    invokeRadio("set_deviation", { hz });
+    const backendId = getSelectedBackendId("rx-device-select");
+    if (backendId) {
+      const cfg = ensureBackendConfig(backendId);
+      cfg.max_deviation_hz = hz;
+      persistSettings();
+    }
   });
 
   // Squelch.
@@ -5593,12 +5708,47 @@ async function setupRadioTab() {
       dbfs: Number(sqDb.value),
       enabled: !!sqOn.checked,
     });
+    const r = ensureRadioSettings();
+    r.squelch_enabled = !!sqOn.checked;
+    r.squelch_dbfs = Number(sqDb.value);
+    persistSettings();
   };
   sqOn?.addEventListener("change", sendSquelch);
   sqDb?.addEventListener("input", () => {
     if (sqLabel) sqLabel.textContent = `${sqDb.value} dB`;
   });
   sqDb?.addEventListener("change", sendSquelch);
+
+  // S-meter calibration trim. Read live by drawRadioSmeter — purely a
+  // display offset, no backend round-trip.
+  const calTrim = document.getElementById("radio-cal-trim");
+  const calLabel = document.getElementById("radio-cal-trim-label");
+  const fmtTrim = () => {
+    if (calLabel) {
+      const v = Number(calTrim.value);
+      calLabel.textContent = `${v > 0 ? "+" : ""}${v} dB`;
+    }
+  };
+  calTrim?.addEventListener("input", fmtTrim);
+  calTrim?.addEventListener("change", () => {
+    ensureRadioSettings().smeter_cal_trim_db = Number(calTrim.value);
+    persistSettings();
+  });
+  fmtTrim();
+
+  // Click-to-tune on the RF spectrum and the waterfall: snap to the actual
+  // signal. The clicked x maps to a frequency, then we pull onto the
+  // strongest RF bin within a small window around it (so a slightly-off
+  // click still lands on the carrier), and round to the nearest kHz for a
+  // clean readout. No channel raster — stays correct for the future SSB /
+  // QO-100 linear-transponder mode. Fine-trim with the ±1k buttons.
+  for (const id of ["radio-rf-fft", "radio-waterfall"]) {
+    const cv = document.getElementById(id);
+    cv?.addEventListener("click", (e) => {
+      const hz = radioSnapHz(cv, e.clientX);
+      if (hz !== null) tuneRadioTo(hz);
+    });
+  }
 
   // Monitor output device list + selection.
   const monSel = document.getElementById("radio-monitor-out");
@@ -5617,11 +5767,13 @@ async function setupRadioTab() {
     }
     monSel.addEventListener("change", () => {
       invokeRadio("set_monitor_output", { device: monSel.value || null });
+      ensureRadioSettings().monitor_device = monSel.value || null;
       // Push the current volume right after enabling a device.
       if (monSel.value) {
         const vol = Number(document.getElementById("radio-volume")?.value ?? 80) / 100;
         invokeRadio("set_monitor_volume", { gain: vol });
       }
+      persistSettings();
     });
   }
   const vol = document.getElementById("radio-volume");
@@ -5630,10 +5782,170 @@ async function setupRadioTab() {
     if (volLabel) volLabel.textContent = `${vol.value} %`;
     invokeRadio("set_monitor_volume", { gain: Number(vol.value) / 100 });
   });
+  // Persist on commit only (not every input tick → no disk-write storm).
+  vol?.addEventListener("change", () => {
+    ensureRadioSettings().monitor_volume = Number(vol.value) / 100;
+    persistSettings();
+  });
+
+  // Restore the persisted control values now that the monitor list and
+  // every listener are in place.
+  restoreRadioControls();
+}
+
+// Reflect the persisted Radio-tab monitoring settings into the controls
+// (values + labels). Does not call the backend — pushRadioControlsLive()
+// handles that once a session is up. Called at setup and on tab entry.
+function restoreRadioControls() {
+  const r = ensureRadioSettings();
+  const sqOn = document.getElementById("radio-squelch-on");
+  const sqDb = document.getElementById("radio-squelch-db");
+  const sqLabel = document.getElementById("radio-squelch-label");
+  if (sqOn) sqOn.checked = !!r.squelch_enabled;
+  if (sqDb) sqDb.value = String(r.squelch_dbfs);
+  if (sqLabel) sqLabel.textContent = `${r.squelch_dbfs} dB`;
+
+  const calTrim = document.getElementById("radio-cal-trim");
+  const calLabel = document.getElementById("radio-cal-trim-label");
+  if (calTrim) calTrim.value = String(r.smeter_cal_trim_db);
+  if (calLabel) {
+    const v = Number(r.smeter_cal_trim_db);
+    calLabel.textContent = `${v > 0 ? "+" : ""}${v} dB`;
+  }
+
+  const vol = document.getElementById("radio-volume");
+  const volLabel = document.getElementById("radio-volume-label");
+  const pct = Math.round(r.monitor_volume * 100);
+  if (vol) vol.value = String(pct);
+  if (volLabel) volLabel.textContent = `${pct} %`;
+
+  // The monitor device option only exists once list_output_audio_devices
+  // has populated the select; setting an absent value is a no-op (stays
+  // "off"), which is the safe fallback when the device is unplugged.
+  const monSel = document.getElementById("radio-monitor-out");
+  if (monSel && r.monitor_device) monSel.value = r.monitor_device;
+}
+
+// Push the persisted monitoring settings to the live SDR session. Safe to
+// call with no active capture — invokeRadio soft-ignores "Radio
+// indisponible". Run on Radio-tab entry so a freshly-started session
+// picks up the squelch / monitor device / volume the operator last used.
+function pushRadioControlsLive() {
+  const r = ensureRadioSettings();
+  invokeRadio("set_squelch", { dbfs: r.squelch_dbfs, enabled: !!r.squelch_enabled });
+  if (r.monitor_device) {
+    invokeRadio("set_monitor_output", { device: r.monitor_device });
+    invokeRadio("set_monitor_volume", { gain: r.monitor_volume });
+  }
+}
+
+// Build the backend-aware gain / AGC controls into the Radio-tab control
+// bar, for the active RX backend. Reuses the same row builders as the
+// Settings panel (continuous dB / LNA+IF / discrete ladder + real AGC
+// modes). Persists to cfg.gain; the host's delegated `change` listener
+// sends it live.
+function renderRadioGain() {
+  const host = document.getElementById("radio-gain-host");
+  if (!host) return;
+  // Drop previously-built rows, keep the leading "Gain RX" label span.
+  host.querySelectorAll(".pluto-row").forEach((n) => n.remove());
+  const backendId = getSelectedBackendId("rx-device-select");
+  const info = backendId ? sdrBackends.get(backendId) : null;
+  if (!info) return;
+  const caps = getCapsForSelected("rx-device-select") || info.capabilities;
+  const cfg = ensureBackendConfig(backendId);
+  if (caps.agc_modes && caps.agc_modes.length > 0) {
+    host.appendChild(buildAgcRow("rx", backendId, caps, cfg));
+  }
+  host.appendChild(buildGainRow("rx", backendId, caps, cfg));
+}
+
+// Push the active backend's current gain setting to the running capture
+// (live LNA/IF/AGC change). No-op when no SDR session is active.
+function sendRadioGainLive() {
+  const backendId = getSelectedBackendId("rx-device-select");
+  if (!backendId) return;
+  const cfg = ensureBackendConfig(backendId);
+  if (cfg && cfg.gain) invokeRadio("set_radio_gain", { gain: cfg.gain });
+}
+
+// ── Radio-tab SDR-parameters popover ("⚙ Réglages SDR" under the S-meter).
+// Reuses the same per-backend row builders as the Settings tab, rendered for
+// the active RX backend. Live-tunable params (gain / squelch / width) are
+// already on the bottom control bar; this popover covers the rest (AGC mode,
+// antenna, LNA/IF, bias-T / notches, backend extras), most of which apply on
+// the next RX start — hence the note + restart button.
+function renderRadioSdrParams() {
+  const rows = document.getElementById("radio-sdr-rows");
+  if (!rows) return;
+  const backendId = getSelectedBackendId("rx-device-select");
+  const info = backendId ? sdrBackends.get(backendId) : null;
+  if (!info) {
+    rows.innerHTML = `<span class="tx-hint">${escapeHtml(t("radio.sdr_params_unavailable"))}</span>`;
+    return;
+  }
+  const caps = getCapsForSelected("rx-device-select") || info.capabilities;
+  const cfg = ensureBackendConfig(backendId);
+  rows.innerHTML = "";
+  // Gain / AGC live on the Radio tab's control bar (renderRadioGain), not
+  // here — keeping them in both places caused conflicting values.
+  if (caps.antennas && caps.antennas.length > 0) {
+    rows.appendChild(buildAntennaRow(backendId, caps, cfg));
+  }
+  if (hasFeatureToggles(caps)) {
+    rows.appendChild(buildFeatureRow("rx", backendId, caps, cfg));
+  }
+  rows.appendChild(buildBackendExtrasRow("rx", backendId, caps, cfg));
+}
+
+function openRadioSdrModal() {
+  const modal = document.getElementById("radio-sdr-modal");
+  if (!modal) return;
+  renderRadioSdrParams();
+  modal.hidden = false;
+}
+
+function closeRadioSdrModal() {
+  const modal = document.getElementById("radio-sdr-modal");
+  if (modal) modal.hidden = true;
+}
+
+// Stop then restart the RX capture so persisted SDR-config changes (antenna,
+// AGC, bias-T, decimation, …) take effect. Frequency / gain are live and
+// don't need this.
+async function restartRadioCapture() {
+  closeRadioSdrModal();
+  await stopCapture();
+  await startCapture();
+}
+
+function setupRadioSdrModal() {
+  const btn = document.getElementById("radio-sdr-params-btn");
+  const modal = document.getElementById("radio-sdr-modal");
+  if (!btn || !modal) return;
+  btn.addEventListener("click", openRadioSdrModal);
+  document.getElementById("radio-sdr-close")?.addEventListener("click", closeRadioSdrModal);
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) closeRadioSdrModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!modal.hidden && e.key === "Escape") {
+      e.preventDefault();
+      closeRadioSdrModal();
+    }
+  });
+  document
+    .getElementById("radio-sdr-restart")
+    ?.addEventListener("click", () => {
+      restartRadioCapture().catch((err) => console.error("[radio] restart", err));
+    });
 }
 
 function startRadioRender() {
   refreshRadioTabVisibility();
+  renderRadioGain();
+  seedRadioFreqInput();
+  pushRadioControlsLive();
   if (radioState.rafId !== null) return;
   radioState.waterfallInit = false;
   const loop = () => {
@@ -5641,6 +5953,30 @@ function startRadioRender() {
     radioState.rafId = requestAnimationFrame(loop);
   };
   radioState.rafId = requestAnimationFrame(loop);
+}
+
+// Pre-fill the Radio-tab frequency entry from the active RX backend's
+// persisted rx_freq_hz when no live session is driving the display yet.
+// This closes the round-trip with tuneRadioTo (which persists the dialed
+// RF): reopening the app shows the last listening frequency. A running
+// session takes over via radioState.tune, so only seed when absent and the
+// input is still blank — never clobber what the operator is typing.
+function seedRadioFreqInput() {
+  const backendId = getSelectedBackendId("rx-device-select");
+  if (!backendId) return;
+  const cfg = ensureBackendConfig(backendId);
+  // Frequency: only when no live session is driving the display and the
+  // operator isn't mid-edit (blank input) — never clobber either.
+  const input = document.getElementById("radio-freq-input");
+  if (input && !input.value && !radioState.tune &&
+      Number.isFinite(cfg.rx_freq_hz) && cfg.rx_freq_hz > 0) {
+    input.value = (cfg.rx_freq_hz / 1e6).toFixed(6);
+  }
+  // Channel width: reflect the persisted deviation (not session-driven).
+  const dev = document.getElementById("radio-deviation");
+  if (dev && Number.isFinite(cfg.max_deviation_hz)) {
+    dev.value = String(Math.round(cfg.max_deviation_hz));
+  }
 }
 
 function stopRadioRender() {
@@ -5654,6 +5990,21 @@ function renderRadio() {
   drawRadioSmeter();
   drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6");
   drawRadioRf();
+}
+
+// The dial spans S1 (left) … S9+60 dB (right). Ticks are placed at their
+// true position on the dB scale (S-units 1..9 are 6 dB apart, the +20/+40/
+// +60 over-S9 marks are 20 dB apart), so the needle reads a calibrated S.
+const SMETER_DIAL_MIN_U = radioDbmToSUnits(SMETER_S9_DBM - 8 * SMETER_DB_PER_UNIT); // S1
+const SMETER_DIAL_MAX_U = radioDbmToSUnits(SMETER_S9_DBM + 60); // S9+60 dB
+const SMETER_ARC_START = Math.PI * 1.15;
+const SMETER_ARC_SWEEP = Math.PI * 0.7;
+
+function smeterFrac(sUnits) {
+  return Math.max(
+    0,
+    Math.min(1, (sUnits - SMETER_DIAL_MIN_U) / (SMETER_DIAL_MAX_U - SMETER_DIAL_MIN_U)),
+  );
 }
 
 function drawRadioSmeter() {
@@ -5670,41 +6021,71 @@ function drawRadioSmeter() {
   ctx.strokeStyle = "#888";
   ctx.lineWidth = Math.max(1, w * 0.004);
   ctx.beginPath();
-  ctx.arc(cx, cy, r, Math.PI * 1.15, Math.PI * 1.85);
+  ctx.arc(cx, cy, r, SMETER_ARC_START, SMETER_ARC_START + SMETER_ARC_SWEEP);
   ctx.stroke();
-  // Ticks S0..S9 then +20/+40/+60.
+  // Calibrated ticks: S1,3,5,7,9 then +20/+40/+60 dB over S9, each at its
+  // true dB position on the arc.
   ctx.fillStyle = "#aaa";
-  ctx.font = `${Math.max(8, Math.round(h * 0.08))}px sans-serif`;
+  ctx.font = `${Math.max(8, Math.round(h * 0.1))}px sans-serif`;
   ctx.textAlign = "center";
-  const labels = ["1", "3", "5", "7", "9", "+20", "+40", "+60"];
-  for (let i = 0; i < labels.length; i++) {
-    const frac = i / (labels.length - 1);
-    const ang = Math.PI * 1.15 + frac * (Math.PI * 0.7);
+  ctx.textBaseline = "middle";
+  const ticks = [
+    { label: "1", dbm: SMETER_S9_DBM - 8 * SMETER_DB_PER_UNIT, red: false },
+    { label: "3", dbm: SMETER_S9_DBM - 6 * SMETER_DB_PER_UNIT, red: false },
+    { label: "5", dbm: SMETER_S9_DBM - 4 * SMETER_DB_PER_UNIT, red: false },
+    { label: "7", dbm: SMETER_S9_DBM - 2 * SMETER_DB_PER_UNIT, red: false },
+    { label: "9", dbm: SMETER_S9_DBM, red: false },
+    { label: "+20", dbm: SMETER_S9_DBM + 20, red: true },
+    { label: "+40", dbm: SMETER_S9_DBM + 40, red: true },
+    { label: "+60", dbm: SMETER_S9_DBM + 60, red: true },
+  ];
+  for (const tk of ticks) {
+    const frac = smeterFrac(radioDbmToSUnits(tk.dbm));
+    const ang = SMETER_ARC_START + frac * SMETER_ARC_SWEEP;
     const x1 = cx + Math.cos(ang) * r;
     const y1 = cy + Math.sin(ang) * r;
     const x2 = cx + Math.cos(ang) * (r * 0.9);
     const y2 = cy + Math.sin(ang) * (r * 0.9);
-    ctx.strokeStyle = i >= 5 ? "#e53935" : "#888";
+    ctx.strokeStyle = tk.red ? "#e53935" : "#888";
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.lineTo(x2, y2);
     ctx.stroke();
-    const lx = cx + Math.cos(ang) * (r * 0.78);
-    const ly = cy + Math.sin(ang) * (r * 0.78);
-    ctx.fillText(labels[i], lx, ly);
+    const lx = cx + Math.cos(ang) * (r * 0.76);
+    const ly = cy + Math.sin(ang) * (r * 0.76);
+    ctx.fillStyle = tk.red ? "#ef9a9a" : "#aaa";
+    ctx.fillText(tk.label, lx, ly);
   }
-  // Needle: map dBFS [-110 .. -10] → fraction [0 .. 1].
+  // Needle position from the calibrated S-unit value.
   const db = radioState.smeterDb;
-  const frac = db === null ? 0 : Math.max(0, Math.min(1, (db + 110) / 100));
-  const ang = Math.PI * 1.15 + frac * (Math.PI * 0.7);
+  const dbm = db === null ? null : radioDbfsToDbm(db);
+  const sUnits = dbm === null ? null : radioDbmToSUnits(dbm);
+  const frac = sUnits === null ? 0 : smeterFrac(sUnits);
+  const ang = SMETER_ARC_START + frac * SMETER_ARC_SWEEP;
   ctx.strokeStyle = "#e0e0e0";
   ctx.lineWidth = Math.max(1.5, w * 0.008);
   ctx.beginPath();
   ctx.moveTo(cx, cy);
   ctx.lineTo(cx + Math.cos(ang) * r * 0.95, cy + Math.sin(ang) * r * 0.95);
   ctx.stroke();
+  ctx.textBaseline = "alphabetic";
   const label = document.getElementById("radio-smeter-label");
-  if (label) label.textContent = db === null ? "—" : `${db.toFixed(0)} dBFS`;
+  if (label) {
+    if (db === null) {
+      label.textContent = "—";
+    } else {
+      label.textContent = `${smeterReport(sUnits)} · ${dbm.toFixed(0)} dBm`;
+    }
+  }
+}
+
+// Human-readable S report: "S7", "S9", "S9+18 dB"…
+function smeterReport(sUnits) {
+  if (sUnits >= 9) {
+    const over = Math.round((sUnits - 9) * SMETER_DB_PER_UNIT);
+    return over <= 0 ? "S9" : `S9+${over} dB`;
+  }
+  return `S${Math.max(0, Math.round(sUnits))}`;
 }
 
 // Generic line/area spectrum painter. `frame.bins_db` are dBFS bins.
@@ -5735,10 +6116,203 @@ function drawRadioSpectrum(canvasId, frame, color) {
   ctx.stroke();
 }
 
+// Pick a "nice" tick step (1/2/5 × 10ⁿ) so the frequency ruler lands on
+// round MHz/kHz values rather than arbitrary fractions.
+function niceTickStep(span, targetTicks) {
+  const raw = span / Math.max(1, targetTicks);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  let step;
+  if (norm < 1.5) step = 1;
+  else if (norm < 3) step = 2;
+  else if (norm < 7) step = 5;
+  else step = 10;
+  return step * mag;
+}
+
+// Tick frequencies (Hz) spanning an RF frame's displayed band.
+function radioRfTicks(frame) {
+  const lo = frame.center_hz - frame.span_hz / 2;
+  const hi = frame.center_hz + frame.span_hz / 2;
+  const step = niceTickStep(frame.span_hz, 6);
+  const ticks = [];
+  for (let f = Math.ceil(lo / step) * step; f <= hi + 1; f += step) ticks.push(f);
+  return { lo, hi, ticks };
+}
+
+// Faint vertical frequency gridlines over a fully-repainted canvas (RF
+// line spectrum). Not used on the waterfall, whose scroll buffer would
+// smear them.
+function drawRfGridlines(canvasId, frame) {
+  if (!frame || !frame.span_hz) return;
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
+  const { lo, hi, ticks } = radioRfTicks(frame);
+  const span = hi - lo || 1;
+  for (const f of ticks) {
+    const x = ((f - lo) / span) * w;
+    const isCenter = Math.abs(f - frame.center_hz) < span * 0.01;
+    ctx.strokeStyle = isCenter ? "rgba(127,209,255,0.35)" : "rgba(255,255,255,0.07)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+}
+
+// The shared Hz ruler painted between the RF spectrum and the waterfall.
+function drawRadioFreqScale() {
+  const canvas = document.getElementById("radio-freq-scale");
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#101216";
+  ctx.fillRect(0, 0, w, h);
+  const frame = radioState.rf;
+  if (!frame || !frame.span_hz) return;
+  const { lo, hi, ticks } = radioRfTicks(frame);
+  const span = hi - lo || 1;
+  // Fixed ~10 px CSS font, decoupled from the canvas buffer height so the
+  // labels stay small even if the strip is ever laid out taller than its
+  // 16 px CSS cap. `h` is device px (CSS px × dpr).
+  const dpr = window.devicePixelRatio || 1;
+  const fontPx = Math.round(10 * dpr);
+  ctx.font = `${fontPx}px sans-serif`;
+  ctx.textBaseline = "middle";
+  const midY = h / 2;
+  const tickY = Math.min(h, 4 * dpr);
+  for (let i = 0; i < ticks.length; i++) {
+    const f = ticks[i];
+    const x = ((f - lo) / span) * w;
+    const isCenter = Math.abs(f - frame.center_hz) < span * 0.01;
+    ctx.strokeStyle = isCenter ? "#7fd1ff" : "#3a3d44";
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, tickY);
+    ctx.stroke();
+    ctx.fillStyle = isCenter ? "#7fd1ff" : "#9aa0aa";
+    ctx.textAlign = x < w * 0.06 ? "left" : x > w * 0.94 ? "right" : "center";
+    // "MHz" unit only on the last tick to keep the ruler uncluttered.
+    const lbl =
+      i === ticks.length - 1 ? `${(f / 1e6).toFixed(3)} MHz` : (f / 1e6).toFixed(3);
+    ctx.fillText(lbl, x, midY + 1.5 * dpr);
+  }
+}
+
+// Horizontal fraction [0..1] of the tuned frequency within the displayed
+// RF band. The band is centred on the LO (frame.center_hz = lo); the tuned
+// frequency is displayed_rf = lo + digital_offset, so the marker slides off
+// centre as the NCO moves while the LO (and the band) stay put.
+function radioMarkerFrac() {
+  const frame = radioState.rf;
+  const t = radioState.tune;
+  if (!frame || !frame.span_hz) return 0.5;
+  const refHz = t ? t.displayed_rf_hz : frame.center_hz;
+  return Math.max(0, Math.min(1, 0.5 + (refHz - frame.center_hz) / frame.span_hz));
+}
+
+// Thin vertical line at the tuned frequency, drawn over a fully-repainted
+// canvas (the RF spectrum). The waterfall gets its own scrolling marker
+// column inside drawRadioRf.
+function drawTunedMarker(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const x = Math.round(canvas.width * radioMarkerFrac()) + 0.5;
+  ctx.strokeStyle = "rgba(127,209,255,0.85)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, canvas.height);
+  ctx.stroke();
+}
+
+// Map a horizontal pixel on an RF canvas to an absolute frequency (Hz),
+// using the latest RF frame's center/span. Returns null with no frame.
+function radioFreqAtX(canvas, clientX) {
+  const frame = radioState.rf;
+  if (!canvas || !frame || !frame.span_hz) return null;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0) return null;
+  const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  return frame.center_hz + (frac - 0.5) * frame.span_hz;
+}
+
+// Snap a click to the real signal: take the clicked frequency, find the
+// strongest RF bin within ±SNAP_WINDOW_HZ, and use it only if that bin
+// stands clearly above the window's mean level (a genuine peak). On a peak
+// we refine the frequency to sub-bin accuracy by parabolic interpolation
+// (FFT bins are ~280 Hz wide) and round to 100 Hz — so a carrier at
+// 145.312550 stays on 145.3125, not collapsed to 145.312. If no peak is
+// near the click — empty/flat spectrum — fall back to the clicked
+// frequency rounded to the nearest kHz.
+const SNAP_WINDOW_HZ = 8_000; // search half-window around the click
+const SNAP_MIN_DB = 6; // peak must beat the local mean by this to snap
+function radioSnapHz(canvas, clientX) {
+  const clickHz = radioFreqAtX(canvas, clientX);
+  if (clickHz === null) return null;
+  const frame = radioState.rf;
+  if (frame && frame.bins_db && frame.bins_db.length) {
+    const bins = frame.bins_db;
+    const n = bins.length;
+    const hzPerBin = frame.span_hz / n;
+    const loEdge = frame.center_hz - frame.span_hz / 2;
+    const clamp = (b) => Math.max(0, Math.min(n - 1, b));
+    const clickBin = clamp(Math.round((clickHz - loEdge) / hzPerBin));
+    const half = Math.max(1, Math.round(SNAP_WINDOW_HZ / hzPerBin));
+    const a = clamp(clickBin - half);
+    const b1 = clamp(clickBin + half);
+    let bestBin = clickBin;
+    let bestVal = -Infinity;
+    let sum = 0;
+    let cnt = 0;
+    for (let b = a; b <= b1; b++) {
+      const v = bins[b];
+      sum += v;
+      cnt++;
+      if (v > bestVal) {
+        bestVal = v;
+        bestBin = b;
+      }
+    }
+    const mean = cnt ? sum / cnt : -Infinity;
+    // Snap to the peak only when one genuinely stands out.
+    if (bestVal - mean >= SNAP_MIN_DB) {
+      // Parabolic (quadratic) interpolation around the peak for sub-bin
+      // accuracy: δ = ½·(yₗ−yᵣ)/(yₗ−2y꜀+yᵣ), valid for a concave top.
+      let refined = bestBin;
+      if (bestBin > 0 && bestBin < n - 1) {
+        const yl = bins[bestBin - 1];
+        const yc = bins[bestBin];
+        const yr = bins[bestBin + 1];
+        const denom = yl - 2 * yc + yr;
+        if (denom < 0) {
+          const delta = (0.5 * (yl - yr)) / denom;
+          if (Math.abs(delta) <= 1) refined = bestBin + delta;
+        }
+      }
+      const hz = loEdge + refined * hzPerBin;
+      return Math.round(hz / 100) * 100;
+    }
+  }
+  // Fallback: tune exactly where the user clicked, rounded to the kHz.
+  return Math.round(clickHz / 1000) * 1000;
+}
+
 function drawRadioRf() {
-  // Top: line spectrum. Bottom: scrolling waterfall, both fed by the
-  // same RF frame.
+  // Top: line spectrum (with frequency gridlines). Middle: shared Hz
+  // ruler. Bottom: scrolling waterfall — all three share the same
+  // horizontal Hz mapping from the latest RF frame.
   drawRadioSpectrum("radio-rf-fft", radioState.rf, "#9CCC65");
+  drawRfGridlines("radio-rf-fft", radioState.rf);
+  drawTunedMarker("radio-rf-fft");
+  drawRadioFreqScale();
   const canvas = document.getElementById("radio-waterfall");
   const ctx = sizeRadioCanvas(canvas);
   if (!ctx) return;
@@ -5761,14 +6335,24 @@ function drawRadioRf() {
   const n = bins.length;
   const [lo, hi] = radioLevelRange();
   const span = hi - lo;
+  // Tuned-frequency column: tracks displayed_rf within the LO-centred band.
+  const centerX = Math.round((w - 1) * radioMarkerFrac());
   const row = ctx.createImageData(w, 1);
   for (let x = 0; x < w; x++) {
     const bi = Math.min(n - 1, Math.floor((x / w) * n));
     const v = Math.max(0, Math.min(1, (bins[bi] - lo) / span));
     const idx = Math.min(255, Math.max(0, Math.round(v * 255)));
-    row.data[x * 4] = RADIO_WF_PALETTE[idx * 3];
-    row.data[x * 4 + 1] = RADIO_WF_PALETTE[idx * 3 + 1];
-    row.data[x * 4 + 2] = RADIO_WF_PALETTE[idx * 3 + 2];
+    if (x === centerX) {
+      // Tint the centre column so a continuous tuned-frequency marker
+      // scrolls down with the waterfall.
+      row.data[x * 4] = 127;
+      row.data[x * 4 + 1] = 209;
+      row.data[x * 4 + 2] = 255;
+    } else {
+      row.data[x * 4] = RADIO_WF_PALETTE[idx * 3];
+      row.data[x * 4 + 1] = RADIO_WF_PALETTE[idx * 3 + 1];
+      row.data[x * 4 + 2] = RADIO_WF_PALETTE[idx * 3 + 2];
+    }
     row.data[x * 4 + 3] = 255;
   }
   ctx.putImageData(row, 0, h - 1);
@@ -5799,6 +6383,7 @@ async function init() {
   setupSounderTab();
   await loadDevices();
   setupRadioTab();
+  setupRadioSdrModal();
   refreshRadioTabVisibility();
   await loadSerialPorts();
   await loadSaveDir();
@@ -6935,6 +7520,10 @@ async function runSounderCollectorSend() {
 // then immediately fire the analyser. The WAV path auto-fills the
 // analyse input.
 let sounderRxRecording = false;
+// True when the current sounder capture is tapping the live SDR session via
+// the raw-capture tee (start_raw_recording) rather than opening the device
+// itself (sounding_rx_start_capture). Decides which stop command to call.
+let sounderRxLiveTap = false;
 async function runSounderRxCaptureToggle() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   const { invoke } = window.__TAURI__.core;
@@ -6945,7 +7534,13 @@ async function runSounderRxCaptureToggle() {
     // Paramètres — same dropdown as the main RX play button.
     const deviceSelect = document.getElementById("rx-device-select");
     const deviceName = deviceSelect ? deviceSelect.value : "";
-    if (!deviceName) {
+    // If an SDR receiver is already running, don't reopen the device (it's
+    // exclusive) — tap its live audio via the raw-capture tee instead, so
+    // reception keeps going while we sound the channel.
+    const rxStopBtn = document.getElementById("btn-stop");
+    const rxRunning = rxStopBtn && !rxStopBtn.disabled;
+    const tapLive = rxRunning && getSelectedBackendId("rx-device-select") !== null;
+    if (!tapLive && !deviceName) {
       setSounderStatus(
         "sounder-an-status",
         t("sounder.pick_rx_card"),
@@ -6954,9 +7549,10 @@ async function runSounderRxCaptureToggle() {
       return;
     }
     try {
-      const path = await invoke("sounding_rx_start_capture", {
-        deviceName,
-      });
+      const path = tapLive
+        ? await invoke("start_raw_recording")
+        : await invoke("sounding_rx_start_capture", { deviceName });
+      sounderRxLiveTap = tapLive;
       sounderRxRecording = true;
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = path;
@@ -6974,7 +7570,11 @@ async function runSounderRxCaptureToggle() {
     }
   } else {
     try {
-      const info = await invoke("sounding_rx_stop_capture");
+      // Match the stop to how we started: raw-capture tee vs standalone
+      // device capture. Both return { path, duration_sec }.
+      const info = sounderRxLiveTap
+        ? await invoke("stop_raw_recording")
+        : await invoke("sounding_rx_stop_capture");
       sounderRxRecording = false;
       const captureInput = document.getElementById("sounder-an-capture");
       if (captureInput) captureInput.value = info.path;

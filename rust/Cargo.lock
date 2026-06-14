@@ -3000,6 +3000,7 @@ dependencies = [
  "modem-io",
  "modem-sdr",
  "modem-sdr-dsp",
+ "modem-sdr-radio",
  "num-complex",
  "serde_json",
  "thiserror 2.0.18",
@@ -3013,6 +3014,7 @@ dependencies = [
  "modem-io",
  "modem-sdr",
  "modem-sdr-dsp",
+ "modem-sdr-radio",
  "num-complex",
  "thiserror 2.0.18",
 ]
@@ -3036,6 +3038,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "modem-sdr-radio"
+version = "0.1.0"
+dependencies = [
+ "modem-sdr",
+ "modem-sdr-dsp",
+ "num-complex",
+]
+
+[[package]]
 name = "modem-sdrplay"
 version = "0.1.0"
 dependencies = [
@@ -3044,6 +3055,7 @@ dependencies = [
  "modem-io",
  "modem-sdr",
  "modem-sdr-dsp",
+ "modem-sdr-radio",
  "num-complex",
  "serde_json",
  "thiserror 2.0.18",

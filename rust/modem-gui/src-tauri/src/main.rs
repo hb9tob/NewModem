@@ -751,6 +751,18 @@ fn set_rx_gain(agc_mode: String, gain_db: i32, state: State<'_, AppState>) -> Re
     send_radio_cmd(&state, RadioUiCommand::SetGain(gain))
 }
 
+/// Set RX gain from a full backend-native [`GainSetting`] — the same JSON
+/// shape the Settings panel persists (`{kind:"manual",shape:"lna_plus_if",
+/// lna_state,if_grdb}`, `{kind:"agc_mode",id,lna_state}`, …). Lets the Radio
+/// tab drive LNA/IF or discrete ladders live, not just a single dB.
+#[tauri::command]
+fn set_radio_gain(
+    gain: modem_sdr::config::GainSetting,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::SetGain(gain))
+}
+
 /// Select an antenna port by capability id (no-op on single-port SDRs).
 #[tauri::command]
 fn set_antenna(id: String, state: State<'_, AppState>) -> Result<(), String> {
@@ -2537,6 +2549,7 @@ fn main() {
             set_radio_freq,
             recenter_lo,
             set_rx_gain,
+            set_radio_gain,
             set_antenna,
             set_deviation,
             set_squelch,

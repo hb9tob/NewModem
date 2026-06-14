@@ -63,6 +63,7 @@ pub mod backend;
 pub mod device;
 pub mod error;
 pub mod ffi;
+mod hardware;
 pub mod rx;
 
 pub use backend::{RtlsdrBackend, RtlsdrDevice, BACKEND_ID};
