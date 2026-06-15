@@ -349,8 +349,12 @@ fn rxreal(args: &[String]) {
     let mut sc_fires = 0u32;
     let mut best_sc_metric = 0.0f64;
     let mut drift_commits: Vec<(f64, f64, bool)> = Vec::new();
+    let mut head = 0usize;
     for chunk in samples.chunks(CHUNK_SAMPLES) {
-        for e in sess.process_audio_chunk(chunk) {
+        head += chunk.len();
+        let mut queue: std::collections::VecDeque<V3SessionEvent> =
+            sess.process_audio_chunk(chunk).into();
+        while let Some(e) = queue.pop_front() {
             match e {
                 V3SessionEvent::SofProbeFired { metric, .. } => {
                     sc_fires += 1;
@@ -387,6 +391,23 @@ fn rxreal(args: &[String]) {
                 }
                 V3SessionEvent::AppHeaderRecovered { file_size, t_bytes, .. } => {
                     hdr.get_or_insert((file_size, t_bytes));
+                }
+                V3SessionEvent::RewindRequest { anchor_abs_sample, new_drift_ppm } => {
+                    // Étage-B re-commit: replay [anchor .. live head] at the new
+                    // rate (mirrors the worker, which owns a rolling history;
+                    // here we lend a slice of the in-memory capture). Stale
+                    // post-trigger events in the queue are dropped — the replay
+                    // re-emits the corrected decode; cw_bytes dedups by ESI.
+                    let start = anchor_abs_sample as usize;
+                    if start <= head {
+                        let replay = sess.replay_from_anchor(
+                            &samples[start..head],
+                            anchor_abs_sample,
+                            new_drift_ppm,
+                        );
+                        queue.clear();
+                        queue.extend(replay);
+                    }
                 }
                 _ => {}
             }

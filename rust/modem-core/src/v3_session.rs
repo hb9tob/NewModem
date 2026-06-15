@@ -179,6 +179,21 @@ pub const COARSE_DRIFT_MIN_OBS: usize = 3;
 /// streaming pipeline at the corrected ratio and replays the audio.
 pub const COARSE_DRIFT_COMMIT_PPM: f64 = 5.0;
 
+/// Étage B (gated by env `V3_DRIFT_TRACK`). Sliding-LS residual-drift tracker
+/// that re-commits the resampler rate by rewinding to the entry preamble.
+/// `BUDGET_PPM`: re-commit when the trailing-window residual exceeds this (the
+/// measured ~5 ppm residual on capture-1781453802 sits above it; ~3 ppm is the
+/// 64-APSK inter-anchor timing budget). `MIN_OBS`: markers needed in the window
+/// for a trustworthy slope (~0.4 ppm at 10 markers ≪ budget). `MAX_RECOMMITS`:
+/// loop guard — the drift is ~constant so one or two re-commits converge.
+const ETAGE_B_BUDGET_PPM: f64 = 2.0;
+const ETAGE_B_MIN_OBS: f64 = 10.0;
+const ETAGE_B_MAX_RECOMMITS: u32 = 4;
+/// Correction damping. The measured residual responds ~2× the applied rate
+/// delta (the marker prediction partly tracks), so a unit-gain re-commit
+/// overshoots and oscillates; 0.5 converges in ~1 step.
+const ETAGE_B_GAIN: f64 = 0.5;
+
 /// Per-cycle timing-poursuite integral gain. After the coarse grid locks
 /// the bulk drift, each validated marker's residual timing error (refined
 /// observed − predicted, in symbols) is converted to a ppm slip over the
@@ -447,6 +462,16 @@ pub struct V3Session {
     drift_diag: Vec<(f64, f64)>,
     /// Running Σ of per-cycle slip (`refined − predicted`) feeding `drift_diag`.
     drift_diag_cum: f64,
+    /// Absolute audio-sample position of the CURRENT epoch's entry preamble —
+    /// the rewind anchor for an étage-B re-commit. Set in `try_acquire_preamble`,
+    /// cleared on reboot/finalize.
+    entry_preamble_abs: Option<u64>,
+    /// True while a `replay_from_anchor` is re-ingesting buffered audio, so the
+    /// étage-B estimator does not emit a nested `RewindRequest` mid-replay.
+    replaying: bool,
+    /// Étage-B re-commits emitted this epoch (loop guard; drift is ~constant so
+    /// one or two suffice).
+    drift_recommits: u32,
     // ---- Inter-frame silence gate (EOT re-acquisition) --------------
     /// Peak SC window-energy seen while Locked. The silence gate fires
     /// when the live energy drops below `SILENCE_ENERGY_RATIO` of this
@@ -587,6 +612,9 @@ impl V3Session {
             coarse_drift_cum_offset_sym: 0,
             drift_diag: Vec::new(),
             drift_diag_cum: 0.0,
+            entry_preamble_abs: None,
+            replaying: false,
+            drift_recommits: 0,
             burst_energy_ref: 0.0,
             silence_run: 0,
             pending_silence_finalize: false,
@@ -866,6 +894,8 @@ impl V3Session {
         self.coarse_drift_cum_offset_sym = 0;
         self.drift_diag.clear();
         self.drift_diag_cum = 0.0;
+        self.entry_preamble_abs = None;
+        self.drift_recommits = 0;
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
         self.consecutive_miss = 0;
@@ -1132,6 +1162,11 @@ impl V3Session {
         if validated.is_none() {
             return;
         }
+        // Étage-B rewind anchor: remember this epoch's entry preamble start so a
+        // later precise drift re-commit can rewind here and re-decode the whole
+        // burst (incl. the first SF) at the corrected rate.
+        self.entry_preamble_abs
+            .get_or_insert(preamble_start_abs_audio);
         events.push(V3SessionEvent::SofProbeFired {
             marker_at_abs: marker_at_abs_audio,
             metric,
@@ -1771,7 +1806,9 @@ impl V3Session {
                 // Ungated by `drift_locked` — this is exactly the post-lock
                 // signal étage B will act on. Markers only here (dense); the
                 // refined preamble anchors fold in when the estimator goes live.
-                if std::env::var_os("V3_DRIFT_LOG").is_some() {
+                let track = std::env::var_os("V3_DRIFT_TRACK").is_some();
+                let logd = std::env::var_os("V3_DRIFT_LOG").is_some();
+                if (track || logd) && !self.replaying {
                     let refined = self.refine_marker_sym_pos_abs(marker_sym_pos_abs);
                     self.drift_diag_cum += refined - pred as f64;
                     self.drift_diag.push((refined, self.drift_diag_cum));
@@ -1791,14 +1828,48 @@ impl V3Session {
                     }
                     let denom = n * sxx - sx * sx;
                     if denom.abs() > 1e-6 {
-                        let slope = (n * sxy - sx * sy) / denom;
-                        eprintln!(
-                            "[drift_diag] t={:.1}s residual_ppm={:+.3} applied={:+.2} window_n={:.0}",
-                            t_now / self.cfg.symbol_rate,
-                            slope * 1.0e6,
-                            self.drift_ppm,
-                            n,
-                        );
+                        let residual_ppm = (n * sxy - sx * sy) / denom * 1.0e6;
+                        if logd {
+                            eprintln!(
+                                "[drift_diag] t={:.1}s residual_ppm={:+.3} applied={:+.2} window_n={:.0}",
+                                t_now / self.cfg.symbol_rate,
+                                residual_ppm,
+                                self.drift_ppm,
+                                n,
+                            );
+                        }
+                        // Étage B: a trustworthy window whose residual exceeds the
+                        // budget → re-commit the resampler rate by rewinding to the
+                        // entry preamble (the worker replays the whole burst at the
+                        // corrected rate). residual < 0 ⇒ markers arrive early ⇒
+                        // stream faster than the applied rate ⇒ need MORE
+                        // compression ⇒ subtract the signed residual.
+                        if track
+                            && n >= ETAGE_B_MIN_OBS
+                            && residual_ppm.abs() > ETAGE_B_BUDGET_PPM
+                            && self.drift_recommits < ETAGE_B_MAX_RECOMMITS
+                        {
+                            if let Some(anchor) = self.entry_preamble_abs {
+                                let new_ppm = (self.drift_ppm
+                                    - ETAGE_B_GAIN * residual_ppm)
+                                    .clamp(-300.0, 300.0);
+                                self.drift_recommits += 1;
+                                if logd {
+                                    eprintln!(
+                                        "[drift_track] RECOMMIT #{} residual={:+.2} {:+.2}->{:+.2} anchor={}",
+                                        self.drift_recommits,
+                                        residual_ppm,
+                                        self.drift_ppm,
+                                        new_ppm,
+                                        anchor,
+                                    );
+                                }
+                                events.push(V3SessionEvent::RewindRequest {
+                                    anchor_abs_sample: anchor,
+                                    new_drift_ppm: new_ppm,
+                                });
+                            }
+                        }
                     }
                 }
                 // EOT detection lives in the protocol header (re-inserted
@@ -1989,6 +2060,11 @@ impl V3Session {
         self.coarse_drift_cum_offset_sym = 0;
         self.drift_diag.clear();
         self.drift_diag_cum = 0.0;
+        self.entry_preamble_abs = None;
+        // NB: `drift_recommits` is deliberately NOT reset here — it must persist
+        // across an étage-B replay so the re-commit count stays bounded per
+        // burst (a reboot is mid-burst, not a new burst). Reset only in
+        // `finalize()`.
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
         self.consecutive_miss = 0;
@@ -2025,6 +2101,9 @@ impl V3Session {
         self.total_samples = anchor_abs_sample;
         self.audio_buffer.clear();
         self.reset_pipeline_and_fsm();
+        // Guard: the re-ingest below re-runs the marker estimator, which must
+        // not emit a nested RewindRequest while we are already replaying.
+        self.replaying = true;
         // Feed the slice back in live-sized batches, NOT as one giant chunk:
         // the FSM advances by bounded steps per `process_audio_chunk` (one SC
         // fire / marker advance / cycle decode), so a single huge call would
@@ -2034,6 +2113,7 @@ impl V3Session {
         for c in audio.chunks(REPLAY_BATCH_SAMPLES) {
             events.extend(self.process_audio_chunk(c));
         }
+        self.replaying = false;
         events
     }
 }
