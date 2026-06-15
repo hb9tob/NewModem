@@ -1061,10 +1061,11 @@ impl V3Session {
             return;
         }
         let start_rel = self.audio_buffer.len().saturating_sub(self.acq_search_len);
-        let (lag, metric) = match self.acq_mf.best_match(&self.audio_buffer[start_rel..]) {
-            Some(v) => v,
-            None => return,
-        };
+        let crate::fd_acquire::PreambleMatch { lag, metric, .. } =
+            match self.acq_mf.best_match(&self.audio_buffer[start_rel..]) {
+                Some(v) => v,
+                None => return,
+            };
         if metric < MF_ACQ_THRESHOLD {
             return;
         }

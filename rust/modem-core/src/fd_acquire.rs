@@ -18,6 +18,28 @@ use std::sync::Arc;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+/// A located preamble. `lag` is the integer 48 kHz sample offset into the
+/// search window where the template best aligns; `frac` ∈ [-1, 1] is the
+/// parabolic sub-sample refinement of that peak (`lag as f64 + frac` is the
+/// refined position); `metric` ∈ [0, 1] is the normalised detection score.
+///
+/// `frac` is what lets the drift LS use a preamble as a sub-sample timing
+/// observation — the raw integer peak carries ~0.29-sample (1/√12) of pure
+/// quantisation noise, throwing away the long template's precision.
+#[derive(Debug, Clone, Copy)]
+pub struct PreambleMatch {
+    pub lag: usize,
+    pub frac: f64,
+    pub metric: f64,
+}
+
+impl PreambleMatch {
+    /// Sub-sample-refined position in the search window (samples).
+    pub fn refined_pos(&self) -> f64 {
+        self.lag as f64 + self.frac
+    }
+}
+
 /// Normalised matched-filter detector for a fixed real passband template.
 pub struct PreambleMatchedFilter {
     n_template: usize,
@@ -66,11 +88,11 @@ impl PreambleMatchedFilter {
     }
 
     /// Cross-correlate `window` (raw passband, length ≤ `max_window`) against
-    /// the template and return the best `(lag, metric)` where `lag` is the
-    /// offset into `window` at which the template best aligns and `metric ∈
-    /// [0,1]` is the normalised match `|Σ w·t|² / (E_t · E_w(lag))`. Returns
-    /// `None` if `window` is shorter than the template.
-    pub fn best_match(&self, window: &[f32]) -> Option<(usize, f64)> {
+    /// the template and return the best match: the integer peak `lag`, a
+    /// parabolic sub-sample refinement `frac`, and the normalised `metric ∈
+    /// [0,1]` = `|Σ w·t|² / (E_t · E_w(lag))`. Returns `None` if `window` is
+    /// shorter than the template.
+    pub fn best_match(&self, window: &[f32]) -> Option<PreambleMatch> {
         if window.len() < self.n_template {
             return None;
         }
@@ -111,7 +133,32 @@ impl PreambleMatchedFilter {
                 best_lag = lag;
             }
         }
-        Some((best_lag, best_metric))
+
+        // Sub-sample refinement: parabolic fit on the matched-filter output
+        // magnitude |corr| at best_lag-1 / best_lag / best_lag+1 (same
+        // convention as `marker::refine_sync_pos_subsample`). The correlation
+        // sequence is already in `buf`, so this is three abs() reads — it
+        // recovers the long template's timing precision the integer peak drops.
+        let frac = if best_lag > 0 && best_lag < last_lag {
+            let mag = |l: usize| (buf[l].re * inv_n).abs();
+            let m_minus = mag(best_lag - 1);
+            let m_zero = mag(best_lag);
+            let m_plus = mag(best_lag + 1);
+            let denom = m_minus - 2.0 * m_zero + m_plus;
+            // Concave peak only (denom < 0); else the central bin isn't the max.
+            if denom < -1e-12 {
+                (0.5 * (m_minus - m_plus) / denom).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        Some(PreambleMatch {
+            lag: best_lag,
+            frac,
+            metric: best_metric,
+        })
     }
 }
 
@@ -155,19 +202,52 @@ mod tests {
         }
 
         let mf = PreambleMatchedFilter::new(&template, window_len);
-        let (lag, metric) = mf.best_match(&window).expect("window ≥ template");
+        let m = mf.best_match(&window).expect("window ≥ template");
         assert!(
-            (lag as i64 - offset as i64).abs() <= 4,
-            "located lag {lag} far from true offset {offset}",
+            (m.lag as i64 - offset as i64).abs() <= 4,
+            "located lag {} far from true offset {offset}",
+            m.lag,
         );
-        assert!(metric > 0.2, "match metric {metric:.3} too weak");
+        assert!(m.metric > 0.2, "match metric {:.3} too weak", m.metric);
 
         // Pure-noise window scores much lower.
         let noise_only = noise(window_len, 0.3, 0x1234);
-        let (_, nm) = mf.best_match(&noise_only).unwrap();
+        let nm = mf.best_match(&noise_only).unwrap().metric;
         assert!(
-            metric > 3.0 * nm,
-            "signal metric {metric:.3} not clearly above noise floor {nm:.3}",
+            m.metric > 3.0 * nm,
+            "signal metric {:.3} not clearly above noise floor {nm:.3}",
+            m.metric,
         );
+    }
+
+    /// The parabolic sub-sample refinement must recover a known FRACTIONAL
+    /// delay far better than the ±0.5-sample integer-peak quantisation. The
+    /// template is a closed-form chirp, so a frac-delayed copy is sampled
+    /// exactly (no interpolation artefact) by evaluating it at `k - frac`.
+    #[test]
+    fn subsample_refines_fractional_offset() {
+        let n_t = 512usize;
+        let f = |t: f64| ((0.05 * t + 0.00002 * t * t).sin() * 0.8) as f32;
+        let template: Vec<f32> = (0..n_t).map(|k| f(k as f64)).collect();
+        let window_len = 8000usize;
+        let offset = 4200usize;
+        let mf = PreambleMatchedFilter::new(&template, window_len);
+
+        for &frac_true in &[0.0_f64, 0.3, -0.4, 0.5, -0.25] {
+            let mut window = noise(window_len, 0.05, 0xBEEF);
+            for k in 0..n_t {
+                window[offset + k] += f(k as f64 - frac_true);
+            }
+            let m = mf.best_match(&window).expect("window ≥ template");
+            let refined = m.refined_pos();
+            let truth = offset as f64 + frac_true;
+            assert!(
+                (refined - truth).abs() < 0.2,
+                "frac_true={frac_true}: refined={refined:.3} vs truth={truth:.3} \
+                 (lag={}, frac={:.3})",
+                m.lag,
+                m.frac,
+            );
+        }
     }
 }

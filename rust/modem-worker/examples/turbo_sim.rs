@@ -264,10 +264,10 @@ fn probe(args: &[String]) {
     while start < samples.len() {
         let end = (start + win).min(samples.len());
         if end - start >= template.len() {
-            if let Some((lag, m)) = mf.best_match(&samples[start..end]) {
-                if m > best_m {
-                    best_m = m;
-                    best_pos = (start + lag) as u64;
+            if let Some(pm) = mf.best_match(&samples[start..end]) {
+                if pm.metric > best_m {
+                    best_m = pm.metric;
+                    best_pos = (start + pm.lag) as u64;
                 }
             }
         }
@@ -348,6 +348,7 @@ fn rxreal(args: &[String]) {
     let (mut max_sigma2, mut sum_sigma2, mut n_sigma2) = (0.0f64, 0.0f64, 0u32);
     let mut sc_fires = 0u32;
     let mut best_sc_metric = 0.0f64;
+    let mut drift_commits: Vec<(f64, f64, bool)> = Vec::new();
     for chunk in samples.chunks(CHUNK_SAMPLES) {
         for e in sess.process_audio_chunk(chunk) {
             match e {
@@ -356,6 +357,9 @@ fn rxreal(args: &[String]) {
                     if metric > best_sc_metric {
                         best_sc_metric = metric;
                     }
+                }
+                V3SessionEvent::DriftCommitted { from_ppm, to_ppm, applied, .. } => {
+                    drift_commits.push((from_ppm, to_ppm, applied));
                 }
                 V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
                     markers += 1;
@@ -396,6 +400,12 @@ fn rxreal(args: &[String]) {
          meanσ²={mean_sigma2:.4} ({mer_db:.1} dB MER) maxσ²={max_sigma2:.4}",
         cw_bytes.len(),
         if hdr.is_some() { "Y" } else { "N" },
+    );
+    println!(
+        "rxreal drift: APPLIED to resampler = {:+.2} ppm (final) | {} coarse commit(s): {:?}",
+        sess.drift_ppm(),
+        drift_commits.len(),
+        drift_commits,
     );
 
     match w_payload {
