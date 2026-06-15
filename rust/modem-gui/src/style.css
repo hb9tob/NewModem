@@ -2956,3 +2956,78 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   background: #101216;
   border-top: 1px solid #2a2d34;
 }
+
+/* ============================================================
+   Radio tab — Raspberry Pi 7" 800x480 kiosk compaction.
+   The desktop radio layout sizes everything in rem (root 16px),
+   so it does NOT shrink with the global `body { font-size: 12px }`
+   small-screen rule, and the top cards overflow their 18vh cap —
+   clipping the audio card's monitor (sound-card) selector out of
+   reach. Here we shrink every radio element and, crucially, drop
+   the hard 18vh cap so the monitor row stays visible while the
+   waterfall still keeps the bulk of the panel.
+   ============================================================ */
+@media (max-width: 900px) {
+  .radio-layout {
+    gap: 0.25rem;
+    padding: 0.25rem;
+  }
+  .radio-top {
+    /* Keep the top strip short (~22vh) so the spectrum + waterfall below
+       own the bulk of the panel. The compacted cards — including the
+       audio card's sound-card (monitor) select — fit within this cap
+       without clipping. */
+    max-height: 24vh;
+    grid-template-columns: minmax(96px, 0.7fr) minmax(146px, 1.2fr) minmax(146px, 1.2fr);
+    gap: 0.25rem;
+  }
+  .radio-card {
+    padding: 0.12rem 0.28rem;
+    gap: 0.1rem;
+  }
+  .radio-card-title { font-size: 8.5px; letter-spacing: 0.02em; }
+
+  /* The needle dial needs a real floor or it collapses to an unreadable
+     sliver — it (not the freq card) sets the top-strip height here. */
+  .radio-smeter { min-height: 50px; }
+  .radio-smeter-label { font-size: 9px; }
+  .radio-sdr-params-btn { padding: 1px 5px; font-size: 9px; }
+
+  .radio-freq-display { font-size: 11px; }
+  .radio-freq-entry { gap: 0.2rem; }
+  .radio-freq-entry input { font-size: 10px; padding: 1px 2px; }
+  .radio-unit { font-size: 9px; }
+  #radio-freq-set { padding: 1px 4px; font-size: 9px; }
+  .radio-step-row, .radio-band-presets { gap: 0.15rem; }
+  .radio-step, .radio-band { padding: 1px 2px; font-size: 8.5px; }
+  #radio-recenter { font-size: 8.5px; }
+  /* Minor tuning-info line — drop it on the tiny panel to save a row. */
+  .radio-tune-info { display: none; }
+
+  .radio-audio-fft { min-height: 24px; }
+  .radio-monitor-row { gap: 0.2rem; font-size: 9.5px; }
+  .radio-monitor-row select { font-size: 9.5px; min-height: 22px; padding: 0 2px; }
+  .radio-monitor-row input[type="range"] { min-height: 20px; }
+  #radio-volume-label { font-size: 9.5px; }
+
+  /* Bottom control bar — compact; shrink the AGC/LNA & Largeur combos. */
+  .radio-controls { gap: 0.25rem 0.6rem; }
+  .radio-ctl { font-size: 9.5px; gap: 0.2rem; }
+  .radio-controls select { font-size: 9.5px; padding: 0 2px; }
+  .radio-controls input[type="number"] { font-size: 9.5px; }
+  .radio-ctl input[type="range"] { width: 64px; }
+  .radio-gain-host .pluto-row { font-size: 9.5px; gap: 0.2rem; }
+  .radio-gain-host .pluto-field,
+  .radio-gain-host .pluto-field-label { font-size: 9.5px; }
+  .radio-gain-host .pluto-field select,
+  .radio-gain-host .pluto-field input { font-size: 9.5px; }
+  .radio-gain-host .pluto-field input[type="number"] { width: 3.4em; }
+
+  .radio-rf-fft { min-height: 44px; flex-basis: 20%; }
+  .radio-freq-scale {
+    height: 13px;
+    min-height: 13px;
+    max-height: 13px;
+    flex-basis: 13px;
+  }
+}

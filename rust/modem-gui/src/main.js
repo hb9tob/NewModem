@@ -6026,7 +6026,9 @@ function drawRadioSmeter() {
   // Calibrated ticks: S1,3,5,7,9 then +20/+40/+60 dB over S9, each at its
   // true dB position on the arc.
   ctx.fillStyle = "#aaa";
-  ctx.font = `${Math.max(8, Math.round(h * 0.1))}px sans-serif`;
+  // Cap the tick-label size: on the Pi 7" panel the card stretches the
+  // canvas tall, and an uncapped h*0.1 made the S-unit digits oversized.
+  ctx.font = `${Math.max(7, Math.min(11, Math.round(h * 0.1)))}px sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   const ticks = [

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "nbfm-modem-gui",
-  "version": "0.14.1",
+  "version": "0.14.1-rc4",
   "identifier": "org.hb9tob.nbfm-modem-gui",
   "build": {
     "frontendDist": "../src",
@@ -23,15 +23,25 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage", "nsis"],
-    "externalBin": ["binaries/nbfm-modem"],
-    "resources": ["rtlsdr.dll"],
+    "targets": [
+      "deb",
+      "appimage",
+      "nsis"
+    ],
+    "externalBin": [
+      "binaries/nbfm-modem"
+    ],
+    "resources": [
+      "rtlsdr.dll"
+    ],
     "category": "Utility",
     "shortDescription": "NBFM modem audio receiver",
     "longDescription": "GUI receiver for NBFM audio modem (amateur radio image transmission).",
@@ -45,7 +55,11 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libasound2"]
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libasound2"
+        ]
       }
     }
   }
