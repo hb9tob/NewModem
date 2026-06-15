@@ -437,39 +437,59 @@ impl StreamingFfe {
             })
             .collect();
 
-        // Forward DD-LMS pass over [sof_rel, cycle_end), mirroring
-        // `ffe::apply_ffe_lms_with_training` but with a closure slicer.
-        let mut train_cursor = 0usize;
-        for k in 0..(cycle_end - sof_rel) {
-            let center = (sof_rel + k) * pitch + self.mf_delay_frac;
-            if center < half || center + (n_ff - half) > self.frac_buf.len() {
-                // Boundary symbol: leave the (forward-applied or raw) value.
-                continue;
+        // DD-LMS over [sof_rel, cycle_end). One forward pass mirrors
+        // `ffe::apply_ffe_lms_with_training`. With `V3_FFE_FBF` set, run
+        // forward-backward-forward: the backward pass approaches a mid-segment
+        // transient (fade / noise burst) from the OTHER side, so the final
+        // forward pass starts from taps the single forward could not reach —
+        // the local re-convergence the batch sliding window gets for free by
+        // re-decoding each codeword in several overlapping windows, but here
+        // over the already-buffered segment (no re-decode). Single forward when
+        // off → bit-identical to the previous behaviour.
+        let span = cycle_end - sof_rel;
+        // Direction-agnostic training lookup (the ascending cursor cannot run
+        // backward): k → expected symbol at known preamble/warmup positions.
+        let mut train_at: Vec<Option<Complex64>> = vec![None; span];
+        for &(k, sym) in &training {
+            if k < span {
+                train_at[k] = Some(sym);
             }
-            let lo = center - half;
-            let mut y = Complex64::new(0.0, 0.0);
-            for (i, &t) in taps.iter().enumerate() {
-                y += t * self.frac_buf[lo + i];
-            }
-            self.out_buf[sof_rel + k] = y;
-
-            while train_cursor < training.len() && training[train_cursor].0 < k {
-                train_cursor += 1;
-            }
-            let (d, mu) = if train_cursor < training.len() && training[train_cursor].0 == k {
-                (training[train_cursor].1, mu_train)
-            } else {
-                (slice(y), mu_dd)
-            };
-            if mu > 0.0 {
-                let e = d - y;
-                let mut r_pow = 1e-12f64;
-                for i in 0..n_ff {
-                    r_pow += self.frac_buf[lo + i].norm_sqr();
+        }
+        let passes: &[bool] = if std::env::var_os("V3_FFE_FBF").is_some() {
+            &[true, false, true] // forward, backward, forward
+        } else {
+            &[true]
+        };
+        for &forward in passes {
+            for kk in 0..span {
+                let k = if forward { kk } else { span - 1 - kk };
+                let center = (sof_rel + k) * pitch + self.mf_delay_frac;
+                if center < half || center + (n_ff - half) > self.frac_buf.len() {
+                    // Boundary symbol: leave the (forward-applied or raw) value.
+                    continue;
                 }
-                let mu_eff = mu / r_pow;
-                for i in 0..n_ff {
-                    taps[i] += Complex64::new(mu_eff, 0.0) * e * self.frac_buf[lo + i].conj();
+                let lo = center - half;
+                let mut y = Complex64::new(0.0, 0.0);
+                for (i, &t) in taps.iter().enumerate() {
+                    y += t * self.frac_buf[lo + i];
+                }
+                self.out_buf[sof_rel + k] = y;
+
+                let (d, mu) = match train_at[k] {
+                    Some(s) => (s, mu_train),
+                    None => (slice(y), mu_dd),
+                };
+                if mu > 0.0 {
+                    let e = d - y;
+                    let mut r_pow = 1e-12f64;
+                    for i in 0..n_ff {
+                        r_pow += self.frac_buf[lo + i].norm_sqr();
+                    }
+                    let mu_eff = mu / r_pow;
+                    for i in 0..n_ff {
+                        taps[i] +=
+                            Complex64::new(mu_eff, 0.0) * e * self.frac_buf[lo + i].conj();
+                    }
                 }
             }
         }
