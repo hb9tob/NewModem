@@ -438,6 +438,15 @@ pub struct V3Session {
     /// by `try_decode_pending_cycle` once it commits the cycle's
     /// prediction.
     coarse_drift_cum_offset_sym: u64,
+    // ---- Étage-B drift MEASUREMENT (decode-neutral, V3_DRIFT_LOG) ----
+    /// `(refined_marker_sym_pos, cumulative_timing_slip_sym)` per validated
+    /// marker, accumulated UNGATED by `drift_locked` — the post-lock residual
+    /// drift signal étage B will act on. A trailing-window OLS slope of this is
+    /// the residual ppm NOT captured by the applied resampler rate. Pure
+    /// diagnostic: only populated when `V3_DRIFT_LOG` is set, never feeds decode.
+    drift_diag: Vec<(f64, f64)>,
+    /// Running Σ of per-cycle slip (`refined − predicted`) feeding `drift_diag`.
+    drift_diag_cum: f64,
     // ---- Inter-frame silence gate (EOT re-acquisition) --------------
     /// Peak SC window-energy seen while Locked. The silence gate fires
     /// when the live energy drops below `SILENCE_ENERGY_RATIO` of this
@@ -576,6 +585,8 @@ impl V3Session {
             drift_anchor_sym_pos: None,
             drift_observations: Vec::new(),
             coarse_drift_cum_offset_sym: 0,
+            drift_diag: Vec::new(),
+            drift_diag_cum: 0.0,
             burst_energy_ref: 0.0,
             silence_run: 0,
             pending_silence_finalize: false,
@@ -853,6 +864,8 @@ impl V3Session {
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
+        self.drift_diag.clear();
+        self.drift_diag_cum = 0.0;
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
         self.consecutive_miss = 0;
@@ -1751,6 +1764,43 @@ impl V3Session {
                     self.drift_ppm =
                         (self.drift_ppm + POURSUITE_KI * delta_ppm).clamp(-300.0, 300.0);
                 }
+                // Étage-B drift MEASUREMENT (decode-neutral, logged under
+                // V3_DRIFT_LOG): accumulate per-cycle timing slip vs symbol
+                // position and report a trailing ~10 s OLS-slope = the residual
+                // drift (ppm) the applied resampler rate does NOT capture.
+                // Ungated by `drift_locked` — this is exactly the post-lock
+                // signal étage B will act on. Markers only here (dense); the
+                // refined preamble anchors fold in when the estimator goes live.
+                if std::env::var_os("V3_DRIFT_LOG").is_some() {
+                    let refined = self.refine_marker_sym_pos_abs(marker_sym_pos_abs);
+                    self.drift_diag_cum += refined - pred as f64;
+                    self.drift_diag.push((refined, self.drift_diag_cum));
+                    let win_sym = self.cfg.symbol_rate * 10.0;
+                    let t_now = refined;
+                    let (mut n, mut sx, mut sy, mut sxx, mut sxy) =
+                        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                    for &(x, y) in self.drift_diag.iter().rev() {
+                        if t_now - x > win_sym {
+                            break;
+                        }
+                        n += 1.0;
+                        sx += x;
+                        sy += y;
+                        sxx += x * x;
+                        sxy += x * y;
+                    }
+                    let denom = n * sxx - sx * sx;
+                    if denom.abs() > 1e-6 {
+                        let slope = (n * sxy - sx * sy) / denom;
+                        eprintln!(
+                            "[drift_diag] t={:.1}s residual_ppm={:+.3} applied={:+.2} window_n={:.0}",
+                            t_now / self.cfg.symbol_rate,
+                            slope * 1.0e6,
+                            self.drift_ppm,
+                            n,
+                        );
+                    }
+                }
                 // EOT detection lives in the protocol header (re-inserted
                 // before EOT meta frames) — wired in a later slice.
                 true
@@ -1937,6 +1987,8 @@ impl V3Session {
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
+        self.drift_diag.clear();
+        self.drift_diag_cum = 0.0;
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
         self.consecutive_miss = 0;
