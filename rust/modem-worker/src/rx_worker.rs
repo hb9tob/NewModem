@@ -1736,6 +1736,20 @@ fn scan_and_route(
         return;
     };
 
+    // Per-window drift diagnostic: the drift (ppm) this scan's CLOSED windows
+    // actually locked onto (broad ±80 grid in Power mode / Gardner in Light).
+    // One line per scan so a per-SF drift trace can be diffed against the
+    // turbo's single committed value. `cw_map` = unique CWs this window yielded.
+    worker_log(&format!(
+        "[scan-drift] buf={:.1}s drift_ppm={:+.2} cw_map={} conv={}/{} sigma2={:.4}",
+        buf_secs,
+        result.drift_ppm,
+        result.cw_bytes_map.len(),
+        result.converged_blocks,
+        result.total_blocks,
+        result.sigma2,
+    ));
+
     // Refine profile from the Golay-decoded header (disambiguates profiles
     // that share Rs/tau/beta — e.g. HIGH vs NORMAL — by reading their
     // canonical profile_index byte). On mismatch, switch the worker config

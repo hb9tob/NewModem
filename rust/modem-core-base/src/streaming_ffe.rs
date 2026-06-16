@@ -158,6 +158,25 @@ impl StreamingFfe {
         self.current_taps.is_some()
     }
 
+    /// Energy-weighted centroid of the current taps, in fractional-sample
+    /// units (T/`pitch_fse`). Under a clock-drift mismatch the adaptive taps
+    /// migrate at the drift rate (Ungerboeck 1976 / Gitlin tap-leakage): the
+    /// centroid walks linearly with symbol index. Measured pre-decision (the
+    /// taps themselves), it is the FSE-correct drift signal — unlike a post-FFE
+    /// timing-error detector, which the FSE's timing-phase insensitivity biases.
+    /// Returns None until taps are installed.
+    pub fn tap_centroid(&self) -> Option<f64> {
+        let taps = self.current_taps.as_ref()?;
+        let mut num = 0.0f64;
+        let mut den = 1e-12f64;
+        for (i, t) in taps.iter().enumerate() {
+            let w = t.norm_sqr();
+            num += i as f64 * w;
+            den += w;
+        }
+        Some(num / den)
+    }
+
     /// Enable continuous forward DD-LMS in `push_raw`. `slice` returns the
     /// nearest data-constellation point for a soft symbol; `mu` is the NLMS
     /// step (0 disables the update). Passed as a closure to stay decoupled
@@ -495,6 +514,83 @@ impl StreamingFfe {
         }
         self.current_taps = Some(taps);
         true
+    }
+
+    /// Re-equalise the `span` symbols starting at absolute symbol `sof_abs`
+    /// from the retained fractional buffer, refining the **current** taps with
+    /// a forward-backward-forward DD-LMS pass on a LOCAL copy — the live
+    /// `current_taps` and the forward-apply state are left untouched.
+    ///
+    /// This is the closed-window re-decode lever (the "turbo sync"): by the
+    /// time a segment's closing marker has validated, the forward DD-LMS in
+    /// `push_raw` has adapted the taps over the rest of the superframe, and the
+    /// bidirectional FBF pass reaches a mid-segment fade from both sides —
+    /// recovering codewords the single forward pass at first-decode time could
+    /// not. It mirrors the batch sliding window's overlapping re-scan, but over
+    /// the already-buffered symbols (no audio re-acquisition).
+    ///
+    /// `slice` returns the nearest data-constellation point; `mu_dd` is the
+    /// NLMS step (0 = pure re-equalise with the current taps, no adaptation).
+    /// Returns `None` if there are no taps yet, or the span (with its full FIR
+    /// window) is not entirely inside the retained buffer.
+    pub fn reequalise_span(
+        &self,
+        sof_abs: u64,
+        span: usize,
+        slice: impl Fn(Complex64) -> Complex64,
+        mu_dd: f64,
+    ) -> Option<Vec<Complex64>> {
+        let taps0 = self.current_taps.as_ref()?;
+        if span == 0 || sof_abs < self.start_abs {
+            return None;
+        }
+        let sof_rel = (sof_abs - self.start_abs) as usize;
+        if sof_rel + span > self.out_buf.len() {
+            return None;
+        }
+        let pitch = self.pitch_fse;
+        let n_ff = self.n_taps;
+        let half = n_ff / 2;
+        // Every symbol in the span must have a full FIR window in `frac_buf`.
+        let first_center = sof_rel * pitch + self.mf_delay_frac;
+        let last_center = (sof_rel + span - 1) * pitch + self.mf_delay_frac;
+        if first_center < half || last_center + (n_ff - half) > self.frac_buf.len() {
+            return None;
+        }
+
+        let mut taps = taps0.clone();
+        let mut out = vec![Complex64::new(0.0, 0.0); span];
+        // forward, backward, forward — the final forward pass's values remain.
+        for &forward in &[true, false, true] {
+            for kk in 0..span {
+                let k = if forward { kk } else { span - 1 - kk };
+                let center = (sof_rel + k) * pitch + self.mf_delay_frac;
+                let lo = center - half;
+                let mut y = Complex64::new(0.0, 0.0);
+                for (i, &t) in taps.iter().enumerate() {
+                    y += t * self.frac_buf[lo + i];
+                }
+                out[k] = y;
+                if mu_dd > 0.0 {
+                    let d = slice(y);
+                    let e = d - y;
+                    // Error-gated update (same guard as the forward path): only
+                    // adapt on a confident decision so a noisy symbol can't pull
+                    // the taps away during the retry.
+                    if e.norm_sqr() < d.norm_sqr() {
+                        let mut r_pow = 1e-12f64;
+                        for i in 0..n_ff {
+                            r_pow += self.frac_buf[lo + i].norm_sqr();
+                        }
+                        let mu_eff = mu_dd / r_pow;
+                        for i in 0..n_ff {
+                            taps[i] += Complex64::new(mu_eff, 0.0) * e * self.frac_buf[lo + i].conj();
+                        }
+                    }
+                }
+            }
+        }
+        Some(out)
     }
 
     fn trim(&mut self) {

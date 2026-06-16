@@ -65,13 +65,23 @@ fn read_wav(path: &str) -> Vec<f32> {
         .collect()
 }
 
+/// Profile for the synthetic tx/rx bench. HIGH+ by default; override with
+/// env `TURBO_SIM_PROFILE` (e.g. `HIGH++`) — tx and rx must agree.
+fn bench_profile() -> ProfileIndex {
+    std::env::var("TURBO_SIM_PROFILE")
+        .ok()
+        .map(|s| parse_profile_index(&s))
+        .unwrap_or(ProfileIndex::HighPlus)
+}
+
 fn tx(args: &[String]) {
     let wav = &args[0];
     let bytes: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
     let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0xC0FFEE);
     let repair_pct: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
 
-    let cfg = ProfileIndex::HighPlus.to_config();
+    let profile = bench_profile();
+    let cfg = profile.to_config();
     let payload = gen_payload(bytes, seed);
     let session_id: u32 = 0x5111_0000 ^ (seed as u32);
 
@@ -112,8 +122,9 @@ fn tx(args: &[String]) {
     write_wav(wav, &samples);
     let secs = samples.len() as f64 / AUDIO_RATE as f64;
     println!(
-        "TX HIGH+  payload={bytes} B  K={k_src}  n_total={n_total}  \
+        "TX {}  payload={bytes} B  K={k_src}  n_total={n_total}  \
          session_id=0x{session_id:08X}  → {wav}  ({:.1}s, {} samples)",
+        profile.name(),
         secs,
         samples.len()
     );
@@ -138,8 +149,9 @@ fn rx(args: &[String]) {
     // --- Primary path: through the worker driver (the "via worker" check) ---
     let tmp = std::env::temp_dir().join(format!("turbo_sim_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
+    let profile = bench_profile();
     let mut worker = RxV3Worker::new(
-        ProfileIndex::HighPlus,
+        profile,
         Arc::new(Mutex::new(tmp.clone())),
         Arc::new(NoopSink),
     )
@@ -159,8 +171,8 @@ fn rx(args: &[String]) {
     let _ = std::fs::remove_dir_all(&tmp);
 
     // --- Diagnostic path: raw V3Session, full modem-level tallies ---
-    let cfg = ProfileIndex::HighPlus.to_config();
-    let mut sess = V3Session::new(cfg, "HIGH+".to_string());
+    let cfg = profile.to_config();
+    let mut sess = V3Session::new(cfg, profile.name().to_string());
     let (mut markers, mut cw_total, mut cw_conv, mut bootstraps) = (0u32, 0u32, 0u32, 0u32);
     let mut hdr: Option<(u32, u8)> = None; // (file_size, t_bytes)
     let mut k_needed = 0u16;
@@ -345,6 +357,10 @@ fn rxreal(args: &[String]) {
     let (mut markers, mut cw_total, mut cw_conv, mut bootstraps) = (0u32, 0u32, 0u32, 0u32);
     let mut hdr: Option<(u32, u8)> = None;
     let mut cw_bytes = std::collections::HashMap::<u32, Vec<u8>>::new();
+    // Diag: every DATA ESI a marker validated for (attempted), regardless of
+    // LDPC convergence. `attempted \ converged` = non-convergence; an ESI a
+    // reference decoder has but is absent here = sync-miss (no marker).
+    let mut attempted_data = std::collections::BTreeSet::<u32>::new();
     let (mut max_sigma2, mut sum_sigma2, mut n_sigma2) = (0.0f64, 0.0f64, 0u32);
     let mut sc_fires = 0u32;
     let mut best_sc_metric = 0.0f64;
@@ -381,6 +397,9 @@ fn rxreal(args: &[String]) {
                     if sigma2 > 0.0 {
                         sum_sigma2 += sigma2;
                         n_sigma2 += 1;
+                    }
+                    if !is_meta {
+                        attempted_data.insert(esi);
                     }
                     if converged {
                         cw_conv += 1;
@@ -428,6 +447,23 @@ fn rxreal(args: &[String]) {
         drift_commits.len(),
         drift_commits,
     );
+    // Diag dump: write the recovered + attempted DATA ESI sets so we can diff
+    // against a reference decoder (V3_DUMP_ESI=<path-prefix>). `<prefix>.conv`
+    // = converged unique ESIs, `<prefix>.att` = ESIs whose marker validated.
+    if let Some(prefix) = std::env::var_os("V3_DUMP_ESI") {
+        let prefix = prefix.to_string_lossy().to_string();
+        let mut conv: Vec<u32> = cw_bytes.keys().copied().collect();
+        conv.sort_unstable();
+        let conv_str = conv.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        std::fs::write(format!("{prefix}.conv"), conv_str).ok();
+        let att_str = attempted_data.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        std::fs::write(format!("{prefix}.att"), att_str).ok();
+        println!(
+            "rxreal dump: {} converged, {} attempted data ESIs -> {prefix}.conv/.att",
+            conv.len(),
+            attempted_data.len(),
+        );
+    }
 
     match w_payload {
         Some(p) => {

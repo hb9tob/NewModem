@@ -417,6 +417,10 @@ pub struct V3Session {
     /// `handle_sc_fire` validates a marker; consumed once
     /// `try_decode_pending_cycle` sees the full segment.
     pending_decode: Option<PendingDecode>,
+    /// Closed-window "turbo sync" retry queue: segments whose codewords did not
+    /// all converge on the forward single pass, kept until they either re-decode
+    /// or age out of the FFE window. See [`PendingRetry`].
+    retry_queue: Vec<PendingRetry>,
     /// Phase 3b: predicted absolute symbol position of the next marker
     /// after the cycle currently being / just decoded. Populated once
     /// `try_decode_pending_cycle` consumes a `PendingDecode` ; consumed
@@ -469,6 +473,9 @@ pub struct V3Session {
     /// True while a `replay_from_anchor` is re-ingesting buffered audio, so the
     /// étage-B estimator does not emit a nested `RewindRequest` mid-replay.
     replaying: bool,
+    /// Closed-window "turbo sync" retry enabled. On by default; set env
+    /// `V3_NO_TURBO_SYNC` to disable (A/B baseline). Read once at construction.
+    turbo_sync_enabled: bool,
     /// Étage-B re-commits emitted this epoch (loop guard; drift is ~constant so
     /// one or two suffice).
     drift_recommits: u32,
@@ -505,6 +512,35 @@ struct PendingDecode {
     base_esi: u32,
     is_meta: bool,
 }
+
+/// A segment that had ≥1 non-converged codeword on its first (forward,
+/// single-pass) decode. Kept in [`V3Session::retry_queue`] so the closed-window
+/// "turbo sync" retry can re-equalise it — now that the FFE taps have adapted
+/// over the rest of the superframe — and re-decode only the failed codewords.
+/// The streaming analogue of the batch sliding window's overlapping re-scan
+/// (see [[project_turbo_drift_calibration]]).
+#[derive(Clone)]
+struct PendingRetry {
+    /// Absolute symbol index of the first segment symbol (past MARKER [+warmup]).
+    seg_start_abs: u64,
+    /// Length of the segment in symbols (data + interleaved pilots).
+    seg_sym_len: usize,
+    base_esi: u32,
+    cycle_idx: u32,
+    is_meta: bool,
+    /// Codeword indices within the segment that have not converged yet.
+    failed_cw: Vec<usize>,
+    /// Retry passes already spent on this segment (bounded by
+    /// [`MAX_RETRY_ATTEMPTS`]).
+    attempts: u32,
+}
+
+/// Maximum closed-window retry passes per failed segment. Each pass re-clones
+/// the (continuously adapting) forward taps, so later attempts start from a
+/// more-converged equaliser; 2 is enough to capture that gain without
+/// re-decoding indefinitely. The segment is also dropped the moment it ages out
+/// of the FFE retention window, whichever comes first.
+const MAX_RETRY_ATTEMPTS: u32 = 2;
 
 impl V3Session {
     pub fn new(cfg: ModemConfig, profile_name: String) -> Self {
@@ -574,7 +610,7 @@ impl V3Session {
         let pll_alpha = 0.05f64;
         let pll_beta = pll_alpha * pll_alpha * 0.25;
         let pll = DdPll::new(pll_alpha, pll_beta);
-        Self {
+        let mut sess = Self {
             cfg,
             profile_name,
             state: V3SessionState::Idle,
@@ -602,6 +638,7 @@ impl V3Session {
             k_bytes,
             deinterleave_perm,
             pending_decode: None,
+            retry_queue: Vec::new(),
             next_marker_sym_pos_pred: None,
             app_header: None,
             cycles_validated: 0,
@@ -614,12 +651,23 @@ impl V3Session {
             drift_diag_cum: 0.0,
             entry_preamble_abs: None,
             replaying: false,
+            turbo_sync_enabled: std::env::var_os("V3_NO_TURBO_SYNC").is_none(),
             drift_recommits: 0,
             burst_energy_ref: 0.0,
             silence_run: 0,
             pending_silence_finalize: false,
             eot_watch_remaining: 0,
+        };
+        // Diagnostic: force a fixed drift (ppm) and lock it, bypassing the
+        // coarse estimator — used to A/B whether the applied drift VALUE (and
+        // its sign) is what costs data CWs. `V3_FORCE_DRIFT_PPM=-13`.
+        if let Some(v) = std::env::var_os("V3_FORCE_DRIFT_PPM") {
+            if let Ok(ppm) = v.to_string_lossy().parse::<f64>() {
+                sess.drift_ppm = ppm;
+                sess.drift_locked = true;
+            }
         }
+        sess
     }
 
     /// Set the drift hint (ppm) forwarded to the streaming resampler
@@ -803,6 +851,12 @@ impl V3Session {
             }
         }
 
+        // 4a-bis. Closed-window "turbo sync": re-decode segments whose codewords
+        //     did not all converge on the forward pass, now that the FFE taps
+        //     have adapted over the rest of the superframe and the whole segment
+        //     is buffered for a forward-backward-forward re-equalisation.
+        self.retry_failed_segments(&mut events);
+
         // 4b. Phase 4 coarse one-shot drift LS. Once enough refined
         //     marker positions have accumulated, fit slope, decide
         //     whether to reboot the streaming pipeline at the corrected
@@ -882,6 +936,7 @@ impl V3Session {
         // counters.
         self.state = V3SessionState::Idle;
         self.pending_decode = None;
+        self.retry_queue.clear();
         self.next_marker_sym_pos_pred = None;
         self.app_header = None;
         self.cycles_validated = 0;
@@ -1387,6 +1442,167 @@ impl V3Session {
         );
     }
 
+    /// Decision-directed Mueller-Müller timing-error detector over a segment's
+    /// equalised data symbols. Returns the **energy-normalised** mean error;
+    /// its sign indicates sampling early/late and its magnitude scales with the
+    /// residual symbol-timing offset. Decode-driven (uses the data decisions),
+    /// unlike the marker-slip residual which is minimised at the wrong drift.
+    /// Diagnostic only for now (logged under `V3_TED_LOG`): open-loop validation
+    /// that the signal crosses zero at the decode-optimal drift and is stable,
+    /// before wiring it as the convergent drift loop's error term.
+    fn data_ted(&self, syms: &[Complex64]) -> f64 {
+        if syms.len() < 2 {
+            return 0.0;
+        }
+        let cons = &self.constellation;
+        let mut e_sum = 0.0f64;
+        let mut p_sum = 1e-12f64;
+        for n in 1..syms.len() {
+            let y0 = syms[n - 1];
+            let y1 = syms[n];
+            let d0 = cons.points[cons.slice_nearest(&[y0])[0]];
+            let d1 = cons.points[cons.slice_nearest(&[y1])[0]];
+            // Mueller-Müller: Re{ conj(d0)·y1 − conj(d1)·y0 }.
+            e_sum += (d0.conj() * y1).re - (d1.conj() * y0).re;
+            p_sum += y1.norm_sqr();
+        }
+        e_sum / p_sum
+    }
+
+    /// Soft-demod + deinterleave + LDPC one codeword's worth of equalised
+    /// symbols. Returns `(info_bytes, converged)`. Shared by the forward decode
+    /// and the closed-window retry so both paths stay bit-identical.
+    fn decode_one_cw(&self, cw_syms: &[Complex64], sigma2_for_llr: f64) -> (Vec<u8>, bool) {
+        let llr = soft_demod::llr_maxlog(cw_syms, &self.constellation, sigma2_for_llr);
+        let llr_deint = interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
+        let llr_for_ldpc = &llr_deint[..self.decoder.n()];
+        let (info_bytes, converged) = self.decoder.decode_to_bytes(llr_for_ldpc);
+        (info_bytes[..self.k_bytes].to_vec(), converged)
+    }
+
+    /// Closed-window "turbo sync" pass. For each queued segment whose codewords
+    /// did not all converge on the forward pass, re-equalise it over the now
+    /// fully-buffered superframe (forward-backward-forward DD-LMS on a local tap
+    /// copy, leaving the live forward state untouched) and re-decode only the
+    /// failed codewords. Newly-converged codewords emit a `CwDecoded { converged
+    /// }` (the worker dedups by ESI, so re-emitting is idempotent) and recover
+    /// the AppHeader if a META CW lands. Segments are dropped once they decode,
+    /// exhaust [`MAX_RETRY_ATTEMPTS`], or age out of the FFE window. This is the
+    /// streaming analogue of the batch sliding window's overlapping re-scan
+    /// ([[project_turbo_drift_calibration]]).
+    fn retry_failed_segments(&mut self, events: &mut Vec<V3SessionEvent>) {
+        if !self.turbo_sync_enabled || self.replaying || self.retry_queue.is_empty() {
+            return;
+        }
+        let sym_start_abs = self.ffe.start_abs();
+        let sym_end_abs = sym_start_abs + self.ffe.out_buf().len() as u64;
+        let queue = std::mem::take(&mut self.retry_queue);
+        let mut still_pending: Vec<PendingRetry> = Vec::new();
+        for mut r in queue {
+            // Aged out of the retained window — give up (RaptorQ repairs if it
+            // can). Or not yet fully buffered — keep for a later chunk.
+            if r.seg_start_abs < sym_start_abs {
+                continue;
+            }
+            if r.seg_start_abs + r.seg_sym_len as u64 > sym_end_abs {
+                still_pending.push(r);
+                continue;
+            }
+            r.attempts += 1;
+            // Re-equalise the segment with the current (now more-adapted) taps,
+            // refined forward-backward-forward; pure re-read of `frac_buf`, no
+            // mutation of the live equaliser.
+            let seg_syms = {
+                let cons = &self.constellation;
+                self.ffe.reequalise_span(
+                    r.seg_start_abs,
+                    r.seg_sym_len,
+                    |y| cons.points[cons.slice_nearest(&[y])[0]],
+                    V3_FFE_MU_DD,
+                )
+            };
+            let Some(seg_syms) = seg_syms else {
+                still_pending.push(r);
+                continue;
+            };
+            // Decode on a CLONED PLL so the live continuous-phase state is
+            // untouched (the retry is a side-pass, not part of the burst chain).
+            let mut pll = self.pll.clone();
+            let mut sigma2_sum = 0.0f64;
+            let mut sigma2_count: usize = 0;
+            let mut pilot_x3_sum = 0.0f64;
+            let mut pilot_x4_sum = 0.0f64;
+            let (seg_data_syms, _pilot_phases) = rx_v2::track_segment(
+                &seg_syms,
+                &self.cfg.pilot_pattern,
+                &mut pll,
+                &self.constellation,
+                &mut sigma2_sum,
+                &mut sigma2_count,
+                &mut pilot_x3_sum,
+                &mut pilot_x4_sum,
+            );
+            let sigma2 = if sigma2_count > 0 {
+                (sigma2_sum / (2 * sigma2_count) as f64) * 2.0
+            } else {
+                0.1
+            };
+            let sigma2_for_llr = sigma2.max(1e-6);
+            let n_cw = if r.is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+            let data_sym_count = n_cw * self.syms_per_cw;
+            if seg_data_syms.len() < data_sym_count {
+                continue;
+            }
+            let mut newly_failed: Vec<usize> = Vec::new();
+            for &cw_idx in &r.failed_cw {
+                let off = cw_idx * self.syms_per_cw;
+                let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
+                let (bytes, converged) = self.decode_one_cw(cw_syms, sigma2_for_llr);
+                if !converged {
+                    newly_failed.push(cw_idx);
+                    continue;
+                }
+                self.cws_converged = self.cws_converged.saturating_add(1);
+                let esi = r.base_esi + cw_idx as u32;
+                // META: recover the AppHeader (first valid copy wins). EOT is
+                // left to the forward path / worker no-progress timer — a retry
+                // is not the place to tear the FSM down.
+                if r.is_meta {
+                    if let Some(h) = decode_meta_payload(&bytes) {
+                        let is_eot = h.k_symbols == 0 && h.file_size == 0;
+                        if !is_eot && self.app_header.is_none() {
+                            events.push(V3SessionEvent::AppHeaderRecovered {
+                                session_id: h.session_id,
+                                file_size: h.file_size,
+                                k_symbols: h.k_symbols,
+                                t_bytes: h.t_bytes,
+                                mode_code: h.mode_code,
+                                mime_type: h.mime_type,
+                                hash_short: h.hash_short,
+                            });
+                            self.app_header = Some(h);
+                        }
+                    }
+                }
+                events.push(V3SessionEvent::CwDecoded {
+                    cycle_idx: r.cycle_idx,
+                    cw_idx,
+                    esi,
+                    is_meta: r.is_meta,
+                    converged: true,
+                    bytes,
+                    sigma2,
+                });
+            }
+            // Keep retrying until decoded, attempts exhausted, or aged out.
+            if !newly_failed.is_empty() && r.attempts < MAX_RETRY_ATTEMPTS {
+                r.failed_cw = newly_failed;
+                still_pending.push(r);
+            }
+        }
+        self.retry_queue = still_pending;
+    }
+
     /// progress) so the outer loop knows to try `try_advance_to_next_marker`.
     fn try_decode_pending_cycle(&mut self, events: &mut Vec<V3SessionEvent>) -> bool {
         let Some(pending) = self.pending_decode else {
@@ -1482,15 +1698,27 @@ impl V3Session {
             return true;
         }
 
+        // Open-loop TED diagnostic (not wired into any correction yet): log the
+        // decision-directed timing error of this segment so we can check, at a
+        // forced drift, whether the signal is convergent (≈0 at the optimum,
+        // monotone-signed off it). `V3_TED_LOG=1`.
+        if std::env::var_os("V3_TED_LOG").is_some() {
+            let ted = self.data_ted(&seg_data_syms[..data_sym_count]);
+            let centroid = self.ffe.tap_centroid().unwrap_or(f64::NAN);
+            eprintln!(
+                "[ted] cycle={} is_meta={} seg_start={} applied_ppm={:+.2} ted={:+.6} centroid={:.4} sigma2={:.4}",
+                pending.cycle_idx, pending.is_meta, seg_start_abs, self.drift_ppm, ted, centroid, sigma2,
+            );
+        }
+
+        let mut failed_cw: Vec<usize> = Vec::new();
         for cw_idx in 0..n_cw {
             let off = cw_idx * self.syms_per_cw;
             let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
-            let llr = soft_demod::llr_maxlog(cw_syms, &self.constellation, sigma2_for_llr);
-            let llr_deint =
-                interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
-            let llr_for_ldpc = &llr_deint[..self.decoder.n()];
-            let (info_bytes, converged) = self.decoder.decode_to_bytes(llr_for_ldpc);
-            let bytes = info_bytes[..self.k_bytes].to_vec();
+            let (bytes, converged) = self.decode_one_cw(cw_syms, sigma2_for_llr);
+            if !converged {
+                failed_cw.push(cw_idx);
+            }
             // ESI per CW: META carries 1 CW at base_esi ; data segments
             // walk V2_CODEWORDS_PER_SEGMENT consecutive ESIs starting at
             // base_esi (matches rx_v2_single's per-marker indexing).
@@ -1555,6 +1783,25 @@ impl V3Session {
                 converged,
                 bytes,
                 sigma2,
+            });
+        }
+        // Closed-window "turbo sync": queue any non-converged codewords for a
+        // later re-decode. By the time this segment's closing marker validates,
+        // the forward DD-LMS will have adapted the taps further, and the retry's
+        // forward-backward-forward re-equalisation reaches a mid-segment fade
+        // from both sides — the streaming analogue of the batch sliding window's
+        // overlapping re-scan. Skip during a drift replay (the replay already
+        // re-decodes the burst) and for the EOT META (handled by the early
+        // return above).
+        if self.turbo_sync_enabled && !failed_cw.is_empty() && !self.replaying {
+            self.retry_queue.push(PendingRetry {
+                seg_start_abs,
+                seg_sym_len,
+                base_esi: pending.base_esi,
+                cycle_idx: pending.cycle_idx,
+                is_meta: pending.is_meta,
+                failed_cw,
+                attempts: 0,
             });
         }
         // Predict the next marker (deterministic superframe-aware advance).
@@ -1969,8 +2216,16 @@ impl V3Session {
         // estimate` (which double-counts when a mid-burst re-acquire
         // re-estimates the same raw audio: −30 → −61). Apply only when it
         // changes the current ratio by more than the commit threshold.
+        // Sign convention: `estimate_drift_gardner` returns the marker-LS slope
+        // in the rx_v2 (batch) resampler's measurement frame. The streaming
+        // `StreamingDsp` needs the OPPOSITE-sign correction to that slope —
+        // confirmed empirically on capture-1781453802 (HIGH++): forcing the
+        // estimate's value (+12.99) costs ~13 data CWs, the negated value
+        // (−12.99) recovers them (335→341 uniqueDataESI, maxσ² 0.032→0.019), and
+        // a forced drift sweep peaks on the negative side (≈ −7..0 ppm). So we
+        // negate here. (`V3_FORCE_DRIFT_PPM` overrides this whole path for A/B.)
         let to_ppm = match rx_v2::estimate_drift_gardner(&self.audio_buffer, &self.cfg) {
-            Some(ppm) => ppm,
+            Some(ppm) => -ppm,
             None => return, // not enough/clean buffer yet — retry next chunk
         };
         let applied = (to_ppm - from_ppm).abs() > COARSE_DRIFT_COMMIT_PPM;
@@ -2051,6 +2306,7 @@ impl V3Session {
         // ones that match reality after the corrected decode).
         self.state = V3SessionState::Idle;
         self.pending_decode = None;
+        self.retry_queue.clear();
         self.next_marker_sym_pos_pred = None;
         self.app_header = None;
         self.cycles_validated = 0;
