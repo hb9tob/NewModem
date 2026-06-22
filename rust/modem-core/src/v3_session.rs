@@ -754,6 +754,32 @@ impl V3Session {
     }
 
     pub fn process_audio_chunk(&mut self, samples: &[f32]) -> Vec<V3SessionEvent> {
+        // No external history → a coarse-drift commit falls back to the internal
+        // 4-cycle `audio_buffer` reboot. Used by unit tests / monolithic feeds.
+        self.process_audio_chunk_impl(samples, None)
+    }
+
+    /// Like [`Self::process_audio_chunk`] but lends the caller's FULL rolling
+    /// capture history (`history`, whose first sample is absolute index
+    /// `history_origin`, running to the live head) so a coarse-drift commit can
+    /// replay from the entry preamble across the WHOLE burst — not just the
+    /// session's truncated 4-cycle `audio_buffer` (~2.6 s), which can never
+    /// reach a superframe boundary several seconds back. The slice is borrowed
+    /// for the call only; the session keeps no copy.
+    pub fn process_audio_chunk_with_history(
+        &mut self,
+        samples: &[f32],
+        history: &[f32],
+        history_origin: u64,
+    ) -> Vec<V3SessionEvent> {
+        self.process_audio_chunk_impl(samples, Some((history, history_origin)))
+    }
+
+    fn process_audio_chunk_impl(
+        &mut self,
+        samples: &[f32],
+        external_history: Option<(&[f32], u64)>,
+    ) -> Vec<V3SessionEvent> {
         let mut events = Vec::new();
         let mut pending_sc: Vec<(u64, f64)> = Vec::new();
 
@@ -891,7 +917,7 @@ impl V3Session {
         //     ratio. Replays the audio buffer recursively (drift_locked
         //     blocks re-entry), so a single call settles the burst at
         //     the right drift.
-        self.try_apply_coarse_drift(&mut events);
+        self.try_apply_coarse_drift(&mut events, external_history);
 
         // 4c. Inter-frame silence gate. The per-sample loop sets
         //     `pending_silence_finalize` once the live SC window energy
@@ -911,6 +937,12 @@ impl V3Session {
         if self.pending_silence_finalize {
             self.pending_silence_finalize = false;
             if matches!(self.state, V3SessionState::Locked { .. }) {
+                if std::env::var_os("V3_LOG_SYNC").is_some() {
+                    eprintln!(
+                        "[finalize] SILENCE-GATE tot={} cycles_validated={}",
+                        self.total_samples, self.cycles_validated,
+                    );
+                }
                 events.extend(self.finalize());
             }
         }
@@ -2440,7 +2472,11 @@ impl V3Session {
     /// streaming pipeline at the corrected ratio, and replays the
     /// rolling audio buffer through it. Either branch locks the
     /// estimator for the rest of the burst.
-    fn try_apply_coarse_drift(&mut self, events: &mut Vec<V3SessionEvent>) {
+    fn try_apply_coarse_drift(
+        &mut self,
+        events: &mut Vec<V3SessionEvent>,
+        external_history: Option<(&[f32], u64)>,
+    ) {
         if self.drift_locked {
             return;
         }
@@ -2495,7 +2531,37 @@ impl V3Session {
         });
         if applied {
             self.drift_ppm = to_ppm;
-            self.reboot_pipeline_and_replay(events);
+            // Prefer a FULL-history replay from the entry preamble: it re-decodes
+            // the WHOLE burst (including the early superframe lost to the
+            // burst-start transient) at the corrected rate, and self-heals across
+            // re-commits — the internal `reboot_pipeline_and_replay` only sees the
+            // 4-cycle `audio_buffer` and can never reach a boundary seconds back.
+            let full_replayed = match (external_history, self.entry_preamble_abs) {
+                (Some((hist, origin)), Some(anchor))
+                    if anchor >= origin && ((anchor - origin) as usize) <= hist.len() =>
+                {
+                    let lo = (anchor - origin) as usize;
+                    if std::env::var_os("V3_LOG_SYNC").is_some() {
+                        eprintln!(
+                            "[finalize] COARSE-DRIFT-REPLAY-ANCHOR tot={} anchor={} from_ppm={:+.2} to_ppm={:+.2} n_obs={} hist_len={}",
+                            self.total_samples, anchor, from_ppm, to_ppm, n_obs, hist.len() - lo,
+                        );
+                    }
+                    let replay = self.replay_from_anchor(&hist[lo..], anchor, to_ppm);
+                    events.extend(replay);
+                    true
+                }
+                _ => false,
+            };
+            if !full_replayed {
+                if std::env::var_os("V3_LOG_SYNC").is_some() {
+                    eprintln!(
+                        "[finalize] COARSE-DRIFT-REBOOT(internal) tot={} from_ppm={:+.2} to_ppm={:+.2} n_obs={}",
+                        self.total_samples, from_ppm, to_ppm, n_obs,
+                    );
+                }
+                self.reboot_pipeline_and_replay(events);
+            }
         }
     }
 

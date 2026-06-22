@@ -153,12 +153,26 @@ impl RxV3Worker {
             self.history.drain(..drop);
             self.history_origin += drop as u64;
         }
-        let events = self.session.process_audio_chunk(samples);
+        // Lend the full rolling history so a coarse-drift commit can replay from
+        // the entry preamble across the whole burst (not the session's 4-cycle
+        // buffer). `history` already includes `samples` (appended just above).
+        let history_origin = self.history_origin;
+        let events = {
+            let hist = self.history.make_contiguous();
+            self.session
+                .process_audio_chunk_with_history(samples, hist, history_origin)
+        };
         let mut outcome = self.route(events);
         // Worker-driven end-of-burst: a locked burst that has gone silent on
         // markers for too long has ended (silence / noise cut / true tail).
         // Finalize → Idle so the next preamble re-acquires.
         if self.active && self.samples_since_progress >= END_OF_BURST_NOPROGRESS_SAMPLES {
+            if std::env::var_os("V3_LOG_SYNC").is_some() {
+                eprintln!(
+                    "[finalize] NO-PROGRESS samples_since_progress={}",
+                    self.samples_since_progress,
+                );
+            }
             let fin = self.finalize();
             outcome.decoded = outcome.decoded.or(fin.decoded);
             outcome.bursts_finalised += fin.bursts_finalised;

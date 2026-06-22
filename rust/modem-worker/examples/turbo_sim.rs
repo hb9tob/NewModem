@@ -368,8 +368,11 @@ fn rxreal(args: &[String]) {
     let mut head = 0usize;
     for chunk in samples.chunks(CHUNK_SAMPLES) {
         head += chunk.len();
+        // Lend the full capture up to the live head so a coarse-drift commit can
+        // replay from the entry preamble across the whole burst (mirrors the
+        // worker lending its rolling history).
         let mut queue: std::collections::VecDeque<V3SessionEvent> =
-            sess.process_audio_chunk(chunk).into();
+            sess.process_audio_chunk_with_history(chunk, &samples[..head], 0).into();
         while let Some(e) = queue.pop_front() {
             match e {
                 V3SessionEvent::SofProbeFired { metric, .. } => {
