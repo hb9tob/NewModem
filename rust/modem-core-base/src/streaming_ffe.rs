@@ -593,6 +593,75 @@ impl StreamingFfe {
         Some(out)
     }
 
+    /// Soft-decision variant of [`reequalise_span`] for turbo equalization
+    /// (Tüchler/Koetter/Singer 2002). Identical FBF re-convolution on a LOCAL
+    /// tap copy, but the per-symbol training reference is the soft estimate
+    /// `soft_refs[k] = E[a_k]` (from the SISO LDPC extrinsic → soft-symbol map)
+    /// instead of the hard nearest-constellation-point. `soft_refs` is aligned
+    /// to the SPAN symbol order (length == `span`), carrying KNOWN pilot symbols
+    /// (full magnitude, weight 1) at pilot positions and `E[a]` at data
+    /// positions. The error gate `|e| < |d|` is retained: with a soft `d` whose
+    /// magnitude shrinks toward 0 at low confidence it doubles as a reliability
+    /// filter (uncertain symbols skip the tap update; pilots with `|d|=1` always
+    /// adapt and anchor the equalizer). `&self`: never mutates the live taps.
+    pub fn reequalise_span_soft(
+        &self,
+        sof_abs: u64,
+        span: usize,
+        soft_refs: &[Complex64],
+        mu_dd: f64,
+    ) -> Option<Vec<Complex64>> {
+        let taps0 = self.current_taps.as_ref()?;
+        if span == 0 || sof_abs < self.start_abs {
+            return None;
+        }
+        if soft_refs.len() != span {
+            return None;
+        }
+        let sof_rel = (sof_abs - self.start_abs) as usize;
+        if sof_rel + span > self.out_buf.len() {
+            return None;
+        }
+        let pitch = self.pitch_fse;
+        let n_ff = self.n_taps;
+        let half = n_ff / 2;
+        let first_center = sof_rel * pitch + self.mf_delay_frac;
+        let last_center = (sof_rel + span - 1) * pitch + self.mf_delay_frac;
+        if first_center < half || last_center + (n_ff - half) > self.frac_buf.len() {
+            return None;
+        }
+
+        let mut taps = taps0.clone();
+        let mut out = vec![Complex64::new(0.0, 0.0); span];
+        for &forward in &[true, false, true] {
+            for kk in 0..span {
+                let k = if forward { kk } else { span - 1 - kk };
+                let center = (sof_rel + k) * pitch + self.mf_delay_frac;
+                let lo = center - half;
+                let mut y = Complex64::new(0.0, 0.0);
+                for (i, &t) in taps.iter().enumerate() {
+                    y += t * self.frac_buf[lo + i];
+                }
+                out[k] = y;
+                if mu_dd > 0.0 {
+                    let d = soft_refs[k];
+                    let e = d - y;
+                    if e.norm_sqr() < d.norm_sqr() {
+                        let mut r_pow = 1e-12f64;
+                        for i in 0..n_ff {
+                            r_pow += self.frac_buf[lo + i].norm_sqr();
+                        }
+                        let mu_eff = mu_dd / r_pow;
+                        for i in 0..n_ff {
+                            taps[i] += Complex64::new(mu_eff, 0.0) * e * self.frac_buf[lo + i].conj();
+                        }
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
     fn trim(&mut self) {
         if self.out_buf.len() > self.retention {
             let drop = self.out_buf.len() - self.retention;

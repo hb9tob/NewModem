@@ -160,6 +160,95 @@ impl LdpcDecoder {
         (bytes, converged)
     }
 
+    /// SISO decode for turbo equalization (Tüchler/Koetter/Singer 2002).
+    ///
+    /// Mirrors [`decode`] exactly (same LNMS schedule) but seeds the variable
+    /// nodes with `channel_llr + apriori_llr`, and returns the per-coded-bit
+    /// EXTRINSIC over the full `n` — the decoder's NEW information for the
+    /// equalizer = posterior − seeded prior = Σ (check-to-variable messages),
+    /// scaled by `extrinsic_damp ∈ (0,1]` to relax the min-sum overconfidence
+    /// and keep the turbo loop from diverging. Subtracting the seeded prior
+    /// (channel AND a-priori) is mandatory: returning the posterior would feed
+    /// the equalizer's own information back to it (positive feedback).
+    ///
+    /// LLR convention: positive = bit 0 more likely (same as [`decode`]).
+    /// `apriori_llr = None` on the first turbo iteration (all-zero prior).
+    /// Returns `(decoded_info_bits, extrinsic_llr_full_n, converged)`.
+    pub fn decode_soft(
+        &self,
+        channel_llr: &[f32],
+        apriori_llr: Option<&[f32]>,
+        extrinsic_damp: f32,
+    ) -> (Vec<u8>, Vec<f32>, bool) {
+        assert_eq!(channel_llr.len(), self.n);
+        if let Some(a) = apriori_llr {
+            assert_eq!(a.len(), self.n);
+        }
+
+        let mut r_messages: Vec<Vec<f32>> = self.h.row_indices.iter()
+            .map(|cols| vec![0.0f32; cols.len()])
+            .collect();
+
+        // Seed = (channel + a-priori), clamped. Keep the CLAMPED seed so the
+        // extrinsic is exactly Σ R (posterior − seed), with no double-counting.
+        let seed: Vec<f32> = (0..self.n)
+            .map(|i| {
+                let ap = apriori_llr.map_or(0.0, |a| a[i]);
+                (channel_llr[i] + ap).clamp(-LLR_CLIP, LLR_CLIP)
+            })
+            .collect();
+        let mut total_llr: Vec<f32> = seed.clone();
+
+        let mut converged = false;
+        for _iter in 0..self.max_iter {
+            for row in 0..self.m {
+                let cols = &self.h.row_indices[row];
+                let degree = cols.len();
+                let q_msgs: Vec<f32> = (0..degree)
+                    .map(|j| total_llr[cols[j]] - r_messages[row][j])
+                    .collect();
+                let mut min1_val = f32::INFINITY;
+                let mut min1_idx = 0usize;
+                let mut min2_val = f32::INFINITY;
+                let mut sign_product: i8 = 1;
+                for (j, &q) in q_msgs.iter().enumerate() {
+                    let absq = q.abs();
+                    if q < 0.0 {
+                        sign_product = -sign_product;
+                    }
+                    if absq < min1_val {
+                        min2_val = min1_val;
+                        min1_val = absq;
+                        min1_idx = j;
+                    } else if absq < min2_val {
+                        min2_val = absq;
+                    }
+                }
+                for j in 0..degree {
+                    let old_r = r_messages[row][j];
+                    let sign_j = if q_msgs[j] < 0.0 { -sign_product } else { sign_product };
+                    let mag = if j == min1_idx { min2_val } else { min1_val };
+                    let new_r = (ALPHA * sign_j as f32 * mag).clamp(-LLR_CLIP, LLR_CLIP);
+                    total_llr[cols[j]] += new_r - old_r;
+                    r_messages[row][j] = new_r;
+                }
+            }
+            if self.check_syndrome(&total_llr) {
+                converged = true;
+                break;
+            }
+        }
+
+        let info_bits: Vec<u8> = total_llr[..self.k]
+            .iter()
+            .map(|&l| if l < 0.0 { 1 } else { 0 })
+            .collect();
+        let extrinsic: Vec<f32> = (0..self.n)
+            .map(|i| (extrinsic_damp * (total_llr[i] - seed[i])).clamp(-LLR_CLIP, LLR_CLIP))
+            .collect();
+        (info_bits, extrinsic, converged)
+    }
+
     pub fn k(&self) -> usize { self.k }
     pub fn n(&self) -> usize { self.n }
 }

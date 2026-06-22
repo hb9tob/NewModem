@@ -135,6 +135,14 @@ pub const V3_FFE_TRAINING_LEN: usize = 384;
 /// `mu_dd` on the data-constellation slicer decisions.
 const V3_FFE_MU_TRAIN: f64 = 0.10;
 const V3_FFE_MU_DD: f64 = 0.02;
+/// Sub-sample search radius (48 kHz samples) for the stage-1b channel-matched
+/// preamble refinement around the integer matched-filter peak.
+const V3_PREAMBLE_REFINE_RADIUS: usize = 8;
+/// Search radius (48 kHz samples) around the predicted position of the second
+/// (boundary) preamble when measuring the 2-preamble coarse drift. Covers a
+/// generous clock error (±~40 ppm over a 4 s superframe ≈ ±8 samples) plus
+/// prediction slop.
+const V3_PREAMBLE2_SEARCH_RADIUS: usize = 2000;
 
 /// Fractional FFE geometry for a profile, mirroring the `rx_v2` batch path
 /// (`sync::decimate_for_fse` + the `n_ff` selection in `rx_v2_single`).
@@ -470,6 +478,23 @@ pub struct V3Session {
     /// the rewind anchor for an étage-B re-commit. Set in `try_acquire_preamble`,
     /// cleared on reboot/finalize.
     entry_preamble_abs: Option<u64>,
+    /// Phase 4 (2-preamble drift): sub-sample-refined ABSOLUTE 48 kHz audio
+    /// position of the entry preamble (#1). Set in `try_acquire_preamble`
+    /// alongside `entry_preamble_abs`; the second preamble at the first
+    /// superframe boundary yields the drift from their measured-vs-nominal
+    /// distance ratio. Cleared on reboot/finalize.
+    preamble1_refined_abs: Option<f64>,
+    /// True once the first superframe boundary was reached and the 2-preamble
+    /// drift estimate was attempted (whether or not preamble #2 was located).
+    /// Gates the mono-preamble `estimate_drift_gardner` fallback in
+    /// `try_apply_coarse_drift` so the precise 2-preamble path commits first.
+    /// Preserved across a reboot (like `drift_locked`); reset in `finalize`.
+    two_preamble_attempted: bool,
+    /// Whether the 2-preamble coarse-drift path is enabled (env `V3_2PRE_DRIFT`).
+    /// Default OFF preserves the validated gardner+reboot path; ON makes the
+    /// 2-preamble estimate primary and gates the gardner fallback. Requires a
+    /// worker (or the diag harness) that services `RewindRequest`.
+    two_preamble_enabled: bool,
     /// True while a `replay_from_anchor` is re-ingesting buffered audio, so the
     /// étage-B estimator does not emit a nested `RewindRequest` mid-replay.
     replaying: bool,
@@ -650,6 +675,9 @@ impl V3Session {
             drift_diag: Vec::new(),
             drift_diag_cum: 0.0,
             entry_preamble_abs: None,
+            preamble1_refined_abs: None,
+            two_preamble_attempted: false,
+            two_preamble_enabled: std::env::var_os("V3_2PRE_DRIFT").is_some(),
             replaying: false,
             turbo_sync_enabled: std::env::var_os("V3_NO_TURBO_SYNC").is_none(),
             drift_recommits: 0,
@@ -950,6 +978,8 @@ impl V3Session {
         self.drift_diag.clear();
         self.drift_diag_cum = 0.0;
         self.entry_preamble_abs = None;
+        self.preamble1_refined_abs = None;
+        self.two_preamble_attempted = false;
         self.drift_recommits = 0;
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
@@ -1167,6 +1197,18 @@ impl V3Session {
         if metric < MF_ACQ_THRESHOLD {
             return;
         }
+        // Stage-1b sub-sample refine of the entry preamble (#1) on the raw
+        // 48 kHz window, for the 2-preamble drift estimate (channel-matched,
+        // group-delay-unbiased; integer-lag fallback if it can't refine).
+        let refined_pre1_abs = {
+            let win = &self.audio_buffer[start_rel..];
+            let refined = self
+                .acq_mf
+                .refine_peak_timedomain(win, lag, V3_PREAMBLE_REFINE_RADIUS)
+                .map(|m| m.refined_pos())
+                .unwrap_or(lag as f64);
+            self.audio_drained_samples as f64 + start_rel as f64 + refined
+        };
         let sps = self.acq_sps as u64;
         const MF_DELAY_SYM: u64 = (crate::types::RRC_SPAN_SYM / 2) as u64;
         // Preamble start on the absolute AUDIO timeline → marker symbol
@@ -1222,6 +1264,9 @@ impl V3Session {
         // burst (incl. the first SF) at the corrected rate.
         self.entry_preamble_abs
             .get_or_insert(preamble_start_abs_audio);
+        if self.preamble1_refined_abs.is_none() {
+            self.preamble1_refined_abs = Some(refined_pre1_abs);
+        }
         events.push(V3SessionEvent::SofProbeFired {
             marker_at_abs: marker_at_abs_audio,
             metric,
@@ -1480,6 +1525,143 @@ impl V3Session {
         (info_bytes[..self.k_bytes].to_vec(), converged)
     }
 
+    /// Soft turbo-equalization of one fully-buffered segment (gated
+    /// `V3_TURBO_SOFT`). Iterates SISO-FFE (`reequalise_span_soft`) ↔ SISO-LDPC
+    /// (`decode_soft`) exchanging extrinsic LLRs as soft symbols E[a]
+    /// (Tüchler/Koetter/Singer 2002), up to `V3_TURBO_SOFT_ITERS` passes or
+    /// until every codeword's LDPC syndrome clears. Iteration 0 is the hard
+    /// re-equalise (≡ today's retry); later iterations re-equalise against E[a]
+    /// at data positions and the KNOWN pilots (full-confidence anchors) at pilot
+    /// positions. Cloned PLL + a local tap copy: the live forward state is never
+    /// touched. Returns the per-codeword `(info_bytes, converged)` (len `n_cw`)
+    /// of the last iteration plus the final per-segment `sigma2`, or `None` if
+    /// the span is not (yet) re-equalisable (caller keeps it pending).
+    fn turbo_soft_segment(
+        &self,
+        seg_start_abs: u64,
+        seg_sym_len: usize,
+        n_cw: usize,
+    ) -> Option<(Vec<(Vec<u8>, bool)>, f64)> {
+        let damp = std::env::var("V3_TURBO_SOFT_DAMP")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.7);
+        let max_iter = std::env::var("V3_TURBO_SOFT_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(2, 6);
+        let cons = &self.constellation;
+        let bps = cons.bits_per_sym;
+        let n = self.decoder.n();
+        let padded_n = self.syms_per_cw * bps;
+        let intl = interleaver::interleave_table(padded_n, self.cfg.constellation);
+        let pattern = &self.cfg.pilot_pattern;
+        let d_syms = pattern.d_syms;
+        let p_syms = pattern.p_syms;
+        let group_sz = d_syms + p_syms;
+        let data_sym_count = n_cw * self.syms_per_cw;
+
+        let mut soft_refs: Option<Vec<Complex64>> = None;
+        let mut results: Vec<(Vec<u8>, bool)> = vec![(Vec::new(), false); n_cw];
+        let mut last_sigma2 = 0.1f64;
+
+        for _it in 0..max_iter {
+            // SISO-FFE leg: hard re-equalise on the first pass, then re-equalise
+            // against the soft references from the previous LDPC pass.
+            let seg_syms = match &soft_refs {
+                None => self.ffe.reequalise_span(
+                    seg_start_abs,
+                    seg_sym_len,
+                    |y| cons.points[cons.slice_nearest(&[y])[0]],
+                    V3_FFE_MU_DD,
+                )?,
+                Some(refs) => {
+                    self.ffe
+                        .reequalise_span_soft(seg_start_abs, seg_sym_len, refs, V3_FFE_MU_DD)?
+                }
+            };
+            // Pilot-interp + sigma2 on a CLONED PLL (side-pass, live state intact).
+            let mut pll = self.pll.clone();
+            let (mut s2sum, mut s2cnt, mut x3, mut x4) = (0.0f64, 0usize, 0.0f64, 0.0f64);
+            let (seg_data_syms, _) = rx_v2::track_segment(
+                &seg_syms,
+                pattern,
+                &mut pll,
+                cons,
+                &mut s2sum,
+                &mut s2cnt,
+                &mut x3,
+                &mut x4,
+            );
+            let sigma2 = if s2cnt > 0 {
+                (s2sum / (2 * s2cnt) as f64) * 2.0
+            } else {
+                0.1
+            }
+            .max(1e-6);
+            last_sigma2 = sigma2;
+            if seg_data_syms.len() < data_sym_count {
+                return None;
+            }
+            // SISO-LDPC leg: decode every codeword, collect E[a] for the FFE.
+            let mut data_e: Vec<Complex64> = Vec::with_capacity(data_sym_count);
+            let mut all_converged = true;
+            for cw_idx in 0..n_cw {
+                let off = cw_idx * self.syms_per_cw;
+                let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
+                let llr = soft_demod::llr_maxlog(cw_syms, cons, sigma2);
+                let llr_deint = interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
+                let (info_bits, extrinsic_n, converged) =
+                    self.decoder.decode_soft(&llr_deint[..n], None, damp);
+                // info bits -> bytes (MSB-first), truncate to k_bytes (mirror decode_to_bytes).
+                let bytes: Vec<u8> = info_bits
+                    .chunks(8)
+                    .map(|chunk| {
+                        let mut byte = 0u8;
+                        for (i, &b) in chunk.iter().enumerate() {
+                            byte |= (b & 1) << (7 - i);
+                        }
+                        byte
+                    })
+                    .collect();
+                let bytes = bytes[..self.k_bytes].to_vec();
+                if !converged {
+                    all_converged = false;
+                }
+                results[cw_idx] = (bytes, converged);
+                // LDPC extrinsic -> soft symbols E[a]: re-pad to padded_n (tail
+                // neutral LLR 0), re-interleave to symbol-major, factorise.
+                let mut ext_padded = vec![0.0f32; padded_n];
+                ext_padded[..n].copy_from_slice(&extrinsic_n);
+                let ext_sym = interleaver::apply_permutation_f32(&ext_padded, &intl);
+                let soft = soft_demod::soft_symbols_from_posterior_llr(&ext_sym, cons);
+                for ss in &soft {
+                    data_e.push(ss.mean);
+                }
+            }
+            if all_converged {
+                break;
+            }
+            // Compose the next-iteration soft references over the FULL span:
+            // E[a] at data positions, KNOWN pilots at pilot positions.
+            let mut refs = vec![Complex64::new(0.0, 0.0); seg_sym_len];
+            for i in 0..seg_sym_len {
+                let g = i / group_sz;
+                let inner = i % group_sz;
+                if inner < d_syms {
+                    let di = g * d_syms + inner;
+                    refs[i] = data_e.get(di).copied().unwrap_or(Complex64::new(0.0, 0.0));
+                } else {
+                    let pilots = crate::pilot::pilots_for_group(g, pattern);
+                    refs[i] = pilots[inner - d_syms];
+                }
+            }
+            soft_refs = Some(refs);
+        }
+        Some((results, last_sigma2))
+    }
+
     /// Closed-window "turbo sync" pass. For each queued segment whose codewords
     /// did not all converge on the forward pass, re-equalise it over the now
     /// fully-buffered superframe (forward-backward-forward DD-LMS on a local tap
@@ -1494,6 +1676,13 @@ impl V3Session {
         if !self.turbo_sync_enabled || self.replaying || self.retry_queue.is_empty() {
             return;
         }
+        // Soft turbo-equalization, ON by default (disable with V3_NO_TURBO_SOFT
+        // for A/B). It can only ADD recoveries: iteration 0 IS the validated
+        // hard re-equalise+re-decode, and it iterates further only on codewords
+        // that still fail — so it never regresses the hard retry, and earns its
+        // keep on ISI/noise-limited (low-SNR) channels even when a clean capture
+        // shows no gain.
+        let turbo_soft = std::env::var_os("V3_NO_TURBO_SOFT").is_none();
         let sym_start_abs = self.ffe.start_abs();
         let sym_end_abs = sym_start_abs + self.ffe.out_buf().len() as u64;
         let queue = std::mem::take(&mut self.retry_queue);
@@ -1509,6 +1698,59 @@ impl V3Session {
                 continue;
             }
             r.attempts += 1;
+            // Soft turbo-equalization path (gated). Runs the iterative SISO-FFE
+            // ↔ SISO-LDPC loop over the whole segment, then emits exactly like
+            // the hard path. Falls through to the hard path when disabled.
+            if turbo_soft {
+                let n_cw = if r.is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+                let Some((per_cw, sigma2)) =
+                    self.turbo_soft_segment(r.seg_start_abs, r.seg_sym_len, n_cw)
+                else {
+                    still_pending.push(r);
+                    continue;
+                };
+                let mut newly_failed: Vec<usize> = Vec::new();
+                for &cw_idx in &r.failed_cw {
+                    let (bytes, converged) = &per_cw[cw_idx];
+                    if !*converged {
+                        newly_failed.push(cw_idx);
+                        continue;
+                    }
+                    self.cws_converged = self.cws_converged.saturating_add(1);
+                    let esi = r.base_esi + cw_idx as u32;
+                    if r.is_meta {
+                        if let Some(h) = decode_meta_payload(bytes) {
+                            let is_eot = h.k_symbols == 0 && h.file_size == 0;
+                            if !is_eot && self.app_header.is_none() {
+                                events.push(V3SessionEvent::AppHeaderRecovered {
+                                    session_id: h.session_id,
+                                    file_size: h.file_size,
+                                    k_symbols: h.k_symbols,
+                                    t_bytes: h.t_bytes,
+                                    mode_code: h.mode_code,
+                                    mime_type: h.mime_type,
+                                    hash_short: h.hash_short,
+                                });
+                                self.app_header = Some(h);
+                            }
+                        }
+                    }
+                    events.push(V3SessionEvent::CwDecoded {
+                        cycle_idx: r.cycle_idx,
+                        cw_idx,
+                        esi,
+                        is_meta: r.is_meta,
+                        converged: true,
+                        bytes: bytes.clone(),
+                        sigma2,
+                    });
+                }
+                if !newly_failed.is_empty() && r.attempts < MAX_RETRY_ATTEMPTS {
+                    r.failed_cw = newly_failed;
+                    still_pending.push(r);
+                }
+                continue;
+            }
             // Re-equalise the segment with the current (now more-adapted) taps,
             // refined forward-backward-forward; pure re-read of `frac_buf`, no
             // mutation of the live equaliser.
@@ -2024,6 +2266,13 @@ impl V3Session {
                         self.drift_observations.push((x, y));
                     }
                 }
+                // Phase 4 (primary): a validated META marker past bootstrap is a
+                // superframe boundary — its preamble (#2) is in the rolling
+                // buffer, so measure the precise 2-preamble coarse drift and
+                // commit by rewinding to preamble #1.
+                if is_meta {
+                    self.try_two_preamble_drift(marker_sym_pos_abs, events);
+                }
                 // Per-cycle timing poursuite (fine tracking). Once the coarse
                 // grid has locked the bulk drift, integrate each marker's
                 // residual timing error into `drift_ppm` so the resampler
@@ -2195,6 +2444,14 @@ impl V3Session {
         if self.drift_locked {
             return;
         }
+        // When the 2-preamble path is enabled it is the primary, more precise
+        // drift source (run at the first superframe boundary). Give it first
+        // commit: only fall back to this marker-grid `estimate_drift_gardner`
+        // once that boundary has passed without locking (preamble #2 lost / too
+        // noisy). When disabled (default) the gardner path is unchanged.
+        if self.two_preamble_enabled && !self.two_preamble_attempted {
+            return;
+        }
         if self.drift_observations.len() < COARSE_DRIFT_MIN_OBS {
             return;
         }
@@ -2239,6 +2496,115 @@ impl V3Session {
         if applied {
             self.drift_ppm = to_ppm;
             self.reboot_pipeline_and_replay(events);
+        }
+    }
+
+    /// Phase 4 (PRIMARY): coarse drift from TWO preambles. Called when the
+    /// first superframe-boundary META marker validates — the boundary preamble
+    /// (#2) then sits in the rolling audio buffer a known nominal distance after
+    /// the entry preamble (#1, `preamble1_refined_abs`). Locating #2 on the raw
+    /// 48 kHz timeline (stage-1b channel-matched refine) gives the clock drift
+    /// from the measured-vs-nominal distance ratio — a coherent 256-symbol
+    /// template, far more precise than the post-decode marker-LS slope.
+    ///
+    /// Sign mirrors `estimate_drift_gardner`: a longer measured distance ⇒ RX
+    /// clock faster than TX ⇒ batch-frame ppm > 0, and the streaming
+    /// `StreamingDsp` needs the OPPOSITE-sign correction, so
+    /// `to_ppm = -((measured/nominal) - 1) * 1e6`. Commits by rewinding to the
+    /// entry preamble via `RewindRequest` so the worker replays the WHOLE burst
+    /// (incl. the first superframe) at the corrected rate — the 4-cycle internal
+    /// buffer can't reach #1, which is the "+7 transient" the coarse one-shot
+    /// otherwise loses. One-shot per burst (`drift_locked`).
+    fn try_two_preamble_drift(
+        &mut self,
+        boundary_marker_sym_pos_abs: u64,
+        events: &mut Vec<V3SessionEvent>,
+    ) {
+        if !self.two_preamble_enabled {
+            return;
+        }
+        if self.drift_locked || self.replaying || self.two_preamble_attempted {
+            return;
+        }
+        // Mark attempted up-front: whatever the outcome, the gardner fallback in
+        // `try_apply_coarse_drift` is now allowed to fire if we don't lock here.
+        self.two_preamble_attempted = true;
+        let Some(pre1) = self.preamble1_refined_abs else {
+            return;
+        };
+        let sps = self.acq_sps as u64;
+        const MF_DELAY_SYM: u64 = (crate::types::RRC_SPAN_SYM / 2) as u64;
+        // Predicted raw-audio position of preamble #2 = (boundary marker sym
+        // − MF half-delay − N_PREAMBLE) × sps. Pre-lock the resampler is unity
+        // so the symbol grid maps to raw audio at exactly `sps`; the wide
+        // matched-filter search absorbs the residual group delay.
+        let pre2_target_abs = boundary_marker_sym_pos_abs
+            .saturating_sub(MF_DELAY_SYM + crate::types::N_PREAMBLE as u64)
+            * sps;
+        if pre2_target_abs < self.audio_drained_samples {
+            return; // #2 scrolled out of the rolling buffer — fall back
+        }
+        let center_rel = (pre2_target_abs - self.audio_drained_samples) as usize;
+        let tlen = self.acq_mf.template_len();
+        let win_start = center_rel.saturating_sub(V3_PREAMBLE2_SEARCH_RADIUS);
+        let win_end =
+            (center_rel + tlen + V3_PREAMBLE2_SEARCH_RADIUS).min(self.audio_buffer.len());
+        if win_end < win_start + tlen {
+            return; // not enough audio around #2 buffered yet — fall back
+        }
+        let (refined_pos, metric) = {
+            let win = &self.audio_buffer[win_start..win_end];
+            let m = match self.acq_mf.best_match(win) {
+                Some(v) => v,
+                None => return,
+            };
+            if m.metric < MF_ACQ_THRESHOLD {
+                return;
+            }
+            let refined = self
+                .acq_mf
+                .refine_peak_timedomain(win, m.lag, V3_PREAMBLE_REFINE_RADIUS)
+                .map(|r| r.refined_pos())
+                .unwrap_or(m.lag as f64);
+            (refined, m.metric)
+        };
+        let refined_pre2_abs =
+            self.audio_drained_samples as f64 + win_start as f64 + refined_pos;
+        let measured = refined_pre2_abs - pre1;
+        let nominal = self.coarse_drift_cum_offset_sym as f64 * sps as f64;
+        if nominal <= 0.0 || measured <= 0.0 {
+            return;
+        }
+        let batch_ppm = (measured / nominal - 1.0) * 1.0e6;
+        let to_ppm = -batch_ppm;
+        if !to_ppm.is_finite() || to_ppm.abs() > 200.0 {
+            return; // implausible — almost certainly a mis-locate; fall back
+        }
+        let from_ppm = self.drift_ppm;
+        let applied = (to_ppm - from_ppm).abs() > COARSE_DRIFT_COMMIT_PPM;
+        if std::env::var_os("V3_DRIFT_LOG").is_some() {
+            eprintln!(
+                "[2pre] measured={measured:.1} nominal={nominal:.1} metric={metric:.3} \
+                 batch_ppm={batch_ppm:+.2} to_ppm={to_ppm:+.2} from={from_ppm:+.2} applied={applied}",
+            );
+        }
+        self.drift_locked = true;
+        events.push(V3SessionEvent::DriftCommitted {
+            from_ppm,
+            to_ppm,
+            n_observations: 2,
+            applied,
+        });
+        if applied {
+            if let Some(anchor) = self.entry_preamble_abs {
+                // Rewind to preamble #1; the worker replays the whole burst at
+                // the corrected rate over its 30 s history (the 4-cycle internal
+                // buffer can't reach back this far, so NOT reboot_pipeline...).
+                events.push(V3SessionEvent::RewindRequest {
+                    anchor_abs_sample: anchor,
+                    new_drift_ppm: to_ppm,
+                });
+            }
         }
     }
 
@@ -2317,6 +2683,10 @@ impl V3Session {
         self.drift_diag.clear();
         self.drift_diag_cum = 0.0;
         self.entry_preamble_abs = None;
+        self.preamble1_refined_abs = None;
+        // NB: `two_preamble_attempted` is deliberately NOT reset here — like
+        // `drift_locked` it must persist across a replay so the corrected pass
+        // does not re-run the one-shot estimator. Reset only in `finalize()`.
         // NB: `drift_recommits` is deliberately NOT reset here — it must persist
         // across an étage-B replay so the re-commit count stays bounded per
         // burst (a reboot is mid-burst, not a new burst). Reset only in
