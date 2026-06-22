@@ -397,6 +397,14 @@ pub struct V3Session {
     /// miss, to exercise the flywheel coast on a clean capture. 0 = off.
     marker_drop_n: u32,
     marker_seen: u32,
+    /// Backward recovery (flywheel): the last validated marker's base_esi and the
+    /// SF-boundary preamble (audio-absolute) at/before it. Preserved across a
+    /// give-up `finalize()` (NOT reset there) so that on a later re-acquisition
+    /// past a gap we RewindRequest to that preamble and let the forward coast
+    /// re-fill the gap over the caller's full history. Cleared on a true EOT and
+    /// on a backward-recovery emit.
+    recovery_base_esi: Option<u32>,
+    recovery_preamble_abs: Option<u64>,
     /// Rolling audio buffer (linear `Vec` because `StreamingDsp::feed_audio`
     /// reads a `&[f32]` slice). Trimmed to
     /// `AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples` each chunk; the
@@ -674,6 +682,8 @@ impl V3Session {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             marker_seen: 0,
+            recovery_base_esi: None,
+            recovery_preamble_abs: None,
             audio_buffer: Vec::with_capacity(retain),
             audio_drained_samples: 0,
             total_samples: 0,
@@ -1157,6 +1167,13 @@ impl V3Session {
                 // from the META cycle length, so the SC-located DATA
                 // marker is the next one `try_advance_to_next_marker`
                 // attempts. No need to set the prediction here.
+                self.maybe_backward_recovery(
+                    meta_payload.base_esi,
+                    meta_at_abs,
+                    meta_payload.is_eot_frame(),
+                    events,
+                );
+                self.note_recovery_anchor(meta_at_abs, meta_payload.base_esi);
                 return;
             }
         }
@@ -1190,6 +1207,77 @@ impl V3Session {
             self.drift_anchor_sym_pos =
                 Some(self.refine_marker_sym_pos_abs(marker_sym_pos_abs));
         }
+        // Backward recovery: a re-acquisition past a gap → replay from the
+        // remembered SF preamble so the forward coast re-fills the gap.
+        self.maybe_backward_recovery(
+            payload.base_esi,
+            marker_at_abs,
+            payload.is_eot_frame(),
+            events,
+        );
+        self.note_recovery_anchor(marker_at_abs, payload.base_esi);
+    }
+
+    /// Record the SF-boundary preamble (audio-absolute) at/before a validated
+    /// marker + its base_esi, so a later re-acquisition past a gap can replay
+    /// from that preamble. Preserved across a give-up `finalize()`.
+    fn note_recovery_anchor(&mut self, marker_audio_abs: u64, base_esi: u32) {
+        self.recovery_base_esi = Some(base_esi);
+        if let Some(entry) = self.entry_preamble_abs {
+            if marker_audio_abs >= entry {
+                let (sps, _) = rrc::check_integer_constraints(
+                    AUDIO_RATE,
+                    self.cfg.symbol_rate,
+                    self.cfg.tau,
+                )
+                .expect("profile config has valid integer sps");
+                let sf_audio = self.superframe_period_sym as u64 * sps as u64;
+                if sf_audio > 0 {
+                    let k = (marker_audio_abs - entry) / sf_audio;
+                    self.recovery_preamble_abs = Some(entry + k * sf_audio);
+                }
+            }
+        }
+    }
+
+    /// On a re-acquisition: if a prior epoch left a recovery anchor and the new
+    /// epoch starts AFTER a gap, RewindRequest to the remembered SF preamble so
+    /// the forward coast re-fills the gap over the caller's full history. Returns
+    /// true if a request was emitted (anchor consumed). Skips during a replay,
+    /// for the EOT trailer, and when there is no forward gap.
+    fn maybe_backward_recovery(
+        &mut self,
+        new_base_esi: u32,
+        new_marker_audio: u64,
+        is_eot: bool,
+        events: &mut Vec<V3SessionEvent>,
+    ) -> bool {
+        if self.replaying || is_eot {
+            return false;
+        }
+        let (Some(prev_esi), Some(preamble)) =
+            (self.recovery_base_esi, self.recovery_preamble_abs)
+        else {
+            return false;
+        };
+        // Forward gap only (≥1 missed segment) and the anchor is genuinely behind.
+        let gap = new_base_esi > prev_esi + V2_CODEWORDS_PER_SEGMENT as u32;
+        if !gap || preamble >= new_marker_audio {
+            return false;
+        }
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[sync] BACKWARD-RECOVERY replay from preamble={preamble} \
+                 (prev_esi={prev_esi} new_esi={new_base_esi})",
+            );
+        }
+        events.push(V3SessionEvent::RewindRequest {
+            anchor_abs_sample: preamble,
+            new_drift_ppm: self.drift_ppm,
+        });
+        self.recovery_base_esi = None;
+        self.recovery_preamble_abs = None;
+        true
     }
 
     /// Probe one META cycle backward of a validated DATA marker, looking
@@ -2049,6 +2137,11 @@ impl V3Session {
                         let is_eot = h.k_symbols == 0 && h.file_size == 0;
                         if is_eot {
                             events.push(V3SessionEvent::EotSeen);
+                            // True burst end → drop the backward-recovery anchor
+                            // so it can't trigger a cross-burst replay into the
+                            // next transmission.
+                            self.recovery_base_esi = None;
+                            self.recovery_preamble_abs = None;
                             // Push the CwDecoded for symmetry with the
                             // non-EOT path BEFORE the finalize teardown,
                             // since finalize() emits SessionFinalised +
@@ -2350,6 +2443,9 @@ impl V3Session {
                     is_meta,
                     blind: false,
                 });
+                // Keep the backward-recovery anchor current through normal
+                // forward progress, so a later give-up brackets the right gap.
+                self.note_recovery_anchor(marker_at_abs, payload.base_esi);
                 // Phase 4: record a (cumulative_offset, drift_residual)
                 // observation for the LS fit. `pred` chains on the
                 // previous integer-observed marker so it absorbs the
