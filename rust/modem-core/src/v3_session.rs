@@ -380,6 +380,23 @@ pub struct V3Session {
     /// return to Idle for a late-entry re-acquire. Reset on any validated
     /// marker.
     consecutive_miss: u32,
+    /// Decision-directed coast. On a missed marker, blind-decode the segment at
+    /// the predicted position (base_esi from `next_base_esi`) instead of
+    /// discarding it; a converged LDPC CW re-confirms sync and resets the miss
+    /// counter so the chain KEEPS ADVANCING. A bounded run of non-convergent
+    /// blinds still gives up (`MAX_CONSECUTIVE_MISS`). Default ON (a safety net
+    /// for low-SNR / QRM / dropouts: it can only ADD recoveries — a converged
+    /// blind CW is a self-validating anchor, and noise never converges so it
+    /// cannot poison). Disable with `V3_NO_FLYWHEEL`.
+    flywheel: bool,
+    /// Running base_esi the NEXT segment should carry (`esi_start + data_cursor`,
+    /// mirrors TX frame.rs). Re-synced from the wire on every validated decode,
+    /// advanced +2 per DATA / +0 per META. Labels blind segments under `flywheel`.
+    next_base_esi: Option<u32>,
+    /// Diagnostic (V3_DROP_MARKER=N): force every Nth otherwise-valid marker to a
+    /// miss, to exercise the flywheel coast on a clean capture. 0 = off.
+    marker_drop_n: u32,
+    marker_seen: u32,
     /// Rolling audio buffer (linear `Vec` because `StreamingDsp::feed_audio`
     /// reads a `&[f32]` slice). Trimmed to
     /// `AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples` each chunk; the
@@ -536,6 +553,10 @@ struct PendingDecode {
     cycle_idx: u32,
     base_esi: u32,
     is_meta: bool,
+    /// Decoded WITHOUT a validated marker (flywheel coast): position +
+    /// `base_esi` are predicted from the cadence. A converged CW resets
+    /// `consecutive_miss` (sync re-confirmed → keep advancing).
+    blind: bool,
 }
 
 /// A segment that had ≥1 non-converged codeword on its first (forward,
@@ -646,6 +667,13 @@ impl V3Session {
             elapsed_since_preamble_sym: 0,
             next_marker_is_meta: false,
             consecutive_miss: 0,
+            flywheel: std::env::var_os("V3_NO_FLYWHEEL").is_none(),
+            next_base_esi: None,
+            marker_drop_n: std::env::var("V3_DROP_MARKER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            marker_seen: 0,
             audio_buffer: Vec::with_capacity(retain),
             audio_drained_samples: 0,
             total_samples: 0,
@@ -1016,6 +1044,8 @@ impl V3Session {
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
         self.consecutive_miss = 0;
+        self.next_base_esi = None;
+        self.marker_seen = 0;
         // Re-arm the SC detector latch so a mid-transmission finalize (the
         // worker no-progress timer, or a consecutive-miss escalation) can
         // late-entry re-acquire: with the signal still present `M` is
@@ -1111,6 +1141,7 @@ impl V3Session {
                     cycle_idx: 0,
                     base_esi: meta_payload.base_esi,
                     is_meta: true,
+                    blind: false,
                 });
                 // Phase 4 anchor: refine the META sym position and
                 // remember it as the LS-fit origin. The DATA marker
@@ -1152,6 +1183,7 @@ impl V3Session {
             cycle_idx,
             base_esi: payload.base_esi,
             is_meta,
+            blind: false,
         });
         // Phase 4 anchor: same recipe as the META-lookback branch.
         if !self.drift_locked && self.drift_anchor_sym_pos.is_none() {
@@ -2067,6 +2099,9 @@ impl V3Session {
         // overlapping re-scan. Skip during a drift replay (the replay already
         // re-decodes the burst) and for the EOT META (handled by the early
         // return above).
+        // Capture before `failed_cw` is moved into the retry queue below: a blind
+        // (marker-less) segment with ≥1 converged CW re-confirms sync.
+        let blind_any_converged = pending.blind && failed_cw.len() < n_cw;
         if self.turbo_sync_enabled && !failed_cw.is_empty() && !self.replaying {
             self.retry_queue.push(PendingRetry {
                 seg_start_abs,
@@ -2077,6 +2112,24 @@ impl V3Session {
                 failed_cw,
                 attempts: 0,
             });
+        }
+        // Track the base_esi the NEXT segment will carry (mirrors TX frame.rs:
+        // +2 per DATA, +0 per META). `pending.base_esi` is the validated marker's
+        // value (re-syncs from the wire each decode) or the reconstructed value
+        // for a blind coast segment.
+        self.next_base_esi = Some(
+            pending.base_esi
+                + if pending.is_meta {
+                    0
+                } else {
+                    V2_CODEWORDS_PER_SEGMENT as u32
+                },
+        );
+        // Flywheel: a converged CW on a BLIND (marker-less) segment re-confirms
+        // sync at the predicted position → reset the miss counter so the coast
+        // KEEPS ADVANCING. Non-convergence leaves it, bounding the coast.
+        if blind_any_converged {
+            self.consecutive_miss = 0;
         }
         // Predict the next marker (deterministic superframe-aware advance).
         let (next_pred, next_is_meta) =
@@ -2227,6 +2280,21 @@ impl V3Session {
             }
         }
 
+        // Diagnostic (V3_DROP_MARKER=N): force every Nth otherwise-valid marker
+        // to a miss, to exercise the flywheel coast on a clean capture.
+        if self.marker_drop_n > 0 && validated.is_some() {
+            self.marker_seen += 1;
+            if self.marker_seen % self.marker_drop_n == 0 {
+                if std::env::var_os("V3_LOG_SYNC").is_some() {
+                    eprintln!(
+                        "[sync] DROP forced miss at pred={pred} (marker #{})",
+                        self.marker_seen,
+                    );
+                }
+                validated = None;
+            }
+        }
+
         match validated {
             Some((pos, payload)) => {
                 self.next_marker_sym_pos_pred = None;
@@ -2280,6 +2348,7 @@ impl V3Session {
                     cycle_idx,
                     base_esi: payload.base_esi,
                     is_meta,
+                    blind: false,
                 });
                 // Phase 4: record a (cumulative_offset, drift_residual)
                 // observation for the LS fit. `pred` chains on the
@@ -2432,15 +2501,59 @@ impl V3Session {
                     events.extend(self.finalize());
                     return true;
                 }
+                // Flywheel (default ON, V3_NO_FLYWHEEL to disable): decision-
+                // directed coast. Instead of
+                // discarding the missed segment, blind-decode it at the predicted
+                // position with the cadence-reconstructed base_esi. The blind
+                // PendingDecode is decoded on the next loop pass; a converged CW
+                // resets `consecutive_miss` (sync re-confirmed → KEEP ADVANCING).
+                // Bounded by the give-up check above. Setting the prediction to
+                // None hands the advance to the blind decode (it advances from
+                // `pred` in `try_decode_pending_cycle`).
+                if self.flywheel {
+                    if let Some(base_esi) = self.next_base_esi {
+                        let cycle_idx = match &self.state {
+                            V3SessionState::Locked { cycle_idx, .. } => {
+                                cycle_idx.saturating_add(1)
+                            }
+                            _ => 0,
+                        };
+                        if std::env::var_os("V3_LOG_SYNC").is_some() {
+                            eprintln!(
+                                "[sync] FLYWHEEL blind-decode pred={pred} base_esi={base_esi} \
+                                 is_meta={} consec={}",
+                                self.next_marker_is_meta, self.consecutive_miss,
+                            );
+                        }
+                        self.pending_decode = Some(PendingDecode {
+                            marker_sym_pos_abs: pred,
+                            cycle_idx,
+                            base_esi,
+                            is_meta: self.next_marker_is_meta,
+                            blind: true,
+                        });
+                        self.next_marker_sym_pos_pred = None;
+                        return true;
+                    }
+                }
                 // Minor OTA incident (QRM) with the TX still in sync: the
                 // next SOF position is still ~known, so SKIP the corrupted
                 // marker and keep predicting forward (its CWs are lost →
                 // RaptorQ repairs). The missed segment still counts toward
                 // the superframe `elapsed`, so the chain stays phase-locked.
+                let skipped_was_meta = self.next_marker_is_meta;
                 let (next_pred, next_is_meta) =
-                    self.advance_prediction(pred, self.next_marker_is_meta);
+                    self.advance_prediction(pred, skipped_was_meta);
                 self.next_marker_sym_pos_pred = Some(next_pred);
                 self.next_marker_is_meta = next_is_meta;
+                // Keep the coast base_esi accounting accurate across a skip too.
+                self.next_base_esi = self.next_base_esi.map(|b| {
+                    b + if skipped_was_meta {
+                        0
+                    } else {
+                        V2_CODEWORDS_PER_SEGMENT as u32
+                    }
+                });
                 true
             }
         }
@@ -2760,6 +2873,8 @@ impl V3Session {
         self.elapsed_since_preamble_sym = 0;
         self.next_marker_is_meta = false;
         self.consecutive_miss = 0;
+        self.next_base_esi = None;
+        self.marker_seen = 0;
         self.burst_energy_ref = 0.0;
         self.silence_run = 0;
         self.pending_silence_finalize = false;
