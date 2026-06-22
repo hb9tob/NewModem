@@ -106,7 +106,14 @@ def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
     # Instant d'echantillonnage dans le signal d'origine
     t_src = t - cum_shift
     t_src = np.clip(t_src, 0.0, (n - 1) / sr)
-    return np.interp(t_src, t, audio)
+    # Cubic interpolation, NOT linear. Linear np.interp injects broadband
+    # interpolation noise (~ -7 dB MER on the resampled passband) that destroys
+    # high-order 64-APSK decode INDEPENDENTLY of the drift value — a simulator
+    # artifact, not a real clock-drift effect. Cubic keeps the modem passband
+    # (~300-2700 Hz, heavily oversampled at 48 kHz) clean so high-drift decode
+    # is actually testable.
+    from scipy.interpolate import CubicSpline
+    return CubicSpline(t, audio)(t_src)
 
 
 def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
