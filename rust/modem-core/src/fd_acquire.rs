@@ -87,6 +87,121 @@ impl PreambleMatchedFilter {
         self.n_template
     }
 
+    /// Stage-2 refinement: re-locate the preamble in the TIME domain at full
+    /// 48 kHz, against a channel-magnitude-matched template.
+    ///
+    /// Stage 1 ([`best_match`]) correlates the FLAT passband template; on a
+    /// colored NBFM channel its correlation peak is broadened and its 3-point
+    /// parabola is biased by the channel group delay. This stage pre-filters
+    /// the KNOWN template with the channel magnitude estimated from the FFT —
+    /// `P(f) = |RX(f)| · exp(j·arg T(f))`: it adopts the received spectral
+    /// MAGNITUDE (matched-filter SNR gain → a sharp, low-variance peak) while
+    /// keeping the template's PHASE (so no bulk delay is absorbed and the
+    /// sub-sample timing stays valid). The residual channel-group-delay bias is
+    /// common to every preamble in a burst, so it cancels in the
+    /// preamble-to-preamble DISTANCE the drift estimator consumes.
+    ///
+    /// `coarse_lag` is the stage-1 integer peak in `window`; we re-search a
+    /// time-domain normalised correlation within `±search_radius` samples of it
+    /// and parabola-refine the (sharp) peak. Returns the refined match (absolute
+    /// `lag` in `window`, sub-sample `frac`, normalised `metric ∈ [0,1]`), or
+    /// `None` if `coarse_lag` leaves less than a full template inside `window`.
+    pub fn refine_peak_timedomain(
+        &self,
+        window: &[f32],
+        coarse_lag: usize,
+        search_radius: usize,
+    ) -> Option<PreambleMatch> {
+        if coarse_lag + self.n_template > window.len() {
+            return None;
+        }
+        // RX(f) = FFT of the received segment at the coarse lag (zero-padded).
+        let mut rx: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); self.fft_size];
+        for i in 0..self.n_template {
+            rx[i] = Complex::new(window[coarse_lag + i] as f64, 0.0);
+        }
+        self.fwd.process(&mut rx);
+        // Channel-magnitude-matched template spectrum:
+        //   P(f) = |RX(f)| · exp(j·arg T(f))
+        //        = |RX(f)| · conj(template_spec_conj) / |template_spec_conj|
+        // (template_spec_conj = conj T, so T/|T| = conj(template_spec_conj)/|..|).
+        // ε floors the template-magnitude denominator so out-of-band bins
+        // (|T|≈0) contribute no noise.
+        let mean_t = (self
+            .template_spec_conj
+            .iter()
+            .map(|c| c.norm_sqr())
+            .sum::<f64>()
+            / self.fft_size as f64)
+            .sqrt();
+        let eps = mean_t * 1e-3;
+        let mut p: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); self.fft_size];
+        for k in 0..self.fft_size {
+            // exp(j·arg T) = T/|T|, and T = conj(template_spec_conj). Using
+            // template_spec_conj directly would be exp(-j·arg T) → a circularly
+            // time-REVERSED template (convolution, not correlation).
+            let t = self.template_spec_conj[k].conj();
+            let t_mag = t.norm();
+            let rx_mag = rx[k].norm();
+            p[k] = t * (rx_mag / (t_mag + eps));
+        }
+        self.inv.process(&mut p);
+        let inv_n = 1.0 / self.fft_size as f64;
+        // Channel-matched time-domain template (real part, first n_template taps).
+        let tmpl: Vec<f64> = (0..self.n_template).map(|i| p[i].re * inv_n).collect();
+        let e_tmpl = tmpl.iter().map(|&x| x * x).sum::<f64>().max(1e-12);
+
+        // Time-domain normalised correlation within ±search_radius of coarse_lag.
+        let lo = coarse_lag.saturating_sub(search_radius);
+        let hi = (coarse_lag + search_radius).min(window.len() - self.n_template);
+        if hi < lo {
+            return None;
+        }
+        let mut best_lag = coarse_lag;
+        let mut best_metric = 0.0f64;
+        let mut curve: Vec<f64> = Vec::with_capacity(hi - lo + 1);
+        for lag in lo..=hi {
+            let mut dot = 0.0f64;
+            let mut e_w = 0.0f64;
+            for i in 0..self.n_template {
+                let w = window[lag + i] as f64;
+                dot += w * tmpl[i];
+                e_w += w * w;
+            }
+            let metric = if e_w > 0.0 {
+                (dot * dot) / (e_tmpl * e_w)
+            } else {
+                0.0
+            };
+            curve.push(metric);
+            if metric > best_metric {
+                best_metric = metric;
+                best_lag = lag;
+            }
+        }
+        // Parabolic sub-sample on the sharp, magnitude-matched correlation curve
+        // (fit on |corr| = sqrt(metric), same convention as `best_match`).
+        let idx = best_lag - lo;
+        let frac = if idx > 0 && idx + 1 < curve.len() {
+            let m_minus = curve[idx - 1].sqrt();
+            let m_zero = curve[idx].sqrt();
+            let m_plus = curve[idx + 1].sqrt();
+            let denom = m_minus - 2.0 * m_zero + m_plus;
+            if denom < -1e-12 {
+                (0.5 * (m_minus - m_plus) / denom).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        Some(PreambleMatch {
+            lag: best_lag,
+            frac,
+            metric: best_metric,
+        })
+    }
+
     /// Cross-correlate `window` (raw passband, length ≤ `max_window`) against
     /// the template and return the best match: the integer peak `lag`, a
     /// parabolic sub-sample refinement `frac`, and the normalised `metric ∈
@@ -249,5 +364,55 @@ mod tests {
                 m.frac,
             );
         }
+    }
+
+    /// Stage-2 time-domain refinement: the drift estimator only consumes the
+    /// preamble-to-preamble DISTANCE, so a common channel group-delay bias must
+    /// cancel. Embed two preambles a known distance apart, both through the same
+    /// 1-pole low-pass "channel" + noise, refine each, and check the recovered
+    /// distance (incl. the fractional difference) to well under a sample.
+    #[test]
+    fn timedomain_refine_recovers_interpreamble_distance() {
+        let n_t = 512usize;
+        let f = |t: f64| ((0.05 * t + 0.00002 * t * t).sin() * 0.8) as f32;
+        let template: Vec<f32> = (0..n_t).map(|k| f(k as f64)).collect();
+        let win_len = 50000usize;
+        let mf = PreambleMatchedFilter::new(&template, win_len);
+
+        let off1 = 8000usize;
+        let frac1 = 0.3f64;
+        let dist = 30000usize; // nominal inter-preamble distance
+        let frac2 = -0.4f64;
+        let off2 = off1 + dist;
+
+        let mut window = noise(win_len, 0.05, 0x51A7);
+        for &(start, frac) in &[(off1, frac1), (off2, frac2)] {
+            let mut prev = 0.0f32;
+            for k in 0..n_t {
+                let s = f(k as f64 - frac); // fractional delay via closed form
+                let lp = 0.6 * s + 0.4 * prev; // identical 1-pole coloring
+                prev = lp;
+                window[start + k] += lp;
+            }
+        }
+
+        let r1 = mf
+            .refine_peak_timedomain(&window, off1, 6)
+            .expect("preamble 1");
+        let r2 = mf
+            .refine_peak_timedomain(&window, off2, 6)
+            .expect("preamble 2");
+
+        let measured = r2.refined_pos() - r1.refined_pos();
+        let truth = dist as f64 + (frac2 - frac1);
+        assert!(
+            (measured - truth).abs() < 0.15,
+            "inter-preamble distance {measured:.3} vs truth {truth:.3} \
+             (r1 lag={} frac={:.3}, r2 lag={} frac={:.3})",
+            r1.lag,
+            r1.frac,
+            r2.lag,
+            r2.frac,
+        );
     }
 }
