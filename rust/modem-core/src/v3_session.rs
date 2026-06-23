@@ -49,7 +49,6 @@ use crate::frame::{self, V2_CODEWORDS_PER_SEGMENT};
 use crate::interleaver;
 use crate::ldpc::decoder::LdpcDecoder;
 use crate::marker;
-use crate::pll::DdPll;
 use crate::preamble;
 use crate::profile::ModemConfig;
 use crate::rrc;
@@ -433,10 +432,6 @@ pub struct V3Session {
     dsp: StreamingDsp,
     ffe: StreamingFfe,
     // ---- Phase 3a: per-cycle CW decode -------------------------------
-    /// Persistent DD-PLL kept alive across cycles — phase advance
-    /// across a Locked burst is continuous, so we don't want to reset
-    /// per cycle.
-    pll: DdPll,
     decoder: LdpcDecoder,
     constellation: Constellation,
     /// `padded_n / bps`: symbols per LDPC codeword for this profile.
@@ -661,9 +656,6 @@ impl V3Session {
         let syms_per_cw = padded_n / bps;
         let k_bytes = decoder.k() / 8;
         let deinterleave_perm = interleaver::deinterleave_table(padded_n, cfg.constellation);
-        let pll_alpha = 0.05f64;
-        let pll_beta = pll_alpha * pll_alpha * 0.25;
-        let pll = DdPll::new(pll_alpha, pll_beta);
         let mut sess = Self {
             cfg,
             profile_name,
@@ -694,7 +686,6 @@ impl V3Session {
             acq_sps: sps,
             dsp,
             ffe,
-            pll,
             decoder,
             constellation,
             syms_per_cw,
@@ -1639,57 +1630,20 @@ impl V3Session {
         );
     }
 
-    /// Decision-directed Mueller-Müller timing-error detector over a segment's
-    /// equalised data symbols. Returns the **energy-normalised** mean error;
-    /// its sign indicates sampling early/late and its magnitude scales with the
-    /// residual symbol-timing offset. Decode-driven (uses the data decisions),
-    /// unlike the marker-slip residual which is minimised at the wrong drift.
-    /// Diagnostic only for now (logged under `V3_TED_LOG`): open-loop validation
-    /// that the signal crosses zero at the decode-optimal drift and is stable,
-    /// before wiring it as the convergent drift loop's error term.
-    fn data_ted(&self, syms: &[Complex64]) -> f64 {
-        if syms.len() < 2 {
-            return 0.0;
-        }
-        let cons = &self.constellation;
-        let mut e_sum = 0.0f64;
-        let mut p_sum = 1e-12f64;
-        for n in 1..syms.len() {
-            let y0 = syms[n - 1];
-            let y1 = syms[n];
-            let d0 = cons.points[cons.slice_nearest(&[y0])[0]];
-            let d1 = cons.points[cons.slice_nearest(&[y1])[0]];
-            // Mueller-Müller: Re{ conj(d0)·y1 − conj(d1)·y0 }.
-            e_sum += (d0.conj() * y1).re - (d1.conj() * y0).re;
-            p_sum += y1.norm_sqr();
-        }
-        e_sum / p_sum
-    }
-
-    /// Soft-demod + deinterleave + LDPC one codeword's worth of equalised
-    /// symbols. Returns `(info_bytes, converged)`. Shared by the forward decode
-    /// and the closed-window retry so both paths stay bit-identical.
-    fn decode_one_cw(&self, cw_syms: &[Complex64], sigma2_for_llr: f64) -> (Vec<u8>, bool) {
-        let llr = soft_demod::llr_maxlog(cw_syms, &self.constellation, sigma2_for_llr);
-        let llr_deint = interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
-        let llr_for_ldpc = &llr_deint[..self.decoder.n()];
-        let (info_bytes, converged) = self.decoder.decode_to_bytes(llr_for_ldpc);
-        (info_bytes[..self.k_bytes].to_vec(), converged)
-    }
-
-    /// Soft turbo-equalization of one fully-buffered segment (gated
-    /// `V3_TURBO_SOFT`). Iterates SISO-FFE (`reequalise_span_soft`) ↔ SISO-LDPC
-    /// (`decode_soft`) exchanging extrinsic LLRs as soft symbols E[a]
-    /// (Tüchler/Koetter/Singer 2002), up to `V3_TURBO_SOFT_ITERS` passes or
-    /// until every codeword's LDPC syndrome clears. Iteration 0 is the hard
-    /// re-equalise (≡ today's retry); later iterations re-equalise against E[a]
-    /// at data positions and the KNOWN pilots (full-confidence anchors) at pilot
-    /// positions. Cloned PLL + a local tap copy: the live forward state is never
-    /// touched. Returns the per-codeword `(info_bytes, converged)` (len `n_cw`)
-    /// of the last iteration plus the final per-segment `sigma2`, or `None` if
-    /// the span is not (yet) re-equalisable (caller keeps it pending).
-    fn turbo_soft_segment(
-        &self,
+    /// Canon turbo demodulator for one fully-buffered segment. Runs the joint
+    /// FFE+phase forward-backward-forward (FBF) loop ([`StreamingFfe::
+    /// reequalise_span_joint`]) — adapting the SINGLE live tap set IN PLACE —
+    /// then SISO-LDPC decodes each codeword, feeding the LDPC extrinsic back as
+    /// soft symbols `E[a]` (Tüchler/Koetter/Singer 2002) for the next FBF pass.
+    /// ALWAYS does at least one full FBF (even when the forward leg already
+    /// converges, so the good decisions refine the live FFE for the segments
+    /// that follow); loops up to `V3_TURBO_SOFT_ITERS` passes on a still-failing
+    /// segment, stopping as soon as every codeword's LDPC syndrome clears.
+    /// Returns the per-codeword `(info_bytes, converged)` (len `n_cw`) of the
+    /// last pass plus the final pilot `sigma2`, or `None` if the span is not
+    /// (yet) re-equalisable (caller keeps it pending).
+    fn canon_demod_segment(
+        &mut self,
         seg_start_abs: u64,
         seg_sym_len: usize,
         n_cw: usize,
@@ -1701,115 +1655,161 @@ impl V3Session {
         let max_iter = std::env::var("V3_TURBO_SOFT_ITERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(3)
-            .clamp(2, 6);
-        let cons = &self.constellation;
-        let bps = cons.bits_per_sym;
+            .unwrap_or(5)
+            .clamp(1, 6);
+        // Per-symbol sigma2(t) LLR scaling (ON by default; V3_NO_PERSYM_SIGMA2
+        // falls back to one segment-average sigma2 for A/B).
+        let persym = std::env::var_os("V3_NO_PERSYM_SIGMA2").is_none();
+        let bps = self.constellation.bits_per_sym;
         let n = self.decoder.n();
         let padded_n = self.syms_per_cw * bps;
         let intl = interleaver::interleave_table(padded_n, self.cfg.constellation);
-        let pattern = &self.cfg.pilot_pattern;
-        let d_syms = pattern.d_syms;
-        let p_syms = pattern.p_syms;
+        let d_syms = self.cfg.pilot_pattern.d_syms;
+        let p_syms = self.cfg.pilot_pattern.p_syms;
         let group_sz = d_syms + p_syms;
         let data_sym_count = n_cw * self.syms_per_cw;
+        // Intra-group residual DD-PLL (bidirectional two-filter smoother in
+        // `reequalise_span_joint`). ON by default; `V3_NO_TURBO_PLL` disables it
+        // (gain-only) for A/B. On clean captures the pilot LS-gain already reaches
+        // batch MER so it adds ~0, but it is the correct refinement for
+        // phase-noise-limited channels (e.g. QO-100). β = α²/4 (critically damped).
+        let (pll_alpha, pll_beta) = if std::env::var_os("V3_NO_TURBO_PLL").is_some() {
+            (0.0, 0.0)
+        } else {
+            (0.05f64, 0.05f64 * 0.05f64 * 0.25)
+        };
 
-        let mut soft_refs: Option<Vec<Complex64>> = None;
+        // Static span layout: pilot mask + known pilot references.
+        let mut is_pilot = vec![false; seg_sym_len];
+        let mut pilot_ref = vec![Complex64::new(0.0, 0.0); seg_sym_len];
+        for i in 0..seg_sym_len {
+            let inner = i % group_sz;
+            if inner >= d_syms {
+                let g = i / group_sz;
+                let pilots = crate::pilot::pilots_for_group(g, &self.cfg.pilot_pattern);
+                is_pilot[i] = true;
+                pilot_ref[i] = pilots[inner - d_syms];
+            }
+        }
+
+        let mut data_e: Vec<Complex64> = Vec::new();
+        let mut data_var: Vec<f64> = Vec::new();
         let mut results: Vec<(Vec<u8>, bool)> = vec![(Vec::new(), false); n_cw];
         let mut last_sigma2 = 0.1f64;
+        let mut iters_run = 0usize;
 
         for _it in 0..max_iter {
-            // SISO-FFE leg: hard re-equalise on the first pass, then re-equalise
-            // against the soft references from the previous LDPC pass.
-            let seg_syms = match &soft_refs {
-                None => self.ffe.reequalise_span(
-                    seg_start_abs,
-                    seg_sym_len,
-                    |y| cons.points[cons.slice_nearest(&[y])[0]],
-                    V3_FFE_MU_DD,
-                )?,
-                Some(refs) => {
-                    self.ffe
-                        .reequalise_span_soft(seg_start_abs, seg_sym_len, refs, V3_FFE_MU_DD)?
+            // Soft references + reliability weights for this FBF pass: STRONG
+            // confidence on the known pilots (w=1); data carry E[a] from the
+            // previous LDPC pass with w = |E[a]|²/(|E[a]|²+Var[a]). On iteration 0
+            // (no a-priori yet) data weight is 0 → only the known anchors adapt
+            // (que du soft, no hard-decision path).
+            let mut refs = pilot_ref.clone();
+            let mut weights = vec![0.0f64; seg_sym_len];
+            for i in 0..seg_sym_len {
+                if is_pilot[i] {
+                    weights[i] = 1.0;
+                    continue;
                 }
-            };
-            // Pilot-interp + sigma2 on a CLONED PLL (side-pass, live state intact).
-            let mut pll = self.pll.clone();
-            let (mut s2sum, mut s2cnt, mut x3, mut x4) = (0.0f64, 0usize, 0.0f64, 0.0f64);
-            let (seg_data_syms, _) = rx_v2::track_segment(
-                &seg_syms,
-                pattern,
-                &mut pll,
-                cons,
-                &mut s2sum,
-                &mut s2cnt,
-                &mut x3,
-                &mut x4,
-            );
-            let sigma2 = if s2cnt > 0 {
-                (s2sum / (2 * s2cnt) as f64) * 2.0
-            } else {
-                0.1
+                let g = i / group_sz;
+                let inner = i % group_sz;
+                let di = g * d_syms + inner;
+                if let (Some(&e), Some(&v)) = (data_e.get(di), data_var.get(di)) {
+                    refs[i] = e;
+                    let p = e.norm_sqr();
+                    weights[i] = if p + v > 1e-12 { p / (p + v) } else { 0.0 };
+                }
             }
-            .max(1e-6);
-            last_sigma2 = sigma2;
-            if seg_data_syms.len() < data_sym_count {
+            // One joint FFE+phase FBF pass, in place on the single live tap set.
+            let (out, sigma2_per_sym) = self.ffe.reequalise_span_joint(
+                seg_start_abs,
+                seg_sym_len,
+                &refs,
+                &weights,
+                &is_pilot,
+                V3_FFE_MU_DD,
+                pll_alpha,
+                pll_beta,
+            )?;
+            // Data symbols + their PER-SYMBOL sigma2(t) (pilots skipped).
+            let mut seg_data: Vec<Complex64> = Vec::with_capacity(data_sym_count);
+            let mut seg_data_s2: Vec<f64> = Vec::with_capacity(data_sym_count);
+            for i in 0..seg_sym_len {
+                if !is_pilot[i] {
+                    seg_data.push(out[i]);
+                    seg_data_s2.push(sigma2_per_sym[i]);
+                }
+            }
+            if seg_data.len() < data_sym_count {
                 return None;
             }
-            // SISO-LDPC leg: decode every codeword, collect E[a] for the FFE.
-            let mut data_e: Vec<Complex64> = Vec::with_capacity(data_sym_count);
-            let mut all_converged = true;
+            // Segment-mean sigma2 for the CwDecoded event / diagnostics.
+            last_sigma2 = (seg_data_s2.iter().sum::<f64>() / seg_data_s2.len() as f64).max(1e-6);
+            // SISO-LDPC leg: decode every codeword, collect E[a]+Var[a] for the
+            // next pass. A converged codeword is LOCKED (best-wins) so a later
+            // adaptation pass can never un-converge an already-recovered CW.
+            let mut next_e: Vec<Complex64> = Vec::with_capacity(data_sym_count);
+            let mut next_var: Vec<f64> = Vec::with_capacity(data_sym_count);
             for cw_idx in 0..n_cw {
                 let off = cw_idx * self.syms_per_cw;
-                let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
-                let llr = soft_demod::llr_maxlog(cw_syms, cons, sigma2);
+                let cw_syms = &seg_data[off..off + self.syms_per_cw];
+                // Per-symbol sigma2(t) LLR: a faded symbol gets near-erasure LLRs
+                // instead of one over-confident segment average (V3_NO_PERSYM_SIGMA2
+                // falls back to the scalar mean for A/B).
+                let cw_s2 = &seg_data_s2[off..off + self.syms_per_cw];
+                let llr = if persym {
+                    soft_demod::llr_maxlog_per_sym(cw_syms, &self.constellation, cw_s2)
+                } else {
+                    soft_demod::llr_maxlog(cw_syms, &self.constellation, last_sigma2)
+                };
                 let llr_deint = interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
                 let (info_bits, extrinsic_n, converged) =
                     self.decoder.decode_soft(&llr_deint[..n], None, damp);
-                // info bits -> bytes (MSB-first), truncate to k_bytes (mirror decode_to_bytes).
-                let bytes: Vec<u8> = info_bits
-                    .chunks(8)
-                    .map(|chunk| {
-                        let mut byte = 0u8;
-                        for (i, &b) in chunk.iter().enumerate() {
-                            byte |= (b & 1) << (7 - i);
-                        }
-                        byte
-                    })
-                    .collect();
-                let bytes = bytes[..self.k_bytes].to_vec();
-                if !converged {
-                    all_converged = false;
+                if !results[cw_idx].1 {
+                    // info bits -> bytes (MSB-first), truncate to k_bytes.
+                    let bytes: Vec<u8> = info_bits
+                        .chunks(8)
+                        .map(|chunk| {
+                            let mut byte = 0u8;
+                            for (i, &b) in chunk.iter().enumerate() {
+                                byte |= (b & 1) << (7 - i);
+                            }
+                            byte
+                        })
+                        .collect();
+                    results[cw_idx] = (bytes[..self.k_bytes].to_vec(), converged);
                 }
-                results[cw_idx] = (bytes, converged);
-                // LDPC extrinsic -> soft symbols E[a]: re-pad to padded_n (tail
-                // neutral LLR 0), re-interleave to symbol-major, factorise.
+                // LDPC extrinsic -> soft symbols E[a]+Var[a]: re-pad to padded_n
+                // (tail neutral LLR 0), re-interleave to symbol-major, factorise.
                 let mut ext_padded = vec![0.0f32; padded_n];
                 ext_padded[..n].copy_from_slice(&extrinsic_n);
                 let ext_sym = interleaver::apply_permutation_f32(&ext_padded, &intl);
-                let soft = soft_demod::soft_symbols_from_posterior_llr(&ext_sym, cons);
+                let soft =
+                    soft_demod::soft_symbols_from_posterior_llr(&ext_sym, &self.constellation);
                 for ss in &soft {
-                    data_e.push(ss.mean);
+                    next_e.push(ss.mean);
+                    next_var.push(ss.var);
                 }
             }
-            if all_converged {
+            data_e = next_e;
+            data_var = next_var;
+            iters_run = _it + 1;
+            // We have done one full FBF; stop once every codeword converged.
+            if results.iter().all(|(_, c)| *c) {
                 break;
             }
-            // Compose the next-iteration soft references over the FULL span:
-            // E[a] at data positions, KNOWN pilots at pilot positions.
-            let mut refs = vec![Complex64::new(0.0, 0.0); seg_sym_len];
-            for i in 0..seg_sym_len {
-                let g = i / group_sz;
-                let inner = i % group_sz;
-                if inner < d_syms {
-                    let di = g * d_syms + inner;
-                    refs[i] = data_e.get(di).copied().unwrap_or(Complex64::new(0.0, 0.0));
-                } else {
-                    let pilots = crate::pilot::pilots_for_group(g, pattern);
-                    refs[i] = pilots[inner - d_syms];
-                }
-            }
-            soft_refs = Some(refs);
+        }
+        if std::env::var_os("V3_LOG_TURBO").is_some() {
+            let conv: Vec<u8> = results.iter().map(|(_, c)| *c as u8).collect();
+            let pll = if std::env::var_os("V3_NO_TURBO_PLL").is_some() {
+                "off"
+            } else {
+                "on"
+            };
+            eprintln!(
+                "[turbo] seg_start={seg_start_abs} n_cw={n_cw} iters={iters_run}/{max_iter} \
+                 cw_converged={conv:?} sigma2={last_sigma2:.4} pll={pll}",
+            );
         }
         Some((results, last_sigma2))
     }
@@ -1828,13 +1828,11 @@ impl V3Session {
         if !self.turbo_sync_enabled || self.replaying || self.retry_queue.is_empty() {
             return;
         }
-        // Soft turbo-equalization, ON by default (disable with V3_NO_TURBO_SOFT
-        // for A/B). It can only ADD recoveries: iteration 0 IS the validated
-        // hard re-equalise+re-decode, and it iterates further only on codewords
-        // that still fail — so it never regresses the hard retry, and earns its
-        // keep on ISI/noise-limited (low-SNR) channels even when a clean capture
-        // shows no gain.
-        let turbo_soft = std::env::var_os("V3_NO_TURBO_SOFT").is_none();
+        // Re-run the canon demodulator on each still-failing segment now that
+        // the live FFE taps have adapted further over the intervening segments
+        // (the streaming analogue of the batch sliding window's overlapping
+        // re-scan). This is the SAME joint FBF loop used on the forward decode —
+        // there is no separate retry equaliser any more.
         let sym_start_abs = self.ffe.start_abs();
         let sym_end_abs = sym_start_abs + self.ffe.out_buf().len() as u64;
         let queue = std::mem::take(&mut self.retry_queue);
@@ -1850,119 +1848,27 @@ impl V3Session {
                 continue;
             }
             r.attempts += 1;
-            // Soft turbo-equalization path (gated). Runs the iterative SISO-FFE
-            // ↔ SISO-LDPC loop over the whole segment, then emits exactly like
-            // the hard path. Falls through to the hard path when disabled.
-            if turbo_soft {
-                let n_cw = if r.is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
-                let Some((per_cw, sigma2)) =
-                    self.turbo_soft_segment(r.seg_start_abs, r.seg_sym_len, n_cw)
-                else {
-                    still_pending.push(r);
-                    continue;
-                };
-                let mut newly_failed: Vec<usize> = Vec::new();
-                for &cw_idx in &r.failed_cw {
-                    let (bytes, converged) = &per_cw[cw_idx];
-                    if !*converged {
-                        newly_failed.push(cw_idx);
-                        continue;
-                    }
-                    self.cws_converged = self.cws_converged.saturating_add(1);
-                    let esi = r.base_esi + cw_idx as u32;
-                    if r.is_meta {
-                        if let Some(h) = decode_meta_payload(bytes) {
-                            let is_eot = h.k_symbols == 0 && h.file_size == 0;
-                            if !is_eot && self.app_header.is_none() {
-                                events.push(V3SessionEvent::AppHeaderRecovered {
-                                    session_id: h.session_id,
-                                    file_size: h.file_size,
-                                    k_symbols: h.k_symbols,
-                                    t_bytes: h.t_bytes,
-                                    mode_code: h.mode_code,
-                                    mime_type: h.mime_type,
-                                    hash_short: h.hash_short,
-                                });
-                                self.app_header = Some(h);
-                            }
-                        }
-                    }
-                    events.push(V3SessionEvent::CwDecoded {
-                        cycle_idx: r.cycle_idx,
-                        cw_idx,
-                        esi,
-                        is_meta: r.is_meta,
-                        converged: true,
-                        bytes: bytes.clone(),
-                        sigma2,
-                    });
-                }
-                if !newly_failed.is_empty() && r.attempts < MAX_RETRY_ATTEMPTS {
-                    r.failed_cw = newly_failed;
-                    still_pending.push(r);
-                }
-                continue;
-            }
-            // Re-equalise the segment with the current (now more-adapted) taps,
-            // refined forward-backward-forward; pure re-read of `frac_buf`, no
-            // mutation of the live equaliser.
-            let seg_syms = {
-                let cons = &self.constellation;
-                self.ffe.reequalise_span(
-                    r.seg_start_abs,
-                    r.seg_sym_len,
-                    |y| cons.points[cons.slice_nearest(&[y])[0]],
-                    V3_FFE_MU_DD,
-                )
-            };
-            let Some(seg_syms) = seg_syms else {
+            let n_cw = if r.is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+            let Some((per_cw, sigma2)) =
+                self.canon_demod_segment(r.seg_start_abs, r.seg_sym_len, n_cw)
+            else {
                 still_pending.push(r);
                 continue;
             };
-            // Decode on a CLONED PLL so the live continuous-phase state is
-            // untouched (the retry is a side-pass, not part of the burst chain).
-            let mut pll = self.pll.clone();
-            let mut sigma2_sum = 0.0f64;
-            let mut sigma2_count: usize = 0;
-            let mut pilot_x3_sum = 0.0f64;
-            let mut pilot_x4_sum = 0.0f64;
-            let (seg_data_syms, _pilot_phases) = rx_v2::track_segment(
-                &seg_syms,
-                &self.cfg.pilot_pattern,
-                &mut pll,
-                &self.constellation,
-                &mut sigma2_sum,
-                &mut sigma2_count,
-                &mut pilot_x3_sum,
-                &mut pilot_x4_sum,
-            );
-            let sigma2 = if sigma2_count > 0 {
-                (sigma2_sum / (2 * sigma2_count) as f64) * 2.0
-            } else {
-                0.1
-            };
-            let sigma2_for_llr = sigma2.max(1e-6);
-            let n_cw = if r.is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
-            let data_sym_count = n_cw * self.syms_per_cw;
-            if seg_data_syms.len() < data_sym_count {
-                continue;
-            }
             let mut newly_failed: Vec<usize> = Vec::new();
             for &cw_idx in &r.failed_cw {
-                let off = cw_idx * self.syms_per_cw;
-                let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
-                let (bytes, converged) = self.decode_one_cw(cw_syms, sigma2_for_llr);
-                if !converged {
+                let (bytes, converged) = &per_cw[cw_idx];
+                if !*converged {
                     newly_failed.push(cw_idx);
                     continue;
                 }
                 self.cws_converged = self.cws_converged.saturating_add(1);
                 let esi = r.base_esi + cw_idx as u32;
                 // META: recover the AppHeader (first valid copy wins). EOT is
-                // left to the forward path / worker no-progress timer — a retry
-                // is not the place to tear the FSM down.
+                // left to the forward path — a retry is not the place to tear
+                // the FSM down.
                 if r.is_meta {
-                    if let Some(h) = decode_meta_payload(&bytes) {
+                    if let Some(h) = decode_meta_payload(bytes) {
                         let is_eot = h.k_symbols == 0 && h.file_size == 0;
                         if !is_eot && self.app_header.is_none() {
                             events.push(V3SessionEvent::AppHeaderRecovered {
@@ -1984,7 +1890,7 @@ impl V3Session {
                     esi,
                     is_meta: r.is_meta,
                     converged: true,
-                    bytes,
+                    bytes: bytes.clone(),
                     sigma2,
                 });
             }
@@ -2007,7 +1913,6 @@ impl V3Session {
         } else {
             V2_CODEWORDS_PER_SEGMENT
         };
-        let data_sym_count = n_cw * self.syms_per_cw;
         let seg_sym_len = self.seg_sym_len_past_marker(pending.is_meta);
 
         // Segment starts past the marker. V4: a META segment (bootstrap /
@@ -2054,62 +1959,22 @@ impl V3Session {
             self.train_ffe_at_meta(pending.marker_sym_pos_abs);
         }
 
-        let seg_off = (seg_start_abs - sym_start_abs) as usize;
-        let seg_syms = &self.ffe.out_buf()[seg_off..seg_off + seg_sym_len];
-        // track_segment mutates pll + sigma2 accumulators ; we keep
-        // pll persistent (continuous burst phase) and use local sigma2
-        // scratch since LLR scaling is per-segment.
-        let mut sigma2_sum = 0.0f64;
-        let mut sigma2_count: usize = 0;
-        let mut pilot_x3_sum = 0.0f64;
-        let mut pilot_x4_sum = 0.0f64;
-        let (seg_data_syms, _pilot_phases) = rx_v2::track_segment(
-            seg_syms,
-            &self.cfg.pilot_pattern,
-            &mut self.pll,
-            &self.constellation,
-            &mut sigma2_sum,
-            &mut sigma2_count,
-            &mut pilot_x3_sum,
-            &mut pilot_x4_sum,
-        );
-        // Per-segment pilot σ² (stacked Re/Im) → LLR scale. Matches
-        // rx_v2_single's sigma2_for_llr derivation (rx_v2.rs:1386-1479).
-        let seg_pilots = sigma2_count;
-        let sigma2 = if seg_pilots > 0 {
-            let n2 = (2 * seg_pilots) as f64;
-            (sigma2_sum / n2) * 2.0
-        } else {
-            0.1
-        };
-        let sigma2_for_llr = sigma2.max(1e-6);
-
-        // Some segments arrive with fewer data symbols than expected
-        // (last cycle truncation). Skip CW decode but clear pending
-        // so we don't loop on it forever.
-        if seg_data_syms.len() < data_sym_count {
+        // Canon turbo demodulator: one or more joint FFE+phase forward-backward-
+        // forward (FBF) passes, adapting the SINGLE live tap set IN PLACE, then
+        // SISO-LDPC per codeword with soft E[a] feedback. Always does ≥1 full
+        // FBF (so the good decisions refine the live FFE for the segments that
+        // follow), loops on a still-failing segment. Replaces the track_segment
+        // side-pass + the separate hard/soft retry equalisers. `None` = the span
+        // is truncated / not re-equalisable → clear pending so we don't loop.
+        let Some((per_cw, sigma2)) =
+            self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw)
+        else {
             self.pending_decode = None;
             return true;
-        }
-
-        // Open-loop TED diagnostic (not wired into any correction yet): log the
-        // decision-directed timing error of this segment so we can check, at a
-        // forced drift, whether the signal is convergent (≈0 at the optimum,
-        // monotone-signed off it). `V3_TED_LOG=1`.
-        if std::env::var_os("V3_TED_LOG").is_some() {
-            let ted = self.data_ted(&seg_data_syms[..data_sym_count]);
-            let centroid = self.ffe.tap_centroid().unwrap_or(f64::NAN);
-            eprintln!(
-                "[ted] cycle={} is_meta={} seg_start={} applied_ppm={:+.2} ted={:+.6} centroid={:.4} sigma2={:.4}",
-                pending.cycle_idx, pending.is_meta, seg_start_abs, self.drift_ppm, ted, centroid, sigma2,
-            );
-        }
+        };
 
         let mut failed_cw: Vec<usize> = Vec::new();
-        for cw_idx in 0..n_cw {
-            let off = cw_idx * self.syms_per_cw;
-            let cw_syms = &seg_data_syms[off..off + self.syms_per_cw];
-            let (bytes, converged) = self.decode_one_cw(cw_syms, sigma2_for_llr);
+        for (cw_idx, (bytes, converged)) in per_cw.into_iter().enumerate() {
             if !converged {
                 failed_cw.push(cw_idx);
             }
@@ -2937,10 +2802,6 @@ impl V3Session {
                 V3_FFE_MU_DD,
             );
         }
-        let pll_alpha = 0.05f64;
-        let pll_beta = pll_alpha * pll_alpha * 0.25;
-        self.pll = DdPll::new(pll_alpha, pll_beta);
-
         // Decode + FSM state goes back to a fresh-bootstrap regime so
         // the replay sees the burst from scratch. Counters reset so
         // SessionFinalised reports the post-reboot numbers (the only

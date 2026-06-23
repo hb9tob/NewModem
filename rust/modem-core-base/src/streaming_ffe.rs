@@ -516,32 +516,61 @@ impl StreamingFfe {
         true
     }
 
-    /// Re-equalise the `span` symbols starting at absolute symbol `sof_abs`
-    /// from the retained fractional buffer, refining the **current** taps with
-    /// a forward-backward-forward DD-LMS pass on a LOCAL copy — the live
-    /// `current_taps` and the forward-apply state are left untouched.
+    /// Canon turbo demodulator — re-equalise the `span` symbols at absolute
+    /// symbol `sof_abs` with ONE joint forward-backward-forward (FBF) pass over
+    /// the WHOLE estimator chain, **adapting the single live tap set in place**
+    /// (no clone — the FIR delay line `frac_buf` is the shared live state).
     ///
-    /// This is the closed-window re-decode lever (the "turbo sync"): by the
-    /// time a segment's closing marker has validated, the forward DD-LMS in
-    /// `push_raw` has adapted the taps over the rest of the superframe, and the
-    /// bidirectional FBF pass reaches a mid-segment fade from both sides —
-    /// recovering codewords the single forward pass at first-decode time could
-    /// not. It mirrors the batch sliding window's overlapping re-scan, but over
-    /// the already-buffered symbols (no audio re-acquisition).
+    /// The phase/gain is removed jointly so the FFE error and the soft
+    /// references `refs[k]` (`E[a_k]` at data, the known pilot at pilot
+    /// positions) live in the SAME frame — the mismatch that made an FFE-only
+    /// soft adaptation diverge (the refs are post-derotation, the raw FFE
+    /// output is not). Two cascaded estimators, both inside the FBF:
+    ///   * coarse per-group gain `g_k` from a least-squares fit of the KNOWN
+    ///     pilots, interpolated across the span (mirrors `rx_v2::track_segment`,
+    ///     self-contained — pilot groups = contiguous `is_pilot` runs);
+    ///   * an intra-group residual phase `θ_k` from a 2nd-order DD-PLL, run
+    ///     forward on the forward legs and TIME-REVERSED on the backward leg
+    ///     (the NCO coasts `−ν`), seeded at 0 each call (the pilot fit already
+    ///     removed the bulk phase). `pll_alpha = 0` disables it (gain-only).
     ///
-    /// `slice` returns the nearest data-constellation point; `mu_dd` is the
-    /// NLMS step (0 = pure re-equalise with the current taps, no adaptation).
-    /// Returns `None` if there are no taps yet, or the span (with its full FIR
+    /// `A = (1/g_k)·e^{−jθ_k}`; `yrot = A·y` is in the constellation frame. The
+    /// FFE tap update is a standard NLMS toward the FFE-frame target
+    /// `t = d/A = d·g_k·e^{jθ_k}` (the soft ref rotated INTO the FFE frame):
+    /// `e_ffe = e_rot / A`, `tap += μ_eff·e_ffe·conj(x)`. (Targeting the FFE
+    /// frame keeps the step well-scaled; the alternative `e_rot·conj(A)` scales
+    /// it by `1/|g_k|²` and blows up on a fade.)
+    ///
+    /// STRONG confidence on the KNOWN anchors: pilots `w=1`; data only ever
+    /// nudges, weighted by its soft confidence `w = |E[a]|²/(|E[a]|²+Var[a])`.
+    /// QUE DU SOFT — there is no hard-decision path: a data symbol with
+    /// `weights[k] == 0` (iteration 0, no a-priori yet, or a low-confidence
+    /// estimate) is equalised and emitted but adapts NEITHER the taps NOR the
+    /// PLL, so an uncertain symbol can never pull the equaliser like an anchor
+    /// and a corrupted segment (QRM / deep fade) cannot poison it.
+    ///
+    /// Returns the derotated span (length `span`, constellation frame) and a
+    /// PER-SYMBOL noise variance `sigma2_per_sym` (length `span`, interpolated
+    /// from the per-pilot-run residual) for LOCAL LLR scaling — a symbol in a
+    /// fade gets a high local sigma2 → near-erasure LLRs rather than one
+    /// over-confident segment average. `None` if the span (with its full FIR
     /// window) is not entirely inside the retained buffer.
-    pub fn reequalise_span(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    pub fn reequalise_span_joint(
+        &mut self,
         sof_abs: u64,
         span: usize,
-        slice: impl Fn(Complex64) -> Complex64,
+        refs: &[Complex64],
+        weights: &[f64],
+        is_pilot: &[bool],
         mu_dd: f64,
-    ) -> Option<Vec<Complex64>> {
-        let taps0 = self.current_taps.as_ref()?;
-        if span == 0 || sof_abs < self.start_abs {
+        pll_alpha: f64,
+        pll_beta: f64,
+    ) -> Option<(Vec<Complex64>, Vec<f64>)> {
+        if self.current_taps.is_none() || span == 0 || sof_abs < self.start_abs {
+            return None;
+        }
+        if refs.len() != span || weights.len() != span || is_pilot.len() != span {
             return None;
         }
         let sof_rel = (sof_abs - self.start_abs) as usize;
@@ -551,115 +580,261 @@ impl StreamingFfe {
         let pitch = self.pitch_fse;
         let n_ff = self.n_taps;
         let half = n_ff / 2;
-        // Every symbol in the span must have a full FIR window in `frac_buf`.
-        let first_center = sof_rel * pitch + self.mf_delay_frac;
-        let last_center = (sof_rel + span - 1) * pitch + self.mf_delay_frac;
+        let mf = self.mf_delay_frac;
+        let first_center = sof_rel * pitch + mf;
+        let last_center = (sof_rel + span - 1) * pitch + mf;
         if first_center < half || last_center + (n_ff - half) > self.frac_buf.len() {
             return None;
         }
 
-        let mut taps = taps0.clone();
+        // --- Coarse per-group gain g_k from the known pilots (measure pass) ---
+        // LS-fit one complex gain per CONTIGUOUS pilot run (= one pilot group),
+        // placed at the run centre; then unwrap + 3-point smooth + interpolate.
+        let mut gain_pos: Vec<usize> = Vec::new();
+        let mut gain_val: Vec<Complex64> = Vec::new();
+        {
+            let taps = self.current_taps.as_ref().unwrap();
+            let mut k = 0usize;
+            while k < span {
+                if !is_pilot[k] {
+                    k += 1;
+                    continue;
+                }
+                let run_start = k;
+                let mut num = Complex64::new(0.0, 0.0);
+                let mut den = 0.0f64;
+                while k < span && is_pilot[k] {
+                    let lo = (sof_rel + k) * pitch + mf - half;
+                    let mut y = Complex64::new(0.0, 0.0);
+                    for (i, &t) in taps.iter().enumerate() {
+                        y += t * self.frac_buf[lo + i];
+                    }
+                    num += y * refs[k].conj();
+                    den += refs[k].norm_sqr();
+                    k += 1;
+                }
+                let g = if den > 1e-12 {
+                    num / den
+                } else {
+                    Complex64::new(1.0, 0.0)
+                };
+                gain_pos.push((run_start + k - 1) / 2);
+                gain_val.push(g);
+            }
+        }
+        let n_g = gain_pos.len();
+        // Per-symbol inverse gain (identity when no pilots are present).
+        let inv_gain: Vec<Complex64> = if n_g == 0 {
+            vec![Complex64::new(1.0, 0.0); span]
+        } else {
+            let mut phases: Vec<f64> = gain_val.iter().map(|g| g.arg()).collect();
+            for i in 1..n_g {
+                let d = phases[i] - phases[i - 1];
+                if d > std::f64::consts::PI {
+                    phases[i] -= 2.0 * std::f64::consts::PI;
+                } else if d < -std::f64::consts::PI {
+                    phases[i] += 2.0 * std::f64::consts::PI;
+                }
+            }
+            let mags: Vec<f64> = gain_val.iter().map(|g| g.norm()).collect();
+            let smooth = |v: &[f64], i: usize| -> f64 {
+                let lo = i.saturating_sub(1);
+                let hi = (i + 1).min(n_g - 1);
+                (v[lo] + v[i] + v[hi]) / (hi - lo + 1) as f64
+            };
+            let ps: Vec<f64> = (0..n_g).map(|i| smooth(&phases, i)).collect();
+            let ms: Vec<f64> = (0..n_g).map(|i| smooth(&mags, i)).collect();
+            (0..span)
+                .map(|i| {
+                    let (mag, phase) = if i <= gain_pos[0] {
+                        (ms[0], ps[0])
+                    } else if i >= gain_pos[n_g - 1] {
+                        (ms[n_g - 1], ps[n_g - 1])
+                    } else {
+                        let mut j = 0;
+                        while j + 1 < n_g && gain_pos[j + 1] < i {
+                            j += 1;
+                        }
+                        let i0 = gain_pos[j];
+                        let i1 = gain_pos[j + 1];
+                        let a = (i - i0) as f64 / (i1 - i0) as f64;
+                        (
+                            ms[j] * (1.0 - a) + ms[j + 1] * a,
+                            ps[j] * (1.0 - a) + ps[j + 1] * a,
+                        )
+                    };
+                    // inv_gain = 1/g = (1/mag)·e^{−jφ}
+                    Complex64::from_polar(1.0 / mag.max(1e-6), -phase)
+                })
+                .collect()
+        };
+
+        // --- Bidirectional 2nd-order phase smoother (two-filter / RTS form) ---
+        // The intra-group residual phase θ[k] is estimated by TWO INDEPENDENT
+        // reset DD-PLL passes — each is the OTA-validated 2nd-order loop (coast
+        // COUPLED to the gated proportional/integrator update, exactly like
+        // `DdPll`), run once forward then once TIME-REVERSED — and the two
+        // per-symbol phase trajectories are averaged. No θ/ν state is threaded
+        // across passes (each resets), so there is no cross-pass integrator
+        // runaway; the reverse pass flips BOTH the NCO coast AND the frequency
+        // integrator (a consistent reverse-time recursion). `w` is a BINARY
+        // anchor gate here (pilots + confident soft data drive the loop) with
+        // FIXED α,β, so the critical damping (β=α²/4) is preserved. With
+        // `pll_alpha == 0` (default) θ≡0 → byte-identical to the gain-only path.
+        let mut theta_sm = vec![0.0f64; span];
+        if pll_alpha > 0.0 {
+            let mut theta_fwd = vec![0.0f64; span];
+            let mut theta_bwd = vec![0.0f64; span];
+            for &forward in &[true, false] {
+                let mut theta = 0.0f64;
+                let mut nu = 0.0f64;
+                let dir = if forward { 1.0 } else { -1.0 };
+                for kk in 0..span {
+                    let k = if forward { kk } else { span - 1 - kk };
+                    if forward {
+                        theta_fwd[k] = theta;
+                    } else {
+                        theta_bwd[k] = theta;
+                    }
+                    let lo = (sof_rel + k) * pitch + mf - half;
+                    let mut y = Complex64::new(0.0, 0.0);
+                    {
+                        let taps = self.current_taps.as_ref().unwrap();
+                        for (i, &t) in taps.iter().enumerate() {
+                            y += t * self.frac_buf[lo + i];
+                        }
+                    }
+                    let yrot = y * inv_gain[k] * Complex64::from_polar(1.0, -theta);
+                    let (d, w) = if is_pilot[k] {
+                        (refs[k], 1.0f64)
+                    } else {
+                        (refs[k], weights[k])
+                    };
+                    let dn2 = d.norm_sqr();
+                    // Update only on a confident anchor; coast coupled to the
+                    // update (DdPll form), sign-reversed on the time-reversed leg.
+                    if w > 0.0 && dn2 > 1e-12 && (d - yrot).norm_sqr() < dn2 {
+                        let phi = (yrot * d.conj()).im / dn2;
+                        theta += pll_alpha * phi + dir * nu;
+                        nu += dir * pll_beta * phi;
+                    }
+                }
+            }
+            for k in 0..span {
+                theta_sm[k] = 0.5 * (theta_fwd[k] + theta_bwd[k]);
+            }
+        }
+
+        // --- FFE FBF: forward-backward-forward NLMS on the live taps, derotated
+        // by the FIXED smoothed phase θ[k] (no PLL state inside the FFE legs). ---
         let mut out = vec![Complex64::new(0.0, 0.0); span];
-        // forward, backward, forward — the final forward pass's values remain.
         for &forward in &[true, false, true] {
             for kk in 0..span {
                 let k = if forward { kk } else { span - 1 - kk };
-                let center = (sof_rel + k) * pitch + self.mf_delay_frac;
-                let lo = center - half;
+                let lo = (sof_rel + k) * pitch + mf - half;
                 let mut y = Complex64::new(0.0, 0.0);
-                for (i, &t) in taps.iter().enumerate() {
-                    y += t * self.frac_buf[lo + i];
+                {
+                    let taps = self.current_taps.as_ref().unwrap();
+                    for (i, &t) in taps.iter().enumerate() {
+                        y += t * self.frac_buf[lo + i];
+                    }
                 }
-                out[k] = y;
-                if mu_dd > 0.0 {
-                    let d = slice(y);
-                    let e = d - y;
-                    // Error-gated update (same guard as the forward path): only
-                    // adapt on a confident decision so a noisy symbol can't pull
-                    // the taps away during the retry.
-                    if e.norm_sqr() < d.norm_sqr() {
+                // Joint derotation: A = inv_gain·e^{−jθ_sm}; yrot in constellation frame.
+                let a = inv_gain[k] * Complex64::from_polar(1.0, -theta_sm[k]);
+                let yrot = y * a;
+                out[k] = yrot;
+                // STRONG confidence on the KNOWN anchors (pilots, w=1); data only
+                // nudges, weighted by its soft confidence (0 at iteration 0). No
+                // hard-decision path: a zero-weight symbol adapts nothing.
+                let (d, w) = if is_pilot[k] {
+                    (refs[k], 1.0f64)
+                } else {
+                    (refs[k], weights[k])
+                };
+                let dn2 = d.norm_sqr();
+                if w > 0.0 && dn2 > 1e-12 {
+                    let e_rot = d - yrot;
+                    // `|e_rot|<|d|` confidence gate (constellation frame).
+                    if e_rot.norm_sqr() < dn2 {
                         let mut r_pow = 1e-12f64;
                         for i in 0..n_ff {
                             r_pow += self.frac_buf[lo + i].norm_sqr();
                         }
-                        let mu_eff = mu_dd / r_pow;
+                        let mu_eff = mu_dd * w / r_pow;
+                        // Standard NLMS toward the FFE-frame target t = d/A:
+                        // e_ffe = e_rot / A (well-scaled; e·conj(A) would scale the
+                        // step by 1/|g|² and blow up on a fade).
+                        let e_ffe = e_rot / a;
+                        let taps = self.current_taps.as_mut().unwrap();
                         for i in 0..n_ff {
-                            taps[i] += Complex64::new(mu_eff, 0.0) * e * self.frac_buf[lo + i].conj();
+                            taps[i] += Complex64::new(mu_eff, 0.0)
+                                * e_ffe
+                                * self.frac_buf[lo + i].conj();
                         }
                     }
                 }
             }
         }
-        Some(out)
-    }
 
-    /// Soft-decision variant of [`reequalise_span`] for turbo equalization
-    /// (Tüchler/Koetter/Singer 2002). Identical FBF re-convolution on a LOCAL
-    /// tap copy, but the per-symbol training reference is the soft estimate
-    /// `soft_refs[k] = E[a_k]` (from the SISO LDPC extrinsic → soft-symbol map)
-    /// instead of the hard nearest-constellation-point. `soft_refs` is aligned
-    /// to the SPAN symbol order (length == `span`), carrying KNOWN pilot symbols
-    /// (full magnitude, weight 1) at pilot positions and `E[a]` at data
-    /// positions. The error gate `|e| < |d|` is retained: with a soft `d` whose
-    /// magnitude shrinks toward 0 at low confidence it doubles as a reliability
-    /// filter (uncertain symbols skip the tap update; pilots with `|d|=1` always
-    /// adapt and anchor the equalizer). `&self`: never mutates the live taps.
-    pub fn reequalise_span_soft(
-        &self,
-        sof_abs: u64,
-        span: usize,
-        soft_refs: &[Complex64],
-        mu_dd: f64,
-    ) -> Option<Vec<Complex64>> {
-        let taps0 = self.current_taps.as_ref()?;
-        if span == 0 || sof_abs < self.start_abs {
-            return None;
-        }
-        if soft_refs.len() != span {
-            return None;
-        }
-        let sof_rel = (sof_abs - self.start_abs) as usize;
-        if sof_rel + span > self.out_buf.len() {
-            return None;
-        }
-        let pitch = self.pitch_fse;
-        let n_ff = self.n_taps;
-        let half = n_ff / 2;
-        let first_center = sof_rel * pitch + self.mf_delay_frac;
-        let last_center = (sof_rel + span - 1) * pitch + self.mf_delay_frac;
-        if first_center < half || last_center + (n_ff - half) > self.frac_buf.len() {
-            return None;
-        }
-
-        let mut taps = taps0.clone();
-        let mut out = vec![Complex64::new(0.0, 0.0); span];
-        for &forward in &[true, false, true] {
-            for kk in 0..span {
-                let k = if forward { kk } else { span - 1 - kk };
-                let center = (sof_rel + k) * pitch + self.mf_delay_frac;
-                let lo = center - half;
-                let mut y = Complex64::new(0.0, 0.0);
-                for (i, &t) in taps.iter().enumerate() {
-                    y += t * self.frac_buf[lo + i];
+        // Per-symbol noise variance sigma2(t): the mean pilot residual
+        // |out-ref|^2 per CONTIGUOUS pilot run, placed at the run centre, then
+        // 3-point-smoothed + linearly interpolated across the span. A local fade
+        // between the pilot runs that bracket it gets a HIGH local sigma2 →
+        // near-erasure LLRs the decoder can outvote, instead of the single
+        // over-confident segment-average sigma2.
+        let mut s2_pos: Vec<usize> = Vec::new();
+        let mut s2_val: Vec<f64> = Vec::new();
+        {
+            let mut k = 0usize;
+            while k < span {
+                if !is_pilot[k] {
+                    k += 1;
+                    continue;
                 }
-                out[k] = y;
-                if mu_dd > 0.0 {
-                    let d = soft_refs[k];
-                    let e = d - y;
-                    if e.norm_sqr() < d.norm_sqr() {
-                        let mut r_pow = 1e-12f64;
-                        for i in 0..n_ff {
-                            r_pow += self.frac_buf[lo + i].norm_sqr();
-                        }
-                        let mu_eff = mu_dd / r_pow;
-                        for i in 0..n_ff {
-                            taps[i] += Complex64::new(mu_eff, 0.0) * e * self.frac_buf[lo + i].conj();
-                        }
-                    }
+                let run_start = k;
+                let mut acc = 0.0f64;
+                let mut cnt = 0usize;
+                while k < span && is_pilot[k] {
+                    acc += (out[k] - refs[k]).norm_sqr();
+                    cnt += 1;
+                    k += 1;
                 }
+                s2_pos.push((run_start + k - 1) / 2);
+                s2_val.push((acc / cnt as f64).max(1e-9));
             }
         }
-        Some(out)
+        let n_s = s2_pos.len();
+        let sigma2_per_sym: Vec<f64> = if n_s == 0 {
+            vec![0.1; span]
+        } else {
+            let ss: Vec<f64> = (0..n_s)
+                .map(|i| {
+                    let lo = i.saturating_sub(1);
+                    let hi = (i + 1).min(n_s - 1);
+                    (s2_val[lo] + s2_val[i] + s2_val[hi]) / (hi - lo + 1) as f64
+                })
+                .collect();
+            (0..span)
+                .map(|i| {
+                    let v = if i <= s2_pos[0] {
+                        ss[0]
+                    } else if i >= s2_pos[n_s - 1] {
+                        ss[n_s - 1]
+                    } else {
+                        let mut j = 0;
+                        while j + 1 < n_s && s2_pos[j + 1] < i {
+                            j += 1;
+                        }
+                        let i0 = s2_pos[j];
+                        let i1 = s2_pos[j + 1];
+                        let a = (i - i0) as f64 / (i1 - i0) as f64;
+                        ss[j] * (1.0 - a) + ss[j + 1] * a
+                    };
+                    v.max(1e-6)
+                })
+                .collect()
+        };
+        Some((out, sigma2_per_sym))
     }
 
     fn trim(&mut self) {

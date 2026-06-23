@@ -52,6 +52,47 @@ pub fn llr_maxlog(
     llr
 }
 
+/// Like [`llr_maxlog`] but with a PER-SYMBOL noise variance `sigma2_per_sym`
+/// (length == `symbols.len()`). A symbol sitting in a local fade / burst gets a
+/// large local `sigma2` → small-magnitude (near-erasure) LLRs the decoder can
+/// outvote, instead of the over-confident WRONG LLRs a single segment-average
+/// `sigma2` would assign there (per-symbol reliability for BICM LLRs — cf. the
+/// time-varying noise-variance / impulsive-noise LLR-weighting literature).
+pub fn llr_maxlog_per_sym(
+    symbols: &[Complex64],
+    constellation: &Constellation,
+    sigma2_per_sym: &[f64],
+) -> Vec<f32> {
+    assert_eq!(
+        symbols.len(),
+        sigma2_per_sym.len(),
+        "sigma2_per_sym length must match symbols",
+    );
+    let bps = constellation.bits_per_sym;
+    let mut llr = Vec::with_capacity(symbols.len() * bps);
+
+    for (si, &y) in symbols.iter().enumerate() {
+        let sigma2 = sigma2_per_sym[si].max(1e-6);
+        let d2: Vec<f64> = constellation.points.iter().map(|&s| (y - s).norm_sqr()).collect();
+        for k in 0..bps {
+            let mut min_d2_0 = f64::INFINITY;
+            let mut min_d2_1 = f64::INFINITY;
+            for (idx, &dist) in d2.iter().enumerate() {
+                if constellation.bit_map[idx][k] == 0 {
+                    if dist < min_d2_0 {
+                        min_d2_0 = dist;
+                    }
+                } else if dist < min_d2_1 {
+                    min_d2_1 = dist;
+                }
+            }
+            llr.push(((min_d2_1 - min_d2_0) / sigma2) as f32);
+        }
+    }
+
+    llr
+}
+
 /// Estimate sigma^2 from FSE residuals (outputs - decisions).
 pub fn sigma2_from_residuals(outputs: &[Complex64], decisions: &[Complex64]) -> f64 {
     if outputs.is_empty() {
