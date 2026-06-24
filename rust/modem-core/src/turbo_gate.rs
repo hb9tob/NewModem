@@ -32,11 +32,47 @@ pub struct GateOpen {
     pub metric: f64,
 }
 
-/// Raw-audio preamble gate over the worker's central ring.
-pub struct TurboGate {
+/// One geometry's FFT preamble matched filter + the representative profile to
+/// report when it wins. The exact profile within a winning geometry family is
+/// refined later from the first validated marker.
+struct GeomFilter {
     profile: ProfileIndex,
     mf: PreambleMatchedFilter,
     template_len: usize,
+}
+
+impl GeomFilter {
+    /// Build the matched filter for `profile`'s geometry. `search_len` is the
+    /// (shared) scan window length, so every geometry's FFT plan is sized to the
+    /// widest template + margin and `best_match` over a common window works.
+    fn build(profile: ProfileIndex, search_len: usize) -> Self {
+        let cfg = profile.to_config();
+        let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
+            .expect("profile config has valid integer sps");
+        let template = modulator::modulate(
+            &preamble::make_preamble_for_config(&cfg),
+            sps,
+            pitch,
+            &rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps),
+            cfg.center_freq_hz,
+        );
+        let template_len = template.len();
+        let mf = PreambleMatchedFilter::new(&template, search_len.max(template_len));
+        Self {
+            profile,
+            mf,
+            template_len,
+        }
+    }
+}
+
+/// Raw-audio preamble gate over the worker's central ring. THE single turbo
+/// detection chain (FFT matched filter): `forced` carries one geometry (the
+/// locked profile), `auto` carries one per distinct non-experimental geometry
+/// and reports the winning family. Same primitive ([`PreambleMatchedFilter::
+/// best_match`]) the in-session acquisition uses — no separate naive cold-detect.
+pub struct TurboGate {
+    filters: Vec<GeomFilter>,
     search_len: usize,
     scan_interval: u64,
     /// Next absolute ring-head index at which a scan is allowed (throttle).
@@ -44,9 +80,19 @@ pub struct TurboGate {
 }
 
 impl TurboGate {
-    /// Build a gate locked to `profile`. The passband preamble template and the
-    /// search window mirror the in-session acquisition (`V3Session::new`,
-    /// v3_session.rs:655-686) so detection behaves identically.
+    /// ~200 ms scan cadence; the search window is the widest preamble template +
+    /// a margin generous enough to bridge the inter-scan gap (the gate sees the
+    /// whole ring, so the only gap is the throttle interval).
+    fn scan_params(template_lens: &[usize]) -> (u64, usize) {
+        let scan_interval = ((AUDIO_RATE as u64) / 5).max(1);
+        let margin = scan_interval as usize + (AUDIO_RATE as usize / 4); // +250 ms
+        let widest = template_lens.iter().copied().max().unwrap_or(0);
+        (scan_interval, widest + margin)
+    }
+
+    /// Build a gate locked to a single `profile`. The passband preamble template
+    /// and the search window mirror the in-session acquisition so detection
+    /// behaves identically.
     pub fn forced(profile: ProfileIndex) -> Self {
         let cfg = profile.to_config();
         let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
@@ -58,17 +104,59 @@ impl TurboGate {
             &rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps),
             cfg.center_freq_hz,
         );
-        // ~200 ms scan cadence; search window = preamble + a margin generous
-        // enough to bridge the inter-scan gap (the gate sees the whole ring, so
-        // the only gap is the throttle interval).
-        let scan_interval = ((AUDIO_RATE as u64) / 5).max(1);
-        let margin = scan_interval as usize + (AUDIO_RATE as usize / 4); // +250 ms
-        let search_len = template.len() + margin;
-        let mf = PreambleMatchedFilter::new(&template, search_len);
+        let (scan_interval, search_len) = Self::scan_params(&[template.len()]);
         Self {
-            profile,
-            template_len: template.len(),
-            mf,
+            filters: vec![GeomFilter::build(profile, search_len)],
+            search_len,
+            scan_interval,
+            next_scan_abs: 0,
+        }
+    }
+
+    /// Build an AUTO gate: one matched filter per DISTINCT non-experimental
+    /// geometry (`(symbol_rate, tau, beta, center_freq)`), each tagged with the
+    /// first profile of that family. This is the FFT replacement for the naive
+    /// `rx_v2::detect_best_profile_cold` — same geometry dedup, same family
+    /// anchoring, but the shared `best_match` primitive (O(N log N)) so a Pi 4
+    /// keeps up at cold startup.
+    pub fn auto() -> Self {
+        // Representative profile + template length per distinct geometry.
+        let mut seen: Vec<(u64, u64, u64, u64)> = Vec::new();
+        let mut reps: Vec<ProfileIndex> = Vec::new();
+        let mut template_lens: Vec<usize> = Vec::new();
+        for &p in ProfileIndex::ALL.iter().filter(|p| !p.is_experimental()) {
+            let cfg = p.to_config();
+            let key = (
+                cfg.symbol_rate.to_bits(),
+                cfg.tau.to_bits(),
+                cfg.beta.to_bits(),
+                cfg.center_freq_hz.to_bits(),
+            );
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let (sps, pitch) = match rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let template = modulator::modulate(
+                &preamble::make_preamble_for_config(&cfg),
+                sps,
+                pitch,
+                &rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps),
+                cfg.center_freq_hz,
+            );
+            reps.push(p);
+            template_lens.push(template.len());
+        }
+        let (scan_interval, search_len) = Self::scan_params(&template_lens);
+        let filters = reps
+            .into_iter()
+            .map(|p| GeomFilter::build(p, search_len))
+            .collect();
+        Self {
+            filters,
             search_len,
             scan_interval,
             next_scan_abs: 0,
@@ -77,23 +165,36 @@ impl TurboGate {
 
     /// Scan the recent ring for a preamble. `ring` is a contiguous view of the
     /// central rolling buffer, `origin` the absolute index of `ring[0]`.
-    /// Throttled to `scan_interval`. Returns a [`GateOpen`] on a peak above the
-    /// metric floor. Cheap: one FFT matched-filter pass over `search_len`.
+    /// Throttled to `scan_interval`. Runs each geometry's FFT matched filter over
+    /// the recent `search_len` window and returns the STRONGEST peak above the
+    /// metric floor, tagged with that geometry's profile family.
     pub fn poll(&mut self, ring: &[f32], origin: u64) -> Option<GateOpen> {
         let head = origin + ring.len() as u64;
-        if ring.len() < self.template_len || head < self.next_scan_abs {
+        let min_template = self.filters.iter().map(|f| f.template_len).min().unwrap_or(usize::MAX);
+        if ring.len() < min_template || head < self.next_scan_abs {
             return None;
         }
         self.next_scan_abs = head + self.scan_interval;
         let start_rel = ring.len().saturating_sub(self.search_len);
-        let m = self.mf.best_match(&ring[start_rel..])?;
-        if m.metric < MF_ACQ_THRESHOLD {
-            return None;
+        let win = &ring[start_rel..];
+        let mut best: Option<(f64, usize, ProfileIndex)> = None;
+        for f in &self.filters {
+            if win.len() < f.template_len {
+                continue;
+            }
+            if let Some(m) = f.mf.best_match(win) {
+                if m.metric >= MF_ACQ_THRESHOLD
+                    && best.map(|(bm, _, _)| m.metric > bm).unwrap_or(true)
+                {
+                    best = Some((m.metric, m.lag, f.profile));
+                }
+            }
         }
+        let (metric, lag, profile) = best?;
         Some(GateOpen {
-            preamble_abs: origin + (start_rel + m.lag) as u64,
-            profile: self.profile,
-            metric: m.metric,
+            preamble_abs: origin + (start_rel + lag) as u64,
+            profile,
+            metric,
         })
     }
 
@@ -104,8 +205,10 @@ impl TurboGate {
         self.next_scan_abs = abs;
     }
 
+    /// The locked profile (forced gate) or the first family anchor (auto gate).
+    /// Per-detection the winning family is carried by [`GateOpen::profile`].
     pub fn profile(&self) -> ProfileIndex {
-        self.profile
+        self.filters.first().map(|f| f.profile).unwrap_or(ProfileIndex::HighPlusPlus)
     }
 
     /// Audio samples the gate needs buffered before it can scan (one search
@@ -167,6 +270,58 @@ mod tests {
         assert!(
             gate.poll(&noise, 0).is_none(),
             "gate opened on noise (false positive)",
+        );
+    }
+
+    #[test]
+    fn auto_gate_detects_the_transmitted_geometry() {
+        // The auto gate must open on a real burst and report a profile of the
+        // SAME geometry as the one transmitted (the exact profile within a
+        // family is refined later from the marker). HIGH++ shares the sps=32
+        // geometry with NORMAL/HIGH/HIGH+, so the reported family anchor need
+        // only be geometry-compatible, not profile-equal.
+        let tx = ProfileIndex::HighPlusPlus;
+        let mut gate = TurboGate::auto();
+        let burst = build_burst(tx, 4000);
+        let win = gate.search_len().min(burst.len());
+        let open = gate
+            .poll(&burst[..win], 0)
+            .expect("auto gate did not open on a real preamble");
+        let tx_cfg = tx.to_config();
+        let got_cfg = open.profile.to_config();
+        assert_eq!(
+            (
+                tx_cfg.symbol_rate.to_bits(),
+                tx_cfg.tau.to_bits(),
+                tx_cfg.beta.to_bits(),
+                tx_cfg.center_freq_hz.to_bits(),
+            ),
+            (
+                got_cfg.symbol_rate.to_bits(),
+                got_cfg.tau.to_bits(),
+                got_cfg.beta.to_bits(),
+                got_cfg.center_freq_hz.to_bits(),
+            ),
+            "auto gate reported a different geometry ({:?}) than transmitted ({tx:?})",
+            open.profile,
+        );
+        assert!(open.metric >= MF_ACQ_THRESHOLD);
+        assert!(open.preamble_abs < (AUDIO_RATE as u64) / 2);
+    }
+
+    #[test]
+    fn auto_gate_stays_closed_on_noise() {
+        let mut gate = TurboGate::auto();
+        let mut s: u64 = 0xDEAD_BEEF;
+        let noise: Vec<f32> = (0..gate.search_len())
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 0.3
+            })
+            .collect();
+        assert!(
+            gate.poll(&noise, 0).is_none(),
+            "auto gate opened on noise (false positive)",
         );
     }
 

@@ -1031,7 +1031,13 @@ fn run_turbo_worker(
     };
     // Warm-up ring used only while detecting (auto mode, driver not yet built).
     let mut warm: Vec<f32> = Vec::new();
-    let mut samples_since_detect: usize = 0;
+    // THE single turbo detection chain at cold startup (auto mode): the FFT
+    // matched-filter gate, multi-geometry. Replaces the naive symbol-domain
+    // `detect_best_profile_cold` (an O(N·taps) re-scan of the whole warm buffer
+    // every tick — the Pi-4 cold-startup bottleneck). Same `PreambleMatchedFilter`
+    // primitive the in-session acquisition + the driver's own gate use, so the
+    // detection behaves identically however the burst is bootstrapped.
+    let mut auto_gate = (!forced).then(modem_core::turbo_gate::TurboGate::auto);
 
     let mut deemph =
         deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
@@ -1169,44 +1175,47 @@ fn run_turbo_worker(
                 max_push_ms = max_push_ms.max(last_push_ms);
             }
             None => {
-                // Auto mode, still detecting: accumulate and probe.
+                // Auto mode, still detecting: accumulate the warm ring and poll
+                // the FFT gate (throttled internally to ~200 ms). The gate scans
+                // only the recent search window per its own throttle — O(N log N),
+                // a fraction of the old per-tick naive re-scan of the whole 8 s
+                // buffer that made the Pi 4 fall behind at cold startup.
                 warm.extend_from_slice(&chunk);
                 if warm.len() > TURBO_WARM_MAX_SAMPLES {
                     let drop = warm.len() - TURBO_WARM_MAX_SAMPLES;
                     warm.drain(..drop);
                 }
-                samples_since_detect += chunk.len();
-                if warm.len() >= TURBO_DETECT_MIN_SAMPLES
-                    && samples_since_detect >= TURBO_DETECT_INTERVAL_SAMPLES
-                {
-                    samples_since_detect = 0;
-                    if let Some(fam) = rx_v2::detect_best_profile_cold(&warm) {
-                        worker_log(&format!("[turbo] auto-detected family anchor {fam:?}"));
-                        match crate::rx_v3_worker::RxV3Worker::new(
-                            fam,
-                            /*forced=*/ false,
-                            save_dir.clone(),
-                            sink.clone(),
-                        ) {
-                            Ok(mut d) => {
-                                // Replay the warm-up so no audio is lost; the
-                                // driver refines to the exact profile from the
-                                // first marker inside this push. Feed it in
-                                // ~100 ms batches (not one big chunk) so the
-                                // throttled acquisition scan — whose search
-                                // window is now ~one preamble, not the whole
-                                // warm buffer — runs across the warm-up and
-                                // catches a preamble anywhere in it (the SC
-                                // detector, run per-sample on ingest, is the
-                                // backstop regardless).
-                                for batch in warm.chunks(ACQ_PUSH_SPLIT) {
-                                    d.push_samples(batch);
-                                }
-                                warm.clear();
-                                driver = Some(d);
+                let warm_origin = total_samples - warm.len() as u64;
+                let open = auto_gate
+                    .as_mut()
+                    .and_then(|g| g.poll(&warm, warm_origin));
+                if let Some(open) = open {
+                    let fam = open.profile;
+                    worker_log(&format!(
+                        "[turbo] gate auto-detected family anchor {fam:?} (metric={:.3})",
+                        open.metric,
+                    ));
+                    match crate::rx_v3_worker::RxV3Worker::new(
+                        fam,
+                        /*forced=*/ false,
+                        save_dir.clone(),
+                        sink.clone(),
+                    ) {
+                        Ok(mut d) => {
+                            // Replay the warm-up so no audio is lost; the driver
+                            // refines to the exact profile from the first marker
+                            // inside this push. Feed it in ~100 ms batches (not
+                            // one big chunk) so the throttled acquisition scan
+                            // runs across the warm-up and catches the preamble
+                            // (the SC detector, run per-sample on ingest, is the
+                            // backstop regardless).
+                            for batch in warm.chunks(ACQ_PUSH_SPLIT) {
+                                d.push_samples(batch);
                             }
-                            Err(e) => worker_log(&format!("[turbo] driver init failed: {e}")),
+                            warm.clear();
+                            driver = Some(d);
                         }
+                        Err(e) => worker_log(&format!("[turbo] driver init failed: {e}")),
                     }
                 }
             }
@@ -1223,12 +1232,6 @@ fn run_turbo_worker(
 /// family. 8 s spans ≥1 full `V3_PREAMBLE_PERIOD_S` (~4 s) preamble, so a
 /// burst that starts mid-window is still caught on the next re-insertion.
 const TURBO_WARM_MAX_SAMPLES: usize = 8 * AUDIO_RATE as usize;
-/// Minimum warm-up depth before the first cold detection attempt — enough
-/// audio to hold a preamble for the correlation probe.
-const TURBO_DETECT_MIN_SAMPLES: usize = (AUDIO_RATE as usize) * 3 / 2;
-/// Re-run the cold detection at most this often (in pushed samples) so the
-/// probe (≈7 preamble correlations over the warm-up) stays cheap.
-const TURBO_DETECT_INTERVAL_SAMPLES: usize = AUDIO_RATE as usize / 2;
 /// Max sub-push fed to the turbo driver at once (~100 ms). Bounds the gap
 /// between throttled acquisition scans so the matched filter's ~325 ms search
 /// window can never be jumped over, regardless of the source's buffer size.
