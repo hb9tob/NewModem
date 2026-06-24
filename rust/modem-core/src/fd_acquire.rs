@@ -26,6 +26,12 @@ use rustfft::{Fft, FftPlanner};
 /// `frac` is what lets the drift LS use a preamble as a sub-sample timing
 /// observation — the raw integer peak carries ~0.29-sample (1/√12) of pure
 /// quantisation noise, throwing away the long template's precision.
+/// Matched-filter acquisition metric floor. A `best_match` metric below this is
+/// noise/no-preamble; above it the window correlates preamble-like and the
+/// caller proceeds to the hard Golay+CRC marker-validation gate. Shared by the
+/// in-session acquisition and the worker-level [`crate::turbo_gate::TurboGate`].
+pub const MF_ACQ_THRESHOLD: f64 = 0.15;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PreambleMatch {
     pub lag: usize,

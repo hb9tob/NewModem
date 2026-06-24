@@ -65,10 +65,7 @@ use modem_framing::app_header::{decode_meta_payload, AppHeader};
 /// landing.
 pub const SC_THRESHOLD: f64 = 0.5;
 
-/// Matched-filter acquisition metric floor (`fd_acquire`). The Golay+CRC
-/// marker validation at the implied position is the hard false-positive gate,
-/// so this only needs to reject windows with no preamble-like correlation.
-const MF_ACQ_THRESHOLD: f64 = 0.15;
+use crate::fd_acquire::MF_ACQ_THRESHOLD;
 
 /// Rolling audio buffer retained, in multiples of the data-cycle period.
 /// 4 cycles gives the streaming pipeline ample resampler-cursor margin
@@ -804,6 +801,15 @@ impl V3Session {
 
     pub fn profile_name(&self) -> &str {
         &self.profile_name
+    }
+
+    /// One superframe period in AUDIO samples (`superframe_period_sym × sps`).
+    /// Used by the turbo gate / backward flywheel to step whole superframes
+    /// along the worker ring at the nominal (pre-drift) rate.
+    pub fn superframe_audio_samples(&self) -> u64 {
+        let (sps, _) = rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
+            .expect("profile config has valid integer sps");
+        self.superframe_period_sym * sps as u64
     }
 
     pub fn state(&self) -> &V3SessionState {

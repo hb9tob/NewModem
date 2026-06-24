@@ -31,5 +31,6 @@ pub mod gate;
 
 pub mod traits;
 pub mod fd_acquire;
+pub mod turbo_gate;
 pub mod v3_modem;
 pub mod v3_session;
