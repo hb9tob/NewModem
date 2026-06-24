@@ -530,6 +530,7 @@ pub fn spawn(
                 save_dir,
                 wav_sink,
                 profile,
+                forced,
                 deemphasis_enabled,
                 dropped_samples,
                 stop_thread,
@@ -996,20 +997,42 @@ fn run_turbo_worker(
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
     profile: ProfileIndex,
+    forced: bool,
     deemphasis_enabled: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = std::fs::remove_file(log_path());
-    worker_log(&format!("[turbo] start V3 profile={profile:?}"));
-    let mut driver =
-        match crate::rx_v3_worker::RxV3Worker::new(profile, save_dir.clone(), sink.clone()) {
-            Ok(d) => d,
+    worker_log(&format!(
+        "[turbo] start V3 profile={profile:?} forced={forced}"
+    ));
+
+    // In forced mode the driver is locked on `profile` from the start. In auto
+    // mode the driver is built LAZILY: we accumulate a warm-up buffer and run
+    // `detect_best_profile_cold` until a preamble's geometry FAMILY is pinned,
+    // then construct the driver at that anchor and replay the warm-up into it.
+    // The driver's own marker-driven refinement then resolves the EXACT profile
+    // (e.g. HIGH vs NORMAL) from the first validated marker's `profile_index`.
+    let mut driver: Option<crate::rx_v3_worker::RxV3Worker> = if forced {
+        match crate::rx_v3_worker::RxV3Worker::new(
+            profile,
+            /*forced=*/ true,
+            save_dir.clone(),
+            sink.clone(),
+        ) {
+            Ok(d) => Some(d),
             Err(e) => {
                 worker_log(&format!("[turbo] driver init failed: {e}"));
                 return;
             }
-        };
+        }
+    } else {
+        None
+    };
+    // Warm-up ring used only while detecting (auto mode, driver not yet built).
+    let mut warm: Vec<f32> = Vec::new();
+    let mut samples_since_detect: usize = 0;
+
     let mut deemph =
         deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
     let mut total_samples: u64 = 0;
@@ -1025,7 +1048,8 @@ fn run_turbo_worker(
         // Capture-side brickwall parity: a producer-ring overflow leaves a
         // hole in the stream the matched filter can't bridge. Flush the
         // session to Idle and request a clean restart, dropping the
-        // corrupted in-flight delivery.
+        // corrupted in-flight delivery. While still detecting (no driver yet)
+        // there is no session state to flush — just drop the warm-up buffer.
         let cur_dropped = dropped_samples.load(Ordering::Relaxed);
         if cur_dropped > last_dropped {
             let delta = cur_dropped - last_dropped;
@@ -1033,7 +1057,10 @@ fn run_turbo_worker(
             worker_log(&format!(
                 "[turbo] BRICKWALL capture: +{delta} samples dropped → finalize + idle"
             ));
-            let _ = driver.finalize();
+            if let Some(d) = driver.as_mut() {
+                let _ = d.finalize();
+            }
+            warm.clear();
             sink.emit(
                 "worker_requests_restart",
                 WorkerRequestsRestartPayload {
@@ -1072,12 +1099,62 @@ fn run_turbo_worker(
             f.process(&mut chunk);
         }
 
-        driver.push_samples(&chunk);
+        match driver.as_mut() {
+            Some(d) => {
+                d.push_samples(&chunk);
+            }
+            None => {
+                // Auto mode, still detecting: accumulate and probe.
+                warm.extend_from_slice(&chunk);
+                if warm.len() > TURBO_WARM_MAX_SAMPLES {
+                    let drop = warm.len() - TURBO_WARM_MAX_SAMPLES;
+                    warm.drain(..drop);
+                }
+                samples_since_detect += chunk.len();
+                if warm.len() >= TURBO_DETECT_MIN_SAMPLES
+                    && samples_since_detect >= TURBO_DETECT_INTERVAL_SAMPLES
+                {
+                    samples_since_detect = 0;
+                    if let Some(fam) = rx_v2::detect_best_profile_cold(&warm) {
+                        worker_log(&format!("[turbo] auto-detected family anchor {fam:?}"));
+                        match crate::rx_v3_worker::RxV3Worker::new(
+                            fam,
+                            /*forced=*/ false,
+                            save_dir.clone(),
+                            sink.clone(),
+                        ) {
+                            Ok(mut d) => {
+                                // Replay the warm-up so no audio is lost; the
+                                // driver refines to the exact profile from the
+                                // first marker inside this push.
+                                d.push_samples(&warm);
+                                warm.clear();
+                                driver = Some(d);
+                            }
+                            Err(e) => worker_log(&format!("[turbo] driver init failed: {e}")),
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    let _ = driver.finalize();
+    if let Some(d) = driver.as_mut() {
+        let _ = d.finalize();
+    }
     worker_log("[turbo] stop");
 }
+
+/// Warm-up ring cap while the turbo worker is auto-detecting the profile
+/// family. 8 s spans ≥1 full `V3_PREAMBLE_PERIOD_S` (~4 s) preamble, so a
+/// burst that starts mid-window is still caught on the next re-insertion.
+const TURBO_WARM_MAX_SAMPLES: usize = 8 * AUDIO_RATE as usize;
+/// Minimum warm-up depth before the first cold detection attempt — enough
+/// audio to hold a preamble for the correlation probe.
+const TURBO_DETECT_MIN_SAMPLES: usize = (AUDIO_RATE as usize) * 3 / 2;
+/// Re-run the cold detection at most this often (in pushed samples) so the
+/// probe (≈7 preamble correlations over the warm-up) stays cheap.
+const TURBO_DETECT_INTERVAL_SAMPLES: usize = AUDIO_RATE as usize / 2;
 
 fn run_worker(
     samples: Receiver<Vec<f32>>,

@@ -104,12 +104,35 @@ pub struct RxV3Worker {
     /// `history_origin + history.len()` is the live head. Maps a
     /// `RewindRequest.anchor_abs_sample` to its offset inside `history`.
     history_origin: u64,
+    /// Set once the exact profile has been resolved: `true` from the start in
+    /// forced mode (the operator locked `profile`), otherwise flipped `true`
+    /// by the first validated marker. Gates the one-shot marker-driven
+    /// exact-profile refinement so it fires at most once per driver.
+    detected_locked: bool,
+    /// Deferred profile switch requested from inside `route()` (which is
+    /// mid-iteration over the current event batch): the actual session
+    /// rebuild + history replay runs in `push_samples` once routing of the
+    /// triggering batch has unwound. `None` when no switch is pending.
+    pending_rebuild: Option<ProfileIndex>,
 }
 
+/// Replay batch size when re-running the rolling history through a freshly
+/// rebuilt session (mirrors `V3Session::replay_from_anchor`'s batching: the
+/// FSM advances by bounded steps per `process_audio_chunk`, so one giant
+/// call would under-process the burst). 2400 samples = 50 ms @ 48 kHz.
+const REPLAY_BATCH_SAMPLES: usize = 2400;
+
 impl RxV3Worker {
-    /// Build a driver for `profile`, persisting under `save_dir/sessions/`.
+    /// Build a driver bootstrapped at `profile`, persisting under
+    /// `save_dir/sessions/`. When `forced` is false the driver refines to the
+    /// exact profile advertised by the first validated marker (see
+    /// [`RxV3Worker::route`]); `profile` then only has to be a geometry-
+    /// compatible anchor (the turbo worker picks it with
+    /// `rx_v2::detect_best_profile_cold`). When `forced` is true the profile
+    /// is locked and the refinement is bypassed.
     pub fn new(
         profile: ProfileIndex,
+        forced: bool,
         save_dir: Arc<Mutex<PathBuf>>,
         sink: Arc<dyn EventSink>,
     ) -> std::io::Result<Self> {
@@ -128,7 +151,15 @@ impl RxV3Worker {
             samples_since_progress: 0,
             history: VecDeque::with_capacity(HISTORY_SAMPLES),
             history_origin: 0,
+            detected_locked: forced,
+            pending_rebuild: None,
         })
+    }
+
+    /// Currently configured profile (the bootstrap anchor until the first
+    /// marker refines it, the exact TX profile thereafter).
+    pub fn profile(&self) -> ProfileIndex {
+        self.profile
     }
 
     /// Forward the caller-provided drift hint (ppm) to the session's
@@ -163,6 +194,16 @@ impl RxV3Worker {
                 .process_audio_chunk_with_history(samples, hist, history_origin)
         };
         let mut outcome = self.route(events);
+        // A marker advertised a different (geometry-compatible) profile than
+        // the bootstrap anchor: rebuild the session at the exact profile and
+        // replay the rolling history so the burst re-acquires + decodes its
+        // DATA with the correct constellation. Deferred out of `route` so the
+        // rebuild does not run mid-iteration over the current event batch.
+        if let Some(p) = self.pending_rebuild.take() {
+            let rebuilt = self.rebuild_at(p);
+            outcome.decoded = outcome.decoded.or(rebuilt.decoded);
+            outcome.bursts_finalised += rebuilt.bursts_finalised;
+        }
         // Worker-driven end-of-burst: a locked burst that has gone silent on
         // markers for too long has ended (silence / noise cut / true tail).
         // Finalize → Idle so the next preamble re-acquires.
@@ -192,12 +233,32 @@ impl RxV3Worker {
         let mut queue: VecDeque<V3SessionEvent> = events.into();
         while let Some(e) = queue.pop_front() {
             match e {
-                V3SessionEvent::MarkerValidated { .. } => {
+                V3SessionEvent::MarkerValidated { profile_index, .. } => {
                     // Forward sync progress — arms the burst and resets the
                     // end-of-burst no-progress timer (fires every cycle,
                     // including across re-insertion crossings).
                     self.active = true;
                     self.samples_since_progress = 0;
+                    // One-shot exact-profile refinement (auto mode only). The
+                    // bootstrap anchor pinned the geometry FAMILY; the marker
+                    // advertises the exact TX profile. If they differ and the
+                    // exact profile is non-experimental + geometry-compatible
+                    // (same preamble family, so the marker positions we just
+                    // locked stay valid after a rebuild), request the switch.
+                    // Experimental / family-incompatible advertisements are
+                    // ignored — auto-detect never silently switches into a
+                    // forced-only profile.
+                    if !self.detected_locked {
+                        self.detected_locked = true;
+                        if let Some(p) = ProfileIndex::from_u8(profile_index) {
+                            if p != self.profile
+                                && !p.is_experimental()
+                                && p.preamble_family() == self.profile.preamble_family()
+                            {
+                                self.pending_rebuild = Some(p);
+                            }
+                        }
+                    }
                 }
                 V3SessionEvent::AppHeaderRecovered {
                     session_id,
@@ -306,6 +367,48 @@ impl RxV3Worker {
         outcome
     }
 
+    /// Rebuild the streaming session at `profile` and replay the rolling
+    /// history through it so the in-flight burst re-acquires and decodes its
+    /// DATA at the corrected constellation, losing no audio. Used once per
+    /// driver by the marker-driven exact-profile refinement.
+    ///
+    /// The fresh session starts its absolute-sample frame at 0, so we reset
+    /// `history_origin` to 0 to keep the worker's `RewindRequest` mapping
+    /// consistent with the session — nothing external depends on the absolute
+    /// stream position (the worker-loop telemetry counter is separate). The
+    /// disk `store` dedups by ESI, so re-routing already-accepted codewords on
+    /// the replay is idempotent.
+    fn rebuild_at(&mut self, profile: ProfileIndex) -> PushOutcome {
+        self.sink.emit(
+            "v3_profile_detected",
+            serde_json::json!({
+                "from": self.profile.name(),
+                "to": profile.name(),
+            }),
+        );
+        self.session = V3Session::new(profile.to_config(), profile.name().to_string());
+        self.profile = profile;
+        // Drop per-burst routing state — the replay re-derives the header and
+        // re-emits the codewords at the corrected profile.
+        self.cur_header = None;
+        self.pending_cw.clear();
+        self.active = false;
+        self.samples_since_progress = 0;
+
+        let hist: Vec<f32> = self.history.iter().copied().collect();
+        self.history_origin = 0;
+        let mut acc: Vec<f32> = Vec::with_capacity(hist.len());
+        let mut events = Vec::new();
+        for chunk in hist.chunks(REPLAY_BATCH_SAMPLES) {
+            acc.extend_from_slice(chunk);
+            events.extend(
+                self.session
+                    .process_audio_chunk_with_history(chunk, &acc, 0),
+            );
+        }
+        self.route(events)
+    }
+
     /// Push packets into the store, emit a progress event, and surface a
     /// freshly-decoded file (emitting `file_complete`).
     fn accept(&mut self, ah: &AppHeader, packets: &HashMap<u32, Vec<u8>>) -> Option<DecodedFile> {
@@ -399,6 +502,7 @@ mod tests {
         let sink = Arc::new(crate::event_sink::RecordingSink::new());
         let mut worker = RxV3Worker::new(
             ProfileIndex::HighPlus,
+            /*forced=*/ true,
             save_dir,
             sink.clone() as Arc<dyn EventSink>,
         )
@@ -442,9 +546,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
         let sink = Arc::new(crate::event_sink::RecordingSink::new());
-        let mut worker =
-            RxV3Worker::new(ProfileIndex::HighPlus, save_dir, sink as Arc<dyn EventSink>)
-                .unwrap();
+        let mut worker = RxV3Worker::new(
+            ProfileIndex::HighPlus,
+            /*forced=*/ true,
+            save_dir,
+            sink as Arc<dyn EventSink>,
+        )
+        .unwrap();
 
         let mut decoded_sids = Vec::new();
         let mut finalised = 0usize;

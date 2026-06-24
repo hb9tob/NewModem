@@ -152,6 +152,7 @@ fn rx(args: &[String]) {
     let profile = bench_profile();
     let mut worker = RxV3Worker::new(
         profile,
+        /*forced=*/ true,
         Arc::new(Mutex::new(tmp.clone())),
         Arc::new(NoopSink),
     )
@@ -336,8 +337,18 @@ fn rxreal(args: &[String]) {
     // --- Worker path (the live driver) ---
     let tmp = std::env::temp_dir().join(format!("turbo_real_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
-    let mut worker = RxV3Worker::new(profile, Arc::new(Mutex::new(tmp.clone())), Arc::new(NoopSink))
-        .expect("worker");
+    // Default: explicit profile (forced) for parity benches. Set
+    // `V3_TURBO_AUTODETECT=1` to exercise the auto-detect path on a real
+    // capture — the driver then bootstraps from `profile` only as the family
+    // anchor and refines from the marker, mirroring the live GUI auto mode.
+    let forced = std::env::var_os("V3_TURBO_AUTODETECT").is_none();
+    let mut worker = RxV3Worker::new(
+        profile,
+        forced,
+        Arc::new(Mutex::new(tmp.clone())),
+        Arc::new(NoopSink),
+    )
+    .expect("worker");
     let mut w_payload: Option<Vec<u8>> = None;
     let mut w_finalised = 0usize;
     for chunk in samples.chunks(CHUNK_SAMPLES) {

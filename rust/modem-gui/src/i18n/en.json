@@ -104,6 +104,8 @@
   "settings.rx_deemphasis_hint": "Falling slope −6 dB/oct above 300 Hz (~−10 dB at 1 kHz, ~−19 dB at 2.7 kHz). Exact mirror of the TX pre-emphasis below: together they emulate the ±6 dB/oct intrinsic to a PM radio. Raw WAV capture and level meter are untouched — only the modem demodulator sees the filtered signal. Enable only if the radio is true FM (no native ±6 dB/oct PM).",
   "settings.rx_power_mode": "Power Mode",
   "settings.rx_power_mode_hint_html": "RX 0.9.x algorithm — full ±80 ppm drift sweep per window (coarse 20 ppm + fine ±10 ppm). Proven robust decode. Flat 6 s preamble-absence timeout for all profiles (strict 0.9.2rc5). Recommended on a modern PC, uncheck on Pi or old PC where the worker may fall behind real time. <em>Disabled by default on Raspberry Pi.</em>",
+  "settings.rx_turbo": "Turbo reception (experimental)",
+  "settings.rx_turbo_hint_html": "Fully-streaming RX decoder (one continuous V3 session, soft turbo FFE equaliser + bidirectional phase smoother) in place of the sliding-window algorithm. Auto-detects the transmitted profile: leave \"Force a profile\" unchecked. Independent of <em>Power Mode</em> above — it is not the same checkbox. The background turns very dark red while turbo reception is active.",
   "settings.audio_backend_alsa": "Direct ALSA (hw:)",
   "settings.audio_backend_alsa_hint_html": "Direct sound-card access via <code>hw:</code> — bypasses the cpal/<code>plug</code> layer that can silently resample (libspeexdsp bug, fatal for the modem). Recommended on Raspberry Pi. Uncheck to fall back to the cpal backend if the card refuses direct opening. No effect outside Linux.",
   "settings.legend_tx_device": "Transmit device (TX)",

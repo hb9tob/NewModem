@@ -272,6 +272,12 @@ pub enum V3SessionEvent {
         session_id_low: u8,
         base_esi: u32,
         is_meta: bool,
+        /// Modulation profile carried by this marker (V4 wire format).
+        /// Every marker (META and DATA) advertises the TX profile here, so
+        /// a worker that bootstrapped at a geometry-compatible anchor can
+        /// refine to the exact profile (e.g. HIGH vs NORMAL) the moment the
+        /// first marker validates. Mirrors `rx_v2`'s bootstrap-marker read.
+        profile_index: u8,
     },
     /// EOT marker observed.
     EotSeen,
@@ -1131,6 +1137,7 @@ impl V3Session {
                     session_id_low: meta_payload.session_id_low,
                     base_esi: meta_payload.base_esi,
                     is_meta: true,
+                    profile_index: meta_payload.profile_index,
                 });
                 self.cycles_validated = self.cycles_validated.saturating_add(1);
                 self.state = V3SessionState::Locked {
@@ -1180,6 +1187,7 @@ impl V3Session {
             session_id_low: payload.session_id_low,
             base_esi: payload.base_esi,
             is_meta,
+            profile_index: payload.profile_index,
         });
         self.cycles_validated = self.cycles_validated.saturating_add(1);
         self.state = V3SessionState::Locked {
@@ -2295,6 +2303,7 @@ impl V3Session {
                     session_id_low: payload.session_id_low,
                     base_esi: payload.base_esi,
                     is_meta,
+                    profile_index: payload.profile_index,
                 });
                 self.cycles_validated = self.cycles_validated.saturating_add(1);
                 self.state = V3SessionState::Locked {

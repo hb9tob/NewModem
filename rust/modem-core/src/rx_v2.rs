@@ -436,6 +436,38 @@ pub fn detect_best_profile(
     Some(best)
 }
 
+/// Cold-start profile family detection for a streaming RX that has NO
+/// current profile to compare against (the turbo worker before it has
+/// constructed its `V3Session`). Unlike [`detect_best_profile`], there is
+/// no "current already as good as best" tie-guard — we simply return the
+/// non-experimental profile whose preamble correlates best, provided it
+/// clears the no-signal floor.
+///
+/// This pins the geometry FAMILY (sps / pitch / β / center), which is all
+/// the streaming session needs to start validating markers. Profiles that
+/// share a geometry (e.g. NORMAL vs HIGH, or the family-A 16/32/64-APSK
+/// group) are indistinguishable by preamble correlation, so the returned
+/// pick may be a geometry-equivalent sibling of the true profile — the
+/// caller refines to the exact profile from the first marker's
+/// `profile_index` (which every V4 marker advertises), exactly as the
+/// batch `rx_v2` bootstrap-marker read does.
+///
+/// Returns `None` when no profile clears the floor (no preamble in view).
+pub fn detect_best_profile_cold(samples: &[f32]) -> Option<crate::profile::ProfileIndex> {
+    use crate::profile::ProfileIndex;
+    let mut best: Option<(ProfileIndex, f64)> = None;
+    for &p in ProfileIndex::ALL.iter().filter(|p| !p.is_experimental()) {
+        let r = preamble_correlation_ratio(samples, &p.to_config());
+        if best.map(|(_, br)| r > br).unwrap_or(true) {
+            best = Some((p, r));
+        }
+    }
+    match best {
+        Some((p, r)) if r >= 50.0 => Some(p),
+        _ => None,
+    }
+}
+
 /// Energy-weighted index of an FFE tap vector, in FSE-input samples.
 ///
 /// `centroid = sum_k k * |tap[k]|^2 / sum_k |tap[k]|^2`. For an LS-trained

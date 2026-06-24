@@ -6,6 +6,12 @@ body {
   background: #1e1e1e;
   color: #e0e0e0;
 }
+/* Experimental turbo reception path selected: very dark red background as an
+   unmistakable visual cue (toggled from the rx_turbo setting in main.js).
+   Distinct from the Power Mode checkbox, which does NOT change the theme. */
+body.turbo-mode {
+  background: #1c0606;
+}
 .top-bar {
   display: flex;
   gap: 1rem;
