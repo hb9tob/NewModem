@@ -569,10 +569,65 @@ fn sfcw(args: &[String]) {
     }
 }
 
+/// Time the startup auto-detect cold correlation (`detect_best_profile_cold`):
+/// `turbo_sim benchdetect [seconds]`. This is what the turbo worker runs every
+/// ~0.5 s over the warm buffer BEFORE the first burst is detected (no driver, no
+/// FFT gate yet) — the Pi-4 startup cost.
+fn benchdetect(args: &[String]) {
+    use std::time::Instant;
+    let secs: f64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(8.0);
+    let n = (secs * AUDIO_RATE as f64) as usize;
+    let mut x: u32 = 0x1234_5678;
+    let buf: Vec<f32> = (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
+        })
+        .collect();
+    let _ = modem_core::rx_v2::detect_best_profile_cold(&buf); // warm cache
+    let iters = 20;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = modem_core::rx_v2::detect_best_profile_cold(&buf);
+    }
+    let per = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!(
+        "OLD naive detect_best_profile_cold: {secs:.1}s buffer ({n} samples) -> {per:.2} ms/call\n\
+         Pi 4 ~10-15x slower -> ~{:.0}-{:.0} ms/call (of a 500 ms real-time budget)",
+        per * 10.0,
+        per * 15.0,
+    );
+    // NEW: the unified FFT gate (TurboGate::auto), polled over its recent search
+    // window — this is what runs per tick now.
+    let mut gate = modem_core::turbo_gate::TurboGate::auto();
+    let _ = gate.poll(&buf, 0); // warm
+    let giters = 200;
+    let t1 = Instant::now();
+    let mut head = 0u64;
+    for _ in 0..giters {
+        gate.reset_to(head); // force a scan each iter (bypass throttle)
+        let _ = gate.poll(&buf, head);
+        head += 1;
+    }
+    let gper = t1.elapsed().as_secs_f64() * 1000.0 / giters as f64;
+    println!(
+        "NEW FFT TurboGate::auto poll: {:.3} ms/poll (scans recent ~{} samples, all geometries)\n\
+         Pi 4 ~10-15x slower -> ~{:.1}-{:.1} ms/poll  (throttled to ~5 polls/s)",
+        gper,
+        gate.search_len(),
+        gper * 10.0,
+        gper * 15.0,
+    );
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some("benchdetect") {
+        benchdetect(&argv[2..]);
+        return;
+    }
     if argv.len() < 3 {
-        eprintln!("usage: turbo_sim <tx|rx|rxreal|probe> <wav> [bytes|profile] [seed] [repair_pct(tx)]");
+        eprintln!("usage: turbo_sim <tx|rx|rxreal|probe|benchdetect> <wav> [bytes|profile] [seed] [repair_pct(tx)]");
         std::process::exit(64);
     }
     let rest = &argv[2..];
