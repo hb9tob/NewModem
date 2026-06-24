@@ -158,6 +158,46 @@ impl StreamingFfe {
         self.current_taps.is_some()
     }
 
+    /// Extend the FFE BACKWARD in time: prepend `n_symbols` of earlier
+    /// fractional (fse) samples to the FRONT of the buffers and lower
+    /// `start_abs`, so a subsequent [`reequalise_span_joint`] can run its
+    /// backward (time-reversed) leg over the now-extended span. The live taps
+    /// and the existing forward data are KEPT — this re-populates the FFE *data*
+    /// the backward pass needs (it is NOT a tap/phase copy). `earlier_fse` must
+    /// be `n_symbols * pitch_fse` fractional samples whose first sample is
+    /// on-symbol (the DSP rewind lands on the symbol grid, satisfying this).
+    /// Returns `false` (no-op) on a length-contract violation.
+    pub fn prepend_raw(&mut self, earlier_fse: &[Complex64], n_symbols: usize) -> bool {
+        if earlier_fse.len() != n_symbols * self.pitch_fse || n_symbols == 0 {
+            return false;
+        }
+        if (n_symbols as u64) > self.start_abs {
+            return false; // would underflow the absolute symbol index
+        }
+        let mut frac = Vec::with_capacity(earlier_fse.len() + self.frac_buf.len());
+        frac.extend_from_slice(earlier_fse);
+        frac.extend_from_slice(&self.frac_buf);
+        self.frac_buf = frac;
+
+        let mut raw = Vec::with_capacity(n_symbols + self.raw_sym_buf.len());
+        for s in 0..n_symbols {
+            raw.push(earlier_fse[s * self.pitch_fse]); // on-symbol grid point
+        }
+        raw.extend_from_slice(&self.raw_sym_buf);
+        self.raw_sym_buf = raw;
+
+        // out_buf placeholders: reequalise_span_joint returns its own equalised
+        // output; these only keep out_buf.len() consistent with the new
+        // start_abs so its in-buffer span check passes.
+        let mut out = Vec::with_capacity(n_symbols + self.out_buf.len());
+        out.extend(std::iter::repeat(Complex64::new(0.0, 0.0)).take(n_symbols));
+        out.extend_from_slice(&self.out_buf);
+        self.out_buf = out;
+
+        self.start_abs -= n_symbols as u64;
+        true
+    }
+
     /// Energy-weighted centroid of the current taps, in fractional-sample
     /// units (T/`pitch_fse`). Under a clock-drift mismatch the adaptive taps
     /// migrate at the drift rate (Ungerboeck 1976 / Gitlin tap-leakage): the
@@ -986,6 +1026,32 @@ fn gauss_solve(mut a: Vec<Vec<Complex64>>, mut b: Vec<Complex64>) -> Option<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepend_extends_backward_and_lowers_start() {
+        // pitch_fse = 2. Push forward so start_abs advances + buffers fill.
+        let mut ffe = StreamingFfe::new(9, 64, 16, 2, 3);
+        // Push enough symbols (> retention = 2*64+16+9) that the buffer trims and
+        // start_abs advances past the prepend count.
+        let fwd: Vec<Complex64> = (0..800).map(|i| Complex64::new(i as f64 * 0.01, 0.0)).collect();
+        ffe.push_raw(&fwd);
+        let start_before = ffe.start_abs();
+        assert!(start_before >= 8, "precondition: start_abs {start_before} too small");
+        let len_before = ffe.out_buf().len();
+        let raw_before = ffe.raw_buf().len();
+        let n_sym = 8usize;
+        let earlier: Vec<Complex64> =
+            (0..n_sym * 2).map(|i| Complex64::new(-(i as f64) * 0.01, 0.0)).collect();
+        assert!(ffe.prepend_raw(&earlier, n_sym), "prepend rejected");
+        assert_eq!(ffe.start_abs(), start_before - n_sym as u64, "start_abs not lowered");
+        assert_eq!(ffe.out_buf().len(), len_before + n_sym, "out_buf not extended");
+        assert_eq!(ffe.raw_buf().len(), raw_before + n_sym, "raw_buf not extended");
+        // First prepended on-symbol grid point is earlier[0].
+        assert_eq!(ffe.raw_buf()[0], earlier[0]);
+        // Contract violations are no-ops.
+        assert!(!ffe.prepend_raw(&earlier, n_sym + 1), "bad length accepted");
+        assert!(!ffe.prepend_raw(&earlier, 0), "zero accepted");
+    }
 
     #[test]
     fn passthrough_when_no_taps_symbol_spaced() {
