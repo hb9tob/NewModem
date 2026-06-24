@@ -351,16 +351,32 @@ fn rxreal(args: &[String]) {
     .expect("worker");
     let mut w_payload: Option<Vec<u8>> = None;
     let mut w_finalised = 0usize;
-    for chunk in samples.chunks(CHUNK_SAMPLES) {
+    // Diagnostic: override the worker feed chunk size (env RXREAL_CHUNK) to
+    // reproduce a lagging/large-batch live source (RTL-SDR) vs the default
+    // small chunks — exposes any per-chunk under-processing in push_samples.
+    let worker_chunk = std::env::var("RXREAL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(CHUNK_SAMPLES)
+        .max(1);
+    let mut w_files: Vec<usize> = Vec::new();
+    for chunk in samples.chunks(worker_chunk) {
         let out = worker.push_samples(chunk);
         w_finalised += out.bursts_finalised;
         if let Some(df) = out.decoded {
+            w_files.push(df.payload.len());
             w_payload.get_or_insert(df.payload);
         }
     }
     if let Some(df) = worker.finalize().decoded {
+        w_files.push(df.payload.len());
         w_payload.get_or_insert(df.payload);
     }
+    eprintln!(
+        "[worker] finalised_bursts={w_finalised} assembled_files={} sizes={:?}",
+        w_files.len(),
+        w_files,
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 
     // --- Diag path (raw V3Session, σ² / CW tallies) ---
@@ -373,11 +389,19 @@ fn rxreal(args: &[String]) {
     // reference decoder has but is absent here = sync-miss (no marker).
     let mut attempted_data = std::collections::BTreeSet::<u32>::new();
     let (mut max_sigma2, mut sum_sigma2, mut n_sigma2) = (0.0f64, 0.0f64, 0u32);
+    // Per-burst degradation probe baselines (RXREAL_PERBURST).
+    let (mut burst_idx, mut burst_cw_total0, mut burst_cw_conv0) = (0u32, 0u32, 0u32);
+    let (mut burst_sumsig0, mut burst_nsig0) = (0.0f64, 0u32);
     let mut sc_fires = 0u32;
     let mut best_sc_metric = 0.0f64;
     let mut drift_commits: Vec<(f64, f64, bool)> = Vec::new();
     let mut head = 0usize;
-    for chunk in samples.chunks(CHUNK_SAMPLES) {
+    let diag_chunk = std::env::var("RXREAL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(CHUNK_SAMPLES)
+        .max(1);
+    for chunk in samples.chunks(diag_chunk) {
         head += chunk.len();
         // Lend the full capture up to the live head so a coarse-drift commit can
         // replay from the entry preamble across the whole burst (mirrors the
@@ -424,6 +448,30 @@ fn rxreal(args: &[String]) {
                 }
                 V3SessionEvent::AppHeaderRecovered { file_size, t_bytes, .. } => {
                     hdr.get_or_insert((file_size, t_bytes));
+                }
+                V3SessionEvent::SessionFinalised { .. } => {
+                    // Per-burst degradation probe (env RXREAL_PERBURST): print
+                    // this burst's CW tally + mean σ² so we can see whether later
+                    // bursts (post-idle re-acquire) decode worse than the first.
+                    if std::env::var_os("RXREAL_PERBURST").is_some() {
+                        let bt = cw_total - burst_cw_total0;
+                        let bc = cw_conv - burst_cw_conv0;
+                        let bmean = if n_sigma2 > burst_nsig0 {
+                            (sum_sigma2 - burst_sumsig0) / (n_sigma2 - burst_nsig0) as f64
+                        } else {
+                            0.0
+                        };
+                        eprintln!(
+                            "[perburst] burst#{burst_idx} CW={bc}/{bt} meanσ²={bmean:.4} \
+                             maxσ²(run)={max_sigma2:.4} head_sample~{head} (~{}s)",
+                            head / 48000,
+                        );
+                        burst_idx += 1;
+                        burst_cw_total0 = cw_total;
+                        burst_cw_conv0 = cw_conv;
+                        burst_sumsig0 = sum_sigma2;
+                        burst_nsig0 = n_sigma2;
+                    }
                 }
                 V3SessionEvent::RewindRequest { anchor_abs_sample, new_drift_ppm } => {
                     // Étage-B re-commit: replay [anchor .. live head] at the new
