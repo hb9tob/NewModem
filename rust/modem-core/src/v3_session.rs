@@ -450,6 +450,18 @@ pub struct V3Session {
     acq_search_len: usize,
     /// Cached samples-per-symbol for acquisition audio↔symbol math.
     acq_sps: usize,
+    /// Throttle for the always-on acquisition FFT: the next absolute sample
+    /// index at which `try_acquire_preamble` may run `best_match` again. While
+    /// Idle this caps the expensive matched filter to one pass per
+    /// `acq_scan_interval` samples instead of one per delivered audio chunk —
+    /// the dominant idle-CPU cost that made the streaming worker fall behind
+    /// realtime between bursts. The search window (`acq_search_len`) spans far
+    /// more than the interval, so no preamble is missed.
+    next_acq_scan_abs: u64,
+    /// Throttle period (samples) for the above. Capped to `cycle_samples` so a
+    /// preamble landing just after a scan is still fully inside the next
+    /// search window.
+    acq_scan_interval: u64,
     dsp: StreamingDsp,
     ffe: StreamingFfe,
     // ---- Phase 3a: per-cycle CW decode -------------------------------
@@ -712,6 +724,10 @@ impl V3Session {
             acq_mf,
             acq_search_len,
             acq_sps: sps,
+            next_acq_scan_abs: 0,
+            // 100 ms cadence, but never longer than one cycle (so the search
+            // window always overlaps the previous scan by ≥ the preamble).
+            acq_scan_interval: ((AUDIO_RATE as u64) / 10).min(cycle_samples as u64).max(1),
             dsp,
             ffe,
             decoder,
@@ -1362,6 +1378,18 @@ impl V3Session {
         }
         if self.audio_buffer.len() < self.acq_mf.template_len() {
             return;
+        }
+        // Throttle the always-on matched filter to a fixed cadence while
+        // acquiring. Running it on every delivered chunk (10–50 ms) re-scans
+        // the same window dozens of times a second — the idle-CPU cost that
+        // made the streaming worker fall behind realtime between bursts. The
+        // search window spans preamble + a full cycle, so a ≤ 1-cycle interval
+        // can never skip a preamble. `V3_NO_ACQ_THROTTLE` disables it.
+        if std::env::var_os("V3_NO_ACQ_THROTTLE").is_none() {
+            if self.total_samples < self.next_acq_scan_abs {
+                return;
+            }
+            self.next_acq_scan_abs = self.total_samples + self.acq_scan_interval;
         }
         let start_rel = self.audio_buffer.len().saturating_sub(self.acq_search_len);
         let crate::fd_acquire::PreambleMatch { lag, metric, .. } =
@@ -2897,6 +2925,8 @@ impl V3Session {
         self.silence_run = 0;
         self.pending_silence_finalize = false;
         self.eot_watch_remaining = 0;
+        // Allow an immediate acquisition pass after a pipeline reset/replay.
+        self.next_acq_scan_abs = 0;
     }
 
     /// Worker-driven rewind (étage B / C1): re-run the streaming pipeline at
