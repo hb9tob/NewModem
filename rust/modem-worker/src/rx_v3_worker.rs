@@ -37,6 +37,7 @@ use modem_core::v3_session::{V3Session, V3SessionEvent};
 use modem_framing::app_header::AppHeader;
 
 use crate::event_sink::{EventSink, EventSinkExt};
+use crate::rx_worker::emit_decoded_file;
 use crate::session_store::{DecodedFile, SessionStore};
 
 /// Worker-driven end-of-burst: if a Locked session produces no new validated
@@ -114,6 +115,13 @@ pub struct RxV3Worker {
     /// rebuild + history replay runs in `push_samples` once routing of the
     /// triggering batch has unwound. `None` when no switch is pending.
     pending_rebuild: Option<ProfileIndex>,
+    /// Running (sum, count) of per-codeword data σ² per session, so the
+    /// `file_complete` panel can show the mean σ²/SNR like the legacy path
+    /// (`sigma2_data_running` in `rx_worker`). Keyed by session_id.
+    sigma2_running: HashMap<u32, (f64, u64)>,
+    /// Most recent per-codeword σ² seen, surfaced as the instantaneous
+    /// figure on `v2_progress` / `file_complete`.
+    last_sigma2: f64,
 }
 
 /// Replay batch size when re-running the rolling history through a freshly
@@ -153,6 +161,8 @@ impl RxV3Worker {
             history_origin: 0,
             detected_locked: forced,
             pending_rebuild: None,
+            sigma2_running: HashMap::new(),
+            last_sigma2: 0.0,
         })
     }
 
@@ -278,19 +288,48 @@ impl RxV3Worker {
                         mime_type,
                         hash_short,
                     };
+                    // Emit the SAME events the legacy `rx_worker` path does so
+                    // the GUI (progress bar, fountain status, file panel) reacts
+                    // identically — the turbo-only `v3_*` events were wired to
+                    // nothing GUI-side. `session_armed` arms the progress UI;
+                    // `app_header` is the legacy companion the Info tab logs.
+                    let session_dir = self
+                        .store
+                        .root()
+                        .join(format!("{session_id:08x}.session"));
                     self.sink.emit(
-                        "v3_app_header",
+                        "session_armed",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "k": k_symbols as u32,
+                            "t": t_bytes,
+                            "file_size": file_size,
+                            "mime_type": mime_type,
+                            "profile": self.profile.name(),
+                            "session_dir": session_dir.to_string_lossy(),
+                        }),
+                    );
+                    self.sink.emit(
+                        "app_header",
                         serde_json::json!({
                             "session_id": session_id,
                             "file_size": file_size,
-                            "k_symbols": k_symbols,
-                            "t_bytes": t_bytes,
+                            "mime_type": mime_type,
+                            "hash_short": hash_short,
                         }),
                     );
                     // Re-transmission of an already-decoded file: re-announce
                     // it (matches rx_worker's peek_decoded behaviour).
                     if let Some(df) = self.store.peek_decoded(&ah, self.profile) {
-                        self.emit_decoded(&df);
+                        if let Some((sid, path)) = emit_decoded_file(
+                            self.sink.as_ref(),
+                            &self.save_dir,
+                            &df,
+                            self.last_sigma2,
+                            self.session_sigma2_avg(df.session_id),
+                        ) {
+                            self.store.record_saved_path(sid, &path);
+                        }
                     }
                     // Flush codewords that beat the header in.
                     let buffered = std::mem::take(&mut self.pending_cw);
@@ -306,9 +345,18 @@ impl RxV3Worker {
                     is_meta: false,
                     esi,
                     bytes,
+                    sigma2,
                     ..
                 } => {
+                    if sigma2.is_finite() && sigma2 > 0.0 {
+                        self.last_sigma2 = sigma2;
+                    }
                     if let Some(ah) = self.cur_header.clone() {
+                        if sigma2.is_finite() && sigma2 > 0.0 {
+                            let e = self.sigma2_running.entry(ah.session_id).or_insert((0.0, 0));
+                            e.0 += sigma2;
+                            e.1 += 1;
+                        }
                         let mut one = HashMap::with_capacity(1);
                         one.insert(esi, bytes);
                         if let Some(df) = self.accept(&ah, &one) {
@@ -409,36 +457,63 @@ impl RxV3Worker {
         self.route(events)
     }
 
-    /// Push packets into the store, emit a progress event, and surface a
-    /// freshly-decoded file (emitting `file_complete`).
+    /// Mean data σ² accumulated for `session_id` (0 if none yet).
+    fn session_sigma2_avg(&self, session_id: u32) -> f64 {
+        self.sigma2_running
+            .get(&session_id)
+            .map(|&(sum, n)| if n > 0 { sum / n as f64 } else { self.last_sigma2 })
+            .unwrap_or(self.last_sigma2)
+    }
+
+    /// Push packets into the store, emit the GUI progress events, and surface a
+    /// freshly-decoded file. Emits the same `session_progress` / `v2_progress`
+    /// / `session_decoded` / `file_complete` events as the legacy `rx_worker`
+    /// so the GUI behaves identically on the turbo path (the live constellation
+    /// scatter is the one piece still missing — the streaming session does not
+    /// yet surface equalised symbols, so `constellation_sample` is empty).
     fn accept(&mut self, ah: &AppHeader, packets: &HashMap<u32, Vec<u8>>) -> Option<DecodedFile> {
         let res = self.store.accept_packets(ah, self.profile, packets);
         self.sink.emit(
-            "v3_progress",
+            "session_progress",
             serde_json::json!({
                 "session_id": ah.session_id,
-                "have": res.unique_esis,
+                "received": res.unique_esis,
                 "needed": res.needed,
+                "decoded": res.decoded.is_some(),
+                "cap_reached": res.cap_reached,
+            }),
+        );
+        // Cumulative fountain block grid + σ². No constellation/pilot data on
+        // the turbo path yet — empty arrays render as a blank scatter (the GUI
+        // guards every array with `Array.isArray`).
+        self.sink.emit(
+            "v2_progress",
+            serde_json::json!({
+                "blocks_converged": res.unique_esis as usize,
+                "blocks_total": res.needed as usize,
+                "blocks_expected": res.needed as usize,
+                "sigma2": self.last_sigma2,
+                "sigma2_data": self.last_sigma2,
+                "converged_bitmap": res.seen_bitmap,
+                "constellation_sample": Vec::<[f32; 2]>::new(),
+                "pilot_phase_segments": Vec::<f32>::new(),
+                "pilot_phase_is_meta": Vec::<bool>::new(),
             }),
         );
         if let Some(df) = res.decoded {
-            self.emit_decoded(&df);
+            let avg = self.session_sigma2_avg(df.session_id);
+            if let Some((sid, path)) = emit_decoded_file(
+                self.sink.as_ref(),
+                &self.save_dir,
+                &df,
+                self.last_sigma2,
+                avg,
+            ) {
+                self.store.record_saved_path(sid, &path);
+            }
             return Some(df);
         }
         None
-    }
-
-    fn emit_decoded(&self, df: &DecodedFile) {
-        let _ = &self.save_dir; // reserved for envelope-aware extraction (rx_worker parity)
-        self.sink.emit(
-            "file_complete",
-            serde_json::json!({
-                "session_id": df.session_id,
-                "size": df.payload.len(),
-                "decoded_path": df.decoded_path.to_string_lossy(),
-                "mime_type": df.meta.mime_type,
-            }),
-        );
     }
 }
 
@@ -514,10 +589,41 @@ mod tests {
         assert_eq!(df.session_id, session_id);
         assert_eq!(df.payload.len(), payload_size);
         assert_eq!(df.payload, vec![0xAA_u8; payload_size]);
+        // The turbo path must emit the SAME GUI events as the legacy worker —
+        // these were previously the turbo-only `v3_*` events the GUI ignored,
+        // so reception showed nothing and the file panel got an `undefined`
+        // image. Lock that in here.
+        let events = sink.events();
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        for required in ["session_armed", "session_progress", "session_decoded", "file_complete"] {
+            assert!(
+                names.contains(&required),
+                "turbo path did not emit `{required}` (GUI would show nothing); emitted: {names:?}",
+            );
+        }
+        // session_armed must carry the fields the GUI reads (k / file_size).
+        let armed = events
+            .iter()
+            .find(|(n, _)| n == "session_armed")
+            .map(|(_, p)| p)
+            .unwrap();
+        assert_eq!(armed["session_id"].as_u64(), Some(session_id as u64));
+        assert!(armed["k"].as_u64().is_some(), "session_armed missing `k`");
+        // file_complete must carry `saved_path` + `filename` (the GUI renders
+        // the image from these — absence is the `undefined` bug), and the file
+        // must actually exist on disk.
+        let fc = events
+            .iter()
+            .find(|(n, _)| n == "file_complete")
+            .map(|(_, p)| p)
+            .unwrap();
+        let saved = fc["saved_path"].as_str().expect("file_complete missing saved_path");
+        assert!(!saved.is_empty(), "file_complete saved_path empty");
         assert!(
-            sink.events().iter().any(|(n, _)| n == "file_complete"),
-            "no file_complete emitted",
+            std::path::Path::new(saved).exists(),
+            "decoded file not written to disk at {saved}",
         );
+        assert!(fc.get("filename").is_some(), "file_complete missing filename");
     }
 
     #[test]

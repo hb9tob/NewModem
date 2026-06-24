@@ -2483,7 +2483,7 @@ fn scan_and_route(
 /// written and the caller should record it on the session (so the history
 /// references the exact file). Returns `None` when an already-recorded copy
 /// was reused (re-announce) or when nothing was written (error).
-fn emit_decoded_file(
+pub(crate) fn emit_decoded_file(
     sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     df: &session_store::DecodedFile,
