@@ -182,6 +182,12 @@ impl RxV3Worker {
         self.profile
     }
 
+    /// `true` when a burst is locked (≥1 validated marker, not yet finalised)
+    /// — i.e. the modem is actively receiving. Drives the GUI modem-state chip.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// Forward the caller-provided drift hint (ppm) to the session's
     /// streaming resampler. See `V3Session::set_drift_ppm`.
     pub fn set_drift_ppm(&mut self, ppm: f64) {

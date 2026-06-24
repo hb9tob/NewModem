@@ -1037,8 +1037,62 @@ fn run_turbo_worker(
         deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
     let mut total_samples: u64 = 0;
     let mut last_dropped: u64 = 0;
+    // Telemetry to drive the GUI modem-state chip (`modem_state`) and the
+    // realtime-margin chip (`rx_realtime`) on the turbo path, mirroring the
+    // legacy worker (which the GUI already listens to but the turbo path never
+    // emitted, leaving both chips frozen).
+    let started = Instant::now();
+    let mut last_tick = Instant::now();
+    let mut prev_state: Option<(bool, String)> = None;
+    let mut last_push_ms = 0.0f64;
+    let mut max_push_ms = 0.0f64;
 
     while !stop.load(Ordering::Relaxed) {
+        // Modem-state + realtime telemetry. Runs every iteration (≥ every
+        // 200 ms via the recv timeout), so the chips update even while idle.
+        {
+            let now_active = driver.as_ref().map(|d| d.is_active()).unwrap_or(false);
+            let now_profile = driver
+                .as_ref()
+                .map(|d| d.profile().name().to_string())
+                .unwrap_or_else(|| profile.name().to_string());
+            if prev_state.as_ref().map(|(a, p)| (*a, p.as_str()))
+                != Some((now_active, now_profile.as_str()))
+            {
+                let t_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                sink.emit(
+                    "modem_state",
+                    ModemStatePayload {
+                        active: now_active,
+                        profile: now_profile.clone(),
+                        t_ms,
+                    },
+                );
+                prev_state = Some((now_active, now_profile));
+            }
+            if last_tick.elapsed() >= Duration::from_millis(500) {
+                let wall_s = started.elapsed().as_secs_f64();
+                let audio_s = total_samples as f64 / AUDIO_RATE as f64;
+                sink.emit(
+                    "rx_realtime",
+                    RxRealtimePayload {
+                        lag_ms: (wall_s - audio_s) * 1000.0,
+                        last_batch_ms: last_push_ms,
+                        max_batch_ms: max_push_ms,
+                        // Turbo is fully streaming — no accumulating session
+                        // buffer (the lag_ms above is the real margin metric).
+                        session_buf_ms: 0.0,
+                        dropped_samples: dropped_samples.load(Ordering::Relaxed),
+                    },
+                );
+                last_tick = Instant::now();
+                max_push_ms = 0.0;
+            }
+        }
+
         let mut chunk = match samples.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -1107,9 +1161,12 @@ fn run_turbo_worker(
                 // (some SDR backends deliver hundreds of ms at once) — otherwise
                 // a preamble landing inside one big push between two scans is
                 // missed. A no-op for the small chunks a sound card delivers.
+                let t0 = Instant::now();
                 for sub in chunk.chunks(ACQ_PUSH_SPLIT) {
                     d.push_samples(sub);
                 }
+                last_push_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                max_push_ms = max_push_ms.max(last_push_ms);
             }
             None => {
                 // Auto mode, still detecting: accumulate and probe.
