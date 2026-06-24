@@ -1,0 +1,542 @@
+//! End-to-end turbo-RX simulation harness.
+//!
+//! Pipeline (the channel lives between, as a separate process):
+//!
+//! ```text
+//!   turbo_sim tx  burst.wav            # 10 KB random payload → V3 WAV (HIGH+)
+//!   python3 study/nbfm_channel_sim.py burst.wav chan.wav --drift-ppm D --if-noise N
+//!   turbo_sim rx  chan.wav             # WAV → worker turbo, 20 ms chunks → decode
+//! ```
+//!
+//! The payload is a deterministic LCG stream keyed by `--seed`, so the RX
+//! regenerates the expected bytes and reports a byte-exact PASS/FAIL without
+//! any side channel. RX drives `RxV3Worker` (the turbo decode driver, the
+//! same one `run_turbo_worker` owns) one 20 ms (960-sample @ 48 kHz) chunk at
+//! a time — the cpal delivery size — per [[feedback-rx-tests-via-worker-chunks]].
+//!
+//! Usage:
+//!   cargo run --release --example turbo_sim -p modem-worker -- tx <wav> [bytes] [seed] [repair_pct]
+//!   cargo run --release --example turbo_sim -p modem-worker -- rx <wav> [bytes] [seed]
+
+use std::sync::{Arc, Mutex};
+
+use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use modem_core::profile::ProfileIndex;
+use modem_core::types::{AUDIO_RATE, RRC_SPAN_SYM};
+use modem_worker::event_sink::NoopSink;
+use modem_worker::rx_v3_worker::RxV3Worker;
+
+/// 20 ms @ 48 kHz — the cpal delivery size the worker would see live.
+const CHUNK_SAMPLES: usize = (AUDIO_RATE as usize) / 50;
+
+/// Deterministic payload: an LCG byte stream, reproducible from `seed` so TX
+/// and RX agree without a side channel.
+fn gen_payload(n: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        })
+        .collect()
+}
+
+fn write_wav(path: &str, samples: &[f32]) {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: AUDIO_RATE,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut w = WavWriter::create(path, spec).expect("create wav");
+    for &s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .unwrap();
+    }
+    w.finalize().unwrap();
+}
+
+fn read_wav(path: &str) -> Vec<f32> {
+    let mut r = WavReader::open(path).expect("open wav");
+    r.samples::<i16>()
+        .map(|s| s.unwrap() as f32 / 32768.0)
+        .collect()
+}
+
+/// Profile for the synthetic tx/rx bench. HIGH+ by default; override with
+/// env `TURBO_SIM_PROFILE` (e.g. `HIGH++`) — tx and rx must agree.
+fn bench_profile() -> ProfileIndex {
+    std::env::var("TURBO_SIM_PROFILE")
+        .ok()
+        .map(|s| parse_profile_index(&s))
+        .unwrap_or(ProfileIndex::HighPlus)
+}
+
+fn tx(args: &[String]) {
+    let wav = &args[0];
+    let bytes: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0xC0FFEE);
+    let repair_pct: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
+
+    let profile = bench_profile();
+    let cfg = profile.to_config();
+    let payload = gen_payload(bytes, seed);
+    let session_id: u32 = 0x5111_0000 ^ (seed as u32);
+
+    // Mirror `nbfm-modem tx`: K from payload, +repair, rounded to a full
+    // final segment (`effective_packet_count`).
+    let k_bytes = modem_core::ldpc::encoder::LdpcEncoder::new(cfg.ldpc_rate).k() / 8;
+    let k_src =
+        modem_framing::raptorq_codec::k_from_payload(payload.len(), k_bytes) as u32;
+    let n_total =
+        modem_core::frame::effective_packet_count(k_src + (k_src * repair_pct) / 100);
+
+    let symbols = modem_core::frame::build_superframe_v3_range(
+        &payload, &cfg, session_id, modem_framing::app_header::mime::BINARY, 0x1234, 0, n_total,
+    );
+    let (sps, pitch) =
+        modem_core::rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+    let taps = modem_core::rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+    let mut samples = modem_core::modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz);
+    // data ++ 200 ms silence ++ EOT (vox==0 layout, matches V3Modem).
+    let eot = modem_core::frame::build_eot_frame(&cfg, session_id);
+    let mut eot_mod = modem_core::modulator::modulate(&eot, sps, pitch, &taps, cfg.center_freq_hz);
+    samples.extend_from_slice(&modem_core::modulator::silence(0.2));
+    samples.append(&mut eot_mod);
+
+    // Optional drive-level scaling (arg 4, peak). 0 = native level (the
+    // channel sim's TX_HARD_CLIP limiter then sets the effective deviation,
+    // the intended OTA-validated usage). A non-zero value scales to that
+    // peak — useful to sweep the TX drive level.
+    let tx_peak: f32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    if tx_peak > 0.0 {
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs())).max(1e-9);
+        let g = tx_peak / peak;
+        for s in &mut samples {
+            *s *= g;
+        }
+    }
+
+    write_wav(wav, &samples);
+    let secs = samples.len() as f64 / AUDIO_RATE as f64;
+    println!(
+        "TX {}  payload={bytes} B  K={k_src}  n_total={n_total}  \
+         session_id=0x{session_id:08X}  → {wav}  ({:.1}s, {} samples)",
+        profile.name(),
+        secs,
+        samples.len()
+    );
+}
+
+fn rx(args: &[String]) {
+    use modem_core::v3_session::{V3Session, V3SessionEvent};
+    let wav = &args[0];
+    let bytes: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0xC0FFEE);
+    let expected = gen_payload(bytes, seed);
+    let samples = read_wav(wav);
+    // Diagnostic chunk size override (default = the live cpal 20 ms size).
+    // Lets us isolate chunk-size-dependent streaming bugs (TURBO_CHUNK=2400).
+    let diag_chunk: usize = std::env::var("TURBO_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CHUNK_SAMPLES);
+    let n_chunks = samples.len().div_ceil(CHUNK_SAMPLES);
+
+    // --- Primary path: through the worker driver (the "via worker" check) ---
+    let tmp = std::env::temp_dir().join(format!("turbo_sim_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let profile = bench_profile();
+    let mut worker = RxV3Worker::new(
+        profile,
+        /*forced=*/ true,
+        Arc::new(Mutex::new(tmp.clone())),
+        Arc::new(NoopSink),
+    )
+    .expect("worker");
+    let mut w_decoded: Option<Vec<u8>> = None;
+    let mut w_finalised = 0usize;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        let out = worker.push_samples(chunk);
+        w_finalised += out.bursts_finalised;
+        if let Some(df) = out.decoded {
+            w_decoded.get_or_insert(df.payload);
+        }
+    }
+    if let Some(df) = worker.finalize().decoded {
+        w_decoded.get_or_insert(df.payload);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // --- Diagnostic path: raw V3Session, full modem-level tallies ---
+    let cfg = profile.to_config();
+    let mut sess = V3Session::new(cfg, profile.name().to_string());
+    let (mut markers, mut cw_total, mut cw_conv, mut bootstraps) = (0u32, 0u32, 0u32, 0u32);
+    let mut hdr: Option<(u32, u8)> = None; // (file_size, t_bytes)
+    let mut k_needed = 0u16;
+    let mut cw_bytes = std::collections::HashMap::<u32, Vec<u8>>::new();
+    let mut first_lost: Option<String> = None;
+    let mut max_sigma2 = 0.0f64;
+    for chunk in samples.chunks(diag_chunk) {
+        for e in sess.process_audio_chunk(chunk) {
+            match e {
+                V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
+                    markers += 1;
+                    if cycle_idx == 0 {
+                        bootstraps += 1;
+                    }
+                }
+                V3SessionEvent::CwDecoded { converged, is_meta, esi, bytes, sigma2, .. } => {
+                    cw_total += 1;
+                    if sigma2 > max_sigma2 {
+                        max_sigma2 = sigma2;
+                    }
+                    if converged {
+                        cw_conv += 1;
+                        if !is_meta {
+                            cw_bytes.entry(esi).or_insert(bytes);
+                        }
+                    }
+                }
+                V3SessionEvent::AppHeaderRecovered { file_size, t_bytes, k_symbols, .. } => {
+                    hdr.get_or_insert((file_size, t_bytes));
+                    k_needed = k_symbols;
+                }
+                V3SessionEvent::SessionLost { reason } => {
+                    first_lost.get_or_insert(reason);
+                }
+                V3SessionEvent::DriftCommitted { from_ppm, to_ppm, applied, n_observations } => {
+                    println!(
+                        "diag: DriftCommitted from={from_ppm:.2} to={to_ppm:.2} applied={applied} n_obs={n_observations}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let assembled = hdr.and_then(|(fs, t)| {
+        modem_framing::raptorq_codec::try_decode(&cw_bytes, fs, t as u16)
+    });
+
+    println!(
+        "diag: bootstraps={bootstraps} markers={markers} CW={cw_conv}/{cw_total} conv \
+         uniqueDataESI={} K_needed={k_needed} appHdr={} maxσ²={max_sigma2:.4}",
+        cw_bytes.len(),
+        if hdr.is_some() { "Y" } else { "N" },
+    );
+    if let Some(r) = &first_lost {
+        println!("diag: first SessionLost: {r}");
+    }
+    println!(
+        "diag: raw-assemble = {}",
+        match &assembled {
+            Some(p) if *p == expected => format!("PASS ({} B byte-exact)", p.len()),
+            Some(p) => format!("bytes-differ ({} B)", p.len()),
+            None => "none".to_string(),
+        }
+    );
+
+    match w_decoded {
+        Some(p) if p == expected => {
+            let n = p.len();
+            println!("RX  PASS  via worker: {n} B byte-exact  ({n_chunks} chunks of {CHUNK_SAMPLES}, {w_finalised} finalises)");
+        }
+        Some(p) => {
+            println!("RX  FAIL  via worker decoded {} B but bytes differ", p.len());
+            std::process::exit(2);
+        }
+        None => {
+            println!("RX  FAIL  via worker: payload never assembled ({w_finalised} finalises)");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Probe the FFT preamble matched filter against a WAV: report the best
+/// (position, metric) — used to check whether acquisition can lock on the
+/// real (possibly channel-colored) signal before wiring it into V3Session.
+fn probe(args: &[String]) {
+    let wav = &args[0];
+    let cfg = ProfileIndex::HighPlus.to_config();
+    // Known preamble passband template (same as the TX emits).
+    let pre_syms = modem_core::preamble::make_preamble_for_config(&cfg);
+    let (sps, pitch) =
+        modem_core::rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+    let taps = modem_core::rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+    let template = modem_core::modulator::modulate(&pre_syms, sps, pitch, &taps, cfg.center_freq_hz);
+    let samples = read_wav(wav);
+
+    let win = 65_536usize;
+    let step = win - template.len() - 64; // ensure the preamble fits whole in some window
+    let mf = modem_core::fd_acquire::PreambleMatchedFilter::new(&template, win);
+    let (mut best_pos, mut best_m) = (0u64, 0.0f64);
+    let mut start = 0usize;
+    while start < samples.len() {
+        let end = (start + win).min(samples.len());
+        if end - start >= template.len() {
+            if let Some(pm) = mf.best_match(&samples[start..end]) {
+                if pm.metric > best_m {
+                    best_m = pm.metric;
+                    best_pos = (start + pm.lag) as u64;
+                }
+            }
+        }
+        if end == samples.len() {
+            break;
+        }
+        start += step;
+    }
+    println!(
+        "probe {wav}: template={} samples, best metric={best_m:.4} at sample {best_pos} ({:.2}s)",
+        template.len(),
+        best_pos as f64 / AUDIO_RATE as f64,
+    );
+}
+
+fn parse_profile_index(s: &str) -> ProfileIndex {
+    match s.to_uppercase().as_str() {
+        "HIGH++" | "HIGHPLUSPLUS" => ProfileIndex::HighPlusPlus,
+        "HIGH+" | "HIGHPLUS" => ProfileIndex::HighPlus,
+        "HIGH" => ProfileIndex::High,
+        "MEGA" => ProfileIndex::Mega,
+        "NORMAL" => ProfileIndex::Normal,
+        "ROBUST" => ProfileIndex::Robust,
+        "ULTRA" => ProfileIndex::Ultra,
+        other => {
+            eprintln!("unknown profile {other:?}");
+            std::process::exit(64);
+        }
+    }
+}
+
+/// Decode a REAL OTA capture (no known payload, no PASS/FAIL): drive the turbo
+/// worker + a raw V3Session diag pass at the given profile, report sync / CW /
+/// σ² tallies, and write the assembled file out if the burst assembled.
+///   turbo_sim rxreal <wav> [profile=HIGH++]
+fn rxreal(args: &[String]) {
+    use modem_core::v3_session::{V3Session, V3SessionEvent};
+    let wav = &args[0];
+    let profile = args
+        .get(1)
+        .map(|s| parse_profile_index(s))
+        .unwrap_or(ProfileIndex::HighPlusPlus);
+    // The SDR radio chain already de-emphasises before recording, so the WAV
+    // is flat — do NOT re-apply de-emphasis here (would double-correct).
+    let samples = read_wav(wav);
+    let cfg = profile.to_config();
+    println!(
+        "rxreal: {} samples ({:.1}s) profile={}",
+        samples.len(),
+        samples.len() as f64 / AUDIO_RATE as f64,
+        profile.name(),
+    );
+
+    // --- Worker path (the live driver) ---
+    let tmp = std::env::temp_dir().join(format!("turbo_real_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // Default: explicit profile (forced) for parity benches. Set
+    // `V3_TURBO_AUTODETECT=1` to exercise the auto-detect path on a real
+    // capture — the driver then bootstraps from `profile` only as the family
+    // anchor and refines from the marker, mirroring the live GUI auto mode.
+    let forced = std::env::var_os("V3_TURBO_AUTODETECT").is_none();
+    let mut worker = RxV3Worker::new(
+        profile,
+        forced,
+        Arc::new(Mutex::new(tmp.clone())),
+        Arc::new(NoopSink),
+    )
+    .expect("worker");
+    let mut w_payload: Option<Vec<u8>> = None;
+    let mut w_finalised = 0usize;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        let out = worker.push_samples(chunk);
+        w_finalised += out.bursts_finalised;
+        if let Some(df) = out.decoded {
+            w_payload.get_or_insert(df.payload);
+        }
+    }
+    if let Some(df) = worker.finalize().decoded {
+        w_payload.get_or_insert(df.payload);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // --- Diag path (raw V3Session, σ² / CW tallies) ---
+    let mut sess = V3Session::new(cfg, profile.name().to_string());
+    let (mut markers, mut cw_total, mut cw_conv, mut bootstraps) = (0u32, 0u32, 0u32, 0u32);
+    let mut hdr: Option<(u32, u8)> = None;
+    let mut cw_bytes = std::collections::HashMap::<u32, Vec<u8>>::new();
+    // Diag: every DATA ESI a marker validated for (attempted), regardless of
+    // LDPC convergence. `attempted \ converged` = non-convergence; an ESI a
+    // reference decoder has but is absent here = sync-miss (no marker).
+    let mut attempted_data = std::collections::BTreeSet::<u32>::new();
+    let (mut max_sigma2, mut sum_sigma2, mut n_sigma2) = (0.0f64, 0.0f64, 0u32);
+    let mut sc_fires = 0u32;
+    let mut best_sc_metric = 0.0f64;
+    let mut drift_commits: Vec<(f64, f64, bool)> = Vec::new();
+    let mut head = 0usize;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        head += chunk.len();
+        // Lend the full capture up to the live head so a coarse-drift commit can
+        // replay from the entry preamble across the whole burst (mirrors the
+        // worker lending its rolling history).
+        let mut queue: std::collections::VecDeque<V3SessionEvent> =
+            sess.process_audio_chunk_with_history(chunk, &samples[..head], 0).into();
+        while let Some(e) = queue.pop_front() {
+            match e {
+                V3SessionEvent::SofProbeFired { metric, .. } => {
+                    sc_fires += 1;
+                    if metric > best_sc_metric {
+                        best_sc_metric = metric;
+                    }
+                }
+                V3SessionEvent::DriftCommitted { from_ppm, to_ppm, applied, .. } => {
+                    drift_commits.push((from_ppm, to_ppm, applied));
+                }
+                V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
+                    markers += 1;
+                    if cycle_idx == 0 {
+                        bootstraps += 1;
+                    }
+                }
+                V3SessionEvent::CwDecoded {
+                    converged, is_meta, esi, bytes, sigma2, ..
+                } => {
+                    cw_total += 1;
+                    if sigma2 > max_sigma2 {
+                        max_sigma2 = sigma2;
+                    }
+                    if sigma2 > 0.0 {
+                        sum_sigma2 += sigma2;
+                        n_sigma2 += 1;
+                    }
+                    if !is_meta {
+                        attempted_data.insert(esi);
+                    }
+                    if converged {
+                        cw_conv += 1;
+                        if !is_meta {
+                            cw_bytes.entry(esi).or_insert(bytes);
+                        }
+                    }
+                }
+                V3SessionEvent::AppHeaderRecovered { file_size, t_bytes, .. } => {
+                    hdr.get_or_insert((file_size, t_bytes));
+                }
+                V3SessionEvent::RewindRequest { anchor_abs_sample, new_drift_ppm } => {
+                    // Étage-B re-commit: replay [anchor .. live head] at the new
+                    // rate (mirrors the worker, which owns a rolling history;
+                    // here we lend a slice of the in-memory capture). Stale
+                    // post-trigger events in the queue are dropped — the replay
+                    // re-emits the corrected decode; cw_bytes dedups by ESI.
+                    let start = anchor_abs_sample as usize;
+                    if start <= head {
+                        let replay = sess.replay_from_anchor(
+                            &samples[start..head],
+                            anchor_abs_sample,
+                            new_drift_ppm,
+                        );
+                        queue.clear();
+                        queue.extend(replay);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mean_sigma2 = if n_sigma2 > 0 { sum_sigma2 / n_sigma2 as f64 } else { 0.0 };
+    let mer_db = if mean_sigma2 > 0.0 { -10.0 * mean_sigma2.log10() } else { 0.0 };
+    println!(
+        "rxreal diag: SC_fires={sc_fires} (best metric={best_sc_metric:.3}) bootstraps={bootstraps} \
+         markers={markers} CW={cw_conv}/{cw_total} uniqueDataESI={} appHdr={} \
+         meanσ²={mean_sigma2:.4} ({mer_db:.1} dB MER) maxσ²={max_sigma2:.4}",
+        cw_bytes.len(),
+        if hdr.is_some() { "Y" } else { "N" },
+    );
+    println!(
+        "rxreal drift: APPLIED to resampler = {:+.2} ppm (final) | {} coarse commit(s): {:?}",
+        sess.drift_ppm(),
+        drift_commits.len(),
+        drift_commits,
+    );
+    // Diag dump: write the recovered + attempted DATA ESI sets so we can diff
+    // against a reference decoder (V3_DUMP_ESI=<path-prefix>). `<prefix>.conv`
+    // = converged unique ESIs, `<prefix>.att` = ESIs whose marker validated.
+    if let Some(prefix) = std::env::var_os("V3_DUMP_ESI") {
+        let prefix = prefix.to_string_lossy().to_string();
+        let mut conv: Vec<u32> = cw_bytes.keys().copied().collect();
+        conv.sort_unstable();
+        let conv_str = conv.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        std::fs::write(format!("{prefix}.conv"), conv_str).ok();
+        let att_str = attempted_data.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        std::fs::write(format!("{prefix}.att"), att_str).ok();
+        println!(
+            "rxreal dump: {} converged, {} attempted data ESIs -> {prefix}.conv/.att",
+            conv.len(),
+            attempted_data.len(),
+        );
+    }
+
+    match w_payload {
+        Some(p) => {
+            let env = modem_framing::payload_envelope::PayloadEnvelope::decode_or_fallback(&p);
+            if env.version == 0 {
+                let out = "rxreal_out.bin";
+                std::fs::write(out, &p).ok();
+                println!("rxreal: WORKER assembled {} B (no envelope) -> {out}", p.len());
+            } else {
+                let out = format!("rxreal_{}", env.filename);
+                std::fs::write(&out, &env.content).ok();
+                println!(
+                    "rxreal: WORKER assembled OK — from={} file={} {} B -> {out}",
+                    env.callsign,
+                    env.filename,
+                    env.content.len(),
+                );
+            }
+        }
+        None => println!("rxreal: WORKER did not assemble ({w_finalised} finalises)"),
+    }
+}
+
+/// Report data-CWs-per-superframe + suggested whole-SF `repair=0` payload sizes
+/// for a profile, so the SNR sweep emits an integer number of CLOSED superframes.
+///   turbo_sim sfcw <profile>
+fn sfcw(args: &[String]) {
+    let profile = parse_profile_index(&args[0]);
+    let cfg = profile.to_config();
+    let cw_per_sf = modem_core::frame::data_cw_per_superframe(&cfg);
+    let k_bytes = modem_core::ldpc::encoder::LdpcEncoder::new(cfg.ldpc_rate).k() / 8;
+    println!(
+        "profile={} Rs={} cw_per_sf={cw_per_sf} k_bytes={k_bytes}",
+        profile.name(),
+        cfg.symbol_rate,
+    );
+    for m in [2usize, 4, 6] {
+        let n_total = m * cw_per_sf; // = K at repair=0 (must round to PACKET_QUANTUM)
+        let bytes = n_total * k_bytes;
+        println!("  {m} SF -> n_total={n_total} payload_bytes={bytes}");
+    }
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 3 {
+        eprintln!("usage: turbo_sim <tx|rx|rxreal|probe> <wav> [bytes|profile] [seed] [repair_pct(tx)]");
+        std::process::exit(64);
+    }
+    let rest = &argv[2..];
+    match argv[1].as_str() {
+        "tx" => tx(rest),
+        "rx" => rx(rest),
+        "rxreal" => rxreal(rest),
+        "probe" => probe(rest),
+        "sfcw" => sfcw(rest),
+        other => {
+            eprintln!("unknown subcommand {other:?} (expected tx|rx|rxreal|probe|sfcw)");
+            std::process::exit(64);
+        }
+    }
+}

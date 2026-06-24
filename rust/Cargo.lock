@@ -2916,6 +2916,7 @@ dependencies = [
 name = "modem-core"
 version = "0.1.0"
 dependencies = [
+ "modem-core-base",
  "modem-framing",
  "num-complex",
  "realfft",

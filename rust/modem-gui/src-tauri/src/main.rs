@@ -686,6 +686,7 @@ fn build_capture_session(
         forced,
         effective_deemphasis,
         cfg.rx_allow_legacy_grid,
+        cfg.rx_turbo,
         dropped_samples,
     );
     Ok(CaptureSession {
@@ -948,6 +949,7 @@ fn start_capture_from_wav(
         forced,
         cfg.rx_deemphasis_enabled,
         cfg.rx_allow_legacy_grid,
+        cfg.rx_turbo,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     *guard = Some(CaptureSession {

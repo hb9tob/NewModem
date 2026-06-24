@@ -92,6 +92,14 @@ pub struct Settings {
     #[serde(default = "default_rx_allow_legacy_grid")]
     pub rx_allow_legacy_grid: bool,
 
+    /// When true, the RX worker forks to the TURBO path: a single
+    /// stateful, fully-streaming `V3Session` (`rx_v3_worker`) fed the live
+    /// sample stream directly, instead of the legacy sliding-window
+    /// `rx_v2` decode. Off by default while the turbo path is validated
+    /// OTA on `feat/v3-turbo`.
+    #[serde(default)]
+    pub rx_turbo: bool,
+
     /// Audio backend for TX playback + RX capture: `"alsa"` (direct
     /// `hw:` PCM — the Linux/Pi default, bypasses cpal's resampling
     /// `plug` layer) or `"cpal"` (the cross-platform fallback, kept
@@ -404,6 +412,7 @@ impl Default for Settings {
             tx_preemphasis_enabled: false,
             rx_deemphasis_enabled: false,
             rx_allow_legacy_grid: default_rx_allow_legacy_grid(),
+            rx_turbo: false,
             audio_backend: default_audio_backend(),
             collector_url: default_collector_url(),
             tx_quality: default_tx_quality(),

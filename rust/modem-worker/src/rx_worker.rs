@@ -513,23 +513,42 @@ pub fn spawn(
     forced: bool,
     deemphasis_enabled: bool,
     allow_legacy_grid: bool,
+    turbo: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
-        run_worker(
-            samples,
-            sink,
-            save_dir,
-            wav_sink,
-            profile,
-            forced,
-            deemphasis_enabled,
-            allow_legacy_grid,
-            dropped_samples,
-            stop_thread,
-        );
+        // The main worker forks by mode: turbo runs the stateful
+        // fully-streaming V3Session path; legacy runs the sliding-window
+        // rx_v2 path. Both share the same capture-side plumbing
+        // (Receiver, WAV tee, de-emphasis, audio-level telemetry).
+        if turbo {
+            run_turbo_worker(
+                samples,
+                sink,
+                save_dir,
+                wav_sink,
+                profile,
+                forced,
+                deemphasis_enabled,
+                dropped_samples,
+                stop_thread,
+            );
+        } else {
+            run_worker(
+                samples,
+                sink,
+                save_dir,
+                wav_sink,
+                profile,
+                forced,
+                deemphasis_enabled,
+                allow_legacy_grid,
+                dropped_samples,
+                stop_thread,
+            );
+        }
     });
     WorkerHandle {
         stop,
@@ -957,6 +976,185 @@ impl WorkerState {
 // ---------------------------------------------------------------------------
 // Worker main
 // ---------------------------------------------------------------------------
+
+/// Turbo RX worker loop — the streaming fork of the main worker.
+///
+/// Owns a single `RxV3Worker` (stateful `V3Session`) for the whole capture
+/// and pushes the live sample stream straight through it: no
+/// `BATCH_TARGET_SAMPLES` batching, no re-accumulated `session_buffer`, no
+/// `scan_and_route` sliding window. Each `Receiver` delivery is forwarded
+/// verbatim to the session — the only "buffering" is the session's own
+/// bounded rolling buffer, which is O(1) per sample with persistent state
+/// ([[feedback-streaming-only-no-exceptions]]).
+///
+/// End-of-burst within a capture is the session's own job (the inter-frame
+/// silence gate + EOT re-acquisition landed in `V3Session`). Here we only
+/// handle the capture-level lifecycle: a ring-buffer overflow flushes the
+/// session to Idle (brickwall parity), and a stream disconnect finalizes.
+fn run_turbo_worker(
+    samples: Receiver<Vec<f32>>,
+    sink: Arc<dyn EventSink>,
+    save_dir: Arc<Mutex<PathBuf>>,
+    wav_sink: SharedWavSink,
+    profile: ProfileIndex,
+    forced: bool,
+    deemphasis_enabled: bool,
+    dropped_samples: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = std::fs::remove_file(log_path());
+    worker_log(&format!(
+        "[turbo] start V3 profile={profile:?} forced={forced}"
+    ));
+
+    // In forced mode the driver is locked on `profile` from the start. In auto
+    // mode the driver is built LAZILY: we accumulate a warm-up buffer and run
+    // `detect_best_profile_cold` until a preamble's geometry FAMILY is pinned,
+    // then construct the driver at that anchor and replay the warm-up into it.
+    // The driver's own marker-driven refinement then resolves the EXACT profile
+    // (e.g. HIGH vs NORMAL) from the first validated marker's `profile_index`.
+    let mut driver: Option<crate::rx_v3_worker::RxV3Worker> = if forced {
+        match crate::rx_v3_worker::RxV3Worker::new(
+            profile,
+            /*forced=*/ true,
+            save_dir.clone(),
+            sink.clone(),
+        ) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                worker_log(&format!("[turbo] driver init failed: {e}"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    // Warm-up ring used only while detecting (auto mode, driver not yet built).
+    let mut warm: Vec<f32> = Vec::new();
+    let mut samples_since_detect: usize = 0;
+
+    let mut deemph =
+        deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
+    let mut total_samples: u64 = 0;
+    let mut last_dropped: u64 = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut chunk = match samples.recv_timeout(Duration::from_millis(200)) {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Capture-side brickwall parity: a producer-ring overflow leaves a
+        // hole in the stream the matched filter can't bridge. Flush the
+        // session to Idle and request a clean restart, dropping the
+        // corrupted in-flight delivery. While still detecting (no driver yet)
+        // there is no session state to flush — just drop the warm-up buffer.
+        let cur_dropped = dropped_samples.load(Ordering::Relaxed);
+        if cur_dropped > last_dropped {
+            let delta = cur_dropped - last_dropped;
+            last_dropped = cur_dropped;
+            worker_log(&format!(
+                "[turbo] BRICKWALL capture: +{delta} samples dropped → finalize + idle"
+            ));
+            if let Some(d) = driver.as_mut() {
+                let _ = d.finalize();
+            }
+            warm.clear();
+            sink.emit(
+                "worker_requests_restart",
+                WorkerRequestsRestartPayload {
+                    reason: "capture-brickwall",
+                },
+            );
+            continue;
+        }
+
+        // Raw capture tee (if armed) — before de-emphasis so the WAV holds
+        // what the radio actually delivered.
+        if let Ok(mut guard) = wav_sink.lock() {
+            if let Some(ref mut s) = *guard {
+                s.write_chunk(&chunk);
+            }
+        }
+
+        total_samples += chunk.len() as u64;
+        let (peak, rms, crest_db) = compute_audio_stats(&chunk);
+        let overdrive =
+            rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
+        sink.emit(
+            "audio_level",
+            AudioLevelPayload {
+                rms,
+                peak,
+                total_samples,
+                overdrive,
+                crest_db,
+            },
+        );
+
+        // Optional NBFM de-emphasis, AFTER the raw tee + level metric and
+        // BEFORE the modem sees the samples (matches the legacy path).
+        if let Some(f) = deemph.as_mut() {
+            f.process(&mut chunk);
+        }
+
+        match driver.as_mut() {
+            Some(d) => {
+                d.push_samples(&chunk);
+            }
+            None => {
+                // Auto mode, still detecting: accumulate and probe.
+                warm.extend_from_slice(&chunk);
+                if warm.len() > TURBO_WARM_MAX_SAMPLES {
+                    let drop = warm.len() - TURBO_WARM_MAX_SAMPLES;
+                    warm.drain(..drop);
+                }
+                samples_since_detect += chunk.len();
+                if warm.len() >= TURBO_DETECT_MIN_SAMPLES
+                    && samples_since_detect >= TURBO_DETECT_INTERVAL_SAMPLES
+                {
+                    samples_since_detect = 0;
+                    if let Some(fam) = rx_v2::detect_best_profile_cold(&warm) {
+                        worker_log(&format!("[turbo] auto-detected family anchor {fam:?}"));
+                        match crate::rx_v3_worker::RxV3Worker::new(
+                            fam,
+                            /*forced=*/ false,
+                            save_dir.clone(),
+                            sink.clone(),
+                        ) {
+                            Ok(mut d) => {
+                                // Replay the warm-up so no audio is lost; the
+                                // driver refines to the exact profile from the
+                                // first marker inside this push.
+                                d.push_samples(&warm);
+                                warm.clear();
+                                driver = Some(d);
+                            }
+                            Err(e) => worker_log(&format!("[turbo] driver init failed: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(d) = driver.as_mut() {
+        let _ = d.finalize();
+    }
+    worker_log("[turbo] stop");
+}
+
+/// Warm-up ring cap while the turbo worker is auto-detecting the profile
+/// family. 8 s spans ≥1 full `V3_PREAMBLE_PERIOD_S` (~4 s) preamble, so a
+/// burst that starts mid-window is still caught on the next re-insertion.
+const TURBO_WARM_MAX_SAMPLES: usize = 8 * AUDIO_RATE as usize;
+/// Minimum warm-up depth before the first cold detection attempt — enough
+/// audio to hold a preamble for the correlation probe.
+const TURBO_DETECT_MIN_SAMPLES: usize = (AUDIO_RATE as usize) * 3 / 2;
+/// Re-run the cold detection at most this often (in pushed samples) so the
+/// probe (≈7 preamble correlations over the warm-up) stays cheap.
+const TURBO_DETECT_INTERVAL_SAMPLES: usize = AUDIO_RATE as usize / 2;
 
 fn run_worker(
     samples: Receiver<Vec<f32>>,
@@ -1614,6 +1812,20 @@ fn scan_and_route(
         ));
         return;
     };
+
+    // Per-window drift diagnostic: the drift (ppm) this scan's CLOSED windows
+    // actually locked onto (broad ±80 grid in Power mode / Gardner in Light).
+    // One line per scan so a per-SF drift trace can be diffed against the
+    // turbo's single committed value. `cw_map` = unique CWs this window yielded.
+    worker_log(&format!(
+        "[scan-drift] buf={:.1}s drift_ppm={:+.2} cw_map={} conv={}/{} sigma2={:.4}",
+        buf_secs,
+        result.drift_ppm,
+        result.cw_bytes_map.len(),
+        result.converged_blocks,
+        result.total_blocks,
+        result.sigma2,
+    ));
 
     // Refine profile from the Golay-decoded header (disambiguates profiles
     // that share Rs/tau/beta — e.g. HIGH vs NORMAL — by reading their
@@ -2635,6 +2847,7 @@ mod tests {
             false,                 // forced = false → auto-detect
             false,                 // deemphasis disabled
             true,                  // allow_legacy_grid
+            false,                 // turbo = false → legacy sliding-window path
             dropped,
         );
         let burst_secs = samples.len() as f64 / 48_000.0;

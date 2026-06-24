@@ -379,6 +379,18 @@
             <em>Désactivé par défaut sur Raspberry Pi.</em>
           </p>
           <label class="ptt-row" style="margin-top: 0.7rem;">
+            <input type="checkbox" id="rx-turbo-enabled">
+            <span data-i18n="settings.rx_turbo">Réception turbo (expérimental)</span>
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n-html="settings.rx_turbo_hint_html">
+            Décodeur RX entièrement streaming (une seule session V3
+            continue, égaliseur turbo soft FFE + lisseur de phase) à la
+            place de l'algorithme à fenêtre glissante. Auto-détecte le
+            profil émis : laissez « Forcer un profil » décoché. Indépendant
+            du <em>Power Mode</em> ci-dessus. Le fond passe en rouge très
+            foncé quand la réception turbo est active.
+          </p>
+          <label class="ptt-row" style="margin-top: 0.7rem;">
             <input type="checkbox" id="audio-backend-alsa">
             <span data-i18n="settings.audio_backend_alsa">ALSA direct (hw:)</span>
           </label>

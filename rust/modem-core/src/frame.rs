@@ -58,6 +58,42 @@ pub fn effective_packet_count(n_packets: u32) -> u32 {
 /// [`effective_packet_count`] for the rationale.
 pub const PACKET_QUANTUM: usize = 2 * V2_CODEWORDS_PER_SEGMENT;
 
+/// Number of DATA codewords a single full superframe carries for `config`,
+/// replicating [`build_superframe_v3_range`]'s elapsed accounting exactly: an SF
+/// opens with the META segment (marker + warmup + meta CW) then emits data
+/// segments (marker + 2 CWs + pilots) until `V3_PREAMBLE_PERIOD_S` (4 s) of
+/// marker+segment symbols have elapsed. Sizing a `repair=0` burst to a multiple
+/// of this gives a whole number of CLOSED superframes (required for the output —
+/// a partial final SF does not close cleanly).
+pub fn data_cw_per_superframe(config: &ModemConfig) -> usize {
+    let encoder = LdpcEncoder::new(config.ldpc_rate);
+    let cons = make_constellation(config);
+    let bps = cons.bits_per_sym;
+    let syms_per_cw =
+        interleaver::padded_cw_bits(encoder.n(), config.constellation) / bps;
+    let zeros = |n: usize| vec![Complex64::new(0.0, 0.0); n];
+    let meta_seg = marker::MARKER_LEN
+        + preamble::make_lms_warmup_for_config(config).len()
+        + pilot::interleave_data_pilots(&zeros(syms_per_cw), &config.pilot_pattern)
+            .0
+            .len();
+    let data_seg = marker::MARKER_LEN
+        + pilot::interleave_data_pilots(
+            &zeros(V2_CODEWORDS_PER_SEGMENT * syms_per_cw),
+            &config.pilot_pattern,
+        )
+        .0
+        .len();
+    let period = (V3_PREAMBLE_PERIOD_S * config.symbol_rate) as usize;
+    let mut elapsed = meta_seg;
+    let mut cw = 0usize;
+    while elapsed < period {
+        elapsed += data_seg;
+        cw += V2_CODEWORDS_PER_SEGMENT;
+    }
+    cw
+}
+
 /// v3 target period between periodic preamble+header insertions, in seconds.
 /// The builder inserts PRE+HDR+META at the next segment boundary after this
 /// many elapsed seconds since the previous preamble.

@@ -606,6 +606,11 @@ let currentSettings = {
   tx_save_wav: false,
   rx_deemphasis_enabled: false,
   rx_allow_legacy_grid: true,
+  /// When true the RX worker forks to the fully-streaming TURBO decode
+  /// path (`rx_v3_worker`) with profile auto-detection, instead of the
+  /// legacy sliding-window `rx_v2`. Independent of `rx_allow_legacy_grid`
+  /// (Power Mode) and of `rx_force_mode`. Drives the dark-red background.
+  rx_turbo: false,
   audio_backend: "alsa",
   collector_url: "",
   tx_quality: 10,
@@ -1744,6 +1749,9 @@ async function loadSettings() {
   if (deemph) deemph.checked = !!currentSettings.rx_deemphasis_enabled;
   const grid = document.getElementById("rx-allow-legacy-grid");
   if (grid) grid.checked = !!currentSettings.rx_allow_legacy_grid;
+  const turbo = document.getElementById("rx-turbo-enabled");
+  if (turbo) turbo.checked = !!currentSettings.rx_turbo;
+  applyTurboModeStyling();
   const alsaBackend = document.getElementById("audio-backend-alsa");
   if (alsaBackend) alsaBackend.checked = (currentSettings.audio_backend || "alsa") !== "cpal";
   const fdx = document.getElementById("full-duplex-enabled");
@@ -1755,6 +1763,14 @@ async function loadSettings() {
   // and surfaced through `data-sdr-field` inputs — no per-backend
   // load block here.
   applyTxSettingsToUI();
+}
+
+/// Toggle the very-dark-red background that signals the experimental turbo
+/// reception path is selected. Driven purely by the `rx_turbo` setting (NOT
+/// by the Power Mode checkbox, which is a separate, legacy-path knob), so the
+/// operator always has an unmistakable visual cue of which RX decoder is live.
+function applyTurboModeStyling() {
+  document.body.classList.toggle("turbo-mode", !!currentSettings.rx_turbo);
 }
 
 function applyRxForceSettingsToUI() {
@@ -2027,6 +2043,11 @@ async function persistSettings() {
   if (deemph) currentSettings.rx_deemphasis_enabled = !!deemph.checked;
   const grid = document.getElementById("rx-allow-legacy-grid");
   if (grid) currentSettings.rx_allow_legacy_grid = !!grid.checked;
+  const turbo = document.getElementById("rx-turbo-enabled");
+  if (turbo) {
+    currentSettings.rx_turbo = !!turbo.checked;
+    applyTurboModeStyling();
+  }
   const alsaBackend = document.getElementById("audio-backend-alsa");
   if (alsaBackend) currentSettings.audio_backend = alsaBackend.checked ? "alsa" : "cpal";
 

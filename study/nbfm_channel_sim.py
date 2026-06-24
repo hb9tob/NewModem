@@ -106,7 +106,14 @@ def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
     # Instant d'echantillonnage dans le signal d'origine
     t_src = t - cum_shift
     t_src = np.clip(t_src, 0.0, (n - 1) / sr)
-    return np.interp(t_src, t, audio)
+    # Cubic interpolation, NOT linear. Linear np.interp injects broadband
+    # interpolation noise (~ -7 dB MER on the resampled passband) that destroys
+    # high-order 64-APSK decode INDEPENDENTLY of the drift value — a simulator
+    # artifact, not a real clock-drift effect. Cubic keeps the modem passband
+    # (~300-2700 Hz, heavily oversampled at 48 kHz) clean so high-drift decode
+    # is actually testable.
+    from scipy.interpolate import CubicSpline
+    return CubicSpline(t, audio)(t_src)
 
 
 def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
@@ -269,6 +276,8 @@ def main():
                          "0=desactive)")
     ap.add_argument("--audio-noise", type=float, default=AUDIO_NOISE_RMS,
                     help=f"RMS bruit audio post-demod (defaut {AUDIO_NOISE_RMS})")
+    ap.add_argument("--post-lpf", type=float, default=POST_LPF,
+                    help=f"Coupure LPF audio RX (Hz, defaut {POST_LPF}, 0=desactive)")
     args = ap.parse_args()
 
     audio_in, sr = load_wav(args.input_wav)
@@ -278,6 +287,7 @@ def main():
 
     audio_out = simulate(audio_in, if_noise_voltage=args.if_noise,
                          sub_audio_hpf=args.hpf,
+                         post_lpf=args.post_lpf,
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,

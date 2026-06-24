@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>NBFM Modem — Turbo RX (Canon Demodulator): Architecture, Algorithms &amp; Benchmarks</title>
+<style>
+    :root {
+        --bg: #fafafa;
+        --fg: #222;
+        --accent: #2b7fbf;
+        --accent-soft: #eef6ff;
+        --warn: #bf5f2b;
+        --ok: #2b8f5f;
+        --code-bg: #f3f3f3;
+        --border: #ddd;
+    }
+    html, body {
+        margin: 0; padding: 0;
+        background: var(--bg); color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem 6rem; }
+    h1 {
+        font-size: 2rem; border-bottom: 3px solid var(--accent);
+        padding-bottom: 0.4rem; margin-bottom: 0.2rem;
+    }
+    h1 .sub { display: block; font-size: 1rem; font-weight: 400; color: #666; margin-top: 0.4rem; }
+    h2 {
+        color: var(--accent); margin-top: 2.5rem;
+        border-left: 4px solid var(--accent); padding-left: 0.6rem;
+    }
+    h3 { margin-top: 1.8rem; color: #444; }
+    code {
+        background: var(--code-bg); padding: 0.15em 0.35em; border-radius: 3px;
+        font-family: "Consolas", "Monaco", monospace; font-size: 0.92em;
+    }
+    pre {
+        background: #1e1e1e; color: #dcdcaa; padding: 1rem; border-radius: 5px;
+        overflow-x: auto; font-size: 0.85rem; line-height: 1.4;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    .box {
+        background: white; border: 1px solid var(--border); border-radius: 6px;
+        padding: 0.8rem 1.1rem; margin: 1.2rem 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    .note { background: var(--accent-soft); border-left: 4px solid var(--accent); }
+    .warn { background: #fdf3ee; border-left: 4px solid var(--warn); }
+    .ok   { background: #eef9f3; border-left: 4px solid var(--ok); }
+    table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.92rem; }
+    th, td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; }
+    th { background: var(--accent-soft); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .win { color: var(--ok); font-weight: 600; }
+    .bad { color: var(--warn); font-weight: 600; }
+    .mono { font-family: "Consolas","Monaco",monospace; }
+    .toc { font-size: 0.95rem; }
+    .toc a { color: var(--accent); text-decoration: none; }
+    figure { margin: 1.5rem 0; padding: 0.8rem; background: white; border: 1px solid var(--border); border-radius: 6px; }
+    figcaption { font-size: 0.9rem; color: #555; margin-top: 0.6rem; font-style: italic; }
+    .refs { font-size: 0.9rem; color: #444; }
+    .refs li { margin-bottom: 0.3rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Turbo RX — the Canon Demodulator
+  <span class="sub">Streaming, superframe-aware decode for the NBFM image modem · architecture, algorithms &amp; channel-sim benchmarks · 2026-06-23</span>
+</h1>
+
+<div class="box note">
+  <strong>Scope.</strong> This documents the <em>turbo</em> receive path — the streaming,
+  superframe-aware <code>V3Session</code> decoder and its per-segment <em>canon
+  demodulator</em> (<code>reequalise_span_joint</code> + <code>canon_demod_segment</code>) — as
+  opposed to the OTA-validated <code>rx_v2</code> <em>batch</em> decoder (the "legacy" path,
+  the source of truth, left untouched). The turbo path is the development/quality path,
+  gated on at the worker level (<code>turbo = true</code>). Branch <code>feat/v3-turbo</code>.
+</div>
+
+<p class="toc">
+  <strong>Contents:</strong>
+  <a href="#pipeline">1. Pipeline structure</a> ·
+  <a href="#canon">2. The canon demodulator</a> ·
+  <a href="#bootstrap">3. FFE bootstrap &amp; training</a> ·
+  <a href="#robust">4. Robustness layers</a> ·
+  <a href="#results">5. Simulation results</a> ·
+  <a href="#knobs">6. Diagnostics &amp; knobs</a> ·
+  <a href="#open">7. Open items</a> ·
+  <a href="#refs">References</a>
+</p>
+
+<h2 id="pipeline">1. Pipeline structure</h2>
+<p>
+  The turbo RX consumes 48&nbsp;kHz audio in ~20&nbsp;ms chunks and tracks the
+  transmitter's superframe cadence continuously. The transmit frame is V4
+  (<em>headerless</em>): a passband <strong>preamble</strong>, a <strong>bootstrap
+  marker</strong> carrying <code>profile_index</code>, an LMS <strong>warmup</strong>, and a
+  <strong>meta</strong> codeword, followed by <strong>data segments</strong>
+  (<code>marker → 2 codewords + pilots</code>). The whole PRE+marker+warmup+meta block is
+  re-inserted every <code>V3_PREAMBLE_PERIOD_S = 4&nbsp;s</code> as a fresh sliding-window
+  anchor — one <em>superframe</em> (SF).
+</p>
+
+<pre><code>audio 20ms chunks
+  │
+  ├─ FFT matched-filter acquisition (fd_acquire)         passband preamble, sub-sample refine
+  │
+  ├─ StreamingFfe   T/2 fractionally-spaced FFE           LS-trained on preamble (calibrate_delay +
+  │                 + continuous forward DD-LMS (push_raw)  train_ls_ridge); raw_buf for the marker probe
+  │
+  ├─ V3Session FSM  Idle → Acquiring → Locked             marker predict-validate; 4 s SF re-anchor
+  │     │
+  │     └─ canon_demod_segment  ── THE CANON DEMODULATOR ──   SISO-FFE ↔ SISO-LDPC turbo loop
+  │            reequalise_span_joint (in-place joint FBF) → llr_maxlog_per_sym
+  │            → deinterleave → decode_soft (extrinsic) → soft_symbols (E[a],Var) → repeat
+  │
+  └─ session_store  converged data CWs accumulated by ESI → RaptorQ fountain → image</code></pre>
+
+<p>
+  Marker <em>validation</em> decodes the marker (Golay/CRC) from the <strong>equalised</strong>
+  <code>out_buf</code>; this is why the canon demodulator must never let a corrupted segment
+  poison the live equaliser (§2). The batch <code>rx_v2</code> path is structurally different
+  (it owns the whole buffer and re-scans overlapping windows); the turbo path achieves the
+  same coverage by re-equalising the already-buffered superframe.
+</p>
+
+<h2 id="canon">2. The canon demodulator</h2>
+
+<h3>2.1 The problem it solves — the frame mismatch</h3>
+<p>
+  Turbo equalization (Tüchler/Koetter/Singer 2002) exchanges soft information between a
+  SISO equaliser and a SISO decoder. The earlier soft path fed the LDPC's soft symbols
+  <code>E[a]</code> back to the FFE, but those references live in the <strong>post-derotation
+  (constellation) frame</strong>, while the raw FFE output lives in the <strong>pre-derotation
+  (channel) frame</strong>. Adapting FFE taps on <code>e = E[a] − y</code> across that mismatch
+  corrupts the equaliser. The canon demodulator removes the phase/gain <em>inside</em> the
+  feedback loop so the error and the references share a frame.
+</p>
+
+<h3>2.2 One in-place joint FBF</h3>
+<p>
+  <code>StreamingFfe::reequalise_span_joint</code> runs a single
+  <strong>forward-backward-forward (FBF)</strong> NLMS over a segment, adapting the
+  <strong>single live tap set in place</strong> (no clone — the FIR delay line is shared live
+  state). Two cascaded estimators are folded into the loop:
+</p>
+<ul>
+  <li><strong>Coarse per-group gain <code>g_k</code></strong> — a least-squares fit of the
+    <em>known pilots</em> per contiguous pilot run, interpolated across the span (3-point
+    smoothed), mirroring <code>rx_v2::track_segment</code>'s pilot-interpolation.</li>
+  <li><strong>Intra-group residual phase <code>θ_k</code></strong> — a bidirectional two-filter
+    smoother (§2.3).</li>
+</ul>
+<p>
+  The joint derotation is <code>A = (1/g_k)·e<sup>−jθ_k</sup></code>, so
+  <code>y<sub>rot</sub> = A·y</code> is in the constellation frame. Crucially, the FFE tap
+  update targets the <strong>FFE frame</strong> — <code>e_ffe = e_rot / A</code> (equivalently
+  <code>d·g_k·e<sup>jθ_k</sup> − y</code>), a standard NLMS step. The naïve alternative
+  <code>e·conj(A)</code> scales the step by <code>1/|g|²</code> and blows up on a fade; the
+  FFE-frame target stays well-scaled.
+</p>
+
+<h3>2.3 Bidirectional two-filter phase smoother (RTS)</h3>
+<div class="box warn">
+  <strong>Hard-won correctness note.</strong> A first attempt threaded one
+  <code>(θ, ν)</code> 2nd-order DD-PLL state through the three FBF legs. It <em>diverged</em>
+  (σ²≈1) via three coupled bugs: the NCO coast ran <em>outside</em> the confidence gate; the
+  frequency integrator <code>ν</code> was never reset and accumulated across all three legs; and
+  the backward leg flipped the coast sign (<code>−ν</code>) but not the integrator update,
+  giving positive feedback. The fix is the literature-correct object.
+</div>
+<p>
+  The phase is estimated by <strong>two independent reset DD-PLL passes</strong> — a forward
+  pass over the span (→ <code>θ_fwd[k]</code>) and a <em>time-reversed</em> pass (→
+  <code>θ_bwd[k]</code>, with <em>both</em> the NCO coast <em>and</em> the frequency-integrator
+  sign reversed) — averaged to a fixed smoothed <code>θ[k] = ½(θ_fwd + θ_bwd)</code>. Each pass
+  is the OTA-validated <code>DdPll</code> recursion (coast coupled to the gated update,
+  <code>β = α²/4</code> critically damped). No state is threaded across legs, so there is no
+  runaway. This is the forward-backward / two-filter smoother (RTS family). It is
+  <strong>on by default</strong> (<code>V3_NO_TURBO_PLL</code> disables it; with
+  <code>pll_alpha = 0</code> the path is byte-identical to gain-only).
+</p>
+
+<h3>2.4 Que du soft — strong anchors, no hard path</h3>
+<p>
+  The loop adapts on <strong>strong confidence at the known anchors</strong> and only nudges on
+  data:
+</p>
+<ul>
+  <li><strong>Pilots:</strong> weight <code>w = 1</code> (known symbols — strong anchors).</li>
+  <li><strong>Data:</strong> <code>w = |E[a]|² / (|E[a]|² + Var[a])</code> — uncertain symbols
+    barely move the taps or the PLL.</li>
+  <li>On iteration 0 (no a-priori yet) data weight is 0 → only the anchors adapt.</li>
+</ul>
+<p>
+  There is <strong>no hard-decision path</strong>: an uncertain (or QRM/noise) symbol can never
+  pull the equaliser like a known anchor, so a corrupted segment yields <code>E[a]≈0 → w≈0</code>
+  and cannot poison the live taps that drive the marker-validation <code>out_buf</code>. The
+  <code>|e|&lt;|d|</code> gate is retained.
+</p>
+
+<h3>2.5 Per-symbol noise variance σ²(t)</h3>
+<p>
+  A single segment-average pilot σ² assigns the few faded symbols <em>over-confident, wrong</em>
+  LLRs that poison the LDPC. Instead, <code>reequalise_span_joint</code> returns a
+  <strong>per-symbol</strong> σ²(t): the mean pilot residual <code>|out − ref|²</code> per
+  contiguous pilot run, placed at the run centre, 3-point-smoothed and interpolated across the
+  span. The demapper (<code>soft_demod::llr_maxlog_per_sym</code>) scales each symbol's LLR by
+  its local σ², so a faded symbol gets <em>near-erasure</em> LLRs the decoder can outvote rather
+  than confident garbage. This recovered the last deep-fade codeword on the HIGH+ capture
+  (111 → 112). On by default (<code>V3_NO_PERSYM_SIGMA2</code> for A/B). It is the
+  literature-standard per-symbol-reliability LLR weighting.
+</p>
+
+<h3>2.6 The SISO loop</h3>
+<pre><code>canon_demod_segment(seg, n_cw):
+  taps = live FFE taps (adapted in place)
+  for it in 0..max_iter (default 5):
+      refs/weights ← pilots(w=1) + data E[a] (w=reliability; 0 at it 0)
+      (out, σ²(t)) = reequalise_span_joint(seg, refs, weights, is_pilot, …)   # ONE FBF
+      for each codeword:
+          llr  = llr_maxlog_per_sym(cw_syms, constellation, σ²(t))
+          llr  = deinterleave(llr)
+          (bits, extrinsic, converged) = decoder.decode_soft(llr, apriori=None, damp=0.7)
+          lock converged result (best-wins)
+          E[a],Var = soft_symbols_from_posterior_llr(interleave(extrinsic))
+      if all codewords converged: break          # ≥1 full FBF always
+</code></pre>
+<p>
+  The extrinsic LLRs feed the FFE (soft ISI/phase refinement), not yet the demapper as
+  a-priori — i.e. this is the equaliser half of turbo equalization; the demapper-side a-priori
+  loop (BICM-ID) is a documented future lever (§7). <code>retry_failed_segments</code> collapses
+  to a thin re-run of this same loop once the superframe is fully buffered (taps further
+  adapted), replacing the old hard/soft two-path retry.
+</p>
+
+<h2 id="bootstrap">3. FFE bootstrap &amp; training</h2>
+<p>
+  The canon demodulator never bootstraps the FFE from scratch — it inherits trained taps and
+  only refines them. Training happens in three upstream layers:
+</p>
+<ol>
+  <li><strong>LS install on the preamble</strong> (<code>train_lms_at</code>, at entry
+    acquisition and at every 4 s re-anchor): <code>calibrate_delay</code> finds the matched-filter
+    peak delay (ML timing); <code>train_ls_ridge</code> fits the <code>n_taps</code> taps over the
+    256 known preamble symbols + LMS warmup (hugely over-determined).</li>
+  <li><strong>DD-LMS refinement</strong> over the cycle (the pure T/2 LS init is ill-conditioned
+    alone).</li>
+  <li><strong>Continuous forward DD-LMS</strong> in <code>push_raw</code> — adapts the live taps
+    on every emitted symbol's decision, error-gated (<code>|e|&lt;|d|</code>), between anchors.</li>
+</ol>
+
+<h2 id="robust">4. Robustness layers (unchanged from the validated path)</h2>
+<ul>
+  <li><strong>Flywheel coast</strong> — on a missed marker, blind-decode at the predicted
+    position with reconstructed <code>base_esi</code>; a converged CW re-confirms sync. Noise
+    never converges, so it cannot poison. (<code>V3_NO_FLYWHEEL</code> to disable.)</li>
+  <li><strong>Coarse-drift estimate + rewind</strong> — <code>try_apply_coarse_drift</code> /
+    <code>estimate_drift_gardner</code> commit a clock-drift ppm and replay from the entry
+    preamble over the full 30 s history (<code>replay_from_anchor</code>), not the crippled
+    internal buffer.</li>
+  <li><strong>Backward late-entry recovery</strong> — on re-acquisition past a gap, a
+    <code>RewindRequest</code> replays from the remembered SF-boundary preamble and the forward
+    coast re-fills (<code>maybe_backward_recovery</code>).</li>
+</ul>
+<p>The canon demodulator change touched none of these.</p>
+
+<h2 id="results">5. Simulation results</h2>
+
+<h3>5.1 Real-capture, byte-exact (no synthetic channel)</h3>
+<table>
+  <tr><th>Capture / mode</th><th>Emitted data CW</th><th>Turbo recovered</th><th>MER</th><th>Image</th></tr>
+  <tr><td>capture-1781453802 · HIGH++ (64-APSK)</td><td class="num">352</td><td class="num win">352 / 352</td><td class="num">~21 dB</td><td>byte-exact ✓</td></tr>
+  <tr><td>capture-1782158315 · HIGH+ (32-APSK)</td><td class="num">112</td><td class="num win">112 / 112</td><td class="num">~12.5 dB</td><td>byte-exact ✓</td></tr>
+</table>
+<p>
+  Both match the <code>rx_v2</code> batch decoder bit-for-bit and reach batch-level MER — the
+  canon demodulator closes the ~2×σ² equaliser-quality gap of the earlier soft path (which lost
+  HIGH+ at 108/112). The per-symbol σ² (§2.5) recovered the last deep-fade codeword (111 → 112).
+</p>
+
+<h3>5.2 Threshold-SNR comparison — turbo vs legacy (channel simulator)</h3>
+<p>
+  <strong>Methodology.</strong> Per mode, a clean burst of a whole number of <em>closed
+  superframes</em> (computed by <code>frame::data_cw_per_superframe</code>) is generated at
+  <strong>repair = 0</strong> (every codeword counts — RaptorQ disabled), then passed through
+  <code>study/nbfm_channel_sim.py</code> at increasing noise. The metric is <strong>raw data
+  codewords lost</strong> = (emitted <code>n_total</code>) − (unique LDPC-converged data
+  codewords), measured for the turbo canon demod (<code>turbo_sim rxreal</code>) and the legacy
+  <code>rx_v2</code> batch (<code>wav_replay_diag</code>), on the <em>same</em> noisy WAV.
+</p>
+<div class="box warn">
+  <strong>Noise knob.</strong> The sweep uses <code>--audio-noise</code> (post-demodulation AWGN
+  — what the decoder's symbols actually see). The pre-demod <code>--if-noise</code> knob is
+  <em>not</em> the right one here: the FM limiter suppresses IF amplitude noise (NBFM capture
+  effect), so <code>--if-noise</code> up to 0.30 leaves the recovered MER essentially flat and
+  never reaches the decode cliff. Drift is set to 0 to isolate the noise threshold; the channel
+  model (pre/de-emphasis, FM hard-clip, band-limit) stays on.
+</div>
+
+<p>
+  <strong>Turbo noise tolerance (raw CW recovery vs post-demod noise).</strong> Each cell is
+  <em>data CWs recovered / emitted</em>; the cliff is where recovery collapses. Constellation
+  robustness orders exactly as expected — 64-APSK (HIGH++) breaks first, the QPSK low-rate modes
+  (ULTRA/ROBUST) last.
+</p>
+<table>
+  <tr><th>Mode (constellation)</th><th>n_total</th>
+      <th>0.03</th><th>0.05</th><th>0.08</th><th>0.13</th><th>0.22</th><th>0.35</th>
+      <th>Turbo cliff (audio-noise)</th></tr>
+  <tr><td>HIGH++ (64-APSK)</td><td class="num">24</td>
+      <td class="num win">24</td><td class="num win">24</td><td class="num bad">0</td><td class="num bad">0</td><td class="num bad">0</td><td class="num bad">0</td>
+      <td>0.05 → 0.08</td></tr>
+  <tr><td>HIGH+ (32-APSK)</td><td class="num">20</td>
+      <td class="num win">20</td><td class="num win">20</td><td class="num win">20</td><td class="num bad">0</td><td class="num bad">0</td><td class="num bad">0</td>
+      <td>0.08 → 0.13</td></tr>
+  <tr><td>HIGH (16-APSK)</td><td class="num">16</td>
+      <td class="num win">16</td><td class="num win">16</td><td class="num win">16</td><td class="num win">16</td><td class="num bad">0</td><td class="num bad">0</td>
+      <td>0.13 → 0.22</td></tr>
+  <tr><td>NORMAL</td><td class="num">12</td>
+      <td class="num win">12</td><td class="num win">12</td><td class="num win">12</td><td class="num win">12</td><td class="num win">12</td><td class="num">5</td>
+      <td>~0.35</td></tr>
+  <tr><td>ULTRA (QPSK, Rs=500)</td><td class="num">4</td>
+      <td class="num win">4</td><td class="num win">4</td><td class="num win">4</td><td class="num win">4</td><td class="num win">4</td><td class="num">2</td>
+      <td>~0.35</td></tr>
+  <tr><td>ROBUST (QPSK, Rs=1000)</td><td class="num">8</td>
+      <td class="num win">8</td><td class="num win">8</td><td class="num win">8</td><td class="num win">8</td><td class="num win">8</td><td class="num win">8</td>
+      <td>&gt; 0.35 (no loss in range)</td></tr>
+  <tr><td>MEGA (FTN) — <em>set aside</em></td><td class="num">16</td>
+      <td colspan="6" style="color:#888;text-align:center">not characterised — see note</td>
+      <td class="bad">set aside</td></tr>
+</table>
+
+<div class="box ok">
+  <strong>Turbo vs legacy.</strong> On this synthetic channel the two decoders' raw <em>decode
+  thresholds</em> coincide for HIGH / HIGH+ / ULTRA / ROBUST (both decode fully up to the same
+  noise and fail past it) — the turbo path's real advantage is in <em>equaliser quality</em>
+  (batch-level MER) and recovering <em>marginal</em> codewords on real channels, as shown by the
+  byte-exact OTA captures (§5.1, where the per-symbol σ² recovered the last deep-fade CW that the
+  old soft path lost). The legacy batch <em>failed HIGH++ at every noise level through the sim</em>
+  (including clean) whereas the turbo path recovered it cleanly up to 0.05 — to be confirmed (a
+  likely <code>wav_replay_diag</code> grace/gate artifact for the heavy 64-APSK batch decode).
+</div>
+<div class="box warn">
+  <strong>Caveats on the legacy column.</strong> The legacy harness
+  (<code>wav_replay_diag</code>) reports the worker's cumulative <code>blocks_converged</code>,
+  which over-counts (2–3× <code>n_total</code> when it decodes) and reads 0 when it fails — so it
+  yields a <em>binary</em> decode/fail signal, not a graded CW-loss curve. A clean graded
+  turbo-vs-legacy CW-loss comparison needs the harness to count <em>unique converged data ESIs</em>
+  (e.g. via the worker's <code>converged_bitmap</code>). <strong>MEGA</strong> (FTN, already
+  flagged experimental and excluded from auto-detect) is <strong>set aside</strong>: it adds
+  little over HIGH and complicates the turbo path, so it is not characterised here. Its clean
+  byte-exact <code>turbo_sim rx</code> still passes; it is simply out of scope for the turbo
+  effort for now.
+</div>
+<p style="font-size:0.9rem;color:#555">
+  Methodology details: 2 closed superframes per mode, <code>repair=0</code>;
+  <code>nbfm_channel_sim.py --if-noise 0 --drift-ppm 0 --audio-noise N</code>; turbo via
+  <code>turbo_sim rxreal</code> (<code>uniqueDataESI</code>), legacy via <code>wav_replay_diag</code>.
+</p>
+
+<h2 id="knobs">6. Diagnostics &amp; environment knobs</h2>
+<table>
+  <tr><th>Knob</th><th>Effect</th></tr>
+  <tr><td class="mono">V3_NO_TURBO_PLL</td><td>Disable the intra-group DD-PLL smoother (gain-only). A/B.</td></tr>
+  <tr><td class="mono">V3_NO_PERSYM_SIGMA2</td><td>Fall back to one segment-average σ² for the LLR. A/B.</td></tr>
+  <tr><td class="mono">V3_TURBO_SOFT_ITERS</td><td>Max SISO iterations per segment (default 5).</td></tr>
+  <tr><td class="mono">V3_TURBO_SOFT_DAMP</td><td>LDPC extrinsic damping (default 0.7).</td></tr>
+  <tr><td class="mono">V3_LOG_TURBO</td><td>Per-segment log: iterations run, per-CW converged, σ², PLL on/off.</td></tr>
+  <tr><td class="mono">V3_DUMP_ESI</td><td>Dump converged / attempted data-ESI sets (diagnose sync-miss vs LDPC-fail).</td></tr>
+  <tr><td class="mono">turbo_sim sfcw &lt;profile&gt;</td><td>Report data-CWs-per-SF + suggested whole-SF payload sizes.</td></tr>
+  <tr><td class="mono">turbo_sim tx|rx|rxreal</td><td>Synthetic byte-exact (rx) / real-capture diag (rxreal) harness.</td></tr>
+  <tr><td class="mono">wav_replay_diag &lt;wav&gt; [PROFILE]</td><td>Legacy rx_v2 batch on a WAV; reports <code>rx_unique_data_cw</code>. <code>WAV_REPLAY_GRACE_S</code> tunes the tail grace.</td></tr>
+</table>
+
+<h2 id="open">7. Open items</h2>
+<ul>
+  <li><strong>OTA / time-varying validation (review nits):</strong> the in-place live-tap
+    adaptation could couple temporally on a <em>fading</em> channel (A/B vs snapshot-restore on a
+    low-SNR capture); the DD-PLL now runs on APSK whereas <code>track_segment</code> ran it
+    QPSK-only (A/B <code>V3_NO_TURBO_PLL</code>); measure per-segment cost on the Pi 4.</li>
+  <li><strong>Deferred recovery levers (literature-grounded):</strong> for a clean-channel LDPC
+    error-floor / trapping set — Informed Dynamic Scheduling / Residual BP, or BP+OSD (Fossorier);
+    for a frequency-selective fade — a soft-DFE (Lopes–Barry) or MMSE-SISO turbo equalizer
+    (Tüchler); BICM-ID a-priori demapping is labelling-gated (≈0 gain on our Gray / DVB-S2 APSK
+    unless a non-Gray, non-interoperable labelling is adopted).</li>
+  <li><strong>Modem auto-selection</strong> for the turbo path (read <code>profile_index</code>
+    from the bootstrap marker, as <code>rx_v2</code> already does).</li>
+</ul>
+
+<h2 id="refs">References</h2>
+<ol class="refs">
+  <li>M. Tüchler, R. Koetter, A. C. Singer, "Turbo Equalization: Principles and New Results," <em>IEEE Trans. Commun.</em>, 50(5):754–767, 2002.</li>
+  <li>M. Tüchler, A. C. Singer, R. Koetter, "Minimum Mean Squared Error Equalization Using A Priori Information," <em>IEEE Trans. Signal Process.</em>, 50(3):673–683, 2002.</li>
+  <li>X. Li, J. A. Ritcey, "Bit-Interleaved Coded Modulation with Iterative Decoding," <em>IEEE Commun. Lett.</em>, 1(6):169–171, 1997.</li>
+  <li>S. ten Brink, J. Speidel, R. Yan, "Iterative demapping and decoding for multilevel modulation," <em>Proc. IEEE Globecom</em>, 1998.</li>
+  <li>R. R. Lopes, J. R. Barry, "The Soft-Feedback Equalizer for Turbo Equalization of Highly Dispersive Channels," <em>IEEE Trans. Commun.</em>, 54(5):783–788, 2006.</li>
+  <li>M. P. C. Fossorier, S. Lin, "Soft-Decision Decoding of Linear Block Codes Based on Ordered Statistics," <em>IEEE Trans. Inf. Theory</em>, 41(5):1379–1396, 1995.</li>
+  <li>Meyr, Moeneclaey, Fechtel, <em>Digital Communication Receivers</em> (DD-PLL, ch. 8); Rauch–Tung–Striebel / two-filter smoothing.</li>
+</ol>
+
+</div>
+</body>
+</html>

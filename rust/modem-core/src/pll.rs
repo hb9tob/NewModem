@@ -9,6 +9,7 @@
 
 use crate::types::Complex64;
 
+#[derive(Clone)]
 pub struct DdPll {
     pub theta: f64,
     pub nu: f64,

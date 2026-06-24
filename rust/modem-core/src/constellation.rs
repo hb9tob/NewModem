@@ -71,6 +71,38 @@ impl Constellation {
         best
     }
 
+    /// Partition the constellation points into amplitude rings (ascending
+    /// radius). Returns `(sorted_radii, ring_index_per_point)`; ring 0 is the
+    /// innermost. Used by the soft-symbol / per-ring turbo machinery.
+    pub fn rings(&self) -> (Vec<f64>, Vec<usize>) {
+        const TOL: f64 = 1e-6;
+        let mut radii: Vec<f64> = Vec::new();
+        let mut ring_of_point: Vec<usize> = Vec::with_capacity(self.points.len());
+        for &p in &self.points {
+            let r = p.norm();
+            let idx = radii
+                .iter()
+                .position(|&existing| (existing - r).abs() < TOL)
+                .unwrap_or_else(|| {
+                    radii.push(r);
+                    radii.len() - 1
+                });
+            ring_of_point.push(idx);
+        }
+        let mut sort_idx: Vec<usize> = (0..radii.len()).collect();
+        sort_idx.sort_by(|&a, &b| radii[a].partial_cmp(&radii[b]).unwrap());
+        let rank: Vec<usize> = {
+            let mut r = vec![0usize; radii.len()];
+            for (new, &old) in sort_idx.iter().enumerate() {
+                r[old] = new;
+            }
+            r
+        };
+        let sorted_radii: Vec<f64> = sort_idx.iter().map(|&i| radii[i]).collect();
+        let remapped: Vec<usize> = ring_of_point.iter().map(|&r| rank[r]).collect();
+        (sorted_radii, remapped)
+    }
+
     /// Convert symbol indices to bits (MSB first per symbol).
     pub fn symbols_to_bits(&self, indices: &[usize]) -> Vec<u8> {
         let mut bits = Vec::with_capacity(indices.len() * self.bits_per_sym);
