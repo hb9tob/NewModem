@@ -158,6 +158,22 @@ impl StreamingFfe {
         self.current_taps.is_some()
     }
 
+    /// Snapshot the current adaptive tap set (the converged channel estimate).
+    /// `None` until taps are installed. Used by the backward-flywheel late-entry
+    /// recovery to seed an earlier span from a well-trained boundary instead of
+    /// cold — the channel is ~stationary over a few seconds, so the converged
+    /// taps are a good prior for the immediately-preceding superframes.
+    pub fn snapshot_taps(&self) -> Option<Vec<Complex64>> {
+        self.current_taps.clone()
+    }
+
+    /// Install a tap snapshot taken by [`snapshot_taps`] as the live tap set
+    /// (seeds a re-equalisation from a converged boundary). The subsequent
+    /// `push_raw` / `reequalise_span_joint` adapt from this prior.
+    pub fn restore_taps(&mut self, taps: Vec<Complex64>) {
+        self.current_taps = Some(taps);
+    }
+
     /// Energy-weighted centroid of the current taps, in fractional-sample
     /// units (T/`pitch_fse`). Under a clock-drift mismatch the adaptive taps
     /// migrate at the drift rate (Ungerboeck 1976 / Gitlin tap-leakage): the
