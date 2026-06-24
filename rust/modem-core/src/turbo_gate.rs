@@ -310,6 +310,29 @@ mod tests {
     }
 
     #[test]
+    fn auto_gate_detects_robust_geometry() {
+        // ROBUST is a DIFFERENT geometry (sps=48, β=0.25, preamble family B)
+        // than the HIGH family (sps=32, family A). The auto gate must carry a
+        // filter for it and open on a real ROBUST burst.
+        let tx = ProfileIndex::Robust;
+        let mut gate = TurboGate::auto();
+        let burst = build_burst(tx, 4000);
+        let win = gate.search_len().min(burst.len());
+        let open = gate
+            .poll(&burst[..win], 0)
+            .expect("auto gate did not open on a ROBUST preamble");
+        let tx_cfg = tx.to_config();
+        let got_cfg = open.profile.to_config();
+        assert_eq!(
+            (tx_cfg.symbol_rate.to_bits(), tx_cfg.beta.to_bits()),
+            (got_cfg.symbol_rate.to_bits(), got_cfg.beta.to_bits()),
+            "auto gate reported {:?} (different geometry) for a ROBUST burst",
+            open.profile,
+        );
+        assert!(open.metric >= MF_ACQ_THRESHOLD, "metric {} too low", open.metric);
+    }
+
+    #[test]
     fn auto_gate_stays_closed_on_noise() {
         let mut gate = TurboGate::auto();
         let mut s: u64 = 0xDEAD_BEEF;
