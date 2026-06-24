@@ -520,6 +520,64 @@ mod tests {
     }
 
     #[test]
+    fn backward_excursion_restores_live_state_byte_exact() {
+        use std::f64::consts::PI;
+        // The backward-flywheel excursion rewinds the LIVE pipeline to an earlier
+        // input, replays forward back to the head, drains, then continues live.
+        // This must leave the pipeline byte-exact: the symbols produced AFTER the
+        // excursion must match a pipeline that never excursed.
+        let n = 4 * AUDIO_RATE as usize;
+        let audio: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / AUDIO_RATE as f64;
+                (0.3 * (2.0 * PI * 1100.0 * t).sin() + 0.2 * (2.0 * PI * 1450.0 * t).sin()) as f32
+            })
+            .collect();
+        let head = (3 * n / 5) as usize; // live head sample
+        let drift = 3.0; // exercise a non-zero resampler ratio too
+
+        // Reference: straight to head, drain, then continue to the end.
+        let mut r = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        r.feed_audio(&audio[..head], 0, drift);
+        let _ = r.drain_symbols();
+        let head_sym = r.sym_buffer_start_abs;
+        r.feed_audio(&audio, 0, drift);
+        let ref_cont = r.sym_buffer.clone(); // symbols [head_sym ..)
+
+        // Excursion: same up to head + drain, then rewind to mid, replay forward
+        // back to head (= end of the lent history), drain the excursion output,
+        // and continue live exactly as before.
+        let mut e = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        e.feed_audio(&audio[..head], 0, drift);
+        let _ = e.drain_symbols();
+        assert_eq!(e.sym_buffer_start_abs, head_sym, "pre-excursion head moved");
+        let mid_input = (head / 3) as u64;
+        e.rewind_to(mid_input, drift);
+        e.feed_audio(&audio[..head], 0, drift); // replay forward back to the head
+        let _ = e.drain_symbols(); // discard the re-produced earlier symbols
+        assert_eq!(
+            e.sym_buffer_start_abs, head_sym,
+            "excursion did not restore the head symbol cursor",
+        );
+        e.feed_audio(&audio, 0, drift); // continue live
+        let exc_cont = &e.sym_buffer;
+
+        // The continued symbols must match the reference within FP noise.
+        let n_cmp = ref_cont.len().min(exc_cont.len());
+        assert!(n_cmp > 500, "too few continued symbols: {n_cmp}");
+        for k in 0..n_cmp {
+            let d = (ref_cont[k] - exc_cont[k]).norm();
+            assert!(
+                d < 1e-6,
+                "continued symbol {k} (abs {}): ref {:?} != post-excursion {:?} (|Δ|={d})",
+                head_sym as usize + k,
+                ref_cont[k],
+                exc_cont[k],
+            );
+        }
+    }
+
+    #[test]
     fn polyphase_bank_unit_dc_gain_per_phase() {
         let bank = build_polyphase_bank();
         for (i, taps) in bank.iter().enumerate() {

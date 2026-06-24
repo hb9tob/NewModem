@@ -198,6 +198,55 @@ impl StreamingFfe {
         true
     }
 
+    /// Re-equalise `span` symbols at absolute symbol `start_sym_abs` by applying
+    /// the CURRENT taps in place (a static FIR apply — NO adaptation, NO PLL),
+    /// overwriting the matching `out_buf` / `raw_sym_buf` entries. Used right
+    /// after [`prepend_raw`](StreamingFfe::prepend_raw) to populate the
+    /// back-extended region's equalised stream (the prepend leaves it zeroed):
+    /// the backward-flywheel marker probe reads `out_buf`, so the prepended
+    /// symbols must carry their real equalised values for the intact markers to
+    /// resync there. The per-segment data decode still re-equalises with the
+    /// full joint FBF ([`reequalise_span_joint`](StreamingFfe::reequalise_span_joint));
+    /// this only seeds the marker search. Returns `false` if the span or its FIR
+    /// window is not fully inside the retained buffer.
+    pub fn reequalise_range_static(&mut self, start_sym_abs: u64, span: usize) -> bool {
+        let Some(taps) = self.current_taps.as_ref() else {
+            return false;
+        };
+        if span == 0 || start_sym_abs < self.start_abs {
+            return false;
+        }
+        let sof_rel = (start_sym_abs - self.start_abs) as usize;
+        if sof_rel + span > self.out_buf.len() {
+            return false;
+        }
+        let pitch = self.pitch_fse;
+        let n_ff = self.n_taps;
+        let half = n_ff / 2;
+        let mf = self.mf_delay_frac;
+        let frac_len = self.frac_buf.len();
+        for k in 0..span {
+            let on_sym = (sof_rel + k) * pitch;
+            let center = on_sym + mf;
+            // Same boundary gate as `push_raw`: convolve only when the full FIR
+            // window is present, else fall back to the on-symbol pass-through
+            // (the very front of a back-extended region lacks left context).
+            let y = if center >= half && center + (n_ff - half) <= frac_len {
+                let lo = center - half;
+                let mut acc = Complex64::new(0.0, 0.0);
+                for (t, &tap) in taps.iter().enumerate() {
+                    acc += tap * self.frac_buf[lo + t];
+                }
+                acc
+            } else {
+                self.frac_buf[on_sym]
+            };
+            self.out_buf[sof_rel + k] = y;
+            self.raw_sym_buf[sof_rel + k] = self.frac_buf[on_sym];
+        }
+        true
+    }
+
     /// Energy-weighted centroid of the current taps, in fractional-sample
     /// units (T/`pitch_fse`). Under a clock-drift mismatch the adaptive taps
     /// migrate at the drift rate (Ungerboeck 1976 / Gitlin tap-leakage): the
