@@ -25,6 +25,10 @@ pub(crate) struct SdrplayRadioHw {
     rx_chan: *mut sdrplay_api_RxChannelParamsT,
     tuner: sdrplay_api_TunerSelectT,
     lib: &'static SdrplayApi,
+    /// Highest valid `LNAstate` index for this device model. The live gain
+    /// setpoint is clamped to it before every `Update`, so a value past the
+    /// GUI input's `max` can never reach the daemon and crash the service.
+    max_lna_state: u8,
 }
 
 // SAFETY: same contract as `SdrplaySession` (device.rs) — the device
@@ -50,6 +54,7 @@ impl SdrplayRadioHw {
             rx_chan,
             tuner: session.device.tuner,
             lib,
+            max_lna_state: session.hardware.lna_state_count().saturating_sub(1),
         }
     }
 
@@ -93,11 +98,14 @@ impl RadioHardware for SdrplayRadioHw {
             return;
         }
         // SAFETY: `rx_chan` is the daemon-owned active channel params.
+        let max_lna = self.max_lna_state;
         let g = unsafe { &mut (*self.rx_chan).tunerParams.gain };
         match gain {
             GainSetting::Manual(ManualGainValue::LnaPlusIf { lna_state, if_grdb }) => {
                 g.gRdB = *if_grdb;
-                g.LNAstate = *lna_state;
+                // Clamp — an out-of-range index aborts the daemon (the GUI
+                // input's `max` does not stop a typed value).
+                g.LNAstate = (*lna_state).min(max_lna);
             }
             GainSetting::Manual(ManualGainValue::Db { db }) => {
                 // The generic Radio-tab slider hands a single dB value; map
@@ -108,7 +116,7 @@ impl RadioHardware for SdrplayRadioHw {
             GainSetting::AgcMode {
                 lna_state: Some(s), ..
             } => {
-                g.LNAstate = *s;
+                g.LNAstate = (*s).min(max_lna);
             }
             _ => return,
         }

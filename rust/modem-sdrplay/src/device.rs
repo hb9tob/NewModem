@@ -100,6 +100,22 @@ impl SdrplayHardware {
     pub fn has_antenna_selector(&self) -> bool {
         matches!(self, Self::RspDuo | Self::RspDx | Self::RspDxR2 | Self::Rsp2)
     }
+
+    /// Number of LNA-state indices the device's gain table exposes — valid
+    /// `LNAstate` is `0 ..= lna_state_count()-1`. Mirrors the per-model
+    /// `lna_states` the backend advertises (`backend::sdrplay_capabilities*`).
+    /// Used to CLAMP the operator's LNA setpoint before it reaches
+    /// `sdrplay_api_Update`: the daemon aborts the whole SDR service on an
+    /// out-of-range `LNAstate`, so an unclamped value (e.g. a number typed
+    /// past the GUI input's `max`) takes the running session down.
+    pub fn lna_state_count(&self) -> u8 {
+        match self {
+            // RSP1's slim VHF gain table is only 4 states (0-3).
+            Self::Rsp1 => 4,
+            // RSP1A/B, RSP2, RSPduo, RSPdx(-R2): 10-state table (0-9).
+            _ => 10,
+        }
+    }
 }
 
 /// Tuner half of an RSPduo. Single-tuner mode is enough for our 2 m
@@ -595,7 +611,10 @@ fn program_params(
         tuner_params.rfFreq.rfHz =
             (config.rf_freq_hz as i64 + DEFAULT_LO_OFFSET_HZ as i64) as f64;
         tuner_params.gain.gRdB = config.if_gain_reduction_db;
-        tuner_params.gain.LNAstate = config.lna_state;
+        // Clamp to the device's LNA table — an out-of-range index makes the
+        // daemon abort the service (see `lna_state_count`).
+        tuner_params.gain.LNAstate =
+            config.lna_state.min(hardware.lna_state_count().saturating_sub(1));
         tuner_params.bwType = sdrplay_api_Bw_MHzT::sdrplay_api_BW_1_536;
         tuner_params.ifType = sdrplay_api_If_kHzT::sdrplay_api_IF_Zero;
 

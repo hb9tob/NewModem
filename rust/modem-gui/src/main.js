@@ -1570,8 +1570,17 @@ function applySdrFieldUpdate(cfg, field, transform, el) {
       break;
     }
     case "manual_lna": {
-      const v = parseInt(el.value, 10);
+      let v = parseInt(el.value, 10);
       if (!Number.isFinite(v)) break;
+      // Clamp to the input's advertised range and write it back. The HTML
+      // `max` attribute does NOT stop a typed value, and an out-of-range
+      // LNA-state index crashes the SDRplay daemon (taking the SDR service
+      // down), so we never let one through.
+      const lnaLo = parseInt(el.min, 10);
+      const lnaHi = parseInt(el.max, 10);
+      if (Number.isFinite(lnaLo)) v = Math.max(lnaLo, v);
+      if (Number.isFinite(lnaHi)) v = Math.min(lnaHi, v);
+      el.value = String(v);
       // When AGC is engaged AND the mode keeps LNA operator-controlled
       // (SDRplay AGC), update the agc_mode variant's lna_state overlay
       // in place — don't switch back to a `manual` payload, that would
