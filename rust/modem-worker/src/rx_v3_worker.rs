@@ -116,6 +116,12 @@ pub struct RxV3Worker {
     /// rebuild + history replay runs in `push_samples` once routing of the
     /// triggering batch has unwound. `None` when no switch is pending.
     pending_rebuild: Option<ProfileIndex>,
+    /// Deferred full session restart requested from inside `route()` on a burst
+    /// boundary (`SessionFinalised` / `EotSeen`). Applied in `push_samples` after
+    /// routing unwinds: rebuilds the `V3Session` fresh and clears the history
+    /// ring so the NEXT burst starts from a neutral pipeline (no inherited
+    /// drift_ppm / FFE taps / phase state). `false` when none pending.
+    restart_pending: bool,
     /// Running (sum, count) of per-codeword data σ² per session, so the
     /// `file_complete` panel can show the mean σ²/SNR like the legacy path
     /// (`sigma2_data_running` in `rx_worker`). Keyed by session_id.
@@ -195,6 +201,7 @@ impl RxV3Worker {
             history_origin: 0,
             detected_locked: forced,
             pending_rebuild: None,
+            restart_pending: false,
             sigma2_running: HashMap::new(),
             last_sigma2: 0.0,
             last_constellation: Vec::new(),
@@ -242,41 +249,78 @@ impl RxV3Worker {
             self.history.drain(..drop);
             self.history_origin += drop as u64;
         }
-        if !self.gated {
-            return self.push_continuous(samples);
+        let outcome = if !self.gated {
+            self.push_continuous(samples)
+        } else {
+            // Gated turbo: park the DSP while Searching; only the raw-audio gate
+            // runs over the ring. On a gate-open seek the DSP to the preamble and
+            // switch to Receiving; feed the DSP live until the burst ends.
+            match self.turbo_state {
+                TurboState::Searching => {
+                    let head = self.history_origin + self.history.len() as u64;
+                    let open = {
+                        let ring = self.history.make_contiguous();
+                        self.gate.poll(ring, self.history_origin)
+                    };
+                    match open {
+                        Some(open) => self.enter_receiving(open, head),
+                        None => PushOutcome::default(),
+                    }
+                }
+                TurboState::Receiving => {
+                    let head = self.history_origin + self.history.len() as u64;
+                    let outcome = self.push_continuous(samples);
+                    if self.active {
+                        self.receiving_locked = true;
+                    }
+                    // Burst end (was locked, now Idle) OR false-positive open
+                    // (never locked within the grace window) → park the DSP,
+                    // re-arm the gate to find the next entry from the live head.
+                    let burst_ended = self.receiving_locked && !self.active;
+                    let false_positive =
+                        !self.receiving_locked && head >= self.receiving_deadline;
+                    if burst_ended || false_positive {
+                        self.exit_receiving(head);
+                    }
+                    outcome
+                }
+            }
+        };
+        // Apply a deferred burst-boundary stop/start (set in `route()`), now that
+        // this push's routing has fully unwound. Rebuilds the session + clears
+        // the ring so the next burst bootstraps a neutral pipeline.
+        if self.restart_pending {
+            self.restart_pending = false;
+            self.restart_session_fresh();
         }
-        // Gated turbo: park the DSP while Searching; only the raw-audio gate
-        // runs over the ring. On a gate-open seek the DSP to the preamble and
-        // switch to Receiving; feed the DSP live until the burst ends.
-        match self.turbo_state {
-            TurboState::Searching => {
-                let head = self.history_origin + self.history.len() as u64;
-                let open = {
-                    let ring = self.history.make_contiguous();
-                    self.gate.poll(ring, self.history_origin)
-                };
-                match open {
-                    Some(open) => self.enter_receiving(open, head),
-                    None => PushOutcome::default(),
-                }
-            }
-            TurboState::Receiving => {
-                let head = self.history_origin + self.history.len() as u64;
-                let outcome = self.push_continuous(samples);
-                if self.active {
-                    self.receiving_locked = true;
-                }
-                // Burst end (was locked, now Idle) OR false-positive open (never
-                // locked within the grace window) → park the DSP, re-arm the
-                // gate to find the next entry from the live head.
-                let burst_ended = self.receiving_locked && !self.active;
-                let false_positive =
-                    !self.receiving_locked && head >= self.receiving_deadline;
-                if burst_ended || false_positive {
-                    self.exit_receiving(head);
-                }
-                outcome
-            }
+        outcome
+    }
+
+    /// Full stop/start of the streaming session at a burst boundary. `finalize()`
+    /// only returns the FSM to Idle; the DSP resampler (its committed `drift_ppm`
+    /// rate), the FFE taps, and the phase estimator all persist. Without a clean
+    /// rebuild the NEXT burst inherits the previous burst's clock-drift rate —
+    /// fatal for a short burst from a different TX that ends before it can
+    /// re-estimate and commit its own drift (it then resamples at the wrong rate
+    /// → σ² ~ 9 garbage). This mirrors a manual stop/start, which decodes every
+    /// burst reliably. The disk `store` keeps all already-accepted packets, so
+    /// dropping the in-memory ring + session loses nothing decoded so far.
+    fn restart_session_fresh(&mut self) {
+        self.session = V3Session::new(self.profile.to_config(), self.profile.name().to_string());
+        self.cur_header = None;
+        self.pending_cw.clear();
+        self.active = false;
+        self.samples_since_progress = 0;
+        // Reset the central ring + frame so the rebuilt session's absolute-sample
+        // frame (which restarts at 0) stays consistent with `history_origin`
+        // (same invariant `rebuild_at` relies on).
+        self.history.clear();
+        self.history_origin = 0;
+        if self.gated {
+            self.turbo_state = TurboState::Searching;
+            self.receiving_locked = false;
+            self.receiving_deadline = 0;
+            self.gate.reset_to(0);
         }
     }
 
@@ -543,6 +587,16 @@ impl RxV3Worker {
                     self.pending_cw.clear();
                     self.active = false;
                     self.samples_since_progress = 0;
+                    // Full stop/start before the next burst: `finalize()` returns
+                    // the session to Idle but leaves the streaming pipeline (DSP
+                    // resampler rate / committed drift_ppm, FFE taps, phase
+                    // estimator) intact. The next burst — often a different TX
+                    // with a different clock drift — then inherits the previous
+                    // burst's rate; a short one that ends before it can
+                    // re-estimate + commit its own drift decodes as garbage
+                    // (σ² ~ 9). Defer the rebuild to `push_samples` (we are
+                    // mid-iteration over this batch here).
+                    self.restart_pending = true;
                 }
                 V3SessionEvent::RewindRequest {
                     anchor_abs_sample,

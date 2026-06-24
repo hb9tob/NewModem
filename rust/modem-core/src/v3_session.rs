@@ -1133,7 +1133,14 @@ impl V3Session {
         self.cycles_validated = 0;
         self.cws_converged = 0;
         // Phase 4: the recycled session must re-bootstrap its own drift
-        // estimate against the next burst.
+        // estimate against the next burst. CRITICAL: also clear the committed
+        // `drift_ppm` itself — otherwise the streaming DSP keeps resampling the
+        // NEXT burst at the PREVIOUS burst's rate (a different TX → different
+        // drift), and a short burst that ends before it can re-estimate +
+        // commit its own drift decodes as garbage (σ² ~ 9). The first burst
+        // after startup works because drift_ppm starts at 0; later bursts
+        // inherited the stale rate. (Root cause of the "1st OK, rest degrade".)
+        self.drift_ppm = 0.0;
         self.drift_locked = false;
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
