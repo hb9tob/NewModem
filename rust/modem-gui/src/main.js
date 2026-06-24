@@ -2159,6 +2159,22 @@ function setupSettingsTab() {
   if (saveWav) saveWav.addEventListener("change", persistSettings);
   const deemph = document.getElementById("rx-deemphasis-enabled");
   if (deemph) deemph.addEventListener("change", persistSettings);
+  // RX power-mode (legacy grid), turbo reception and audio backend had no
+  // change listener, so toggling them did nothing until some OTHER control
+  // happened to trigger persistSettings. Wire each so it saves immediately;
+  // turbo also re-applies the dark-red theme on the spot.
+  const gridCb = document.getElementById("rx-allow-legacy-grid");
+  if (gridCb) gridCb.addEventListener("change", persistSettings);
+  const turboCb = document.getElementById("rx-turbo-enabled");
+  if (turboCb) {
+    turboCb.addEventListener("change", () => {
+      currentSettings.rx_turbo = turboCb.checked;
+      applyTurboModeStyling();
+      persistSettings();
+    });
+  }
+  const alsaCb = document.getElementById("audio-backend-alsa");
+  if (alsaCb) alsaCb.addEventListener("change", persistSettings);
   const stopRxBtn = document.getElementById("settings-stop-rx-btn");
   if (stopRxBtn) {
     stopRxBtn.addEventListener("click", async () => {

@@ -6,11 +6,18 @@ body {
   background: #1e1e1e;
   color: #e0e0e0;
 }
-/* Experimental turbo reception path selected: very dark red background as an
+/* Experimental turbo reception path selected: dark red theme as an
    unmistakable visual cue (toggled from the rx_turbo setting in main.js).
-   Distinct from the Power Mode checkbox, which does NOT change the theme. */
+   Distinct from the Power Mode checkbox, which does NOT change the theme.
+   The plain body background is mostly covered by panels, so we also tint the
+   always-visible top-bar + tab-bar — otherwise the cue is imperceptible. */
 body.turbo-mode {
-  background: #1c0606;
+  background: #2a0808;
+}
+body.turbo-mode .top-bar,
+body.turbo-mode .tab-bar {
+  background: #3a0d0d;
+  border-bottom-color: #5a1a1a;
 }
 .top-bar {
   display: flex;
