@@ -222,6 +222,54 @@ impl StreamingDsp {
         snap
     }
 
+    /// Rewind the pipeline's READ POSITION to absolute input sample `abs_input`
+    /// so the next `feed_audio` re-produces the stream FROM there — WITHOUT
+    /// rebuilding the planner / NCO / MF taps (those are kept). Used by the
+    /// backward-flywheel late-entry recovery to re-process an earlier region of
+    /// the SAME rolling buffer in place, carrying the (separately-seeded) FFE
+    /// taps. This is a cursor move + intermediate-buffer clear, NOT a reset.
+    ///
+    /// CONTINUITY CONTRACT: the resampler and matched-filter delay lines are
+    /// cleared, so the caller MUST present `audio_buffer` starting at least
+    /// `warmup_samples()` BEFORE `abs_input` (no skipped samples) and discard
+    /// the symbols produced in that warmup span — otherwise the first symbols
+    /// are convolved against zero state. The NCO phase is reconstructed exactly
+    /// from the absolute index, so the downmix stays phase-continuous.
+    pub fn rewind_to(&mut self, abs_input: u64, drift_ppm: f64) {
+        let ratio = 1.0 + drift_ppm * 1e-6;
+        // Output (resampled) index whose input maps to `abs_input`.
+        let out_idx = ((abs_input as f64) / ratio).floor() as u64;
+        self.resampler_next_tx = out_idx;
+        self.resampled_start_abs = out_idx;
+        self.resampled.clear();
+        self.downmix_next_abs = out_idx;
+        self.baseband_start_abs = out_idx;
+        self.baseband.clear();
+        self.mf_output_start_abs = out_idx;
+        self.mf_output.clear();
+        for s in self.mf_state.iter_mut() {
+            *s = Complex64::new(0.0, 0.0);
+        }
+        // Decimation cursor lands on the next ON-SYMBOL grid point >= out_idx
+        // (a multiple of sps = d_fse·pitch_fse in the output domain), so the
+        // produced fse stream begins on a symbol boundary and the downstream
+        // FFE's on-symbol invariant (frac_buf[0] is on-symbol) holds after its
+        // matching rewind.
+        let g = self.sps as u64;
+        let dec = out_idx.div_ceil(g) * g;
+        self.decimation_cursor_abs = dec;
+        self.sym_buffer.clear();
+        self.sym_buffer_start_abs = dec / self.d_fse as u64;
+    }
+
+    /// Audio samples of delay-line context the resampler + matched filter need
+    /// re-primed after a [`rewind_to`] before their output is valid. The caller
+    /// feeds from `abs_input - warmup_samples()` and discards that span.
+    pub fn warmup_samples(&self) -> usize {
+        // Resampler half-window + full MF tap span, with margin.
+        N_TAPS + self.mf_taps.len()
+    }
+
     /// Drive the pipeline forward against the current contents of
     /// `audio_buffer`. The buffer holds RX-time audio samples; its
     /// first sample is at absolute index `audio_drained_samples`.
@@ -422,6 +470,112 @@ mod tests {
     const TEST_TAU: f64 = 1.0;
     const TEST_BETA: f64 = 0.20;
     const TEST_FC: f64 = 1100.0;
+
+    #[test]
+    fn rewind_to_reproduces_symbols_byte_exact() {
+        use std::f64::consts::PI;
+        // Deterministic two-tone audio, a few seconds long.
+        let n = 3 * AUDIO_RATE as usize;
+        let audio: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / AUDIO_RATE as f64;
+                (0.3 * (2.0 * PI * 1100.0 * t).sin() + 0.2 * (2.0 * PI * 1450.0 * t).sin()) as f32
+            })
+            .collect();
+
+        // Reference: one straight forward pass.
+        let mut a = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        a.feed_audio(&audio, 0, 0.0);
+        let ref_syms = a.sym_buffer.clone(); // indexed by absolute symbol index
+
+        // Rewind a fresh pipeline to a mid-stream input sample and re-process
+        // the SAME buffer from there — must reproduce the identical symbols
+        // (after the MF/resampler delay lines re-prime), proving continuity.
+        let mut b = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        let a_input = (n / 2) as u64;
+        b.rewind_to(a_input, 0.0);
+        b.feed_audio(&audio, 0, 0.0);
+        let a_sym = b.sym_buffer_start_abs;
+        let re = &b.sym_buffer;
+
+        // Skip the delay-line re-prime margin, then compare to the reference at
+        // the SAME absolute symbol indices.
+        let margin = 2 * b.mf_taps.len() / b.d_fse + 8;
+        let mut compared = 0usize;
+        for k in margin..re.len() {
+            let abs = (a_sym as usize) + k;
+            if abs >= ref_syms.len() {
+                break;
+            }
+            let d = (ref_syms[abs] - re[k]).norm();
+            assert!(
+                d < 1e-6,
+                "symbol {abs}: forward {:?} != rewound {:?} (|Δ|={d})",
+                ref_syms[abs],
+                re[k],
+            );
+            compared += 1;
+        }
+        assert!(compared > 500, "too few symbols compared: {compared}");
+    }
+
+    #[test]
+    fn backward_excursion_restores_live_state_byte_exact() {
+        use std::f64::consts::PI;
+        // The backward-flywheel excursion rewinds the LIVE pipeline to an earlier
+        // input, replays forward back to the head, drains, then continues live.
+        // This must leave the pipeline byte-exact: the symbols produced AFTER the
+        // excursion must match a pipeline that never excursed.
+        let n = 4 * AUDIO_RATE as usize;
+        let audio: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / AUDIO_RATE as f64;
+                (0.3 * (2.0 * PI * 1100.0 * t).sin() + 0.2 * (2.0 * PI * 1450.0 * t).sin()) as f32
+            })
+            .collect();
+        let head = (3 * n / 5) as usize; // live head sample
+        let drift = 3.0; // exercise a non-zero resampler ratio too
+
+        // Reference: straight to head, drain, then continue to the end.
+        let mut r = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        r.feed_audio(&audio[..head], 0, drift);
+        let _ = r.drain_symbols();
+        let head_sym = r.sym_buffer_start_abs;
+        r.feed_audio(&audio, 0, drift);
+        let ref_cont = r.sym_buffer.clone(); // symbols [head_sym ..)
+
+        // Excursion: same up to head + drain, then rewind to mid, replay forward
+        // back to head (= end of the lent history), drain the excursion output,
+        // and continue live exactly as before.
+        let mut e = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        e.feed_audio(&audio[..head], 0, drift);
+        let _ = e.drain_symbols();
+        assert_eq!(e.sym_buffer_start_abs, head_sym, "pre-excursion head moved");
+        let mid_input = (head / 3) as u64;
+        e.rewind_to(mid_input, drift);
+        e.feed_audio(&audio[..head], 0, drift); // replay forward back to the head
+        let _ = e.drain_symbols(); // discard the re-produced earlier symbols
+        assert_eq!(
+            e.sym_buffer_start_abs, head_sym,
+            "excursion did not restore the head symbol cursor",
+        );
+        e.feed_audio(&audio, 0, drift); // continue live
+        let exc_cont = &e.sym_buffer;
+
+        // The continued symbols must match the reference within FP noise.
+        let n_cmp = ref_cont.len().min(exc_cont.len());
+        assert!(n_cmp > 500, "too few continued symbols: {n_cmp}");
+        for k in 0..n_cmp {
+            let d = (ref_cont[k] - exc_cont[k]).norm();
+            assert!(
+                d < 1e-6,
+                "continued symbol {k} (abs {}): ref {:?} != post-excursion {:?} (|Δ|={d})",
+                head_sym as usize + k,
+                ref_cont[k],
+                exc_cont[k],
+            );
+        }
+    }
 
     #[test]
     fn polyphase_bank_unit_dc_gain_per_phase() {

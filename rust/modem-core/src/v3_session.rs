@@ -65,10 +65,7 @@ use modem_framing::app_header::{decode_meta_payload, AppHeader};
 /// landing.
 pub const SC_THRESHOLD: f64 = 0.5;
 
-/// Matched-filter acquisition metric floor (`fd_acquire`). The Golay+CRC
-/// marker validation at the implied position is the hard false-positive gate,
-/// so this only needs to reject windows with no preamble-like correlation.
-const MF_ACQ_THRESHOLD: f64 = 0.15;
+use crate::fd_acquire::MF_ACQ_THRESHOLD;
 
 /// Rolling audio buffer retained, in multiples of the data-cycle period.
 /// 4 cycles gives the streaming pipeline ample resampler-cursor margin
@@ -122,6 +119,11 @@ const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
 /// corrupted marker and keep predicting forward. 3 ≈ ride through up to
 /// ~0.6 s of corruption at HIGH+ before giving up.
 const MAX_CONSECUTIVE_MISS: u32 = 3;
+
+/// Converged CWs of forward decode before the backward flywheel fires — enough
+/// for the FFE/phase to have trained, while the entry segments still sit inside
+/// the ~2-superframe FFE retention so the backward span is reachable.
+const BACKWARD_TRAIN_CWS: u32 = 4;
 
 /// Worst-case FFE training reference span behind a SOF: V3 preamble
 /// (256 sym) + a generous LMS warmup margin. The actual training pull
@@ -409,6 +411,17 @@ pub struct V3Session {
     /// blind CW is a self-validating anchor, and noise never converges so it
     /// cannot poison). Disable with `V3_NO_FLYWHEEL`.
     flywheel: bool,
+    /// Backward flywheel (late/damaged-entry recovery, env `V3_BACKWARD`): once
+    /// the FFE/phase have trained forward, retreat the cadence from the entry
+    /// marker and re-decode the EARLIER (preamble-lost) segments via
+    /// `canon_demod_segment` on the live taps — the intact markers resync, 2
+    /// consecutive non-converged stop it. One-shot per burst.
+    backward_enabled: bool,
+    backward_attempted: bool,
+    /// Entry (first validated) marker of the burst: its symbol position and
+    /// base_esi — the retreat origin for the backward flywheel.
+    entry_marker_sym_abs: Option<u64>,
+    entry_marker_base_esi: Option<u32>,
     /// Running base_esi the NEXT segment should carry (`esi_start + data_cursor`,
     /// mirrors TX frame.rs). Re-synced from the wire on every validated decode,
     /// advanced +2 per DATA / +0 per META. Labels blind segments under `flywheel`.
@@ -727,6 +740,10 @@ impl V3Session {
             next_marker_is_meta: false,
             consecutive_miss: 0,
             flywheel: std::env::var_os("V3_NO_FLYWHEEL").is_none(),
+            backward_enabled: std::env::var_os("V3_BACKWARD").is_some(),
+            backward_attempted: false,
+            entry_marker_sym_abs: None,
+            entry_marker_base_esi: None,
             next_base_esi: None,
             marker_drop_n: std::env::var("V3_DROP_MARKER")
                 .ok()
@@ -804,6 +821,15 @@ impl V3Session {
 
     pub fn profile_name(&self) -> &str {
         &self.profile_name
+    }
+
+    /// One superframe period in AUDIO samples (`superframe_period_sym × sps`).
+    /// Used by the turbo gate / backward flywheel to step whole superframes
+    /// along the worker ring at the nominal (pre-drift) rate.
+    pub fn superframe_audio_samples(&self) -> u64 {
+        let (sps, _) = rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
+            .expect("profile config has valid integer sps");
+        self.superframe_period_sym * sps as u64
     }
 
     pub fn state(&self) -> &V3SessionState {
@@ -1003,6 +1029,19 @@ impl V3Session {
         //     is buffered for a forward-backward-forward re-equalisation.
         self.retry_failed_segments(&mut events);
 
+        // 4a-ter. Backward flywheel: once the FFE/phase have trained over the
+        //     first ~superframe of forward decode, retreat the cadence and
+        //     recover the EARLIER (preamble-lost) segments still in the FFE
+        //     window. One-shot, gated on `V3_BACKWARD`. Triggered here, after
+        //     a stable forward lock, so the seed is well-trained (the entry
+        //     segments still sit inside the ~2-superframe FFE retention).
+        if self.backward_enabled
+            && !self.backward_attempted
+            && self.cws_converged >= BACKWARD_TRAIN_CWS
+        {
+            self.recover_backward(&mut events, external_history);
+        }
+
         // 4b. Phase 4 coarse one-shot drift LS. Once enough refined
         //     marker positions have accumulated, fit slope, decide
         //     whether to reboot the streaming pipeline at the corrected
@@ -1103,6 +1142,10 @@ impl V3Session {
         self.drift_diag_cum = 0.0;
         self.entry_preamble_abs = None;
         self.preamble1_refined_abs = None;
+        // Backward flywheel: re-arm for the next burst / re-decode.
+        self.backward_attempted = false;
+        self.entry_marker_sym_abs = None;
+        self.entry_marker_base_esi = None;
         self.two_preamble_attempted = false;
         self.drift_recommits = 0;
         self.elapsed_since_preamble_sym = 0;
@@ -1271,7 +1314,17 @@ impl V3Session {
             payload.is_eot_frame(),
             events,
         );
-        self.note_recovery_anchor(marker_at_abs, payload.base_esi);
+        // Feed the backward-flywheel anchor a ratio-free `sym_pos * sps` (the
+        // contract `note_recovery_anchor` divides back by sps), NOT the raw
+        // SC-fire audio position `marker_at_abs` — under clock drift the latter
+        // is `sym * sps * ratio`, so dividing by sps alone would taint the entry
+        // symbol index by the drift factor. The validated symbol position
+        // `marker_sym_pos_abs` is exact; mirror the META/forward paths which
+        // already pass `sym * sps`.
+        let (sps, _) =
+            rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
+                .expect("profile config has valid integer sps");
+        self.note_recovery_anchor(marker_sym_pos_abs * sps as u64, payload.base_esi);
     }
 
     /// Record the SF-boundary preamble (audio-absolute) at/before a validated
@@ -1279,6 +1332,17 @@ impl V3Session {
     /// from that preamble. Preserved across a give-up `finalize()`.
     fn note_recovery_anchor(&mut self, marker_audio_abs: u64, base_esi: u32) {
         self.recovery_base_esi = Some(base_esi);
+        // Remember the FIRST validated marker of the burst as the backward
+        // flywheel's retreat origin (symbol position + base_esi). `marker_at_abs
+        // = marker_sym_pos * sps`, so the symbol position is the audio position
+        // divided by sps.
+        if self.entry_marker_base_esi.is_none() {
+            let (sps, _) =
+                rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
+                    .expect("profile config has valid integer sps");
+            self.entry_marker_sym_abs = Some(marker_audio_abs / sps as u64);
+            self.entry_marker_base_esi = Some(base_esi);
+        }
         if let Some(entry) = self.entry_preamble_abs {
             if marker_audio_abs >= entry {
                 let (sps, _) = rrc::check_integer_constraints(
@@ -1907,6 +1971,313 @@ impl V3Session {
             );
         }
         Some((results, last_sigma2))
+    }
+
+    /// Re-populate the FFE *data* BACKWARD in time over `[target_sym ..
+    /// ffe.start_abs())` so the backward flywheel can resync + decode the
+    /// preamble-lost segments that have already scrolled off the FFE's front.
+    ///
+    /// Method (user's plan — go back in time IN the live DSP, no copy): rewind
+    /// the **live** [`StreamingDsp`] to a warmup margin before `target_sym` and
+    /// replay the lent capture `hist` (origin = abs index of `hist[0]`) FORWARD
+    /// from there all the way back to the live head. Re-processing the same
+    /// samples on the same pipeline (a) re-produces the earlier (preamble-lost)
+    /// fse the FFE never saw, which glues seamlessly onto the live `frac_buf` via
+    /// [`StreamingFfe::prepend_raw`] (the `rewind_to` continuity contract makes
+    /// the overlap byte-exact), and (b) returns every DSP cursor + the MF delay
+    /// line to the head, so draining `sym_buffer` leaves the live pipeline
+    /// exactly where it started — no separate restore. The FFE taps and the DD
+    /// phase estimator are kept trained throughout (the live state is reused, not
+    /// reset). A static re-equalise then fills the prepended `out_buf` so the
+    /// marker probe can resync the intact markers there.
+    ///
+    /// All indices are in the GLOBAL frame (origin = input audio sample 0): a
+    /// symbol `S` is produced at output index `S·sps`, i.e. input audio
+    /// `≈ S·sps·ratio`. Returns `true` if it extended the window.
+    fn extend_ffe_backward(&mut self, target_sym: u64, hist: &[f32], origin: u64) -> bool {
+        // Contract: the lent history ends exactly at the live DSP head, so
+        // replaying it FORWARD to its end restores the cursors there byte-exact.
+        // A future caller lending a trimmed/short slice would silently mis-map
+        // the next live chunk — fail loudly in debug instead.
+        debug_assert_eq!(
+            origin + hist.len() as u64,
+            self.total_samples,
+            "extend_ffe_backward: lent history must end at the live head",
+        );
+        let ffe_start = self.ffe.start_abs();
+        let pitch_fse = self.dsp.pitch_fse();
+        let sps = self.dsp.sps() as u64;
+        if sps == 0 || pitch_fse == 0 {
+            return false;
+        }
+        let ratio = 1.0 + self.drift_ppm * 1e-6;
+        let ctx = self.dsp.warmup_samples() as u64;
+        // Warmup margin in symbols the rewound DSP needs before its output is
+        // byte-valid (discarded — we only keep [target_sym .. ffe_start)).
+        let warm_sym = ctx / sps + 4;
+        // Earliest symbol the lent history can produce (need `ctx` real input
+        // samples before it for the resampler/MF to re-prime to byte-exact).
+        let min_input = origin + ctx;
+        let min_sym = ((min_input as f64 / ratio).ceil() as u64) / sps + warm_sym + 2;
+        let target_sym = target_sym.max(min_sym);
+        if target_sym + 2 >= ffe_start {
+            return false; // no room to extend (history too shallow)
+        }
+        let exc_start_sym = target_sym - warm_sym;
+        // Input audio abs where the rewound DSP begins re-producing.
+        let abs_input_start = ((exc_start_sym * sps) as f64 * ratio).floor() as u64;
+        if abs_input_start < origin {
+            return false;
+        }
+        // Feed from `ctx` samples before the rewind point so the resampler/MF
+        // have real context (not zero-padding) over the kept region.
+        let feed_from_abs = abs_input_start.saturating_sub(ctx).max(origin);
+        let feed_lo = (feed_from_abs - origin) as usize;
+        if feed_lo >= hist.len() {
+            return false;
+        }
+
+        // Rewind the LIVE DSP back in time and replay the lent history FORWARD
+        // from there to the live head (= end of `hist`). The replay reaches the
+        // head, so the cursors + MF delay line land exactly where they were
+        // before the excursion (byte-exact, `rewind_to` contract); draining
+        // `sym_buffer` then leaves the live pipeline in its pre-excursion
+        // (drained-at-head) state. No copy, no reset, no separate restore.
+        self.dsp.rewind_to(abs_input_start, self.drift_ppm);
+        self.dsp
+            .feed_audio(&hist[feed_lo..], feed_from_abs, self.drift_ppm);
+        let first_sym = self.dsp.sym_buffer_start_abs() / pitch_fse as u64;
+        let fse = self.dsp.drain_symbols();
+        if first_sym > target_sym {
+            return false; // rewind landed late — can't cover the target
+        }
+        let fse_lo = ((target_sym - first_sym) as usize) * pitch_fse;
+        let fse_hi = ((ffe_start - first_sym) as usize) * pitch_fse;
+        if fse_hi > fse.len() || fse_lo >= fse_hi {
+            return false;
+        }
+        let n_prepend = (ffe_start - target_sym) as usize;
+        let earlier_fse = &fse[fse_lo..fse_hi];
+        if !self.ffe.prepend_raw(earlier_fse, n_prepend) {
+            return false;
+        }
+        // Fill the prepended `out_buf` (prepend leaves it zeroed) so the marker
+        // probe resyncs over the back-extended region.
+        self.ffe.reequalise_range_static(target_sym, n_prepend);
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[sync] BACKWARD-EXTEND target_sym={target_sym} n_prepend={n_prepend} \
+                 first_sym={first_sym} fse_syms={} new_window=[{}..{}]",
+                fse.len() / pitch_fse,
+                self.ffe.start_abs(),
+                self.ffe.start_abs() + self.ffe.out_buf().len() as u64,
+            );
+        }
+        true
+    }
+
+    /// Backward flywheel: late/damaged-entry recovery (env `V3_BACKWARD`, see the
+    /// field docs). Once the FFE/phase have trained forward, retreat the cadence
+    /// from the entry marker over the retained FFE window and re-decode the
+    /// EARLIER (preamble-lost) segments via `canon_demod_segment` on the LIVE
+    /// taps — its forward-backward-forward + two-filter RTS is the real backward
+    /// pass (no tap/phase copy; BiDFE / time-reversal-EQ literature). The intact
+    /// markers (Golay+CRC) resync each step; **2 consecutive non-converged**
+    /// segments, `base_esi == 0`, or the window edge stop the coast. One-shot.
+    fn recover_backward(
+        &mut self,
+        events: &mut Vec<V3SessionEvent>,
+        external_history: Option<(&[f32], u64)>,
+    ) {
+        if !self.backward_enabled || self.backward_attempted || self.replaying || !self.ffe.has_taps()
+        {
+            return;
+        }
+        let (Some(entry_marker), Some(entry_esi)) =
+            (self.entry_marker_sym_abs, self.entry_marker_base_esi)
+        else {
+            return;
+        };
+        self.backward_attempted = true;
+        if entry_esi == 0 {
+            return; // already at the start — nothing precedes it
+        }
+        let radius = marker::MARKER_SYNC_LEN as u64;
+        let data_step = marker::MARKER_LEN as u64 + self.seg_sym_len_past_marker(false) as u64;
+        // A superframe boundary inserts a fresh PRE+HDR before the META, so the
+        // previous marker there sits this much further back than a DATA step.
+        let boundary_extra =
+            self.cfg.lms_warmup_syms() as u64 + self.superframe_header_offset_sym;
+
+        // The FFE retains only ~2 superframes, so by the time we have a trained
+        // forward lock the entry marker (and the earlier preamble-lost segments)
+        // have already scrolled off the FRONT of the FFE window. Re-populate the
+        // FFE *data* backward over those earlier segments by rewinding the LIVE
+        // DSP and replaying the lent capture history forward back to the head
+        // (no copy — see `extend_ffe_backward`), then `prepend_raw` + a static
+        // re-equalise so the intact markers below are findable in `out_buf`. Skip
+        // the excursion when no history is lent (unit tests) — the in-window
+        // search still runs.
+        if let Some((hist, origin)) = external_history {
+            // Walk back far enough to cover ESI 0: `entry_esi` codewords back,
+            // `V2_CODEWORDS_PER_SEGMENT` per DATA segment, plus a few segments
+            // and superframe-boundary insertions of slack.
+            let n_seg_back = (entry_esi as u64 / V2_CODEWORDS_PER_SEGMENT as u64) + 3;
+            let back_needed = n_seg_back * data_step + 4 * boundary_extra + radius;
+            let target_sym = entry_marker.saturating_sub(back_needed);
+            self.extend_ffe_backward(target_sym, hist, origin);
+        }
+
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[sync] BACKWARD-START entry_marker={entry_marker} entry_esi={entry_esi} \
+                 data_step={data_step} ffe_window=[{}..{}]",
+                self.ffe.start_abs(),
+                self.ffe.start_abs() + self.ffe.out_buf().len() as u64,
+            );
+        }
+        // Closest-preceding-marker scan bounds. The TX marker grid is not a
+        // single cadence: a superframe boundary spaces markers at META→DATA
+        // (~592), DATA→DATA (`data_step`), and DATA→META (~`data_step +
+        // boundary_extra`). Rather than predict the exact step (brittle to the
+        // boundary structure AND to a few-symbol bookkeeping offset on the entry
+        // marker), scan backward for the NEAREST decodable marker — Golay+CRC
+        // gates false positives, and snapping to the real decoded position
+        // self-corrects the offset each hop. `min_gap` clears the current marker;
+        // `max_gap` brackets the largest real step (DATA→META) with slack.
+        let min_gap = marker::MARKER_LEN as u64 + radius;
+        let max_gap = 2 * data_step;
+        // `max_gap` must bracket the largest real step (DATA→META ≈ data_step +
+        // boundary_extra). Holds while a codeword spans several markers; a future
+        // tiny-codeword profile could break the backward walk silently.
+        debug_assert!(
+            max_gap >= data_step + boundary_extra,
+            "backward scan bracket too small: max_gap={max_gap} < data_step+boundary_extra={}",
+            data_step + boundary_extra,
+        );
+
+        let mut marker_pos = entry_marker;
+        let mut miss = 0u32;
+        loop {
+            if miss >= 2 {
+                break;
+            }
+            let Some((prev_marker_abs, payload)) =
+                self.search_prev_marker_scan(marker_pos, min_gap, max_gap)
+            else {
+                break; // no marker in the retained window (gone / scrolled out)
+            };
+            let is_meta = payload.is_meta();
+            let prev_base_esi = payload.base_esi;
+            let warmup_detach = if is_meta {
+                self.cfg.lms_warmup_syms() as u64
+            } else {
+                0
+            };
+            let seg_start_abs = prev_marker_abs + marker::MARKER_LEN as u64 + warmup_detach;
+            let seg_sym_len = self.seg_sym_len_past_marker(is_meta);
+            let n_cw = if is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+            if seg_start_abs < self.ffe.start_abs() {
+                break; // segment scrolled out of the retained window
+            }
+            let Some((per_cw, sigma2)) = self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw)
+            else {
+                miss += 1;
+                marker_pos = prev_marker_abs;
+                continue;
+            };
+            let mut any_conv = false;
+            for (cw_idx, (bytes, converged)) in per_cw.into_iter().enumerate() {
+                if !converged {
+                    continue; // accept ONLY converged CWs — never inject false data
+                }
+                any_conv = true;
+                self.cws_converged = self.cws_converged.saturating_add(1);
+                let esi = prev_base_esi + cw_idx as u32;
+                if is_meta {
+                    if let Some(h) = decode_meta_payload(&bytes) {
+                        if h.k_symbols != 0 && h.file_size != 0 && self.app_header.is_none() {
+                            events.push(V3SessionEvent::AppHeaderRecovered {
+                                session_id: h.session_id,
+                                file_size: h.file_size,
+                                k_symbols: h.k_symbols,
+                                t_bytes: h.t_bytes,
+                                mode_code: h.mode_code,
+                                mime_type: h.mime_type,
+                                hash_short: h.hash_short,
+                            });
+                            self.app_header = Some(h);
+                        }
+                    }
+                }
+                events.push(V3SessionEvent::CwDecoded {
+                    cycle_idx: 0,
+                    cw_idx,
+                    esi,
+                    is_meta,
+                    converged: true,
+                    bytes,
+                    sigma2,
+                });
+            }
+            if std::env::var_os("V3_LOG_SYNC").is_some() {
+                eprintln!(
+                    "[sync] BACKWARD-FLYWHEEL marker={prev_marker_abs} base_esi={prev_base_esi} \
+                     is_meta={is_meta} any_conv={any_conv} miss={miss}",
+                );
+            }
+            if any_conv {
+                miss = 0;
+            } else {
+                miss += 1;
+            }
+            marker_pos = prev_marker_abs;
+            if prev_base_esi == 0 {
+                break; // reached the true start
+            }
+        }
+    }
+
+    /// Scan the FFE-equalised `out_buf` backward from `marker_pos - min_gap`
+    /// down to `marker_pos - max_gap` and return the NEAREST (closest-preceding)
+    /// position whose `MARKER_LEN` window decodes a valid marker (Golay+CRC),
+    /// plus its payload. Used by the backward flywheel instead of a fixed-cadence
+    /// prediction: the TX marker grid mixes META→DATA / DATA→DATA / DATA→META
+    /// spacings around superframe boundaries, so the immediate predecessor is the
+    /// closest decodable marker in a bracketing window, not at a single offset.
+    /// Snapping to the actual decoded position resyncs the cadence each hop.
+    fn search_prev_marker_scan(
+        &self,
+        marker_pos: u64,
+        min_gap: u64,
+        max_gap: u64,
+    ) -> Option<(u64, marker::MarkerPayload)> {
+        let raw = self.ffe.out_buf();
+        let s0 = self.ffe.start_abs();
+        let hi_abs = marker_pos.checked_sub(min_gap)?;
+        let lo_abs = marker_pos.saturating_sub(max_gap).max(s0);
+        if hi_abs < lo_abs {
+            return None;
+        }
+        let mut abs = hi_abs;
+        while abs >= lo_abs {
+            let rel = (abs - s0) as usize;
+            if rel + marker::MARKER_LEN <= raw.len() {
+                // Fast sync-correlation gate, then the full Golay+CRC decode.
+                if marker::find_sync_in_window(raw, rel, 0, 0.5).is_some() {
+                    if let Some(payload) =
+                        marker::decode_marker_at(&raw[rel..rel + marker::MARKER_LEN])
+                    {
+                        return Some((abs, payload));
+                    }
+                }
+            }
+            if abs == lo_abs {
+                break;
+            }
+            abs -= 1;
+        }
+        None
     }
 
     /// Closed-window "turbo sync" pass. For each queued segment whose codewords
@@ -2926,6 +3297,10 @@ impl V3Session {
         self.drift_diag_cum = 0.0;
         self.entry_preamble_abs = None;
         self.preamble1_refined_abs = None;
+        // Backward flywheel: re-arm for the next burst / re-decode.
+        self.backward_attempted = false;
+        self.entry_marker_sym_abs = None;
+        self.entry_marker_base_esi = None;
         // NB: `two_preamble_attempted` is deliberately NOT reset here — like
         // `drift_locked` it must persist across a replay so the corrected pass
         // does not re-run the one-shot estimator. Reset only in `finalize()`.

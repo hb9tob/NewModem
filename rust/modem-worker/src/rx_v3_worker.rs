@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use modem_core::profile::ProfileIndex;
+use modem_core::turbo_gate::TurboGate;
 use modem_core::types::AUDIO_RATE;
 use modem_core::v3_session::{V3Session, V3SessionEvent};
 use modem_framing::app_header::AppHeader;
@@ -122,6 +123,16 @@ pub struct RxV3Worker {
     /// Most recent per-codeword σ² seen, surfaced as the instantaneous
     /// figure on `v2_progress` / `file_complete`.
     last_sigma2: f64,
+    /// Gated-turbo architecture: when true, `push_samples` parks the DSP and
+    /// runs only the raw-audio `gate` while `Searching` (env `TURBO_GATED`).
+    gated: bool,
+    turbo_state: TurboState,
+    gate: TurboGate,
+    /// Whether a marker has validated since the last gate-open (locked the
+    /// burst). Drives the false-positive bail / burst-end exit in `Receiving`.
+    receiving_locked: bool,
+    /// Ring head (abs) past which an un-locked `Receiving` is a false positive.
+    receiving_deadline: u64,
     /// Latest segment scatter (equalised data I/Q) for the GUI constellation,
     /// from `V3SessionEvent::ConstellationDiag`. Emitted on every `v2_progress`.
     last_constellation: Vec<[f32; 2]>,
@@ -136,6 +147,22 @@ pub struct RxV3Worker {
 /// FSM advances by bounded steps per `process_audio_chunk`, so one giant
 /// call would under-process the burst). 2400 samples = 50 ms @ 48 kHz.
 const REPLAY_BATCH_SAMPLES: usize = 2400;
+
+/// Gated-turbo state. While `Searching` the expensive streaming DSP is parked
+/// and only the raw-audio [`TurboGate`] runs over the ring; on a gate-open the
+/// driver seeks the DSP to the preamble and switches to `Receiving`, feeding
+/// the DSP live until the burst ends, then back to `Searching`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurboState {
+    Searching,
+    Receiving,
+}
+
+/// Grace window after a gate-open during which the DSP is fed even before a
+/// marker validates (the seek needs the marker+segment audio to stream in).
+/// If no marker validates within it, the open was a false positive →
+/// bail back to `Searching`. ~1.5 s @ 48 kHz comfortably spans one superframe.
+const RECEIVING_GRACE_SAMPLES: u64 = (modem_core::types::AUDIO_RATE as u64) * 3 / 2;
 
 impl RxV3Worker {
     /// Build a driver bootstrapped at `profile`, persisting under
@@ -173,6 +200,11 @@ impl RxV3Worker {
             last_constellation: Vec::new(),
             last_pilot_phases: Vec::new(),
             last_pilot_is_meta: false,
+            gated: std::env::var_os("TURBO_GATED").is_some(),
+            turbo_state: TurboState::Searching,
+            gate: TurboGate::forced(profile),
+            receiving_locked: false,
+            receiving_deadline: 0,
         })
     }
 
@@ -202,17 +234,125 @@ impl RxV3Worker {
         self.samples_since_progress = self
             .samples_since_progress
             .saturating_add(samples.len() as u64);
-        // Append to the rolling history first, so a rewind triggered while
-        // routing this chunk's events can reach right up to the live head.
+        // Append to the rolling central ring first, so a rewind/seek triggered
+        // while routing this chunk's events can reach right up to the live head.
         self.history.extend(samples.iter().copied());
         if self.history.len() > HISTORY_SAMPLES {
             let drop = self.history.len() - HISTORY_SAMPLES;
             self.history.drain(..drop);
             self.history_origin += drop as u64;
         }
+        if !self.gated {
+            return self.push_continuous(samples);
+        }
+        // Gated turbo: park the DSP while Searching; only the raw-audio gate
+        // runs over the ring. On a gate-open seek the DSP to the preamble and
+        // switch to Receiving; feed the DSP live until the burst ends.
+        match self.turbo_state {
+            TurboState::Searching => {
+                let head = self.history_origin + self.history.len() as u64;
+                let open = {
+                    let ring = self.history.make_contiguous();
+                    self.gate.poll(ring, self.history_origin)
+                };
+                match open {
+                    Some(open) => self.enter_receiving(open, head),
+                    None => PushOutcome::default(),
+                }
+            }
+            TurboState::Receiving => {
+                let head = self.history_origin + self.history.len() as u64;
+                let outcome = self.push_continuous(samples);
+                if self.active {
+                    self.receiving_locked = true;
+                }
+                // Burst end (was locked, now Idle) OR false-positive open (never
+                // locked within the grace window) → park the DSP, re-arm the
+                // gate to find the next entry from the live head.
+                let burst_ended = self.receiving_locked && !self.active;
+                let false_positive =
+                    !self.receiving_locked && head >= self.receiving_deadline;
+                if burst_ended || false_positive {
+                    self.exit_receiving(head);
+                }
+                outcome
+            }
+        }
+    }
+
+    /// Seek the DSP to a gate-detected preamble over the ring (reusing
+    /// `replay_from_anchor`, the same mechanism as a drift rewind), then switch
+    /// to `Receiving`. The Golay+CRC marker validation inside the replay is the
+    /// hard gate; if it doesn't fire within the grace window the open was a
+    /// false positive and `Receiving` bails back to `Searching`.
+    fn enter_receiving(&mut self, open: modem_core::turbo_gate::GateOpen, head: u64) -> PushOutcome {
+        self.turbo_state = TurboState::Receiving;
+        self.receiving_locked = false;
+        self.receiving_deadline = head + RECEIVING_GRACE_SAMPLES;
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[gate] OPEN preamble_abs={} metric={:.3} -> seek+Receiving",
+                open.preamble_abs, open.metric,
+            );
+        }
+        let anchor = open.preamble_abs;
+        if anchor < self.history_origin {
+            // Aged out of the ring already — drop back to Searching.
+            self.turbo_state = TurboState::Searching;
+            self.gate.reset_to(head);
+            return PushOutcome::default();
+        }
+        let lo = (anchor - self.history_origin) as usize;
+        let drift = 0.0; // pre-lock: nominal rate; the session re-estimates drift
+        let replay = {
+            let mut hist = std::mem::take(&mut self.history);
+            let ev = {
+                let buf = hist.make_contiguous();
+                if lo <= buf.len() {
+                    self.session.replay_from_anchor(&buf[lo..], anchor, drift)
+                } else {
+                    Vec::new()
+                }
+            };
+            self.history = hist;
+            ev
+        };
+        let mut outcome = self.route(replay);
+        if self.active {
+            self.receiving_locked = true;
+        }
+        if let Some(p) = self.pending_rebuild.take() {
+            let rebuilt = self.rebuild_at(p);
+            outcome.decoded = outcome.decoded.or(rebuilt.decoded);
+            outcome.bursts_finalised += rebuilt.bursts_finalised;
+        }
+        outcome
+    }
+
+    /// Burst ended (or false-positive open): park the DSP, re-arm the gate to
+    /// search again from the live head.
+    fn exit_receiving(&mut self, head: u64) {
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[gate] EXIT Receiving (locked={}) -> Searching from head={}",
+                self.receiving_locked, head,
+            );
+        }
+        self.turbo_state = TurboState::Searching;
+        self.receiving_locked = false;
+        // Re-arm to scan from ~the live head minus one search window, so a
+        // back-to-back burst whose preamble already landed isn't skipped.
+        let back = self.gate.search_len() as u64;
+        self.gate.reset_to(head.saturating_sub(back));
+    }
+
+    /// The original continuous path: feed the DSP every chunk, route, rebuild,
+    /// no-progress end-of-burst. Used when `!gated`, and as the live-feed half
+    /// of the gated `Receiving` state.
+    fn push_continuous(&mut self, samples: &[f32]) -> PushOutcome {
         // Lend the full rolling history so a coarse-drift commit can replay from
         // the entry preamble across the whole burst (not the session's 4-cycle
-        // buffer). `history` already includes `samples` (appended just above).
+        // buffer). `history` already includes `samples` (appended by the caller).
         let history_origin = self.history_origin;
         let events = {
             let hist = self.history.make_contiguous();
@@ -664,6 +804,35 @@ mod tests {
             has_constellation,
             "no v2_progress carried a non-empty constellation_sample",
         );
+    }
+
+    #[test]
+    fn turbo_worker_gated_assembles_v3_payload_from_stream() {
+        // Gated turbo path (TURBO_GATED): the worker parks the DSP and runs the
+        // raw-audio gate; on the preamble it seeks the DSP via replay_from_anchor
+        // and decodes. Must assemble the SAME payload as the continuous path.
+        let cfg = ProfileIndex::HighPlus.to_config();
+        let payload_size = 800usize;
+        let session_id = 0xAB12_3456u32;
+        let audio = build_v3_burst_audio(&cfg, payload_size, session_id);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
+        let sink = Arc::new(crate::event_sink::RecordingSink::new());
+        let mut worker = RxV3Worker::new(
+            ProfileIndex::HighPlus,
+            /*forced=*/ true,
+            save_dir,
+            sink as Arc<dyn EventSink>,
+        )
+        .unwrap();
+        worker.gated = true; // force the gated path regardless of env
+
+        let mut decoded = push_stream(&mut worker, &audio);
+        decoded = decoded.or(worker.finalize().decoded);
+        let df = decoded.expect("gated turbo driver never assembled the payload");
+        assert_eq!(df.session_id, session_id);
+        assert_eq!(df.payload, vec![0xAA_u8; payload_size]);
     }
 
     #[test]

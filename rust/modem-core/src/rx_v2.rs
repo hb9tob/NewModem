@@ -456,8 +456,27 @@ pub fn detect_best_profile(
 pub fn detect_best_profile_cold(samples: &[f32]) -> Option<crate::profile::ProfileIndex> {
     use crate::profile::ProfileIndex;
     let mut best: Option<(ProfileIndex, f64)> = None;
+    // Correlate once per GEOMETRY, not per profile. The preamble correlation
+    // depends only on (symbol_rate, tau, beta, center_freq) — every profile
+    // sharing those (e.g. the whole sps=32 family: NORMAL / HIGH / HIGH+ /
+    // HIGH++ / HIGH56) yields an IDENTICAL ratio, so correlating each one
+    // re-ran the same ~320-tap matched filter over the whole warm-up buffer 5×.
+    // That redundant work was the bulk of the slow turbo entry on a Pi. The
+    // exact profile within the winning family is refined later from the marker.
+    let mut seen: Vec<(u64, u64, u64, u64)> = Vec::new();
     for &p in ProfileIndex::ALL.iter().filter(|p| !p.is_experimental()) {
-        let r = preamble_correlation_ratio(samples, &p.to_config());
+        let cfg = p.to_config();
+        let key = (
+            cfg.symbol_rate.to_bits(),
+            cfg.tau.to_bits(),
+            cfg.beta.to_bits(),
+            cfg.center_freq_hz.to_bits(),
+        );
+        if seen.contains(&key) {
+            continue; // same geometry → same ratio, already scored
+        }
+        seen.push(key);
+        let r = preamble_correlation_ratio(samples, &cfg);
         if best.map(|(_, br)| r > br).unwrap_or(true) {
             best = Some((p, r));
         }
