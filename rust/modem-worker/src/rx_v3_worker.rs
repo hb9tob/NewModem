@@ -431,11 +431,12 @@ impl RxV3Worker {
         // Worker-driven end-of-burst: a locked burst that has gone silent on
         // markers for too long has ended (silence / noise cut / true tail).
         // Finalize → Idle so the next preamble re-acquires.
-        if self.active && self.samples_since_progress >= END_OF_BURST_NOPROGRESS_SAMPLES {
+        if self.active && self.samples_since_progress >= self.no_progress_threshold() {
             if std::env::var_os("V3_LOG_SYNC").is_some() {
                 eprintln!(
-                    "[finalize] NO-PROGRESS samples_since_progress={}",
+                    "[finalize] NO-PROGRESS samples_since_progress={} threshold={}",
                     self.samples_since_progress,
+                    self.no_progress_threshold(),
                 );
             }
             let fin = self.finalize();
@@ -450,6 +451,19 @@ impl RxV3Worker {
     pub fn finalize(&mut self) -> PushOutcome {
         let events = self.session.finalize();
         self.route(events)
+    }
+
+    /// End-of-burst no-progress threshold (samples). Must exceed the worst-case
+    /// gap between VALIDATED markers in a healthy transmission, otherwise it
+    /// false-fires mid-burst — and with the burst-boundary restart that
+    /// fragments the session, so a slow profile never assembles. The slow
+    /// profiles have a large gap: measured ROBUST data cycle ≈ 2.8 s, superframe
+    /// boundary ≈ 5.4 s (ULTRA is slower still). Scale with the live cycle (3× a
+    /// data cycle comfortably covers the boundary, which runs ≈ 2× a cycle) but
+    /// never below the 2 s baseline that keeps the fast profiles snappy.
+    fn no_progress_threshold(&self) -> u64 {
+        let by_cycle = 3 * self.session.cycle_samples() as u64;
+        END_OF_BURST_NOPROGRESS_SAMPLES.max(by_cycle)
     }
 
     fn route(&mut self, events: Vec<V3SessionEvent>) -> PushOutcome {
