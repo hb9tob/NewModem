@@ -255,6 +255,17 @@ body {
 .tab-bar .tab:hover {
   color: #e0e0e0;
 }
+/* Tab icons render only in the kiosk/narrow layout (see the
+   max-width:900px block); on the desktop the text labels carry the tabs.
+   Stroke follows the button colour so the active/hover states apply. */
+.tab-icon {
+  display: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .tab-bar .tab.active {
   color: #9ccc65;
   background: #1e1e1e;
@@ -2235,17 +2246,33 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   /* Baseline: smaller font, no enlarged controls. */
   body { font-size: 12px; }
 
-  /* Tab bar — 7 tabs (Info hidden) ~110 px each on 800 px wide. */
+  /* Tab bar — stacked icon + small label so the 8 tabs (Info hidden) fit
+     on one row at 800 px without truncating the French labels. Each tab is
+     a comfortable single-tap target (icon 22 px over a ~9 px caption). */
   .tab-bar {
     gap: 1px;
     padding: 1px;
     flex-wrap: nowrap;
   }
   .tab-bar .tab {
-    padding: 4px 4px;
-    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 3px 2px;
     min-width: 0;
     flex: 1 1 0;
+  }
+  .tab-bar .tab .tab-icon {
+    display: block;
+    width: 22px;
+    height: 22px;
+  }
+  .tab-bar .tab .tab-label {
+    max-width: 100%;
+    font-size: 8.5px;
+    line-height: 1.1;
+    letter-spacing: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2683,4 +2710,324 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 }
 .sounder-plot-svg .point {
   fill: #4a9eff;
+}
+
+/* ───────────────────────────── Radio tab ─────────────────────────── */
+.radio-layout {
+  gap: 0.6rem;
+  padding: 0.6rem;
+  overflow: hidden;
+}
+.radio-top {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(210px, 1.3fr) minmax(210px, 1.3fr);
+  gap: 0.4rem;
+  flex: 0 0 auto;
+  /* Hard cap: the top block must never exceed ~18% of the tab height so
+     the RF spectrum + waterfall below always keep the bulk of the screen. */
+  max-height: 18vh;
+  min-height: 0;
+  overflow: hidden;
+}
+.radio-card {
+  background: #15171c;
+  border: 1px solid #2a2d34;
+  border-radius: 6px;
+  padding: 0.25rem 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+  overflow: hidden;
+}
+.radio-card-title {
+  font-size: 0.66rem;
+  color: #7fd1ff;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.radio-smeter {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 48px;
+}
+.radio-smeter-label {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: #cfd2d8;
+  font-size: 0.72rem;
+}
+.radio-sdr-params-btn {
+  align-self: center;
+  padding: 0.12rem 0.5rem;
+  font-size: 0.7rem;
+  background: #1c2129;
+  color: #9ccc65;
+  border: 1px solid #2a3845;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.radio-sdr-params-btn:hover {
+  background: #243040;
+}
+/* SDR parameters popover — same overlay pattern as .select-picker-modal. */
+.radio-sdr-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.88);
+  z-index: 260;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+}
+.radio-sdr-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.7rem 0.8rem;
+  width: 100%;
+  max-width: 560px;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.radio-sdr-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.radio-sdr-title {
+  font-weight: 600;
+  color: #7fd1ff;
+  letter-spacing: 0.02em;
+}
+.radio-sdr-close {
+  font-size: 1.3rem;
+  color: #ef5350;
+  cursor: pointer;
+  padding: 0 0.4rem;
+  user-select: none;
+}
+.radio-sdr-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.radio-sdr-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+#radio-sdr-restart {
+  padding: 0.3rem 0.7rem;
+}
+.radio-freq-display {
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  color: #e8ffe8;
+  text-align: center;
+  font-weight: 600;
+}
+.radio-freq-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.radio-freq-entry input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.radio-unit {
+  color: #9aa0aa;
+}
+.radio-step-row,
+.radio-band-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+}
+.radio-step,
+.radio-band {
+  flex: 1 1 auto;
+  padding: 0.12rem 0.25rem;
+  font-size: 0.68rem;
+}
+.radio-tune-info {
+  font-size: 0.62rem;
+  color: #8a909a;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.radio-audio-fft {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 56px;
+  background: #0a0a0a;
+  border-radius: 4px;
+}
+.radio-monitor-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.radio-monitor-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.radio-monitor-row input[type="range"] {
+  flex: 1 1 auto;
+}
+.radio-bottom {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 0;
+}
+.radio-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.4rem;
+  align-items: center;
+}
+.radio-ctl {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: #cfd2d8;
+}
+.radio-ctl input[type="range"] {
+  width: 110px;
+}
+/* Backend-aware gain/AGC host: keep the dynamically-built pluto rows inline
+   and compact inside the horizontal control bar. */
+.radio-gain-host {
+  flex-wrap: wrap;
+}
+.radio-gain-host .pluto-row {
+  margin-top: 0;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+}
+.radio-gain-host .pluto-field input[type="number"] {
+  width: 4.5em;
+}
+.radio-spectrum-wrap {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid #2a2d34;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.radio-rf-fft {
+  width: 100%;
+  /* Fixed slice for the line spectrum; the waterfall takes everything
+     else so it fills the rest of the screen. */
+  flex: 0 0 26%;
+  min-height: 70px;
+  background: #0a0a0a;
+  cursor: pointer;
+}
+.radio-waterfall {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: #000;
+  cursor: pointer;
+}
+/* Frequency ruler pinned at the very bottom, under the waterfall. The RF
+   spectrum and waterfall share its horizontal Hz mapping (center_hz ±
+   span_hz/2). Small, MHz labels. Height locked hard so it can never grow
+   and steal the waterfall's space. */
+.radio-freq-scale {
+  width: 100%;
+  height: 16px;
+  min-height: 16px;
+  max-height: 16px;
+  flex: 0 0 16px;
+  background: #101216;
+  border-top: 1px solid #2a2d34;
+}
+
+/* ============================================================
+   Radio tab — Raspberry Pi 7" 800x480 kiosk compaction.
+   The desktop radio layout sizes everything in rem (root 16px),
+   so it does NOT shrink with the global `body { font-size: 12px }`
+   small-screen rule, and the top cards overflow their 18vh cap —
+   clipping the audio card's monitor (sound-card) selector out of
+   reach. Here we shrink every radio element and, crucially, drop
+   the hard 18vh cap so the monitor row stays visible while the
+   waterfall still keeps the bulk of the panel.
+   ============================================================ */
+@media (max-width: 900px) {
+  .radio-layout {
+    gap: 0.25rem;
+    padding: 0.25rem;
+  }
+  .radio-top {
+    /* Keep the top strip short (~22vh) so the spectrum + waterfall below
+       own the bulk of the panel. The compacted cards — including the
+       audio card's sound-card (monitor) select — fit within this cap
+       without clipping. */
+    max-height: 24vh;
+    grid-template-columns: minmax(96px, 0.7fr) minmax(146px, 1.2fr) minmax(146px, 1.2fr);
+    gap: 0.25rem;
+  }
+  .radio-card {
+    padding: 0.12rem 0.28rem;
+    gap: 0.1rem;
+  }
+  .radio-card-title { font-size: 8.5px; letter-spacing: 0.02em; }
+
+  /* The needle dial needs a real floor or it collapses to an unreadable
+     sliver — it (not the freq card) sets the top-strip height here. */
+  .radio-smeter { min-height: 50px; }
+  .radio-smeter-label { font-size: 9px; }
+  .radio-sdr-params-btn { padding: 1px 5px; font-size: 9px; }
+
+  .radio-freq-display { font-size: 11px; }
+  .radio-freq-entry { gap: 0.2rem; }
+  .radio-freq-entry input { font-size: 10px; padding: 1px 2px; }
+  .radio-unit { font-size: 9px; }
+  #radio-freq-set { padding: 1px 4px; font-size: 9px; }
+  .radio-step-row, .radio-band-presets { gap: 0.15rem; }
+  .radio-step, .radio-band { padding: 1px 2px; font-size: 8.5px; }
+  #radio-recenter { font-size: 8.5px; }
+  /* Minor tuning-info line — drop it on the tiny panel to save a row. */
+  .radio-tune-info { display: none; }
+
+  .radio-audio-fft { min-height: 24px; }
+  .radio-monitor-row { gap: 0.2rem; font-size: 9.5px; }
+  .radio-monitor-row select { font-size: 9.5px; min-height: 22px; padding: 0 2px; }
+  .radio-monitor-row input[type="range"] { min-height: 20px; }
+  #radio-volume-label { font-size: 9.5px; }
+
+  /* Bottom control bar — compact; shrink the AGC/LNA & Largeur combos. */
+  .radio-controls { gap: 0.25rem 0.6rem; }
+  .radio-ctl { font-size: 9.5px; gap: 0.2rem; }
+  .radio-controls select { font-size: 9.5px; padding: 0 2px; }
+  .radio-controls input[type="number"] { font-size: 9.5px; }
+  .radio-ctl input[type="range"] { width: 64px; }
+  .radio-gain-host .pluto-row { font-size: 9.5px; gap: 0.2rem; }
+  .radio-gain-host .pluto-field,
+  .radio-gain-host .pluto-field-label { font-size: 9.5px; }
+  .radio-gain-host .pluto-field select,
+  .radio-gain-host .pluto-field input { font-size: 9.5px; }
+  .radio-gain-host .pluto-field input[type="number"] { width: 3.4em; }
+
+  .radio-rf-fft { min-height: 44px; flex-basis: 20%; }
+  .radio-freq-scale {
+    height: 13px;
+    min-height: 13px;
+    max-height: 13px;
+    flex-basis: 13px;
+  }
 }

@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use modem_sdr::{
     AgcMode, AntennaChoice, BackendCapabilities, BackendFeatures, DeviceDescriptor, GainSetting,
-    ManualGainShape, ManualGainValue, SampleRateStrategy, SdrBackend, SdrCaptureHandle, SdrConfig,
-    SdrDevice, SdrError,
+    ManualGainShape, ManualGainValue, RadioTuning, SampleRateStrategy, SdrBackend,
+    SdrCaptureHandle, SdrConfig, SdrDevice, SdrError,
 };
 
 use crate::device::{PlutoConfig, RxGainMode};
@@ -125,6 +125,16 @@ fn pluto_capabilities() -> &'static BackendCapabilities {
         sample_rate_strategy: SampleRateStrategy {
             host_iq_rate_hz: crate::PREFERRED_SAMPLE_RATE_HZ,
             audio_decim_ratio: crate::PREFERRED_RATIO as u32,
+        },
+        // AD9363 has hardware DC compensation, so the channel may sit on
+        // DC (lo_offset = 0). The digital fine-tune window is kept well
+        // inside the captured band (576 kHz → ±288 kHz Nyquist) with
+        // margin for the channel filter.
+        radio_tuning: RadioTuning {
+            dc_tunable: true,
+            lo_offset_hz: 0.0,
+            digital_window_hz: 200_000.0,
+            dc_guard_hz: 0.0,
         },
     })
 }
@@ -223,16 +233,27 @@ impl SdrDevice for PlutoDevice {
     }
 
     fn start_rx(&mut self) -> Result<(SdrCaptureHandle, std::sync::mpsc::Receiver<Vec<f32>>), SdrError> {
-        let (handle, rx) = rx::start(&self.pluto_config).map_err(SdrError::backend)?;
-        Ok((SdrCaptureHandle::new(handle), rx))
+        // Always wire the Radio-tab channels: the telemetry/control
+        // overhead is negligible and the GUI decides whether to consume
+        // them. Keeps one code path for the SDR RX session.
+        let (handle, rx, telemetry, control) =
+            rx::start_radio(&self.pluto_config).map_err(SdrError::backend)?;
+        Ok((SdrCaptureHandle::with_radio(handle, telemetry, control), rx))
     }
 
     fn tx_sink(&self) -> Option<Arc<dyn modem_io::SampleSink>> {
         Some(Arc::new(PlutoSink::new(self.pluto_config.clone())))
     }
 
-    fn update_rx_freq(&mut self, _hz: u64) -> Result<(), SdrError> {
-        Err(SdrError::NotImplemented)
+    fn update_rx_freq(&mut self, hz: u64) -> Result<(), SdrError> {
+        // Out-of-stream LO retune (capture not running, or one-shot).
+        // The live Radio-tab path retunes from inside the capture
+        // thread via RadioCommand instead; this serves callers that
+        // hold the device object directly.
+        rx::live_lo_write(&self.pluto_config.uri, hz).map_err(SdrError::backend)?;
+        self.pluto_config.rx_freq_hz = hz;
+        self.config.rx_freq_hz = hz;
+        Ok(())
     }
     fn update_tx_freq(&mut self, _hz: u64) -> Result<(), SdrError> {
         Err(SdrError::NotImplemented)

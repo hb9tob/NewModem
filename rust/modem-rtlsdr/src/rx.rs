@@ -29,19 +29,31 @@
 
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use num_complex::Complex32;
 
+use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
 use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
+use modem_sdr_radio::{RadioInit, RadioRuntime};
 
 use crate::device::{
     self, RtlsdrSession, DEFAULT_LO_OFFSET_HZ, READ_BUF_LEN, READ_BUF_NUM,
 };
 use crate::error::RtlsdrError;
 use crate::ffi::{rtlsdr_dev_t, RtlsdrLib};
+use crate::hardware::RtlHardware;
+
+/// The two channel ends the backend hands the capture path to drive the
+/// Radio tab: telemetry out (spectra / S-meter / tune state) and control in
+/// (retune / gain / squelch). `None` for plain captures.
+pub struct RadioWiring {
+    pub telemetry_tx: Sender<RadioTelemetry>,
+    pub control_rx: Receiver<RadioCommand>,
+}
 
 /// Audio rate the chain produces. Locked to the modem core's
 /// `AUDIO_RATE` (48 kHz).
@@ -70,6 +82,10 @@ pub struct CaptureHandle {
     pub channels: u16,
     /// Live host I/Q rate from the dongle (= `cfg.sample_rate_hz`).
     pub host_iq_rate_hz: u64,
+    /// Radio-tab control thread (drains retune / gain commands). `None`
+    /// for plain captures. Joined **before** the capture thread on
+    /// teardown so it stops issuing tuner FFI before the device closes.
+    control_thread: Option<JoinHandle<()>>,
     /// Raw device pointer so we can call `rtlsdr_cancel_async` from
     /// outside the capture thread on Drop. SAFETY: only ever invoked
     /// once, before the join; the cancel call wakes the blocking
@@ -89,33 +105,36 @@ unsafe impl Send for CancelHandle {}
 
 impl CaptureHandle {
     pub fn stop(mut self) {
-        self.signal_stop();
-        if let Some(h) = self.thread.take() {
-            let _ = h.join();
-        }
+        self.teardown();
     }
 
-    fn signal_stop(&self) {
+    /// Idempotent teardown. Order matters: the control thread must stop
+    /// issuing tuner FFI *before* the capture thread closes the device, so
+    /// we join it first (it exits within one 200 ms poll of `stop`), then
+    /// wake + join the capture thread which owns `rtlsdr_close`.
+    fn teardown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wake the blocking read_async so the capture thread can
-        // teardown. cancel_async is safe to call even after the
-        // stream has ended.
+        if let Some(h) = self.control_thread.take() {
+            let _ = h.join();
+        }
+        // Wake the blocking read_async so the capture thread can teardown.
+        // cancel_async is safe to call even after the stream has ended.
         if let Ok(lib) = RtlsdrLib::get() {
-            // SAFETY: cancel_async accepts the live dev pointer; we
-            // only call this once before joining the thread.
+            // SAFETY: cancel_async accepts the live dev pointer; we only
+            // call this once before joining the capture thread.
             unsafe {
                 let _ = (lib.cancel_async)(self.cancel_handle.0);
             }
+        }
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
         }
     }
 }
 
 impl Drop for CaptureHandle {
     fn drop(&mut self) {
-        self.signal_stop();
-        if let Some(h) = self.thread.take() {
-            let _ = h.join();
-        }
+        self.teardown();
     }
 }
 
@@ -137,6 +156,22 @@ struct CallbackState {
     /// Reuse this scratch to avoid reallocating the Complex32 buffer
     /// per callback (the same chunk size keeps coming back).
     iq_scratch: Vec<Complex32>,
+    /// Radio-tab runtime (RF/audio spectra, S-meter, tune-command apply).
+    /// `None` for plain captures. Shared between the USB callback (on_iq /
+    /// on_audio) and the control thread (apply_command), both behind this
+    /// struct's mutex.
+    radio: Option<RadioRuntime>,
+}
+
+impl CallbackState {
+    /// Apply the DSP side of a Radio-tab command to the chain (no-op
+    /// without radio). Called from the control thread under this mutex; the
+    /// hardware side runs separately, outside the lock.
+    fn apply_radio_command(&mut self, cmd: RadioCommand) {
+        if let Some(rt) = self.radio.as_mut() {
+            rt.apply_command(cmd, &mut self.chain);
+        }
+    }
 }
 
 const STATUS_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
@@ -151,12 +186,16 @@ pub fn start(
     config: &device::RtlsdrConfig,
 ) -> Result<(CaptureHandle, Receiver<Vec<f32>>), RtlsdrError> {
     let session = device::open(config)?;
-    start_on(session)
+    start_on(session, None)
 }
 
-/// Same as [`start`] but takes an already-opened [`RtlsdrSession`].
+/// Same as [`start`] but takes an already-opened [`RtlsdrSession`] and an
+/// optional [`RadioWiring`] (Radio-tab telemetry + control). `None` gives a
+/// plain capture; `Some` wires the shared [`RadioRuntime`] and drives live
+/// retune / gain from a dedicated control thread (never the USB callback).
 pub fn start_on(
     session: RtlsdrSession,
+    radio: Option<RadioWiring>,
 ) -> Result<(CaptureHandle, Receiver<Vec<f32>>), RtlsdrError> {
     let lib = RtlsdrLib::get()?;
     let host_iq_rate_hz = session.config.sample_rate_hz as u64;
@@ -169,6 +208,30 @@ pub fn start_on(
         session.config.max_deviation_hz,
         DEFAULT_LO_OFFSET_HZ as f32,
     ));
+
+    // Build the Radio-tab runtime (if wired). Zero-IF model: the LO is
+    // programmed `DEFAULT_LO_OFFSET_HZ` above the user frequency and the
+    // chain's NCO already sits at `-offset`, so seed `digital_offset =
+    // -offset` ⇒ `displayed_rf = user`. `control_rx` goes to the control
+    // thread spawned below.
+    let (radio_rt, control_rx) = match radio {
+        Some(w) => {
+            let init = RadioInit {
+                input_rate_hz: host_iq_rate_hz as u32,
+                lo_hz: session.config.rf_freq_hz + DEFAULT_LO_OFFSET_HZ as u64,
+                digital_offset_hz: -(DEFAULT_LO_OFFSET_HZ as f64),
+                lo_offset_hz: DEFAULT_LO_OFFSET_HZ as f32,
+                max_deviation_hz: session.config.max_deviation_hz,
+                dc_tunable: false,
+            };
+            (
+                Some(RadioRuntime::new(w.telemetry_tx, init)),
+                Some(w.control_rx),
+            )
+        }
+        None => (None, None),
+    };
+
     let cb_state = Arc::new(Mutex::new(CallbackState {
         chain,
         pending: Vec::with_capacity(TARGET_CHUNK_SAMPLES * 2),
@@ -177,6 +240,7 @@ pub fn start_on(
         frame_errors: 0,
         last_tick: std::time::Instant::now(),
         iq_scratch: Vec::new(),
+        radio: radio_rt,
     }));
 
     // Move the raw device pointer out of the session — the capture
@@ -228,6 +292,19 @@ pub fn start_on(
             RtlsdrError::Stream(format!("spawn capture thread: {e}"))
         })?;
 
+    // Radio-tab control thread: owns `control_rx` + a clone of the
+    // CallbackState Arc + the device pointer (as usize, for tuner FFI). It
+    // applies retune / gain off the USB callback thread (where re-entering
+    // libusb would deadlock). Joined before the capture thread on teardown.
+    let control_thread = control_rx.map(|rx| {
+        let cb = cb_state.clone();
+        let stop_ctl = stop.clone();
+        thread::spawn(move || {
+            let mut hw = RtlHardware::new(dev_addr, lib);
+            run_control(rx, cb, stop_ctl, &mut hw);
+        })
+    });
+
     Ok((
         CaptureHandle {
             stop,
@@ -235,10 +312,40 @@ pub fn start_on(
             sample_rate: AUDIO_RATE,
             channels: 1,
             host_iq_rate_hz,
+            control_thread,
             cancel_handle: CancelHandle(dev),
         },
         sample_rx,
     ))
+}
+
+/// Radio-tab control-thread body: drain retune / gain commands and apply
+/// them under the CallbackState mutex. Exits within one 200 ms poll of the
+/// `stop` flag, or immediately when every command sender has dropped.
+fn run_control(
+    control_rx: Receiver<RadioCommand>,
+    cb_state: Arc<Mutex<CallbackState>>,
+    stop: Arc<AtomicBool>,
+    hw: &mut RtlHardware,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match control_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(cmd) => {
+                // Hardware write OUTSIDE the lock: librtlsdr's USB callback
+                // thread must keep processing events to complete the control
+                // transfer, and it can't if it's blocked on this mutex.
+                RadioRuntime::run_hardware(&cmd, hw);
+                if let Ok(mut g) = cb_state.lock() {
+                    g.apply_radio_command(cmd);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 /// Capture-thread body: blocks in `rtlsdr_read_async` until the
@@ -324,6 +431,7 @@ unsafe extern "C" fn stream_callback(buf: *mut u8, len: u32, ctx: *mut c_void) {
         frame_errors,
         last_tick,
         iq_scratch,
+        radio,
     } = &mut *g;
 
     // Convert interleaved u8 I/Q → Complex32 into the reusable scratch.
@@ -349,12 +457,23 @@ unsafe extern "C" fn stream_callback(buf: *mut u8, len: u32, ctx: *mut c_void) {
         *last_tick = now;
     }
 
+    // Radio tab: wideband RF spectrum from the raw I/Q (before the chain).
+    if let Some(rt) = radio.as_mut() {
+        rt.on_iq(&iq_scratch[..n_samples]);
+    }
+
     // chain.process needs &[Complex32]; iq_scratch is borrowed
     // mutably above. Read-only reborrow is enough since the mutating
     // pass is finished.
-    let audio = chain.process(&iq_scratch[..n_samples]);
+    let mut audio = chain.process(&iq_scratch[..n_samples]);
     if audio.is_empty() {
         return;
+    }
+    // Radio tab: S-meter + audio spectrum; mute the chunk under squelch.
+    if let Some(rt) = radio.as_mut() {
+        if rt.on_audio(&audio, chain.last_channel_power()) {
+            audio.iter_mut().for_each(|s| *s = 0.0);
+        }
     }
 
     pending.extend_from_slice(&audio);

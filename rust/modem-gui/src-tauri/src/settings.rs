@@ -158,6 +158,45 @@ pub struct Settings {
     /// `sdrplay_*` fields the legacy schema carried.
     #[serde(default)]
     pub sdr_settings: SdrSettings,
+
+    /// Persistent UI state for the Radio tab's monitoring controls.
+    #[serde(default)]
+    pub radio: RadioUiSettings,
+}
+
+/// Persistent UI state for the Radio tab's monitoring controls. These
+/// are GUI-side preferences the frontend pushes to the live SDR session
+/// via Tauri commands (`set_squelch` / `set_monitor_output` /
+/// `set_monitor_volume`) plus the S-meter calibration trim it reads when
+/// drawing the needle. None of them is read back from a running capture,
+/// so the GUI re-applies them on Radio-tab entry. Global (not
+/// per-backend): the monitoring chain is independent of which SDR feeds
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RadioUiSettings {
+    /// Audio squelch engaged on the monitor path.
+    pub squelch_enabled: bool,
+    /// Squelch threshold in dBFS (UI range -120..0).
+    pub squelch_dbfs: f32,
+    /// Monitor output device name; `None` = monitoring off.
+    pub monitor_device: Option<String>,
+    /// Monitor volume as a linear gain (UI shows 0..150 %).
+    pub monitor_volume: f32,
+    /// S-meter calibration trim in dB, added to the dBFS→dBm estimate.
+    pub smeter_cal_trim_db: f32,
+}
+
+impl Default for RadioUiSettings {
+    fn default() -> Self {
+        RadioUiSettings {
+            squelch_enabled: false,
+            squelch_dbfs: -80.0,
+            monitor_device: None,
+            monitor_volume: 0.80,
+            smeter_cal_trim_db: 0.0,
+        }
+    }
 }
 
 /// SDR-side persistent state. One entry per registered backend.
@@ -385,6 +424,7 @@ impl Default for Settings {
             active_overlay: 0,
             overlay_default_seeded: false,
             sdr_settings: SdrSettings::default(),
+            radio: RadioUiSettings::default(),
         }
     }
 }

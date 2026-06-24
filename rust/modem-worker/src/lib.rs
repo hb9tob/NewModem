@@ -15,8 +15,10 @@
 
 pub mod event_sink;
 pub mod ptt;
+pub mod radio;
 pub mod rx_worker;
 pub mod session_store;
 pub mod tx_worker;
 
 pub use event_sink::{EventSink, EventSinkExt, NoopSink, RecordingSink};
+pub use radio::{RadioSessionHandle, RadioTuner, RadioUiCommand};

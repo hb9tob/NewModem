@@ -8,6 +8,7 @@
   pret a zipper contenant :
     - nbfm-modem-gui.exe                              (binaire GUI)
     - nbfm-modem-x86_64-pc-windows-msvc.exe           (sidecar CLI)
+    - rtlsdr.dll                                      (driver RTL-SDR runtime)
     - portable.txt                                    (marqueur mode portable)
     - README-portable.txt                             (notice utilisateur)
 
@@ -91,6 +92,17 @@ New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 
 Copy-Item $GuiExe (Join-Path $StageDir 'nbfm-modem-gui.exe')
 Copy-Item $CliExe (Join-Path $StageDir "nbfm-modem-$Triple.exe")
+
+# RTL-SDR runtime driver. The GUI loads it at runtime when the RTL backend
+# is enabled; without it the portable build silently lacks RTL support
+# (SDRplay/Pluto are unaffected). Same DLL the NSIS bundle ships as a
+# Tauri resource (rust/modem-gui/src-tauri/rtlsdr.dll).
+$RtlDll = Join-Path $RepoRoot 'rust\modem-gui\src-tauri\rtlsdr.dll'
+if (Test-Path $RtlDll) {
+    Copy-Item $RtlDll (Join-Path $StageDir 'rtlsdr.dll')
+} else {
+    Write-Warning "rtlsdr.dll introuvable a $RtlDll — zip portable sans support RTL-SDR."
+}
 
 # Marqueur portable : presence suffit, contenu ignore par le code Rust.
 Set-Content -Path (Join-Path $StageDir 'portable.txt') -Value '' -Encoding ascii -NoNewline

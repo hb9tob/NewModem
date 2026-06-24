@@ -19,8 +19,8 @@ use std::sync::OnceLock;
 
 use modem_sdr::{
     AgcMode as SdrAgcModeDescriptor, AntennaChoice, BackendCapabilities, BackendFeatures,
-    DeviceDescriptor, GainSetting, ManualGainShape, ManualGainValue, SampleRateStrategy,
-    SdrBackend, SdrCaptureHandle, SdrConfig, SdrDevice, SdrError, TunerOption,
+    DeviceDescriptor, GainSetting, ManualGainShape, ManualGainValue, RadioTuning,
+    SampleRateStrategy, SdrBackend, SdrCaptureHandle, SdrConfig, SdrDevice, SdrError, TunerOption,
 };
 
 use crate::device::{self, RtlsdrConfig, GAIN_TABLE_TENTHS_DB, PREFERRED_SAMPLE_RATE_HZ};
@@ -71,6 +71,17 @@ fn rtlsdr_capabilities() -> &'static BackendCapabilities {
             sample_rate_strategy: SampleRateStrategy {
                 host_iq_rate_hz: PREFERRED_SAMPLE_RATE_HZ as u64,
                 audio_decim_ratio: PREFERRED_SAMPLE_RATE_HZ / 48_000,
+            },
+            // RTL2832U is zero-IF with a DC spike; keep the channel off
+            // DC via a deliberate LO offset and a guard band. `lo_offset_hz`
+            // MUST match `device::DEFAULT_LO_OFFSET_HZ` (250 kHz) — the
+            // capture chain and the RadioTuner both derive the tuned-channel
+            // position from it, so a mismatch puts the marker off the signal.
+            radio_tuning: RadioTuning {
+                dc_tunable: false,
+                lo_offset_hz: 250_000.0,
+                digital_window_hz: 200_000.0,
+                dc_guard_hz: 8_000.0,
             },
         }
     })
@@ -177,8 +188,19 @@ impl SdrDevice for RtlsdrDevice {
             backend: BACKEND_ID,
             detail: "device already started — re-open to RX again".into(),
         })?;
-        let (handle, rx) = rx::start_on(session).map_err(SdrError::backend)?;
-        Ok((SdrCaptureHandle::new(handle), rx))
+        // Always wire the Radio-tab channels: the telemetry/control overhead
+        // is negligible and the GUI decides whether to consume them.
+        let (telemetry_tx, telemetry_rx) = std::sync::mpsc::channel();
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let wiring = rx::RadioWiring {
+            telemetry_tx,
+            control_rx,
+        };
+        let (handle, rx) = rx::start_on(session, Some(wiring)).map_err(SdrError::backend)?;
+        Ok((
+            SdrCaptureHandle::with_radio(handle, telemetry_rx, control_tx),
+            rx,
+        ))
     }
     fn tx_sink(&self) -> Option<Arc<dyn modem_io::SampleSink>> {
         None

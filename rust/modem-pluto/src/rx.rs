@@ -41,11 +41,14 @@ use std::time::Duration;
 
 use num_complex::Complex32;
 
+use modem_sdr::config::{GainSetting, ManualGainValue};
+use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
 use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
+use modem_sdr_radio::{RadioHardware, RadioInit, RadioRuntime};
 
-use crate::device::{self, NegotiatedRate, PlutoConfig, PlutoSession};
+use crate::device::{self, NegotiatedRate, PlutoConfig, PlutoSession, RxGainMode};
 use crate::error::PlutoError;
-use crate::iiod::IiodClient;
+use crate::iiod::{ChanDir, IiodClient};
 
 /// Audio rate the chain produces. Locked to the modem core's
 /// `AUDIO_RATE`. Decimation ratio against the AD9361's IF rate is
@@ -85,6 +88,17 @@ const RX_S12_PEAK: f32 = 2047.0;
 /// USB hiccup doesn't flood the terminal.
 const STATUS_TICK_PERIOD: Duration = Duration::from_secs(2);
 
+// Radio-tab FFT sizes and emit-rate throttles now live in the shared
+// `modem_sdr_radio::RadioRuntime`.
+
+/// The two channel ends the worker hands the capture thread to drive
+/// the Radio tab: telemetry out (spectra / S-meter / tune state) and
+/// control in (retune / gain / squelch). `None` for plain captures.
+struct RadioWiring {
+    telemetry_tx: Sender<RadioTelemetry>,
+    control_rx: Receiver<RadioCommand>,
+}
+
 /// Live handle on a Pluto capture thread. Drop / call [`stop()`] to
 /// cancel streaming.
 pub struct CaptureHandle {
@@ -122,6 +136,40 @@ impl Drop for CaptureHandle {
 /// `(handle, mpsc::Receiver<Vec<f32>>)` tuple — so the worker doesn't
 /// know it's talking to an SDR rather than a soundcard.
 pub fn start(config: &PlutoConfig) -> Result<(CaptureHandle, Receiver<Vec<f32>>), PlutoError> {
+    let (handle, sample_rx) = start_inner(config, None)?;
+    Ok((handle, sample_rx))
+}
+
+/// Like [`start`] but also wires the Radio-tab telemetry / control
+/// channels into the capture thread. Returns, in addition to the audio
+/// receiver, the telemetry receiver (RF/audio spectrum, S-meter, tune
+/// state) and the control sender (live retune / gain / squelch).
+pub fn start_radio(
+    config: &PlutoConfig,
+) -> Result<
+    (
+        CaptureHandle,
+        Receiver<Vec<f32>>,
+        Receiver<RadioTelemetry>,
+        Sender<RadioCommand>,
+    ),
+    PlutoError,
+> {
+    let (telemetry_tx, telemetry_rx) = mpsc::channel::<RadioTelemetry>();
+    let (control_tx, control_rx) = mpsc::channel::<RadioCommand>();
+    let wiring = RadioWiring {
+        telemetry_tx,
+        control_rx,
+    };
+    let (handle, sample_rx) = start_inner(config, Some(wiring))?;
+    Ok((handle, sample_rx, telemetry_rx, control_tx))
+}
+
+/// Shared spawn path for [`start`] / [`start_radio`].
+fn start_inner(
+    config: &PlutoConfig,
+    radio: Option<RadioWiring>,
+) -> Result<(CaptureHandle, Receiver<Vec<f32>>), PlutoError> {
     let (sample_tx, sample_rx) = mpsc::channel::<Vec<f32>>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<NegotiatedRate, PlutoError>>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -129,7 +177,7 @@ pub fn start(config: &PlutoConfig) -> Result<(CaptureHandle, Receiver<Vec<f32>>)
     let cfg = config.clone();
 
     let thread = thread::spawn(move || {
-        run_capture(cfg, sample_tx, ready_tx, stop_thread);
+        run_capture(cfg, sample_tx, ready_tx, stop_thread, radio);
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
@@ -158,7 +206,7 @@ pub fn start_on(
     sample_tx: Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
 ) -> Result<NegotiatedRate, PlutoError> {
-    capture_loop(session, sample_tx, stop)
+    capture_loop(session, sample_tx, stop, None)
 }
 
 fn run_capture(
@@ -166,6 +214,7 @@ fn run_capture(
     sample_tx: Sender<Vec<f32>>,
     ready_tx: Sender<Result<NegotiatedRate, PlutoError>>,
     stop: Arc<AtomicBool>,
+    radio: Option<RadioWiring>,
 ) {
     let session = match device::open(&config) {
         Ok(s) => s,
@@ -176,7 +225,7 @@ fn run_capture(
     };
     let rate = session.negotiated_rate;
     let _ = ready_tx.send(Ok(rate));
-    let _ = capture_loop(session, sample_tx, stop);
+    let _ = capture_loop(session, sample_tx, stop, radio);
 }
 
 /// Inner loop. Returns once `stop` is set or the iiod stream fails.
@@ -185,6 +234,7 @@ fn capture_loop(
     session: PlutoSession,
     sample_tx: Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
+    radio: Option<RadioWiring>,
 ) -> Result<NegotiatedRate, PlutoError> {
     // Open the streaming connection — distinct from the control
     // connection that `device::open` used and dropped. iiod allocates
@@ -215,6 +265,34 @@ fn capture_loop(
         session.rx_max_deviation_hz,
         0.0,
     ));
+
+    // Radio-tab runtime: spectra / S-meter / tune-state telemetry and live
+    // retune. `None` for plain captures (CLI, loopback) — the loop costs
+    // nothing extra then. The shared runtime owns the DSP/telemetry; the
+    // control receiver is drained inline below (this is a poll loop, not a
+    // callback, so it may safely touch the hardware) and the Pluto-specific
+    // LO/gain writes go through `PlutoHardware`. lo_offset = 0 (AD9363 DC
+    // comp), so digital_offset starts at 0 and displayed_rf = the LO.
+    let (mut radio_rt, mut radio_ctl, mut radio_hw) = match radio {
+        Some(w) => {
+            let init = RadioInit {
+                input_rate_hz: session.negotiated_rate.sample_rate_hz as u32,
+                lo_hz: session.config.rx_freq_hz,
+                digital_offset_hz: 0.0,
+                lo_offset_hz: 0.0,
+                max_deviation_hz: session.rx_max_deviation_hz,
+                dc_tunable: true,
+            };
+            (
+                Some(RadioRuntime::new(w.telemetry_tx, init)),
+                Some(w.control_rx),
+                Some(PlutoHardware {
+                    uri: session.config.uri.clone(),
+                }),
+            )
+        }
+        None => (None, None, None),
+    };
 
     // Pre-allocated I/Q wire-format scratch — one buffer worth of
     // bytes. iiod's `read_buffer_into` writes here; we reinterpret
@@ -265,12 +343,34 @@ fn capture_loop(
             iq.push(Complex32::new(i, q));
         }
 
+        // Radio control + wideband spectrum: drain any pending retune /
+        // gain / squelch commands (may rebuild `chain`), then run the
+        // RF FFT on the raw I/Q (before downmix). Both throttled inside.
+        if let (Some(rt), Some(ctl), Some(hw)) =
+            (radio_rt.as_mut(), radio_ctl.as_mut(), radio_hw.as_mut())
+        {
+            while let Ok(cmd) = ctl.try_recv() {
+                RadioRuntime::run_hardware(&cmd, hw);
+                rt.apply_command(cmd, &mut chain);
+            }
+            rt.on_iq(&iq);
+        }
+
         // Channel select + demod + audio filters in one call. The
         // chain handles every rate transition; we get 48 kHz mono
         // back.
-        let audio = chain.process(&iq);
+        let mut audio = chain.process(&iq);
         if audio.is_empty() {
             continue;
+        }
+
+        // Radio audio telemetry (S-meter + audio spectrum) and squelch.
+        // A muted chunk is zeroed so neither the monitor nor the decode
+        // path hears noise below the threshold.
+        if let Some(rt) = radio_rt.as_mut() {
+            if rt.on_audio(&audio, chain.last_channel_power()) {
+                audio.iter_mut().for_each(|s| *s = 0.0);
+            }
         }
 
         // Accumulate into `pending`, flush full chunks of
@@ -302,4 +402,83 @@ fn capture_loop(
     let _ = client.close_buffer(crate::device::iio_names::RX_BUFFER);
     let _ = client.close();
     Ok(session.negotiated_rate)
+}
+
+/// Live-tuning hardware shim for the Radio tab: turns the backend-agnostic
+/// [`RadioHardware`] calls into AD9361 iiod attribute writes over a
+/// transient control connection. The shared `RadioRuntime` owns the DSP /
+/// telemetry; only the LO / gain writes are Pluto-specific.
+struct PlutoHardware {
+    uri: String,
+}
+
+impl RadioHardware for PlutoHardware {
+    fn retune_lo(&mut self, lo_hz: u64) {
+        if let Err(e) = live_lo_write(&self.uri, lo_hz) {
+            eprintln!("[pluto-rx] live LO write to {lo_hz} Hz failed: {e}");
+        }
+    }
+
+    fn set_gain(&mut self, gain: &GainSetting) {
+        if let Err(e) = apply_gain_live(&self.uri, gain) {
+            eprintln!("[pluto-rx] live gain change failed: {e}");
+        }
+    }
+}
+
+/// Live hardware-LO retune over a transient iiod control connection.
+/// iiod allocates one server thread per client and the AD9361
+/// serialises hardware contention, so opening a short-lived control
+/// connection alongside the streaming one is clean — and far simpler
+/// than multiplexing control writes onto the busy streaming socket.
+/// Retunes are operator-driven (rare), so the connect cost is moot.
+pub(crate) fn live_lo_write(uri: &str, lo_hz: u64) -> Result<(), PlutoError> {
+    let mut c = IiodClient::connect(uri)?;
+    let _ = c.set_iiod_timeout(2000);
+    c.write_chn_attr(
+        device::iio_names::PHY,
+        ChanDir::Output,
+        "altvoltage0",
+        "frequency",
+        &lo_hz.to_string(),
+    )
+    .map_err(|e| PlutoError::Stream(format!("live RX_LO write {lo_hz} Hz: {e}")))?;
+    c.close()?;
+    Ok(())
+}
+
+/// Live RX-gain change over a transient control connection. Maps the
+/// backend-agnostic [`GainSetting`] onto the AD9361's
+/// `gain_control_mode` + `hardwaregain` the same way `device::open`
+/// does at session start.
+fn apply_gain_live(uri: &str, gain: &GainSetting) -> Result<(), PlutoError> {
+    let (mode, db) = match gain {
+        GainSetting::Manual(ManualGainValue::Db { db }) => (RxGainMode::Manual, *db),
+        GainSetting::Manual(_) => (RxGainMode::Manual, 30),
+        GainSetting::AgcMode { id, .. } => {
+            (RxGainMode::from_iio_str(id).unwrap_or(RxGainMode::SlowAttack), 30)
+        }
+    };
+    let mut c = IiodClient::connect(uri)?;
+    let _ = c.set_iiod_timeout(2000);
+    c.write_chn_attr(
+        device::iio_names::PHY,
+        ChanDir::Input,
+        "voltage0",
+        "gain_control_mode",
+        mode.as_iio_str(),
+    )
+    .map_err(|e| PlutoError::Stream(format!("live gain_control_mode: {e}")))?;
+    if mode == RxGainMode::Manual {
+        c.write_chn_attr(
+            device::iio_names::PHY,
+            ChanDir::Input,
+            "voltage0",
+            "hardwaregain",
+            &db.to_string(),
+        )
+        .map_err(|e| PlutoError::Stream(format!("live hardwaregain {db} dB: {e}")))?;
+    }
+    c.close()?;
+    Ok(())
 }

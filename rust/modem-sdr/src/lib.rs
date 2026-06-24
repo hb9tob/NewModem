@@ -33,14 +33,16 @@ pub mod config;
 pub mod device;
 pub mod error;
 pub mod handle;
+pub mod telemetry;
 pub mod traits;
 
 pub use capabilities::{
-    AgcMode, AntennaChoice, BackendCapabilities, BackendFeatures, ManualGainShape,
+    AgcMode, AntennaChoice, BackendCapabilities, BackendFeatures, ManualGainShape, RadioTuning,
     SampleRateStrategy, TunerOption,
 };
 pub use config::{GainSetting, ManualGainValue, SdrConfig};
 pub use device::DeviceDescriptor;
 pub use error::SdrError;
 pub use handle::SdrCaptureHandle;
+pub use telemetry::{RadioCommand, RadioTelemetry, SpectrumFrame, TuneState};
 pub use traits::{SdrBackend, SdrDevice};

@@ -33,8 +33,8 @@ use std::sync::OnceLock;
 
 use modem_sdr::{
     AgcMode as SdrAgcModeDescriptor, AntennaChoice, BackendCapabilities, BackendFeatures,
-    DeviceDescriptor, GainSetting, ManualGainShape, ManualGainValue, SampleRateStrategy,
-    SdrBackend, SdrCaptureHandle, SdrConfig, SdrDevice, SdrError, TunerOption,
+    DeviceDescriptor, GainSetting, ManualGainShape, ManualGainValue, RadioTuning,
+    SampleRateStrategy, SdrBackend, SdrCaptureHandle, SdrConfig, SdrDevice, SdrError, TunerOption,
 };
 
 use crate::device::{
@@ -131,6 +131,21 @@ fn shared_sample_rate_strategy() -> SampleRateStrategy {
     }
 }
 
+/// Radio-tab tuning for the SDRplay family. Zero-IF tuners show a DC
+/// spike, so the channel must stay off DC: `dc_tunable = false`, a
+/// deliberate LO offset keeps the carrier clear, and the digital
+/// fine-tune is forbidden from bringing the channel inside the guard
+/// band around DC. (Wired into the capture path in a later pass — the
+/// Pluto backend is the reference for now.)
+fn shared_radio_tuning() -> RadioTuning {
+    RadioTuning {
+        dc_tunable: false,
+        lo_offset_hz: 75_000.0,
+        digital_window_hz: 200_000.0,
+        dc_guard_hz: 8_000.0,
+    }
+}
+
 /// Family-level capabilities — used pre-selection, also serves as the
 /// fallback for unknown hwVer bytes. Identical to RSPduo's caps so we
 /// never silently hide a knob the user might need.
@@ -178,6 +193,7 @@ fn sdrplay_capabilities() -> &'static BackendCapabilities {
             rf_bandwidth_range_hz: None,
         },
         sample_rate_strategy: shared_sample_rate_strategy(),
+        radio_tuning: shared_radio_tuning(),
     })
 }
 
@@ -217,6 +233,7 @@ fn sdrplay_capabilities_rsp1a() -> &'static BackendCapabilities {
             rf_bandwidth_range_hz: None,
         },
         sample_rate_strategy: shared_sample_rate_strategy(),
+        radio_tuning: shared_radio_tuning(),
     })
 }
 
@@ -251,6 +268,7 @@ fn sdrplay_capabilities_rsp1() -> &'static BackendCapabilities {
             rf_bandwidth_range_hz: None,
         },
         sample_rate_strategy: shared_sample_rate_strategy(),
+        radio_tuning: shared_radio_tuning(),
     })
 }
 
@@ -383,8 +401,19 @@ impl SdrDevice for SdrplayDevice {
             backend: BACKEND_ID,
             detail: "device already started — re-open to RX again".into(),
         })?;
-        let (handle, rx) = rx::start_on(session).map_err(SdrError::backend)?;
-        Ok((SdrCaptureHandle::new(handle), rx))
+        // Always wire the Radio-tab channels: the telemetry/control overhead
+        // is negligible and the GUI decides whether to consume them.
+        let (telemetry_tx, telemetry_rx) = std::sync::mpsc::channel();
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let wiring = rx::RadioWiring {
+            telemetry_tx,
+            control_rx,
+        };
+        let (handle, rx) = rx::start_on(session, Some(wiring)).map_err(SdrError::backend)?;
+        Ok((
+            SdrCaptureHandle::with_radio(handle, telemetry_rx, control_tx),
+            rx,
+        ))
     }
 
     fn tx_sink(&self) -> Option<Arc<dyn modem_io::SampleSink>> {

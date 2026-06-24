@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 num-complex = { workspace = true }
+rustfft = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
