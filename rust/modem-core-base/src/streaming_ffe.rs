@@ -174,6 +174,20 @@ impl StreamingFfe {
         self.current_taps = Some(taps);
     }
 
+    /// Reposition the symbol buffers to start at absolute symbol index
+    /// `sym_abs`, discarding the current contents — the FFE counterpart to
+    /// [`StreamingDsp::rewind_to`]. The adaptive `current_taps` are KEPT (the
+    /// caller typically [`restore_taps`]es a converged snapshot first), so the
+    /// backward re-equalisation starts from a trained prior, not cold. As with
+    /// the DSP rewind the first few symbols lack full fractional context and
+    /// should be discarded (feed from `warmup` symbols before the target).
+    pub fn rewind_to(&mut self, sym_abs: u64) {
+        self.frac_buf.clear();
+        self.raw_sym_buf.clear();
+        self.out_buf.clear();
+        self.start_abs = sym_abs;
+    }
+
     /// Energy-weighted centroid of the current taps, in fractional-sample
     /// units (T/`pitch_fse`). Under a clock-drift mismatch the adaptive taps
     /// migrate at the drift rate (Ungerboeck 1976 / Gitlin tap-leakage): the

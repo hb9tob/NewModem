@@ -250,13 +250,16 @@ impl StreamingDsp {
         for s in self.mf_state.iter_mut() {
             *s = Complex64::new(0.0, 0.0);
         }
-        // Decimation cursor lands on the next on-grid symbol >= out_idx so the
-        // symbol indexing stays aligned to the d_fse lattice.
-        let d = self.d_fse as u64;
-        let dec = out_idx.div_ceil(d) * d;
+        // Decimation cursor lands on the next ON-SYMBOL grid point >= out_idx
+        // (a multiple of sps = d_fse·pitch_fse in the output domain), so the
+        // produced fse stream begins on a symbol boundary and the downstream
+        // FFE's on-symbol invariant (frac_buf[0] is on-symbol) holds after its
+        // matching rewind.
+        let g = self.sps as u64;
+        let dec = out_idx.div_ceil(g) * g;
         self.decimation_cursor_abs = dec;
         self.sym_buffer.clear();
-        self.sym_buffer_start_abs = dec / d;
+        self.sym_buffer_start_abs = dec / self.d_fse as u64;
     }
 
     /// Audio samples of delay-line context the resampler + matched filter need
