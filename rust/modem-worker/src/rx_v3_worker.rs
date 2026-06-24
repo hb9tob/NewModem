@@ -109,8 +109,14 @@ pub struct RxV3Worker {
     /// Set once the exact profile has been resolved: `true` from the start in
     /// forced mode (the operator locked `profile`), otherwise flipped `true`
     /// by the first validated marker. Gates the one-shot marker-driven
-    /// exact-profile refinement so it fires at most once per driver.
+    /// exact-profile refinement so it fires at most once per BURST (reset to
+    /// `forced` at each burst boundary so the next transmission — possibly a
+    /// different profile of the SAME geometry, e.g. HIGH++ → HIGH+ — re-refines).
     detected_locked: bool,
+    /// The operator's auto/forced choice, preserved so a burst-boundary restart
+    /// can restore `detected_locked` to its initial value (re-enabling profile
+    /// refinement in auto mode, keeping the lock in forced mode).
+    forced: bool,
     /// Deferred profile switch requested from inside `route()` (which is
     /// mid-iteration over the current event batch): the actual session
     /// rebuild + history replay runs in `push_samples` once routing of the
@@ -200,6 +206,7 @@ impl RxV3Worker {
             history: VecDeque::with_capacity(HISTORY_SAMPLES),
             history_origin: 0,
             detected_locked: forced,
+            forced,
             pending_rebuild: None,
             restart_pending: false,
             sigma2_running: HashMap::new(),
@@ -311,6 +318,13 @@ impl RxV3Worker {
         self.pending_cw.clear();
         self.active = false;
         self.samples_since_progress = 0;
+        // Re-arm the one-shot exact-profile refinement (auto mode only): the
+        // next transmission may be a different profile of the SAME geometry
+        // (HIGH++ → HIGH+ share the sps=32 preamble family), and its first
+        // marker must be allowed to switch the session. Without this the driver
+        // stayed locked on the previous burst's profile and silently failed the
+        // new one until a manual stop/start. Forced mode keeps its lock.
+        self.detected_locked = self.forced;
         // Reset the central ring + frame so the rebuilt session's absolute-sample
         // frame (which restarts at 0) stays consistent with `history_origin`
         // (same invariant `rebuild_at` relies on).
@@ -956,6 +970,72 @@ mod tests {
         assert!(
             decoded_sids.contains(&sid_b),
             "burst B ({sid_b:#010x}) not assembled: {decoded_sids:#010x?}",
+        );
+    }
+
+    #[test]
+    fn auto_worker_reacquires_a_different_profile_of_the_same_geometry() {
+        // Auto mode, two bursts of DIFFERENT profiles in the SAME geometry
+        // (HIGH++ then HIGH+, both sps=32 → identical preamble/markers). After
+        // burst A the driver has refined+locked on HIGH++; the burst boundary
+        // must RE-ARM the refinement so burst B's marker switches to HIGH+.
+        // Without that reset the driver stays on HIGH++ and silently fails
+        // burst B (the "needs a stop/start" bug).
+        let cfg_a = ProfileIndex::HighPlusPlus.to_config();
+        let cfg_b = ProfileIndex::HighPlus.to_config();
+        let sid_a = 0xAA11_AA11u32;
+        let sid_b = 0xBB22_BB22u32;
+        let mut audio = build_v3_burst_audio(&cfg_a, 800, sid_a);
+        let mut s: u64 = 0x51ED;
+        let noise: Vec<f32> = (0..(AUDIO_RATE as usize) * 3)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 0.3
+            })
+            .collect();
+        audio.extend_from_slice(&noise);
+        audio.extend_from_slice(&build_v3_burst_audio(&cfg_b, 800, sid_b));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
+        let sink = Arc::new(crate::event_sink::RecordingSink::new());
+        // Auto mode: the driver bootstraps at the HIGH++ family anchor and
+        // refines per burst from the marker's advertised profile_index.
+        let mut worker = RxV3Worker::new(
+            ProfileIndex::HighPlusPlus,
+            /*forced=*/ false,
+            save_dir,
+            sink as Arc<dyn EventSink>,
+        )
+        .unwrap();
+
+        let mut decoded_sids = Vec::new();
+        let mut i = 0;
+        let sizes = [2400usize, 997, 4096, 480];
+        let mut k = 0;
+        while i < audio.len() {
+            let n = sizes[k % sizes.len()].min(audio.len() - i);
+            let out = worker.push_samples(&audio[i..i + n]);
+            if let Some(df) = out.decoded {
+                decoded_sids.push(df.session_id);
+            }
+            i += n;
+            k += 1;
+        }
+        if let Some(df) = worker.finalize().decoded {
+            decoded_sids.push(df.session_id);
+        }
+
+        assert!(
+            decoded_sids.contains(&sid_a),
+            "HIGH++ burst A ({sid_a:#010x}) not assembled: {decoded_sids:#010x?}",
+        );
+        assert!(
+            decoded_sids.contains(&sid_b),
+            "HIGH+ burst B ({sid_b:#010x}) not assembled — profile refinement not \
+             re-armed at the burst boundary: {decoded_sids:#010x?}",
         );
     }
 }
