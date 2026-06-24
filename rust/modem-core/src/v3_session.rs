@@ -120,6 +120,11 @@ const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
 /// ~0.6 s of corruption at HIGH+ before giving up.
 const MAX_CONSECUTIVE_MISS: u32 = 3;
 
+/// Converged CWs of forward decode before the backward flywheel fires — enough
+/// for the FFE/phase to have trained, while the entry segments still sit inside
+/// the ~2-superframe FFE retention so the backward span is reachable.
+const BACKWARD_TRAIN_CWS: u32 = 4;
+
 /// Worst-case FFE training reference span behind a SOF: V3 preamble
 /// (256 sym) + a generous LMS warmup margin. The actual training pull
 /// at PLHEADER time can use fewer refs without overflowing the
@@ -406,6 +411,17 @@ pub struct V3Session {
     /// blind CW is a self-validating anchor, and noise never converges so it
     /// cannot poison). Disable with `V3_NO_FLYWHEEL`.
     flywheel: bool,
+    /// Backward flywheel (late/damaged-entry recovery, env `V3_BACKWARD`): once
+    /// the FFE/phase have trained forward, retreat the cadence from the entry
+    /// marker and re-decode the EARLIER (preamble-lost) segments via
+    /// `canon_demod_segment` on the live taps — the intact markers resync, 2
+    /// consecutive non-converged stop it. One-shot per burst.
+    backward_enabled: bool,
+    backward_attempted: bool,
+    /// Entry (first validated) marker of the burst: its symbol position and
+    /// base_esi — the retreat origin for the backward flywheel.
+    entry_marker_sym_abs: Option<u64>,
+    entry_marker_base_esi: Option<u32>,
     /// Running base_esi the NEXT segment should carry (`esi_start + data_cursor`,
     /// mirrors TX frame.rs). Re-synced from the wire on every validated decode,
     /// advanced +2 per DATA / +0 per META. Labels blind segments under `flywheel`.
@@ -724,6 +740,10 @@ impl V3Session {
             next_marker_is_meta: false,
             consecutive_miss: 0,
             flywheel: std::env::var_os("V3_NO_FLYWHEEL").is_none(),
+            backward_enabled: std::env::var_os("V3_BACKWARD").is_some(),
+            backward_attempted: false,
+            entry_marker_sym_abs: None,
+            entry_marker_base_esi: None,
             next_base_esi: None,
             marker_drop_n: std::env::var("V3_DROP_MARKER")
                 .ok()
@@ -1009,6 +1029,19 @@ impl V3Session {
         //     is buffered for a forward-backward-forward re-equalisation.
         self.retry_failed_segments(&mut events);
 
+        // 4a-ter. Backward flywheel: once the FFE/phase have trained over the
+        //     first ~superframe of forward decode, retreat the cadence and
+        //     recover the EARLIER (preamble-lost) segments still in the FFE
+        //     window. One-shot, gated on `V3_BACKWARD`. Triggered here, after
+        //     a stable forward lock, so the seed is well-trained (the entry
+        //     segments still sit inside the ~2-superframe FFE retention).
+        if self.backward_enabled
+            && !self.backward_attempted
+            && self.cws_converged >= BACKWARD_TRAIN_CWS
+        {
+            self.recover_backward(&mut events);
+        }
+
         // 4b. Phase 4 coarse one-shot drift LS. Once enough refined
         //     marker positions have accumulated, fit slope, decide
         //     whether to reboot the streaming pipeline at the corrected
@@ -1109,6 +1142,10 @@ impl V3Session {
         self.drift_diag_cum = 0.0;
         self.entry_preamble_abs = None;
         self.preamble1_refined_abs = None;
+        // Backward flywheel: re-arm for the next burst / re-decode.
+        self.backward_attempted = false;
+        self.entry_marker_sym_abs = None;
+        self.entry_marker_base_esi = None;
         self.two_preamble_attempted = false;
         self.drift_recommits = 0;
         self.elapsed_since_preamble_sym = 0;
@@ -1285,6 +1322,17 @@ impl V3Session {
     /// from that preamble. Preserved across a give-up `finalize()`.
     fn note_recovery_anchor(&mut self, marker_audio_abs: u64, base_esi: u32) {
         self.recovery_base_esi = Some(base_esi);
+        // Remember the FIRST validated marker of the burst as the backward
+        // flywheel's retreat origin (symbol position + base_esi). `marker_at_abs
+        // = marker_sym_pos * sps`, so the symbol position is the audio position
+        // divided by sps.
+        if self.entry_marker_base_esi.is_none() {
+            let (sps, _) =
+                rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
+                    .expect("profile config has valid integer sps");
+            self.entry_marker_sym_abs = Some(marker_audio_abs / sps as u64);
+            self.entry_marker_base_esi = Some(base_esi);
+        }
         if let Some(entry) = self.entry_preamble_abs {
             if marker_audio_abs >= entry {
                 let (sps, _) = rrc::check_integer_constraints(
@@ -1913,6 +1961,160 @@ impl V3Session {
             );
         }
         Some((results, last_sigma2))
+    }
+
+    /// Backward flywheel: late/damaged-entry recovery (env `V3_BACKWARD`, see the
+    /// field docs). Once the FFE/phase have trained forward, retreat the cadence
+    /// from the entry marker over the retained FFE window and re-decode the
+    /// EARLIER (preamble-lost) segments via `canon_demod_segment` on the LIVE
+    /// taps — its forward-backward-forward + two-filter RTS is the real backward
+    /// pass (no tap/phase copy; BiDFE / time-reversal-EQ literature). The intact
+    /// markers (Golay+CRC) resync each step; **2 consecutive non-converged**
+    /// segments, `base_esi == 0`, or the window edge stop the coast. One-shot.
+    fn recover_backward(&mut self, events: &mut Vec<V3SessionEvent>) {
+        if !self.backward_enabled || self.backward_attempted || self.replaying || !self.ffe.has_taps()
+        {
+            return;
+        }
+        let (Some(entry_marker), Some(entry_esi)) =
+            (self.entry_marker_sym_abs, self.entry_marker_base_esi)
+        else {
+            return;
+        };
+        self.backward_attempted = true;
+        if entry_esi == 0 {
+            return; // already at the start — nothing precedes it
+        }
+        let radius = marker::MARKER_SYNC_LEN as u64;
+        let data_step = marker::MARKER_LEN as u64 + self.seg_sym_len_past_marker(false) as u64;
+        if std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[sync] BACKWARD-START entry_marker={entry_marker} entry_esi={entry_esi} \
+                 data_step={data_step} ffe_window=[{}..{}]",
+                self.ffe.start_abs(),
+                self.ffe.start_abs() + self.ffe.out_buf().len() as u64,
+            );
+        }
+        // A superframe boundary inserts a fresh PRE+HDR before the META, so the
+        // previous marker there sits this much further back than a DATA step.
+        let boundary_extra =
+            self.cfg.lms_warmup_syms() as u64 + self.superframe_header_offset_sym;
+
+        let mut marker_pos = entry_marker;
+        let mut miss = 0u32;
+        loop {
+            if miss >= 2 {
+                break;
+            }
+            let found = self
+                .search_prev_marker(marker_pos, data_step, radius)
+                .or_else(|| self.search_prev_marker(marker_pos, data_step + boundary_extra, radius));
+            let Some((prev_marker_abs, payload)) = found else {
+                break; // no marker in the retained window (gone / scrolled out)
+            };
+            let is_meta = payload.is_meta();
+            let prev_base_esi = payload.base_esi;
+            let warmup_detach = if is_meta {
+                self.cfg.lms_warmup_syms() as u64
+            } else {
+                0
+            };
+            let seg_start_abs = prev_marker_abs + marker::MARKER_LEN as u64 + warmup_detach;
+            let seg_sym_len = self.seg_sym_len_past_marker(is_meta);
+            let n_cw = if is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
+            if seg_start_abs < self.ffe.start_abs() {
+                break; // segment scrolled out of the retained window
+            }
+            let Some((per_cw, sigma2)) = self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw)
+            else {
+                miss += 1;
+                marker_pos = prev_marker_abs;
+                continue;
+            };
+            let mut any_conv = false;
+            for (cw_idx, (bytes, converged)) in per_cw.into_iter().enumerate() {
+                if !converged {
+                    continue; // accept ONLY converged CWs — never inject false data
+                }
+                any_conv = true;
+                self.cws_converged = self.cws_converged.saturating_add(1);
+                let esi = prev_base_esi + cw_idx as u32;
+                if is_meta {
+                    if let Some(h) = decode_meta_payload(&bytes) {
+                        if h.k_symbols != 0 && h.file_size != 0 && self.app_header.is_none() {
+                            events.push(V3SessionEvent::AppHeaderRecovered {
+                                session_id: h.session_id,
+                                file_size: h.file_size,
+                                k_symbols: h.k_symbols,
+                                t_bytes: h.t_bytes,
+                                mode_code: h.mode_code,
+                                mime_type: h.mime_type,
+                                hash_short: h.hash_short,
+                            });
+                            self.app_header = Some(h);
+                        }
+                    }
+                }
+                events.push(V3SessionEvent::CwDecoded {
+                    cycle_idx: 0,
+                    cw_idx,
+                    esi,
+                    is_meta,
+                    converged: true,
+                    bytes,
+                    sigma2,
+                });
+            }
+            if std::env::var_os("V3_LOG_SYNC").is_some() {
+                eprintln!(
+                    "[sync] BACKWARD-FLYWHEEL marker={prev_marker_abs} base_esi={prev_base_esi} \
+                     is_meta={is_meta} any_conv={any_conv} miss={miss}",
+                );
+            }
+            if any_conv {
+                miss = 0;
+            } else {
+                miss += 1;
+            }
+            marker_pos = prev_marker_abs;
+            if prev_base_esi == 0 {
+                break; // reached the true start
+            }
+        }
+    }
+
+    /// Find a marker `back` symbols before `marker_pos` (±`radius`) in the
+    /// FFE-equalised symbol buffer; returns its absolute symbol position +
+    /// payload. The backward-flywheel resync (intact markers).
+    fn search_prev_marker(
+        &self,
+        marker_pos: u64,
+        back: u64,
+        radius: u64,
+    ) -> Option<(u64, marker::MarkerPayload)> {
+        let pred = marker_pos.checked_sub(back)?;
+        let raw_start_abs = self.ffe.start_abs();
+        if pred < raw_start_abs.saturating_add(radius) {
+            return None;
+        }
+        let window_start_abs = pred - radius;
+        let window_end_abs = pred + radius + marker::MARKER_LEN as u64;
+        let raw = self.ffe.out_buf();
+        if window_end_abs > raw_start_abs + raw.len() as u64 {
+            return None;
+        }
+        let start_rel = (window_start_abs - raw_start_abs) as usize;
+        let total_len = (window_end_abs - window_start_abs) as usize;
+        let search_len = total_len.saturating_sub(marker::MARKER_LEN);
+        if search_len == 0 {
+            return None;
+        }
+        let (pos, _) = marker::find_sync_in_window(raw, start_rel, search_len, 0.5)?;
+        if pos + marker::MARKER_LEN > raw.len() {
+            return None;
+        }
+        let payload = marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])?;
+        Some((raw_start_abs + pos as u64, payload))
     }
 
     /// Closed-window "turbo sync" pass. For each queued segment whose codewords
@@ -2932,6 +3134,10 @@ impl V3Session {
         self.drift_diag_cum = 0.0;
         self.entry_preamble_abs = None;
         self.preamble1_refined_abs = None;
+        // Backward flywheel: re-arm for the next burst / re-decode.
+        self.backward_attempted = false;
+        self.entry_marker_sym_abs = None;
+        self.entry_marker_base_esi = None;
         // NB: `two_preamble_attempted` is deliberately NOT reset here — like
         // `drift_locked` it must persist across a replay so the corrected pass
         // does not re-run the one-shot estimator. Reset only in `finalize()`.
