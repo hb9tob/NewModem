@@ -446,7 +446,9 @@ pub struct V3Session {
     /// acquisition trigger (no silence/energy gate; robust to noise/speech/QRM
     /// on the channel between bursts). See `try_acquire_preamble`.
     acq_mf: crate::fd_acquire::PreambleMatchedFilter,
-    /// Recent-audio span searched each acquisition pass (preamble + 1 cycle).
+    /// Recent-audio span searched each acquisition pass: one preamble + a
+    /// small margin (NOT a full cycle — see `new`). Sizes the matched-filter
+    /// FFT, so keeping it O(preamble) is what keeps idle CPU low on a Pi 4.
     acq_search_len: usize,
     /// Cached samples-per-symbol for acquisition audio↔symbol math.
     acq_sps: usize,
@@ -662,7 +664,20 @@ impl V3Session {
             &rrc::rrc_taps(cfg.beta, crate::types::RRC_SPAN_SYM, sps_pb),
             cfg.center_freq_hz,
         );
-        let acq_search_len = preamble_template.len() + cycle_samples;
+        // Idle acquisition scan cadence (~100 ms, ≤ one cycle). The always-on
+        // matched filter is throttled to this while waiting for a signal.
+        let acq_scan_interval = ((AUDIO_RATE as u64) / 10).min(cycle_samples as u64).max(1);
+        // Acquisition search span. NOT a full cycle (that sized the FFT at
+        // ~256 k points on slow profiles and dominated idle CPU on a Pi 4 —
+        // wasteful: detecting a preamble only needs a window of one preamble +
+        // a small margin). The margin must cover (a) the throttle interval, so
+        // a preamble landing between two scans is still fully inside the next
+        // window, and (b) the ±`V3_PREAMBLE2_SEARCH_RADIUS` the shared filter
+        // scans for preamble #2 in the two-preamble drift estimator. So the FFT
+        // shrinks from O(cycle) to O(preamble), ~4–8× fewer points per pass.
+        let acq_margin =
+            (acq_scan_interval as usize).max(2 * V3_PREAMBLE2_SEARCH_RADIUS) + V3_PREAMBLE2_SEARCH_RADIUS;
+        let acq_search_len = preamble_template.len() + acq_margin;
         let acq_mf =
             crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
@@ -725,9 +740,7 @@ impl V3Session {
             acq_search_len,
             acq_sps: sps,
             next_acq_scan_abs: 0,
-            // 100 ms cadence, but never longer than one cycle (so the search
-            // window always overlaps the previous scan by ≥ the preamble).
-            acq_scan_interval: ((AUDIO_RATE as u64) / 10).min(cycle_samples as u64).max(1),
+            acq_scan_interval,
             dsp,
             ffe,
             decoder,

@@ -1126,8 +1126,18 @@ fn run_turbo_worker(
                             Ok(mut d) => {
                                 // Replay the warm-up so no audio is lost; the
                                 // driver refines to the exact profile from the
-                                // first marker inside this push.
-                                d.push_samples(&warm);
+                                // first marker inside this push. Feed it in
+                                // ~100 ms batches (not one big chunk) so the
+                                // throttled acquisition scan — whose search
+                                // window is now ~one preamble, not the whole
+                                // warm buffer — runs across the warm-up and
+                                // catches a preamble anywhere in it (the SC
+                                // detector, run per-sample on ingest, is the
+                                // backstop regardless).
+                                let warm_batch = (AUDIO_RATE as usize / 10).max(1);
+                                for batch in warm.chunks(warm_batch) {
+                                    d.push_samples(batch);
+                                }
                                 warm.clear();
                                 driver = Some(d);
                             }
