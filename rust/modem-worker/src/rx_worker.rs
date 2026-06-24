@@ -1101,7 +1101,15 @@ fn run_turbo_worker(
 
         match driver.as_mut() {
             Some(d) => {
-                d.push_samples(&chunk);
+                // Feed in ≤100 ms sub-pushes so the throttled acquisition scan
+                // (≈200 ms cadence, ~325 ms search window) never has a gap
+                // larger than its window even when the source hands big buffers
+                // (some SDR backends deliver hundreds of ms at once) — otherwise
+                // a preamble landing inside one big push between two scans is
+                // missed. A no-op for the small chunks a sound card delivers.
+                for sub in chunk.chunks(ACQ_PUSH_SPLIT) {
+                    d.push_samples(sub);
+                }
             }
             None => {
                 // Auto mode, still detecting: accumulate and probe.
@@ -1134,8 +1142,7 @@ fn run_turbo_worker(
                                 // catches a preamble anywhere in it (the SC
                                 // detector, run per-sample on ingest, is the
                                 // backstop regardless).
-                                let warm_batch = (AUDIO_RATE as usize / 10).max(1);
-                                for batch in warm.chunks(warm_batch) {
+                                for batch in warm.chunks(ACQ_PUSH_SPLIT) {
                                     d.push_samples(batch);
                                 }
                                 warm.clear();
@@ -1165,6 +1172,10 @@ const TURBO_DETECT_MIN_SAMPLES: usize = (AUDIO_RATE as usize) * 3 / 2;
 /// Re-run the cold detection at most this often (in pushed samples) so the
 /// probe (≈7 preamble correlations over the warm-up) stays cheap.
 const TURBO_DETECT_INTERVAL_SAMPLES: usize = AUDIO_RATE as usize / 2;
+/// Max sub-push fed to the turbo driver at once (~100 ms). Bounds the gap
+/// between throttled acquisition scans so the matched filter's ~325 ms search
+/// window can never be jumped over, regardless of the source's buffer size.
+const ACQ_PUSH_SPLIT: usize = AUDIO_RATE as usize / 10;
 
 fn run_worker(
     samples: Receiver<Vec<f32>>,

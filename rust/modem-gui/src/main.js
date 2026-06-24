@@ -3977,11 +3977,15 @@ async function _runTxCompressImpl() {
   const { invoke, convertFileSrc } = window.__TAURI__.core;
   const seq = ++txState.compressSeq;
   // A (re)compression prepares a new transmission: zero the RaptorQ block
-  // counter so the previous TX's grid (kept on screen since 0.15.4) doesn't
-  // linger over the new one. A live RX would refill it on its next packet.
+  // counter so the previous TX's state (kept on screen since 0.15.4) doesn't
+  // linger over the new one. Reset BOTH the block grid (lastProgress) AND the
+  // fountain status bar (fountainState) — they show the count independently,
+  // so clearing only the grid left the bar still reading the old total. A live
+  // RX refills them on its next packet.
   lastProgress = { bitmap: null, expected: 0, converged: 0, sigma2: null };
   const v2txt = document.getElementById("v2-progress-text");
   if (v2txt) v2txt.textContent = "—";
+  hideFountainStatus();
   drawProgressBlocks();
   txState.compressing = true;
   const previewEl = document.getElementById("tx-preview");

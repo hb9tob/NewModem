@@ -664,19 +664,23 @@ impl V3Session {
             &rrc::rrc_taps(cfg.beta, crate::types::RRC_SPAN_SYM, sps_pb),
             cfg.center_freq_hz,
         );
-        // Idle acquisition scan cadence (~100 ms, ≤ one cycle). The always-on
+        // Idle acquisition scan cadence (~200 ms, ≤ one cycle). The always-on
         // matched filter is throttled to this while waiting for a signal.
-        let acq_scan_interval = ((AUDIO_RATE as u64) / 10).min(cycle_samples as u64).max(1);
+        let acq_scan_interval = ((AUDIO_RATE as u64) / 5).min(cycle_samples as u64).max(1);
         // Acquisition search span. NOT a full cycle (that sized the FFT at
         // ~256 k points on slow profiles and dominated idle CPU on a Pi 4 —
         // wasteful: detecting a preamble only needs a window of one preamble +
-        // a small margin). The margin must cover (a) the throttle interval, so
-        // a preamble landing between two scans is still fully inside the next
-        // window, and (b) the ±`V3_PREAMBLE2_SEARCH_RADIUS` the shared filter
-        // scans for preamble #2 in the two-preamble drift estimator. So the FFT
-        // shrinks from O(cycle) to O(preamble), ~4–8× fewer points per pass.
-        let acq_margin =
-            (acq_scan_interval as usize).max(2 * V3_PREAMBLE2_SEARCH_RADIUS) + V3_PREAMBLE2_SEARCH_RADIUS;
+        // a margin). The margin must cover the worst-case gap between two scans
+        // = throttle interval + the largest push fed between scans (the worker
+        // splits live pushes to ≤ ACQ_PUSH_SPLIT so that stays bounded), plus
+        // the ±`V3_PREAMBLE2_SEARCH_RADIUS` the shared filter scans for preamble
+        // #2 in the two-preamble drift estimator. Sized to stay just under the
+        // next power-of-two FFT bucket (≤ ~341 ms for every profile), so the
+        // generous margin costs nothing: the FFT is still O(preamble), ~4–8×
+        // fewer points than the old O(cycle).
+        let acq_margin = (acq_scan_interval as usize)
+            .max(2 * V3_PREAMBLE2_SEARCH_RADIUS)
+            + (AUDIO_RATE as usize / 8); // +125 ms slack (push split + jitter)
         let acq_search_len = preamble_template.len() + acq_margin;
         let acq_mf =
             crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
