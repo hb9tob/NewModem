@@ -5004,8 +5004,10 @@ async function onTxComplete(payload) {
     const { invoke } = window.__TAURI__.core;
     await invoke("tx_reset");
   } catch (_) {}
-  // Reset affichage RX + relance si besoin.
-  resetRxVisuals();
+  // Keep the final RX raptor grid + constellation on screen after the
+  // transmission ends (loopback / full-duplex): the operator wants to see
+  // the last decoded state. The visuals are cleared only when a genuinely
+  // new session arrives (session_armed with a different session_id).
   await maybeRestartRx();
 }
 
@@ -5020,7 +5022,7 @@ async function onTxError(payload) {
     const { invoke } = window.__TAURI__.core;
     await invoke("tx_reset");
   } catch (_) {}
-  resetRxVisuals();
+  // Preserve the final RX raptor grid + constellation (see onTxComplete).
   await maybeRestartRx();
 }
 
