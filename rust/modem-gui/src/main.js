@@ -3987,6 +3987,13 @@ async function _runTxCompressImpl() {
   if (v2txt) v2txt.textContent = "—";
   hideFountainStatus();
   drawProgressBlocks();
+  // Fresh compressed bytes ⇒ a different RaptorQ session_id (it hashes the
+  // payload), so the previous session's ESI high-water + archive ref must NOT
+  // carry over — otherwise the next TX continues the OLD fountain (esiMax+1)
+  // instead of starting a brand-new session at ESI 0. Resume bypasses this
+  // function entirely (it transmits the bit-exact archive without
+  // recompressing), so every call here IS a new session.
+  clearTxSessionRef();
   txState.compressing = true;
   const previewEl = document.getElementById("tx-preview");
   if (previewEl) previewEl.classList.add("compressing");
