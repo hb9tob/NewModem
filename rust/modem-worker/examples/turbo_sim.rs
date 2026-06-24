@@ -490,6 +490,26 @@ fn rxreal(args: &[String]) {
     }
 }
 
+/// Report data-CWs-per-superframe + suggested whole-SF `repair=0` payload sizes
+/// for a profile, so the SNR sweep emits an integer number of CLOSED superframes.
+///   turbo_sim sfcw <profile>
+fn sfcw(args: &[String]) {
+    let profile = parse_profile_index(&args[0]);
+    let cfg = profile.to_config();
+    let cw_per_sf = modem_core::frame::data_cw_per_superframe(&cfg);
+    let k_bytes = modem_core::ldpc::encoder::LdpcEncoder::new(cfg.ldpc_rate).k() / 8;
+    println!(
+        "profile={} Rs={} cw_per_sf={cw_per_sf} k_bytes={k_bytes}",
+        profile.name(),
+        cfg.symbol_rate,
+    );
+    for m in [2usize, 4, 6] {
+        let n_total = m * cw_per_sf; // = K at repair=0 (must round to PACKET_QUANTUM)
+        let bytes = n_total * k_bytes;
+        println!("  {m} SF -> n_total={n_total} payload_bytes={bytes}");
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 {
@@ -502,8 +522,9 @@ fn main() {
         "rx" => rx(rest),
         "rxreal" => rxreal(rest),
         "probe" => probe(rest),
+        "sfcw" => sfcw(rest),
         other => {
-            eprintln!("unknown subcommand {other:?} (expected tx|rx|rxreal|probe)");
+            eprintln!("unknown subcommand {other:?} (expected tx|rx|rxreal|probe|sfcw)");
             std::process::exit(64);
         }
     }
