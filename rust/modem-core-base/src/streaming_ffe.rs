@@ -158,36 +158,6 @@ impl StreamingFfe {
         self.current_taps.is_some()
     }
 
-    /// Snapshot the current adaptive tap set (the converged channel estimate).
-    /// `None` until taps are installed. Used by the backward-flywheel late-entry
-    /// recovery to seed an earlier span from a well-trained boundary instead of
-    /// cold — the channel is ~stationary over a few seconds, so the converged
-    /// taps are a good prior for the immediately-preceding superframes.
-    pub fn snapshot_taps(&self) -> Option<Vec<Complex64>> {
-        self.current_taps.clone()
-    }
-
-    /// Install a tap snapshot taken by [`snapshot_taps`] as the live tap set
-    /// (seeds a re-equalisation from a converged boundary). The subsequent
-    /// `push_raw` / `reequalise_span_joint` adapt from this prior.
-    pub fn restore_taps(&mut self, taps: Vec<Complex64>) {
-        self.current_taps = Some(taps);
-    }
-
-    /// Reposition the symbol buffers to start at absolute symbol index
-    /// `sym_abs`, discarding the current contents — the FFE counterpart to
-    /// [`StreamingDsp::rewind_to`]. The adaptive `current_taps` are KEPT (the
-    /// caller typically [`restore_taps`]es a converged snapshot first), so the
-    /// backward re-equalisation starts from a trained prior, not cold. As with
-    /// the DSP rewind the first few symbols lack full fractional context and
-    /// should be discarded (feed from `warmup` symbols before the target).
-    pub fn rewind_to(&mut self, sym_abs: u64) {
-        self.frac_buf.clear();
-        self.raw_sym_buf.clear();
-        self.out_buf.clear();
-        self.start_abs = sym_abs;
-    }
-
     /// Energy-weighted centroid of the current taps, in fractional-sample
     /// units (T/`pitch_fse`). Under a clock-drift mismatch the adaptive taps
     /// migrate at the drift rate (Ungerboeck 1976 / Gitlin tap-leakage): the
