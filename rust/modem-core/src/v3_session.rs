@@ -349,7 +349,22 @@ pub enum V3SessionEvent {
         anchor_abs_sample: u64,
         new_drift_ppm: f64,
     },
+    /// Per-segment scatter diagnostics for the GUI, emitted right after a
+    /// segment is canon-demodulated. `constellation` is a sample of the
+    /// equalised DATA symbols (I/Q, ≤ [`MAX_TURBO_CONSTELLATION`] points);
+    /// `pilot_phases` is the pilot residual phase `arg(out·conj(ref))` at each
+    /// pilot position (radians). Purely informational — the decode does not
+    /// depend on it. Mirrors `rx_v2`'s `constellation_sample` /
+    /// `pilot_phase_segments` so the worker can feed the same `v2_progress`.
+    ConstellationDiag {
+        constellation: Vec<[f32; 2]>,
+        pilot_phases: Vec<f32>,
+        is_meta: bool,
+    },
 }
+
+/// Max equalised data symbols sampled per segment for the GUI constellation.
+pub const MAX_TURBO_CONSTELLATION: usize = 500;
 
 pub struct V3Session {
     /// Stored verbatim for Phase 3+ — drives the constellation, RRC,
@@ -550,6 +565,13 @@ pub struct V3Session {
     /// short preamble correlator runs to catch the EOT trailer's lone
     /// preamble (the cycle-lag SC can't). Cleared on lock or expiry.
     eot_watch_remaining: u64,
+    /// Last segment's equalised data-symbol scatter (I/Q) for the GUI. Filled
+    /// by [`canon_demod_segment`]; read by `try_decode_pending_cycle` to emit a
+    /// [`V3SessionEvent::ConstellationDiag`]. Diagnostic only.
+    last_diag_constellation: Vec<[f32; 2]>,
+    /// Last segment's pilot residual phases (radians), parallel companion to
+    /// `last_diag_constellation`.
+    last_diag_pilot_phases: Vec<f32>,
 }
 
 /// Bookkeeping for a cycle whose marker has been validated but whose
@@ -720,6 +742,8 @@ impl V3Session {
             silence_run: 0,
             pending_silence_finalize: false,
             eot_watch_remaining: 0,
+            last_diag_constellation: Vec::new(),
+            last_diag_pilot_phases: Vec::new(),
         };
         // Diagnostic: force a fixed drift (ppm) and lock it, bypassing the
         // coarse estimator — used to A/B whether the applied drift VALUE (and
@@ -1751,6 +1775,24 @@ impl V3Session {
             if seg_data.len() < data_sym_count {
                 return None;
             }
+            // GUI scatter diagnostics (cheap, additive — does not affect the
+            // decode). Recomputed each iteration; the final pass survives the
+            // loop. Equalised DATA symbols → constellation; pilot residual
+            // phase arg(out·conj(ref)) → pilot_phases.
+            {
+                let mut cst: Vec<[f32; 2]> = Vec::with_capacity(MAX_TURBO_CONSTELLATION);
+                let mut php: Vec<f32> = Vec::new();
+                for i in 0..seg_sym_len {
+                    if is_pilot[i] {
+                        let r = out[i] * pilot_ref[i].conj();
+                        php.push(r.arg() as f32);
+                    } else if cst.len() < MAX_TURBO_CONSTELLATION {
+                        cst.push([out[i].re as f32, out[i].im as f32]);
+                    }
+                }
+                self.last_diag_constellation = cst;
+                self.last_diag_pilot_phases = php;
+            }
             // Segment-mean sigma2 for the CwDecoded event / diagnostics.
             last_sigma2 = (seg_data_s2.iter().sum::<f64>() / seg_data_s2.len() as f64).max(1e-6);
             // SISO-LDPC leg: decode every codeword, collect E[a]+Var[a] for the
@@ -1863,6 +1905,11 @@ impl V3Session {
                 still_pending.push(r);
                 continue;
             };
+            events.push(V3SessionEvent::ConstellationDiag {
+                constellation: std::mem::take(&mut self.last_diag_constellation),
+                pilot_phases: std::mem::take(&mut self.last_diag_pilot_phases),
+                is_meta: r.is_meta,
+            });
             let mut newly_failed: Vec<usize> = Vec::new();
             for &cw_idx in &r.failed_cw {
                 let (bytes, converged) = &per_cw[cw_idx];
@@ -1980,6 +2027,11 @@ impl V3Session {
             self.pending_decode = None;
             return true;
         };
+        events.push(V3SessionEvent::ConstellationDiag {
+            constellation: std::mem::take(&mut self.last_diag_constellation),
+            pilot_phases: std::mem::take(&mut self.last_diag_pilot_phases),
+            is_meta: pending.is_meta,
+        });
 
         let mut failed_cw: Vec<usize> = Vec::new();
         for (cw_idx, (bytes, converged)) in per_cw.into_iter().enumerate() {

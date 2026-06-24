@@ -122,6 +122,13 @@ pub struct RxV3Worker {
     /// Most recent per-codeword σ² seen, surfaced as the instantaneous
     /// figure on `v2_progress` / `file_complete`.
     last_sigma2: f64,
+    /// Latest segment scatter (equalised data I/Q) for the GUI constellation,
+    /// from `V3SessionEvent::ConstellationDiag`. Emitted on every `v2_progress`.
+    last_constellation: Vec<[f32; 2]>,
+    /// Latest segment pilot residual phases (radians), companion to
+    /// `last_constellation`; `last_pilot_is_meta` flags a META segment.
+    last_pilot_phases: Vec<f32>,
+    last_pilot_is_meta: bool,
 }
 
 /// Replay batch size when re-running the rolling history through a freshly
@@ -163,6 +170,9 @@ impl RxV3Worker {
             pending_rebuild: None,
             sigma2_running: HashMap::new(),
             last_sigma2: 0.0,
+            last_constellation: Vec::new(),
+            last_pilot_phases: Vec::new(),
+            last_pilot_is_meta: false,
         })
     }
 
@@ -367,6 +377,17 @@ impl RxV3Worker {
                         self.pending_cw.entry(esi).or_insert(bytes);
                     }
                 }
+                V3SessionEvent::ConstellationDiag {
+                    constellation,
+                    pilot_phases,
+                    is_meta,
+                } => {
+                    // Cache the latest segment scatter; the next `v2_progress`
+                    // (emitted from `accept`) carries it to the GUI.
+                    self.last_constellation = constellation;
+                    self.last_pilot_phases = pilot_phases;
+                    self.last_pilot_is_meta = is_meta;
+                }
                 V3SessionEvent::SessionFinalised { .. } | V3SessionEvent::EotSeen => {
                     // Burst boundary. Disk store keeps everything; just drop
                     // the in-memory per-burst routing state so the next burst
@@ -483,9 +504,9 @@ impl RxV3Worker {
                 "cap_reached": res.cap_reached,
             }),
         );
-        // Cumulative fountain block grid + σ². No constellation/pilot data on
-        // the turbo path yet — empty arrays render as a blank scatter (the GUI
-        // guards every array with `Array.isArray`).
+        // Cumulative fountain block grid + σ² + the latest segment scatter
+        // (equalised constellation + pilot residual phase) from the most recent
+        // ConstellationDiag — mirrors the legacy rx_v2 v2_progress payload.
         self.sink.emit(
             "v2_progress",
             serde_json::json!({
@@ -495,9 +516,9 @@ impl RxV3Worker {
                 "sigma2": self.last_sigma2,
                 "sigma2_data": self.last_sigma2,
                 "converged_bitmap": res.seen_bitmap,
-                "constellation_sample": Vec::<[f32; 2]>::new(),
-                "pilot_phase_segments": Vec::<f32>::new(),
-                "pilot_phase_is_meta": Vec::<bool>::new(),
+                "constellation_sample": self.last_constellation.clone(),
+                "pilot_phase_segments": vec![self.last_pilot_phases.clone()],
+                "pilot_phase_is_meta": vec![self.last_pilot_is_meta],
             }),
         );
         if let Some(df) = res.decoded {
@@ -624,6 +645,19 @@ mod tests {
             "decoded file not written to disk at {saved}",
         );
         assert!(fc.get("filename").is_some(), "file_complete missing filename");
+        // The turbo path must feed the GUI scatter: at least one v2_progress
+        // carries a non-empty equalised constellation sample.
+        let has_constellation = events.iter().any(|(n, p)| {
+            n == "v2_progress"
+                && p["constellation_sample"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+        });
+        assert!(
+            has_constellation,
+            "no v2_progress carried a non-empty constellation_sample",
+        );
     }
 
     #[test]
