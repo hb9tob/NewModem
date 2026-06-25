@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/channel.js",
+  "import_from": "./tabs/channel.js",
+  "header": "// Channel tab — attenuation cascade (the manual ATT chain + its mean/median\n// stats). Self-contained; reads/mutates currentSettings, invokes set_attenuation.\nimport { now } from \"../lib/format.js\";\nimport { invoke } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"../lib/state.js\";",
+  "symbols": ["cascadeFeedback", "attGainStr", "clampAttDb", "syncAttUi", "applyAttenuation", "median", "mean", "renderCascade", "setupChannelTab"]
+}
