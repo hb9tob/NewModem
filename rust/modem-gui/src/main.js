@@ -6,6 +6,7 @@ import { MIME_TYPES, MIME_BINARY, MIME_TEXT, MIME_IMAGE_AVIF, MIME_IMAGE_JPEG, M
 import { invoke, listen, convertFileSrc, getCurrentWindow, openExternalUrl } from "./lib/ipc.js";
 import { getSelectedBackendId, makeRow, makeFieldLabel, rxIsRunning } from "./lib/dom.js";
 import { eventLogBuffer, logEvent } from "./lib/log.js";
+import { currentSettings, setSettings, modemProfiles, setModemProfiles } from "./lib/state.js";
 
 // Event log: we also keep an in-memory buffer so we can serialize and
 // push it to the Phase D collector at submission time. Capped at 500
@@ -531,64 +532,6 @@ function setupLightbox() {
 // ─────────────────────────────────────────── Settings / device selection
 // Both sound cards (RX/TX) + the callsign live in the Settings tab and are
 // persisted via the Tauri get_settings / save_settings commands.
-let currentSettings = {
-  callsign: "",
-  rx_device: "",
-  tx_device: "",
-  ptt_enabled: false,
-  ptt_port: "",
-  ptt_use_rts: true,
-  ptt_use_dtr: false,
-  ptt_rts_tx_high: true,
-  ptt_dtr_tx_high: true,
-  tx_attenuation_db: 0,
-  tx_preemphasis_enabled: false,
-  tx_save_wav: false,
-  rx_deemphasis_enabled: false,
-  rx_allow_legacy_grid: true,
-  /// When true the RX worker forks to the fully-streaming TURBO decode
-  /// path (`rx_v3_worker`) with profile auto-detection, instead of the
-  /// legacy sliding-window `rx_v2`. Independent of `rx_allow_legacy_grid`
-  /// (Power Mode) and of `rx_force_mode`. Drives the dark-red background.
-  rx_turbo: false,
-  audio_backend: "alsa",
-  collector_url: "",
-  tx_quality: 10,
-  tx_repair_pct: 5,
-  tx_mode: "HIGH56",
-  tx_resize: "800x600",
-  tx_free_w: 800,
-  tx_free_h: 600,
-  tx_speed: 6,
-  tx_more_count: 5,
-  /// If true, the RX profile is locked on rx_forced_profile and auto-
-  /// detection is disabled. Required to receive MEGA, FAST, HIGH++ or
-  /// HIGH+56 (which are outside PROBE_TEMPLATES).
-  rx_force_mode: false,
-  rx_forced_profile: "HIGH56",
-  /// If true, experimental profiles appear in the TX and RX combos and
-  /// the "Force a profile" UI becomes visible at startup. If false
-  /// (default): combos are filtered to standard profiles (ULTRA /
-  /// ROBUST / NORMAL / HIGH / HIGH56 / HIGH+) and the rx-force-bar is
-  /// hidden.
-  experimental_modes_enabled: false,
-  /// If true, TX no longer stops RX before transmitting and a dedicated
-  /// TX progress bar (violet → logo blue) appears above the RX bar
-  /// while both run concurrently. Default false: keep the historical
-  /// half-duplex behaviour (txStart stops RX, maybeRestartRx restarts it
-  /// after tx_complete). Mirror of the Rust-side `full_duplex_enabled`.
-  full_duplex_enabled: false,
-  overlays: [],
-  active_overlay: 0,
-  // Radio-tab monitoring controls (mirror of the Rust RadioUiSettings).
-  radio: {
-    squelch_enabled: false,
-    squelch_dbfs: -80,
-    monitor_device: null,
-    monitor_volume: 0.80,
-    smeter_cal_trim_db: 0,
-  },
-};
 
 // Backfill the radio-settings block so the rest of the code can read
 // currentSettings.radio.* unconditionally — covers the get_settings
@@ -1634,10 +1577,10 @@ async function loadDevices() {
 async function loadSettings() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   try {
-    currentSettings = await invoke("get_settings");
+    setSettings(await invoke("get_settings"));
   } catch (err) {
     console.error("get_settings", err);
-    currentSettings = {
+    setSettings({
       callsign: "", rx_device: "", tx_device: "",
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
@@ -1649,7 +1592,7 @@ async function loadSettings() {
       tx_speed: 6, tx_more_count: 5,
       tx_history_max: 100,
       overlays: makeDefaultOverlays(), active_overlay: 0,
-    };
+    });
   }
   ensureOverlaySlots();
   ensureRadioSettings();
@@ -1711,15 +1654,14 @@ function applyRxForceSettingsToUI() {
 /// Drives the contents of the tx-mode and rx-forced-profile combos so the GUI
 /// never hard-codes the modem list — adding a profile in modem-core makes it
 /// appear here with no JS/HTML change required.
-let modemProfiles = [];
 
 async function loadModemProfiles() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   try {
-    modemProfiles = await invoke("list_modem_profiles");
+    setModemProfiles(await invoke("list_modem_profiles"));
   } catch (err) {
     console.error("list_modem_profiles", err);
-    modemProfiles = [];
+    setModemProfiles([]);
   }
   populateProfileSelects();
 }

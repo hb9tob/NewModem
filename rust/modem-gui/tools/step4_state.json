@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/state.js",
+  "import_from": "./lib/state.js",
+  "header": "// Shared layer — the single mutable app-state store.\n// `currentSettings` / `modemProfiles` are reassigned only through the setters\n// here (ESM imported bindings are read-only in other modules), while every tab\n// reads them live and mutates their PROPERTIES (currentSettings.x = y) freely.\n// Imports nothing.",
+  "symbols": ["currentSettings", "modemProfiles"]
+}
