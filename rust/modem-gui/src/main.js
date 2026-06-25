@@ -2,36 +2,7 @@
 // live constellation display.
 
 import { initI18n, setLang, getLang, supportedLangs, t, applyI18n } from "./i18n.js";
-
-// Mapping aligned with modem-core/src/app_header.rs :: mime
-//   0 = BINARY, 1 = TEXT, 2 = IMAGE_AVIF, 3 = IMAGE_JPEG, 4 = IMAGE_PNG,
-//   5 = ZSTD (non-image file decompressed RX-side by the Rust worker).
-const MIME_TYPES = {
-  0: "application/octet-stream",
-  1: "text/plain",
-  2: "image/avif",
-  3: "image/jpeg",
-  4: "image/png",
-  5: "application/zstd",
-};
-const MIME_BINARY = 0;
-const MIME_TEXT = 1;
-const MIME_IMAGE_AVIF = 2;
-const MIME_IMAGE_JPEG = 3;
-const MIME_IMAGE_PNG = 4;
-const MIME_ZSTD = 5;
-
-function mimeToExt(code) {
-  return MIME_TYPES[code] || "application/octet-stream";
-}
-
-function isImageMime(code) {
-  return [MIME_IMAGE_AVIF, MIME_IMAGE_JPEG, MIME_IMAGE_PNG].includes(code);
-}
-
-function now() {
-  return new Date().toLocaleTimeString();
-}
+import { MIME_TYPES, MIME_BINARY, MIME_TEXT, MIME_IMAGE_AVIF, MIME_IMAGE_JPEG, MIME_IMAGE_PNG, MIME_ZSTD, mimeToExt, isImageMime, now, escapeHtml, numOr, fmtSeconds, txFormatBytes, IMAGE_EXTS, isImageFilename, formatTimestamp, formatBytes, fmtNumOrDash } from "./lib/format.js";
 
 // Event log: we also keep an in-memory buffer so we can serialize and
 // push it to the Phase D collector at submission time. Capped at 500
@@ -286,14 +257,6 @@ function renderSessionRow(s) {
     </tr>`;
 }
 
-function escapeHtml(s) {
-  if (s == null) return "";
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 // ───────────────────────────────────────────────────── Received-file panel
 function showCurrentFile(payload) {
@@ -2696,10 +2659,6 @@ function readOverlayEditorIntoState() {
   }
 }
 
-function numOr(v, fallback) {
-  const n = parseFloat(v);
-  return Number.isFinite(n) ? n : fallback;
-}
 
 let _overlayCommitTimer = null;
 function commitOverlayChange() {
@@ -3694,12 +3653,6 @@ const TX_WARN_SECONDS = 2 * 60;
 const TX_FILE_HARD_SECONDS = 10 * 60;
 const TX_FILE_WARN_SECONDS = 5 * 60;
 
-function fmtSeconds(s) {
-  if (!Number.isFinite(s)) return "—";
-  const m = Math.floor(s / 60);
-  const r = Math.round(s - m * 60);
-  return `${m}:${String(r).padStart(2, "0")}`;
-}
 
 function refreshTxExperimentalWarn() {
   const warn = document.getElementById("tx-experimental-warn");
@@ -3795,12 +3748,6 @@ function refreshTxButtons() {
   }
 }
 
-function txFormatBytes(n) {
-  if (n == null) return "—";
-  if (n < 1024) return `${n} o`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
-  return `${(n / 1024 / 1024).toFixed(2)} Mio`;
-}
 
 // TX button tooltip: duration, N emitted, K required, K threshold.
 // `dur` is `est.duration_s` (raw float seconds); we always format it
@@ -4135,13 +4082,6 @@ async function _runTxCompressImpl() {
 }
 
 // Image-extension detection - if false, switch to the file/zstd flow.
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "avif", "webp", "gif", "bmp"]);
-function isImageFilename(name) {
-  const lower = (name || "").toLowerCase();
-  const dot = lower.lastIndexOf(".");
-  if (dot < 0) return false;
-  return IMAGE_EXTS.has(lower.slice(dot + 1));
-}
 
 // Render an 8-channel punched-tape visual from the filename (holes
 // represent the actual ASCII bytes). Looping SMIL scroll for the retro
@@ -5441,23 +5381,7 @@ async function deleteHistoryItem(kind, key) {
   }
 }
 
-function formatTimestamp(unixSeconds) {
-  if (!unixSeconds) return "—";
-  const d = new Date(unixSeconds * 1000);
-  return d.toLocaleString("fr-CH", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
-function formatBytes(n) {
-  if (!n || n < 1024) return `${n || 0} o`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Kio`;
-  return `${(n / (1024 * 1024)).toFixed(2)} Mio`;
-}
 
 // Kiosk mode (small touchscreen, e.g. Pi 7" 800x480) — the Rust setup
 // hook auto-engages fullscreen and emits `kiosk_mode` so the frontend
@@ -7180,12 +7104,6 @@ function setSounderStatus(id, text, level) {
   else if (level === "err") el.classList.add("err");
 }
 
-function fmtNumOrDash(v, digits) {
-  if (v === null || v === undefined) return "—";
-  const n = Number(v);
-  if (!Number.isFinite(n)) return "—";
-  return n.toFixed(digits ?? 2);
-}
 
 // Build the standard SoundingRequest the TX emit + RX regenerate
 // paths share. Deterministic at the JS level: the same defaults yield
