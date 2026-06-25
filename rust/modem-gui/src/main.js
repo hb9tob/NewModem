@@ -11,6 +11,7 @@ import { openLightbox, setupLightbox } from "./lib/lightbox.js";
 import { sdrBackends, EIA_CTCSS_TONES_HZ, loadSdrBackends, isBackendEnabled, renderSdrBackendsList, resolveDeviceCaps, prefetchCapsForSelected, getCapsForSelected, ensureBackendConfig, renderSdrPanel, refreshSdrPanels, hasFeatureToggles, buildAgcRow, buildGainRow, buildAntennaRow, buildFeatureRow, buildBackendExtrasRow, onSdrFieldChange, isFreqInputId, backendIdForFreqInput, freqFavoritesArray, pushFreqMru } from "./lib/sdr.js";
 import { on as onBus } from "./lib/bus.js";
 import { setupSelectPicker, setupVirtKeyboard } from "./lib/kiosk.js";
+import { startCapture, tryAutoStartCapture, startCaptureFromWav, stopCapture } from "./lib/capture.js";
 
 // Event log: we also keep an in-memory buffer so we can serialize and
 // push it to the Phase D collector at submission time. Capped at 500
@@ -1172,59 +1173,10 @@ async function loadSaveDir() {
   }
 }
 
-async function startCapture() {
-  const select = document.getElementById("rx-device-select");
-  const deviceName = select ? select.value : "";
-  const status = document.getElementById("status");
-  if (!deviceName) {
-    status.textContent = t("status.select_rx_in_settings");
-    status.style.color = "#ef5350";
-    return;
-  }
-  const forced = !!currentSettings.rx_force_mode;
-  // If forced, pass the chosen profile; otherwise HIGH (default anchor,
-  // auto-detection will refine it).
-  const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
-  try {
-    await invoke("start_capture", { deviceName, profile, forced });
-    status.textContent = forced
-      ? t("status.capture_forced", { profile })
-      : t("status.capture_running");
-    status.style.color = "#ffb74d";
-    document.getElementById("btn-start").disabled = true;
-    document.getElementById("btn-stop").disabled = false;
-    if (select) select.disabled = true;
-    refreshSettingsRxWarn();
-    // RX just came up: if TX is also running and FDX is on, surface the
-    // dedicated TX bar with whatever progress we already had buffered.
-    refreshDuplexTxBar();
-    // Radio monitoring is independent of the active tab: once an SDR
-    // capture is up, its session exists, so resume the persisted squelch /
-    // monitor output / volume now. The operator hears the radio and gets
-    // squelch without first opening the Radio tab. Soft-ignored for non-SDR
-    // sources (no radio session → invokeRadio swallows "Radio indisponible").
-    pushRadioControlsLive();
-    logEvent("start", { device: deviceName, profile, forced });
-  } catch (err) {
-    status.textContent = t("status.error_start", { err });
-    status.style.color = "#ef5350";
-    logEvent("error", { message: String(err) });
-  }
-}
 
 // Start RX capture if it isn't already running, no TX is occupying the
 // audio chain, and a valid RX device is selected. Called at app startup
 // and when returning to the RX tab.
-async function tryAutoStartCapture() {
-  const stopBtn = document.getElementById("btn-stop");
-  const startBtn = document.getElementById("btn-start");
-  const txStopBtn = document.getElementById("tx-btn-stop");
-  if (!stopBtn || !startBtn) return;
-  if (!stopBtn.disabled) return;
-  if (txStopBtn && !txStopBtn.disabled) return;
-  if (startBtn.disabled) return;
-  await startCapture();
-}
 
 // ─── WAV-file replay (offline RX from a recorded capture) ─────────
 //
@@ -1258,71 +1210,7 @@ function setupWavPlayback() {
   }
 }
 
-async function startCaptureFromWav(file) {
-  const status = document.getElementById("status");
-  // Refuse to start a WAV replay when a live RX is already in flight —
-  // the backend rejects it anyway, but this surfaces a clearer message
-  // and avoids spending seconds reading the file for nothing.
-  const stopBtn = document.getElementById("btn-stop");
-  if (stopBtn && !stopBtn.disabled) {
-    status.textContent = t("status.stop_capture_first");
-    status.style.color = "#ef5350";
-    return;
-  }
-  status.textContent = t("status.loading_file", { name: file.name });
-  status.style.color = "#90caf9";
-  try {
-    const buf = await file.arrayBuffer();
-    // JSON-array IPC (same pattern as set_tx_source) — Tauri 2 doesn't
-    // wire raw-binary arguments by default in this codebase. For long
-    // captures (tens of MB) the transfer is the bottleneck; the user
-    // sees a "chargement" status while it happens.
-    const bytes = Array.from(new Uint8Array(buf));
-    const forced = !!currentSettings.rx_force_mode;
-    const profile = forced ? (currentSettings.rx_forced_profile || "HIGH") : "HIGH";
-    await invoke("start_capture_from_wav", { args: { bytes, profile, forced } });
-    status.textContent = t("status.wav_playback", { name: file.name });
-    status.style.color = "#ffb74d";
-    document.getElementById("btn-start").disabled = true;
-    document.getElementById("btn-stop").disabled = false;
-    const rxSel = document.getElementById("rx-device-select");
-    if (rxSel) rxSel.disabled = true;
-    refreshSettingsRxWarn();
-    // Same as live RX start: refresh the duplex bar in case TX is running.
-    refreshDuplexTxBar();
-    logEvent("wav_playback_start", { file: file.name, profile, forced });
-  } catch (err) {
-    status.textContent = t("status.wav_playback_error", { err });
-    status.style.color = "#ef5350";
-    logEvent("wav_playback_error", { message: String(err) });
-  }
-}
 
-async function stopCapture() {
-  const status = document.getElementById("status");
-  try {
-    await invoke("stop_capture");
-    status.textContent = t("status.stopped");
-    status.style.color = "#9ccc65";
-    document.getElementById("btn-stop").disabled = true;
-    const rxSel = document.getElementById("rx-device-select");
-    if (rxSel) rxSel.disabled = false;
-    refreshStartButtonFromRx();
-    refreshSettingsRxWarn();
-    // RX just stopped: if TX is still running, hide the duplex bar — the
-    // next tx_progress event will fall back to the bottom canvas.
-    refreshDuplexTxBar();
-    // The worker stopped emitting rx_realtime — drop the chip back to
-    // its inactive state. Without this it would freeze on the last
-    // received colour even though no measurement is being produced.
-    noteRxRealtimeReset();
-    await refreshRawRecordingState();
-    logEvent("stop", null);
-  } catch (err) {
-    status.textContent = t("status.error_stop", { err });
-    status.style.color = "#ef5350";
-  }
-}
 
 let rawRecordingActive = false;
 
@@ -5259,6 +5147,20 @@ function setupSdrBusHandlers() {
   onBus("sdr:reload-devices", () => { loadDevices(); });
   onBus("sdr:refresh-radio-gain", () => { renderRadioGain(); });
   onBus("sdr:refresh-radio-sdr-params", () => { renderRadioSdrParams(); });
+  // lib/capture.js emits these so the RX/TX/Radio/Settings chips refresh
+  // without the lifecycle module importing a tab.
+  onBus("capture:started", () => {
+    refreshSettingsRxWarn();
+    refreshDuplexTxBar();
+    pushRadioControlsLive();
+  });
+  onBus("capture:stopped", () => {
+    refreshStartButtonFromRx();
+    refreshSettingsRxWarn();
+    refreshDuplexTxBar();
+    noteRxRealtimeReset();
+    refreshRawRecordingState();
+  });
 }
 
 async function init() {

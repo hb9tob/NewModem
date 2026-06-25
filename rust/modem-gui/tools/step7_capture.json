@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/capture.js",
+  "import_from": "./lib/capture.js",
+  "header": "// Shared lifecycle — the audio-capture start/stop the RX/TX/Radio/Channel tabs\n// all sequence on the one audio device. Pure lifecycle: it invokes the Rust\n// start/stop, sets the start/stop button state, and EMITS capture:started /\n// capture:stopped on the bus so the tabs refresh their own chips/bars (it never\n// imports a tab). tx-coupled maybeRestartRx and channel-coupled\n// stopRxAndTxForChannelTab stay with their tabs and call these.\nimport { invoke } from \"./ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"./state.js\";\nimport { logEvent } from \"./log.js\";\nimport { emit } from \"./bus.js\";",
+  "symbols": ["startCapture", "tryAutoStartCapture", "startCaptureFromWav", "stopCapture"]
+}
