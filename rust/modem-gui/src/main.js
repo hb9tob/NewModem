@@ -4,34 +4,13 @@
 import { initI18n, setLang, getLang, supportedLangs, t, applyI18n } from "./i18n.js";
 import { MIME_TYPES, MIME_BINARY, MIME_TEXT, MIME_IMAGE_AVIF, MIME_IMAGE_JPEG, MIME_IMAGE_PNG, MIME_ZSTD, mimeToExt, isImageMime, now, escapeHtml, numOr, fmtSeconds, txFormatBytes, IMAGE_EXTS, isImageFilename, formatTimestamp, formatBytes, fmtNumOrDash } from "./lib/format.js";
 import { invoke, listen, convertFileSrc, getCurrentWindow, openExternalUrl } from "./lib/ipc.js";
+import { getSelectedBackendId, makeRow, makeFieldLabel, rxIsRunning } from "./lib/dom.js";
+import { eventLogBuffer, logEvent } from "./lib/log.js";
 
 // Event log: we also keep an in-memory buffer so we can serialize and
 // push it to the Phase D collector at submission time. Capped at 500
 // entries like the DOM list.
-const eventLogBuffer = [];
 
-function logEvent(name, data) {
-  const tsMs = Date.now();
-  eventLogBuffer.push({ ts_ms: tsMs, name, data: data ?? null });
-  while (eventLogBuffer.length > 500) eventLogBuffer.shift();
-
-  const log = document.getElementById("event-log");
-  if (!log) return;
-  const li = document.createElement("li");
-  const t = document.createElement("span");
-  t.className = "ev-time";
-  t.textContent = now();
-  const n = document.createElement("span");
-  n.className = "ev-name";
-  n.textContent = name;
-  const body = document.createElement("span");
-  body.textContent = data ? JSON.stringify(data) : "";
-  li.appendChild(t);
-  li.appendChild(n);
-  li.appendChild(body);
-  log.insertBefore(li, log.firstChild);
-  while (log.children.length > 500) log.removeChild(log.lastChild);
-}
 
 // ────────────────────────────────────────────────────────── Language
 // The <select id="lang-select"> in the Settings panel persists across
@@ -924,14 +903,6 @@ function getCapsForSelected(selectId) {
 /// option on a device dropdown. Returns the backend ID for SDR
 /// entries or `null` for cpal soundcard entries (which carry
 /// `data-backend = "audio"`).
-function getSelectedBackendId(selectId) {
-  const sel = document.getElementById(selectId);
-  if (!sel) return null;
-  const opt = sel.options[sel.selectedIndex];
-  if (!opt || !opt.dataset) return null;
-  const b = opt.dataset.backend;
-  return (b && b !== "audio") ? b : null;
-}
 
 /// Ensure `currentSettings.sdr_settings.backends[backendId]` exists,
 /// seeding from the per-backend defaults table (mirror of
@@ -1091,17 +1062,6 @@ function hasFeatureToggles(caps) {
   return !!(f && (f.bias_t || f.fm_notch || f.dab_notch));
 }
 
-function makeRow() {
-  const r = document.createElement("div");
-  r.className = "pluto-row";
-  return r;
-}
-function makeFieldLabel(text) {
-  const s = document.createElement("span");
-  s.className = "pluto-field-label";
-  s.textContent = text;
-  return s;
-}
 
 function buildFreqRow(direction, backendId, caps, cfg) {
   const row = makeRow();
@@ -4862,10 +4822,6 @@ function lerpDuplexColor(frac) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-function rxIsRunning() {
-  const stopBtn = document.getElementById("btn-stop");
-  return !!(stopBtn && !stopBtn.disabled);
-}
 
 function isDuplexActive() {
   return !!currentSettings.full_duplex_enabled

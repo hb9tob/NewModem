@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/log.js",
+  "import_from": "./lib/log.js",
+  "header": "// Shared layer — in-memory event log + the #event-log DOM list.\n// The buffer is serialized to the Phase D collector at capture-submit time.\nimport { now } from \"./format.js\";",
+  "symbols": ["eventLogBuffer", "logEvent"]
+}
