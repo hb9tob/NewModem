@@ -1,0 +1,19 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/sdr.js",
+  "import_from": "./lib/sdr.js",
+  "header": "// Shared layer — the SDR subsystem: device-capability cache, per-backend\n// config, the Settings/Radio control-row builders, and the frequency MRU.\n// Settings AND Radio both drive it; upward effects (persist settings, reload\n// the device list, refresh the Radio gain panel) are emitted on the bus so this\n// module never imports a tab.\nimport { invoke, convertFileSrc } from \"./ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"./state.js\";\nimport { getSelectedBackendId, makeRow, makeFieldLabel, rxIsRunning } from \"./dom.js\";\nimport { escapeHtml } from \"./format.js\";\nimport { emit } from \"./bus.js\";",
+  "symbols": [
+    "sdrBackends", "EIA_CTCSS_TONES_HZ", "loadSdrBackends", "isBackendEnabled",
+    "renderSdrBackendsList", "refreshBackendLibraryStatus", "deviceCapsCache",
+    "pendingCapsFetch", "resolveDeviceCaps", "prefetchCapsForSelected",
+    "getCapsForSelected", "ensureBackendConfig", "ensureBackendEntry",
+    "makeDefaultSdrConfig", "renderSdrPanel", "refreshSdrPanels", "hasFeatureToggles",
+    "buildFreqRow", "buildAgcRow", "readLnaStateFromGain", "agcModeKeepsLnaManual",
+    "manualGainFromShape", "buildGainRow", "buildAntennaRow", "buildFeatureRow",
+    "makeCheckbox", "buildDeviationRow", "buildCtcssRow", "buildTxAttenuationRow",
+    "buildBackendExtrasRow", "onSdrFieldChange", "applySdrFieldUpdate",
+    "FREQ_INPUT_ID_PREFIX", "isFreqInputId", "backendIdForFreqInput",
+    "freqFavoritesArray", "pushFreqMru"
+  ]
+}
