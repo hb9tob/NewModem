@@ -1,0 +1,19 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/tx.js",
+  "import_from": "./tabs/tx.js",
+  "header": "// TX tab — source loading (picker + native drag-drop), AVIF/zstd\n// compression with live preview, transport-limit gating, the fountain\n// estimate, the TX/More/Stop orchestration (half- and full-duplex), the\n// duplex progress bar, and History relay/resume. Depends on rx.js for the\n// shared #progress-blocks bitmap (half-duplex repaints it via\n// setProgressBitmap); the tx->rx edge is acyclic (rx.js imports nothing\n// from here). The tx:* bus subscriptions stay wired centrally in main.js\n// setupSdrBusHandlers, mirroring the rx.js extraction.\nimport { invoke, listen, convertFileSrc } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings, modemProfiles } from \"../lib/state.js\";\nimport { logEvent } from \"../lib/log.js\";\nimport { fmtSeconds, txFormatBytes, isImageFilename } from \"../lib/format.js\";\nimport { rxIsRunning } from \"../lib/dom.js\";\nimport { startCapture } from \"../lib/capture.js\";\nimport { getActiveOverlayPayload } from \"./overlays.js\";\nimport { persistSettings } from \"./settings.js\";\nimport { setProgressBitmap, drawProgressBlocks, hideFountainStatus } from \"./rx.js\";",
+  "symbols": [
+    "txState", "clearTxSessionRef", "_compressChain",
+    "TX_HARD_BYTES", "TX_HARD_SECONDS", "TX_WARN_SECONDS", "TX_FILE_HARD_SECONDS", "TX_FILE_WARN_SECONDS",
+    "refreshTxExperimentalWarn", "refreshTxButtons", "txButtonTitle", "moreButtonTitle", "txFitInto", "txTargetDims",
+    "refreshTxPreview", "scheduleTxCompress", "getTxFilename", "refreshTxEstimate", "runTxCompress", "_runTxCompressImpl",
+    "renderFileTape", "applyTxModeUI", "applyPassthroughUI", "applyFileModeUI", "showTxBusyOverlay", "hideTxBusyOverlay",
+    "loadTxFileFromPath", "loadTxFile", "resetTxFile", "setupTxTab",
+    "kioskInfoToastTimer", "showKioskInfoToast",
+    "txStart", "computeK", "computeNInitial", "persistNextEsi", "computeMoreCount", "txMore", "txStop", "maybeRestartRx",
+    "updateTxProgressText",
+    "TX_DUPLEX_VIOLET", "TX_DUPLEX_BLUE", "lerpDuplexColor", "isDuplexActive", "refreshDuplexTxBar",
+    "onTxProgress", "onTxComplete", "onTxError", "relayHistoryItem", "resumeTxFromHistory"
+  ]
+}
