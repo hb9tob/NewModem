@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/history.js",
+  "import_from": "./tabs/history.js",
+  "header": "// History tab — RX received-files + TX sent-sessions columns. The relay/resume\n// buttons emit tx:relay / tx:resume with the path; the heavy TX-state restore\n// (relayHistoryItem/resumeTxFromHistory) stays in main.js, so history imports no tx.\nimport { invoke, convertFileSrc } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { logEvent } from \"../lib/log.js\";\nimport { formatTimestamp, formatBytes } from \"../lib/format.js\";\nimport { openLightbox } from \"../lib/lightbox.js\";\nimport { emit } from \"../lib/bus.js\";",
+  "symbols": ["setupHistoryTab", "refreshHistory", "renderHistoryColumn", "deleteHistoryItem"]
+}
