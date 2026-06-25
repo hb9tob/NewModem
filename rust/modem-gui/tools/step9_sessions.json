@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/sessions.js",
+  "import_from": "./tabs/sessions.js",
+  "header": "// Sessions tab — the on-disk RaptorQ session registry table.\n// Self-contained: the live session_armed/progress/decoded events (wired in\n// main.js) call upsertSession; refreshSessions reloads from disk.\nimport { invoke } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { escapeHtml } from \"../lib/format.js\";\nimport { logEvent } from \"../lib/log.js\";",
+  "symbols": ["sessionRegistry", "refreshSessions", "upsertSession", "renderSessionsTable", "renderSessionRow"]
+}
