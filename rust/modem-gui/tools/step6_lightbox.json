@@ -1,0 +1,11 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/lightbox.js",
+  "import_from": "./lib/lightbox.js",
+  "header": "// Shared widget — fullscreen image lightbox (wheel/drag/keyboard zoom+pan).\n// Opened from the RX received-file panel and the History tab. Self-contained:\n// owns its `lightbox` state, touches only its own DOM, and reaches the OS window\n// for true fullscreen via the ipc wrapper.\nimport { getCurrentWindow } from \"./ipc.js\";",
+  "symbols": [
+    "LIGHTBOX_MAX_SCALE", "lightbox", "waitForResize", "setWindowFullscreen",
+    "openLightbox", "closeLightbox", "clampLightboxPan", "applyLightboxTransform",
+    "fitLightbox", "zoomLightboxBy", "zoomLightbox", "panLightbox", "setupLightbox"
+  ]
+}
