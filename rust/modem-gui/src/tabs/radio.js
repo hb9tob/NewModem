@@ -191,6 +191,8 @@ export async function setupRadioTab() {
   on("sdr:refresh-radio-gain", () => renderRadioGain());
   on("sdr:refresh-radio-sdr-params", () => renderRadioSdrParams());
   on("capture:started", () => pushRadioControlsLive());
+  // Settings emits this when the RX device changes (Radio tab is SDR-only).
+  on("rx-device:changed", () => refreshRadioTabVisibility());
   // Frequency entry + tune button.
   document.getElementById("radio-freq-set")?.addEventListener("click", () => {
     const v = parseFloat(document.getElementById("radio-freq-input").value);
