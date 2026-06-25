@@ -3022,11 +3022,31 @@ impl V3Session {
         raw_start_abs as f64 + refined_rel
     }
 
+    /// Profile-aware coarse-drift commit threshold (ppm). Committing a drift
+    /// CORRECTION reboots + replays the pipeline, which is disruptive (on the
+    /// slow profiles it re-acquired ROBUST mid-burst on a clean 23 dB signal).
+    /// The fractionally-spaced FFE is re-trained at every superframe boundary
+    /// (4 s) and tracks residual timing continuously, while the marker-position
+    /// PREDICTION drifts only `ppm·symbol_rate·T` symbols — so the slower the
+    /// profile, the larger the drift the receiver rides before a reboot is worth
+    /// it. The fast family (1500 sym/s — NORMAL/HIGH/HIGH+/HIGH++) keeps the
+    /// OTA-tuned 5 ppm EXACTLY (`scale` clamps to 1.0); only ROBUST
+    /// (1000 → ~11 ppm) and ULTRA (500 → ~45 ppm) relax it, letting the FFE
+    /// absorb normal crystal drift instead of rebooting. Quadratic: both the
+    /// per-boundary FFE headroom AND the prediction headroom scale inversely
+    /// with the rate. (Proof of fast-family neutrality:
+    /// `coarse_drift_commit_ppm_is_fast_family_neutral`.)
+    fn coarse_drift_commit_ppm(&self) -> f64 {
+        const FAST_FAMILY_SYMBOL_RATE: f64 = 1500.0;
+        let scale = (FAST_FAMILY_SYMBOL_RATE / self.cfg.symbol_rate).max(1.0);
+        COARSE_DRIFT_COMMIT_PPM * scale * scale
+    }
+
     /// Phase 4 coarse one-shot estimator. Called after each
     /// decode/advance loop in `process_audio_chunk`. Computes the LS
     /// slope of `residual` vs `expected_from_anchor` over the
     /// accumulated marker positions. When the slope crosses
-    /// `COARSE_DRIFT_COMMIT_PPM`, updates `self.drift_ppm`, rebuilds the
+    /// `coarse_drift_commit_ppm()`, updates `self.drift_ppm`, rebuilds the
     /// streaming pipeline at the corrected ratio, and replays the
     /// rolling audio buffer through it. Either branch locks the
     /// estimator for the rest of the burst.
@@ -3079,7 +3099,7 @@ impl V3Session {
             Some(ppm) => -ppm,
             None => return, // not enough/clean buffer yet — retry next chunk
         };
-        let applied = (to_ppm - from_ppm).abs() > COARSE_DRIFT_COMMIT_PPM;
+        let applied = (to_ppm - from_ppm).abs() > self.coarse_drift_commit_ppm();
         self.drift_locked = true;
         events.push(V3SessionEvent::DriftCommitted {
             from_ppm,
@@ -3205,7 +3225,7 @@ impl V3Session {
             return; // implausible — almost certainly a mis-locate; fall back
         }
         let from_ppm = self.drift_ppm;
-        let applied = (to_ppm - from_ppm).abs() > COARSE_DRIFT_COMMIT_PPM;
+        let applied = (to_ppm - from_ppm).abs() > self.coarse_drift_commit_ppm();
         if std::env::var_os("V3_DRIFT_LOG").is_some() {
             eprintln!(
                 "[2pre] measured={measured:.1} nominal={nominal:.1} metric={metric:.3} \
@@ -3488,6 +3508,39 @@ mod tests {
             rrc_mod::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
         let taps = rrc_mod::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
         modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz)
+    }
+
+    /// The ROBUST/ULTRA coarse-drift relaxation must be a TRUE no-op for the
+    /// fast family: `coarse_drift_commit_ppm()` returns the OTA-tuned constant
+    /// EXACTLY for every 1500 Bd profile, and only widens for ROBUST/ULTRA.
+    #[test]
+    fn coarse_drift_commit_ppm_is_fast_family_neutral() {
+        for p in [
+            ProfileIndex::Normal,
+            ProfileIndex::High,
+            ProfileIndex::HighPlus,
+            ProfileIndex::HighPlusPlus,
+        ] {
+            let s = V3Session::new(p.to_config(), p.name().to_string());
+            assert_eq!(
+                s.coarse_drift_commit_ppm(),
+                COARSE_DRIFT_COMMIT_PPM,
+                "{} (fast family) must keep the OTA-tuned {COARSE_DRIFT_COMMIT_PPM} ppm exactly",
+                p.name(),
+            );
+        }
+        let robust = V3Session::new(
+            ProfileIndex::Robust.to_config(),
+            ProfileIndex::Robust.name().to_string(),
+        );
+        let ultra = V3Session::new(
+            ProfileIndex::Ultra.to_config(),
+            ProfileIndex::Ultra.name().to_string(),
+        );
+        // 1000 Bd → 5·(1.5)² = 11.25 ppm ; 500 Bd → 5·3² = 45.0 ppm.
+        assert!((robust.coarse_drift_commit_ppm() - 11.25).abs() < 1e-9);
+        assert!((ultra.coarse_drift_commit_ppm() - 45.0).abs() < 1e-9);
+        assert!(ultra.coarse_drift_commit_ppm() > robust.coarse_drift_commit_ppm());
     }
 
     /// Linear-interp resample to simulate `ppm` of clock drift on the

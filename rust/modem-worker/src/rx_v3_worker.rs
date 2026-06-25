@@ -453,15 +453,43 @@ impl RxV3Worker {
         self.route(events)
     }
 
+    /// True for the SLOW geometry families — ROBUST (family B, 1000 Bd) and
+    /// ULTRA (family C, 500 Bd) — whose data cycle exceeds the 2 s no-progress
+    /// baseline and whose drift-commit replay spans seconds. The end-of-burst
+    /// timing relaxations below are confined to these so the OTA-validated fast
+    /// family (A: NORMAL / HIGH / HIGH+ / HIGH++ …) stays byte-identical.
+    fn is_slow_family(&self) -> bool {
+        use modem_core::preamble::PreambleFamily;
+        !matches!(self.profile.preamble_family(), PreambleFamily::A)
+    }
+
     /// End-of-burst no-progress threshold (samples). Must exceed the worst-case
     /// gap between VALIDATED markers in a healthy transmission, otherwise it
     /// false-fires mid-burst — and with the burst-boundary restart that
-    /// fragments the session, so a slow profile never assembles. The slow
-    /// profiles have a large gap: measured ROBUST data cycle ≈ 2.8 s, superframe
-    /// boundary ≈ 5.4 s (ULTRA is slower still). Scale with the live cycle (3× a
-    /// data cycle comfortably covers the boundary, which runs ≈ 2× a cycle) but
-    /// never below the 2 s baseline that keeps the fast profiles snappy.
+    /// fragments the session, so a slow profile never assembles.
+    ///
+    /// This is confined to the SLOW families (ROBUST / ULTRA). They have a data
+    /// cycle (≈ 2.6 s / 5.4 s) larger than the 2 s baseline, so a fixed timer
+    /// false-fires at the superframe boundary and fragments the burst; scale it
+    /// with the live cycle instead. The fast family (A) gets a marker every
+    /// cycle (< 2 s), so it keeps the OTA-tuned 2 s baseline UNCHANGED — the
+    /// 3×cycle relaxation must never widen fast-profile end-of-burst timing.
     fn no_progress_threshold(&self) -> u64 {
+        // This is a BACKSTOP, not the primary end-of-burst detector — the energy
+        // silence-gate finalises a clean tail in ~100 ms. The no-progress timer
+        // only catches a carrier that drops into NOISE (energy stays high, no
+        // markers), so it can be generous.
+        if !self.is_slow_family() {
+            // Fast family (A): a validated marker arrives every data cycle
+            // (< 2 s), so the 2 s baseline never false-fires mid-burst. Hold it
+            // byte-identical to the OTA-validated path.
+            return END_OF_BURST_NOPROGRESS_SAMPLES;
+        }
+        // ROBUST / ULTRA only: a clean burst legitimately goes several seconds
+        // with no NEW validated marker (data cycle ~2.6 s, superframe boundary
+        // ~5.4 s, plus drift-reboot replay re-acquisition), so a tight bound
+        // false-fires mid-transmission and — with the burst-boundary restart —
+        // fragments it. 3× a data cycle clears those with margin.
         let by_cycle = 3 * self.session.cycle_samples() as u64;
         END_OF_BURST_NOPROGRESS_SAMPLES.max(by_cycle)
     }
@@ -605,6 +633,24 @@ impl RxV3Worker {
                     self.last_constellation = constellation;
                     self.last_pilot_phases = pilot_phases;
                     self.last_pilot_is_meta = is_meta;
+                }
+                V3SessionEvent::DriftCommitted { .. } => {
+                    // SLOW families only (ROBUST / ULTRA): a coarse-drift commit
+                    // reboots the pipeline and replays the whole rolling history
+                    // at the corrected rate — that is ACTIVE progress, not a dead
+                    // burst. On those profiles the replay spans many seconds
+                    // (large history) during which no NEW marker reaches the
+                    // worker, so without this the no-progress end-of-burst timer
+                    // accrued the replay span and false-fired mid-transmission
+                    // ("ROBUST drops + re-acquires on a clean 23 dB signal").
+                    // Treat the commit as progress. The fast family replays
+                    // briefly and gets a marker every cycle, so leave its
+                    // end-of-burst timing byte-identical to the OTA-validated path
+                    // (the relaxation must not touch NORMAL/HIGH/HIGH+/HIGH++).
+                    if self.is_slow_family() {
+                        self.active = true;
+                        self.samples_since_progress = 0;
+                    }
                 }
                 V3SessionEvent::SessionFinalised { .. } | V3SessionEvent::EotSeen => {
                     // Burst boundary. Disk store keeps everything; just drop
