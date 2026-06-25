@@ -253,6 +253,20 @@ fn forward_telemetry(sink: &dyn EventSink, t: RadioTelemetry) {
             serde_json::json!({ "channel_power_dbfs": channel_power_dbfs, "seq": seq }),
         ),
         RadioTelemetry::Tune(state) => sink.emit("radio_tune_state", state),
+        RadioTelemetry::FmExcursion {
+            peak_hz,
+            rms_hz,
+            max_dev_hz,
+            seq,
+        } => sink.emit(
+            "radio_fm_excursion",
+            serde_json::json!({
+                "peak_hz": peak_hz,
+                "rms_hz": rms_hz,
+                "max_dev_hz": max_dev_hz,
+                "seq": seq,
+            }),
+        ),
     }
 }
 

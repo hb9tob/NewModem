@@ -1,0 +1,14 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/sounder.js",
+  "import_from": "./tabs/sounder.js",
+  "header": "// Sounder tab — channel sounding: emit a multitone/chirp/AWGN probe sequence,\n// capture + analyze the RX chain response, plot it (SVG), and POST a report to\n// the collector. Self-contained; the TX-emit and RX-regenerate paths share\n// buildStandardSoundingRequest internally.\nimport { invoke, openExternalUrl } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"../lib/state.js\";\nimport { getSelectedBackendId } from \"../lib/dom.js\";\nimport { now, fmtNumOrDash } from \"../lib/format.js\";",
+  "symbols": [
+    "SOUNDER_LEVELS_DBFS", "levelDbToAmp", "expandLevels", "defaultSounderProbes",
+    "setSounderStatus", "buildStandardSoundingRequest", "runSounderTxEmit",
+    "runSounderTxRender", "buildRxChainMetadata", "runSounderAnalyze",
+    "lastSounderResult", "runSounderCollectorSend", "sounderRxRecording",
+    "sounderRxLiveTap", "runSounderRxCaptureToggle", "svgXY", "renderSounderPlots",
+    "setupSounderTab"
+  ]
+}

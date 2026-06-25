@@ -1,0 +1,12 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/format.js",
+  "import_from": "./lib/format.js",
+  "header": "// Shared layer — pure formatters & MIME constants.\n// Zero DOM, zero app state, imports nothing. Leaf of the module graph\n// (mirrors modem-framing in the Rust workspace: no DSP, no IO).",
+  "symbols": [
+    "MIME_TYPES", "MIME_BINARY", "MIME_TEXT", "MIME_IMAGE_AVIF", "MIME_IMAGE_JPEG",
+    "MIME_IMAGE_PNG", "MIME_ZSTD", "mimeToExt", "isImageMime", "now", "escapeHtml",
+    "numOr", "fmtSeconds", "txFormatBytes", "IMAGE_EXTS", "isImageFilename",
+    "formatTimestamp", "formatBytes", "fmtNumOrDash"
+  ]
+}

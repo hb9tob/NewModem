@@ -2883,6 +2883,16 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   background: #0a0a0a;
   border-radius: 4px;
 }
+/* FM-excursion (over-modulation) strip-chart — a fixed slice below the
+   audio spectrum so the deviation history stays readable. */
+.radio-fm-excursion {
+  width: 100%;
+  flex: 0 0 auto;
+  height: 84px;
+  min-height: 60px;
+  background: #0a0a0a;
+  border-radius: 4px;
+}
 .radio-monitor-row {
   display: flex;
   align-items: center;
@@ -3018,6 +3028,7 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   .radio-tune-info { display: none; }
 
   .radio-audio-fft { min-height: 24px; }
+  .radio-fm-excursion { height: 40px; min-height: 32px; }
   .radio-monitor-row { gap: 0.2rem; font-size: 9.5px; }
   .radio-monitor-row select { font-size: 9.5px; min-height: 22px; padding: 0 2px; }
   .radio-monitor-row input[type="range"] { min-height: 20px; }

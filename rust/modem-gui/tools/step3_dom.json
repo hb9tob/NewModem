@@ -1,0 +1,7 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/dom.js",
+  "import_from": "./lib/dom.js",
+  "header": "// Shared layer — generic DOM helpers. No app state, no Tauri, imports\n// nothing. Leaf of the module graph.",
+  "symbols": ["getSelectedBackendId", "rxIsRunning", "makeRow", "makeFieldLabel"]
+}

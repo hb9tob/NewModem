@@ -471,7 +471,12 @@ unsafe extern "C" fn stream_callback(buf: *mut u8, len: u32, ctx: *mut c_void) {
     }
     // Radio tab: S-meter + audio spectrum; mute the chunk under squelch.
     if let Some(rt) = radio.as_mut() {
-        if rt.on_audio(&audio, chain.last_channel_power()) {
+        if rt.on_audio(
+            &audio,
+            chain.last_channel_power(),
+            chain.last_excursion_peak(),
+            chain.last_excursion_rms(),
+        ) {
             audio.iter_mut().for_each(|s| *s = 0.0);
         }
     }

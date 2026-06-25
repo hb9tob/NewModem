@@ -31,6 +31,8 @@
   "radio.recenter": "Recenter LO",
   "radio.recenter_tip": "Recenter the local oscillator (digital offset → nominal)",
   "radio.audio_spectrum": "Audio spectrum",
+  "radio.fm_excursion": "FM excursion",
+  "radio.fm_excursion_tip": "Peak FM deviation (pre-de-emphasis) — red = over-modulation beyond the max deviation",
   "radio.monitor_out": "Monitor output",
   "radio.monitor_off": "— Monitoring off —",
   "radio.volume": "Volume",

@@ -368,7 +368,12 @@ fn capture_loop(
         // A muted chunk is zeroed so neither the monitor nor the decode
         // path hears noise below the threshold.
         if let Some(rt) = radio_rt.as_mut() {
-            if rt.on_audio(&audio, chain.last_channel_power()) {
+            if rt.on_audio(
+                &audio,
+                chain.last_channel_power(),
+                chain.last_excursion_peak(),
+                chain.last_excursion_rms(),
+            ) {
                 audio.iter_mut().for_each(|s| *s = 0.0);
             }
         }

@@ -1,0 +1,14 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/settings.js",
+  "import_from": "./tabs/settings.js",
+  "header": "// Settings tab — device selects, PTT form, serial ports, save dir, modem-profile\n// combos, experimental/force/turbo toggles, the settings-form save. loadSettings\n// and setupLangSelect stay in main.js (cross-tab orchestration). Subscribes to\n// sdr:persist-settings / sdr:reload-devices / capture:* on the bus; emits\n// rx-device:changed for the Radio tab.\nimport { invoke } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings, modemProfiles, setModemProfiles } from \"../lib/state.js\";\nimport { logEvent } from \"../lib/log.js\";\nimport { on, emit } from \"../lib/bus.js\";\nimport { refreshSdrPanels, prefetchCapsForSelected } from \"../lib/sdr.js\";",
+  "symbols": [
+    "refreshSettingsRxWarn", "populateDeviceSelect", "loadDevices",
+    "applyTurboModeStyling", "applyRxForceSettingsToUI", "loadModemProfiles",
+    "populateProfileSelects", "populateOneProfileSelect", "applyExperimentalModesToUI",
+    "applyPttSettingsToUI", "loadSerialPorts", "readPttFormIntoSettings",
+    "renderPttStatus", "persistSettings", "refreshTxHwVolume", "setupSettingsTab",
+    "loadSaveDir"
+  ]
+}

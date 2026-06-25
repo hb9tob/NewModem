@@ -1,0 +1,21 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/radio.js",
+  "import_from": "./tabs/radio.js",
+  "header": "// Radio tab — SDR-only monitor: S-meter, RF/audio spectrum + waterfall, freq\n// scale + click-to-tune (peak snap), gain/AGC controls and the SDR popover. Owns\n// radioState; renders driven by the radio_spectrum/radio_audio/smeter/tune events\n// (wired in main.js, which mutates radioState). Subscribes to sdr:refresh-* and\n// capture:started on the bus so it never imports Settings/RX directly.\nimport { invoke } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"../lib/state.js\";\nimport { getSelectedBackendId } from \"../lib/dom.js\";\nimport { escapeHtml } from \"../lib/format.js\";\nimport { on } from \"../lib/bus.js\";\nimport { getCapsForSelected, ensureBackendConfig, buildAgcRow, buildGainRow, buildAntennaRow, buildFeatureRow, buildBackendExtrasRow, hasFeatureToggles } from \"../lib/sdr.js\";\nimport { startCapture, stopCapture } from \"../lib/capture.js\";",
+  "symbols": [
+    "ensureRadioSettings", "radioState", "RADIO_WF_PALETTE", "radioLevelRange",
+    "PLUTO_FS_DBM", "SMETER_S9_DBM", "SMETER_DB_PER_UNIT", "radioGainDb",
+    "radioCalTrimDb", "radioDbfsToDbm", "radioDbmToSUnits", "sizeRadioCanvas",
+    "invokeRadio", "refreshRadioTabVisibility", "updateRadioTuneDisplay",
+    "currentRadioHz", "tuneRadioTo", "setupRadioTab", "restoreRadioControls",
+    "pushRadioControlsLive", "renderRadioGain", "sendRadioGainLive",
+    "renderRadioSdrParams", "openRadioSdrModal", "closeRadioSdrModal",
+    "restartRadioCapture", "setupRadioSdrModal", "startRadioRender",
+    "seedRadioFreqInput", "stopRadioRender", "renderRadio", "SMETER_DIAL_MIN_U",
+    "SMETER_DIAL_MAX_U", "SMETER_ARC_START", "SMETER_ARC_SWEEP", "smeterFrac",
+    "drawRadioSmeter", "smeterReport", "drawRadioSpectrum", "niceTickStep",
+    "radioRfTicks", "drawRadioFreqScale", "radioMarkerFrac", "radioFreqAtX",
+    "SNAP_WINDOW_HZ", "SNAP_MIN_DB", "radioSnapHz", "drawRadioRf"
+  ]
+}

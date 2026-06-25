@@ -31,6 +31,8 @@
   "radio.recenter": "Recentrer OL",
   "radio.recenter_tip": "Recentrer l'oscillateur local (offset numérique → nominal)",
   "radio.audio_spectrum": "Spectre audio",
+  "radio.fm_excursion": "Excursion FM",
+  "radio.fm_excursion_tip": "Déviation FM crête (avant dé-emphase) — rouge = surmodulation au-delà de la déviation max",
   "radio.monitor_out": "Sortie monitoring",
   "radio.monitor_off": "— Écoute désactivée —",
   "radio.volume": "Volume",

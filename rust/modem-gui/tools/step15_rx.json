@@ -1,0 +1,19 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/rx.js",
+  "import_from": "./tabs/rx.js",
+  "header": "// RX tab — received-file panel, audio-level meter, modem-state chip, the\n// RaptorQ progress bitmap / constellation / pilot-phase renderers, fountain\n// status, raw-WAV recording, the realtime-margin chip, and the Phase-D\n// capture-submit prompt. Owns lastProgress (the #progress-blocks bitmap); TX\n// half-duplex repaints it through the exported setProgressBitmap setter.\nimport { invoke, listen, convertFileSrc } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"../lib/state.js\";\nimport { logEvent, eventLogBuffer } from \"../lib/log.js\";\nimport { now, numOr, fmtSeconds, formatBytes, formatTimestamp, fmtNumOrDash, isImageMime, mimeToExt, MIME_TYPES } from \"../lib/format.js\";\nimport { openLightbox } from \"../lib/lightbox.js\";\nimport { rxIsRunning, getSelectedBackendId } from \"../lib/dom.js\";",
+  "symbols": [
+    "OVD_STICKY_MS", "RX_RT_DROP_HOLD_MS", "rawRecordingActive", "pendingCapture",
+    "lastOverdriveMs", "lastCrestDb", "lastRxRealtime", "lastDropTimestamp",
+    "lastSeenDroppedSamples", "rxRealtimeActive", "lastProgress", "lastConstellation",
+    "lastPilotPhases", "lastPilotPhaseIsMeta", "fountainState",
+    "showCurrentFile", "revealReceivedFile", "refreshRxDeviceLabel", "refreshStartButtonFromRx",
+    "setRawButtonState", "refreshRawRecordingState", "toggleRawRecording", "maybeOfferCaptureSubmit",
+    "submitPendingCapture", "dismissCapturePrompt", "updateLevel", "refreshOverdriveChip",
+    "noteAudioOverdrive", "refreshRxRealtimeChip", "noteRxRealtime", "noteRxRealtimeReset",
+    "noteProfileFromHeader", "updateV2State", "updateV2Marker", "resetRxVisuals",
+    "hideFountainStatus", "updateFountainStatus", "updateV2Progress", "redrawAll",
+    "drawProgressBlocks", "drawConstellation", "drawPilotPhase"
+  ]
+}

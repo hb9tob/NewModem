@@ -1,0 +1,13 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/lib/kiosk.js",
+  "import_from": "./lib/kiosk.js",
+  "header": "// Shared widget layer — kiosk touch input: the full-screen <select> picker and\n// the on-screen virtual keyboard (frequency inputs get a numeric pad with\n// favorites + step rows). Global capture-phase listeners; reaches the SDR\n// frequency MRU helpers but no tab.\nimport { backendIdForFreqInput, freqFavoritesArray, isFreqInputId, pushFreqMru } from \"./sdr.js\";",
+  "symbols": [
+    "selectPicker", "setupSelectPicker", "selectLabel", "openSelectPicker",
+    "closeSelectPicker", "virtKb", "setupVirtKeyboard", "openVirtKeyboard",
+    "closeVirtKeyboard", "inputLabel", "renderVirtKeyboardLayout", "makeKbKey",
+    "onVirtKbKey", "appendVirtKbChar", "refreshVirtKbDisplay", "STEP_OPTIONS_KHZ",
+    "renderVirtKbFavoritesRow", "renderVirtKbStepRow", "stepDraft"
+  ]
+}

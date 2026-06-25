@@ -50,6 +50,10 @@ const RF_FRAME_PERIOD: Duration = Duration::from_millis(80);
 const AUDIO_FRAME_PERIOD: Duration = Duration::from_millis(66);
 /// Minimum spacing between successive S-meter frames (~10 Hz).
 const SMETER_PERIOD: Duration = Duration::from_millis(100);
+/// Minimum spacing between successive FM-excursion frames (~20 Hz).
+/// Faster than the spectra so brief over-deviation transients still show;
+/// the peak is held between emits so none is missed even at this cadence.
+const EXCURSION_PERIOD: Duration = Duration::from_millis(50);
 
 /// Backend-specific live hardware writes the runtime delegates to. Calls
 /// are best-effort: implementations log their own failures and return,
@@ -115,9 +119,16 @@ pub struct RadioRuntime {
     rf_seq: u64,
     audio_seq: u64,
     smeter_seq: u64,
+    excursion_seq: u64,
     last_rf: Instant,
     last_audio: Instant,
     last_smeter: Instant,
+    last_excursion: Instant,
+    /// Peak-hold of the normalised excursion peak / RMS accumulated since
+    /// the last emitted FM-excursion frame, so a transient between emits is
+    /// not lost. Reset to 0 on each emit.
+    exc_peak_hold: f32,
+    exc_rms_hold: f32,
 }
 
 impl RadioRuntime {
@@ -142,9 +153,13 @@ impl RadioRuntime {
             rf_seq: 0,
             audio_seq: 0,
             smeter_seq: 0,
+            excursion_seq: 0,
             last_rf: now,
             last_audio: now,
             last_smeter: now,
+            last_excursion: now,
+            exc_peak_hold: 0.0,
+            exc_rms_hold: 0.0,
         };
         rt.send_tune();
         rt
@@ -258,10 +273,19 @@ impl RadioRuntime {
         self.last_rf = Instant::now();
     }
 
-    /// S-meter + audio spectrum from the demodulated audio. `channel_power_lin`
-    /// is the chain's last linear channel power. Returns `true` when the
-    /// chunk should be muted (channel power below the squelch threshold).
-    pub fn on_audio(&mut self, audio: &[f32], channel_power_lin: f32) -> bool {
+    /// S-meter + audio spectrum + FM-excursion meter from the demodulated
+    /// audio. `channel_power_lin` is the chain's last linear channel power;
+    /// `excursion_peak` / `excursion_rms` are the chain's last normalised
+    /// pre-de-emphasis discriminator peak / RMS (`1.0` == max deviation).
+    /// Returns `true` when the chunk should be muted (channel power below the
+    /// squelch threshold).
+    pub fn on_audio(
+        &mut self,
+        audio: &[f32],
+        channel_power_lin: f32,
+        excursion_peak: f32,
+        excursion_rms: f32,
+    ) -> bool {
         let power_dbfs = if channel_power_lin > 0.0 {
             10.0 * channel_power_lin.log10()
         } else {
@@ -275,6 +299,25 @@ impl RadioRuntime {
                 seq: self.smeter_seq,
             });
             self.last_smeter = Instant::now();
+        }
+
+        // FM-excursion meter (Radio-tab over-modulation display). Peak-hold
+        // the normalised excursion across callbacks so a brief over-deviation
+        // between emits is not missed, then scale by the active max deviation
+        // to report absolute Hz.
+        self.exc_peak_hold = self.exc_peak_hold.max(excursion_peak);
+        self.exc_rms_hold = self.exc_rms_hold.max(excursion_rms);
+        if self.last_excursion.elapsed() >= EXCURSION_PERIOD {
+            self.excursion_seq += 1;
+            let _ = self.telemetry_tx.send(RadioTelemetry::FmExcursion {
+                peak_hz: self.exc_peak_hold * self.max_deviation_hz,
+                rms_hz: self.exc_rms_hold * self.max_deviation_hz,
+                max_dev_hz: self.max_deviation_hz,
+                seq: self.excursion_seq,
+            });
+            self.exc_peak_hold = 0.0;
+            self.exc_rms_hold = 0.0;
+            self.last_excursion = Instant::now();
         }
 
         // Keep a ring of the most recent AUDIO_FFT_SIZE samples.
