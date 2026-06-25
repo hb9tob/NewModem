@@ -503,6 +503,11 @@ function wireEvents() {
     radioState.tune = event.payload;
     updateRadioTuneDisplay();
   });
+  listen("radio_fm_excursion", (event) => {
+    // Latest FM-excursion frame; the Radio-tab RAF loop folds it into the
+    // scrolling over-modulation graph (drawFmExcursion).
+    radioState.excursion = event.payload;
+  });
 }
 
 // Kiosk mode (small touchscreen, e.g. Pi 7" 800x480) — the Rust setup

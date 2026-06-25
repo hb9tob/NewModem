@@ -147,7 +147,12 @@ impl CallbackState {
     /// `true` when the chunk should be squelch-muted.
     fn radio_on_audio(&mut self, audio: &[f32]) -> bool {
         match self.radio.as_mut() {
-            Some(rt) => rt.on_audio(audio, self.chain.last_channel_power()),
+            Some(rt) => rt.on_audio(
+                audio,
+                self.chain.last_channel_power(),
+                self.chain.last_excursion_peak(),
+                self.chain.last_excursion_rms(),
+            ),
             None => false,
         }
     }

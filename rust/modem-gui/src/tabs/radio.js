@@ -27,6 +27,9 @@ export const radioState = {
   audio: null, // latest audio SpectrumFrame
   smeterDb: null, // EMA-smoothed channel power, dBFS
   tune: null, // latest TuneState
+  excursion: null, // latest FM-excursion frame {peak_hz, rms_hz, max_dev_hz, seq}
+  excHist: [], // rolling history of {peak, rms} (Hz) for the scrolling graph
+  excLastSeq: -1, // last ingested excursion seq (dedup vs the 60 Hz RAF)
   rafId: null,
   waterfallInit: false,
 };
@@ -500,7 +503,11 @@ export function stopRadioRender() {
 
 export function renderRadio() {
   drawRadioSmeter();
-  drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6");
+  // Half-width audio spectrum: NBFM useful audio is ~300-2700 Hz, so the
+  // upper half of the 0-24 kHz band is dead space. Render only the lower
+  // half (0-12 kHz) so the voice band fills the panel.
+  drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6", 0.5);
+  drawFmExcursion();
   drawRadioRf();
 }
 
@@ -601,7 +608,10 @@ export function smeterReport(sUnits) {
   return `S${Math.max(0, Math.round(sUnits))}`;
 }
 
-export function drawRadioSpectrum(canvasId, frame, color) {
+// `binFrac` (0..1, default 1) renders only the lower fraction of the FFT
+// bins across the full canvas width — used to show the audio spectrum at
+// half-width (0-12 kHz of the 0-24 kHz band) where the NBFM voice band lives.
+export function drawRadioSpectrum(canvasId, frame, color, binFrac = 1) {
   const canvas = document.getElementById(canvasId);
   const ctx = sizeRadioCanvas(canvas);
   if (!ctx) return;
@@ -612,7 +622,7 @@ export function drawRadioSpectrum(canvasId, frame, color) {
   ctx.fillRect(0, 0, w, h);
   if (!frame || !frame.bins_db || !frame.bins_db.length) return;
   const bins = frame.bins_db;
-  const n = bins.length;
+  const n = Math.max(1, Math.floor(bins.length * Math.max(0, Math.min(1, binFrac))));
   const [lo, hi] = radioLevelRange();
   const span = hi - lo;
   ctx.strokeStyle = color;
@@ -626,6 +636,102 @@ export function drawRadioSpectrum(canvasId, frame, color) {
     else ctx.lineTo(x, y);
   }
   ctx.stroke();
+}
+
+// Scrolling FM-excursion (over-modulation) graph. Plots the peak frequency
+// deviation per frame as a strip-chart (newest at the right, scrolling left),
+// with the RMS deviation overlaid as a line and reference grid lines at
+// ±2.5 / ±5 kHz. The active max deviation is the over-modulation threshold:
+// peaks above it are drawn red. Source = QuadratureDemod discriminator output
+// tapped BEFORE de-emphasis (radio_fm_excursion telemetry), so it reflects the
+// true on-air deviation. Magnitude (|deviation|) is shown — what matters for
+// over-modulation is how far the peak swings, not its sign.
+const EXC_HIST_MAX = 240; // ~12 s of history at the ~20 Hz emit cadence
+
+export function drawFmExcursion() {
+  const canvas = document.getElementById("radio-fm-excursion");
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const ex = radioState.excursion;
+  const maxDev =
+    ex && Number.isFinite(ex.max_dev_hz) && ex.max_dev_hz > 0 ? ex.max_dev_hz : 5000;
+  // Ingest the latest frame once (dedup on seq vs the faster RAF).
+  if (ex && ex.seq !== radioState.excLastSeq) {
+    radioState.excLastSeq = ex.seq;
+    radioState.excHist.push({ peak: ex.peak_hz || 0, rms: ex.rms_hz || 0 });
+    if (radioState.excHist.length > EXC_HIST_MAX) {
+      radioState.excHist.splice(0, radioState.excHist.length - EXC_HIST_MAX);
+    }
+  }
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0a0a0a";
+  ctx.fillRect(0, 0, w, h);
+  const topHz = Math.max(6000, maxDev * 1.2);
+  const yOf = (hz) => h - Math.max(0, Math.min(1, hz / topHz)) * h;
+
+  // Reference grid: ±2.5 kHz (amateur narrow NBFM) and ±5 kHz (standard).
+  ctx.font = "10px sans-serif";
+  ctx.textBaseline = "bottom";
+  for (const r of [
+    { hz: 2500, color: "rgba(120,200,120,0.35)", label: "2,5 kHz" },
+    { hz: 5000, color: "rgba(210,200,120,0.35)", label: "5 kHz" },
+  ]) {
+    if (r.hz >= topHz) continue;
+    const y = yOf(r.hz);
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+    ctx.fillStyle = r.color;
+    ctx.fillText(r.label, 3, y - 1);
+  }
+  // Over-modulation threshold = active max deviation (red dashed).
+  const yMax = yOf(maxDev);
+  ctx.strokeStyle = "rgba(244,67,54,0.85)";
+  ctx.setLineDash([4, 3]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, yMax);
+  ctx.lineTo(w, yMax);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Peak bars, newest at the right, scrolling left. Red above the threshold.
+  const hist = radioState.excHist;
+  const colW = w / EXC_HIST_MAX;
+  for (let k = 0; k < hist.length; k++) {
+    const s = hist[hist.length - 1 - k];
+    const x = w - (k + 1) * colW;
+    if (x + colW < 0) break;
+    const yp = yOf(s.peak);
+    ctx.fillStyle = s.peak > maxDev ? "#f44336" : "#43a047";
+    ctx.fillRect(x, yp, Math.max(1, colW + 0.5), h - yp);
+  }
+  // RMS overlay as a thin line.
+  if (hist.length > 1) {
+    ctx.strokeStyle = "rgba(255,255,255,0.55)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let k = 0; k < hist.length; k++) {
+      const s = hist[hist.length - 1 - k];
+      const x = w - (k + 0.5) * colW;
+      const y = yOf(s.rms);
+      if (k === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  // Live numeric peak read-out.
+  if (ex) {
+    ctx.textBaseline = "top";
+    ctx.font = "11px sans-serif";
+    ctx.fillStyle = ex.peak_hz > maxDev ? "#ff8a80" : "#9be29b";
+    ctx.fillText(`crête ${((ex.peak_hz || 0) / 1000).toFixed(2)} kHz`, 3, 2);
+  }
 }
 
 export function niceTickStep(span, targetTicks) {

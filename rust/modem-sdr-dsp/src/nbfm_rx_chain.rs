@@ -159,6 +159,15 @@ pub struct NbfmRxChain {
     /// the channel-selected power just before the discriminator. Feeds
     /// the GUI S-meter. `0.0` until the first non-empty `process`.
     last_channel_power: f32,
+    /// Peak `|discriminator output|` of the most recent [`Self::process`]
+    /// call, measured **before** de-emphasis. Normalised so `1.0` equals
+    /// the configured `max_deviation`. Read-only side-channel for the
+    /// Radio-tab FM-excursion (over-modulation) meter — it does not touch
+    /// the audio path. `0.0` until the first non-empty `process`.
+    last_excursion_peak: f32,
+    /// RMS of the same pre-de-emphasis discriminator output, normalised
+    /// (`1.0` == `max_deviation`).
+    last_excursion_rms: f32,
 }
 
 impl NbfmRxChain {
@@ -219,6 +228,8 @@ impl NbfmRxChain {
             audio_scratch: Vec::new(),
             input_rate_hz: cfg.input_rate_hz as f32,
             last_channel_power: 0.0,
+            last_excursion_peak: 0.0,
+            last_excursion_rms: 0.0,
         }
     }
 
@@ -247,6 +258,24 @@ impl NbfmRxChain {
     #[inline]
     pub fn last_channel_power(&self) -> f32 {
         self.last_channel_power
+    }
+
+    /// Peak `|discriminator output|` of the last [`Self::process`] call,
+    /// taken **before** de-emphasis, normalised so `1.0` equals the
+    /// configured max deviation. Multiply by `max_deviation_hz` for the
+    /// peak frequency excursion in Hz. Drives the Radio-tab
+    /// over-modulation meter; reflects the true on-air deviation (the
+    /// de-emphasis roll-off would otherwise understate the highs).
+    #[inline]
+    pub fn last_excursion_peak(&self) -> f32 {
+        self.last_excursion_peak
+    }
+
+    /// RMS of the last [`Self::process`] call's pre-de-emphasis
+    /// discriminator output, normalised (`1.0` == max deviation).
+    #[inline]
+    pub fn last_excursion_rms(&self) -> f32 {
+        self.last_excursion_rms
     }
 
     /// Input I/Q sample rate in Hz (== captured RF span for the wideband
@@ -296,6 +325,24 @@ impl NbfmRxChain {
         let audio = &mut self.audio_scratch[..baseband.len()];
         self.demod.process(&baseband, audio);
 
+        // Radio-tab FM-excursion side-channel: peak + RMS of the raw
+        // discriminator output BEFORE de-emphasis (de-emphasis rolls off
+        // the highs and would understate the true on-air deviation).
+        // Normalised units — 1.0 == max_deviation. Read-only over `audio`:
+        // the de-emphasis/HPF signal path below is unchanged, so the
+        // emitted audio stays byte-identical to the pre-meter chain.
+        let mut peak = 0.0f32;
+        let mut sumsq = 0.0f32;
+        for &s in audio.iter() {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+            sumsq += s * s;
+        }
+        self.last_excursion_peak = peak;
+        self.last_excursion_rms = (sumsq / audio.len() as f32).sqrt();
+
         // Stage 3+4: deemphasis + sub-audio HPF, in place.
         self.deemph.process(audio);
         self.hpf.process(audio);
@@ -317,6 +364,8 @@ impl NbfmRxChain {
         self.hpf.reset();
         self.audio_scratch.clear();
         self.last_channel_power = 0.0;
+        self.last_excursion_peak = 0.0;
+        self.last_excursion_rms = 0.0;
     }
 }
 

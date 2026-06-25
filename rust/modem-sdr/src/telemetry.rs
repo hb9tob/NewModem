@@ -73,6 +73,16 @@ pub enum RadioTelemetry {
     SMeter { channel_power_dbfs: f32, seq: u64 },
     /// Tuning state changed.
     Tune(TuneState),
+    /// FM-excursion meter: peak and RMS frequency deviation (Hz) over the
+    /// last frame window, with the active max deviation so the GUI can draw
+    /// the over-modulation threshold. Peak-held between emits so brief
+    /// over-deviation transients are not lost. Radio tab only.
+    FmExcursion {
+        peak_hz: f32,
+        rms_hz: f32,
+        max_dev_hz: f32,
+        seq: u64,
+    },
 }
 
 /// Commands the worker sends down to the capture thread to retune /
