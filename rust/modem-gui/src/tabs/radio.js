@@ -469,8 +469,15 @@ export function startRadioRender() {
   pushRadioControlsLive();
   if (radioState.rafId !== null) return;
   radioState.waterfallInit = false;
+  // Re-schedule unconditionally: a throw in any draw fn must NOT kill the
+  // loop (otherwise the whole Radio tab freezes after one frame — the
+  // `requestAnimationFrame` below would never run). Log and keep ticking.
   const loop = () => {
-    renderRadio();
+    try {
+      renderRadio();
+    } catch (err) {
+      console.error("[radio] render error", err);
+    }
     radioState.rafId = requestAnimationFrame(loop);
   };
   radioState.rafId = requestAnimationFrame(loop);
@@ -503,10 +510,10 @@ export function stopRadioRender() {
 
 export function renderRadio() {
   drawRadioSmeter();
-  // Half-width audio spectrum: NBFM useful audio is ~300-2700 Hz, so the
-  // upper half of the 0-24 kHz band is dead space. Render only the lower
-  // half (0-12 kHz) so the voice band fills the panel.
-  drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6", 0.5);
+  // Audio spectrum cut at 4 kHz: NBFM useful audio is ~300-2700 Hz, so show
+  // only 0-4 kHz of the 0-24 kHz band (= 4000/24000 of the bins) — the voice
+  // band fills the panel and the dead high end is dropped.
+  drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6", 4000 / 24000);
   drawFmExcursion();
   drawRadioRf();
 }

@@ -2876,20 +2876,25 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.radio-audio-fft {
-  width: 100%;
+/* Audio spectrum + FM-excursion side by side, each filling half the card. */
+.radio-audio-graphs {
+  display: flex;
   flex: 1 1 auto;
-  min-height: 56px;
-  background: #0a0a0a;
-  border-radius: 4px;
+  gap: 6px;
+  min-height: 0;
 }
-/* FM-excursion (over-modulation) strip-chart — a fixed slice below the
-   audio spectrum so the deviation history stays readable. */
+.radio-graph-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.radio-audio-fft,
 .radio-fm-excursion {
   width: 100%;
-  flex: 0 0 auto;
-  height: 84px;
-  min-height: 60px;
+  flex: 1 1 auto;
+  min-height: 48px;
   background: #0a0a0a;
   border-radius: 4px;
 }
@@ -3027,8 +3032,8 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   /* Minor tuning-info line — drop it on the tiny panel to save a row. */
   .radio-tune-info { display: none; }
 
-  .radio-audio-fft { min-height: 24px; }
-  .radio-fm-excursion { height: 40px; min-height: 32px; }
+  .radio-audio-graphs { gap: 3px; }
+  .radio-audio-fft, .radio-fm-excursion { min-height: 24px; }
   .radio-monitor-row { gap: 0.2rem; font-size: 9.5px; }
   .radio-monitor-row select { font-size: 9.5px; min-height: 22px; padding: 0 2px; }
   .radio-monitor-row input[type="range"] { min-height: 20px; }
