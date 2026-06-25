@@ -1038,6 +1038,10 @@ fn run_turbo_worker(
     // primitive the in-session acquisition + the driver's own gate use, so the
     // detection behaves identically however the burst is bootstrapped.
     let mut auto_gate = (!forced).then(modem_core::turbo_gate::TurboGate::auto);
+    // One gate search window, captured once (deterministic across rebuilds): on a
+    // burst-end cross-family reset we re-seed `warm` with this many tail samples
+    // so a near-back-to-back burst already begun is not lost.
+    let gate_search_len = auto_gate.as_ref().map(|g| g.search_len()).unwrap_or(0);
 
     let mut deemph =
         deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
@@ -1159,6 +1163,10 @@ fn run_turbo_worker(
             f.process(&mut chunk);
         }
 
+        // Set when the driver crosses a burst boundary this push (auto mode):
+        // the cross-family reset runs AFTER the match so `driver` is no longer
+        // borrowed by `d`.
+        let mut burst_ended = false;
         match driver.as_mut() {
             Some(d) => {
                 // Feed in ≤100 ms sub-pushes so the throttled acquisition scan
@@ -1168,11 +1176,17 @@ fn run_turbo_worker(
                 // a preamble landing inside one big push between two scans is
                 // missed. A no-op for the small chunks a sound card delivers.
                 let t0 = Instant::now();
+                let mut finalised = 0usize;
                 for sub in chunk.chunks(ACQ_PUSH_SPLIT) {
-                    d.push_samples(sub);
+                    finalised += d.push_samples(sub).bursts_finalised;
                 }
                 last_push_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 max_push_ms = max_push_ms.max(last_push_ms);
+                // A burst just ended. In AUTO mode (auto_gate.is_some() ⇔ !forced)
+                // flag a return to the cold-startup detection state below.
+                if finalised > 0 && auto_gate.is_some() {
+                    burst_ended = true;
+                }
             }
             None => {
                 // Auto mode, still detecting: accumulate the warm ring and poll
@@ -1219,6 +1233,33 @@ fn run_turbo_worker(
                     }
                 }
             }
+        }
+
+        // Cross-family re-detection: when a burst ends in AUTO mode, return to
+        // the exact application-launch detection state (driver = None + a fresh
+        // multi-geometry `TurboGate::auto()`) so the NEXT burst is re-detected
+        // across ALL geometries — a DIFFERENT family (NORMAL/HIGH after ROBUST,
+        // and vice versa). The driver's own in-session profile refinement is
+        // family-locked by design (`rx_v3_worker::route`), so a cross-family
+        // hand-off MUST happen at this layer. `burst_ended` was only set when
+        // `auto_gate.is_some()` (⇔ !forced), so a forced single-profile capture
+        // stays locked on the operator's profile and is never torn down.
+        if burst_ended {
+            // Seed `warm` with the most-recent tail (one gate search window) so a
+            // near-back-to-back burst already begun is not lost, then re-arm a
+            // fresh gate and make that tail immediately eligible WITHOUT
+            // re-scanning the just-decoded burst body. `total_samples` already
+            // counts this chunk (incremented above), so the None-arm
+            // `warm_origin` (= total_samples − warm.len()) stays exact.
+            let tail_n = gate_search_len.min(chunk.len());
+            warm.clear();
+            warm.extend_from_slice(&chunk[chunk.len() - tail_n..]);
+            driver = None;
+            auto_gate = Some(modem_core::turbo_gate::TurboGate::auto());
+            if let Some(g) = auto_gate.as_mut() {
+                g.reset_to(total_samples - warm.len() as u64);
+            }
+            worker_log("[turbo] burst exit -> reset to cold-detect (cross-family re-arm)");
         }
     }
 
@@ -3001,5 +3042,114 @@ mod tests {
     #[test]
     fn v4_chunked_worker_auto_detects_high_plus_plus() {
         run_v4_worker_sim("HIGH++", ProfileIndexT::HighPlusPlus, 4500);
+    }
+
+    /// Cross-family re-detection on burst exit (AUTO mode). A family-A burst
+    /// (HIGH+) then a family-B burst (ROBUST) separated by a NOISE gap. The
+    /// turbo worker locks its multi-geometry gate to the FIRST detected family
+    /// and — before the fix — never re-polled it once a driver was built, so the
+    /// family-B burst was never acquired (the user-reported "NORMAL/HIGH no
+    /// longer detected after a ROBUST, and vice versa"). On a burst end the
+    /// worker must return to the cold-startup detection state and re-detect
+    /// ROBUST. Asserts BOTH session headers arm.
+    #[test]
+    fn turbo_worker_redetects_cross_family_burst() {
+        use crate::event_sink::{EventSink, RecordingSink};
+        use modem_core::types::{AUDIO_RATE, RRC_SPAN_SYM};
+        use modem_core::{frame, modulator, rrc};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{mpsc, Arc, Mutex};
+
+        fn build_v3_burst_audio(
+            cfg: &modem_core::profile::ModemConfig,
+            payload_bytes: usize,
+            session_id: u32,
+        ) -> Vec<f32> {
+            let payload = vec![0xAA_u8; payload_bytes];
+            let n_packets = ((payload_bytes + 31) / 32) as u32;
+            let symbols = frame::build_superframe_v3_range(
+                &payload, cfg, session_id, 0x01, 0x1234, 0, n_packets,
+            );
+            let (sps, pitch) =
+                rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+            let taps = rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+            modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz)
+        }
+
+        let cfg_a = ProfileIndexT::HighPlus.to_config();
+        let cfg_b = ProfileIndexT::Robust.to_config();
+        let sid_a = 0xA1A1_A1A1u32;
+        let sid_b = 0xB2B2_B2B2u32;
+
+        // family A burst, then 3 s of high-energy pseudo-noise (forces the
+        // no-progress end-of-burst — the in-session silence gate stays shut on
+        // loud noise), then the family B burst.
+        let mut audio = build_v3_burst_audio(&cfg_a, 800, sid_a);
+        let mut s: u64 = 0x9E37_79B9;
+        let noise: Vec<f32> = (0..(AUDIO_RATE as usize) * 3)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 0.3
+            })
+            .collect();
+        audio.extend_from_slice(&noise);
+        audio.extend_from_slice(&build_v3_burst_audio(&cfg_b, 800, sid_b));
+
+        let dir = std::env::temp_dir().join(format!("nbfm_crossfam_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = Arc::new(Mutex::new(dir.clone()));
+
+        let rec = Arc::new(RecordingSink::new());
+        let sink: Arc<dyn EventSink> = rec.clone();
+        let wav_sink: super::SharedWavSink = Arc::new(Mutex::new(None));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Pre-fill an irregular cpal-like stream, then drop the sender so the
+        // worker exits on Disconnected after draining it (no wall-clock pacing
+        // needed — the turbo path is sample-driven).
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let sizes = [2400usize, 997, 4096, 480];
+        let mut i = 0;
+        let mut k = 0;
+        while i < audio.len() {
+            let n = sizes[k % sizes.len()].min(audio.len() - i);
+            tx.send(audio[i..i + n].to_vec()).unwrap();
+            i += n;
+            k += 1;
+        }
+        drop(tx);
+
+        super::run_turbo_worker(
+            rx,
+            sink,
+            save_dir,
+            wav_sink,
+            ProfileIndexT::Normal, // auto bootstrap anchor — the gate re-detects
+            /*forced=*/ false,
+            /*deemphasis=*/ false,
+            dropped,
+            stop,
+        );
+
+        let events = rec.events();
+        let armed: Vec<u64> = events
+            .iter()
+            .filter(|(n, _)| n == "session_armed")
+            .filter_map(|(_, p)| p["session_id"].as_u64())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            armed.contains(&(sid_a as u64)),
+            "family-A burst A ({sid_a:#010x}) never armed; armed={armed:#010x?}",
+        );
+        assert!(
+            armed.contains(&(sid_b as u64)),
+            "family-B burst B ({sid_b:#010x}) never re-detected after the burst-end \
+             cross-family reset; armed={armed:#010x?}",
+        );
     }
 }
