@@ -3,6 +3,7 @@
 
 import { initI18n, setLang, getLang, supportedLangs, t, applyI18n } from "./i18n.js";
 import { MIME_TYPES, MIME_BINARY, MIME_TEXT, MIME_IMAGE_AVIF, MIME_IMAGE_JPEG, MIME_IMAGE_PNG, MIME_ZSTD, mimeToExt, isImageMime, now, escapeHtml, numOr, fmtSeconds, txFormatBytes, IMAGE_EXTS, isImageFilename, formatTimestamp, formatBytes, fmtNumOrDash } from "./lib/format.js";
+import { invoke, listen, convertFileSrc, getCurrentWindow, openExternalUrl } from "./lib/ipc.js";
 
 // Event log: we also keep an in-memory buffer so we can serialize and
 // push it to the Phase D collector at submission time. Capped at 500
@@ -145,7 +146,6 @@ const sessionRegistry = new Map();
 
 async function refreshSessions() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     const list = await invoke("list_sessions");
     sessionRegistry.clear();
@@ -204,7 +204,6 @@ function renderSessionsTable() {
         return;
       }
       try {
-        const { invoke } = window.__TAURI__.core;
         await invoke("delete_session", { sessionId: id });
         sessionRegistry.delete(id);
         renderSessionsTable();
@@ -284,7 +283,6 @@ function showCurrentFile(payload) {
     `<code>${payload.saved_path}</code>`;
   wrap.innerHTML = "";
   if (isImageMime(payload.mime_type)) {
-    const { convertFileSrc } = window.__TAURI__.core;
     const src = convertFileSrc(payload.saved_path);
     const img = document.createElement("img");
     img.src = src;
@@ -307,7 +305,7 @@ async function revealReceivedFile(savedPath) {
     } else if (window.__TAURI__ && window.__TAURI__.core) {
       // Fallback through direct invoke if the plugin's global surface is
       // not exposed by withGlobalTauri on this Tauri version.
-      await window.__TAURI__.core.invoke("plugin:opener|reveal_item_in_dir", {
+      await invoke("plugin:opener|reveal_item_in_dir", {
         path: savedPath,
       });
     }
@@ -338,7 +336,7 @@ const lightbox = {
 
 async function setWindowFullscreen(flag) {
   try {
-    const win = window.__TAURI__.window.getCurrentWindow();
+    const win = getCurrentWindow();
     await win.setFullscreen(flag);
   } catch (err) {
     console.error("setFullscreen", err);
@@ -379,7 +377,7 @@ async function openLightbox(src, alt) {
   // OS fullscreen via Tauri: the browser requestFullscreen only fullscreens
   // the WebView inside the window, not the window itself.
   try {
-    const win = window.__TAURI__.window.getCurrentWindow();
+    const win = getCurrentWindow();
     lightbox.wasFullscreen = await win.isFullscreen();
     if (!lightbox.wasFullscreen) {
       const prevW = window.innerWidth;
@@ -751,7 +749,6 @@ const EIA_CTCSS_TONES_HZ = [
 
 async function loadSdrBackends() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     const backends = await invoke("list_sdr_backends");
     sdrBackends = new Map(backends.map(b => [b.id, b]));
@@ -784,7 +781,6 @@ async function renderSdrBackendsList() {
     return;
   }
   host.innerHTML = "";
-  const { invoke } = window.__TAURI__.core;
   for (const [id, info] of sdrBackends.entries()) {
     // Seed the settings entry so the persisted bool round-trips
     // even when the user hasn't touched the checkbox yet.
@@ -831,7 +827,6 @@ async function renderSdrBackendsList() {
 /// toggle.
 async function refreshBackendLibraryStatus(backendId) {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const span = document.querySelector(
     `.sdr-backend-status[data-backend-id="${backendId}"]`
   );
@@ -876,7 +871,6 @@ async function resolveDeviceCaps(compositeName, backendId) {
   if (deviceCapsCache.has(compositeName)) return deviceCapsCache.get(compositeName);
   if (pendingCapsFetch.has(compositeName)) return pendingCapsFetch.get(compositeName);
   if (!window.__TAURI__ || !window.__TAURI__.core) return null;
-  const { invoke } = window.__TAURI__.core;
   const promise = (async () => {
     try {
       const caps = await invoke("get_sdr_device_capabilities", { compositeName });
@@ -1619,7 +1613,6 @@ async function loadDevices() {
     status.style.color = "#ef5350";
     return;
   }
-  const { invoke } = window.__TAURI__.core;
   try {
     // cpal soundcard lists in parallel; per-backend SDR device lists
     // come next (one Tauri call per registered backend, fanned out).
@@ -1680,7 +1673,6 @@ async function loadDevices() {
 
 async function loadSettings() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     currentSettings = await invoke("get_settings");
   } catch (err) {
@@ -1763,7 +1755,6 @@ let modemProfiles = [];
 
 async function loadModemProfiles() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     modemProfiles = await invoke("list_modem_profiles");
   } catch (err) {
@@ -1931,7 +1922,6 @@ function applyPttSettingsToUI() {
 
 async function loadSerialPorts() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const sel = document.getElementById("ptt-port-select");
   if (!sel) return;
   let ports = [];
@@ -1992,7 +1982,6 @@ function renderPttStatus(payload) {
 
 async function persistSettings() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const call = document.getElementById("callsign-input");
   const rxSel = document.getElementById("rx-device-select");
   const txSel = document.getElementById("tx-device-select");
@@ -2045,7 +2034,6 @@ async function refreshTxHwVolume() {
   const row = document.getElementById("tx-hwvol-row");
   if (!row) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) { row.hidden = true; return; }
-  const { invoke } = window.__TAURI__.core;
   const dev = ((currentSettings && currentSettings.tx_device) || "").trim();
   if (!dev) { row.hidden = true; return; }
   try {
@@ -2228,7 +2216,6 @@ function setupSettingsTab() {
 }
 
 async function loadSaveDir() {
-  const { invoke } = window.__TAURI__.core;
   try {
     const dir = await invoke("get_save_dir");
     document.getElementById("save-dir-label").textContent = `→ ${dir}`;
@@ -2239,7 +2226,6 @@ async function loadSaveDir() {
 }
 
 async function startCapture() {
-  const { invoke } = window.__TAURI__.core;
   const select = document.getElementById("rx-device-select");
   const deviceName = select ? select.value : "";
   const status = document.getElementById("status");
@@ -2319,14 +2305,13 @@ function setupWavPlayback() {
   // manually press Stop. The backend leaves the worker running for a
   // few seconds so any in-flight decode finalises naturally.
   if (window.__TAURI__ && window.__TAURI__.event) {
-    window.__TAURI__.event.listen("wav_playback_done", () => {
+    listen("wav_playback_done", () => {
       logEvent("wav_playback_done", null);
     });
   }
 }
 
 async function startCaptureFromWav(file) {
-  const { invoke } = window.__TAURI__.core;
   const status = document.getElementById("status");
   // Refuse to start a WAV replay when a live RX is already in flight —
   // the backend rejects it anyway, but this surfaces a clearer message
@@ -2367,7 +2352,6 @@ async function startCaptureFromWav(file) {
 }
 
 async function stopCapture() {
-  const { invoke } = window.__TAURI__.core;
   const status = document.getElementById("status");
   try {
     await invoke("stop_capture");
@@ -2408,7 +2392,6 @@ function setRawButtonState(recording) {
 }
 
 async function refreshRawRecordingState() {
-  const { invoke } = window.__TAURI__.core;
   try {
     const active = await invoke("is_raw_recording");
     setRawButtonState(!!active);
@@ -2418,7 +2401,6 @@ async function refreshRawRecordingState() {
 }
 
 async function toggleRawRecording() {
-  const { invoke } = window.__TAURI__.core;
   try {
     if (rawRecordingActive) {
       const info = await invoke("stop_raw_recording");
@@ -2471,7 +2453,6 @@ function maybeOfferCaptureSubmit(captureInfo) {
 async function submitPendingCapture() {
   if (!pendingCapture) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const panel = document.getElementById("capture-submit-prompt");
   const status = document.getElementById("csp-status");
   const submit = document.getElementById("csp-submit");
@@ -2610,7 +2591,6 @@ async function refreshLogoPreview(filename) {
   }
   nameEl.textContent = filename;
   if (window.__TAURI__ && window.__TAURI__.core) {
-    const { invoke, convertFileSrc } = window.__TAURI__.core;
     try {
       const dir = await invoke("overlays_logos_dir");
       const sep = dir.includes("\\") ? "\\" : "/";
@@ -2675,7 +2655,6 @@ function commitOverlayChange() {
 async function pickOverlayLogo(file) {
   if (!file) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const buf = await file.arrayBuffer();
   try {
     const filename = await invoke("overlays_import_logo", {
@@ -3304,7 +3283,6 @@ function drawPilotPhase() {
 }
 
 function wireEvents() {
-  const { listen } = window.__TAURI__.event;
   const names = [
     "preamble",
     "header",
@@ -3371,7 +3349,6 @@ function wireEvents() {
       // invoke` and `worker_requests_restart_error` fired every
       // single Idle transition since 0.10.43, meaning the auto
       // stop/start NEVER actually ran.
-      const { invoke } = window.__TAURI__.core;
       await invoke("restart_capture");
       logEvent("auto_start", { reason });
     } catch (err) {
@@ -3880,7 +3857,6 @@ async function refreshTxEstimate() {
     return;
   }
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     const est = await invoke("tx_estimate", {
       payloadBytes: txState.compressedBytes,
@@ -3921,7 +3897,6 @@ function runTxCompress() {
 async function _runTxCompressImpl() {
   if (!txState.sourceFile) return;
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke, convertFileSrc } = window.__TAURI__.core;
   const seq = ++txState.compressSeq;
   // A (re)compression prepares a new transmission: zero the RaptorQ block
   // counter so the previous TX's state (kept on screen since 0.15.4) doesn't
@@ -4227,7 +4202,6 @@ async function loadTxFileFromPath(path) {
   }
   txState.loading = true;
   showTxBusyOverlay();
-  const { convertFileSrc, invoke } = window.__TAURI__.core;
   const url = convertFileSrc(path);
   const name = path.split(/[/\\]/).pop() || "fichier";
   const isImage = isImageFilename(name);
@@ -4329,7 +4303,6 @@ async function loadTxFile(file) {
     // Upload source to the backend for later compressions.
     try {
       const buf = await file.arrayBuffer();
-      const { invoke } = window.__TAURI__.core;
       await invoke("set_tx_source", { bytes: Array.from(new Uint8Array(buf)) });
       scheduleTxCompress(50);
     } catch (err) {
@@ -4407,7 +4380,6 @@ async function resetTxFile() {
   refreshTxPreview();
   refreshTxButtons();
   try {
-    const { invoke } = window.__TAURI__.core;
     await invoke("clear_tx_source");
   } catch {
     // Doesn't matter: the JS state is already reset.
@@ -4433,7 +4405,6 @@ function setupTxTab() {
   // events (dragDropEnabled:true in tauri.conf.json), emitted at the
   // window level.
   if (window.__TAURI__ && window.__TAURI__.event) {
-    const { listen } = window.__TAURI__.event;
     const setOver = (on) => drop.classList.toggle("drag-over", on);
     listen("tauri://drag-enter", () => setOver(true)).catch(() => {});
     listen("tauri://drag-over", () => setOver(true)).catch(() => {});
@@ -4640,7 +4611,6 @@ async function txStart() {
     const warnSeconds = txState.fileMode ? TX_FILE_WARN_SECONDS : TX_WARN_SECONDS;
     showKioskInfoToast(txButtonTitle(est, dur, dur > warnSeconds));
   }
-  const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
   const rxWasActive = rxStopBtn && !rxStopBtn.disabled;
   // Half-duplex (default): stop RX before TX, then maybeRestartRx() picks
@@ -4750,7 +4720,6 @@ function computeNInitial() {
 async function persistNextEsi() {
   if (!txState.archivePath || !txState.lastTx) return;
   try {
-    const { invoke } = window.__TAURI__.core;
     await invoke("tx_set_next_esi", {
       archivePath: txState.archivePath,
       nextEsi: txState.lastTx.esiMax + 1,
@@ -4782,7 +4751,6 @@ async function txMore() {
     return;
   }
   const esiStart = txState.lastTx.esiMax + 1;
-  const { invoke } = window.__TAURI__.core;
   const rxStopBtn = document.getElementById("btn-stop");
   const rxWasActive = rxStopBtn && !rxStopBtn.disabled;
   // Same FDX gate as in txStart: keep RX running when full_duplex_enabled
@@ -4830,7 +4798,6 @@ async function txMore() {
 
 async function txStop() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     await invoke("tx_stop");
   } catch (err) {
@@ -4959,7 +4926,6 @@ async function onTxComplete(payload) {
   refreshTxButtons();
   refreshDuplexTxBar();
   try {
-    const { invoke } = window.__TAURI__.core;
     await invoke("tx_reset");
   } catch (_) {}
   // Keep the final RX raptor grid + constellation on screen after the
@@ -4977,7 +4943,6 @@ async function onTxError(payload) {
   refreshTxButtons();
   refreshDuplexTxBar();
   try {
-    const { invoke } = window.__TAURI__.core;
     await invoke("tx_reset");
   } catch (_) {}
   // Preserve the final RX raptor grid + constellation (see onTxComplete).
@@ -5018,7 +4983,7 @@ async function applyAttenuation(db, source) {
   const status = document.getElementById("att-status");
   try {
     if (window.__TAURI__ && window.__TAURI__.core) {
-      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
+      await invoke("save_settings", { settings: currentSettings });
     }
     if (status) {
       status.textContent = source
@@ -5154,7 +5119,6 @@ function setupHistoryTab() {
 
 async function refreshHistory() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     const [tx, rx] = await Promise.all([
       invoke("list_tx_history"),
@@ -5180,7 +5144,6 @@ function renderHistoryColumn(items, kind) {
     list.appendChild(empty);
     return;
   }
-  const { convertFileSrc } = window.__TAURI__.core;
   for (const item of items) {
     const card = document.createElement("div");
     card.className = "history-card";
@@ -5307,7 +5270,6 @@ async function relayHistoryItem(absolutePath) {
 // callsign + mode).
 async function resumeTxFromHistory(archivePath) {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke, convertFileSrc } = window.__TAURI__.core;
   const txBtn = document.querySelector('.tab-bar .tab[data-tab="tx"]');
   if (txBtn) txBtn.click();
   let info;
@@ -5371,7 +5333,6 @@ async function resumeTxFromHistory(archivePath) {
 
 async function deleteHistoryItem(kind, key) {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   try {
     await invoke("delete_history_item", { kind, key });
     await refreshHistory();
@@ -5397,7 +5358,7 @@ function setupKioskMode() {
     document.body.classList.add("kiosk-mode");
   }
   if (window.__TAURI__ && window.__TAURI__.event) {
-    window.__TAURI__.event.listen("kiosk_mode", () => {
+    listen("kiosk_mode", () => {
       document.body.classList.add("kiosk-mode");
     });
   }
@@ -5405,7 +5366,7 @@ function setupKioskMode() {
   if (exitBtn && window.__TAURI__ && window.__TAURI__.window) {
     exitBtn.addEventListener("click", async () => {
       try {
-        await window.__TAURI__.window.getCurrentWindow().close();
+        await getCurrentWindow().close();
       } catch (e) {
         console.error("kiosk close", e);
       }
@@ -5420,7 +5381,7 @@ function setupKioskMode() {
     if (lb && !lb.hidden) return;
     if (!window.__TAURI__ || !window.__TAURI__.window) return;
     try {
-      const win = window.__TAURI__.window.getCurrentWindow();
+      const win = getCurrentWindow();
       const isFs = await win.isFullscreen();
       await win.setFullscreen(!isFs);
     } catch (e) {
@@ -5438,7 +5399,6 @@ async function setupAppVersionChip() {
   const el = document.getElementById("app-version");
   if (!el) return;
   try {
-    const { invoke } = window.__TAURI__.core;
     const v = await invoke("get_app_version");
     el.textContent = `v${v}`;
     el.title = `Version de l'application : ${v}`;
@@ -5579,7 +5539,6 @@ function sizeRadioCanvas(canvas) {
 
 async function invokeRadio(cmd, args) {
   try {
-    const { invoke } = window.__TAURI__.core;
     await invoke(cmd, args || {});
   } catch (err) {
     // No active SDR session yet (capture not started) → soft-ignore.
@@ -5744,7 +5703,6 @@ async function setupRadioTab() {
   const monSel = document.getElementById("radio-monitor-out");
   if (monSel) {
     try {
-      const { invoke } = window.__TAURI__.core;
       const outs = await invoke("list_output_audio_devices");
       for (const d of outs || []) {
         const o = document.createElement("option");
@@ -6381,7 +6339,7 @@ async function init() {
   await loadSaveDir();
   // Display the initial PTT state (computed by the backend at setup).
   try {
-    const st = await window.__TAURI__.core.invoke("ptt_status");
+    const st = await invoke("ptt_status");
     renderPttStatus(st);
   } catch (err) {
     console.error("ptt_status", err);
@@ -6952,7 +6910,7 @@ async function pushFreqMru(mhz, targetEl) {
   while (list.length > 6) list.pop();
   if (window.__TAURI__ && window.__TAURI__.core) {
     try {
-      await window.__TAURI__.core.invoke("save_settings", { settings: currentSettings });
+      await invoke("save_settings", { settings: currentSettings });
     } catch (err) {
       console.warn("save favorites:", err);
     }
@@ -7145,7 +7103,6 @@ function buildStandardSoundingRequest() {
 // to fill — the user just clicks once and waits.
 async function runSounderTxEmit() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   // Read the device from the persisted settings (Paramètres tab).
   // The previous version queried `getElementById("tx-device")` which
   // never existed in the DOM (the actual id is `tx-device-select` and
@@ -7204,7 +7161,6 @@ async function runSounderTxEmit() {
 // transfer between machines required.
 async function runSounderTxRender() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   setSounderStatus("sounder-an-status", t("sounder.generating"));
   try {
     const request = buildStandardSoundingRequest();
@@ -7262,7 +7218,6 @@ function buildRxChainMetadata() {
 
 async function runSounderAnalyze() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const capture = (
     document.getElementById("sounder-an-capture")?.value || ""
   ).trim();
@@ -7441,7 +7396,6 @@ let lastSounderResult = null;
 async function runSounderCollectorSend() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
   if (!lastSounderResult) return;
-  const { invoke } = window.__TAURI__.core;
   const btn = document.getElementById("sd-collector-send");
   const statusEl = document.getElementById("sd-collector-status");
   const wavChk = document.getElementById("sd-collector-with-wav");
@@ -7486,9 +7440,7 @@ async function runSounderCollectorSend() {
     // Best-effort: open the entry in the OS browser. The opener
     // plugin is optional; swallow the error if it's not registered.
     try {
-      if (window.__TAURI__.opener && window.__TAURI__.opener.openUrl) {
-        await window.__TAURI__.opener.openUrl(link);
-      }
+      await openExternalUrl(link);
     } catch (_) {
       /* the URL is shown in the status line anyway */
     }
@@ -7512,7 +7464,6 @@ let sounderRxRecording = false;
 let sounderRxLiveTap = false;
 async function runSounderRxCaptureToggle() {
   if (!window.__TAURI__ || !window.__TAURI__.core) return;
-  const { invoke } = window.__TAURI__.core;
   const btn = document.getElementById("sounder-rx-capture-toggle");
   const analyseBtn = document.getElementById("sounder-an-run");
   if (!sounderRxRecording) {
