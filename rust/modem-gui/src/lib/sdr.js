@@ -382,7 +382,7 @@ export function buildAgcRow(direction, backendId, caps, cfg) {
         ? { kind: "agc_mode", id: sel.value, lna_state: lna }
         : { kind: "agc_mode", id: sel.value };
     }
-    emit("sdr:persist-settings");
+    emit("settings:persist");
     refreshSdrPanels();   // re-render so the gain row's enable/disable matches.
   });
   label.appendChild(sel);
@@ -626,12 +626,12 @@ export function buildCtcssRow(backendId, cfg) {
   sel.addEventListener("change", () => {
     if (cb.checked) {
       cfg.ctcss_freq_hz = parseFloat(sel.value);
-      emit("sdr:persist-settings");
+      emit("settings:persist");
     }
   });
   cb.addEventListener("change", () => {
     cfg.ctcss_freq_hz = cb.checked ? parseFloat(sel.value) : 0.0;
-    emit("sdr:persist-settings");
+    emit("settings:persist");
   });
   toneLabel.appendChild(sel);
   row.appendChild(toneLabel);
@@ -704,7 +704,7 @@ export function onSdrFieldChange(evt) {
   if (!backendId) return;
   const cfg = ensureBackendConfig(backendId);
   applySdrFieldUpdate(cfg, el.dataset.sdrField, el.dataset.sdrTransform, el);
-  emit("sdr:persist-settings");
+  emit("settings:persist");
 }
 
 export function applySdrFieldUpdate(cfg, field, transform, el) {

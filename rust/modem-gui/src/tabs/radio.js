@@ -180,7 +180,7 @@ export function tuneRadioTo(hz) {
   if (backendId) {
     const cfg = ensureBackendConfig(backendId);
     cfg.rx_freq_hz = clamped;
-    emit("sdr:persist-settings");
+    emit("settings:persist");
   }
 }
 
@@ -236,7 +236,7 @@ export async function setupRadioTab() {
     if (backendId) {
       const cfg = ensureBackendConfig(backendId);
       cfg.max_deviation_hz = hz;
-      emit("sdr:persist-settings");
+      emit("settings:persist");
     }
   });
 
@@ -253,7 +253,7 @@ export async function setupRadioTab() {
     const r = ensureRadioSettings();
     r.squelch_enabled = !!sqOn.checked;
     r.squelch_dbfs = Number(sqDb.value);
-    emit("sdr:persist-settings");
+    emit("settings:persist");
   };
   sqOn?.addEventListener("change", sendSquelch);
   sqDb?.addEventListener("input", () => {
@@ -274,7 +274,7 @@ export async function setupRadioTab() {
   calTrim?.addEventListener("input", fmtTrim);
   calTrim?.addEventListener("change", () => {
     ensureRadioSettings().smeter_cal_trim_db = Number(calTrim.value);
-    emit("sdr:persist-settings");
+    emit("settings:persist");
   });
   fmtTrim();
 
@@ -314,7 +314,7 @@ export async function setupRadioTab() {
         const vol = Number(document.getElementById("radio-volume")?.value ?? 80) / 100;
         invokeRadio("set_monitor_volume", { gain: vol });
       }
-      emit("sdr:persist-settings");
+      emit("settings:persist");
     });
   }
   const vol = document.getElementById("radio-volume");
@@ -326,7 +326,7 @@ export async function setupRadioTab() {
   // Persist on commit only (not every input tick → no disk-write storm).
   vol?.addEventListener("change", () => {
     ensureRadioSettings().monitor_volume = Number(vol.value) / 100;
-    emit("sdr:persist-settings");
+    emit("settings:persist");
   });
 
   // Restore the persisted control values now that the monitor list and

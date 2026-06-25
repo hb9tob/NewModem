@@ -1,7 +1,7 @@
 // Settings tab — device selects, PTT form, serial ports, save dir, modem-profile
 // combos, experimental/force/turbo toggles, the settings-form save. loadSettings
 // and setupLangSelect stay in main.js (cross-tab orchestration). Subscribes to
-// sdr:persist-settings / sdr:reload-devices / capture:* on the bus; emits
+// settings:persist / sdr:reload-devices / capture:* on the bus; emits
 // rx-device:changed for the Radio tab.
 import { invoke } from "../lib/ipc.js";
 import { t } from "../i18n.js";
@@ -401,7 +401,7 @@ export function setupSettingsTab() {
   // Own the settings reactions to shared-bus events: lib/sdr.js asks for a
   // form save / device reload, and lib/capture.js signals RX up/down (the
   // RX-running warn-bar). Keeps these off main.js.
-  on("sdr:persist-settings", () => persistSettings());
+  on("settings:persist", () => persistSettings());
   on("sdr:reload-devices", () => loadDevices());
   on("capture:started", () => refreshSettingsRxWarn());
   on("capture:stopped", () => refreshSettingsRxWarn());

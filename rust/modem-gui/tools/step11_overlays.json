@@ -1,0 +1,12 @@
+{
+  "source": "../src/main.js",
+  "module_path": "../src/tabs/overlays.js",
+  "import_from": "./tabs/overlays.js",
+  "header": "// Overlays tab — the 5 logo/callsign overlay slots + the editor. Owns the\n// overlay slots in currentSettings; emits settings:persist and tx:recompress\n// (re-burn the TX image with the new overlay) so it never imports settings/tx.\nimport { invoke, convertFileSrc } from \"../lib/ipc.js\";\nimport { t } from \"../i18n.js\";\nimport { currentSettings } from \"../lib/state.js\";\nimport { logEvent } from \"../lib/log.js\";\nimport { numOr } from \"../lib/format.js\";\nimport { emit } from \"../lib/bus.js\";",
+  "symbols": [
+    "makeDefaultOverlays", "ensureOverlaySlots", "getActiveOverlayPayload",
+    "setSlotLabel", "refreshSlotLabels", "getEditingSlot", "applyOverlayEditorFromState",
+    "refreshLogoPreview", "readOverlayEditorIntoState", "_overlayCommitTimer",
+    "commitOverlayChange", "pickOverlayLogo", "setupOverlaysTab", "applyOverlaysToUI"
+  ]
+}
