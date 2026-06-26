@@ -14,7 +14,7 @@ use modem_worker::{rx_worker, tx_worker, EventSink};
 use modem_io::cpal_capture::CaptureHandle;
 use modem_io::devices::{list_input_devices, list_output_devices, DeviceInfo};
 use modem_io::SampleSink;
-use modem_sdr::{DeviceDescriptor, SdrCaptureHandle, SdrDevice};
+use modem_sdr::{DemodMode, DeviceDescriptor, SdrCaptureHandle, SdrDevice};
 use ptt::SharedPtt;
 use settings::Settings;
 use modem_worker::tx_worker::TxHandle;
@@ -775,6 +775,25 @@ fn set_antenna(id: String, state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn set_deviation(hz: f32, state: State<'_, AppState>) -> Result<(), String> {
     send_radio_cmd(&state, RadioUiCommand::SetDeviation(hz))
+}
+
+/// Switch the RX demodulation mode. `mode` = `"ssb_usb"` selects SSB-USB;
+/// anything else (`"nbfm"`) selects NBFM. Rebuilds the live RX chain.
+#[tauri::command]
+fn set_demod_mode(mode: String, state: State<'_, AppState>) -> Result<(), String> {
+    let m = if mode == "ssb_usb" {
+        DemodMode::SsbUsb
+    } else {
+        DemodMode::Nbfm
+    };
+    send_radio_cmd(&state, RadioUiCommand::SetDemodMode(m))
+}
+
+/// Set the SSB channel bandwidth (Hz, e.g. 2200 / 2400 / 2700). No-op in
+/// NBFM mode (remembered for the next SSB switch).
+#[tauri::command]
+fn set_ssb_bandwidth(hz: f32, state: State<'_, AppState>) -> Result<(), String> {
+    send_radio_cmd(&state, RadioUiCommand::SetSsbBandwidth(hz))
 }
 
 /// Set the audio squelch. `enabled = false` disables it; otherwise mute
@@ -2554,6 +2573,8 @@ fn main() {
             set_radio_gain,
             set_antenna,
             set_deviation,
+            set_demod_mode,
+            set_ssb_bandwidth,
             set_squelch,
             set_monitor_output,
             set_monitor_volume,

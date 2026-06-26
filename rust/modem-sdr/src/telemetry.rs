@@ -17,9 +17,21 @@
 //! GUI only needs ordering + a "newer frame arrived" signal, not an
 //! absolute time.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::GainSetting;
+
+/// Demodulation mode for the SDR RX chain. `Nbfm` is the over-the-air-
+/// validated FM path (default, so persisted configs predating SSB load
+/// unchanged); `SsbUsb` is the linear USB-data path for QO-100-style
+/// reception. Selects which chain [`RadioCommand::SetDemodMode`] builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemodMode {
+    #[default]
+    Nbfm,
+    SsbUsb,
+}
 
 /// One magnitude-spectrum frame, in dB bins. Used for both the wideband
 /// RF spectrum (`RadioTelemetry::RfSpectrum`) and the audio spectrum
@@ -83,6 +95,11 @@ pub enum RadioTelemetry {
         max_dev_hz: f32,
         seq: u64,
     },
+    /// SSB level meter: peak and RMS of the analytic envelope over the last
+    /// frame window, in normalised linear units (the FM-excursion meter is
+    /// meaningless for a linear mode). Replaces `FmExcursion` while the chain
+    /// is in [`DemodMode::SsbUsb`]. Radio tab only.
+    AudioLevel { peak: f32, rms: f32, seq: u64 },
 }
 
 /// Commands the worker sends down to the capture thread to retune /
@@ -112,4 +129,10 @@ pub enum RadioCommand {
     /// Set the audio squelch threshold, in dBFS of channel power.
     /// Chunks below this are muted. `f32::NEG_INFINITY` = squelch off.
     SetSquelch(f32),
+    /// Switch the demodulation mode — rebuilds the RX chain as NBFM or
+    /// SSB-USB (mirrors `SetDeviation`'s chain-rebuild). DSP-only.
+    SetDemodMode(DemodMode),
+    /// Rebuild the SSB chain for a new channel bandwidth (Hz) — e.g.
+    /// 2200 / 2400 / 2700. No-op while in NBFM mode. DSP-only.
+    SetSsbBandwidth(f32),
 }

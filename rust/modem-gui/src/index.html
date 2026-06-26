@@ -933,7 +933,7 @@
               <canvas id="radio-audio-fft" class="radio-audio-fft"></canvas>
             </div>
             <div class="radio-graph-col">
-              <div class="radio-card-title" data-i18n="radio.fm_excursion"
+              <div class="radio-card-title" id="radio-meter-title" data-i18n="radio.fm_excursion"
                    data-i18n-title="radio.fm_excursion_tip"
                    title="Déviation FM crête (avant dé-emphase) — rouge = surmodulation">Excursion FM</div>
               <canvas id="radio-fm-excursion" class="radio-fm-excursion"></canvas>
@@ -964,10 +964,25 @@
             <span data-i18n="radio.gain">Gain RX</span>
           </div>
           <label class="radio-ctl">
+            <span data-i18n="radio.mode">Mode</span>
+            <select id="radio-demod-mode" title="Démodulation : NBFM (FM bande étroite) ou SSB USB data (xAPSK linéaire, sans FM)">
+              <option value="nbfm" selected>NBFM</option>
+              <option value="ssb_usb">SSB USB</option>
+            </select>
+          </label>
+          <label class="radio-ctl" id="radio-deviation-wrap">
             <span data-i18n="radio.width">Largeur</span>
             <select id="radio-deviation">
               <option value="2500" data-i18n="radio.width_25">±2,5 kHz</option>
               <option value="5000" selected data-i18n="radio.width_5">±5 kHz</option>
+            </select>
+          </label>
+          <label class="radio-ctl" id="radio-ssb-bw-wrap" hidden>
+            <span data-i18n="radio.ssb_bw">Bande</span>
+            <select id="radio-ssb-bw" title="Bande passante du canal SSB (filtre une-bande)">
+              <option value="2200">2,2 kHz</option>
+              <option value="2400">2,4 kHz</option>
+              <option value="2700" selected>2,7 kHz</option>
             </select>
           </label>
           <label class="radio-ctl">

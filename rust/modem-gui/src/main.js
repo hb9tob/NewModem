@@ -508,6 +508,11 @@ function wireEvents() {
     // scrolling over-modulation graph (drawFmExcursion).
     radioState.excursion = event.payload;
   });
+  listen("radio_audio_level", (event) => {
+    // Latest SSB level frame; folded into the scrolling level graph
+    // (drawSsbLevel) when the chain is in SSB-USB mode.
+    radioState.audioLevel = event.payload;
+  });
 }
 
 // Kiosk mode (small touchscreen, e.g. Pi 7" 800x480) — the Rust setup

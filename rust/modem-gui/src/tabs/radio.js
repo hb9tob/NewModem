@@ -30,6 +30,10 @@ export const radioState = {
   excursion: null, // latest FM-excursion frame {peak_hz, rms_hz, max_dev_hz, seq}
   excHist: [], // rolling history of {peak, rms} (Hz) for the scrolling graph
   excLastSeq: -1, // last ingested excursion seq (dedup vs the 60 Hz RAF)
+  demodMode: "nbfm", // "nbfm" | "ssb_usb" — selects the meter drawn
+  audioLevel: null, // latest SSB level frame {peak, rms, seq} (linear, 1.0 = full scale)
+  levelHist: [], // rolling history of {peak, rms} (linear) for the SSB level graph
+  levelLastSeq: -1, // last ingested SSB-level seq
   rafId: null,
   waterfallInit: false,
   wfW: 0, // waterfall canvas dims last init'd at — re-init only when these change
@@ -240,6 +244,37 @@ export async function setupRadioTab() {
     if (backendId) {
       const cfg = ensureBackendConfig(backendId);
       cfg.max_deviation_hz = hz;
+      emit("settings:persist");
+    }
+  });
+
+  // Demod mode (NBFM ↔ SSB-USB) + SSB bandwidth. Applied live and persisted
+  // into the active RX backend's config. The deviation control (NBFM) and the
+  // SSB-bandwidth control are mutually exclusive in the UI.
+  document.getElementById("radio-demod-mode")?.addEventListener("change", (e) => {
+    const mode = e.target.value === "ssb_usb" ? "ssb_usb" : "nbfm";
+    radioState.demodMode = mode;
+    invokeRadio("set_demod_mode", { mode });
+    applyDemodModeUi(mode);
+    if (mode === "ssb_usb") {
+      // Make sure the running chain matches the dropdown's bandwidth.
+      const bw = Number(document.getElementById("radio-ssb-bw")?.value);
+      if (Number.isFinite(bw) && bw > 0) invokeRadio("set_ssb_bandwidth", { hz: bw });
+    }
+    const backendId = getSelectedBackendId("rx-device-select");
+    if (backendId) {
+      const cfg = ensureBackendConfig(backendId);
+      cfg.rx_demod_mode = mode;
+      emit("settings:persist");
+    }
+  });
+  document.getElementById("radio-ssb-bw")?.addEventListener("change", (e) => {
+    const hz = Number(e.target.value);
+    invokeRadio("set_ssb_bandwidth", { hz });
+    const backendId = getSelectedBackendId("rx-device-select");
+    if (backendId) {
+      const cfg = ensureBackendConfig(backendId);
+      cfg.ssb_bandwidth_hz = hz;
       emit("settings:persist");
     }
   });
@@ -484,6 +519,23 @@ export function startRadioRender() {
   radioState.rafId = requestAnimationFrame(loop);
 }
 
+/// Show the deviation control in NBFM, the SSB-bandwidth control in SSB.
+export function applyDemodModeUi(mode) {
+  const ssb = mode === "ssb_usb";
+  const devWrap = document.getElementById("radio-deviation-wrap");
+  const bwWrap = document.getElementById("radio-ssb-bw-wrap");
+  if (devWrap) devWrap.hidden = ssb;
+  if (bwWrap) bwWrap.hidden = !ssb;
+  // The right-hand meter is excursion (NBFM) or level (SSB); retitle it.
+  const title = document.getElementById("radio-meter-title");
+  if (title) {
+    title.textContent = ssb ? "Niveau SSB" : "Excursion FM";
+    title.title = ssb
+      ? "Niveau audio SSB (enveloppe analytique) — rouge = saturation 0 dBFS"
+      : "Déviation FM crête (avant dé-emphase) — rouge = surmodulation";
+  }
+}
+
 export function seedRadioFreqInput() {
   const backendId = getSelectedBackendId("rx-device-select");
   if (!backendId) return;
@@ -500,6 +552,17 @@ export function seedRadioFreqInput() {
   if (dev && Number.isFinite(cfg.max_deviation_hz)) {
     dev.value = String(Math.round(cfg.max_deviation_hz));
   }
+  // Demod mode + SSB bandwidth: reflect the persisted backend config and set
+  // the matching control visibility.
+  const mode = cfg.rx_demod_mode === "ssb_usb" ? "ssb_usb" : "nbfm";
+  radioState.demodMode = mode;
+  const modeSel = document.getElementById("radio-demod-mode");
+  if (modeSel) modeSel.value = mode;
+  const bwSel = document.getElementById("radio-ssb-bw");
+  if (bwSel && Number.isFinite(cfg.ssb_bandwidth_hz)) {
+    bwSel.value = String(Math.round(cfg.ssb_bandwidth_hz));
+  }
+  applyDemodModeUi(mode);
 }
 
 export function stopRadioRender() {
@@ -515,7 +578,10 @@ export function renderRadio() {
   // only 0-4 kHz of the 0-24 kHz band (= 4000/24000 of the bins) — the voice
   // band fills the panel and the dead high end is dropped.
   drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6", 4000 / 24000);
-  drawFmExcursion();
+  // The right-hand meter is mode-dependent: FM over-modulation excursion in
+  // NBFM, a linear level meter in SSB (deviation is meaningless there).
+  if (radioState.demodMode === "ssb_usb") drawSsbLevel();
+  else drawFmExcursion();
   drawRadioRf();
 }
 
@@ -770,6 +836,111 @@ export function drawFmExcursion() {
   }
 }
 
+/// SSB level meter — the linear-mode replacement for the FM-excursion graph.
+/// Scrolling peak bars + RMS line of the analytic envelope (1.0 = full scale),
+/// with a 0 dBFS clip line and a dBFS read-out. No deviation grid (meaningless
+/// for a linear mode).
+export function drawSsbLevel() {
+  const canvas = document.getElementById("radio-fm-excursion");
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  const lv = radioState.audioLevel;
+  // Ingest the latest frame once (dedup on seq vs the faster RAF).
+  if (lv && lv.seq !== radioState.levelLastSeq) {
+    radioState.levelLastSeq = lv.seq;
+    radioState.levelHist.push({ peak: lv.peak || 0, rms: lv.rms || 0, t: performance.now() });
+    if (radioState.levelHist.length > EXC_HIST_MAX) {
+      radioState.levelHist.splice(0, radioState.levelHist.length - EXC_HIST_MAX);
+    }
+  }
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0a0a0a";
+  ctx.fillRect(0, 0, w, h);
+  // Linear scale with a little headroom above full scale.
+  const top = 1.2;
+  const yOf = (v) => h - Math.max(0, Math.min(1, v / top)) * h;
+
+  // Reference grid: -6 dB / -12 dB (linear 0.5 / 0.25) and the 0 dBFS clip line.
+  ctx.font = `${Math.round(9 * dpr)}px sans-serif`;
+  ctx.textBaseline = "bottom";
+  ctx.textAlign = "right";
+  for (const r of [
+    { v: 0.25, line: "rgba(120,160,200,0.40)", text: "#a8c4e6", label: "-12 dB" },
+    { v: 0.5, line: "rgba(120,200,120,0.40)", text: "#bfe6bf", label: "-6 dB" },
+  ]) {
+    const y = yOf(r.v);
+    ctx.strokeStyle = r.line;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+    ctx.fillStyle = r.text;
+    ctx.fillText(r.label, w - 3 * dpr, y - 1);
+  }
+  ctx.textAlign = "left";
+  // 0 dBFS clip line (red dashed).
+  const yClip = yOf(1.0);
+  ctx.strokeStyle = "rgba(244,67,54,0.85)";
+  ctx.setLineDash([4, 3]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, yClip);
+  ctx.lineTo(w, yClip);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Peak bars, newest at the right, scrolling left. Red at/above full scale.
+  const hist = radioState.levelHist;
+  const colW = w / EXC_HIST_MAX;
+  for (let k = 0; k < hist.length; k++) {
+    const s = hist[hist.length - 1 - k];
+    const x = w - (k + 1) * colW;
+    if (x + colW < 0) break;
+    const yp = yOf(s.peak);
+    ctx.fillStyle = s.peak >= 1.0 ? "#f44336" : "#26a69a";
+    ctx.fillRect(x, yp, Math.max(1, colW + 0.5), h - yp);
+  }
+  // RMS overlay line.
+  if (hist.length > 1) {
+    ctx.strokeStyle = "rgba(255,255,255,0.55)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let k = 0; k < hist.length; k++) {
+      const s = hist[hist.length - 1 - k];
+      const x = w - (k + 0.5) * colW;
+      const y = yOf(s.rms);
+      if (k === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  // Read-out in dBFS (peak + RMS) over a high-contrast box.
+  if (hist.length) {
+    const last = hist[hist.length - 1];
+    const dbfs = (v) => (v > 1e-4 ? 20 * Math.log10(v) : -80);
+    const fs = Math.round(13 * dpr);
+    const pad = Math.round(4 * dpr);
+    const lineH = Math.round(fs * 1.3);
+    ctx.font = `bold ${fs}px sans-serif`;
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    const l1 = `crête ${dbfs(last.peak).toFixed(1)} dBFS`;
+    const l2 = `RMS ${dbfs(last.rms).toFixed(1)} dBFS`;
+    const boxW =
+      Math.max(ctx.measureText(l1).width, ctx.measureText(l2).width) + pad * 2;
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, boxW, lineH * 2 + pad);
+    ctx.fillStyle = last.peak >= 1.0 ? "#ff5252" : "#b2f0ea";
+    ctx.fillText(l1, pad, pad);
+    ctx.fillStyle = "#9be29b";
+    ctx.fillText(l2, pad, pad + lineH);
+  }
+}
+
 export function niceTickStep(span, targetTicks) {
   const raw = span / Math.max(1, targetTicks);
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -855,6 +1026,12 @@ export const SNAP_MIN_DB = 6; // peak must beat the local mean by this to snap
 export function radioSnapHz(canvas, clientX) {
   const clickHz = radioFreqAtX(canvas, clientX);
   if (clickHz === null) return null;
+  // In SSB you tune to the suppressed carrier (the signal sits ABOVE it as
+  // USB), so the strongest RF bin is ~1 kHz off the carrier — peak-snap would
+  // mistune. Honor the clicked frequency instead, rounded to the 100 Hz.
+  if (radioState.demodMode === "ssb_usb") {
+    return Math.round(clickHz / 100) * 100;
+  }
   const frame = radioState.rf;
   if (frame && frame.bins_db && frame.bins_db.length) {
     const bins = frame.bins_db;

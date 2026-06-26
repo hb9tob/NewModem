@@ -40,6 +40,7 @@
 pub mod traits;
 
 pub mod audio_filters;
+pub mod complex_fir;
 pub mod ctcss_gen;
 pub mod decimator;
 pub mod emphasis;
@@ -50,10 +51,15 @@ pub mod freq_xlating;
 pub mod interpolator;
 pub mod nbfm_rx_chain;
 pub mod pm_mod;
+pub mod rx_chain;
 pub mod spectrum;
+pub mod ssb_rx_chain;
 
+pub use complex_fir::{analytic_bandpass_taps, ComplexFir, Sideband};
 pub use nbfm_rx_chain::{NbfmRxChain, NbfmRxChainConfig};
+pub use rx_chain::RxChain;
 pub use spectrum::SpectrumAnalyzer;
+pub use ssb_rx_chain::{SsbRxChain, SsbRxChainConfig};
 
 /// Audio sample rate the modem core expects, in Hz. Mirrors
 /// `modem_core::types::AUDIO_RATE`. Re-exported so SDR backends can

@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use num_complex::Complex32;
 
-use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
-use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
+use modem_sdr::telemetry::{DemodMode, RadioCommand, RadioTelemetry};
+use modem_sdr_dsp::{NbfmRxChainConfig, RxChain, SsbRxChainConfig};
 use modem_sdr_radio::{RadioInit, RadioRuntime};
 
 use crate::device::{
@@ -142,7 +142,7 @@ impl Drop for CaptureHandle {
 /// `CaptureHandle`. Allocated once, lives behind an `Arc<Mutex<>>` so
 /// the C callback can borrow it via the `cb_context` void pointer.
 struct CallbackState {
-    chain: NbfmRxChain,
+    chain: RxChain,
     pending: Vec<f32>,
     sample_tx: Sender<Vec<f32>>,
     /// Heartbeat counter — bumped every callback so a future
@@ -203,11 +203,18 @@ pub fn start_on(
     let (sample_tx, sample_rx) = mpsc::channel::<Vec<f32>>();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let chain = NbfmRxChain::new(NbfmRxChainConfig::new(
-        host_iq_rate_hz as u32,
-        session.config.max_deviation_hz,
-        DEFAULT_LO_OFFSET_HZ as f32,
-    ));
+    let chain = match session.config.rx_demod_mode {
+        DemodMode::Nbfm => RxChain::nbfm(NbfmRxChainConfig::new(
+            host_iq_rate_hz as u32,
+            session.config.max_deviation_hz,
+            DEFAULT_LO_OFFSET_HZ as f32,
+        )),
+        DemodMode::SsbUsb => RxChain::ssb(SsbRxChainConfig::new(
+            host_iq_rate_hz as u32,
+            session.config.rx_ssb_bandwidth_hz,
+            DEFAULT_LO_OFFSET_HZ as f32,
+        )),
+    };
 
     // Build the Radio-tab runtime (if wired). Zero-IF model: the LO is
     // programmed `DEFAULT_LO_OFFSET_HZ` above the user frequency and the
@@ -223,6 +230,8 @@ pub fn start_on(
                 lo_offset_hz: DEFAULT_LO_OFFSET_HZ as f32,
                 max_deviation_hz: session.config.max_deviation_hz,
                 dc_tunable: false,
+                demod_mode: session.config.rx_demod_mode,
+                ssb_bandwidth_hz: session.config.rx_ssb_bandwidth_hz,
             };
             (
                 Some(RadioRuntime::new(w.telemetry_tx, init)),
@@ -474,8 +483,8 @@ unsafe extern "C" fn stream_callback(buf: *mut u8, len: u32, ctx: *mut c_void) {
         if rt.on_audio(
             &audio,
             chain.last_channel_power(),
-            chain.last_excursion_peak(),
-            chain.last_excursion_rms(),
+            chain.last_meter_peak(),
+            chain.last_meter_rms(),
         ) {
             audio.iter_mut().for_each(|s| *s = 0.0);
         }

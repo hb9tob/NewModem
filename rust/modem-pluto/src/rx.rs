@@ -42,8 +42,8 @@ use std::time::Duration;
 use num_complex::Complex32;
 
 use modem_sdr::config::{GainSetting, ManualGainValue};
-use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
-use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig};
+use modem_sdr::telemetry::{DemodMode, RadioCommand, RadioTelemetry};
+use modem_sdr_dsp::{NbfmRxChainConfig, RxChain, SsbRxChainConfig};
 use modem_sdr_radio::{RadioHardware, RadioInit, RadioRuntime};
 
 use crate::device::{self, NegotiatedRate, PlutoConfig, PlutoSession, RxGainMode};
@@ -260,11 +260,16 @@ fn capture_loop(
     // filters, and outputs 48 kHz mono. lo_offset_hz = 0 because
     // the AD9363 has hardware DC compensation — no LO-leakage spike
     // to dodge.
-    let mut chain = NbfmRxChain::new(NbfmRxChainConfig::new(
-        session.negotiated_rate.sample_rate_hz as u32,
-        session.rx_max_deviation_hz,
-        0.0,
-    ));
+    // NBFM or SSB-USB per the session config. lo_offset = 0 (AD9363 DC comp).
+    let rate = session.negotiated_rate.sample_rate_hz as u32;
+    let mut chain = match session.rx_demod_mode {
+        DemodMode::Nbfm => {
+            RxChain::nbfm(NbfmRxChainConfig::new(rate, session.rx_max_deviation_hz, 0.0))
+        }
+        DemodMode::SsbUsb => {
+            RxChain::ssb(SsbRxChainConfig::new(rate, session.rx_ssb_bandwidth_hz, 0.0))
+        }
+    };
 
     // Radio-tab runtime: spectra / S-meter / tune-state telemetry and live
     // retune. `None` for plain captures (CLI, loopback) — the loop costs
@@ -282,6 +287,8 @@ fn capture_loop(
                 lo_offset_hz: 0.0,
                 max_deviation_hz: session.rx_max_deviation_hz,
                 dc_tunable: true,
+                demod_mode: session.rx_demod_mode,
+                ssb_bandwidth_hz: session.rx_ssb_bandwidth_hz,
             };
             (
                 Some(RadioRuntime::new(w.telemetry_tx, init)),
@@ -371,8 +378,8 @@ fn capture_loop(
             if rt.on_audio(
                 &audio,
                 chain.last_channel_power(),
-                chain.last_excursion_peak(),
-                chain.last_excursion_rms(),
+                chain.last_meter_peak(),
+                chain.last_meter_rms(),
             ) {
                 audio.iter_mut().for_each(|s| *s = 0.0);
             }

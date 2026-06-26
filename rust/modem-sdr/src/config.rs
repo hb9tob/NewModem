@@ -16,6 +16,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::telemetry::DemodMode;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SdrConfig {
@@ -43,6 +45,16 @@ pub struct SdrConfig {
     /// it can differ: e.g. RX scaled for 5 kHz reception, TX
     /// scaled for narrow-NFM transmission.
     pub tx_deviation_hz: f32,
+
+    /// RX demodulation mode — `Nbfm` (default) or `SsbUsb`. Selects which
+    /// RX chain the backend builds. Defaults to `Nbfm` so existing
+    /// settings load unchanged.
+    #[serde(default)]
+    pub rx_demod_mode: DemodMode,
+    /// SSB channel bandwidth in Hz (2200 / 2400 / 2700), used only in
+    /// `SsbUsb` mode. Default 2700.
+    #[serde(default = "default_ssb_bandwidth_hz")]
+    pub ssb_bandwidth_hz: f32,
 
     /// Selected antenna ID — must match one of
     /// `BackendCapabilities::antennas[].id`. Empty `""` when the
@@ -77,6 +89,12 @@ pub struct SdrConfig {
     pub backend_extras: HashMap<String, serde_json::Value>,
 }
 
+/// serde default for [`SdrConfig::ssb_bandwidth_hz`] — 2.7 kHz, the widest
+/// of the target set (QO-100 allows 2.7 kHz anywhere).
+fn default_ssb_bandwidth_hz() -> f32 {
+    2_700.0
+}
+
 impl Default for SdrConfig {
     fn default() -> Self {
         Self {
@@ -87,6 +105,8 @@ impl Default for SdrConfig {
             gain: GainSetting::default(),
             max_deviation_hz: 5_000.0, // NBFM standard
             tx_deviation_hz: 5_000.0,
+            rx_demod_mode: DemodMode::default(),
+            ssb_bandwidth_hz: default_ssb_bandwidth_hz(),
             antenna: String::new(),
             bias_t: false,
             fm_notch: false,

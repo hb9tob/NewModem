@@ -26,6 +26,8 @@
 //! composite of 48 kHz audio).
 
 use crate::error::PlutoError;
+use modem_sdr::telemetry::DemodMode;
+
 use crate::iiod::{ChanDir, IiodClient};
 
 /// Names of the three IIO devices the Pluto exposes that we drive.
@@ -90,6 +92,10 @@ pub struct PlutoConfig {
     /// deviation clips the audio amplitude; picking it above attenuates
     /// it. Default 5000.
     pub rx_max_deviation_hz: f32,
+    /// RX demodulation mode (NBFM or SSB-USB). Default NBFM.
+    pub rx_demod_mode: DemodMode,
+    /// SSB channel bandwidth in Hz (used in SSB-USB mode). Default 2700.
+    pub rx_ssb_bandwidth_hz: f32,
     /// Effective TX FM deviation in Hz (= preset + fine-tune offset
     /// already resolved by the caller). Drives the phase modulator's
     /// `k_p` so audio at unit amplitude produces ±tx_deviation_hz on
@@ -122,6 +128,8 @@ impl Default for PlutoConfig {
             rf_bandwidth_hz: 200_000,
             prefer_low_rate: true,
             rx_max_deviation_hz: 5000.0,
+            rx_demod_mode: DemodMode::Nbfm,
+            rx_ssb_bandwidth_hz: 2700.0,
             tx_deviation_hz: 5000.0,
             ctcss_freq_hz: 0.0,
             ctcss_level: 0.1,
@@ -211,6 +219,11 @@ pub struct PlutoSession {
     /// open this session. Read by `rx::capture_loop` to size the
     /// `QuadratureDemod` discriminator gain.
     pub rx_max_deviation_hz: f32,
+    /// RX demodulation mode copied from the [`PlutoConfig`]. Read by
+    /// `rx::capture_loop` to pick the NBFM or SSB chain.
+    pub rx_demod_mode: DemodMode,
+    /// SSB channel bandwidth copied from the [`PlutoConfig`] (SSB mode).
+    pub rx_ssb_bandwidth_hz: f32,
     /// TX FM deviation copied from the [`PlutoConfig`]. Read by
     /// `tx::run_tx` to scale the `PhaseMod`'s `k_p` from its 5 kHz
     /// calibration.
@@ -362,6 +375,8 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
         config: config.clone(),
         negotiated_rate,
         rx_max_deviation_hz: config.rx_max_deviation_hz,
+        rx_demod_mode: config.rx_demod_mode,
+        rx_ssb_bandwidth_hz: config.rx_ssb_bandwidth_hz,
         tx_deviation_hz: config.tx_deviation_hz,
         ctcss_freq_hz: config.ctcss_freq_hz,
         ctcss_level: config.ctcss_level,

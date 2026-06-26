@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use modem_io::AudioMonitor;
 use modem_sdr::config::GainSetting;
-use modem_sdr::telemetry::{RadioCommand, RadioTelemetry};
+use modem_sdr::telemetry::{DemodMode, RadioCommand, RadioTelemetry};
 use modem_sdr::RadioTuning;
 
 use crate::event_sink::{EventSink, EventSinkExt};
@@ -146,6 +146,10 @@ pub enum RadioUiCommand {
     SetGain(GainSetting),
     SetAntenna(String),
     SetDeviation(f32),
+    /// Switch demodulation mode (NBFM ↔ SSB-USB).
+    SetDemodMode(DemodMode),
+    /// SSB channel bandwidth in Hz (2200 / 2400 / 2700).
+    SetSsbBandwidth(f32),
     /// Audio squelch threshold, dBFS of channel power
     /// (`f32::NEG_INFINITY` = off).
     SetSquelch(f32),
@@ -253,6 +257,10 @@ fn forward_telemetry(sink: &dyn EventSink, t: RadioTelemetry) {
             serde_json::json!({ "channel_power_dbfs": channel_power_dbfs, "seq": seq }),
         ),
         RadioTelemetry::Tune(state) => sink.emit("radio_tune_state", state),
+        RadioTelemetry::AudioLevel { peak, rms, seq } => sink.emit(
+            "radio_audio_level",
+            serde_json::json!({ "peak": peak, "rms": rms, "seq": seq }),
+        ),
         RadioTelemetry::FmExcursion {
             peak_hz,
             rms_hz,
@@ -291,6 +299,12 @@ fn apply_ui_command(
         }
         RadioUiCommand::SetDeviation(dev) => {
             let _ = control.send(RadioCommand::SetDeviation(dev));
+        }
+        RadioUiCommand::SetDemodMode(mode) => {
+            let _ = control.send(RadioCommand::SetDemodMode(mode));
+        }
+        RadioUiCommand::SetSsbBandwidth(bw) => {
+            let _ = control.send(RadioCommand::SetSsbBandwidth(bw));
         }
         RadioUiCommand::SetSquelch(t) => {
             let _ = control.send(RadioCommand::SetSquelch(t));

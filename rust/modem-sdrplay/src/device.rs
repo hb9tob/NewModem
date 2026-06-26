@@ -29,6 +29,7 @@ use crate::api::{
     sdrplay_api_RspDuoModeT, sdrplay_api_RspDuo_AmPortSelectT, sdrplay_api_TunerSelectT,
 };
 use crate::error::SdrplayError;
+use modem_sdr::telemetry::DemodMode;
 
 /// SDRplay hardware family — derived from `sdrplay_api_DeviceT::hwVer`.
 /// The daemon tells us which device is on the bus; we use that to
@@ -226,6 +227,10 @@ pub struct SdrplayConfig {
     /// Maximum FM deviation expected on air, in Hz. 5000 = NBFM
     /// standard. Drives the QuadratureDemod gain in the DSP chain.
     pub max_deviation_hz: f32,
+    /// RX demodulation mode (NBFM or SSB-USB). Default NBFM.
+    pub rx_demod_mode: DemodMode,
+    /// SSB channel bandwidth in Hz (SSB-USB mode). Default 2700.
+    pub rx_ssb_bandwidth_hz: f32,
 }
 
 impl Default for SdrplayConfig {
@@ -248,6 +253,8 @@ impl Default for SdrplayConfig {
             if_gain_reduction_db: 40,
             agc_mode: AgcMode::Disable,
             max_deviation_hz: 5_000.0,
+            rx_demod_mode: DemodMode::Nbfm,
+            rx_ssb_bandwidth_hz: 2_700.0,
         }
     }
 }

@@ -19,6 +19,8 @@ use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::sync::Mutex;
 
+use modem_sdr::telemetry::DemodMode;
+
 use crate::error::RtlsdrError;
 use crate::ffi::{
     rtlsdr_dev_t, RtlsdrLib, RTLSDR_TUNER_R820T, RTLSDR_TUNER_R828D,
@@ -157,6 +159,10 @@ pub struct RtlsdrConfig {
     /// Maximum FM deviation expected on air, in Hz. 5 000 = NBFM
     /// standard. Drives the QuadratureDemod gain in the DSP chain.
     pub max_deviation_hz: f32,
+    /// RX demodulation mode (NBFM or SSB-USB). Default NBFM.
+    pub rx_demod_mode: DemodMode,
+    /// SSB channel bandwidth in Hz (SSB-USB mode). Default 2700.
+    pub rx_ssb_bandwidth_hz: f32,
 }
 
 impl Default for RtlsdrConfig {
@@ -174,6 +180,8 @@ impl Default for RtlsdrConfig {
             direct_sampling: false,
             tuner_bandwidth_hz: 0,
             max_deviation_hz: 5_000.0,
+            rx_demod_mode: DemodMode::Nbfm,
+            rx_ssb_bandwidth_hz: 2_700.0,
         }
     }
 }

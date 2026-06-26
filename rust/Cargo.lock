@@ -3073,6 +3073,8 @@ dependencies = [
  "modem-io",
  "modem-sdr",
  "modem-sdr-dsp",
+ "num-complex",
+ "rustfft",
  "serde",
  "serde_json",
  "serialport",

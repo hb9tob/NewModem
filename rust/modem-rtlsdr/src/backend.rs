@@ -286,5 +286,7 @@ pub fn build_rtlsdr_config(
         direct_sampling,
         tuner_bandwidth_hz,
         max_deviation_hz: cfg.max_deviation_hz,
+        rx_demod_mode: cfg.rx_demod_mode,
+        rx_ssb_bandwidth_hz: cfg.ssb_bandwidth_hz,
     })
 }

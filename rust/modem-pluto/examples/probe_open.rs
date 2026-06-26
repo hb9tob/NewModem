@@ -30,6 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rf_bandwidth_hz: 200_000,
         prefer_low_rate: true,
         rx_max_deviation_hz: 5000.0,
+        rx_demod_mode: modem_sdr::telemetry::DemodMode::Nbfm,
+        rx_ssb_bandwidth_hz: 2700.0,
         tx_deviation_hz: 5000.0,
         ctcss_freq_hz: 0.0,
         ctcss_level: 0.1,

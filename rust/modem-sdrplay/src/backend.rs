@@ -520,6 +520,8 @@ pub fn build_sdrplay_config(
         if_gain_reduction_db,
         agc_mode,
         max_deviation_hz: cfg.max_deviation_hz,
+        rx_demod_mode: cfg.rx_demod_mode,
+        rx_ssb_bandwidth_hz: cfg.ssb_bandwidth_hz,
     })
 }
 

@@ -326,6 +326,8 @@ pub fn build_pluto_config(
         rf_bandwidth_hz: cfg.rf_bandwidth_hz.unwrap_or(200_000),
         prefer_low_rate,
         rx_max_deviation_hz: cfg.max_deviation_hz,
+        rx_demod_mode: cfg.rx_demod_mode,
+        rx_ssb_bandwidth_hz: cfg.ssb_bandwidth_hz,
         tx_deviation_hz: cfg.tx_deviation_hz,
         ctcss_freq_hz: cfg.ctcss_freq_hz,
         ctcss_level: cfg.ctcss_level,

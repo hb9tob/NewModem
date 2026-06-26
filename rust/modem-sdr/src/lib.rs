@@ -44,5 +44,5 @@ pub use config::{GainSetting, ManualGainValue, SdrConfig};
 pub use device::DeviceDescriptor;
 pub use error::SdrError;
 pub use handle::SdrCaptureHandle;
-pub use telemetry::{RadioCommand, RadioTelemetry, SpectrumFrame, TuneState};
+pub use telemetry::{DemodMode, RadioCommand, RadioTelemetry, SpectrumFrame, TuneState};
 pub use traits::{SdrBackend, SdrDevice};
