@@ -1002,6 +1002,41 @@ export function drawRadioFreqScale() {
   }
 }
 
+// dB graticule on the RF line spectrum: faint horizontal lines + dBFS labels
+// at "nice" steps across the operator-set level window (radioLevelRange). The
+// vertical Hz grid is drawn separately (drawRfGridlines / drawRadioFreqScale).
+// Drawn AFTER the trace so the labels stay readable; lines are faint enough not
+// to fight the spectrum.
+export function drawRfDbGraticule(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const [lo, hi] = radioLevelRange();
+  const span = hi - lo || 1;
+  const dpr = window.devicePixelRatio || 1;
+  const step = niceTickStep(span, 5); // ~5 divisions
+  ctx.font = `${Math.round(9 * dpr)}px sans-serif`;
+  ctx.textBaseline = "bottom";
+  ctx.textAlign = "left";
+  ctx.lineWidth = 1;
+  const top = Math.floor(hi / step) * step;
+  for (let db = top; db >= lo; db -= step) {
+    const y = h - ((db - lo) / span) * h;
+    if (y < 1 || y > h - 1) continue;
+    ctx.strokeStyle = "rgba(125,135,148,0.22)";
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+    ctx.fillStyle = "#8a9099";
+    // Unit only on the top label to keep the column uncluttered.
+    const lbl = db === top ? `${db} dBFS` : `${db}`;
+    ctx.fillText(lbl, 3 * dpr, y - 1.5 * dpr);
+  }
+}
+
 export function radioMarkerFrac() {
   const frame = radioState.rf;
   const t = radioState.tune;
@@ -1085,6 +1120,7 @@ export function drawRadioRf() {
   // ruler. Bottom: scrolling waterfall — all three share the same
   // horizontal Hz mapping from the latest RF frame.
   drawRadioSpectrum("radio-rf-fft", radioState.rf, "#9CCC65");
+  drawRfDbGraticule("radio-rf-fft");
   drawRfGridlines("radio-rf-fft", radioState.rf);
   drawTunedMarker("radio-rf-fft");
   drawRadioFreqScale();

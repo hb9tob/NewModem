@@ -2957,10 +2957,11 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
 }
 .radio-rf-fft {
   width: 100%;
-  /* Fixed slice for the line spectrum; the waterfall takes everything
-     else so it fills the rest of the screen. */
-  flex: 0 0 26%;
-  min-height: 70px;
+  /* Line spectrum gets a generous slice in normal mode (read levels + the
+     dB/Hz graticule); the waterfall takes the rest. Kiosk overrides to 20%
+     (small DSI screen) further down. */
+  flex: 0 0 42%;
+  min-height: 90px;
   background: #0a0a0a;
   cursor: pointer;
 }
