@@ -40,6 +40,37 @@ use crate::AUDIO_RATE;
 /// only has to clear the suppressed-carrier line at DC.
 pub const DEFAULT_AUDIO_LOW_EDGE_HZ: f32 = 100.0;
 
+/// Digital-AGC target for the analytic envelope `|z|`. SSB is a linear
+/// mode: unlike NBFM (whose discriminator is amplitude-independent and
+/// lands the audio near full scale on its own), the SSB audio level just
+/// follows the received amplitude, so without normalisation a typical
+/// off-air signal comes out tens of dB low. This AGC normalises the mean
+/// envelope to a comfortable level on TOP of whatever the SDR's own gain
+/// /AGC delivers. 0.35 → audio ≈ −9 dBFS RMS with headroom for the APSK
+/// peak-to-average and RRC overshoot.
+pub const AGC_TARGET_ENV: f32 = 0.35;
+
+/// Maximum digital-AGC make-up gain (linear). +24 dB lifts a weak signal
+/// without amplifying inter-burst noise — or a burst onset before the
+/// loop settles — to hard clipping (a strong burst needs little make-up
+/// anyway). The SDR's hardware gain does the bulk of the work; this is
+/// the residual normaliser.
+pub const AGC_MAX_GAIN: f32 = 16.0;
+
+/// AGC attack time constant (s) — how fast the gain comes DOWN when the
+/// envelope rises. 50 ms settles well within the 256-symbol preamble at
+/// every profile (≥ 150 ms), so the data after the preamble sees a stable
+/// gain and the APSK amplitude rings are preserved.
+pub const AGC_ATTACK_S: f32 = 0.050;
+
+/// AGC release time constant (s) — how slowly the gain comes UP when the
+/// envelope falls. 300 ms holds the gain steady across a burst and across
+/// the short inter-frame silences (so a following burst's onset isn't
+/// over-amplified), yet lets a fresh weak signal come up to level within
+/// ~1 s. Still far slower than the symbol rate, so APSK amplitude rings
+/// are untouched (the decoder also re-normalises).
+pub const AGC_RELEASE_S: f32 = 0.3;
+
 /// Configuration for [`SsbRxChain`]. Mirrors
 /// [`NbfmRxChainConfig`](crate::nbfm_rx_chain::NbfmRxChainConfig) so the
 /// two chains plug into the same orchestration.
@@ -64,6 +95,14 @@ pub struct SsbRxChainConfig {
     pub audio_low_edge_hz: f32,
     /// Channel + image-rejection stop-band depth, dB. [`DEFAULT_STOPBAND_DB`].
     pub stopband_db: f32,
+    /// Enable the digital AGC (level normaliser) on the output audio.
+    /// **Default `false`.** The modem decoder already normalises each
+    /// burst's level internally (the FFE), and an external AGC's onset
+    /// ramp fights that LS fit and breaks decoding — so the AGC is a
+    /// **monitor/listening** aid, not for the decode path, and stays off
+    /// until wired to the monitor tee. The meter is pre-AGC (true level)
+    /// regardless. See [`AGC_TARGET_ENV`].
+    pub agc: bool,
 }
 
 impl SsbRxChainConfig {
@@ -77,6 +116,7 @@ impl SsbRxChainConfig {
             sideband: Sideband::Usb,
             audio_low_edge_hz: DEFAULT_AUDIO_LOW_EDGE_HZ,
             stopband_db: DEFAULT_STOPBAND_DB,
+            agc: false,
         }
     }
 }
@@ -105,10 +145,20 @@ pub struct SsbRxChain {
     last_channel_power: f32,
     /// Peak analytic-envelope `|z|` of the last `process` — a **linear**
     /// level (the FM excursion meter is meaningless for SSB). Read-only
-    /// side-channel for the Radio-tab level meter.
+    /// side-channel for the Radio-tab level meter. **Pre-AGC** (the true
+    /// received level), so the meter still reads signal strength.
     last_level_peak: f32,
     /// RMS analytic-envelope of the last `process`.
     last_level_rms: f32,
+    /// Digital AGC enabled.
+    agc: bool,
+    /// Smoothed envelope estimate the AGC gain is derived from. Carried
+    /// across chunks (fast-attack / slow-release follower).
+    agc_env: f32,
+    /// One-pole attack coefficient (rising envelope).
+    agc_attack: f32,
+    /// One-pole release coefficient (falling envelope).
+    agc_release: f32,
 }
 
 impl SsbRxChain {
@@ -164,6 +214,12 @@ impl SsbRxChain {
             last_channel_power: 0.0,
             last_level_peak: 0.0,
             last_level_rms: 0.0,
+            agc: cfg.agc,
+            // Start at the target so the initial gain is unity (neutral) and
+            // a first burst ramps gently, never a sudden boost.
+            agc_env: AGC_TARGET_ENV,
+            agc_attack: 1.0 - (-1.0 / (AGC_ATTACK_S * AUDIO_RATE as f32)).exp(),
+            agc_release: 1.0 - (-1.0 / (AGC_RELEASE_S * AUDIO_RATE as f32)).exp(),
         }
     }
 
@@ -226,20 +282,32 @@ impl SsbRxChain {
         // Stage 2: one-sided analytic band-pass (USB) at 48 kHz.
         let z = self.analytic.process(&baseband);
 
-        // Real part = wanted-sideband audio; linear level from |z|.
+        // Real part = wanted-sideband audio; linear level from |z|; digital
+        // AGC normalises the output level (meter stays on the pre-AGC |z|).
         if self.audio_scratch.len() < z.len() {
             self.audio_scratch.resize(z.len(), 0.0);
         }
         let audio = &mut self.audio_scratch[..z.len()];
         let mut peak = 0.0f32;
         let mut sumsq = 0.0f32;
+        let floor = AGC_TARGET_ENV / AGC_MAX_GAIN; // env below this → gain caps
         for (i, c) in z.iter().enumerate() {
-            audio[i] = c.re;
             let m2 = c.re * c.re + c.im * c.im;
             if m2 > peak {
                 peak = m2;
             }
             sumsq += m2;
+            // Fast-attack / slow-release envelope follower on |z|.
+            let env = m2.sqrt();
+            let coef = if env > self.agc_env { self.agc_attack } else { self.agc_release };
+            self.agc_env += coef * (env - self.agc_env);
+            let gain = if self.agc {
+                (AGC_TARGET_ENV / self.agc_env.max(floor)).min(AGC_MAX_GAIN)
+            } else {
+                1.0
+            };
+            // Slow gain commutes with the (short-memory) HPF below.
+            audio[i] = gain * c.re;
         }
         self.last_level_peak = peak.sqrt();
         self.last_level_rms = (sumsq / z.len() as f32).sqrt();
@@ -259,6 +327,7 @@ impl SsbRxChain {
         self.last_channel_power = 0.0;
         self.last_level_peak = 0.0;
         self.last_level_rms = 0.0;
+        self.agc_env = AGC_TARGET_ENV;
     }
 }
 
@@ -281,14 +350,23 @@ mod tests {
             .collect()
     }
 
+    /// Config with the digital AGC disabled — for tests that measure the
+    /// raw filter response (AGC would boost a near-silent rejected output).
+    fn cfg_no_agc(input_rate_hz: u32, bw: f32, lo_offset: f32) -> SsbRxChainConfig {
+        let mut c = SsbRxChainConfig::new(input_rate_hz, bw, lo_offset);
+        c.agc = false;
+        c
+    }
+
     /// A USB tone at +1000 Hz lands at 1000 Hz in the audio; its LSB
-    /// mirror (carrier − 1000) is rejected.
+    /// mirror (carrier − 1000) is rejected. AGC off so this measures the
+    /// analytic filter, not the level normaliser.
     #[test]
     fn usb_tone_lands_in_audio_and_mirror_is_rejected() {
         let input_rate = 576_000.0_f32;
         let n = 576_000usize; // 1 s
         // Pluto-style: lo_offset 0, carrier at DC of the captured band.
-        let mut chain = SsbRxChain::new(SsbRxChainConfig::new(576_000, 2700.0, 0.0));
+        let mut chain = SsbRxChain::new(cfg_no_agc(576_000, 2700.0, 0.0));
         let usb = synth_usb_iq(1000.0, 0.0, input_rate, n);
         let audio = chain.process(&usb);
         let skip = 4_000usize;
@@ -298,7 +376,7 @@ mod tests {
         assert!(rms_usb > 0.05, "USB tone should pass, rms={rms_usb}");
 
         // LSB mirror: tone at carrier − 1000 = −1000 in baseband.
-        let mut chain2 = SsbRxChain::new(SsbRxChainConfig::new(576_000, 2700.0, 0.0));
+        let mut chain2 = SsbRxChain::new(cfg_no_agc(576_000, 2700.0, 0.0));
         let lsb = synth_usb_iq(-1000.0, 0.0, input_rate, n);
         let audio2 = chain2.process(&lsb);
         let rms_lsb: f32 = (audio2.iter().skip(skip).map(|s| s * s).sum::<f32>()
@@ -306,6 +384,48 @@ mod tests {
             .sqrt();
         let rej_db = 20.0 * (rms_lsb / rms_usb).log10();
         assert!(rej_db <= -60.0, "LSB mirror rejection = {rej_db:.1} dB (want <= -60)");
+    }
+
+    /// RMS (dBFS) of the settled tail of a 1 kHz USB tone of baseband
+    /// amplitude `amp` through the chain, with AGC on/off.
+    fn ssb_tone_tail_dbfs(amp: f32, agc: bool) -> f32 {
+        let input_rate = 576_000u32;
+        let n = 576_000usize * 2; // 2 s — lets the AGC settle
+        let mut cfg = SsbRxChainConfig::new(input_rate, 2700.0, 0.0);
+        cfg.agc = agc;
+        let mut chain = SsbRxChain::new(cfg);
+        let iq: Vec<Complex32> = (0..n)
+            .map(|k| {
+                let phi = 2.0 * PI * 1000.0 * k as f32 / input_rate as f32;
+                Complex32::new(amp * phi.cos(), amp * phi.sin())
+            })
+            .collect();
+        let audio = chain.process(&iq);
+        let tail = &audio[audio.len() * 3 / 4..]; // last 0.5 s, settled
+        let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt();
+        20.0 * (rms + 1e-12).log10()
+    }
+
+    /// The digital AGC pins a strong in-band signal near the target level
+    /// and lifts a weak one well above its un-normalised level — the whole
+    /// point of SSB AGC (a linear mode has no built-in level normalisation).
+    #[test]
+    fn agc_normalises_level() {
+        // Strong input (|z|=0.5, −6 dBFS) settles near target (≈ −12 dBFS).
+        let strong = ssb_tone_tail_dbfs(0.5, true);
+        assert!(strong > -16.0 && strong < -8.0, "strong AGC out = {strong:.1} dBFS (want -16..-8)");
+
+        // A signal within AGC range (|z|=0.03, −30 dBFS) is normalised up to
+        // about the same target as the strong one — that's normalisation.
+        let mid = ssb_tone_tail_dbfs(0.03, true);
+        assert!((mid - strong).abs() < 4.0, "AGC residual spread = {:.1} dB (want < 4)", mid - strong);
+
+        // A very weak signal (|z|=0.004, −48 dBFS) is gain-capped but still
+        // lifted by close to the +24 dB max vs AGC-off.
+        let weak_on = ssb_tone_tail_dbfs(0.004, true);
+        let weak_off = ssb_tone_tail_dbfs(0.004, false);
+        let lift = weak_on - weak_off;
+        assert!(lift > 18.0, "AGC lift on weak signal = {lift:.1} dB (want > 18)");
     }
 
     /// The LO-offset path (SDRplay) lands the carrier at DC too: a USB
