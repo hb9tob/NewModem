@@ -260,7 +260,8 @@ fn rx(args: &[String]) {
 /// real (possibly channel-colored) signal before wiring it into V3Session.
 fn probe(args: &[String]) {
     let wav = &args[0];
-    let cfg = ProfileIndex::HighPlus.to_config();
+    let profile = args.get(1).map(|s| parse_profile_index(s)).unwrap_or(ProfileIndex::HighPlus);
+    let cfg = profile.to_config();
     // Known preamble passband template (same as the TX emits).
     let pre_syms = modem_core::preamble::make_preamble_for_config(&cfg);
     let (sps, pitch) =
@@ -269,18 +270,23 @@ fn probe(args: &[String]) {
     let template = modem_core::modulator::modulate(&pre_syms, sps, pitch, &taps, cfg.center_freq_hz);
     let samples = read_wav(wav);
 
-    let win = 65_536usize;
+    let win = 131_072usize;
     let step = win - template.len() - 64; // ensure the preamble fits whole in some window
     let mf = modem_core::fd_acquire::PreambleMatchedFilter::new(&template, win);
-    let (mut best_pos, mut best_m) = (0u64, 0.0f64);
+    // Sweep carrier offset (the SSB ambiguity) so a shifted preamble is found.
+    let cfos: Vec<f64> = (-250..=250).step_by(5).map(|h| h as f64).collect();
+    let (mut best_pos, mut best_m, mut best_cfo) = (0u64, 0.0f64, 0.0f64);
     let mut start = 0usize;
     while start < samples.len() {
         let end = (start + win).min(samples.len());
         if end - start >= template.len() {
-            if let Some(pm) = mf.best_match(&samples[start..end]) {
-                if pm.metric > best_m {
-                    best_m = pm.metric;
-                    best_pos = (start + pm.lag) as u64;
+            for &cfo in &cfos {
+                if let Some(pm) = mf.best_match_derotated(&samples[start..end], cfo) {
+                    if pm.metric > best_m {
+                        best_m = pm.metric;
+                        best_pos = (start + pm.lag) as u64;
+                        best_cfo = cfo;
+                    }
                 }
             }
         }
@@ -290,10 +296,223 @@ fn probe(args: &[String]) {
         start += step;
     }
     println!(
-        "probe {wav}: template={} samples, best metric={best_m:.4} at sample {best_pos} ({:.2}s)",
+        "probe {wav} [{}]: template={} samples, best metric={best_m:.4} at sample {best_pos} \
+         ({:.2}s) cfo={best_cfo:+.0} Hz  (acq threshold=0.15)",
+        profile.name(),
         template.len(),
         best_pos as f64 / AUDIO_RATE as f64,
     );
+}
+
+/// Build a TX burst (data ++ 200 ms silence ++ EOT) in memory and return the
+/// modulated audio plus the exact payload bytes, for the AWGN sweep. Mirrors
+/// `tx()` but keeps everything in-process.
+fn build_tx_burst(profile: ProfileIndex, bytes: usize, seed: u64) -> (Vec<f32>, Vec<u8>) {
+    let cfg = profile.to_config();
+    let payload = gen_payload(bytes, seed);
+    let session_id: u32 = 0x5111_0000 ^ (seed as u32);
+    let k_bytes = modem_core::ldpc::encoder::LdpcEncoder::new(cfg.ldpc_rate).k() / 8;
+    let k_src = modem_framing::raptorq_codec::k_from_payload(payload.len(), k_bytes) as u32;
+    let n_total = modem_core::frame::effective_packet_count(k_src + k_src / 3); // ~33% repair
+    let symbols = modem_core::frame::build_superframe_v3_range(
+        &payload, &cfg, session_id, modem_framing::app_header::mime::BINARY, 0x1234, 0, n_total,
+    );
+    let (sps, pitch) =
+        modem_core::rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+    let taps = modem_core::rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+    let mut samples = modem_core::modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz);
+    let eot = modem_core::frame::build_eot_frame(&cfg, session_id);
+    let mut eot_mod = modem_core::modulator::modulate(&eot, sps, pitch, &taps, cfg.center_freq_hz);
+    samples.extend_from_slice(&modem_core::modulator::silence(0.2));
+    samples.append(&mut eot_mod);
+    (samples, payload)
+}
+
+/// Drive `RxV3Worker` (the turbo decode driver) over `samples` in cpal-sized
+/// chunks; return the first assembled payload, if any.
+fn decode_via_worker(profile: ProfileIndex, samples: &[f32]) -> Option<Vec<u8>> {
+    let tmp = std::env::temp_dir().join(format!("awgnsweep_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok();
+    let mut worker = RxV3Worker::new(
+        profile,
+        /*forced=*/ true,
+        Arc::new(Mutex::new(tmp.clone())),
+        Arc::new(NoopSink),
+    )
+    .expect("worker");
+    let mut out: Option<Vec<u8>> = None;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        if let Some(df) = worker.push_samples(chunk).decoded {
+            out.get_or_insert(df.payload);
+        }
+    }
+    if let Some(df) = worker.finalize().decoded {
+        out.get_or_insert(df.payload);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    out
+}
+
+/// Deterministic Gaussian noise (Box-Muller over an LCG), keyed by `seed`.
+fn add_awgn(samples: &mut [f32], sigma: f32, seed: u64) {
+    let mut s = seed | 1;
+    let mut next = || {
+        // LCG → uniform (0,1].
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+    };
+    let mut i = 0;
+    while i < samples.len() {
+        let u1 = next();
+        let u2 = next();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let z0 = r * (2.0 * std::f64::consts::PI * u2).cos();
+        let z1 = r * (2.0 * std::f64::consts::PI * u2).sin();
+        samples[i] += (sigma as f64 * z0) as f32;
+        if i + 1 < samples.len() {
+            samples[i + 1] += (sigma as f64 * z1) as f32;
+        }
+        i += 2;
+    }
+}
+
+/// Measure, through the modem's OWN downmix + matched filter, the on-symbol
+/// signal power S and the MF-output noise power per unit input variance N1.
+/// `Es/N0 = S / (σ²·N1)` (matched-filter SNR = Es/N0), so the AWGN sweep gets a
+/// convention-free, modem-accurate calibration.
+fn calibrate_esn0(profile: ProfileIndex, clean: &[f32]) -> (f64, f64) {
+    use modem_core::demodulator;
+    let cfg = profile.to_config();
+    let (sps, _pitch) =
+        modem_core::rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+    let taps = modem_core::rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+    let n_full = clean.len();
+    let lo = n_full / 10;
+    let hi = n_full * 9 / 10; // skip edge transients
+
+    // Signal: on-symbol MF output power, taking the best decimation phase.
+    let bb = demodulator::downmix(clean, cfg.center_freq_hz);
+    let mf = demodulator::matched_filter(&bb, &taps);
+    let mut best_s = 0.0f64;
+    for phase in 0..sps {
+        let (mut acc, mut cnt) = (0.0f64, 0usize);
+        let mut j = phase;
+        while j < hi.min(mf.len()) {
+            if j >= lo {
+                acc += mf[j].norm_sqr();
+                cnt += 1;
+            }
+            j += sps;
+        }
+        if cnt > 0 {
+            best_s = best_s.max(acc / cnt as f64);
+        }
+    }
+
+    // Noise: unit-variance real noise through the same front-end.
+    let mut noise = vec![0.0f32; n_full];
+    add_awgn(&mut noise, 1.0, 0x1234_5678_9abc_def0);
+    let bbn = demodulator::downmix(&noise, cfg.center_freq_hz);
+    let mfn = demodulator::matched_filter(&bbn, &taps);
+    let (mut accn, mut cntn) = (0.0f64, 0usize);
+    for j in lo..hi.min(mfn.len()) {
+        accn += mfn[j].norm_sqr();
+        cntn += 1;
+    }
+    (best_s, accn / cntn.max(1) as f64)
+}
+
+/// AWGN decode-threshold sweep for a profile. TX a burst once, then for each
+/// target Es/N0 add calibrated noise over N trials and report the byte-exact
+/// success rate → the lowest Es/N0 that still decodes reliably (the link-budget
+/// floor of THIS mode). Calibration (complex-baseband Es/N0, the modem's own
+/// convention): the real passband signal keeps only its +carrier half through
+/// the downmix (−3 dB), so Es_complex = (P_s/2)/Rs and N0 = sigma^2/Fs ⇒
+/// sigma = sqrt(Fs*P_s/(2*Rs*esn0)). Anchored on the QPSK sanity check.
+///   turbo_sim awgnsweep <profile> [esn0_db_csv] [trials] [bytes]
+fn awgnsweep(args: &[String]) {
+    let profile = parse_profile_index(&args[0]);
+    let cfg = profile.to_config();
+    let esn0_list: Vec<f64> = match args.get(1) {
+        Some(s) if !s.is_empty() => s.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
+        _ => {
+            // Default descending sweep 14 → -2 dB in 1 dB steps.
+            (0..=16).map(|k| 14.0 - k as f64).collect()
+        }
+    };
+    let trials: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let bytes: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
+
+    let (clean, expected) = build_tx_burst(profile, bytes, 0xC0FFEE);
+    // Convention-free Es/N0 calibration via the modem's OWN front-end (downmix +
+    // matched filter): measure the on-symbol signal power S and the per-σ²
+    // noise power N1 at the MF output. The matched-filter output SNR at the
+    // symbol instant IS Es/N0 by definition, so a target Es/N0 needs noise
+    // variance σ² = S / (N1 · Es/N0). No real/complex/PSD convention to get
+    // wrong — the labelled Es/N0 is exactly what the modem's symbols see.
+    let (es_sig, n1) = calibrate_esn0(profile, &clean);
+    println!(
+        "awgnsweep {} : payload={bytes}B Rs={} trials={trials} (S={es_sig:.3e} N1={n1:.3e})",
+        profile.name(),
+        cfg.symbol_rate,
+    );
+    println!("  Es/N0(dB)  success");
+    let mut threshold: Option<f64> = None;
+    for &esn0_db in &esn0_list {
+        let esn0 = 10f64.powf(esn0_db / 10.0);
+        let sigma = (es_sig / (n1 * esn0)).sqrt() as f32;
+        let mut ok = 0usize;
+        for t in 0..trials {
+            let mut noisy = clean.clone();
+            add_awgn(&mut noisy, sigma, 0xA5A5_0000 ^ (t as u64).wrapping_mul(2654435761));
+            if decode_via_worker(profile, &noisy).as_deref() == Some(expected.as_slice()) {
+                ok += 1;
+            }
+        }
+        println!("  {esn0_db:>7.1}   {ok}/{trials}");
+        if ok * 10 >= trials * 8 {
+            threshold = Some(esn0_db); // track the lowest Es/N0 with >=80% success
+        }
+    }
+    match threshold {
+        Some(t) => println!("  -> decode threshold (>=80%): {t:.1} dB Es/N0"),
+        None => println!("  -> no Es/N0 in the sweep reached 80% success"),
+    }
+}
+
+/// Nominal LDPC code rate as a fraction (numerator, denominator).
+fn ldpc_rate_frac(r: modem_core::profile::LdpcRate) -> (u32, u32) {
+    use modem_core::profile::LdpcRate;
+    match r {
+        LdpcRate::R1_2 => (1, 2),
+        LdpcRate::R2_3 => (2, 3),
+        LdpcRate::R3_4 => (3, 4),
+        LdpcRate::R5_6 => (5, 6),
+    }
+}
+
+/// Dump a profile's constellation points + parameters for the capacity
+/// analysis (study/modem_capacity.py). Points come straight from the proven
+/// `modem_core` constellation builder (no re-derivation of APSK radii).
+///   turbo_sim consteldump <profile>
+fn consteldump(args: &[String]) {
+    let profile = parse_profile_index(&args[0]);
+    let cfg = profile.to_config();
+    let cons = modem_core::frame::make_constellation(&cfg);
+    let (rn, rd) = ldpc_rate_frac(cfg.ldpc_rate);
+    let m = cons.points.len();
+    // Average symbol energy (for Python to normalise to unit Es).
+    let es: f64 = cons.points.iter().map(|p| p.norm_sqr()).sum::<f64>() / m as f64;
+    println!(
+        "# profile={} M={m} bits={} rate_num={rn} rate_den={rd} symbol_rate={} beta={} es={es:.6}",
+        profile.name(),
+        cons.bits_per_sym,
+        cfg.symbol_rate,
+        cfg.beta,
+    );
+    for p in &cons.points {
+        println!("{:.9} {:.9}", p.re, p.im);
+    }
 }
 
 fn parse_profile_index(s: &str) -> ProfileIndex {
@@ -637,6 +856,8 @@ fn main() {
         "rxreal" => rxreal(rest),
         "probe" => probe(rest),
         "sfcw" => sfcw(rest),
+        "consteldump" => consteldump(rest),
+        "awgnsweep" => awgnsweep(rest),
         other => {
             eprintln!("unknown subcommand {other:?} (expected tx|rx|rxreal|probe|sfcw)");
             std::process::exit(64);
