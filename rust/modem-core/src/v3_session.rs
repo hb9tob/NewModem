@@ -137,6 +137,11 @@ pub const V3_FFE_TRAINING_LEN: usize = 384;
 /// `mu_dd` on the data-constellation slicer decisions.
 const V3_FFE_MU_TRAIN: f64 = 0.10;
 const V3_FFE_MU_DD: f64 = 0.02;
+/// Damping gain for the persistent carrier loop's frequency integrator (Couche
+/// 2): `ν += gain·Δω` per forward segment. < 1 smooths the per-segment residual
+/// slope so a noisy fit can't kick the loop; the phase is set exactly each
+/// segment (gain 1), so phase is always continuous at the segment handoff.
+const CARRIER_FREQ_GAIN: f64 = 0.5;
 /// Sub-sample search radius (48 kHz samples) for the stage-1b channel-matched
 /// preamble refinement around the integer matched-filter peak.
 const V3_PREAMBLE_REFINE_RADIUS: usize = 8;
@@ -363,6 +368,11 @@ pub enum V3SessionEvent {
         constellation: Vec<[f32; 2]>,
         pilot_phases: Vec<f32>,
         is_meta: bool,
+        /// Error-vector magnitude of the displayed DATA symbols vs their hard
+        /// decision (mean `|out − nearest_point|²`). This is the spread the eye
+        /// sees on the scatter — distinct from the pilot-based `sigma2` (channel
+        /// MER, used for LLR scaling), which the GUI shows alongside it.
+        data_evm: f32,
     },
 }
 
@@ -469,6 +479,23 @@ pub struct V3Session {
     /// CFO recovery enabled (off iff `V3_NO_CFO`). When off, `cfo_hz` stays 0.0
     /// and every CFO stage is a no-op. Read once at construction.
     cfo_enabled: bool,
+    /// Persistent symbol-domain carrier loop (Couche 2). A global linear phase
+    /// model `θ + ν·(s − anchor)` (rad), updated once per FORWARD-primary segment
+    /// from the residual pilot phase, predicted into every segment's
+    /// `reequalise_span_joint` so the bulk carrier + drift are removed BEFORE the
+    /// per-segment pilot fit (the per-segment loop then only tracks phase noise).
+    /// The downmix NCO stays static — this is the fine, post-MF stage (DVB-S2 /
+    /// Meyr-Moeneclaey two-stage split). Default ON (validated OTA: +3.2 dB mean
+    /// MER); `V3_NO_CARRIER_TRACK` disables it (→ never predicts → byte-identical
+    /// to the pre-tracking decode, for A/B). Reset on reboot/finalize.
+    carrier_track: bool,
+    carrier_inited: bool,
+    /// Phase (rad) of the model at `carrier_anchor_sym`.
+    carrier_theta: f64,
+    /// Frequency (rad/symbol) of the model.
+    carrier_nu: f64,
+    /// Absolute symbol index the model is anchored at.
+    carrier_anchor_sym: u64,
     sc: ScDetector,
     /// FFT matched filter vs the KNOWN passband preamble — the always-on
     /// acquisition trigger (no silence/energy gate; robust to noise/speech/QRM
@@ -614,6 +641,9 @@ pub struct V3Session {
     /// Last segment's pilot residual phases (radians), parallel companion to
     /// `last_diag_constellation`.
     last_diag_pilot_phases: Vec<f32>,
+    /// Last segment's DATA EVM (mean `|out − decision|²` over the scatter) — the
+    /// visible spread of `last_diag_constellation`. Emitted in `ConstellationDiag`.
+    last_diag_data_evm: f32,
 }
 
 /// Bookkeeping for a cycle whose marker has been validated but whose
@@ -774,6 +804,11 @@ impl V3Session {
             cfo_hz: 0.0,
             cfo_locked: false,
             cfo_enabled: std::env::var_os("V3_NO_CFO").is_none(),
+            carrier_track: std::env::var_os("V3_NO_CARRIER_TRACK").is_none(),
+            carrier_inited: false,
+            carrier_theta: 0.0,
+            carrier_nu: 0.0,
+            carrier_anchor_sym: 0,
             sc,
             acq_mf,
             acq_search_len,
@@ -812,6 +847,7 @@ impl V3Session {
             eot_watch_remaining: 0,
             last_diag_constellation: Vec::new(),
             last_diag_pilot_phases: Vec::new(),
+            last_diag_data_evm: 0.0,
         };
         // Diagnostic: force a fixed drift (ppm) and lock it, bypassing the
         // coarse estimator — used to A/B whether the applied drift VALUE (and
@@ -1179,6 +1215,9 @@ impl V3Session {
         // live DSP's NCO to the no-op state.
         self.set_cfo_hz(0.0);
         self.cfo_locked = false;
+        self.carrier_inited = false;
+        self.carrier_theta = 0.0;
+        self.carrier_nu = 0.0;
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
@@ -1895,11 +1934,17 @@ impl V3Session {
     /// Returns the per-codeword `(info_bytes, converged)` (len `n_cw`) of the
     /// last pass plus the final pilot `sigma2`, or `None` if the span is not
     /// (yet) re-equalisable (caller keeps it pending).
+    /// `update_carrier`: when the persistent carrier loop is enabled, only the
+    /// FORWARD-PRIMARY decode (segments arriving in order) updates the carrier
+    /// model. Backward-flywheel / retry decodes still PREDICT from the model
+    /// (read-only) but never update it, so out-of-order re-decodes can't corrupt
+    /// the forward frequency estimate.
     fn canon_demod_segment(
         &mut self,
         seg_start_abs: u64,
         seg_sym_len: usize,
         n_cw: usize,
+        update_carrier: bool,
     ) -> Option<(Vec<(Vec<u8>, bool)>, f64)> {
         let damp = std::env::var("V3_TURBO_SOFT_DAMP")
             .ok()
@@ -1945,6 +1990,27 @@ impl V3Session {
             }
         }
 
+        // Persistent carrier loop (Couche 2): predict this segment's phase ramp
+        // from the global model θ + ν·(s − anchor). Fixed across the turbo
+        // iterations; updated once after the loop (forward-primary only). On the
+        // first segment of a burst (not inited) the model is identity → pred ≡ 0
+        // → byte-identical. Disabled (`carrier_track == false`) → None → no-op.
+        let carrier_pred: Option<Vec<f64>> = if self.carrier_track {
+            let (theta, nu, anchor) = if self.carrier_inited {
+                (self.carrier_theta, self.carrier_nu, self.carrier_anchor_sym)
+            } else {
+                (0.0, 0.0, seg_start_abs)
+            };
+            Some(
+                (0..seg_sym_len)
+                    .map(|k| theta + nu * ((seg_start_abs + k as u64) as f64 - anchor as f64))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let mut last_resid: (f64, f64) = (0.0, 0.0);
+
         let mut data_e: Vec<Complex64> = Vec::new();
         let mut data_var: Vec<f64> = Vec::new();
         let mut results: Vec<(Vec<u8>, bool)> = vec![(Vec::new(), false); n_cw];
@@ -1974,7 +2040,7 @@ impl V3Session {
                 }
             }
             // One joint FFE+phase FBF pass, in place on the single live tap set.
-            let (out, sigma2_per_sym) = self.ffe.reequalise_span_joint(
+            let sd = self.ffe.reequalise_span_joint(
                 seg_start_abs,
                 seg_sym_len,
                 &refs,
@@ -1983,7 +2049,11 @@ impl V3Session {
                 V3_FFE_MU_DD,
                 pll_alpha,
                 pll_beta,
+                carrier_pred.as_deref(),
             )?;
+            let out = sd.out;
+            let sigma2_per_sym = sd.sigma2_per_sym;
+            last_resid = (sd.resid_freq, sd.resid_phase_last);
             // Data symbols + their PER-SYMBOL sigma2(t) (pilots skipped).
             let mut seg_data: Vec<Complex64> = Vec::with_capacity(data_sym_count);
             let mut seg_data_s2: Vec<f64> = Vec::with_capacity(data_sym_count);
@@ -2003,16 +2073,28 @@ impl V3Session {
             {
                 let mut cst: Vec<[f32; 2]> = Vec::with_capacity(MAX_TURBO_CONSTELLATION);
                 let mut php: Vec<f32> = Vec::new();
+                // DATA EVM = mean |out − hard decision|² over ALL data symbols
+                // (the visible scatter spread), independent of the sampled subset.
+                let mut evm_acc = 0.0f64;
+                let mut evm_n = 0usize;
                 for i in 0..seg_sym_len {
                     if is_pilot[i] {
                         let r = out[i] * pilot_ref[i].conj();
                         php.push(r.arg() as f32);
-                    } else if cst.len() < MAX_TURBO_CONSTELLATION {
-                        cst.push([out[i].re as f32, out[i].im as f32]);
+                    } else {
+                        let dec = self.constellation.points
+                            [self.constellation.slice_nearest(&[out[i]])[0]];
+                        evm_acc += (out[i] - dec).norm_sqr();
+                        evm_n += 1;
+                        if cst.len() < MAX_TURBO_CONSTELLATION {
+                            cst.push([out[i].re as f32, out[i].im as f32]);
+                        }
                     }
                 }
                 self.last_diag_constellation = cst;
                 self.last_diag_pilot_phases = php;
+                self.last_diag_data_evm =
+                    if evm_n > 0 { (evm_acc / evm_n as f64) as f32 } else { 0.0 };
             }
             // Segment-mean sigma2 for the CwDecoded event / diagnostics.
             last_sigma2 = (seg_data_s2.iter().sum::<f64>() / seg_data_s2.len() as f64).max(1e-6);
@@ -2069,6 +2151,27 @@ impl V3Session {
             if results.iter().all(|(_, c)| *c) {
                 break;
             }
+        }
+        // Update the persistent carrier model from this segment's residual —
+        // FORWARD-PRIMARY decodes only (in order). The model's phase is set
+        // exactly to the measured phase at the segment's last symbol (G_phase=1);
+        // the frequency integrates the residual slope with a damping gain.
+        if self.carrier_track && update_carrier {
+            let (resid_freq, resid_phase_last) = last_resid;
+            let s_last = seg_start_abs + seg_sym_len as u64 - 1;
+            if self.carrier_inited {
+                let pred_last = self.carrier_theta
+                    + self.carrier_nu * (s_last as f64 - self.carrier_anchor_sym as f64);
+                self.carrier_nu += CARRIER_FREQ_GAIN * resid_freq;
+                self.carrier_theta = pred_last + resid_phase_last;
+            } else {
+                // First forward segment: prediction was 0, so the residual IS the
+                // absolute carrier of this segment — grab it in full.
+                self.carrier_nu = resid_freq;
+                self.carrier_theta = resid_phase_last;
+                self.carrier_inited = true;
+            }
+            self.carrier_anchor_sym = s_last;
         }
         if std::env::var_os("V3_LOG_TURBO").is_some() {
             let conv: Vec<u8> = results.iter().map(|(_, c)| *c as u8).collect();
@@ -2292,7 +2395,8 @@ impl V3Session {
             if seg_start_abs < self.ffe.start_abs() {
                 break; // segment scrolled out of the retained window
             }
-            let Some((per_cw, sigma2)) = self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw)
+            let Some((per_cw, sigma2)) =
+                self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw, false)
             else {
                 miss += 1;
                 marker_pos = prev_marker_abs;
@@ -2428,7 +2532,7 @@ impl V3Session {
             r.attempts += 1;
             let n_cw = if r.is_meta { 1 } else { V2_CODEWORDS_PER_SEGMENT };
             let Some((per_cw, sigma2)) =
-                self.canon_demod_segment(r.seg_start_abs, r.seg_sym_len, n_cw)
+                self.canon_demod_segment(r.seg_start_abs, r.seg_sym_len, n_cw, false)
             else {
                 still_pending.push(r);
                 continue;
@@ -2437,6 +2541,7 @@ impl V3Session {
                 constellation: std::mem::take(&mut self.last_diag_constellation),
                 pilot_phases: std::mem::take(&mut self.last_diag_pilot_phases),
                 is_meta: r.is_meta,
+                data_evm: self.last_diag_data_evm,
             });
             let mut newly_failed: Vec<usize> = Vec::new();
             for &cw_idx in &r.failed_cw {
@@ -2550,7 +2655,7 @@ impl V3Session {
         // side-pass + the separate hard/soft retry equalisers. `None` = the span
         // is truncated / not re-equalisable → clear pending so we don't loop.
         let Some((per_cw, sigma2)) =
-            self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw)
+            self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw, true)
         else {
             self.pending_decode = None;
             return true;
@@ -2559,6 +2664,7 @@ impl V3Session {
             constellation: std::mem::take(&mut self.last_diag_constellation),
             pilot_phases: std::mem::take(&mut self.last_diag_pilot_phases),
             is_meta: pending.is_meta,
+            data_evm: self.last_diag_data_evm,
         });
 
         let mut failed_cw: Vec<usize> = Vec::new();
@@ -3402,6 +3508,11 @@ impl V3Session {
         // across the corrected replay so the second pass keeps the correction
         // and does not re-commit. (0.0 ⇒ byte-exact no-op, the default path.)
         self.dsp.set_cfo_hz(self.cfo_hz);
+        // The persistent carrier loop re-derives from the first segment of the
+        // replayed burst (it is a fine, in-order forward estimate).
+        self.carrier_inited = false;
+        self.carrier_theta = 0.0;
+        self.carrier_nu = 0.0;
         let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&self.cfg);
         self.ffe = StreamingFfe::new(
             n_ff,

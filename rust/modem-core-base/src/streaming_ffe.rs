@@ -49,6 +49,21 @@ use crate::types::Complex64;
 /// rather than the OTA-validated `ffe::train_ffe_ls`.
 const FFE_RIDGE_REL: f64 = 1e-2;
 
+/// Output of [`StreamingFfe::reequalise_span_joint`].
+pub struct SpanDemod {
+    /// Derotated span (constellation frame), length `span`.
+    pub out: Vec<Complex64>,
+    /// Per-symbol noise variance for LOCAL LLR scaling, length `span`.
+    pub sigma2_per_sym: Vec<f64>,
+    /// Residual carrier slope (rad/symbol) measured on the pilots AFTER the
+    /// predicted-carrier de-rotation — the part the prediction missed. 0.0 when
+    /// `carrier_pred` is `None`. Feeds the session's persistent carrier loop.
+    pub resid_freq: f64,
+    /// Residual carrier phase (rad) at the LAST symbol of the span, after the
+    /// prediction. 0.0 when `carrier_pred` is `None`.
+    pub resid_phase_last: f64,
+}
+
 /// Streaming fractionally-spaced FFE block. See module docs.
 pub struct StreamingFfe {
     /// Fractional FFE length (taps at T/`pitch_fse` spacing).
@@ -655,7 +670,8 @@ impl StreamingFfe {
         mu_dd: f64,
         pll_alpha: f64,
         pll_beta: f64,
-    ) -> Option<(Vec<Complex64>, Vec<f64>)> {
+        carrier_pred: Option<&[f64]>,
+    ) -> Option<SpanDemod> {
         if self.current_taps.is_none() || span == 0 || sof_abs < self.start_abs {
             return None;
         }
@@ -675,6 +691,19 @@ impl StreamingFfe {
         if first_center < half || last_center + (n_ff - half) > self.frac_buf.len() {
             return None;
         }
+
+        // Predicted-carrier de-rotation factor at symbol k: e^{−j·carrier_pred[k]}.
+        // `None` (or all-zero) ⇒ exactly 1+0j, so every pass below is byte-
+        // identical to the pre-carrier-tracking path. When supplied (session's
+        // persistent carrier loop), this removes the bulk carrier BEFORE the
+        // pilot LS, so the LS measures only the RESIDUAL (flat per-group gains,
+        // correct edge extrapolation) and the residual slope feeds the loop.
+        let cphase = |k: usize| -> Complex64 {
+            match carrier_pred {
+                Some(p) => Complex64::from_polar(1.0, -p[k]),
+                None => Complex64::new(1.0, 0.0),
+            }
+        };
 
         // --- Coarse per-group gain g_k from the known pilots (measure pass) ---
         // LS-fit one complex gain per CONTIGUOUS pilot run (= one pilot group),
@@ -698,7 +727,8 @@ impl StreamingFfe {
                     for (i, &t) in taps.iter().enumerate() {
                         y += t * self.frac_buf[lo + i];
                     }
-                    num += y * refs[k].conj();
+                    // Measure the RESIDUAL gain after the predicted carrier.
+                    num += (y * cphase(k)) * refs[k].conj();
                     den += refs[k].norm_sqr();
                     k += 1;
                 }
@@ -712,6 +742,11 @@ impl StreamingFfe {
             }
         }
         let n_g = gain_pos.len();
+        // Residual carrier model measured on the (now residual) pilot phases,
+        // for the session's persistent loop. Stays 0 unless a prediction was
+        // supplied (carrier tracking enabled).
+        let mut resid_freq = 0.0f64;
+        let mut resid_phase_last = 0.0f64;
         // Per-symbol inverse gain (identity when no pilots are present).
         let inv_gain: Vec<Complex64> = if n_g == 0 {
             vec![Complex64::new(1.0, 0.0); span]
@@ -733,6 +768,27 @@ impl StreamingFfe {
             };
             let ps: Vec<f64> = (0..n_g).map(|i| smooth(&phases, i)).collect();
             let ms: Vec<f64> = (0..n_g).map(|i| smooth(&mags, i)).collect();
+            // When carrier prediction is active, `phases` ARE the residual phases:
+            // LS-fit a line vs symbol position → residual slope (rad/sym) + phase
+            // at the last symbol, for the session's carrier loop. Slope clamped
+            // for safety (a noisy fit can't kick the loop hard).
+            if carrier_pred.is_some() {
+                if n_g >= 2 {
+                    let mean_x =
+                        gain_pos.iter().map(|&p| p as f64).sum::<f64>() / n_g as f64;
+                    let mean_p = phases.iter().sum::<f64>() / n_g as f64;
+                    let (mut sxx, mut sxp) = (0.0f64, 0.0f64);
+                    for i in 0..n_g {
+                        let dx = gain_pos[i] as f64 - mean_x;
+                        sxx += dx * dx;
+                        sxp += dx * (phases[i] - mean_p);
+                    }
+                    resid_freq = if sxx > 1e-9 { (sxp / sxx).clamp(-0.1, 0.1) } else { 0.0 };
+                    resid_phase_last = mean_p + resid_freq * ((span - 1) as f64 - mean_x);
+                } else {
+                    resid_phase_last = phases[0];
+                }
+            }
             (0..span)
                 .map(|i| {
                     let (mag, phase) = if i <= gain_pos[0] {
@@ -793,7 +849,7 @@ impl StreamingFfe {
                             y += t * self.frac_buf[lo + i];
                         }
                     }
-                    let yrot = y * inv_gain[k] * Complex64::from_polar(1.0, -theta);
+                    let yrot = y * cphase(k) * inv_gain[k] * Complex64::from_polar(1.0, -theta);
                     let (d, w) = if is_pilot[k] {
                         (refs[k], 1.0f64)
                     } else {
@@ -828,8 +884,10 @@ impl StreamingFfe {
                         y += t * self.frac_buf[lo + i];
                     }
                 }
-                // Joint derotation: A = inv_gain·e^{−jθ_sm}; yrot in constellation frame.
-                let a = inv_gain[k] * Complex64::from_polar(1.0, -theta_sm[k]);
+                // Joint derotation: A = e^{−j·carrier_pred}·inv_gain·e^{−jθ_sm};
+                // yrot in constellation frame. cphase folds the predicted carrier
+                // into the same factor, so the NLMS target frame stays consistent.
+                let a = cphase(k) * inv_gain[k] * Complex64::from_polar(1.0, -theta_sm[k]);
                 let yrot = y * a;
                 out[k] = yrot;
                 // STRONG confidence on the KNOWN anchors (pilots, w=1); data only
@@ -923,7 +981,12 @@ impl StreamingFfe {
                 })
                 .collect()
         };
-        Some((out, sigma2_per_sym))
+        Some(SpanDemod {
+            out,
+            sigma2_per_sym,
+            resid_freq,
+            resid_phase_last,
+        })
     }
 
     fn trim(&mut self) {
@@ -1075,6 +1138,74 @@ fn gauss_solve(mut a: Vec<Vec<Complex64>>, mut b: Vec<Complex64>) -> Option<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The residual-carrier measurement: on an identity channel fed a known
+    /// predicted ramp `ω·k`, the pilot LS sees a residual rotating at `−ω`, so
+    /// `reequalise_span_joint` must report `resid_freq ≈ −ω` and a matching
+    /// last-symbol residual phase. Validates the loop's measurement (Couche 2).
+    #[test]
+    fn reequalise_reports_residual_carrier_slope() {
+        use std::f64::consts::PI;
+        let pitch = 2;
+        let n_sym = 120usize;
+        // Unrotated QPSK reference symbols.
+        let refs: Vec<Complex64> = (0..n_sym)
+            .map(|k| {
+                let ph = (k % 4) as f64 * PI / 2.0;
+                Complex64::new(ph.cos(), ph.sin())
+            })
+            .collect();
+        // Identity T/2 channel (on-symbol = ref, half = midpoint).
+        let mut frac = vec![Complex64::new(0.0, 0.0); n_sym * pitch];
+        for k in 0..n_sym {
+            frac[2 * k] = refs[k];
+            let nxt = if k + 1 < n_sym { refs[k + 1] } else { refs[k] };
+            frac[2 * k + 1] = (refs[k] + nxt) * Complex64::new(0.5, 0.0);
+        }
+        let mut ffe = StreamingFfe::new(9, 200, 16, pitch, 0);
+        ffe.push_raw(&frac);
+        // Train an ≈identity FFE on a clean window.
+        let train_refs: Vec<(u64, Complex64)> = (10..40).map(|k| (k as u64, refs[k])).collect();
+        assert!(ffe.train_at(10, &train_refs, 30), "train_at failed");
+
+        // Span [50, 50+span) with pilot groups of 2 every 6 symbols (≥2 groups
+        // so the slope fit runs); data positions get weight 0.
+        let sof = 50u64;
+        let span = 48usize;
+        let mut is_pilot = vec![false; span];
+        let mut weights = vec![0.0f64; span];
+        let mut span_refs = vec![Complex64::new(0.0, 0.0); span];
+        for i in 0..span {
+            span_refs[i] = refs[sof as usize + i];
+            if i % 6 >= 4 {
+                is_pilot[i] = true;
+                weights[i] = 1.0;
+            }
+        }
+        let omega = 0.03f64; // rad/symbol predicted ramp
+        let pred: Vec<f64> = (0..span).map(|k| omega * k as f64).collect();
+        let sd = ffe
+            .reequalise_span_joint(
+                sof, span, &span_refs, &weights, &is_pilot, 0.0, 0.0, 0.0, Some(&pred),
+            )
+            .expect("reequalise span");
+        // Predicted +ω removed → residual rotates at −ω.
+        assert!(
+            (sd.resid_freq + omega).abs() < 5e-3,
+            "resid_freq={} expected ≈ {}",
+            sd.resid_freq,
+            -omega,
+        );
+        // And the no-prediction path reports zero residual (and is the byte-exact
+        // legacy behaviour).
+        let sd0 = ffe
+            .reequalise_span_joint(
+                sof, span, &span_refs, &weights, &is_pilot, 0.0, 0.0, 0.0, None,
+            )
+            .expect("reequalise span none");
+        assert_eq!(sd0.resid_freq, 0.0);
+        assert_eq!(sd0.resid_phase_last, 0.0);
+    }
 
     #[test]
     fn prepend_extends_backward_and_lowers_start() {

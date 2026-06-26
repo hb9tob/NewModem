@@ -338,6 +338,7 @@ export let lastProgress = {
   expected: 0,
   converged: 0,
   sigma2: null,
+  evm: null,
 };
 
 // TX half-duplex repaints the RX progress bitmap; ESM bindings are read-only
@@ -353,7 +354,7 @@ export let lastPilotPhases = [];
 export let lastPilotPhaseIsMeta = [];
 
 export function resetRxVisuals() {
-  lastProgress = { bitmap: null, expected: 0, converged: 0, sigma2: null };
+  lastProgress = { bitmap: null, expected: 0, converged: 0, sigma2: null, evm: null };
   lastConstellation = [];
   lastPilotPhases = [];
   lastPilotPhaseIsMeta = [];
@@ -422,14 +423,21 @@ export function updateV2Progress(payload) {
   // Prefer `sigma2_data` (frame-only, hard-decision residuals) when the
   // worker provides it. Fall back to `sigma2` (pilot-residual) for
   // older payloads so a partial rebuild doesn't blank the indicator.
-  const sigmaInst = Number.isFinite(payload.sigma2_data)
-    ? payload.sigma2_data
-    : (Number.isFinite(payload.sigma2) ? payload.sigma2 : null);
+  // Two distinct quality metrics, shown side by side (labeled):
+  //  - σ² pilote: pilot-residual variance = channel MER (the LLR scaling input).
+  //  - EVM data: spread of the displayed DATA scatter vs hard decision — what
+  //    the eye sees on the constellation. They differ because the soft FFE/phase
+  //    pulls symbols toward soft refs; showing both removes the ambiguity.
+  const pilotSigma2 = Number.isFinite(payload.sigma2) ? payload.sigma2 : null;
+  const dataEvm = Number.isFinite(payload.data_evm)
+    ? payload.data_evm
+    : (Number.isFinite(payload.sigma2_data) ? payload.sigma2_data : null);
   lastProgress = {
     bitmap,
     expected: payload.blocks_expected || 0,
     converged: payload.blocks_converged || 0,
-    sigma2: sigmaInst,
+    sigma2: pilotSigma2,
+    evm: dataEvm,
   };
   lastConstellation = Array.isArray(payload.constellation_sample)
     ? payload.constellation_sample
@@ -444,11 +452,14 @@ export function updateV2Progress(payload) {
   const sigmaStr = lastProgress.sigma2 != null
     ? lastProgress.sigma2.toFixed(3).padStart(6, " ")
     : "     ?";
+  const evmStr = lastProgress.evm != null
+    ? lastProgress.evm.toFixed(3).padStart(6, " ")
+    : "     ?";
   const mini = document.getElementById("v2-progress-text");
   if (mini) {
     const c = String(lastProgress.converged).padStart(3, " ");
     const e = String(lastProgress.expected).padStart(3, " ");
-    mini.textContent = `${c}/${e} σ²=${sigmaStr}`;
+    mini.textContent = `${c}/${e} σ²=${sigmaStr} EVM=${evmStr}`;
   }
   drawProgressBlocks();
   drawConstellation();
@@ -725,13 +736,20 @@ export function drawPilotPhase() {
     }
   }
 
-  // Header overlay : range, segments count, σ² (if available), implied SNR.
+  // Header overlay : range, segments, EVM data (matches THIS scatter) + σ²
+  // pilote (channel MER). Both labeled so the displayed number always tracks
+  // what the eye sees on the points.
   const rangeMrad = (yRange * 1000).toFixed(0);
   const sigma2 = lastProgress.sigma2;
+  const evm = lastProgress.evm;
   let header = `±${(rangeMrad / 2).toFixed(0)} mrad · ${segments.length} seg`;
+  if (evm != null && evm > 0) {
+    const evmDb = (-10 * Math.log10(evm)).toFixed(1);
+    header += ` · EVM=${evm.toFixed(3)} (${evmDb} dB)`;
+  }
   if (sigma2 != null && sigma2 > 0) {
     const snrDb = (-10 * Math.log10(sigma2)).toFixed(1);
-    header += ` · σ²=${sigma2.toFixed(3)} (${snrDb} dB)`;
+    header += ` · σ²pil=${sigma2.toFixed(3)} (${snrDb} dB)`;
   }
   ctx.fillStyle = "rgba(0,0,0,0.55)";
   ctx.fillRect(plotX0, 0, plotW, 22 * dpr);

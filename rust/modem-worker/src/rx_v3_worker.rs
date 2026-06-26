@@ -151,6 +151,9 @@ pub struct RxV3Worker {
     /// Latest segment pilot residual phases (radians), companion to
     /// `last_constellation`; `last_pilot_is_meta` flags a META segment.
     last_pilot_phases: Vec<f32>,
+    /// DATA EVM of the last segment (mean |out − decision|² of the scatter) —
+    /// the spread the eye sees, shown alongside the pilot σ² (channel MER).
+    last_data_evm: f32,
     last_pilot_is_meta: bool,
 }
 
@@ -213,6 +216,7 @@ impl RxV3Worker {
             last_sigma2: 0.0,
             last_constellation: Vec::new(),
             last_pilot_phases: Vec::new(),
+            last_data_evm: 0.0,
             last_pilot_is_meta: false,
             gated: std::env::var_os("TURBO_GATED").is_some(),
             turbo_state: TurboState::Searching,
@@ -632,12 +636,14 @@ impl RxV3Worker {
                     constellation,
                     pilot_phases,
                     is_meta,
+                    data_evm,
                 } => {
                     // Cache the latest segment scatter; the next `v2_progress`
                     // (emitted from `accept`) carries it to the GUI.
                     self.last_constellation = constellation;
                     self.last_pilot_phases = pilot_phases;
                     self.last_pilot_is_meta = is_meta;
+                    self.last_data_evm = data_evm;
                 }
                 V3SessionEvent::DriftCommitted { .. } => {
                     // SLOW families only (ROBUST / ULTRA): a coarse-drift commit
@@ -794,6 +800,7 @@ impl RxV3Worker {
                 "blocks_expected": res.needed as usize,
                 "sigma2": self.last_sigma2,
                 "sigma2_data": self.last_sigma2,
+                "data_evm": self.last_data_evm,
                 "converged_bitmap": res.seen_bitmap,
                 "constellation_sample": self.last_constellation.clone(),
                 "pilot_phase_segments": vec![self.last_pilot_phases.clone()],
