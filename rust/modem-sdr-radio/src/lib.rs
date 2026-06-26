@@ -40,9 +40,10 @@ use modem_sdr_dsp::{NbfmRxChain, NbfmRxChainConfig, SpectrumAnalyzer, AUDIO_RATE
 /// channels, cheap enough to run several times a second.
 const RF_FFT_SIZE: usize = 2048;
 
-/// FFT size for the demodulated-audio spectrum. 1024 over the 0–24 kHz
-/// half-band ≈ 23 Hz/bin.
-const AUDIO_FFT_SIZE: usize = 1024;
+/// FFT size for the demodulated-audio spectrum. 4096 over the 0–24 kHz
+/// half-band ≈ 11.7 Hz/bin — fine enough to resolve the voice-band detail in
+/// the 0–4 kHz zoom the Radio tab shows.
+const AUDIO_FFT_SIZE: usize = 4096;
 
 /// Minimum spacing between successive RF spectrum frames (~12 Hz).
 const RF_FRAME_PERIOD: Duration = Duration::from_millis(80);

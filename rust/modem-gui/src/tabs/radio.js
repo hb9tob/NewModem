@@ -32,6 +32,8 @@ export const radioState = {
   excLastSeq: -1, // last ingested excursion seq (dedup vs the 60 Hz RAF)
   rafId: null,
   waterfallInit: false,
+  wfW: 0, // waterfall canvas dims last init'd at — re-init only when these change
+  wfH: 0,
 };
 
 export const RADIO_WF_PALETTE = (() => {
@@ -120,7 +122,6 @@ export function sizeRadioCanvas(canvas) {
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;
-    radioState.waterfallInit = false; // RF/waterfall geometry changed
   }
   return canvas.getContext("2d");
 }
@@ -661,13 +662,16 @@ export function drawFmExcursion() {
   if (!ctx) return;
   const w = canvas.width;
   const h = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
   const ex = radioState.excursion;
   const maxDev =
     ex && Number.isFinite(ex.max_dev_hz) && ex.max_dev_hz > 0 ? ex.max_dev_hz : 5000;
-  // Ingest the latest frame once (dedup on seq vs the faster RAF).
+  // Ingest the latest frame once (dedup on seq vs the faster RAF). Each entry
+  // is timestamped (performance.now, ms) so the 5 s peak-hold is time-accurate
+  // whatever the emit cadence.
   if (ex && ex.seq !== radioState.excLastSeq) {
     radioState.excLastSeq = ex.seq;
-    radioState.excHist.push({ peak: ex.peak_hz || 0, rms: ex.rms_hz || 0 });
+    radioState.excHist.push({ peak: ex.peak_hz || 0, rms: ex.rms_hz || 0, t: performance.now() });
     if (radioState.excHist.length > EXC_HIST_MAX) {
       radioState.excHist.splice(0, radioState.excHist.length - EXC_HIST_MAX);
     }
@@ -679,23 +683,26 @@ export function drawFmExcursion() {
   const yOf = (hz) => h - Math.max(0, Math.min(1, hz / topHz)) * h;
 
   // Reference grid: ±2.5 kHz (amateur narrow NBFM) and ±5 kHz (standard).
-  ctx.font = "10px sans-serif";
+  // Labels DPR-scaled + right-aligned so they don't collide with the read-out.
+  ctx.font = `${Math.round(9 * dpr)}px sans-serif`;
   ctx.textBaseline = "bottom";
+  ctx.textAlign = "right";
   for (const r of [
-    { hz: 2500, color: "rgba(120,200,120,0.35)", label: "2,5 kHz" },
-    { hz: 5000, color: "rgba(210,200,120,0.35)", label: "5 kHz" },
+    { hz: 2500, line: "rgba(120,200,120,0.45)", text: "#bfe6bf", label: "2,5 kHz" },
+    { hz: 5000, line: "rgba(220,210,120,0.45)", text: "#e6dca0", label: "5 kHz" },
   ]) {
     if (r.hz >= topHz) continue;
     const y = yOf(r.hz);
-    ctx.strokeStyle = r.color;
+    ctx.strokeStyle = r.line;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, y);
     ctx.lineTo(w, y);
     ctx.stroke();
-    ctx.fillStyle = r.color;
-    ctx.fillText(r.label, 3, y - 1);
+    ctx.fillStyle = r.text;
+    ctx.fillText(r.label, w - 3 * dpr, y - 1);
   }
+  ctx.textAlign = "left";
   // Over-modulation threshold = active max deviation (red dashed).
   const yMax = yOf(maxDev);
   ctx.strokeStyle = "rgba(244,67,54,0.85)";
@@ -732,12 +739,34 @@ export function drawFmExcursion() {
     }
     ctx.stroke();
   }
-  // Live numeric peak read-out.
-  if (ex) {
+  // Live read-out: current deviation + 5 s peak-hold, in a high-contrast box so
+  // the numbers stay readable over the bars. DPR-scaled so the font isn't tiny
+  // on HiDPI displays (the whole point of this read-out).
+  if (hist.length) {
+    const cur = hist[hist.length - 1].peak;
+    const nowMs = performance.now();
+    let pk2 = 0;
+    for (let i = hist.length - 1; i >= 0; i--) {
+      const e = hist[i];
+      if (e.t !== undefined && nowMs - e.t > 2000) break;
+      if (e.peak > pk2) pk2 = e.peak;
+    }
+    const fs = Math.round(13 * dpr);
+    const pad = Math.round(4 * dpr);
+    const lineH = Math.round(fs * 1.3);
+    ctx.font = `bold ${fs}px sans-serif`;
     ctx.textBaseline = "top";
-    ctx.font = "11px sans-serif";
-    ctx.fillStyle = ex.peak_hz > maxDev ? "#ff8a80" : "#9be29b";
-    ctx.fillText(`crête ${((ex.peak_hz || 0) / 1000).toFixed(2)} kHz`, 3, 2);
+    ctx.textAlign = "left";
+    const l1 = `cour ${(cur / 1000).toFixed(2)} kHz`;
+    const l2 = `pic 2 s ${(pk2 / 1000).toFixed(2)} kHz`;
+    const boxW =
+      Math.max(ctx.measureText(l1).width, ctx.measureText(l2).width) + pad * 2;
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, boxW, lineH * 2 + pad);
+    ctx.fillStyle = cur > maxDev ? "#ff8a80" : "#e6ffe6";
+    ctx.fillText(l1, pad, pad);
+    ctx.fillStyle = pk2 > maxDev ? "#ff5252" : "#a8e6a8";
+    ctx.fillText(l2, pad, pad + lineH);
   }
 }
 
@@ -887,10 +916,16 @@ export function drawRadioRf() {
   if (!ctx) return;
   const w = canvas.width;
   const h = canvas.height;
-  if (!radioState.waterfallInit) {
+  // Re-init only when the WATERFALL canvas geometry itself changes (or on the
+  // first paint / tab open). Decoupled from the other canvases: sizing the
+  // smeter / audio / RF / excursion canvases must NOT wipe the accumulated
+  // waterfall history — that coupling is what stopped the waterfall scrolling.
+  if (!radioState.waterfallInit || w !== radioState.wfW || h !== radioState.wfH) {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, w, h);
     radioState.waterfallInit = true;
+    radioState.wfW = w;
+    radioState.wfH = h;
     radioState.lastWfSeq = -1;
   }
   const frame = radioState.rf;

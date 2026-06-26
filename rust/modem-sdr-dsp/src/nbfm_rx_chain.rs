@@ -70,6 +70,22 @@ pub const TRANSITION_RATIO: f32 = 1.5;
 /// enough for any realistic crowded 2 m / 70 cm scenario.
 pub const DEFAULT_STOPBAND_DB: f32 = 80.0;
 
+/// Band-limit (Hz) applied to the discriminator output before the Radio-tab
+/// FM-excursion peak/RMS measurement. The useful NBFM modulation deviation
+/// lives in the voice band; everything above is FM click noise whose
+/// unbounded instantaneous-frequency spikes would otherwise dominate the
+/// peak. 4 kHz keeps the full voice band with margin.
+pub const EXCURSION_METER_HZ: f32 = 4_000.0;
+
+/// DC-block (Hz) for the FM-excursion meter. The discriminator output's DC
+/// component is the carrier↔tuning frequency offset (RTL-SDR ppm error puts an
+/// unmodulated carrier several kHz off-centre), NOT deviation — without removing
+/// it an unmodulated carrier reads a large bogus "deviation" and every reading
+/// is inflated. The corner is kept LOW (~20 Hz) so it blocks only the static
+/// offset: CTCSS sub-audio tones (67 Hz and up) ARE part of the transmitted
+/// deviation budget and must be counted, so they pass.
+pub const EXCURSION_HPF_HZ: f32 = 20.0;
+
 /// Configuration for [`NbfmRxChain`]. One source of truth for the
 /// channel-select / demod / audio-filter parameters; backends that
 /// don't expose a knob simply leave it at the default.
@@ -168,6 +184,18 @@ pub struct NbfmRxChain {
     /// RMS of the same pre-de-emphasis discriminator output, normalised
     /// (`1.0` == `max_deviation`).
     last_excursion_rms: f32,
+    /// 2-pole LPF state for the excursion meter, band-limiting the
+    /// discriminator output to the voice band before peak/RMS detection. The
+    /// raw instantaneous frequency of FM noise is broadband and unbounded
+    /// (random phase jumps → huge spikes); without this the meter pegs on
+    /// noise. Measurement-only — never touches the emitted audio.
+    exc_lpf_alpha: f32,
+    exc_lpf1: f32,
+    exc_lpf2: f32,
+    /// One-pole DC tracker (carrier-offset estimate) subtracted from the
+    /// band-limited signal so only the AC modulation deviation is measured.
+    exc_hpf_alpha: f32,
+    exc_dc: f32,
 }
 
 impl NbfmRxChain {
@@ -230,6 +258,15 @@ impl NbfmRxChain {
             last_channel_power: 0.0,
             last_excursion_peak: 0.0,
             last_excursion_rms: 0.0,
+            // One-pole coefficient for the excursion-meter band-limit, cascaded
+            // twice (≈12 dB/oct) at EXCURSION_METER_HZ on the AUDIO_RATE stream.
+            exc_lpf_alpha: 1.0
+                - (-2.0 * std::f32::consts::PI * EXCURSION_METER_HZ / AUDIO_RATE as f32).exp(),
+            exc_lpf1: 0.0,
+            exc_lpf2: 0.0,
+            exc_hpf_alpha: 1.0
+                - (-2.0 * std::f32::consts::PI * EXCURSION_HPF_HZ / AUDIO_RATE as f32).exp(),
+            exc_dc: 0.0,
         }
     }
 
@@ -325,21 +362,40 @@ impl NbfmRxChain {
         let audio = &mut self.audio_scratch[..baseband.len()];
         self.demod.process(&baseband, audio);
 
-        // Radio-tab FM-excursion side-channel: peak + RMS of the raw
-        // discriminator output BEFORE de-emphasis (de-emphasis rolls off
-        // the highs and would understate the true on-air deviation).
-        // Normalised units — 1.0 == max_deviation. Read-only over `audio`:
-        // the de-emphasis/HPF signal path below is unchanged, so the
+        // Radio-tab FM-excursion side-channel: peak + RMS of the discriminator
+        // output BEFORE de-emphasis (de-emphasis rolls off the highs and would
+        // understate the true on-air deviation), band-limited to the voice band
+        // by a 2-pole LPF first. The band-limit is ESSENTIAL: the raw
+        // instantaneous frequency of FM noise is broadband and unbounded
+        // (random inter-sample phase jumps → spikes far beyond max_deviation),
+        // which would peg the meter on noise; limiting to ~EXCURSION_METER_HZ
+        // keeps the real modulation deviation and rejects the out-of-band click
+        // noise. Normalised units — 1.0 == max_deviation. Measurement-only:
+        // `audio` (the de-emphasis/HPF signal path below) is untouched, so the
         // emitted audio stays byte-identical to the pre-meter chain.
+        let alpha = self.exc_lpf_alpha;
+        let hpf = self.exc_hpf_alpha;
+        let mut lp1 = self.exc_lpf1;
+        let mut lp2 = self.exc_lpf2;
+        let mut dc = self.exc_dc;
         let mut peak = 0.0f32;
         let mut sumsq = 0.0f32;
         for &s in audio.iter() {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
+            lp1 += alpha * (s - lp1);
+            lp2 += alpha * (lp1 - lp2);
+            // DC tracker = carrier-offset estimate; subtract it so the meter
+            // sees only the AC modulation deviation, not the tuning offset.
+            dc += hpf * (lp2 - dc);
+            let bp = lp2 - dc;
+            let v = bp.abs();
+            if v > peak {
+                peak = v;
             }
-            sumsq += s * s;
+            sumsq += bp * bp;
         }
+        self.exc_lpf1 = lp1;
+        self.exc_lpf2 = lp2;
+        self.exc_dc = dc;
         self.last_excursion_peak = peak;
         self.last_excursion_rms = (sumsq / audio.len() as f32).sqrt();
 
@@ -366,6 +422,9 @@ impl NbfmRxChain {
         self.last_channel_power = 0.0;
         self.last_excursion_peak = 0.0;
         self.last_excursion_rms = 0.0;
+        self.exc_lpf1 = 0.0;
+        self.exc_lpf2 = 0.0;
+        self.exc_dc = 0.0;
     }
 }
 
