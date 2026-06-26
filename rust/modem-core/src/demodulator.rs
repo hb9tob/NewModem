@@ -125,12 +125,12 @@ fn matched_filter_fft(bb: &[Complex64], taps: &[f64]) -> Vec<Complex64> {
     out
 }
 
-struct FftPlans {
-    forward: Arc<dyn Fft<f64>>,
-    inverse: Arc<dyn Fft<f64>>,
+pub(crate) struct FftPlans {
+    pub(crate) forward: Arc<dyn Fft<f64>>,
+    pub(crate) inverse: Arc<dyn Fft<f64>>,
 }
 
-fn get_or_build_plans(fft_len: usize) -> Arc<FftPlans> {
+pub(crate) fn get_or_build_plans(fft_len: usize) -> Arc<FftPlans> {
     static CACHE: OnceLock<Mutex<HashMap<usize, Arc<FftPlans>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().expect("matched_filter FFT cache poisoned");

@@ -18,6 +18,8 @@ use std::sync::Arc;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+use crate::types::AUDIO_RATE;
+
 /// A located preamble. `lag` is the integer 48 kHz sample offset into the
 /// search window where the template best aligns; `frac` ∈ [-1, 1] is the
 /// parabolic sub-sample refinement of that peak (`lag as f64 + frac` is the
@@ -281,6 +283,87 @@ impl PreambleMatchedFilter {
             metric: best_metric,
         })
     }
+
+    /// Like [`best_match`](Self::best_match), but first de-rotates `window` by a
+    /// carrier-frequency offset of `cfo_hz` (multiplying sample `i` by
+    /// `exp(-j·2π·cfo_hz·i/Fs)`) before correlating. A signal whose carrier has
+    /// drifted by `cfo_hz` (e.g. SSB TX/RX oscillator mismatch) smears the
+    /// real-input correlation to nothing once the offset exceeds the template's
+    /// sinc main lobe (~6 Hz over a 256-symbol preamble); de-rotating first
+    /// brings its preamble back onto the template's carrier so the peak
+    /// survives. De-rotation is unitary, so the per-lag energy normaliser is
+    /// unchanged.
+    ///
+    /// `cfo_hz == 0.0` dispatches to the unmodified [`best_match`](Self::best_match)
+    /// (real path), so it is **bit-identical** — the caller's deadband makes the
+    /// CFO-unaware behaviour a true no-op.
+    pub fn best_match_derotated(&self, window: &[f32], cfo_hz: f64) -> Option<PreambleMatch> {
+        if cfo_hz == 0.0 {
+            return self.best_match(window);
+        }
+        if window.len() < self.n_template {
+            return None;
+        }
+        let usable = window.len().min(self.fft_size);
+        // FFT of the complex de-rotated, zero-padded window.
+        let mut buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); self.fft_size];
+        let w0 = -2.0 * std::f64::consts::PI * cfo_hz / AUDIO_RATE as f64;
+        for (i, &w) in window[..usable].iter().enumerate() {
+            let (s, c) = (w0 * i as f64).sin_cos();
+            buf[i] = Complex::new(w as f64 * c, w as f64 * s);
+        }
+        self.fwd.process(&mut buf);
+        for (b, t) in buf.iter_mut().zip(self.template_spec_conj.iter()) {
+            *b *= *t;
+        }
+        self.inv.process(&mut buf);
+        let inv_n = 1.0 / self.fft_size as f64;
+
+        // Sliding window energy = Σ|window|²; de-rotation is unitary so this is
+        // the same as the real-path energy (|w·e^{jθ}|² = |w|²).
+        let last_lag = usable - self.n_template;
+        let mut prefix = vec![0.0f64; usable + 1];
+        for i in 0..usable {
+            let w = window[i] as f64;
+            prefix[i + 1] = prefix[i] + w * w;
+        }
+
+        let mut best_lag = 0usize;
+        let mut best_metric = 0.0f64;
+        for lag in 0..=last_lag {
+            // Correlation is now complex; use its magnitude.
+            let corr2 = buf[lag].norm_sqr() * inv_n * inv_n;
+            let e_w = prefix[lag + self.n_template] - prefix[lag];
+            if e_w <= 0.0 {
+                continue;
+            }
+            let metric = corr2 / (self.template_energy * e_w);
+            if metric > best_metric {
+                best_metric = metric;
+                best_lag = lag;
+            }
+        }
+
+        let frac = if best_lag > 0 && best_lag < last_lag {
+            let mag = |l: usize| buf[l].norm() * inv_n;
+            let m_minus = mag(best_lag - 1);
+            let m_zero = mag(best_lag);
+            let m_plus = mag(best_lag + 1);
+            let denom = m_minus - 2.0 * m_zero + m_plus;
+            if denom < -1e-12 {
+                (0.5 * (m_minus - m_plus) / denom).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        Some(PreambleMatch {
+            lag: best_lag,
+            frac,
+            metric: best_metric,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +503,96 @@ mod tests {
             r2.lag,
             r2.frac,
         );
+    }
+
+    /// Analytic signal of a real sequence via FFT (zero negative freqs, double
+    /// positive). Used to synthesise a faithful single-carrier frequency shift.
+    fn analytic(x: &[f32]) -> Vec<Complex<f64>> {
+        let n = x.len();
+        let mut planner = FftPlanner::<f64>::new();
+        let fwd = planner.plan_fft_forward(n);
+        let inv = planner.plan_fft_inverse(n);
+        let mut buf: Vec<Complex<f64>> = x.iter().map(|&v| Complex::new(v as f64, 0.0)).collect();
+        fwd.process(&mut buf);
+        for k in 1..n / 2 {
+            buf[k] *= 2.0;
+        }
+        for b in buf.iter_mut().take(n).skip(n / 2 + 1) {
+            *b = Complex::new(0.0, 0.0);
+        }
+        inv.process(&mut buf);
+        let s = 1.0 / n as f64;
+        for c in &mut buf {
+            *c *= s;
+        }
+        buf
+    }
+
+    /// A carrier-frequency-shifted preamble is lost by the plain real matched
+    /// filter (offset past the template's sinc main lobe) but recovered by
+    /// `best_match_derotated` at the matching offset; and the 0 Hz call is
+    /// bit-identical to `best_match`.
+    #[test]
+    fn derotated_recovers_frequency_shifted_preamble() {
+        use std::f64::consts::PI;
+        let fs = AUDIO_RATE as f64;
+        // Long, preamble-like real template (multitone around 1100 Hz). At
+        // n_t=2048 the sinc null is ~23 Hz, so a 108 Hz offset is deep in the
+        // sidelobes — the plain MF cannot lock.
+        let n_t = 2048usize;
+        let tones = [800.0, 1000.0, 1100.0, 1250.0, 1400.0];
+        let template: Vec<f32> = (0..n_t)
+            .map(|k| {
+                let t = k as f64 / fs;
+                (tones.iter().map(|&f| (2.0 * PI * f * t).sin()).sum::<f64>()
+                    / (tones.len() as f64).sqrt()) as f32
+            })
+            .collect();
+
+        let window_len = 20000usize;
+        let offset = 8000usize;
+        let delta = 108.0_f64;
+        let mut window = noise(window_len, 0.1, 0x55AA);
+        // Embed the template carrier-shifted by `delta`: a single complex
+        // rotation of its analytic signal at absolute window time.
+        let an = analytic(&template);
+        for k in 0..n_t {
+            let i = offset + k;
+            let ph = 2.0 * PI * delta * i as f64 / fs;
+            let rot = Complex::new(ph.cos(), ph.sin());
+            window[i] += (an[k] * rot).re as f32;
+        }
+
+        let mf = PreambleMatchedFilter::new(&template, window_len);
+
+        // Plain MF: degraded — should not lock cleanly.
+        let plain = mf.best_match(&window).expect("window ≥ template");
+        // De-rotated MF at the true offset: locks at the right lag, strong metric.
+        let derot = mf
+            .best_match_derotated(&window, delta)
+            .expect("window ≥ template");
+        // Multitone template → broad/oscillatory correlation peak (a carrier
+        // period is ~43 samples here), so allow a fraction of a period; the
+        // point is that it locks near the preamble at all, vs the plain MF.
+        assert!(
+            (derot.lag as i64 - offset as i64).abs() <= 20,
+            "de-rotated lag {} far from true offset {offset}",
+            derot.lag,
+        );
+        // De-rotation lifts the metric above the acquisition threshold while
+        // the plain MF stays below it: the difference between locking and not.
+        assert!(
+            derot.metric > MF_ACQ_THRESHOLD && plain.metric < MF_ACQ_THRESHOLD,
+            "de-rotated metric {:.4} (want > {MF_ACQ_THRESHOLD}) vs plain {:.4} (want < {MF_ACQ_THRESHOLD})",
+            derot.metric,
+            plain.metric,
+        );
+
+        // 0 Hz is bit-identical to best_match.
+        let a = mf.best_match(&window).unwrap();
+        let b = mf.best_match_derotated(&window, 0.0).unwrap();
+        assert_eq!(a.lag, b.lag);
+        assert_eq!(a.frac.to_bits(), b.frac.to_bits());
+        assert_eq!(a.metric.to_bits(), b.metric.to_bits());
     }
 }

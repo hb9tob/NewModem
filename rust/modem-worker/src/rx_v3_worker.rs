@@ -362,6 +362,11 @@ impl RxV3Worker {
         }
         let lo = (anchor - self.history_origin) as usize;
         let drift = 0.0; // pre-lock: nominal rate; the session re-estimates drift
+        // Seed the session with the gate's coarse carrier-offset estimate so the
+        // replay's acquisition starts pre-corrected (0.0 when the gate found no
+        // offset → no-op). A hint only: the session re-estimates and commits the
+        // fine offset on its own, so correctness doesn't depend on it.
+        self.session.set_cfo_hz(open.cfo_hz);
         let replay = {
             let mut hist = std::mem::take(&mut self.history);
             let ev = {

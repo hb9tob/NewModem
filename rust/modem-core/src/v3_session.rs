@@ -44,6 +44,7 @@
 
 use std::collections::VecDeque;
 
+use crate::cfo::{self, CfoBand};
 use crate::constellation::Constellation;
 use crate::frame::{self, V2_CODEWORDS_PER_SEGMENT};
 use crate::interleaver;
@@ -454,6 +455,20 @@ pub struct V3Session {
     /// "coarse one-shot + fine tracker"); for Phase 2 it's set by
     /// the caller (sweep tests, future worker hint).
     drift_ppm: f64,
+    /// Carrier-frequency-offset correction (Hz) forwarded to the downmix NCO of
+    /// `StreamingDsp` each chunk. Default 0.0 ⇒ the downmix is byte-identical to
+    /// the CFO-unaware pipeline (the no-op core). Estimated once per burst at
+    /// acquisition (coarse spectral via the gate + fine data-aided on the
+    /// preamble) and held for the burst; the DD-PLL/pilot tracking mop up the
+    /// residual. See [`crate::cfo`]. Persisted across a replay (like
+    /// `drift_ppm`), reset in `finalize`.
+    cfo_hz: f64,
+    /// Set once the per-burst CFO has been committed (one-shot, like
+    /// `drift_locked`). Blocks re-estimation across the corrected replay.
+    cfo_locked: bool,
+    /// CFO recovery enabled (off iff `V3_NO_CFO`). When off, `cfo_hz` stays 0.0
+    /// and every CFO stage is a no-op. Read once at construction.
+    cfo_enabled: bool,
     sc: ScDetector,
     /// FFT matched filter vs the KNOWN passband preamble — the always-on
     /// acquisition trigger (no silence/energy gate; robust to noise/speech/QRM
@@ -756,6 +771,9 @@ impl V3Session {
             audio_drained_samples: 0,
             total_samples: 0,
             drift_ppm: 0.0,
+            cfo_hz: 0.0,
+            cfo_locked: false,
+            cfo_enabled: std::env::var_os("V3_NO_CFO").is_none(),
             sc,
             acq_mf,
             acq_search_len,
@@ -813,6 +831,19 @@ impl V3Session {
     /// nominal rate.
     pub fn set_drift_ppm(&mut self, ppm: f64) {
         self.drift_ppm = ppm;
+    }
+
+    /// Set the per-burst carrier-frequency offset (Hz) and push it into the
+    /// streaming DSP's downmix NCO. The DSP is rebuilt on every pipeline reset,
+    /// so `reset_pipeline_and_fsm` re-applies `self.cfo_hz` — this setter keeps
+    /// the field and the live DSP in step between resets. 0.0 is a true no-op.
+    pub fn set_cfo_hz(&mut self, hz: f64) {
+        self.cfo_hz = hz;
+        self.dsp.set_cfo_hz(hz);
+    }
+
+    pub fn cfo_hz(&self) -> f64 {
+        self.cfo_hz
     }
 
     pub fn drift_ppm(&self) -> f64 {
@@ -1142,6 +1173,12 @@ impl V3Session {
         // inherited the stale rate. (Root cause of the "1st OK, rest degrade".)
         self.drift_ppm = 0.0;
         self.drift_locked = false;
+        // CFO is per-TX (oscillator offset): clear it so the next burst — a
+        // possibly different TX — re-estimates from scratch instead of inheriting
+        // the previous burst's carrier offset. `set_cfo_hz(0.0)` also resets the
+        // live DSP's NCO to the no-op state.
+        self.set_cfo_hz(0.0);
+        self.cfo_locked = false;
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
@@ -1480,11 +1517,79 @@ impl V3Session {
             self.next_acq_scan_abs = self.total_samples + self.acq_scan_interval;
         }
         let start_rel = self.audio_buffer.len().saturating_sub(self.acq_search_len);
-        let crate::fd_acquire::PreambleMatch { lag, metric, .. } =
-            match self.acq_mf.best_match(&self.audio_buffer[start_rel..]) {
-                Some(v) => v,
-                None => return,
-            };
+        let win = &self.audio_buffer[start_rel..];
+        // Acquisition matched filter, CFO-aware. The MF runs on RAW passband
+        // (which always carries the full carrier offset), so de-rotate by our
+        // best current estimate `self.cfo_hz`: 0 when unknown — byte-identical to
+        // the pre-CFO path for a clean signal — or the worker gate's hint /
+        // committed offset otherwise. Phase 2 below covers the case where this
+        // still doesn't lock because the offset isn't known yet.
+        let found = self.acq_mf.best_match_derotated(win, self.cfo_hz);
+        let phase1_ok = found.as_ref().map(|m| m.metric >= MF_ACQ_THRESHOLD).unwrap_or(false);
+
+        // Phase 2: nothing locked at 0 and a carrier offset may be hiding the
+        // preamble. Where there's genuine in-band energy, estimate the coarse
+        // offset, bracket it with an MF-metric grid, and PARABOLICALLY REFINE on
+        // the metric — which peaks exactly at the true carrier offset, immune to
+        // the modem spectrum's intrinsic centroid bias and to raw-symbol quality.
+        // Commit the refined offset one-shot and replay the burst CFO-corrected
+        // (the marker can't validate while the segment still spins); the replay
+        // re-enters here with `cfo_locked` and decodes the corrected stream.
+        if !phase1_ok && self.cfo_enabled && !self.cfo_locked {
+            if let Some(psd) = cfo::coarse_psd(win) {
+                let band = CfoBand::from_config(&self.cfg);
+                if cfo::band_signal_ratio(&psd, &band) >= cfo::BAND_SIGNAL_RATIO_MIN {
+                    let coarse =
+                        cfo::snap_deadband(cfo::estimate_coarse_cfo_from_psd(&psd, &band));
+                    if coarse != 0.0 {
+                        let grid: Vec<f64> = cfo::refine_grid(coarse).collect();
+                        let metrics: Vec<f64> = grid
+                            .iter()
+                            .map(|&c| {
+                                self.acq_mf
+                                    .best_match_derotated(win, c)
+                                    .map(|m| m.metric)
+                                    .unwrap_or(0.0)
+                            })
+                            .collect();
+                        let best_i = metrics
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        if metrics[best_i] >= MF_ACQ_THRESHOLD {
+                            // Sub-grid parabolic refine on the metric peak.
+                            let step = 3.0;
+                            let mut refined = grid[best_i];
+                            if best_i > 0 && best_i + 1 < grid.len() {
+                                let (ml, m0, mh) =
+                                    (metrics[best_i - 1], metrics[best_i], metrics[best_i + 1]);
+                                let denom = ml - 2.0 * m0 + mh;
+                                if denom < -1e-12 {
+                                    refined += step * (0.5 * (ml - mh) / denom).clamp(-1.0, 1.0);
+                                }
+                            }
+                            if std::env::var_os("V3_LOG_SYNC").is_some() {
+                                eprintln!(
+                                    "[cfo] commit refined={refined:.2} Hz (coarse={coarse:.2}, best_metric={:.3})",
+                                    metrics[best_i],
+                                );
+                            }
+                            self.set_cfo_hz(refined);
+                            self.cfo_locked = true;
+                            self.reboot_pipeline_and_replay(events);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        let crate::fd_acquire::PreambleMatch { lag, metric, .. } = match found {
+            Some(v) => v,
+            None => return,
+        };
         if metric < MF_ACQ_THRESHOLD {
             return;
         }
@@ -3291,6 +3396,12 @@ impl V3Session {
             self.cfg.beta,
             self.cfg.center_freq_hz,
         );
+        // The DSP is fresh, so re-apply the committed CFO to its NCO (mirrors how
+        // `drift_ppm` is re-applied via feed_audio). `cfo_hz`/`cfo_locked` are
+        // deliberately NOT reset here — like `drift_locked`, they must persist
+        // across the corrected replay so the second pass keeps the correction
+        // and does not re-commit. (0.0 ⇒ byte-exact no-op, the default path.)
+        self.dsp.set_cfo_hz(self.cfo_hz);
         let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&self.cfg);
         self.ffe = StreamingFfe::new(
             n_ff,
@@ -4467,5 +4578,68 @@ mod tests {
         assert!(matches!(session.state(), V3SessionState::Acquiring { .. }));
         let _ = session.finalize();
         assert!(matches!(session.state(), V3SessionState::Idle));
+    }
+
+    /// Carrier-shift a real passband burst by `delta` Hz via a single complex
+    /// rotation of its analytic signal — a faithful single-sideband carrier
+    /// offset (same method as `ssb_loopback::analytic`). `delta == 0.0` returns
+    /// the audio unchanged.
+    fn shift_carrier(audio: &[f32], delta: f64) -> Vec<f32> {
+        if delta == 0.0 {
+            return audio.to_vec();
+        }
+        use rustfft::num_complex::Complex;
+        use rustfft::FftPlanner;
+        let n = audio.len();
+        let mut planner = FftPlanner::<f64>::new();
+        let fwd = planner.plan_fft_forward(n);
+        let inv = planner.plan_fft_inverse(n);
+        let mut buf: Vec<Complex<f64>> =
+            audio.iter().map(|&v| Complex::new(v as f64, 0.0)).collect();
+        fwd.process(&mut buf);
+        for k in 1..n / 2 {
+            buf[k] *= 2.0;
+        }
+        for b in buf.iter_mut().take(n).skip(n / 2 + 1) {
+            *b = Complex::new(0.0, 0.0);
+        }
+        inv.process(&mut buf);
+        let s = 1.0 / n as f64;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        buf.iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let ph = two_pi * delta * i as f64 / AUDIO_RATE as f64;
+                ((c * s) * Complex::new(ph.cos(), ph.sin())).re as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turbo_cfo_recovers_offset_burst_byte_exact() {
+        // End-to-end: a V3 burst with an injected SSB-style carrier offset must
+        // still assemble the exact payload through the turbo session (coarse
+        // grid → fine data-aided → commit + replay → decode). δ = 0 also proves
+        // the CFO path is a no-op on a clean burst (it assembles identically).
+        let cfg = high_plus_config();
+        let payload_size = 800usize;
+        let session_id = 0xCF01_2345u32;
+        let audio = build_v3_burst_audio(&cfg, payload_size, session_id);
+        let expected = vec![0xAA_u8; payload_size];
+
+        for &delta in &[0.0_f64, 108.0, 200.0, -150.0] {
+            let shifted = shift_carrier(&audio, delta);
+            let mut session = V3Session::new(cfg.clone(), "HIGH+".to_string());
+            let outcome = run_session_and_assemble(&mut session, &shifted);
+            assert_eq!(
+                outcome.file_size,
+                Some(payload_size as u32),
+                "δ={delta}: wrong/absent file_size",
+            );
+            let bytes = outcome
+                .payload
+                .unwrap_or_else(|| panic!("δ={delta} Hz: RaptorQ never assembled the payload"));
+            assert_eq!(bytes, expected, "δ={delta} Hz: assembled payload mismatch");
+        }
     }
 }

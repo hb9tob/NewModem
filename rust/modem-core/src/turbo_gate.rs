@@ -14,10 +14,18 @@
 //! the DSP) — the Golay+CRC validation after the seek is the hard false-positive
 //! gate.
 
+use crate::cfo::{self, CfoBand};
 use crate::fd_acquire::{PreambleMatchedFilter, MF_ACQ_THRESHOLD};
 use crate::profile::ProfileIndex;
 use crate::types::{AUDIO_RATE, RRC_SPAN_SYM};
 use crate::{modulator, preamble, rrc};
+
+/// Coarse-CFO de-rotation is enabled unless the `V3_NO_CFO` kill-switch is set
+/// (A/B testing and OTA safety). Read once at gate construction.
+fn cfo_enabled() -> bool {
+    std::env::var_os("V3_NO_CFO").is_none()
+}
+
 
 /// A gate "open": a preamble was detected on raw audio; the worker should seek
 /// the DSP here and let the marker validation confirm it.
@@ -30,6 +38,10 @@ pub struct GateOpen {
     pub profile: ProfileIndex,
     /// Matched-filter metric at the peak (≥ [`MF_ACQ_THRESHOLD`]).
     pub metric: f64,
+    /// Coarse carrier-frequency offset (Hz) the gate de-rotated by to open
+    /// (0.0 if none / inside the deadband). A hint for the session to start its
+    /// replay pre-corrected; the session re-estimates the fine offset anyway.
+    pub cfo_hz: f64,
 }
 
 /// One geometry's FFT preamble matched filter + the representative profile to
@@ -39,6 +51,8 @@ struct GeomFilter {
     profile: ProfileIndex,
     mf: PreambleMatchedFilter,
     template_len: usize,
+    /// Occupied-band signature for the coarse CFO estimate of this geometry.
+    band: CfoBand,
 }
 
 impl GeomFilter {
@@ -62,6 +76,7 @@ impl GeomFilter {
             profile,
             mf,
             template_len,
+            band: CfoBand::from_config(&cfg),
         }
     }
 }
@@ -77,6 +92,9 @@ pub struct TurboGate {
     scan_interval: u64,
     /// Next absolute ring-head index at which a scan is allowed (throttle).
     next_scan_abs: u64,
+    /// Coarse CFO de-rotation enabled (off iff `V3_NO_CFO` is set). When off
+    /// the gate de-rotates by 0.0 → byte-identical to the pre-CFO behaviour.
+    cfo_enabled: bool,
 }
 
 impl TurboGate {
@@ -110,6 +128,7 @@ impl TurboGate {
             search_len,
             scan_interval,
             next_scan_abs: 0,
+            cfo_enabled: cfo_enabled(),
         }
     }
 
@@ -160,6 +179,7 @@ impl TurboGate {
             search_len,
             scan_interval,
             next_scan_abs: 0,
+            cfo_enabled: cfo_enabled(),
         }
     }
 
@@ -177,24 +197,62 @@ impl TurboGate {
         self.next_scan_abs = head + self.scan_interval;
         let start_rel = ring.len().saturating_sub(self.search_len);
         let win = &ring[start_rel..];
-        let mut best: Option<(f64, usize, ProfileIndex)> = None;
+
+        // Phase 1 — cheap detection at cfo = 0 (the pre-CFO behaviour, exactly).
+        // A clean or small-offset signal locks here, byte-identically; the
+        // expensive CFO search below only runs when this finds nothing.
+        let mut best: Option<(f64, usize, ProfileIndex, f64)> = None;
         for f in &self.filters {
             if win.len() < f.template_len {
                 continue;
             }
             if let Some(m) = f.mf.best_match(win) {
                 if m.metric >= MF_ACQ_THRESHOLD
-                    && best.map(|(bm, _, _)| m.metric > bm).unwrap_or(true)
+                    && best.map(|(bm, _, _, _)| m.metric > bm).unwrap_or(true)
                 {
-                    best = Some((m.metric, m.lag, f.profile));
+                    best = Some((m.metric, m.lag, f.profile, 0.0));
                 }
             }
         }
-        let (metric, lag, profile) = best?;
+
+        // Phase 2 — nothing locked at 0. A large carrier offset (SSB) hides the
+        // preamble from the real matched filter (sinc null ≈ 6 Hz), so where
+        // there is genuine in-band energy, estimate the coarse offset and refine
+        // it with a small MF-metric grid (the grid absorbs the modem spectrum's
+        // intrinsic ~10 Hz centroid bias). Idle noise has no in-band energy, so
+        // this never pays the grid on an idle channel.
+        if best.is_none() && self.cfo_enabled {
+            if let Some(psd) = cfo::coarse_psd(win) {
+                for f in &self.filters {
+                    if win.len() < f.template_len {
+                        continue;
+                    }
+                    if cfo::band_signal_ratio(&psd, &f.band) < cfo::BAND_SIGNAL_RATIO_MIN {
+                        continue; // no signal in this band → skip the grid
+                    }
+                    let coarse = cfo::snap_deadband(cfo::estimate_coarse_cfo_from_psd(&psd, &f.band));
+                    if coarse == 0.0 {
+                        continue; // already covered by phase 1
+                    }
+                    for cfo in cfo::refine_grid(coarse) {
+                        if let Some(m) = f.mf.best_match_derotated(win, cfo) {
+                            if m.metric >= MF_ACQ_THRESHOLD
+                                && best.map(|(bm, _, _, _)| m.metric > bm).unwrap_or(true)
+                            {
+                                best = Some((m.metric, m.lag, f.profile, cfo));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (metric, lag, profile, cfo_hz) = best?;
         Some(GateOpen {
             preamble_abs: origin + (start_rel + lag) as u64,
             profile,
             metric,
+            cfo_hz,
         })
     }
 
@@ -233,6 +291,60 @@ mod tests {
             rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
         let taps = rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
         modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz)
+    }
+
+    /// Carrier-shift a real passband burst by `delta` Hz via a single complex
+    /// rotation of its analytic signal (faithful single-sideband shift).
+    fn shift_carrier(audio: &[f32], delta: f64) -> Vec<f32> {
+        use rustfft::num_complex::Complex;
+        use rustfft::FftPlanner;
+        let n = audio.len();
+        let mut planner = FftPlanner::<f64>::new();
+        let fwd = planner.plan_fft_forward(n);
+        let inv = planner.plan_fft_inverse(n);
+        let mut buf: Vec<Complex<f64>> =
+            audio.iter().map(|&v| Complex::new(v as f64, 0.0)).collect();
+        fwd.process(&mut buf);
+        for k in 1..n / 2 {
+            buf[k] *= 2.0;
+        }
+        for b in buf.iter_mut().take(n).skip(n / 2 + 1) {
+            *b = Complex::new(0.0, 0.0);
+        }
+        inv.process(&mut buf);
+        let s = 1.0 / n as f64;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        buf.iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let ph = two_pi * delta * i as f64 / AUDIO_RATE as f64;
+                ((c * s) * Complex::new(ph.cos(), ph.sin())).re as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gate_opens_on_carrier_offset_preamble() {
+        // A 108 Hz carrier offset hides the preamble from the plain MF (null
+        // ≈ 6 Hz — see fd_acquire::derotated_recovers_frequency_shifted_preamble);
+        // the gate's CFO phase must still open and report a cfo_hz near the true
+        // offset.
+        let profile = ProfileIndex::HighPlus;
+        let burst = build_burst(profile, 4000);
+        let win = TurboGate::forced(profile).search_len().min(burst.len());
+        let shifted = shift_carrier(&burst[..win], 108.0);
+
+        let mut gate = TurboGate::forced(profile);
+        let open = gate
+            .poll(&shifted, 0)
+            .expect("CFO gate did not open on a 108 Hz-offset burst");
+        assert_eq!(open.profile, profile);
+        assert!(open.metric >= MF_ACQ_THRESHOLD);
+        assert!(
+            (open.cfo_hz - 108.0).abs() <= 15.0,
+            "reported cfo_hz {:.1} far from 108 Hz",
+            open.cfo_hz,
+        );
     }
 
     #[test]

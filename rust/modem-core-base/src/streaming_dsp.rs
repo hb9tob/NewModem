@@ -121,6 +121,13 @@ fn bessel_i0(x: f64) -> f64 {
 pub struct StreamingDsp {
     sps: usize,
     fc: f64,
+    /// Carrier-frequency-offset correction (Hz) folded into the downmix NCO.
+    /// `0.0` (the default) makes the downmix bit-identical to `fc` alone, so a
+    /// CFO-unaware caller is unaffected. May only be changed at a pipeline
+    /// reset/replay boundary (a fresh DSP or right after [`rewind_to`], where
+    /// the absolute index restarts), never mid-`feed_audio`, otherwise the NCO
+    /// phase would step. See [`set_cfo_hz`](Self::set_cfo_hz).
+    cfo_hz: f64,
 
     bank: Vec<[f64; N_TAPS]>,
     /// Index of the next TX-time output sample the resampler will emit
@@ -171,6 +178,7 @@ impl StreamingDsp {
         Self {
             sps,
             fc: center_freq_hz,
+            cfo_hz: 0.0,
             bank: build_polyphase_bank(),
             resampler_next_tx: 0,
             last_drift_ppm: 0.0,
@@ -193,6 +201,20 @@ impl StreamingDsp {
 
     pub fn sps(&self) -> usize {
         self.sps
+    }
+
+    /// Set the carrier-frequency-offset correction (Hz) folded into the
+    /// downmix NCO. `0.0` is a true no-op (downmix bit-identical to `fc`).
+    /// Must only be called at a reset/replay boundary (see the `cfo_hz`
+    /// field doc): the NCO phase is reconstructed from the absolute index,
+    /// so changing the frequency only stays phase-continuous when the index
+    /// also restarts (a fresh DSP or right after [`rewind_to`]).
+    pub fn set_cfo_hz(&mut self, hz: f64) {
+        self.cfo_hz = hz;
+    }
+
+    pub fn cfo_hz(&self) -> f64 {
+        self.cfo_hz
     }
 
     /// Number of fse samples per symbol in `sym_buffer` (= `sps / d_fse`).
@@ -367,9 +389,12 @@ impl StreamingDsp {
         while self.downmix_next_abs < resampled_end_abs {
             let rel = (self.downmix_next_abs - self.resampled_start_abs) as usize;
             let s = self.resampled[rel] as f64;
+            // `fc + cfo_hz`: at cfo_hz == 0.0 this is bit-identical to `fc`
+            // (IEEE-754 x + 0.0 == x for finite x), keeping the downmix a
+            // byte-exact no-op for CFO-unaware callers.
             let phase = -2.0
                 * std::f64::consts::PI
-                * self.fc
+                * (self.fc + self.cfo_hz)
                 * (self.downmix_next_abs as f64)
                 / (AUDIO_RATE as f64);
             let (sin_p, cos_p) = phase.sin_cos();
@@ -666,5 +691,72 @@ mod tests {
             }
         }
         assert!(max_err < 1e-9, "chunked/mono divergence = {max_err}");
+    }
+
+    #[test]
+    fn cfo_zero_is_byte_exact() {
+        use std::f64::consts::PI;
+        // Two pipelines fed identical audio; one has the CFO NCO explicitly
+        // set to 0.0. The downmix term `fc + 0.0` must be bit-identical to
+        // `fc`, so every produced symbol is exactly equal — the no-op core.
+        let n = 2 * AUDIO_RATE as usize;
+        let audio: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / AUDIO_RATE as f64;
+                (0.3 * (2.0 * PI * 1100.0 * t).sin() + 0.2 * (2.0 * PI * 1450.0 * t).sin()) as f32
+            })
+            .collect();
+        let drift = 30.0;
+
+        let mut base = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        base.feed_audio(&audio, 0, drift);
+
+        let mut with_cfo0 = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        with_cfo0.set_cfo_hz(0.0);
+        with_cfo0.feed_audio(&audio, 0, drift);
+
+        let a = base.sym_buffer();
+        let b = with_cfo0.sym_buffer();
+        assert_eq!(a.len(), b.len(), "sym counts differ");
+        for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            // Bit-exact, not just close: x.re == y.re && x.im == y.im.
+            assert!(
+                x.re.to_bits() == y.re.to_bits() && x.im.to_bits() == y.im.to_bits(),
+                "symbol {k}: cfo=0 not byte-exact: {x:?} != {y:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn cfo_shifts_dc() {
+        use std::f64::consts::PI;
+        // A pure tone at fc + delta, downmixed with cfo_hz = delta, must land
+        // at DC (the baseband becomes a constant phasor). Without the CFO the
+        // same tone would sit at `delta` Hz in the baseband.
+        let delta = 150.0_f64;
+        let n = AUDIO_RATE as usize;
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * (TEST_FC + delta) * i as f64 / AUDIO_RATE as f64).cos() as f32)
+            .collect();
+
+        let mut dsp = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        dsp.set_cfo_hz(delta);
+        dsp.feed_audio(&tone, 0, 0.0);
+
+        // After the matched filter (RRC ≈ ±900 Hz) the real tone's image at
+        // -2*(fc+delta) ≈ -2500 Hz is rejected, leaving a near-constant DC
+        // phasor: the mean power must dominate the total power. (On the raw
+        // pre-MF baseband the image carries half the power, so this check has
+        // to be taken downstream of the matched filter.)
+        let mf = &dsp.mf_output[N_TAPS..];
+        assert!(mf.len() > 1000, "too little mf output: {}", mf.len());
+        let mean: Complex64 = mf.iter().sum::<Complex64>() / mf.len() as f64;
+        let mean_pow = mean.norm_sqr();
+        let total_pow: f64 = mf.iter().map(|c| c.norm_sqr()).sum::<f64>() / mf.len() as f64;
+        assert!(
+            mean_pow / total_pow > 0.9,
+            "tone not at DC after CFO downmix: mean_pow/total_pow = {:.3}",
+            mean_pow / total_pow,
+        );
     }
 }
