@@ -490,6 +490,15 @@ impl StreamingFfe {
     /// their own).
     ///
     /// Returns `false` when fewer than `n_taps` refs survive in-window.
+    /// `rebuild` selects how the live tap set is seeded:
+    ///   * `true`  — solve a fresh LS over the anchor refs (the ACQUISITION
+    ///     bootstrap: there is no trustworthy live tap set yet).
+    ///   * `false` — keep the existing live taps and only let the DD-LMS passes
+    ///     REFINE them from the anchor refs (the streaming steady state: a META
+    ///     anchor must never throw away accumulated adaptation, otherwise one bad
+    ///     anchor poisons every downstream segment). Falls back to an LS solve if
+    ///     no taps exist yet (defensive — a META can only land after acquisition
+    ///     already built taps).
     pub fn train_lms_at(
         &mut self,
         sof_abs: u64,
@@ -498,6 +507,7 @@ impl StreamingFfe {
         slice: impl Fn(Complex64) -> Complex64,
         mu_train: f64,
         mu_dd: f64,
+        rebuild: bool,
     ) -> bool {
         let pitch = self.pitch_fse;
         let n_ff = self.n_taps;
@@ -532,7 +542,18 @@ impl StreamingFfe {
         if positions.len() < n_ff {
             return false;
         }
-        let mut taps = train_ls_ridge(&self.frac_buf, &fit_refs, &positions, n_ff);
+        // Streaming-FFE design intent: only the acquisition bootstrap BUILDS the
+        // tap set from a fresh LS solve; every later (META) anchor REFINES the
+        // live taps instead. A full LS at each anchor discards all accumulated DD
+        // adaptation and lets a single bad anchor (preamble in a fade, or a
+        // slightly-mispositioned-but-validated marker) overwrite good taps with
+        // garbage, destabilising the whole downstream segment.
+        let refine_only = !rebuild && self.current_taps.is_some();
+        let mut taps = if refine_only {
+            self.current_taps.clone().unwrap()
+        } else {
+            train_ls_ridge(&self.frac_buf, &fit_refs, &positions, n_ff)
+        };
 
         if sof_abs < self.start_abs {
             // Anchor already trimmed out of the window — keep the LS taps
@@ -560,15 +581,6 @@ impl StreamingFfe {
             })
             .collect();
 
-        // DD-LMS over [sof_rel, cycle_end). One forward pass mirrors
-        // `ffe::apply_ffe_lms_with_training`. With `V3_FFE_FBF` set, run
-        // forward-backward-forward: the backward pass approaches a mid-segment
-        // transient (fade / noise burst) from the OTHER side, so the final
-        // forward pass starts from taps the single forward could not reach —
-        // the local re-convergence the batch sliding window gets for free by
-        // re-decoding each codeword in several overlapping windows, but here
-        // over the already-buffered segment (no re-decode). Single forward when
-        // off → bit-identical to the previous behaviour.
         let span = cycle_end - sof_rel;
         // Direction-agnostic training lookup (the ascending cursor cannot run
         // backward): k → expected symbol at known preamble/warmup positions.
@@ -578,6 +590,62 @@ impl StreamingFfe {
                 train_at[k] = Some(sym);
             }
         }
+
+        // Best-of-two seed selection (refine path only). Refining from the live
+        // taps preserves history but can lag when ALL anchors are weak; a fresh
+        // LS rebuild re-centres but discards history. Picking by residual ON THE
+        // KNOWN REFS would ALWAYS choose the LS (it minimises exactly that), so
+        // instead run BOTH DD-LMS legs and keep whichever GENERALISES better —
+        // lower decision-directed residual Σ|slice(y)−y|² over the DATA symbols.
+        // Result ≥ rebuild and ≥ pure-refine on that metric. `V3_FFE_PURE_REFINE`
+        // forces the single refine leg (A/B); `V3_FFE_REBUILD_META` is a single
+        // rebuild leg (handled above via `refine_only == false`).
+        let best_of_two = refine_only && std::env::var_os("V3_FFE_PURE_REFINE").is_none();
+        if best_of_two {
+            let old = taps; // the live-taps refine seed
+            let ls = train_ls_ridge(&self.frac_buf, &fit_refs, &positions, n_ff);
+            let snap: Vec<Complex64> = self.out_buf[sof_rel..cycle_end].to_vec();
+            let (taps_r, resid_r) =
+                self.dd_lms_run(old, sof_rel, span, &train_at, mu_train, mu_dd, &slice);
+            let out_r: Vec<Complex64> = self.out_buf[sof_rel..cycle_end].to_vec();
+            self.out_buf[sof_rel..cycle_end].copy_from_slice(&snap);
+            let (taps_b, resid_b) =
+                self.dd_lms_run(ls, sof_rel, span, &train_at, mu_train, mu_dd, &slice);
+            if resid_r <= resid_b {
+                self.out_buf[sof_rel..cycle_end].copy_from_slice(&out_r);
+                self.current_taps = Some(taps_r);
+            } else {
+                self.current_taps = Some(taps_b);
+            }
+            return true;
+        }
+        // Single leg: rebuild (taps == fresh LS) or forced pure-refine.
+        let (taps_final, _) =
+            self.dd_lms_run(taps, sof_rel, span, &train_at, mu_train, mu_dd, &slice);
+        self.current_taps = Some(taps_final);
+        true
+    }
+
+    /// One DD-LMS equalisation of `[sof_rel, sof_rel+span)` seeded from `taps`:
+    /// runs the forward (or FBF, `V3_FFE_FBF`) passes mirroring
+    /// `ffe::apply_ffe_lms_with_training`, writing the equalised symbols into
+    /// `out_buf`, and returns the adapted taps plus the decision-directed
+    /// residual `Σ|slice(y)−y|²` over the NON-training (data) symbols — a measure
+    /// of how well the taps generalise past the known refs.
+    fn dd_lms_run<F: Fn(Complex64) -> Complex64>(
+        &mut self,
+        mut taps: Vec<Complex64>,
+        sof_rel: usize,
+        span: usize,
+        train_at: &[Option<Complex64>],
+        mu_train: f64,
+        mu_dd: f64,
+        slice: &F,
+    ) -> (Vec<Complex64>, f64) {
+        let pitch = self.pitch_fse;
+        let n_ff = self.n_taps;
+        let half = n_ff / 2;
+        let mf = self.mf_delay_frac;
         let passes: &[bool] = if std::env::var_os("V3_FFE_FBF").is_some() {
             &[true, false, true] // forward, backward, forward
         } else {
@@ -586,7 +654,7 @@ impl StreamingFfe {
         for &forward in passes {
             for kk in 0..span {
                 let k = if forward { kk } else { span - 1 - kk };
-                let center = (sof_rel + k) * pitch + self.mf_delay_frac;
+                let center = (sof_rel + k) * pitch + mf;
                 if center < half || center + (n_ff - half) > self.frac_buf.len() {
                     // Boundary symbol: leave the (forward-applied or raw) value.
                     continue;
@@ -616,8 +684,25 @@ impl StreamingFfe {
                 }
             }
         }
-        self.current_taps = Some(taps);
-        true
+        // Decision-directed residual over the DATA (non-training) symbols with
+        // the FINAL taps — the generalisation metric for best-of-two selection.
+        let mut resid = 0.0f64;
+        for k in 0..span {
+            if train_at[k].is_some() {
+                continue;
+            }
+            let center = (sof_rel + k) * pitch + mf;
+            if center < half || center + (n_ff - half) > self.frac_buf.len() {
+                continue;
+            }
+            let lo = center - half;
+            let mut y = Complex64::new(0.0, 0.0);
+            for (i, &t) in taps.iter().enumerate() {
+                y += t * self.frac_buf[lo + i];
+            }
+            resid += (slice(y) - y).norm_sqr();
+        }
+        (taps, resid)
     }
 
     /// Canon turbo demodulator — re-equalise the `span` symbols at absolute
@@ -692,6 +777,40 @@ impl StreamingFfe {
             return None;
         }
 
+        // Code-aided (soft-DD) channel estimation: augment the pilot-only gain
+        // and noise-variance fits with the CONFIDENT soft data symbols the turbo
+        // loop already produced — E[a] in `refs`, reliability in `weights` —
+        // weighted by reliability, never hard decisions (Colavolpe-Barbieri-Caire
+        // 2005; EM / soft-DD channel & noise estimation). The pilots are sparse,
+        // so between them the gain is merely linearly interpolated and σ² is
+        // sampled on a handful of points — exactly where low-SNR estimates are
+        // noisiest and "drift between frames". Folding in the confident data
+        // densifies both. The pilot-run ANCHOR POSITIONS are unchanged, so the
+        // interpolation grid is identical; iteration 0 carries no data a-priori
+        // (weights all 0) → pilots only → byte-identical. `V3_NO_CODE_AIDED_EST`
+        // restores the pilot-only fit for A/B.
+        let code_aided = std::env::var_os("V3_NO_CODE_AIDED_EST").is_none();
+        // Reliability floor for a soft data symbol to JOIN the gain/σ² fit
+        // (|E[a]|²/(|E[a]|²+Var) ≥ W_TRUST). Above-average confidence only.
+        const W_TRUST: f64 = 0.5;
+        // Window bounds [left,right) of trusted DATA assigned to pilot-run `ri`
+        // out of `runs`: split at the midpoints to the neighbouring runs so each
+        // data symbol feeds the nearest anchor and no other run's pilots leak in.
+        let data_window = |runs: &[(usize, usize)], ri: usize| -> (usize, usize) {
+            let (s, e) = runs[ri];
+            let left = if ri == 0 {
+                0
+            } else {
+                (runs[ri - 1].1 - 1 + s) / 2 + 1
+            };
+            let right = if ri + 1 == runs.len() {
+                span
+            } else {
+                (e - 1 + runs[ri + 1].0) / 2 + 1
+            };
+            (left, right)
+        };
+
         // Predicted-carrier de-rotation factor at symbol k: e^{−j·carrier_pred[k]}.
         // `None` (or all-zero) ⇒ exactly 1+0j, so every pass below is byte-
         // identical to the pre-carrier-tracking path. When supplied (session's
@@ -712,6 +831,17 @@ impl StreamingFfe {
         let mut gain_val: Vec<Complex64> = Vec::new();
         {
             let taps = self.current_taps.as_ref().unwrap();
+            // Equalised symbol y[k] = taps ⋆ frac_buf at the calibrated centre.
+            let y_at = |k: usize| -> Complex64 {
+                let lo = (sof_rel + k) * pitch + mf - half;
+                let mut y = Complex64::new(0.0, 0.0);
+                for (i, &t) in taps.iter().enumerate() {
+                    y += t * self.frac_buf[lo + i];
+                }
+                y
+            };
+            // Pilot runs (contiguous), each one gain anchor at its centre.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut k = 0usize;
             while k < span {
                 if !is_pilot[k] {
@@ -719,25 +849,42 @@ impl StreamingFfe {
                     continue;
                 }
                 let run_start = k;
+                while k < span && is_pilot[k] {
+                    k += 1;
+                }
+                runs.push((run_start, k));
+            }
+            for ri in 0..runs.len() {
+                let (s, e) = runs[ri];
                 let mut num = Complex64::new(0.0, 0.0);
                 let mut den = 0.0f64;
-                while k < span && is_pilot[k] {
-                    let lo = (sof_rel + k) * pitch + mf - half;
-                    let mut y = Complex64::new(0.0, 0.0);
-                    for (i, &t) in taps.iter().enumerate() {
-                        y += t * self.frac_buf[lo + i];
+                // Known pilots (w=1): the RESIDUAL gain after the predicted carrier.
+                for kk in s..e {
+                    num += (y_at(kk) * cphase(kk)) * refs[kk].conj();
+                    den += refs[kk].norm_sqr();
+                }
+                // Code-aided: fold in the confident soft DATA assigned to this
+                // anchor, weighted by reliability (weighted LS). Iter-0 w=0 → no-op.
+                if code_aided {
+                    let (left, right) = data_window(&runs, ri);
+                    for kk in left..right {
+                        if is_pilot[kk] {
+                            continue;
+                        }
+                        let w = weights[kk];
+                        if w < W_TRUST {
+                            continue;
+                        }
+                        num += ((y_at(kk) * cphase(kk)) * refs[kk].conj()) * w;
+                        den += refs[kk].norm_sqr() * w;
                     }
-                    // Measure the RESIDUAL gain after the predicted carrier.
-                    num += (y * cphase(k)) * refs[k].conj();
-                    den += refs[k].norm_sqr();
-                    k += 1;
                 }
                 let g = if den > 1e-12 {
                     num / den
                 } else {
                     Complex64::new(1.0, 0.0)
                 };
-                gain_pos.push((run_start + k - 1) / 2);
+                gain_pos.push((s + e - 1) / 2);
                 gain_val.push(g);
             }
         }
@@ -932,6 +1079,8 @@ impl StreamingFfe {
         let mut s2_pos: Vec<usize> = Vec::new();
         let mut s2_val: Vec<f64> = Vec::new();
         {
+            // Pilot runs (same anchors as the gain fit).
+            let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut k = 0usize;
             while k < span {
                 if !is_pilot[k] {
@@ -939,15 +1088,40 @@ impl StreamingFfe {
                     continue;
                 }
                 let run_start = k;
-                let mut acc = 0.0f64;
-                let mut cnt = 0usize;
                 while k < span && is_pilot[k] {
-                    acc += (out[k] - refs[k]).norm_sqr();
-                    cnt += 1;
                     k += 1;
                 }
-                s2_pos.push((run_start + k - 1) / 2);
-                s2_val.push((acc / cnt as f64).max(1e-9));
+                runs.push((run_start, k));
+            }
+            for ri in 0..runs.len() {
+                let (s, e) = runs[ri];
+                // Known-pilot residual energy (w=1).
+                let mut acc = 0.0f64;
+                let mut wsum = 0.0f64;
+                for kk in s..e {
+                    acc += (out[kk] - refs[kk]).norm_sqr();
+                    wsum += 1.0;
+                }
+                // Code-aided: add the confident soft DATA residuals, weighted by
+                // reliability. A faded/noisy stretch between pilots now raises the
+                // LOCAL σ² from its own symbols instead of being interpolated from
+                // two distant pilots. Iter-0 w=0 → pilots only → byte-identical.
+                if code_aided {
+                    let (left, right) = data_window(&runs, ri);
+                    for kk in left..right {
+                        if is_pilot[kk] {
+                            continue;
+                        }
+                        let w = weights[kk];
+                        if w < W_TRUST {
+                            continue;
+                        }
+                        acc += (out[kk] - refs[kk]).norm_sqr() * w;
+                        wsum += w;
+                    }
+                }
+                s2_pos.push((s + e - 1) / 2);
+                s2_val.push((acc / wsum.max(1e-9)).max(1e-9));
             }
         }
         let n_s = s2_pos.len();

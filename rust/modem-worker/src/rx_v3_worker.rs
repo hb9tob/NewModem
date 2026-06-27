@@ -41,26 +41,26 @@ use crate::event_sink::{EventSink, EventSinkExt};
 use crate::rx_worker::emit_decoded_file;
 use crate::session_store::{DecodedFile, SessionStore};
 
-/// Worker-driven end-of-burst: if a Locked session produces no new validated
-/// marker for this many samples, the burst has ended — silence, a true tail,
-/// OR an OTA carrier-drop into channel NOISE (the case the in-session energy
-/// silence-gate can't catch). We `finalize()` → Idle so the next preamble
-/// re-acquires instead of the session staying stuck until the 5-min
-/// brickwall. 2 s @ 48 kHz: comfortably above the worst healthy
-/// marker-to-marker gap (one cycle, or one PRE+HDR re-insertion block that
-/// `V3Session` now crosses — both well under 1 s) yet far below the legacy
-/// brickwall. A burst whose re-insertion crossing transiently fails also
-/// trips this and cleanly re-acquires on the next re-inserted preamble.
-const END_OF_BURST_NOPROGRESS_SAMPLES: u64 = (modem_core::types::AUDIO_RATE as u64) * 2;
+/// Idle span (FSM not receiving) after which a warm-kept session is HARD-flushed
+/// — a real transmission STOP. Must comfortably exceed a same-transmission
+/// late-entry re-acquire + backward replay (≈ 1 SF ≈ 4 s for NORMAL) so an
+/// in-transmission gap stays warm, yet be short enough that a genuinely new
+/// transmission bootstraps clean. 8 s @ 48 kHz. Tunable via `RXV3_STOP_FLUSH_S`.
+const STOP_FLUSH_SAMPLES: u64 = (modem_core::types::AUDIO_RATE as u64) * 8;
 
 /// Depth of the source-agnostic rolling capture history the driver retains so a
-/// drift-rewind (`V3SessionEvent::RewindRequest`) can re-run the pipeline from a
-/// preamble anchor that lies further back than the session's own 4-cycle
-/// `audio_buffer`. 30 s comfortably spans several inter-preamble periods at every
-/// profile. This lives here — at the single funnel every source (cpal sound card,
-/// SDR runtime, WAV/sim replay) feeds through — NOT in the cpal-only 30 s capture
-/// ring (which is a drained SPSC transit pipe, empty for SDR sources).
-const HISTORY_SAMPLES: usize = 30 * AUDIO_RATE as usize;
+/// drift-rewind (`V3SessionEvent::RewindRequest`) and the backward / late-entry
+/// recovery can re-run the pipeline from a preamble anchor that lies further back
+/// than the session's own 4-cycle `audio_buffer`. Pushed to **5 minutes** so the
+/// live worker's replay reaches as far back as an offline full-capture decode —
+/// on a faded NORMAL capture this recovers the deep-fade codewords the 30 s ring
+/// dropped (closing the live-vs-offline unique-ESI gap). This bounds REPLAY REACH
+/// only; end-of-burst latency is independent (driven by `is_last`, the session's
+/// `consecutive_miss`, and the no-progress timer), so a real carrier cut still
+/// finalises in ~2 s and frees this buffer via `restart_session_fresh`. Cost:
+/// ~58 MB of f32 history (acceptable on a PC / Pi 4). Lives at the single funnel
+/// every source (cpal, SDR, WAV/sim) feeds through.
+const HISTORY_SAMPLES: usize = 300 * AUDIO_RATE as usize;
 
 /// Outcome summary returned by [`RxV3Worker::push_samples`] / [`finalize`] so
 /// a caller (the turbo worker loop, an integration test) can react without
@@ -91,13 +91,22 @@ pub struct RxV3Worker {
     /// `AppHeader` (keyed by ESI, first copy wins). Flushed into the store
     /// the moment the header lands.
     pending_cw: HashMap<u32, Vec<u8>>,
-    /// True once a burst has locked (≥1 `MarkerValidated`) and not yet
-    /// finalised — gates the no-progress end-of-burst timer so it can't fire
-    /// during preamble acquisition.
+    /// True once a burst has locked (≥1 `MarkerValidated`) and not yet finalised.
+    /// Gates the idle/STOP guard so it can't fire during preamble acquisition.
     active: bool,
-    /// Samples pushed since the last validated marker. Drives the
-    /// worker-side end-of-burst (`END_OF_BURST_NOPROGRESS_SAMPLES`).
-    samples_since_progress: u64,
+    /// Samples accumulated while WARM-waiting after a give-up exit (see
+    /// `warm_pending`). Reset to 0 on re-acquire or after the hard-flush.
+    idle_samples: u64,
+    /// True after a give-up exit (`SessionLost` / consecutive-miss) that kept the
+    /// session WARM: a quick late-entry re-acquire can backward-replay the gap,
+    /// but if none comes within `idle_flush_threshold()` (a real STOP — and a
+    /// re-transmission is MANUAL, so it is always far slower than any mode's auto
+    /// re-acquire) we hard-flush. A CLEAN exit (`is_last` / EOT) never sets this:
+    /// it hard-flushes immediately (the transmission is genuinely over).
+    warm_pending: bool,
+    /// Set by the finalize route handler: was the exit a CLEAN end-of-transmission
+    /// (`is_last` flag / EOT, no preceding `SessionLost`)? Drives flush-now vs warm.
+    exit_was_clean: bool,
     /// Source-agnostic rolling capture history (mono f32 @ 48 kHz), capped at
     /// `HISTORY_SAMPLES`. Appended every `push_samples`; lent (zero-copy, via
     /// `mem::take`) to `V3Session::replay_from_anchor` on a drift rewind.
@@ -205,7 +214,9 @@ impl RxV3Worker {
             cur_header: None,
             pending_cw: HashMap::new(),
             active: false,
-            samples_since_progress: 0,
+            idle_samples: 0,
+            warm_pending: false,
+            exit_was_clean: false,
             history: VecDeque::with_capacity(HISTORY_SAMPLES),
             history_origin: 0,
             detected_locked: forced,
@@ -249,9 +260,6 @@ impl RxV3Worker {
     /// sample with persistent state, so there is no fixed chunk size and no
     /// boundary effect.
     pub fn push_samples(&mut self, samples: &[f32]) -> PushOutcome {
-        self.samples_since_progress = self
-            .samples_since_progress
-            .saturating_add(samples.len() as u64);
         // Append to the rolling central ring first, so a rewind/seek triggered
         // while routing this chunk's events can reach right up to the live head.
         self.history.extend(samples.iter().copied());
@@ -297,14 +305,59 @@ impl RxV3Worker {
                 }
             }
         };
-        // Apply a deferred burst-boundary stop/start (set in `route()`), now that
-        // this push's routing has fully unwound. Rebuilds the session + clears
-        // the ring so the next burst bootstraps a neutral pipeline.
+        // Burst-boundary handling, driven by the EXIT CAUSE:
+        //  • CLEAN end (LAST flag / EOT) → hard-flush NOW: re-arm everything for
+        //    the next transmission (which, being keyed by hand, is far away).
+        //  • GIVE-UP (consecutive-miss) → stay WARM (keep trained taps + history)
+        //    so the late-entry backward replay can re-decode the gap on the next
+        //    re-acquire. Only if no re-acquire comes within the generous, mode-
+        //    scaled idle window — a real STOP — do we then hard-flush.
         if self.restart_pending {
             self.restart_pending = false;
-            self.restart_session_fresh();
+            self.idle_samples = 0;
+            if self.exit_was_clean {
+                self.restart_session_fresh();
+                self.warm_pending = false;
+            } else {
+                self.warm_pending = true;
+            }
+        }
+        if self.active {
+            self.idle_samples = 0;
+            self.warm_pending = false;
+        } else if self.warm_pending {
+            self.idle_samples = self.idle_samples.saturating_add(samples.len() as u64);
+            if self.idle_samples >= self.idle_flush_threshold() {
+                if std::env::var_os("V3_LOG_SYNC").is_some()
+                    || std::env::var_os("V3_LOG_EXIT").is_some()
+                {
+                    eprintln!(
+                        "[finalize] WARM→STOP hard-flush after {} idle samples (≥{}) — real STOP",
+                        self.idle_samples,
+                        self.idle_flush_threshold(),
+                    );
+                }
+                self.restart_session_fresh();
+                self.idle_samples = 0;
+                self.warm_pending = false;
+            }
         }
         outcome
+    }
+
+    /// Warm idle span after a give-up before the hard-flush (a real STOP). Scaled
+    /// to the live mode's marker cycle so the SLOW families (ROBUST / ULTRA, whose
+    /// re-acquire + replay span many seconds) get a proportionally longer window;
+    /// floored so the FAST family is still generous. Re-keying a transmission is
+    /// MANUAL, so any auto re-acquire of the same transmission beats this easily.
+    /// Tunable via `RXV3_STOP_FLUSH_S` (absolute seconds, overrides the scaling).
+    fn idle_flush_threshold(&self) -> u64 {
+        if let Some(s) = std::env::var("RXV3_STOP_FLUSH_S").ok().and_then(|v| v.parse::<f64>().ok())
+        {
+            return (s * modem_core::types::AUDIO_RATE as f64) as u64;
+        }
+        // ~6 marker cycles ≈ 1–2 superframes of warm grace, never below the floor.
+        STOP_FLUSH_SAMPLES.max(6 * self.session.cycle_samples() as u64)
     }
 
     /// Full stop/start of the streaming session at a burst boundary. `finalize()`
@@ -317,11 +370,18 @@ impl RxV3Worker {
     /// burst reliably. The disk `store` keeps all already-accepted packets, so
     /// dropping the in-memory ring + session loses nothing decoded so far.
     fn restart_session_fresh(&mut self) {
+        if !self.pending_cw.is_empty() && std::env::var_os("V3_LOG_CONT").is_some() {
+            let mut esis: Vec<u32> = self.pending_cw.keys().copied().collect();
+            esis.sort_unstable();
+            eprintln!(
+                "[cont] restart DROPS {} pending data CW (header never recovered): {esis:?}",
+                esis.len(),
+            );
+        }
         self.session = V3Session::new(self.profile.to_config(), self.profile.name().to_string());
         self.cur_header = None;
         self.pending_cw.clear();
         self.active = false;
-        self.samples_since_progress = 0;
         // Re-arm the one-shot exact-profile refinement (auto mode only): the
         // next transmission may be a different profile of the SAME geometry
         // (HIGH++ → HIGH+ share the sps=32 preamble family), and its first
@@ -437,21 +497,15 @@ impl RxV3Worker {
             outcome.decoded = outcome.decoded.or(rebuilt.decoded);
             outcome.bursts_finalised += rebuilt.bursts_finalised;
         }
-        // Worker-driven end-of-burst: a locked burst that has gone silent on
-        // markers for too long has ended (silence / noise cut / true tail).
-        // Finalize → Idle so the next preamble re-acquires.
-        if self.active && self.samples_since_progress >= self.no_progress_threshold() {
-            if std::env::var_os("V3_LOG_SYNC").is_some() {
-                eprintln!(
-                    "[finalize] NO-PROGRESS samples_since_progress={} threshold={}",
-                    self.samples_since_progress,
-                    self.no_progress_threshold(),
-                );
-            }
-            let fin = self.finalize();
-            outcome.decoded = outcome.decoded.or(fin.decoded);
-            outcome.bursts_finalised += fin.bursts_finalised;
-        }
+        // End-of-burst is NOT decided here any more. A worker-side no-progress
+        // timer false-fires on a single deep-faded superframe and then the
+        // restart wipes the trained taps cold — losing the very codewords the
+        // backward flywheel would have re-decoded. End-of-transmission is the
+        // deterministic LAST-SF flag (`is_last`, → the session self-finalises),
+        // and a real carrier cut is caught by the session's `consecutive_miss`
+        // give-up (blind decodes stop converging → SessionFinalised). Both arrive
+        // as session events the routing above already handles. Mid-burst fades
+        // simply coast on the flywheel with warm taps.
         outcome
     }
 
@@ -472,48 +526,37 @@ impl RxV3Worker {
         !matches!(self.profile.preamble_family(), PreambleFamily::A)
     }
 
-    /// End-of-burst no-progress threshold (samples). Must exceed the worst-case
-    /// gap between VALIDATED markers in a healthy transmission, otherwise it
-    /// false-fires mid-burst — and with the burst-boundary restart that
-    /// fragments the session, so a slow profile never assembles.
-    ///
-    /// This is confined to the SLOW families (ROBUST / ULTRA). They have a data
-    /// cycle (≈ 2.6 s / 5.4 s) larger than the 2 s baseline, so a fixed timer
-    /// false-fires at the superframe boundary and fragments the burst; scale it
-    /// with the live cycle instead. The fast family (A) gets a marker every
-    /// cycle (< 2 s), so it keeps the OTA-tuned 2 s baseline UNCHANGED — the
-    /// 3×cycle relaxation must never widen fast-profile end-of-burst timing.
-    fn no_progress_threshold(&self) -> u64 {
-        // This is a BACKSTOP, not the primary end-of-burst detector — the energy
-        // silence-gate finalises a clean tail in ~100 ms. The no-progress timer
-        // only catches a carrier that drops into NOISE (energy stays high, no
-        // markers), so it can be generous.
-        if !self.is_slow_family() {
-            // Fast family (A): a validated marker arrives every data cycle
-            // (< 2 s), so the 2 s baseline never false-fires mid-burst. Hold it
-            // byte-identical to the OTA-validated path.
-            return END_OF_BURST_NOPROGRESS_SAMPLES;
-        }
-        // ROBUST / ULTRA only: a clean burst legitimately goes several seconds
-        // with no NEW validated marker (data cycle ~2.6 s, superframe boundary
-        // ~5.4 s, plus drift-reboot replay re-acquisition), so a tight bound
-        // false-fires mid-transmission and — with the burst-boundary restart —
-        // fragments it. 3× a data cycle clears those with margin.
-        let by_cycle = 3 * self.session.cycle_samples() as u64;
-        END_OF_BURST_NOPROGRESS_SAMPLES.max(by_cycle)
-    }
-
     fn route(&mut self, events: Vec<V3SessionEvent>) -> PushOutcome {
         let mut outcome = PushOutcome::default();
+        // Did a give-up (`SessionLost` / consecutive-miss) precede a finalize in
+        // THIS batch? Then the exit is NOT a clean end-of-transmission → warm.
+        let mut saw_session_lost = false;
+        let log_exit = std::env::var_os("V3_LOG_EXIT").is_some();
         let mut queue: VecDeque<V3SessionEvent> = events.into();
         while let Some(e) = queue.pop_front() {
+            if log_exit {
+                let label = match &e {
+                    V3SessionEvent::MarkerValidated { is_meta, base_esi, .. } => {
+                        format!("MarkerValidated meta={is_meta} base_esi={base_esi}")
+                    }
+                    V3SessionEvent::CwDecoded { converged, is_meta, esi, .. } => {
+                        format!("CwDecoded conv={converged} meta={is_meta} esi={esi}")
+                    }
+                    V3SessionEvent::AppHeaderRecovered { session_id, .. } => {
+                        format!("AppHeaderRecovered sid={session_id:08x}")
+                    }
+                    V3SessionEvent::SessionFinalised { .. } => "SessionFinalised".to_string(),
+                    V3SessionEvent::EotSeen => "EotSeen".to_string(),
+                    V3SessionEvent::SessionLost { reason } => format!("SessionLost: {reason}"),
+                    other => format!("{other:?}").chars().take(40).collect(),
+                };
+                eprintln!("[exit] route {label}");
+            }
             match e {
                 V3SessionEvent::MarkerValidated { profile_index, .. } => {
                     // Forward sync progress — arms the burst and resets the
-                    // end-of-burst no-progress timer (fires every cycle,
-                    // including across re-insertion crossings).
+                    // burst as active.
                     self.active = true;
-                    self.samples_since_progress = 0;
                     // One-shot exact-profile refinement (auto mode only). The
                     // bootstrap anchor pinned the geometry FAMILY; the marker
                     // advertises the exact TX profile. If they differ and the
@@ -607,12 +650,22 @@ impl RxV3Worker {
                 }
                 V3SessionEvent::CwDecoded {
                     converged: true,
+                    is_meta: true,
+                    ..
+                } => {
+                    // A converged meta codeword keeps the burst active.
+                    self.active = true;
+                }
+                V3SessionEvent::CwDecoded {
+                    converged: true,
                     is_meta: false,
                     esi,
                     bytes,
                     sigma2,
                     ..
                 } => {
+                    // A converged data codeword keeps the burst active.
+                    self.active = true;
                     if sigma2.is_finite() && sigma2 > 0.0 {
                         self.last_sigma2 = sigma2;
                     }
@@ -660,7 +713,6 @@ impl RxV3Worker {
                     // (the relaxation must not touch NORMAL/HIGH/HIGH+/HIGH++).
                     if self.is_slow_family() {
                         self.active = true;
-                        self.samples_since_progress = 0;
                     }
                 }
                 V3SessionEvent::SessionFinalised { .. } | V3SessionEvent::EotSeen => {
@@ -668,10 +720,25 @@ impl RxV3Worker {
                     // the in-memory per-burst routing state so the next burst
                     // (possibly a different session) re-derives its own header.
                     outcome.bursts_finalised += 1;
+                    if !self.pending_cw.is_empty()
+                        && std::env::var_os("V3_LOG_CONT").is_some()
+                    {
+                        let mut esis: Vec<u32> = self.pending_cw.keys().copied().collect();
+                        esis.sort_unstable();
+                        eprintln!(
+                            "[cont] finalize DROPS {} pending data CW (header never recovered \
+                             this fragment): {esis:?}",
+                            esis.len(),
+                        );
+                    }
                     self.cur_header = None;
                     self.pending_cw.clear();
                     self.active = false;
-                    self.samples_since_progress = 0;
+                    // CLEAN end-of-transmission (LAST flag / EOT, no preceding
+                    // give-up) → flush everything NOW; a give-up (consecutive-miss)
+                    // → stay WARM so the late-entry backward replay can recover the
+                    // gap. Decided in `push_samples` (we are mid-iteration here).
+                    self.exit_was_clean = !saw_session_lost;
                     // Full stop/start before the next burst: `finalize()` returns
                     // the session to Idle but leaves the streaming pipeline (DSP
                     // resampler rate / committed drift_ppm, FFE taps, phase
@@ -715,6 +782,11 @@ impl RxV3Worker {
                         }
                     }
                 }
+                V3SessionEvent::SessionLost { .. } => {
+                    // A mid-transmission give-up (consecutive-miss): the finalize
+                    // that follows in this batch is NOT a clean end → stay warm.
+                    saw_session_lost = true;
+                }
                 _ => {}
             }
         }
@@ -747,7 +819,6 @@ impl RxV3Worker {
         self.cur_header = None;
         self.pending_cw.clear();
         self.active = false;
-        self.samples_since_progress = 0;
 
         let hist: Vec<f32> = self.history.iter().copied().collect();
         self.history_origin = 0;

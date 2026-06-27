@@ -121,6 +121,25 @@ const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
 /// ~0.6 s of corruption at HIGH+ before giving up.
 const MAX_CONSECUTIVE_MISS: u32 = 3;
 
+/// Marker sync-correlation acceptance gate (`min_corr_ratio` passed to
+/// [`marker::find_sync_in_window`]). A validated marker's confidence |g| lies in
+/// `[MARKER_SYNC_CONF_GATE, 1.0]`.
+const MARKER_SYNC_CONF_GATE: f64 = 0.5;
+
+/// Refine confidence assigned to a BLIND (marker-less) coast segment: there is
+/// no validated marker, so a META re-anchor on a blind position must barely
+/// nudge the live taps. Equal to the gate ⇒ refine scale 0 (taps preserved).
+const BLIND_MARKER_CONF: f64 = MARKER_SYNC_CONF_GATE;
+
+/// Map a marker's sync-correlation confidence |g| ∈ `[MARKER_SYNC_CONF_GATE, 1]`
+/// to a META-anchor FFE refinement strength ∈ `[0, 1]`: a marker that barely
+/// cleared the correlation gate (deep fade / QRM) refines the live taps only
+/// gently — "raffiner avec discernement" — so a poor anchor cannot drag good
+/// taps off; a clean marker (|g| → 1) refines at full step. Linear from the gate.
+fn meta_refine_scale(conf: f64) -> f64 {
+    ((conf - MARKER_SYNC_CONF_GATE) / (1.0 - MARKER_SYNC_CONF_GATE)).clamp(0.0, 1.0)
+}
+
 /// Converged CWs of forward decode before the backward flywheel fires — enough
 /// for the FFE/phase to have trained, while the entry segments still sit inside
 /// the ~2-superframe FFE retention so the backward span is reachable.
@@ -422,11 +441,11 @@ pub struct V3Session {
     /// blind CW is a self-validating anchor, and noise never converges so it
     /// cannot poison). Disable with `V3_NO_FLYWHEEL`.
     flywheel: bool,
-    /// Backward flywheel (late/damaged-entry recovery, env `V3_BACKWARD`): once
-    /// the FFE/phase have trained forward, retreat the cadence from the entry
-    /// marker and re-decode the EARLIER (preamble-lost) segments via
-    /// `canon_demod_segment` on the live taps — the intact markers resync, 2
-    /// consecutive non-converged stop it. One-shot per burst.
+    /// Backward flywheel (late/damaged-entry recovery, default ON, kill-switch
+    /// `V3_NO_BACKWARD`): once the FFE/phase have trained forward, retreat the
+    /// cadence from the entry marker and re-decode the EARLIER (preamble-lost)
+    /// segments via `canon_demod_segment` on the live taps — the intact markers
+    /// resync, 2 consecutive non-converged stop it. One-shot per burst.
     backward_enabled: bool,
     backward_attempted: bool,
     /// Entry (first validated) marker of the burst: its symbol position and
@@ -660,6 +679,19 @@ struct PendingDecode {
     /// `base_esi` are predicted from the cadence. A converged CW resets
     /// `consecutive_miss` (sync re-confirmed → keep advancing).
     blind: bool,
+    /// This segment's marker carried `LAST_FLAG_BIT` — it is the LAST data
+    /// segment of the burst (the TX sends the EOT frame next). The RX finalises
+    /// cleanly once this segment is decoded: a deterministic, signalled end of
+    /// transmission instead of inferring it from an energy dip. Always `false`
+    /// for blind (marker-less) coast segments.
+    is_last: bool,
+    /// Sync-correlation confidence |g| ∈ [`MARKER_SYNC_CONF_GATE`, 1.0] of the
+    /// marker that opened this segment — how cleanly it cleared the correlation
+    /// gate. Drives "discerning" META-anchor FFE refinement: a marker that
+    /// barely passed (deep fade / QRM) refines the live taps only gently so a
+    /// poor anchor cannot drag good taps off. Blind coast segments carry
+    /// [`BLIND_MARKER_CONF`] (no validated marker → minimal-trust refine).
+    marker_conf: f64,
 }
 
 /// A segment that had ≥1 non-converged codeword on its first (forward,
@@ -785,7 +817,13 @@ impl V3Session {
             next_marker_is_meta: false,
             consecutive_miss: 0,
             flywheel: std::env::var_os("V3_NO_FLYWHEEL").is_none(),
-            backward_enabled: std::env::var_os("V3_BACKWARD").is_some(),
+            // Late-entry backward flywheel: on re-acquisition past a gap, retreat
+            // the cadence from the entry marker and re-decode the EARLIER
+            // (preamble-lost) segments on the trained taps. Default ON — it can
+            // only ADD recoveries (intact markers resync; noise never converges);
+            // measured to lift live unique-ESI on a faded NORMAL capture.
+            // `V3_NO_BACKWARD` disables it for A/B.
+            backward_enabled: std::env::var_os("V3_NO_BACKWARD").is_none(),
             backward_attempted: false,
             entry_marker_sym_abs: None,
             entry_marker_base_esi: None,
@@ -1134,7 +1172,16 @@ impl V3Session {
         //     it.)
         if self.pending_silence_finalize {
             self.pending_silence_finalize = false;
-            if matches!(self.state, V3SessionState::Locked { .. }) {
+            // The energy silence-gate finalises on a sustained drop to noise
+            // floor. On a real RF cut the carrier is replaced by BAND NOISE
+            // (energy stays high), so the gate never fires on a true end; it only
+            // false-fires on deep fades MID-burst, fragmenting the session before
+            // the flywheel / consecutive-miss coast can carry through. End-of-
+            // burst is now driven by the LAST flag (deterministic) and
+            // MAX_CONSECUTIVE_MISS (loss of structure), so the energy gate is
+            // disabled by default. `V3_LEGACY_EOB` restores it for A/B.
+            let legacy_eob = std::env::var_os("V3_LEGACY_EOB").is_some();
+            if legacy_eob && matches!(self.state, V3SessionState::Locked { .. }) {
                 if std::env::var_os("V3_LOG_SYNC").is_some() {
                     eprintln!(
                         "[finalize] SILENCE-GATE tot={} cycles_validated={}",
@@ -1275,7 +1322,8 @@ impl V3Session {
         // `MarkerValidated`; otherwise we record the candidate in
         // `Acquiring` so the next chunk can retry as more symbols
         // arrive (or a later SC fire on the same burst overrides).
-        let Some((marker_sym_pos_abs, payload)) = self.try_validate_marker_at(marker_at_abs)
+        let Some((marker_sym_pos_abs, payload, marker_conf)) =
+            self.try_validate_marker_at(marker_at_abs)
         else {
             if matches!(self.state, V3SessionState::Idle) {
                 self.state = V3SessionState::Acquiring {
@@ -1302,7 +1350,7 @@ impl V3Session {
         // cycle_idx 1 (validated lazily by `try_advance_to_next_marker`
         // once we transition out of the META cycle).
         if !payload.is_meta() {
-            if let Some((meta_sym_pos, meta_payload)) =
+            if let Some((meta_sym_pos, meta_payload, meta_conf)) =
                 self.try_validate_meta_lookback(marker_sym_pos_abs)
             {
                 let (sps, _) = rrc::check_integer_constraints(
@@ -1333,6 +1381,8 @@ impl V3Session {
                     base_esi: meta_payload.base_esi,
                     is_meta: true,
                     blind: false,
+                    is_last: meta_payload.is_last(),
+                    marker_conf: meta_conf,
                 });
                 // Phase 4 anchor: refine the META sym position and
                 // remember it as the LS-fit origin. The DATA marker
@@ -1383,6 +1433,8 @@ impl V3Session {
             base_esi: payload.base_esi,
             is_meta,
             blind: false,
+            is_last: payload.is_last(),
+            marker_conf,
         });
         // Phase 4 anchor: same recipe as the META-lookback branch.
         if !self.drift_locked && self.drift_anchor_sym_pos.is_none() {
@@ -1493,7 +1545,7 @@ impl V3Session {
     fn try_validate_meta_lookback(
         &self,
         data_marker_sym_pos: u64,
-    ) -> Option<(u64, marker::MarkerPayload)> {
+    ) -> Option<(u64, marker::MarkerPayload, f64)> {
         // V4: the META segment spans MARKER + warmup + meta CW+pilots, so a
         // DATA marker sits this far past the META marker that precedes it.
         let meta_cycle_len = marker::MARKER_LEN as u64
@@ -1517,7 +1569,7 @@ impl V3Session {
         if search_len == 0 {
             return None;
         }
-        let (pos, _) = marker::find_sync_in_window(raw, start_rel, search_len, 0.5)?;
+        let (pos, gain) = marker::find_sync_in_window(raw, start_rel, search_len, 0.5)?;
         if pos + marker::MARKER_LEN > raw.len() {
             return None;
         }
@@ -1525,7 +1577,7 @@ impl V3Session {
         if !payload.is_meta() {
             return None;
         }
-        Some((raw_start_abs + pos as u64, payload))
+        Some((raw_start_abs + pos as u64, payload, gain.norm()))
     }
 
     /// Always-on preamble acquisition. While not Locked, FFT-correlate the
@@ -1678,6 +1730,7 @@ impl V3Session {
             |y| cons.points[cons.slice_nearest(&[y])[0]],
             V3_FFE_MU_TRAIN,
             V3_FFE_MU_DD,
+            true, // acquisition bootstrap: BUILD the tap set from a fresh LS
         );
         // Commit only if the marker actually validates at the implied position.
         let validated = self.try_validate_marker_at(marker_at_abs_audio);
@@ -1804,7 +1857,7 @@ impl V3Session {
     fn try_validate_marker_at(
         &self,
         marker_at_abs_audio: u64,
-    ) -> Option<(u64, marker::MarkerPayload)> {
+    ) -> Option<(u64, marker::MarkerPayload, f64)> {
         let (sps, _) = rrc::check_integer_constraints(
             AUDIO_RATE,
             self.cfg.symbol_rate,
@@ -1848,13 +1901,13 @@ impl V3Session {
         // probability per position, so scanning ~1000 positions
         // produces several "decodes" that aren't real markers.
         // Anchoring on the SYNC-correlation peak filters those out.
-        let (best_pos, _gain) = marker::find_sync_in_window(raw, start, window, 0.5)?;
+        let (best_pos, gain) = marker::find_sync_in_window(raw, start, window, 0.5)?;
         if best_pos + marker::MARKER_LEN > raw.len() {
             return None;
         }
         let payload =
             marker::decode_marker_at(&raw[best_pos..best_pos + marker::MARKER_LEN])?;
-        Some((raw_start_abs + best_pos as u64, payload))
+        Some((raw_start_abs + best_pos as u64, payload, gain.norm()))
     }
 
     /// Segment span in symbols PAST a marker — i.e. data symbols +
@@ -1886,7 +1939,7 @@ impl V3Session {
     /// FFE stays in pass-through and dense constellations never converge off
     /// a clean channel (the "FFE off" σ² regression). Mirrors the rx_v2 V4
     /// batch path (preamble-only bootstrap → preamble+warmup retrain).
-    fn train_ffe_at_meta(&mut self, marker_sym_pos_abs: u64) {
+    fn train_ffe_at_meta(&mut self, marker_sym_pos_abs: u64, marker_conf: f64) {
         let n_pre = crate::types::N_PREAMBLE as u64;
         if marker_sym_pos_abs < n_pre {
             return;
@@ -1912,13 +1965,35 @@ impl V3Session {
             + self.seg_sym_len_past_marker(true)
             + self.cycle_data_sym;
         let cons = &self.constellation;
+        // META-anchor FFE seeding. MEASURED on faded low-SNR NORMAL captures: a
+        // fresh LS REBUILD at every anchor recovers MORE unique ESI than
+        // refine-only or best-of-two (diag 160 vs 156/156) — when every anchor is
+        // weak there are no "good" taps to protect, so the extra re-centring
+        // wins. This is also the original OTA-validated behaviour. Default
+        // REBUILD; `V3_FFE_REFINE` opts into the refine / best-of-two seed path
+        // (see `StreamingFfe::train_lms_at`) for A/B.
+        let rebuild_meta = std::env::var_os("V3_FFE_REFINE").is_none();
+        // "Raffiner avec discernement": scale the refinement step by the marker's
+        // sync confidence so a barely-validated anchor (deep fade / QRM) nudges
+        // the live taps only gently, while a clean marker refines at full step.
+        // OPT-IN (`V3_DISCERNING_REFINE`): measured to HURT at low SNR, where
+        // EVERY marker sits ~0.5 (just above the gate) so down-scaling starves
+        // the adaptation globally — exactly when the channel is hardest. The
+        // confidence threading is kept for a future mixed-quality policy. Off
+        // (default) and the legacy rebuild → full μ (byte-identical).
+        let scale = if !rebuild_meta && std::env::var_os("V3_DISCERNING_REFINE").is_some() {
+            meta_refine_scale(marker_conf)
+        } else {
+            1.0
+        };
         self.ffe.train_lms_at(
             preamble_start_abs,
             &refs,
             cycle_period,
             |y| cons.points[cons.slice_nearest(&[y])[0]],
-            V3_FFE_MU_TRAIN,
-            V3_FFE_MU_DD,
+            V3_FFE_MU_TRAIN * scale,
+            V3_FFE_MU_DD * scale,
+            rebuild_meta,
         );
     }
 
@@ -2644,7 +2719,7 @@ impl V3Session {
         // refs are all in the retained window. `train_at` only rewrites
         // out_buf contents (not start/len), so `seg_off` stays valid.
         if pending.is_meta {
-            self.train_ffe_at_meta(pending.marker_sym_pos_abs);
+            self.train_ffe_at_meta(pending.marker_sym_pos_abs, pending.marker_conf);
         }
 
         // Canon turbo demodulator: one or more joint FFE+phase forward-backward-
@@ -2742,6 +2817,26 @@ impl V3Session {
                 bytes,
                 sigma2,
             });
+        }
+        // Deterministic end-of-transmission. This segment's marker carried the
+        // LAST flag (the last DATA segment; the TX sends the standalone EOT frame
+        // next), so the burst is over: finalise NOW → Idle, ready for the EOT
+        // frame's preamble, instead of inferring the end from an energy dip (the
+        // silence gate a deep fade false-triggers) or from MAX_CONSECUTIVE_MISS.
+        // `V3_LEGACY_EOB` restores the silence-driven exit for A/B. A blind coast
+        // never reaches here with `is_last` (no validated marker).
+        let legacy_eob = std::env::var_os("V3_LEGACY_EOB").is_some();
+        if pending.is_last && !legacy_eob {
+            if std::env::var_os("V3_LOG_SYNC").is_some() {
+                eprintln!(
+                    "[finalize] LAST-FLAG segment base_esi={} → clean EOT exit",
+                    pending.base_esi,
+                );
+            }
+            self.next_base_esi = None;
+            self.pending_decode = None;
+            events.extend(self.finalize());
+            return true;
         }
         // Closed-window "turbo sync": queue any non-converged codewords for a
         // later re-decode. By the time this segment's closing marker validates,
@@ -2897,9 +2992,9 @@ impl V3Session {
             if search_len == 0 {
                 return None;
             }
-            marker::find_sync_in_window(raw, start_rel, search_len, 0.5).and_then(|(pos, _)| {
+            marker::find_sync_in_window(raw, start_rel, search_len, 0.5).and_then(|(pos, gain)| {
                 marker::decode_marker_at(&raw[pos..pos + marker::MARKER_LEN])
-                    .map(|payload| (pos, payload))
+                    .map(|payload| (pos, payload, gain.norm()))
             })
         };
         let mut validated = search_window(self.ffe.out_buf(),window_start_abs, window_end_abs);
@@ -2948,7 +3043,7 @@ impl V3Session {
         }
 
         match validated {
-            Some((pos, payload)) => {
+            Some((pos, payload, conf)) => {
                 self.next_marker_sym_pos_pred = None;
                 // A validated marker = the TX is in sync here; clear the
                 // skip-and-continue miss counter.
@@ -3002,6 +3097,8 @@ impl V3Session {
                     base_esi: payload.base_esi,
                     is_meta,
                     blind: false,
+                    is_last: payload.is_last(),
+                    marker_conf: conf,
                 });
                 // Keep the backward-recovery anchor current through normal
                 // forward progress, so a later give-up brackets the right gap.
@@ -3187,6 +3284,12 @@ impl V3Session {
                             base_esi,
                             is_meta: self.next_marker_is_meta,
                             blind: true,
+                            // No validated marker on a blind coast → the LAST
+                            // flag is unknown; never finalise off a coast.
+                            is_last: false,
+                            // No marker confidence on a blind position → refine
+                            // the META anchor (if any) only minimally.
+                            marker_conf: BLIND_MARKER_CONF,
                         });
                         self.next_marker_sym_pos_pred = None;
                         return true;
@@ -3998,6 +4101,10 @@ mod tests {
         let mut got_validated = false;
         let mut locked_after = None;
         let mut sc_fires = 0usize;
+        // The burst's last DATA segment carries the LAST flag, so the session
+        // now self-finalises (deterministic EOT exit) at the end of streaming
+        // → SessionFinalised during the loop, Idle afterwards.
+        let mut self_finalised = false;
         let chunk = 2400; // 50 ms at 48 kHz
         for c in audio.chunks(chunk) {
             let events = session.process_audio_chunk(c);
@@ -4008,6 +4115,7 @@ mod tests {
                         got_validated = true;
                         locked_after.get_or_insert(cycle_idx);
                     }
+                    V3SessionEvent::SessionFinalised { .. } => self_finalised = true,
                     _ => {}
                 }
             }
@@ -4016,8 +4124,10 @@ mod tests {
             got_validated,
             "no MarkerValidated event on a clean V3 burst (sc_fires={sc_fires})",
         );
-        assert!(matches!(session.state(), V3SessionState::Locked { .. }));
         assert_eq!(locked_after, Some(0));
+        // LAST-flag clean exit: the burst finalised itself and returned to Idle.
+        assert!(self_finalised, "clean burst did not self-finalise on LAST flag");
+        assert!(matches!(session.state(), V3SessionState::Idle));
     }
 
     #[test]
@@ -4653,23 +4763,23 @@ mod tests {
         let cfg = high_plus_config();
         let audio = build_v3_burst_audio(&cfg, 800, 0xBEEF_BABE);
         let mut session = V3Session::new(cfg, "HIGH+".to_string());
+        // The burst's last DATA segment carries the LAST flag, so the session
+        // self-finalises during streaming (deterministic EOT exit) and emits
+        // SessionFinalised THEN, not from a trailing explicit finalize().
+        let mut summary = None;
         for c in audio.chunks(2400) {
-            let _ = session.process_audio_chunk(c);
-        }
-        let events = session.finalize();
-        let summary = events.iter().find_map(|e| {
-            if let V3SessionEvent::SessionFinalised {
-                cycles_validated,
-                cws_converged,
-            } = e
-            {
-                Some((*cycles_validated, *cws_converged))
-            } else {
-                None
+            for e in session.process_audio_chunk(c) {
+                if let V3SessionEvent::SessionFinalised {
+                    cycles_validated,
+                    cws_converged,
+                } = e
+                {
+                    summary = Some((cycles_validated, cws_converged));
+                }
             }
-        });
-        let (cv, cc) =
-            summary.expect("SessionFinalised not emitted by finalize() on active burst");
+        }
+        // A trailing finalize() on the (now Idle) session is a no-op summary-wise.
+        let (cv, cc) = summary.expect("SessionFinalised not emitted on LAST-flag exit");
         assert!(cv >= 3, "expected ≥3 cycles validated, got {cv}");
         assert!(cc >= 2, "expected ≥2 CWs converged, got {cc}");
         assert!(matches!(session.state(), V3SessionState::Idle));

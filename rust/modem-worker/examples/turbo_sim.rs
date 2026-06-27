@@ -23,11 +23,40 @@ use std::sync::{Arc, Mutex};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use modem_core::profile::ProfileIndex;
 use modem_core::types::{AUDIO_RATE, RRC_SPAN_SYM};
-use modem_worker::event_sink::NoopSink;
+use modem_worker::event_sink::{EventSink, NoopSink};
 use modem_worker::rx_v3_worker::RxV3Worker;
 
 /// 20 ms @ 48 kHz — the cpal delivery size the worker would see live.
 const CHUNK_SAMPLES: usize = (AUDIO_RATE as usize) / 50;
+
+/// Sink that records, per session_id, the MAX unique-ESI count the worker
+/// accumulated on disk (the `session_progress.received` field). This is the
+/// number that actually decides RaptorQ assembly — distinct from the diag
+/// path's full-history unique-ESI tally, because the live worker fragments the
+/// stream across sessions / re-acquisition gaps.
+#[derive(Clone, Default)]
+struct EsiCountSink {
+    // session_id -> (max received unique ESIs, K needed)
+    per_session: std::sync::Arc<Mutex<std::collections::HashMap<u64, (u32, u32)>>>,
+}
+impl EventSink for EsiCountSink {
+    fn emit_json(&self, name: &str, payload: serde_json::Value) {
+        if name == "session_progress" {
+            if let (Some(sid), Some(recv)) = (
+                payload.get("session_id").and_then(|v| v.as_u64()),
+                payload.get("received").and_then(|v| v.as_u64()),
+            ) {
+                let needed = payload.get("needed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let mut m = self.per_session.lock().unwrap();
+                let e = m.entry(sid).or_insert((0, needed));
+                e.0 = e.0.max(recv as u32);
+                if needed > 0 {
+                    e.1 = needed;
+                }
+            }
+        }
+    }
+}
 
 /// Deterministic payload: an LCG byte stream, reproducible from `seed` so TX
 /// and RX agree without a side channel.
@@ -561,11 +590,12 @@ fn rxreal(args: &[String]) {
     // capture — the driver then bootstraps from `profile` only as the family
     // anchor and refines from the marker, mirroring the live GUI auto mode.
     let forced = std::env::var_os("V3_TURBO_AUTODETECT").is_none();
+    let esi_sink = EsiCountSink::default();
     let mut worker = RxV3Worker::new(
         profile,
         forced,
         Arc::new(Mutex::new(tmp.clone())),
-        Arc::new(NoopSink),
+        Arc::new(esi_sink.clone()),
     )
     .expect("worker");
     let mut w_payload: Option<Vec<u8>> = None;
@@ -591,10 +621,18 @@ fn rxreal(args: &[String]) {
         w_files.push(df.payload.len());
         w_payload.get_or_insert(df.payload);
     }
+    let esi_map = esi_sink.per_session.lock().unwrap().clone();
+    let best_esi = esi_map.values().map(|&(r, _)| r).max().unwrap_or(0);
+    let k_needed = esi_map.values().map(|&(_, k)| k).max().unwrap_or(0);
+    let total_esi: u32 = esi_map.values().map(|&(r, _)| r).sum();
+    let mut per_session_sorted: Vec<u32> = esi_map.values().map(|&(r, _)| r).collect();
+    per_session_sorted.sort_unstable();
     eprintln!(
-        "[worker] finalised_bursts={w_finalised} assembled_files={} sizes={:?}",
+        "[worker] finalised_bursts={w_finalised} assembled_files={} \
+         | live unique-ESI: best_session={best_esi}/K={k_needed} total_all_sessions={total_esi} \
+         across {} session(s) per_session={per_session_sorted:?}",
         w_files.len(),
-        w_files,
+        esi_map.len(),
     );
     let _ = std::fs::remove_dir_all(&tmp);
 
@@ -722,6 +760,42 @@ fn rxreal(args: &[String]) {
         cw_bytes.len(),
         if hdr.is_some() { "Y" } else { "N" },
     );
+    // Decisive: do the diag's UNIQUE converged data ESIs actually assemble via
+    // RaptorQ? uniqueDataESI ≥ K ⇒ this should succeed, proving the content is
+    // fully decodable and any WORKER shortfall is live-path ESI loss (history
+    // cap / restart flush), NOT missing data on the air.
+    if let Some((file_size, t_bytes)) = hdr {
+        match modem_framing::raptorq_codec::try_decode(&cw_bytes, file_size, t_bytes as u16) {
+            Some(p) => {
+                // Confirm the RaptorQ payload is a VALID file (real recovery, not
+                // a false convergence): decode the PayloadEnvelope like the worker.
+                let env = modem_framing::payload_envelope::PayloadEnvelope::decode_or_fallback(&p);
+                if env.version == 0 {
+                    println!(
+                        "rxreal diag-assemble: RaptorQ OK from {} unique data ESIs -> {} B \
+                         (NO envelope — payload may be invalid)",
+                        cw_bytes.len(),
+                        p.len(),
+                    );
+                } else {
+                    let out = format!("rxreal_diag_{}", env.filename);
+                    std::fs::write(&out, &env.content).ok();
+                    println!(
+                        "rxreal diag-assemble: VALID FILE from {} unique data ESIs — from={} \
+                         file={} {} B -> {out}",
+                        cw_bytes.len(),
+                        env.callsign,
+                        env.filename,
+                        env.content.len(),
+                    );
+                }
+            }
+            None => println!(
+                "rxreal diag-assemble: RaptorQ FAILED from {} unique data ESIs (file_size={file_size})",
+                cw_bytes.len(),
+            ),
+        }
+    }
     println!(
         "rxreal drift: APPLIED to resampler = {:+.2} ppm (final) | {} coarse commit(s): {:?}",
         sess.drift_ppm(),
