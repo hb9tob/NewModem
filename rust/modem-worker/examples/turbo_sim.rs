@@ -609,6 +609,9 @@ fn rxreal(args: &[String]) {
         .unwrap_or(CHUNK_SAMPLES)
         .max(1);
     let mut w_files: Vec<usize> = Vec::new();
+    // Mirror the live worker's no-progress brickwall (run_turbo_worker) so a
+    // real capture exercises it: finalise a wedged burst between pushes.
+    let mut brickwall_fires = 0u32;
     for chunk in samples.chunks(worker_chunk) {
         let out = worker.push_samples(chunk);
         w_finalised += out.bursts_finalised;
@@ -616,7 +619,17 @@ fn rxreal(args: &[String]) {
             w_files.push(df.payload.len());
             w_payload.get_or_insert(df.payload);
         }
+        if worker.is_stuck() {
+            brickwall_fires += 1;
+            let fin = worker.finalize();
+            w_finalised += fin.bursts_finalised;
+            if let Some(df) = fin.decoded {
+                w_files.push(df.payload.len());
+                w_payload.get_or_insert(df.payload);
+            }
+        }
     }
+    eprintln!("[worker] no-progress brickwall fires = {brickwall_fires}");
     if let Some(df) = worker.finalize().decoded {
         w_files.push(df.payload.len());
         w_payload.get_or_insert(df.payload);

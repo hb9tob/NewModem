@@ -164,6 +164,24 @@ pub struct RxV3Worker {
     /// the spread the eye sees, shown alongside the pilot σ² (channel MER).
     last_data_evm: f32,
     last_pilot_is_meta: bool,
+    /// Live-stream samples elapsed since the last NEW unique data ESI was
+    /// accepted into the store *while a burst is active*. Drives the no-progress
+    /// brickwall: a burst that stays "active" (markers/CWs keep the FSM alive)
+    /// but stops adding unique payload is wedged — finalise it so the worker
+    /// re-detects. Keyed on UNIQUE-ESI progress, NOT marker presence (the old
+    /// no-progress timer keyed on markers and false-fired on deep fades —
+    /// [[project-robust-ultra-window-bug]]).
+    samples_since_progress: u64,
+    /// Per-session high-water mark of accepted unique ESIs, so a genuine
+    /// new-unique resets the timer but a replay re-routing already-seen ESIs
+    /// (idempotent in the store) does not.
+    unique_hwm: HashMap<u32, u32>,
+    /// No-progress brickwall enabled (default on; kill-switch `V3_NO_BRICKWALL`).
+    brickwall_enabled: bool,
+    /// Floor for the no-progress deadline, in samples (`V3_BRICKWALL_S`, default
+    /// 15 s). Effective deadline = `max(floor, 4 × cycle_samples)` so the SLOW
+    /// families (ROBUST/ULTRA) get proportionally longer before a flush.
+    brickwall_floor: u64,
 }
 
 /// Replay batch size when re-running the rolling history through a freshly
@@ -234,6 +252,14 @@ impl RxV3Worker {
             gate: TurboGate::forced(profile),
             receiving_locked: false,
             receiving_deadline: 0,
+            samples_since_progress: 0,
+            unique_hwm: HashMap::new(),
+            brickwall_enabled: std::env::var_os("V3_NO_BRICKWALL").is_none(),
+            brickwall_floor: std::env::var("V3_BRICKWALL_S")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|s| (s * AUDIO_RATE as f64) as u64)
+                .unwrap_or(AUDIO_RATE as u64 * 15),
         })
     }
 
@@ -325,21 +351,31 @@ impl RxV3Worker {
         if self.active {
             self.idle_samples = 0;
             self.warm_pending = false;
-        } else if self.warm_pending {
-            self.idle_samples = self.idle_samples.saturating_add(samples.len() as u64);
-            if self.idle_samples >= self.idle_flush_threshold() {
-                if std::env::var_os("V3_LOG_SYNC").is_some()
-                    || std::env::var_os("V3_LOG_EXIT").is_some()
-                {
-                    eprintln!(
-                        "[finalize] WARM→STOP hard-flush after {} idle samples (≥{}) — real STOP",
-                        self.idle_samples,
-                        self.idle_flush_threshold(),
-                    );
+            // No-progress brickwall timer: live samples since the last new unique
+            // ESI (reset in `accept`). Only accrues while a burst is active.
+            self.samples_since_progress =
+                self.samples_since_progress.saturating_add(samples.len() as u64);
+        } else {
+            // Not receiving: the no-progress timer is meaningless — clear it so a
+            // later re-acquire starts fresh (otherwise a stale span could trip the
+            // brickwall on the very next burst).
+            self.samples_since_progress = 0;
+            if self.warm_pending {
+                self.idle_samples = self.idle_samples.saturating_add(samples.len() as u64);
+                if self.idle_samples >= self.idle_flush_threshold() {
+                    if std::env::var_os("V3_LOG_SYNC").is_some()
+                        || std::env::var_os("V3_LOG_EXIT").is_some()
+                    {
+                        eprintln!(
+                            "[finalize] WARM→STOP hard-flush after {} idle samples (≥{}) — real STOP",
+                            self.idle_samples,
+                            self.idle_flush_threshold(),
+                        );
+                    }
+                    self.restart_session_fresh();
+                    self.idle_samples = 0;
+                    self.warm_pending = false;
                 }
-                self.restart_session_fresh();
-                self.idle_samples = 0;
-                self.warm_pending = false;
             }
         }
         outcome
@@ -358,6 +394,26 @@ impl RxV3Worker {
         }
         // ~6 marker cycles ≈ 1–2 superframes of warm grace, never below the floor.
         STOP_FLUSH_SAMPLES.max(6 * self.session.cycle_samples() as u64)
+    }
+
+    /// No-progress deadline (samples): the `brickwall_floor` (15 s default), but
+    /// at least 4 marker cycles so the SLOW families (ROBUST/ULTRA) don't trip on
+    /// a multi-superframe fade.
+    fn brickwall_deadline(&self) -> u64 {
+        self.brickwall_floor.max(4 * self.session.cycle_samples() as u64)
+    }
+
+    /// True when a burst is wedged: actively receiving (markers/CWs keep the FSM
+    /// alive) yet no NEW unique data ESI has landed for `brickwall_deadline`. The
+    /// turbo worker finalises + re-detects on this — the missing brickwall exit
+    /// for the noise-limit "busy but useless" state. Keyed on unique-ESI
+    /// PROGRESS, never on marker presence (markers keep validating on replays /
+    /// false acquisitions), so a marginal-but-decoding capture never trips it.
+    /// Disabled via `V3_NO_BRICKWALL`.
+    pub fn is_stuck(&self) -> bool {
+        self.brickwall_enabled
+            && self.active
+            && self.samples_since_progress >= self.brickwall_deadline()
     }
 
     /// Full stop/start of the streaming session at a burst boundary. `finalize()`
@@ -382,6 +438,8 @@ impl RxV3Worker {
         self.cur_header = None;
         self.pending_cw.clear();
         self.active = false;
+        self.samples_since_progress = 0;
+        self.unique_hwm.clear();
         // Re-arm the one-shot exact-profile refinement (auto mode only): the
         // next transmission may be a different profile of the SAME geometry
         // (HIGH++ → HIGH+ share the sps=32 preamble family), and its first
@@ -513,7 +571,9 @@ impl RxV3Worker {
     /// `SessionFinalised` summary for an in-flight burst and resets to Idle.
     pub fn finalize(&mut self) -> PushOutcome {
         let events = self.session.finalize();
-        self.route(events)
+        let outcome = self.route(events);
+        self.samples_since_progress = 0;
+        outcome
     }
 
     /// True for the SLOW geometry families — ROBUST (family B, 1000 Bd) and
@@ -850,6 +910,15 @@ impl RxV3Worker {
     /// yet surface equalised symbols, so `constellation_sample` is empty).
     fn accept(&mut self, ah: &AppHeader, packets: &HashMap<u32, Vec<u8>>) -> Option<DecodedFile> {
         let res = self.store.accept_packets(ah, self.profile, packets);
+        // No-progress brickwall: a genuinely NEW unique ESI is real forward
+        // progress → reset the wedge timer. Replays re-routing already-accepted
+        // ESIs (idempotent in the store) don't raise the high-water mark, so a
+        // burst stuck re-decoding old audio still trips the brickwall.
+        let prev_unique = self.unique_hwm.get(&ah.session_id).copied().unwrap_or(0);
+        if res.unique_esis > prev_unique {
+            self.unique_hwm.insert(ah.session_id, res.unique_esis);
+            self.samples_since_progress = 0;
+        }
         self.sink.emit(
             "session_progress",
             serde_json::json!({
@@ -1180,5 +1249,42 @@ mod tests {
             "HIGH+ burst B ({sid_b:#010x}) not assembled — profile refinement not \
              re-armed at the burst boundary: {decoded_sids:#010x?}",
         );
+    }
+
+    #[test]
+    fn brickwall_is_stuck_predicate() {
+        // The no-progress brickwall must fire only when ACTIVE and the
+        // no-new-unique span has reached the deadline; never while idle. (Tests
+        // share the crate module, so we drive the private timer fields directly.)
+        let tmp = tempfile::tempdir().unwrap();
+        let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
+        let sink = Arc::new(crate::event_sink::RecordingSink::new());
+        let mut w = RxV3Worker::new(
+            ProfileIndex::HighPlus,
+            /*forced=*/ true,
+            save_dir,
+            sink as Arc<dyn EventSink>,
+        )
+        .unwrap();
+        let deadline = w.brickwall_deadline();
+        assert!(deadline > 0);
+
+        // Idle (not active): never stuck, whatever the timer.
+        w.active = false;
+        w.samples_since_progress = deadline * 10;
+        assert!(!w.is_stuck(), "must not trip while idle");
+
+        // Active but still making progress (timer below deadline): not stuck.
+        w.active = true;
+        w.samples_since_progress = deadline - 1;
+        assert!(!w.is_stuck(), "must not trip below the deadline");
+
+        // Active and no new unique ESI for >= deadline: WEDGED → stuck.
+        w.samples_since_progress = deadline;
+        assert!(w.is_stuck(), "must trip at the deadline while active");
+
+        // Kill-switch disables it.
+        w.brickwall_enabled = false;
+        assert!(!w.is_stuck(), "V3_NO_BRICKWALL must disable the brickwall");
     }
 }

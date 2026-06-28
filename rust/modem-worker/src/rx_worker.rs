@@ -1182,8 +1182,27 @@ fn run_turbo_worker(
                 }
                 last_push_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 max_push_ms = max_push_ms.max(last_push_ms);
-                // A burst just ended. In AUTO mode (auto_gate.is_some() ⇔ !forced)
-                // flag a return to the cold-startup detection state below.
+                // No-progress BRICKWALL: the burst is "active" (markers/CWs keep
+                // the FSM alive) but has added no new unique ESI for the deadline
+                // — wedged in the noise-limit "busy but useless" state. Force a
+                // finalize so the next burst re-detects, exactly as a manual
+                // stop/start does (the missing brickwall exit). One finalize drops
+                // active → is_stuck can't re-fire. The respawn signal mirrors the
+                // capture brickwall; the local burst-end reset below covers the
+                // headless/sim case where nothing services the restart event.
+                if d.is_stuck() {
+                    worker_log("[turbo] BRICKWALL no-progress: active but no new ESI -> finalize + re-detect");
+                    finalised += d.finalize().bursts_finalised;
+                    sink.emit(
+                        "worker_requests_restart",
+                        WorkerRequestsRestartPayload {
+                            reason: "noprogress-brickwall",
+                        },
+                    );
+                }
+                // A burst just ended (clean LAST/EOT, give-up, or the brickwall
+                // above). In AUTO mode (auto_gate.is_some() ⇔ !forced) flag a
+                // return to the cold-startup detection state below.
                 if finalised > 0 && auto_gate.is_some() {
                     burst_ended = true;
                 }
