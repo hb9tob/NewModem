@@ -59,6 +59,11 @@ pub struct RadioTuner {
     dc_tunable: bool,
     dc_guard_hz: f64,
     input_rate_hz: u32,
+    /// Digital half-window in Hz: a move stays digital (no LO retune) while the
+    /// channel is within ±this of the LO. Defaults to `(0.5 − EDGE_MARGIN) ·
+    /// span`; widened for wideband captures (QO-100) so panning across the whole
+    /// transponder never recenters the spectrum. See [`Self::set_digital_window_hz`].
+    digital_window_hz: f64,
 }
 
 /// Fraction of the captured span kept clear at each band edge: a move stays
@@ -82,7 +87,18 @@ impl RadioTuner {
             dc_tunable: tuning.dc_tunable,
             dc_guard_hz: tuning.dc_guard_hz,
             input_rate_hz,
+            digital_window_hz: (0.5 - EDGE_MARGIN_FRAC) * input_rate_hz as f64,
         }
+    }
+
+    /// Override the digital half-window (Hz). Wideband captures (QO-100) pin the
+    /// LO across the whole transponder by widening this toward the captured
+    /// Nyquist; the value is clamped to `[default, 0.49 · span]` so it can only
+    /// widen, never narrow below the safe default, and never reach the band edge.
+    pub fn set_digital_window_hz(&mut self, hz: f64) {
+        let default = (0.5 - EDGE_MARGIN_FRAC) * self.input_rate_hz as f64;
+        let max = 0.49 * self.input_rate_hz as f64;
+        self.digital_window_hz = hz.clamp(default, max);
     }
 
     pub fn displayed_rf_hz(&self) -> u64 {
@@ -96,10 +112,9 @@ impl RadioTuner {
     /// internal model. Returns the command to send to the capture thread.
     pub fn tune_to(&mut self, target_rf_hz: u64) -> RadioCommand {
         let d = target_rf_hz as f64 - self.lo_hz as f64;
-        // Digital half-window scales with the captured span: keep 15% clear
-        // at each edge, so anything inside ±(0.35 · span) stays digital.
-        let digital_window_hz = (0.5 - EDGE_MARGIN_FRAC) * self.input_rate_hz as f64;
-        let within_window = d.abs() <= digital_window_hz;
+        // Stay digital while the channel is within the digital half-window of the
+        // LO (default ±0.35·span; wider for QO-100 — see `set_digital_window_hz`).
+        let within_window = d.abs() <= self.digital_window_hz;
         let dc_ok = self.dc_tunable || d.abs() >= self.dc_guard_hz;
         if within_window && dc_ok {
             self.displayed_rf_hz = target_rf_hz;

@@ -124,6 +124,31 @@ fn synth_usb_iq(audio: &[f32], f_sc: f32) -> Vec<Complex<f32>> {
     iq
 }
 
+/// The **real streaming TX modulator** (`ssb_usb_iq`: `ComplexFir` analytic +
+/// polyphase interpolation — the exact DSP the Pluto SSB TX loop streams)
+/// round-trips byte-exact through `SsbRxChain` + the unmodified modem RX. This
+/// is the transmit half of the QO-100 link: prove our own SSB TX is decodable
+/// by our own SSB RX (and, by symmetry, any SSB station).
+#[test]
+fn ssb_tx_modulator_roundtrip_decodes_byte_exact() {
+    let audio = encode_modem_audio();
+    let cfg = ProfileIndex::Normal.to_config();
+
+    let reference = rx_v2(&audio, &cfg).expect("reference decode failed on clean modem audio");
+    assert!(!reference.data.is_empty(), "reference decode recovered no data");
+
+    // Pluto path: suppressed carrier at DC (lo_offset 0).
+    let iq = modem_sdr_dsp::ssb_usb_iq(&audio, INPUT_RATE, 2700.0, modem_sdr_dsp::Sideband::Usb);
+    let mut chain = SsbRxChain::new(SsbRxChainConfig::new(INPUT_RATE, 2700.0, 0.0));
+    let ssb_audio = chain.process(&iq);
+
+    let got = rx_v2(&ssb_audio, &cfg).expect("TX-modulator SSB audio failed to decode");
+    assert_eq!(
+        got.data, reference.data,
+        "the streaming SSB TX modulator corrupted the waveform (TX/RX not symmetric)",
+    );
+}
+
 #[test]
 fn ssb_usb_roundtrip_decodes_byte_exact() {
     let audio = encode_modem_audio();

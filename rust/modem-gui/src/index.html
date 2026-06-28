@@ -919,11 +919,22 @@
             <button class="radio-band" data-freq="145500000">2 m</button>
             <button class="radio-band" data-freq="433500000">70 cm</button>
             <button class="radio-band" data-freq="1296000000">23 cm</button>
+            <button id="radio-qo100" class="radio-band radio-qo100"
+                    data-i18n="radio.qo100" data-i18n-title="radio.qo100_tip"
+                    title="Centrer sur le transpondeur bande étroite QO-100 (SSB, OL LNB + décalage)">QO-100</button>
             <button id="radio-recenter" data-i18n="radio.recenter"
                     data-i18n-title="radio.recenter_tip"
                     title="Recentrer l'oscillateur local">Recentrer OL</button>
           </div>
           <div id="radio-tune-info" class="radio-tune-info">—</div>
+          <!-- Derived TX (uplink) frequency readout = dialed sky + TX shift.
+               The LNB LO, TX shift and RF bandwidth inputs live in the SDR popover. -->
+          <div id="radio-sat" class="radio-sat">
+            <div class="radio-sat-line">
+              <span data-i18n="radio.tx_freq">Fréquence TX</span>
+              <span id="radio-tx-freq-display" class="radio-tx-freq">—</span>
+            </div>
+          </div>
         </div>
         <!-- Top-right: audio spectrum + monitoring -->
         <div class="radio-card radio-audio-card">
@@ -937,6 +948,11 @@
                    data-i18n-title="radio.fm_excursion_tip"
                    title="Déviation FM crête (avant dé-emphase) — rouge = surmodulation">Excursion FM</div>
               <canvas id="radio-fm-excursion" class="radio-fm-excursion"></canvas>
+              <!-- Calibrate the LNB LO on the QO-100 BPSK beacon: shown only in
+                   SSB within ±10 kHz of 10489.750 — see updateBeaconCalButton. -->
+              <button id="radio-beacon-cal" class="radio-beacon-cal" hidden
+                      data-i18n="radio.beacon_cal" data-i18n-title="radio.beacon_cal_tip"
+                      title="Caler l'OL LNB sur la balise BPSK (10489.750) et recentrer dessus">⌖ Caler sur balise</button>
             </div>
           </div>
           <div class="radio-monitor-row">
@@ -992,15 +1008,49 @@
             <span id="radio-squelch-label">−80 dB</span>
           </label>
           <label class="radio-ctl">
+            <span data-i18n="radio.fft_smooth"
+                  title="Lissage temporel de la FFT (moyennage) — révèle les signaux faibles">Lissage</span>
+            <input type="range" id="radio-fft-smooth" min="0" max="95" value="50" />
+            <span id="radio-fft-smooth-label">50 %</span>
+          </label>
+          <label class="radio-ctl"
+                 title="Maintien (hang) puis décroissance du pic spectral — révèle les signaux fugaces/faibles (0 dB/s = désactivé)">
+            <span data-i18n="radio.hang">Hang</span>
+            <input type="number" id="radio-hang-ms" class="radio-num-sm" min="0" max="2000" step="25" value="225" />
+            <span class="radio-unit">ms</span>
+            <input type="number" id="radio-decay-dbs" class="radio-num-sm" min="0" max="200" step="5" value="55" />
+            <span class="radio-unit">dB/s</span>
+          </label>
+          <label class="radio-ctl">
             <span data-i18n="radio.level_zoom">Niveaux</span>
             <input type="range" id="radio-level-min" min="-140" max="-20" value="-120" />
             <input type="range" id="radio-level-max" min="-120" max="20" value="-20" />
+            <button id="radio-level-auto" type="button" class="radio-step"
+                    data-i18n="radio.level_auto"
+                    title="Ajuster l'échelle de niveaux au spectre courant (~40 dB)">Auto</button>
           </label>
           <label class="radio-ctl">
             <span data-i18n="radio.cal_trim" data-i18n-title="radio.cal_trim_tip"
                   title="Réglage fin du S-mètre">Cal S</span>
             <input type="range" id="radio-cal-trim" min="-40" max="40" value="0" />
             <span id="radio-cal-trim-label">0 dB</span>
+          </label>
+          <!-- TX RF power = Pluto TX attenuation (0 dB att = full output). The
+               value stays attenuation in dB; dir="rtl" flips the slider so the
+               LEFT end is low power (max attenuation) and the RIGHT end is full
+               power (0 dB) — intuitive for a "power" control. Rides live during
+               a Tune (set_tune_power) and an image TX (set_tx_power), and is
+               persisted to the active backend config for the next TX. -->
+          <label class="radio-ctl">
+            <span data-i18n="radio.tx_power" data-i18n-title="radio.tx_power_tip"
+                  title="Puissance d'émission Pluto (gauche = mini, droite = pleine puissance ; valeur = atténuation dB)">Puiss. TX</span>
+            <input type="range" id="radio-tx-att" min="0" max="89.75" step="0.25" value="30" dir="rtl" />
+            <span id="radio-tx-att-label">30 dB</span>
+            <!-- CW tune carrier: TX a steady carrier (max 30 s) at the live TX
+                 power, for setting uplink level / SWR. Pluto only. -->
+            <button id="radio-tune-tx" class="radio-tune-tx" type="button"
+                    data-i18n="radio.tune_tx" data-i18n-title="radio.tune_tx_tip"
+                    title="Émettre une porteuse CW (max 30 s) au niveau Puiss. TX">Tune</button>
           </label>
         </div>
         <div class="radio-spectrum-wrap">
@@ -1025,6 +1075,33 @@
         <span class="radio-sdr-title" data-i18n="radio.sdr_params">Paramètres SDR</span>
         <span class="radio-sdr-close" id="radio-sdr-close"
               data-i18n-title="radio.sdr_close" title="Fermer">✕</span>
+      </div>
+      <!-- LNB local oscillator + TX/RX shift (station/QO-100 config, set once).
+           The operator dials the real sky frequency; the SDR tunes IF = sky −
+           LNB LO. The TX (uplink) freq is derived as sky + shift. -->
+      <div class="radio-sat-modal" id="radio-sat-modal">
+        <label class="radio-sat-line">
+          <input type="checkbox" id="radio-lnb-enable" />
+          <span data-i18n="radio.lnb_lo">OL LNB</span>
+          <input type="number" id="radio-lnb-lo" step="0.001" min="0"
+                 data-i18n-title="radio.lnb_lo_tip"
+                 title="Oscillateur local du LNB en MHz (9750 = LNB universel standard)" />
+          <span class="radio-unit">MHz</span>
+        </label>
+        <label class="radio-sat-line">
+          <span data-i18n="radio.tx_shift">Décalage TX</span>
+          <input type="number" id="radio-tx-shift" step="0.001"
+                 data-i18n-title="radio.tx_shift_tip"
+                 title="Décalage émission/réception en MHz : TX = RX + décalage (QO-100 ≈ −8089,5)" />
+          <span class="radio-unit">MHz</span>
+        </label>
+        <label class="radio-sat-line" id="radio-rfbw-wrap" hidden>
+          <span data-i18n="radio.rf_bandwidth">Bande RF</span>
+          <input type="number" id="radio-rfbw" step="10" min="100" max="560"
+                 data-i18n-title="radio.rf_bandwidth_tip"
+                 title="Largeur du filtre RF analogique (kHz). QO-100 ≈ 540 pour voir tout le transpondeur. Redémarre le RX." />
+          <span class="radio-unit">kHz</span>
+        </label>
       </div>
       <div class="radio-sdr-rows" id="radio-sdr-rows"></div>
       <p class="tx-hint" id="radio-sdr-note" data-i18n="radio.sdr_params_note">

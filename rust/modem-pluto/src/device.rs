@@ -363,8 +363,15 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
             detail: format!("{} Hz rejected: {e}", config.tx_freq_hz),
         })?;
 
-    // FIR: load taps + enable per-direction, then negotiate rate.
-    load_decim4_fir(&mut client)?;
+    // FIR: load taps + enable per-direction, then negotiate rate. The default
+    // 0.10 (≈230 kHz at 576 kS/s) is relaxed for NBFM and clips the outer ~20%
+    // of the band — visible on a wideband signal like the QO-100 NB transponder
+    // (±250 kHz). Wideband captures get the near-Nyquist passband a 4× decimator
+    // supports (≈f_out/2 = 0.125, the same the AD9361 standard / SDR Console use
+    // to show the full 576 kHz span); narrow NBFM keeps the byte-identical 0.10.
+    // Tied to rf_bandwidth as the operator's "wide" signal (set together for QO-100).
+    let fir_fc_norm = if config.rf_bandwidth_hz >= 450_000 { 0.124 } else { 0.10 };
+    load_decim4_fir(&mut client, fir_fc_norm)?;
     let negotiated_rate = negotiate_sample_rate(&mut client, config.prefer_low_rate)?;
 
     // Tear the control connection down — chip state is retained
@@ -389,8 +396,8 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
 /// count or gain combo doesn't match the BBPLL state), we surface the
 /// error rather than silently fall back — the caller can choose to
 /// rebuild with a different rate.
-fn load_decim4_fir(client: &mut IiodClient) -> Result<(), PlutoError> {
-    let taps = design_decim4_lpf();
+fn load_decim4_fir(client: &mut IiodClient, fc_norm: f64) -> Result<(), PlutoError> {
+    let taps = design_decim4_lpf_fc(fc_norm);
     let blob = format_fir_blob(&taps, &taps);
 
     client
@@ -511,15 +518,22 @@ const FIR_QUANT_PEAK: f64 = 32_000.0;
 /// quantized to int16 with a peak just under the 16-bit ceiling so
 /// the AD9361's internal accumulator has headroom.
 pub fn design_decim4_lpf() -> [i16; FIR_TAP_COUNT] {
-    // Normalized cutoff (-6 dB point) in FIR-rate units. 0.10 means the
-    // passband edge sits at 10 % of the FIR-rate, which at the
-    // worst-case rate of 2.304 MS/s is 230 kHz — comfortably above any
-    // realistic NBFM channel even at the FIR's input.
-    const FC_NORM: f64 = 0.10;
+    // Default relaxed cutoff (0.10 / ~230 kHz at 2.304 MS/s) — the NBFM /
+    // narrow path. Wideband callers pass an explicit cutoff via
+    // [`design_decim4_lpf_fc`].
+    design_decim4_lpf_fc(0.10)
+}
+
+/// Design the 4× decimation FIR with an explicit normalized cutoff (-6 dB point
+/// in FIR-rate units). Valid range ≈ 0.10..0.125 (0.125 = the output Nyquist,
+/// `f_out/2`, i.e. no transition band); the QO-100 wideband case uses ~0.12 to
+/// pass ±250 kHz, NBFM keeps 0.10.
+pub fn design_decim4_lpf_fc(fc_norm: f64) -> [i16; FIR_TAP_COUNT] {
+    let fc_norm = fc_norm.clamp(0.10, 0.124);
 
     let n = FIR_TAP_COUNT as i32;
     let mid = (n - 1) as f64 / 2.0;
-    let two_pi_fc = 2.0 * std::f64::consts::PI * FC_NORM;
+    let two_pi_fc = 2.0 * std::f64::consts::PI * fc_norm;
 
     // Build float taps: windowed sinc.
     let mut taps_f = [0.0f64; FIR_TAP_COUNT];

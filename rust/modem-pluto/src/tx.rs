@@ -29,16 +29,18 @@
 //! WRITEBUF blocks until the previous batch has been clocked out
 //! kernel-side, which gives natural backpressure against the DAC.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use num_complex::Complex32;
 
+use modem_sdr::telemetry::DemodMode;
 use modem_sdr_dsp::ctcss_gen::CtcssToneGen;
 use modem_sdr_dsp::interpolator::PolyphaseInterpolator;
 use modem_sdr_dsp::pm_mod::PhaseMod;
+use modem_sdr_dsp::{ssb_tx_analytic_taps, ssb_tx_interp_taps, ComplexFir, Sideband};
 
 use crate::device::{self, PlutoConfig, PlutoSession};
 use crate::error::PlutoError;
@@ -181,6 +183,135 @@ impl Drop for TxJob {
     }
 }
 
+/// Emit an unmodulated CW carrier for antenna/PA/QO-100 "tune": a clean tone
+/// 1.5 kHz above TX_LO (off the LO-leakage spot). **Full-duplex** — it opens
+/// only a TX buffer and writes TX_LO (`altvoltage1`) + TX hardwaregain
+/// (`voltage0`); it does NOT touch the sample rate / FIR / RX_LO, so a
+/// concurrent RX keeps running and the operator can watch the carrier on the
+/// downlink. Blocks until `stop` is set or `max_secs` elapses (a hard safety
+/// ceiling). TX attenuation is read live from `atten_centidb` (dB × 100) and
+/// written to the AD9361 on every change, so the level can be ridden during tune.
+/// Key the PA: power UP the TX LO (`altvoltage1`). The F5OEO Pluto firmware
+/// traps this `powerdown` write and pulls the amplifier-chain relays on it
+/// (`0` = TX LO on → relays engage). Must be written on a healthy (pre-stream)
+/// connection. The RX LO (`altvoltage0`) is untouched, so this stays
+/// full-duplex (mandatory for QO-100). Without this write the carrier still
+/// radiates but the relays never move — the long-standing reason this app's
+/// TX never switched the PA chain.
+fn tx_lo_power_up(client: &mut IiodClient) {
+    let phy = device::iio_names::PHY;
+    let _ = client.write_chn_attr(phy, crate::iiod::ChanDir::Output, "altvoltage1", "powerdown", "0");
+}
+
+/// Un-key the PA on a FRESH connection: max the TX attenuation, then power DOWN
+/// the TX LO. The firmware traps `altvoltage1 powerdown` = 1 and releases the
+/// relays. A post-streaming connection is WRITEBUF-desynced (backpressure
+/// short-writes leave it out of step) so its attribute writes silently never
+/// reach the firmware — hence a brand-new connection here, mirroring the proven
+/// `tx_off` path.
+fn tx_lo_power_down(uri: &str) {
+    let phy = device::iio_names::PHY;
+    if let Ok(mut c) = IiodClient::connect(uri) {
+        let _ = c.set_iiod_timeout(2000);
+        let _ = c.write_chn_attr(phy, crate::iiod::ChanDir::Output, "voltage0", "hardwaregain", "-89.75");
+        let _ = c.write_chn_attr(phy, crate::iiod::ChanDir::Output, "altvoltage1", "powerdown", "1");
+        let _ = c.close();
+    }
+}
+
+/// Live-set the AD9361 TX hardware gain from an attenuation in dB (non-negative;
+/// the chip wants it negated) on a FRESH control connection. The gain register
+/// is chip-global, so this takes effect immediately even while a TX buffer is
+/// streaming on another connection — the same way SDR Console rides TX power
+/// mid-transmission. No-op-safe when idle (just sets the register).
+pub fn set_tx_hardwaregain(uri: &str, atten_db: f64) -> Result<(), PlutoError> {
+    let mut c = IiodClient::connect(uri)
+        .map_err(|e| PlutoError::Stream(format!("set TX power connect: {e}")))?;
+    let _ = c.set_iiod_timeout(2000);
+    let gain = -(atten_db.clamp(0.0, 89.75));
+    c.write_chn_attr(
+        device::iio_names::PHY,
+        crate::iiod::ChanDir::Output,
+        "voltage0",
+        "hardwaregain",
+        &format!("{gain}"),
+    )
+    .map_err(|e| PlutoError::Stream(format!("set TX power: {e}")))?;
+    let _ = c.close();
+    Ok(())
+}
+
+pub fn run_tune_carrier(
+    uri: &str,
+    tx_lo_hz: u64,
+    sample_rate_hz: u64,
+    stop: &AtomicBool,
+    atten_centidb: &AtomicU32,
+    max_secs: u64,
+) -> Result<(), PlutoError> {
+    use crate::iiod::ChanDir;
+    let phy = device::iio_names::PHY;
+    let mut client = IiodClient::connect(uri)
+        .map_err(|e| PlutoError::Stream(format!("tune connect: {e}")))?;
+    let _ = client.set_iiod_timeout(2000);
+    // TX_LO only (altvoltage1) — RX_LO (altvoltage0) is left untouched.
+    client
+        .write_chn_attr(phy, ChanDir::Output, "altvoltage1", "frequency", &tx_lo_hz.to_string())
+        .map_err(|e| PlutoError::Stream(format!("tune TX_LO: {e}")))?;
+    // Key the PA (TX LO up → firmware pulls the relays). Full-duplex safe.
+    tx_lo_power_up(&mut client);
+
+    // Pre-generate an integer number of 1200 Hz tone periods, so repeatedly
+    // pushing the SAME buffer forms a phase-seamless continuous carrier. (The
+    // iiod CYCLIC mode returns 0 on this firmware — we do "manual cyclic".)
+    let tone_hz = 1200.0_f64;
+    let period = (sample_rate_hz as f64 / tone_hz).round().max(1.0) as usize; // 480 @ 576k
+    let n = period * 10; // ~4800 IQ — fills the kernel buffer comfortably
+    let amp = 0.5_f64 * TX_S16_SCALE as f64; // −6 dBFS digital, clean headroom
+    let mut wire = vec![0u8; n * BYTES_PER_SCAN];
+    for k in 0..n {
+        let ph = std::f64::consts::TAU * tone_hz * (k as f64) / sample_rate_hz as f64;
+        let i = (ph.cos() * amp).round() as i16;
+        let q = (ph.sin() * amp).round() as i16;
+        let off = k * BYTES_PER_SCAN;
+        wire[off..off + 2].copy_from_slice(&i.to_le_bytes());
+        wire[off + 2..off + 4].copy_from_slice(&q.to_le_bytes());
+    }
+    client
+        .open_buffer(device::iio_names::TX_BUFFER, n, TX_CHANNEL_MASK, false)
+        .map_err(|e| PlutoError::Stream(format!("tune open TX buffer: {e}")))?;
+    eprintln!(
+        "[pluto-tune] carrier ON: TX_LO {} Hz (+{tone_hz} Hz), atten {:.2} dB, ≤{max_secs}s",
+        tx_lo_hz,
+        atten_centidb.load(Ordering::Relaxed) as f64 / 100.0
+    );
+
+    let mut last_centidb = u32::MAX;
+    let start = Instant::now();
+    while !stop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(max_secs) {
+        // Live power: write TX hardwaregain whenever the attenuation changes.
+        let cd = atten_centidb.load(Ordering::Relaxed);
+        if cd != last_centidb {
+            last_centidb = cd;
+            let gain = -(cd as f64 / 100.0); // AD9361 wants negative dB
+            let _ =
+                client.write_chn_attr(phy, ChanDir::Output, "voltage0", "hardwaregain", &format!("{gain}"));
+        }
+        // Repeat the same integer-period buffer; on backpressure write_buffer
+        // returns 0 and we simply re-push next iteration (no phase drift).
+        let _ = client.write_buffer(device::iio_names::TX_BUFFER, &wire);
+    }
+    // Stop the carrier stream and drop the streaming connection. A connection
+    // that has been pushing WRITEBUF (with backpressure short-writes) is left
+    // desynced, so attribute writes on it silently fail to reach the firmware.
+    let _ = client.close_buffer(device::iio_names::TX_BUFFER);
+    let _ = client.close();
+    // Relay-safe disengage on a fresh connection (the streaming one is desynced).
+    tx_lo_power_down(uri);
+    eprintln!("[pluto-tune] carrier OFF (TX LO powered down → relays release)");
+    Ok(())
+}
+
 fn run_tx(
     config: PlutoConfig,
     audio: Vec<f32>,
@@ -205,11 +336,21 @@ fn run_tx_loop(
     pos: &AtomicUsize,
     stop: Arc<AtomicBool>,
 ) -> Result<(), PlutoError> {
+    // Linear mode (QO-100 SSB): the signal goes up as a single sideband, not
+    // FM. Dispatch to the SSB-USB modulator; the FM/PM path below is untouched.
+    if session.config.rx_demod_mode == DemodMode::SsbUsb {
+        return run_tx_loop_ssb(session, audio, pos, stop);
+    }
     // Open a dedicated TX streaming connection (independent of any
     // concurrent RX, independent of the control connection that
     // `device::open` opened-and-dropped).
     let mut client = IiodClient::connect(&session.config.uri)?;
     let _ = client.set_iiod_timeout(2000);
+
+    // Key the PA before any RF leaves the chip: power up the TX LO so the F5OEO
+    // firmware pulls the amplifier-chain relays (relays-before-drive sequencing).
+    // RX LO stays up → full-duplex. Released in the teardown below.
+    tx_lo_power_up(&mut client);
 
     // Buffer size = exactly one chunk's worth of I/Q samples. Sizing
     // it to match means each WRITEBUF ships only modulated audio with
@@ -332,5 +473,129 @@ fn run_tx_loop(
     // Best-effort cleanup.
     let _ = client.close_buffer(crate::device::iio_names::TX_BUFFER);
     let _ = client.close();
+    // Un-key the PA: drop the relays + silence the TX LO (fresh connection, the
+    // streaming one is WRITEBUF-desynced). Relay-safe rest state between bursts.
+    tx_lo_power_down(&session.config.uri);
+    Ok(())
+}
+
+/// Peak target for the SSB I/Q, as a fraction of the i16 DAC full scale. SSB
+/// is linear, so the radiated power follows the digital level: we push the
+/// whole-burst peak to ~0.92 of full scale — near maximum Pluto output — while
+/// staying just under the ceiling (clipping a linear signal splatters the
+/// adjacent QO-100 channels). The RF attenuation sets the final power on top.
+const SSB_TX_PEAK_TARGET: f32 = 0.92;
+
+/// SSB-USB transmit loop — the QO-100 linear uplink. The modem audio is
+/// modulated to a single sideband with a suppressed carrier (no FM) and
+/// streamed to the AD9361. Mirrors the FM [`run_tx_loop`] lifecycle (dedicated
+/// connection, PA keying, relay-safe teardown) but with the linear SSB chain
+/// and whole-burst peak normalisation to near full DAC scale.
+fn run_tx_loop_ssb(
+    session: PlutoSession,
+    audio: &[f32],
+    pos: &AtomicUsize,
+    stop: Arc<AtomicBool>,
+) -> Result<(), PlutoError> {
+    let mut client = IiodClient::connect(&session.config.uri)?;
+    let _ = client.set_iiod_timeout(5000); // a TX-quad cal can take ~1 s
+
+    // AD9361 TX quadrature calibration, with the PA relays OFF. We have NOT
+    // written `altvoltage1 powerdown = 0` yet, so the F5OEO firmware keeps the
+    // relay chain RELEASED — the cal's out-of-band sweep never reaches the PA
+    // (validated on the bench: no relay voltage during the cal). This suppresses
+    // the unwanted lower-sideband image that TX I/Q imbalance otherwise leaks
+    // (harmless for FM, but a linear SSB uplink must be clean).
+    let _ = client.write_chn_attr(
+        device::iio_names::PHY,
+        crate::iiod::ChanDir::Output,
+        "altvoltage1",
+        "powerdown",
+        "1",
+    );
+    let _ = client.write_dev_attr(device::iio_names::PHY, "calib_mode", "tx_quad");
+    eprintln!("[pluto-tx ssb] TX quadrature cal done (relays OFF), keying PA");
+
+    // NOW key the PA before any RF (relays engage on this powerdown=0 write).
+    tx_lo_power_up(&mut client);
+
+    let ratio = session.negotiated_rate.ratio;
+    let if_rate = session.negotiated_rate.sample_rate_hz as u32;
+    let ssb_bw = session.config.rx_ssb_bandwidth_hz;
+    let chunk_iq_samples = TX_CHUNK_AUDIO_SAMPLES * ratio;
+    client
+        .open_buffer(crate::device::iio_names::TX_BUFFER, chunk_iq_samples, TX_CHANNEL_MASK, false)
+        .map_err(|e| PlutoError::Stream(format!("OPEN cf-ad9361-dds-core-lpc (ssb): {e}")))?;
+
+    // Analytic USB at audio rate over the whole burst — the SAME analytic
+    // band-pass the SsbRxChain selects with, so TX/RX are exactly symmetric.
+    // Computing it up front lets us peak-normalise the entire transmission to
+    // near full scale (linear mode → power follows the digital level).
+    let mut analytic = ComplexFir::new(ssb_tx_analytic_taps(ssb_bw, Sideband::Usb));
+    let z48 = {
+        let audio_c: Vec<Complex32> = audio.iter().map(|&a| Complex32::new(a, 0.0)).collect();
+        analytic.process(&audio_c) // audio_c freed here, only z48 persists
+    };
+    let peak = z48.iter().fold(0.0f32, |m, c| m.max(c.re.hypot(c.im)));
+    let scale = if peak > 1e-6 { SSB_TX_PEAK_TARGET * i16::MAX as f32 / peak } else { 0.0 };
+
+    // Anti-imaging interpolation, Re & Im branches (real taps preserve the
+    // analytic/USB property and reject the interpolation images).
+    let interp_taps = ssb_tx_interp_taps(if_rate);
+    let mut interp_re = PolyphaseInterpolator::with_taps(interp_taps.clone(), ratio);
+    let mut interp_im = PolyphaseInterpolator::with_taps(interp_taps, ratio);
+
+    let mut wire_buf = vec![0u8; chunk_iq_samples * BYTES_PER_SCAN];
+    let mut re48 = vec![0.0f32; TX_CHUNK_AUDIO_SAMPLES];
+    let mut im48 = vec![0.0f32; TX_CHUNK_AUDIO_SAMPLES];
+    let mut last_tick = std::time::Instant::now();
+    let mut total_iq_pushed: u64 = 0;
+    let mut push_errors: u64 = 0;
+
+    let mut idx = 0usize;
+    while idx < z48.len() && !stop.load(Ordering::Relaxed) {
+        let end = (idx + TX_CHUNK_AUDIO_SAMPLES).min(z48.len());
+        let m = end - idx;
+        for k in 0..TX_CHUNK_AUDIO_SAMPLES {
+            // Pad a short final chunk with zeros = silence (SSB has no carrier,
+            // so trailing zeros radiate nothing — a clean burst tail).
+            let (re, im) = if k < m { (z48[idx + k].re, z48[idx + k].im) } else { (0.0, 0.0) };
+            re48[k] = re;
+            im48[k] = im;
+        }
+        let re_if = interp_re.process(&re48);
+        let im_if = interp_im.process(&im48);
+        for k in 0..re_if.len() {
+            let i = (re_if[k] * scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let q = (im_if[k] * scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let off = k * BYTES_PER_SCAN;
+            wire_buf[off..off + 2].copy_from_slice(&i.to_le_bytes());
+            wire_buf[off + 2..off + 4].copy_from_slice(&q.to_le_bytes());
+        }
+        match client.write_buffer(crate::device::iio_names::TX_BUFFER, &wire_buf) {
+            Ok(_n) => total_iq_pushed += re_if.len() as u64,
+            Err(e) => {
+                push_errors += 1;
+                if last_tick.elapsed() >= STATUS_TICK_PERIOD {
+                    eprintln!("[pluto-tx ssb] push error #{push_errors}: {e}");
+                    last_tick = std::time::Instant::now();
+                }
+            }
+        }
+        idx = end;
+        pos.store(idx, Ordering::Relaxed);
+        if last_tick.elapsed() >= STATUS_TICK_PERIOD {
+            eprintln!(
+                "[pluto-tx ssb] tick: {idx}/{} audio samples, {total_iq_pushed} I/Q pushed, \
+                 {push_errors} push errors (peak-norm ×{scale:.0})",
+                z48.len()
+            );
+            last_tick = std::time::Instant::now();
+        }
+    }
+
+    let _ = client.close_buffer(crate::device::iio_names::TX_BUFFER);
+    let _ = client.close();
+    tx_lo_power_down(&session.config.uri);
     Ok(())
 }

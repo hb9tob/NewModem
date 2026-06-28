@@ -19,6 +19,11 @@ export function ensureRadioSettings() {
   if (r.monitor_device === undefined) r.monitor_device = null;
   if (!Number.isFinite(r.monitor_volume)) r.monitor_volume = 0.80;
   if (!Number.isFinite(r.smeter_cal_trim_db)) r.smeter_cal_trim_db = 0;
+  if (!Number.isFinite(r.fft_smooth_pct)) r.fft_smooth_pct = 50;
+  if (!Number.isFinite(r.hang_ms)) r.hang_ms = 225;
+  if (!Number.isFinite(r.decay_db_s)) r.decay_db_s = 55;
+  if (!Number.isFinite(r.level_min_dbfs)) r.level_min_dbfs = -120;
+  if (!Number.isFinite(r.level_max_dbfs)) r.level_max_dbfs = -20;
   return r;
 }
 
@@ -35,10 +40,82 @@ export const radioState = {
   levelHist: [], // rolling history of {peak, rms} (linear) for the SSB level graph
   levelLastSeq: -1, // last ingested SSB-level seq
   rafId: null,
+  bandPlanQo100: false, // QO-100 NB transponder band-plan overlay active
+  rfSmoothed: null, // EMA-averaged copy of the latest RF frame (display only)
+  rfSmoothSeq: -1, // last RF seq folded into rfSmoothed
+  rfHeld: null, // peak hang/decay envelope of the RF line spectrum (display only)
+  rfDisplayLastMs: 0, // performance.now() of the last hang/decay tick
+  tuning: false, // CW tune carrier active (TX)
+  tuneTimer: null, // client-side 30 s auto-stop timer id
   waterfallInit: false,
   wfW: 0, // waterfall canvas dims last init'd at — re-init only when these change
   wfH: 0,
 };
+
+// QO-100 (Es'hail-2) narrowband transponder reference frequencies (sky/downlink),
+// the standard universal-LNB local oscillator, and the constant uplink shift.
+// Beacons are the firm anchors (AMSAT-DL band plan); TX = sky_RX + shift.
+export const QO100_DOWNLINK_CENTER_HZ = 10_489_750_000; // middle BPSK beacon = passband centre
+export const QO100_BEACON_LOWER_HZ = 10_489_500_000; // lower CW beacon (lower edge)
+export const QO100_BEACON_UPPER_HZ = 10_490_000_000; // upper CW beacon (upper edge)
+export const QO100_LNB_LO_HZ = 9_750_000_000; // standard universal LNB local oscillator
+export const QO100_SHIFT_HZ = -8_089_500_000; // uplink = downlink − 8089.5 MHz
+export const QO100_RF_BANDWIDTH_HZ = 540_000; // analog RF filter to pass the full ~500 kHz transponder
+
+/// The active RX backend's persisted config, or null when no SDR is selected.
+export function activeRadioCfg() {
+  const backendId = getSelectedBackendId("rx-device-select");
+  return backendId ? ensureBackendConfig(backendId) : null;
+}
+
+/// True while a live RX capture is running (the Stop button is enabled).
+export function isCapturing() {
+  const b = document.getElementById("btn-stop");
+  return !!b && !b.disabled;
+}
+
+/// LNB display offset in Hz: when the LNB is enabled, the operator dials the real
+/// sky frequency while the SDR tunes IF = sky − lnb_lo. Returns 0 when disabled
+/// or unset (→ behaviour identical to plain terrestrial tuning).
+export function skyOffsetHz(cfg) {
+  const ex = cfg && cfg.backend_extras;
+  if (!ex || !ex.lnb_enabled) return 0;
+  const lo = Number(ex.lnb_lo_hz);
+  return Number.isFinite(lo) ? lo : 0;
+}
+
+export function currentSkyOffsetHz() {
+  return skyOffsetHz(activeRadioCfg());
+}
+
+/// Signed uplink↔downlink shift in Hz: TX (uplink) = sky_RX + shift. 0 = simplex.
+export function txShiftHz(cfg) {
+  const ex = cfg && cfg.backend_extras;
+  const s = ex ? Number(ex.tx_rx_shift_hz) : 0;
+  return Number.isFinite(s) ? s : 0;
+}
+
+/// Recompute the derived uplink into the active config. The Radio tab is the
+/// SINGLE source of the TX frequency: TX = sky_RX + shift. Terrestrial simplex
+/// is just shift = 0 (TX = RX); a repeater/cross-band split is a non-zero shift.
+/// (The standalone Settings TX-frequency field is removed — see renderSdrPanel.)
+export function deriveUplink(cfg, skyHz) {
+  if (!cfg) return;
+  const tx = skyHz + txShiftHz(cfg);
+  if (Number.isFinite(tx) && tx >= 0) cfg.tx_freq_hz = Math.round(tx);
+}
+
+/// Update the read-only "TX frequency" display from a sky RX frequency.
+export function updateTxFreqDisplay(skyHz, cfg) {
+  const el = document.getElementById("radio-tx-freq-display");
+  if (!el) return;
+  if (!Number.isFinite(skyHz)) {
+    el.textContent = "—";
+    return;
+  }
+  const tx = skyHz + txShiftHz(cfg);
+  el.textContent = tx >= 0 ? `${(tx / 1e6).toFixed(6)} MHz` : "—";
+}
 
 export const RADIO_WF_PALETTE = (() => {
   const p = new Uint8ClampedArray(256 * 3);
@@ -159,36 +236,101 @@ export function updateRadioTuneDisplay() {
   const t = radioState.tune;
   const disp = document.getElementById("radio-freq-display");
   const info = document.getElementById("radio-tune-info");
+  const offset = currentSkyOffsetHz();
   if (t && disp) {
-    disp.textContent = `${(t.displayed_rf_hz / 1e6).toFixed(6)} MHz`;
+    // Big dial = the real sky frequency (IF + LNB LO when the LNB is enabled).
+    disp.textContent = `${((t.displayed_rf_hz + offset) / 1e6).toFixed(6)} MHz`;
   }
   if (t && info) {
     const off = t.digital_offset_hz;
     const offStr = `${off >= 0 ? "+" : ""}${(off / 1000).toFixed(2)} kHz`;
-    info.textContent = `OL ${(t.lo_hz / 1e6).toFixed(4)} MHz · décalage num. ${offStr} · span ${(t.input_rate_hz / 1000).toFixed(0)} kHz`;
+    // The "OL" line stays the real hardware LO (the LNB IF when an LNB is in
+    // use), tagged "(IF)" so it isn't mistaken for the dialed sky frequency.
+    const loStr = offset !== 0
+      ? `OL ${(t.lo_hz / 1e6).toFixed(4)} MHz (IF)`
+      : `OL ${(t.lo_hz / 1e6).toFixed(4)} MHz`;
+    info.textContent = `${loStr} · décalage num. ${offStr} · span ${(t.input_rate_hz / 1000).toFixed(0)} kHz`;
   }
+  if (t) updateTxFreqDisplay(t.displayed_rf_hz + offset, activeRadioCfg());
 }
 
 export function currentRadioHz() {
-  if (radioState.tune) return radioState.tune.displayed_rf_hz;
+  if (radioState.tune) return radioState.tune.displayed_rf_hz + currentSkyOffsetHz();
+  // The input field already holds the sky frequency.
   const v = parseFloat(document.getElementById("radio-freq-input")?.value);
   return isFinite(v) ? Math.round(v * 1e6) : 145_500_000;
 }
 
-export function tuneRadioTo(hz) {
-  const clamped = Math.max(0, Math.round(hz));
+// `skyHz` is the real (sky) frequency the operator dials. The SDR tunes the IF
+// = sky − LNB LO; both the dialed sky value and the derived uplink are kept in
+// the active backend config.
+export function tuneRadioTo(skyHz) {
+  const sky = Math.max(0, Math.round(skyHz));
+  const cfg = activeRadioCfg();
+  const offset = skyOffsetHz(cfg);
+  const ifHz = Math.max(0, Math.round(sky - offset)); // what the hardware tunes
   const input = document.getElementById("radio-freq-input");
-  if (input) input.value = (clamped / 1e6).toFixed(6);
-  invokeRadio("set_radio_freq", { hz: clamped });
-  // Persist the dialed RF into the active RX backend's config so a later
+  if (input) input.value = (sky / 1e6).toFixed(6); // operator sees the sky freq
+  invokeRadio("set_radio_freq", { hz: ifHz });
+  // Persist the dialed RF (IF) into the active RX backend's config so a later
   // plain "Start RX" (which reads the saved SDR config) reuses the last
-  // frequency tuned here — the Settings RX panel no longer carries this
-  // field now that all SDR RX controls live on the Radio tab.
-  const backendId = getSelectedBackendId("rx-device-select");
-  if (backendId) {
-    const cfg = ensureBackendConfig(backendId);
-    cfg.rx_freq_hz = clamped;
+  // frequency tuned here — the Settings RX panel no longer carries this field.
+  if (cfg) {
+    cfg.rx_freq_hz = ifHz;
+    deriveUplink(cfg, sky); // TX = sky + shift (satellite / cross-band only)
     emit("settings:persist");
+  }
+  updateTxFreqDisplay(sky, cfg);
+}
+
+// One-click QO-100 narrowband transponder setup: enable the LNB display offset,
+// set the standard uplink shift, switch to SSB-USB, show the band-plan overlay,
+// and tune the sky centre (10489.750 MHz, the middle BPSK beacon).
+export async function goToQo100() {
+  const cfg = activeRadioCfg();
+  if (!cfg) return;
+  cfg.backend_extras = cfg.backend_extras || {};
+  cfg.backend_extras.lnb_enabled = true;
+  // Keep a previously-entered LO; otherwise seed the standard universal LNB.
+  const lo = Number(cfg.backend_extras.lnb_lo_hz);
+  if (!Number.isFinite(lo) || lo <= 0) cfg.backend_extras.lnb_lo_hz = QO100_LNB_LO_HZ;
+  cfg.backend_extras.tx_rx_shift_hz = QO100_SHIFT_HZ;
+  // Widen the analog RF filter so the whole ~500 kHz transponder (both edge
+  // beacons) is passed — the 200 kHz NBFM default hides everything past ±100 kHz.
+  // rf_bandwidth is an open-time parameter, hence the restart below.
+  cfg.rf_bandwidth_hz = QO100_RF_BANDWIDTH_HZ;
+  // SSB-USB demod (the transponder is linear; FM is meaningless here).
+  cfg.rx_demod_mode = "ssb_usb";
+  radioState.demodMode = "ssb_usb";
+  const modeSel = document.getElementById("radio-demod-mode");
+  if (modeSel) modeSel.value = "ssb_usb";
+  invokeRadio("set_demod_mode", { mode: "ssb_usb" });
+  applyDemodModeUi("ssb_usb");
+  const bw = Number(document.getElementById("radio-ssb-bw")?.value) ||
+    Number(cfg.ssb_bandwidth_hz) || 2700;
+  invokeRadio("set_ssb_bandwidth", { hz: bw });
+  radioState.bandPlanQo100 = true;
+  // Reflect the satellite controls, then tune the centre (also derives + persists
+  // the uplink and the IF the SDR hardware actually receives).
+  seedSatControls(cfg);
+  tuneRadioTo(QO100_DOWNLINK_CENTER_HZ);
+  // rf_bandwidth only takes effect on (re)open, and build_capture_session
+  // reloads the SdrConfig from settings.json — so flush the config to disk
+  // BEFORE restarting, otherwise the new capture reopens with the old 200 kHz.
+  if (isCapturing()) {
+    await saveSettingsNow();
+    restartRadioCapture().catch((e) => console.error("[radio] qo100 restart", e));
+  }
+}
+
+/// Await a synchronous flush of the in-memory settings to disk (settings.json),
+/// so a capture (re)start that reloads the config from disk sees the latest
+/// values. The bus `settings:persist` is fire-and-forget and would race a restart.
+export async function saveSettingsNow() {
+  try {
+    await invoke("save_settings", { settings: currentSettings });
+  } catch (e) {
+    console.error("[radio] save_settings", e);
   }
 }
 
@@ -226,6 +368,145 @@ export async function setupRadioTab() {
     invokeRadio("recenter_lo");
   });
 
+  // LNB local oscillator (enable + LO MHz). Pure display offset: the hardware
+  // does NOT retune — we only relabel IF↔sky, re-seed the dialed value and
+  // refresh the read-outs. The freq scale / band-plan overlay redraw on the RAF.
+  const onLnbChange = () => {
+    const cfg = activeRadioCfg();
+    if (!cfg) return;
+    cfg.backend_extras = cfg.backend_extras || {};
+    const en = document.getElementById("radio-lnb-enable");
+    cfg.backend_extras.lnb_enabled = !!(en && en.checked);
+    const loMhz = parseFloat(document.getElementById("radio-lnb-lo")?.value);
+    if (Number.isFinite(loMhz)) cfg.backend_extras.lnb_lo_hz = Math.round(loMhz * 1e6);
+    if (!cfg.backend_extras.lnb_enabled) radioState.bandPlanQo100 = false;
+    reseedRadioSkyInput(cfg);
+    updateRadioTuneDisplay();
+    // The sky frequency for the fixed IF changed → recompute the derived uplink.
+    deriveUplink(cfg, currentRadioHz());
+    updateTxFreqDisplay(currentRadioHz(), cfg);
+    emit("settings:persist");
+  };
+  document.getElementById("radio-lnb-enable")?.addEventListener("change", onLnbChange);
+  document.getElementById("radio-lnb-lo")?.addEventListener("change", onLnbChange);
+
+  // TX/RX shift (MHz, signed): TX uplink = sky_RX + shift. Recompute + persist
+  // the derived uplink for the next TX.
+  document.getElementById("radio-tx-shift")?.addEventListener("change", (e) => {
+    const cfg = activeRadioCfg();
+    if (!cfg) return;
+    cfg.backend_extras = cfg.backend_extras || {};
+    const mhz = parseFloat(e.target.value);
+    cfg.backend_extras.tx_rx_shift_hz = Number.isFinite(mhz) ? Math.round(mhz * 1e6) : 0;
+    const sky = currentRadioHz();
+    deriveUplink(cfg, sky);
+    updateTxFreqDisplay(sky, cfg);
+    emit("settings:persist");
+  });
+
+  // TX RF power = Pluto TX attenuation (0 dB = full output). Persisted to the
+  // backend config; applies on the next TX. While a tune carrier is on, rides
+  // the power live (set_tune_power) so the operator can level on the downlink.
+  const txAtt = document.getElementById("radio-tx-att");
+  const txAttLabel = document.getElementById("radio-tx-att-label");
+  txAtt?.addEventListener("input", () => {
+    if (txAttLabel) txAttLabel.textContent = `${txAtt.value} dB`;
+    const v = Number(txAtt.value); // value is attenuation dB (slider is rtl-flipped)
+    if (!Number.isFinite(v)) return;
+    if (radioState.tuning) {
+      invoke("set_tune_power", { attenDb: v }).catch(() => {});
+    } else {
+      // Live-ride the AD9361 TX gain so an in-progress image/voice TX changes
+      // immediately. Throttled — each call opens a brief control connection.
+      const now = performance.now();
+      if (now - (radioState.lastTxPowerSend || 0) >= 120) {
+        radioState.lastTxPowerSend = now;
+        const deviceName = document.getElementById("rx-device-select")?.value;
+        if (deviceName) invoke("set_tx_power", { deviceName, attenDb: v }).catch(() => {});
+      }
+    }
+  });
+  txAtt?.addEventListener("change", () => {
+    const cfg = activeRadioCfg();
+    if (!cfg) return;
+    cfg.backend_extras = cfg.backend_extras || {};
+    let v = Number(txAtt.value);
+    if (!Number.isFinite(v)) v = 30;
+    v = Math.max(0, Math.min(89.75, v));
+    cfg.backend_extras.tx_attenuation_db = v;
+    if (txAttLabel) txAttLabel.textContent = `${v} dB`;
+    // Apply the final value live too (the throttle may have dropped it), unless
+    // a Tune is on (that path rides set_tune_power already).
+    if (!radioState.tuning) {
+      const deviceName = document.getElementById("rx-device-select")?.value;
+      if (deviceName) invoke("set_tx_power", { deviceName, attenDb: v }).catch(() => {});
+    }
+    emit("settings:persist");
+  });
+
+  // One-click QO-100 NB transponder: LNB on, SSB-USB, shift, center + band plan.
+  document.getElementById("radio-qo100")?.addEventListener("click", goToQo100);
+  // Calibrate the LNB LO on the BPSK beacon (shown only near it, in SSB).
+  document.getElementById("radio-beacon-cal")?.addEventListener("click", calibrateToBeacon);
+  // CW tune carrier (TX) — toggle. Safety: stop it if the RX capture stops.
+  document.getElementById("radio-tune-tx")?.addEventListener("click", () => {
+    if (radioState.tuning) stopTuneTx();
+    else startTuneTx();
+  });
+  on("capture:stopped", () => {
+    if (radioState.tuning) stopTuneTx();
+  });
+
+  // Analog RF bandwidth (Pluto) — open-time parameter, so a change restarts the
+  // capture when one is running. QO-100 needs ~540 kHz to pass the whole 500 kHz
+  // transponder (the 200 kHz default hides everything past ±100 kHz).
+  document.getElementById("radio-rfbw")?.addEventListener("change", async () => {
+    const cfg = activeRadioCfg();
+    if (!cfg) return;
+    const khz = parseFloat(document.getElementById("radio-rfbw").value);
+    if (!Number.isFinite(khz)) return;
+    cfg.rf_bandwidth_hz = Math.round(khz * 1000);
+    if (isCapturing()) {
+      // Flush to disk before the restart reloads the config (see goToQo100).
+      await saveSettingsNow();
+      restartRadioCapture().catch((e) => console.error("[radio] rfbw restart", e));
+    } else {
+      emit("settings:persist");
+    }
+  });
+
+  // Spectrum display: temporal smoothing (FFT averaging) + peak hang/decay.
+  const sm = document.getElementById("radio-fft-smooth");
+  const smLabel = document.getElementById("radio-fft-smooth-label");
+  sm?.addEventListener("input", () => {
+    if (smLabel) smLabel.textContent = `${sm.value} %`;
+  });
+  sm?.addEventListener("change", () => {
+    ensureRadioSettings().fft_smooth_pct = Number(sm.value);
+    emit("settings:persist");
+  });
+  document.getElementById("radio-hang-ms")?.addEventListener("change", (e) => {
+    ensureRadioSettings().hang_ms = Math.max(0, Number(e.target.value) || 0);
+    emit("settings:persist");
+  });
+  document.getElementById("radio-decay-dbs")?.addEventListener("change", (e) => {
+    ensureRadioSettings().decay_db_s = Math.max(0, Number(e.target.value) || 0);
+    emit("settings:persist");
+  });
+
+  // Level window: persist on commit + an Auto-fit to the current spectrum.
+  const persistLevels = () => {
+    const lmin = document.getElementById("radio-level-min");
+    const lmax = document.getElementById("radio-level-max");
+    const r = ensureRadioSettings();
+    if (lmin) r.level_min_dbfs = Number(lmin.value);
+    if (lmax) r.level_max_dbfs = Number(lmax.value);
+    emit("settings:persist");
+  };
+  document.getElementById("radio-level-min")?.addEventListener("change", persistLevels);
+  document.getElementById("radio-level-max")?.addEventListener("change", persistLevels);
+  document.getElementById("radio-level-auto")?.addEventListener("click", autoFitLevels);
+
   // RX gain / AGC — backend-aware controls built by renderRadioGain() from
   // the active SDR's capabilities. A single delegated `change` listener on
   // the host sends the new gain live (set_radio_gain): the builders mutate
@@ -254,6 +535,8 @@ export async function setupRadioTab() {
   document.getElementById("radio-demod-mode")?.addEventListener("change", (e) => {
     const mode = e.target.value === "ssb_usb" ? "ssb_usb" : "nbfm";
     radioState.demodMode = mode;
+    // The QO-100 band plan is an SSB-mode overlay; leaving SSB hides it.
+    if (mode !== "ssb_usb") radioState.bandPlanQo100 = false;
     invokeRadio("set_demod_mode", { mode });
     applyDemodModeUi(mode);
     if (mode === "ssb_usb") {
@@ -330,6 +613,19 @@ export async function setupRadioTab() {
       if (hz !== null) tuneRadioTo(hz);
     });
   }
+  // Click-to-tune on the SSB spectrum-zoom panel: map the clicked x within the
+  // ±ZOOM_HALF_HZ window (centred on the tuned point) to a sky frequency. SSB
+  // only — in NBFM the same canvas shows the FM-excursion graph. 10 Hz step.
+  const zoomCv = document.getElementById("radio-fm-excursion");
+  zoomCv?.addEventListener("click", (e) => {
+    if (radioState.demodMode !== "ssb_usb" || !radioState.tune) return;
+    const rect = zoomCv.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const sky =
+      radioState.tune.displayed_rf_hz + (frac - 0.5) * 2 * ZOOM_HALF_HZ + currentSkyOffsetHz();
+    tuneRadioTo(Math.round(sky / 10) * 10);
+  });
 
   // Monitor output device list + selection.
   const monSel = document.getElementById("radio-monitor-out");
@@ -401,6 +697,20 @@ export function restoreRadioControls() {
   // "off"), which is the safe fallback when the device is unplugged.
   const monSel = document.getElementById("radio-monitor-out");
   if (monSel && r.monitor_device) monSel.value = r.monitor_device;
+
+  // Spectrum-display controls: smoothing, peak hang/decay, and the level window.
+  const sm = document.getElementById("radio-fft-smooth");
+  const smLabel = document.getElementById("radio-fft-smooth-label");
+  if (sm) sm.value = String(r.fft_smooth_pct);
+  if (smLabel) smLabel.textContent = `${r.fft_smooth_pct} %`;
+  const hang = document.getElementById("radio-hang-ms");
+  if (hang) hang.value = String(r.hang_ms);
+  const decay = document.getElementById("radio-decay-dbs");
+  if (decay) decay.value = String(r.decay_db_s);
+  const lmin = document.getElementById("radio-level-min");
+  const lmax = document.getElementById("radio-level-max");
+  if (lmin) lmin.value = String(r.level_min_dbfs);
+  if (lmax) lmax.value = String(r.level_max_dbfs);
 }
 
 export function pushRadioControlsLive() {
@@ -526,13 +836,20 @@ export function applyDemodModeUi(mode) {
   const bwWrap = document.getElementById("radio-ssb-bw-wrap");
   if (devWrap) devWrap.hidden = ssb;
   if (bwWrap) bwWrap.hidden = !ssb;
-  // The right-hand meter is excursion (NBFM) or level (SSB); retitle it.
+  // The right-hand panel is the FM-excursion meter (NBFM) or a zoom on the RF
+  // spectrum around the tuned frequency (SSB), for fine RX tuning; retitle it.
   const title = document.getElementById("radio-meter-title");
   if (title) {
-    title.textContent = ssb ? "Niveau SSB" : "Excursion FM";
+    title.textContent = ssb ? "Zoom spectre" : "Excursion FM";
     title.title = ssb
-      ? "Niveau audio SSB (enveloppe analytique) — rouge = saturation 0 dBFS"
+      ? "Zoom du spectre RF autour du point de réception (±15 kHz) — pour affiner l'accord"
       : "Déviation FM crête (avant dé-emphase) — rouge = surmodulation";
+  }
+  // The beacon-cal button is SSB-only; updateBeaconCalButton gates it on the
+  // ±10 kHz proximity, but hide it outright when leaving SSB.
+  if (!ssb) {
+    const btn = document.getElementById("radio-beacon-cal");
+    if (btn) btn.hidden = true;
   }
 }
 
@@ -545,7 +862,8 @@ export function seedRadioFreqInput() {
   const input = document.getElementById("radio-freq-input");
   if (input && !input.value && !radioState.tune &&
       Number.isFinite(cfg.rx_freq_hz) && cfg.rx_freq_hz > 0) {
-    input.value = (cfg.rx_freq_hz / 1e6).toFixed(6);
+    // rx_freq_hz is the IF; show the sky frequency (IF + LNB LO when enabled).
+    input.value = ((cfg.rx_freq_hz + skyOffsetHz(cfg)) / 1e6).toFixed(6);
   }
   // Channel width: reflect the persisted deviation (not session-driven).
   const dev = document.getElementById("radio-deviation");
@@ -563,6 +881,55 @@ export function seedRadioFreqInput() {
     bwSel.value = String(Math.round(cfg.ssb_bandwidth_hz));
   }
   applyDemodModeUi(mode);
+  // LNB / TX-shift / TX-power controls reflect the persisted backend config.
+  seedSatControls(cfg);
+}
+
+/// Reflect the persisted LNB / TX-shift / TX-power values into their controls
+/// and refresh the derived TX-frequency read-out.
+export function seedSatControls(cfg) {
+  const ex = (cfg && cfg.backend_extras) || {};
+  const en = document.getElementById("radio-lnb-enable");
+  if (en) en.checked = !!ex.lnb_enabled;
+  const lo = document.getElementById("radio-lnb-lo");
+  if (lo) {
+    const v = Number.isFinite(Number(ex.lnb_lo_hz)) ? Number(ex.lnb_lo_hz) : QO100_LNB_LO_HZ;
+    lo.value = (v / 1e6).toFixed(3);
+  }
+  const sh = document.getElementById("radio-tx-shift");
+  if (sh) {
+    const v = Number.isFinite(Number(ex.tx_rx_shift_hz)) ? Number(ex.tx_rx_shift_hz) : 0;
+    sh.value = (v / 1e6).toFixed(3);
+  }
+  const att = document.getElementById("radio-tx-att");
+  const attLabel = document.getElementById("radio-tx-att-label");
+  if (att) {
+    const v = Number.isFinite(Number(ex.tx_attenuation_db)) ? Number(ex.tx_attenuation_db) : 30;
+    att.value = String(v);
+    if (attLabel) attLabel.textContent = `${v} dB`;
+  }
+  // RF bandwidth is a Pluto knob (SDRplay/RTL lock it) — show the row only there.
+  const rfbwWrap = document.getElementById("radio-rfbw-wrap");
+  const rfbw = document.getElementById("radio-rfbw");
+  const isPluto = (cfg && cfg.backend_id === "pluto") ||
+    getSelectedBackendId("rx-device-select") === "pluto";
+  if (rfbwWrap) rfbwWrap.hidden = !isPluto;
+  if (rfbw && Number.isFinite(Number(cfg.rf_bandwidth_hz))) {
+    rfbw.value = String(Math.round(Number(cfg.rf_bandwidth_hz) / 1000));
+  }
+  updateTxFreqDisplay(currentRadioHz(), cfg);
+}
+
+/// Re-show the dialed sky frequency after the LNB offset changes (the hardware
+/// does NOT move — only the IF↔sky relabel does).
+export function reseedRadioSkyInput(cfg) {
+  const input = document.getElementById("radio-freq-input");
+  if (!input) return;
+  const offset = skyOffsetHz(cfg);
+  const ifHz = radioState.tune
+    ? radioState.tune.displayed_rf_hz
+    : (Number.isFinite(cfg.rx_freq_hz) ? cfg.rx_freq_hz : null);
+  if (ifHz !== null && ifHz > 0) input.value = ((ifHz + offset) / 1e6).toFixed(6);
 }
 
 export function stopRadioRender() {
@@ -578,9 +945,10 @@ export function renderRadio() {
   // only 0-4 kHz of the 0-24 kHz band (= 4000/24000 of the bins) — the voice
   // band fills the panel and the dead high end is dropped.
   drawRadioSpectrum("radio-audio-fft", radioState.audio, "#29B6F6", 4000 / 24000);
-  // The right-hand meter is mode-dependent: FM over-modulation excursion in
-  // NBFM, a linear level meter in SSB (deviation is meaningless there).
-  if (radioState.demodMode === "ssb_usb") drawSsbLevel();
+  // The right-hand panel is mode-dependent: FM over-modulation excursion in
+  // NBFM, a zoom on the RF spectrum around the tuned point in SSB (for fine
+  // tuning — deviation is meaningless there).
+  if (radioState.demodMode === "ssb_usb") drawSpectrumZoom();
   else drawFmExcursion();
   drawRadioRf();
 }
@@ -702,9 +1070,14 @@ export function drawRadioSpectrum(canvasId, frame, color, binFrac = 1) {
   ctx.strokeStyle = color;
   ctx.lineWidth = 1;
   ctx.beginPath();
+  // Peak-preserving downsample: with many more bins than pixels (8192-bin RF
+  // FFT), take the MAX bin per pixel column so narrow signals (beacons) survive.
   for (let x = 0; x < w; x++) {
-    const bi = Math.min(n - 1, Math.floor((x / w) * n));
-    const v = Math.max(0, Math.min(1, (bins[bi] - lo) / span));
+    const b0 = Math.min(n - 1, Math.floor((x / w) * n));
+    const b1 = Math.min(n, Math.max(b0 + 1, Math.floor(((x + 1) / w) * n)));
+    let m = bins[b0];
+    for (let b = b0 + 1; b < b1; b++) if (bins[b] > m) m = bins[b];
+    const v = Math.max(0, Math.min(1, (m - lo) / span));
     const y = h - v * h;
     if (x === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
@@ -836,10 +1209,156 @@ export function drawFmExcursion() {
   }
 }
 
-/// SSB level meter — the linear-mode replacement for the FM-excursion graph.
-/// Scrolling peak bars + RMS line of the analytic envelope (1.0 = full scale),
-/// with a 0 dBFS clip line and a dBFS read-out. No deviation grid (meaningless
-/// for a linear mode).
+// Half-width of the SSB fine-tuning zoom around the tuned point.
+export const ZOOM_HALF_HZ = 10000; // ±10 kHz
+
+/// Show the QO-100 beacon-calibration button only in SSB and within ±10 kHz of
+/// the BPSK beacon (10489.750 MHz sky).
+export function updateBeaconCalButton() {
+  const btn = document.getElementById("radio-beacon-cal");
+  if (!btn) return;
+  const ssb = radioState.demodMode === "ssb_usb";
+  const near = Math.abs(currentRadioHz() - QO100_DOWNLINK_CENTER_HZ) <= 10_000;
+  btn.hidden = !(ssb && near);
+}
+
+/// Calibrate the LNB LO on the QO-100 BPSK beacon. Assumes the operator centred
+/// the zoom on the beacon: shift the LNB LO so the dialed point reads exactly
+/// 10489.750 MHz, then recentre the LO on it (beacon at the spectrum centre).
+export function calibrateToBeacon() {
+  const cfg = activeRadioCfg();
+  if (!cfg) return;
+  cfg.backend_extras = cfg.backend_extras || {};
+  const sky = currentRadioHz();
+  const loOld = Number(cfg.backend_extras.lnb_lo_hz);
+  const delta = QO100_DOWNLINK_CENTER_HZ - sky;
+  cfg.backend_extras.lnb_lo_hz =
+    Math.round((Number.isFinite(loOld) ? loOld : QO100_LNB_LO_HZ) + delta);
+  tuneRadioTo(QO100_DOWNLINK_CENTER_HZ); // relabel the channel + persist
+  invokeRadio("recenter_lo"); // centre the LO on the beacon
+  seedSatControls(cfg);
+  updateRadioTuneDisplay();
+}
+
+/// Reflect the TX-tune button state (idle vs transmitting).
+export function setTuneBtnState(on) {
+  const btn = document.getElementById("radio-tune-tx");
+  if (!btn) return;
+  btn.classList.toggle("tx-on", on);
+  btn.textContent = on ? "■ TX" : "Tune";
+}
+
+/// Start the CW tune carrier (TX). Pluto only, full-duplex; auto-stops after
+/// 30 s on both sides. Power follows the live "Puiss. TX" slider.
+export function startTuneTx() {
+  const deviceName = document.getElementById("rx-device-select")?.value;
+  if (!deviceName) return;
+  const attenDb = Number(document.getElementById("radio-tx-att")?.value);
+  invoke("start_tune", { deviceName, attenDb: Number.isFinite(attenDb) ? attenDb : 30 })
+    .then(() => {
+      radioState.tuning = true;
+      setTuneBtnState(true);
+      if (radioState.tuneTimer) clearTimeout(radioState.tuneTimer);
+      radioState.tuneTimer = setTimeout(() => stopTuneTx(), 30_000);
+    })
+    .catch((err) => {
+      console.error("[tune] start", err);
+      const st = document.getElementById("status");
+      if (st) st.textContent = String(err);
+    });
+}
+
+export function stopTuneTx() {
+  invoke("stop_tune").catch(() => {});
+  radioState.tuning = false;
+  setTuneBtnState(false);
+  if (radioState.tuneTimer) {
+    clearTimeout(radioState.tuneTimer);
+    radioState.tuneTimer = null;
+  }
+}
+
+/// Zoom on the RF spectrum around the tuned point (±ZOOM_HALF_HZ) for fine SSB
+/// tuning — replaces the SSB level meter. Centre marker = the tuned frequency,
+/// ±5/±10 kHz grid. Reuses the smoothed RF frame and the level window.
+export function drawSpectrumZoom() {
+  const canvas = document.getElementById("radio-fm-excursion");
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0a0a0a";
+  ctx.fillRect(0, 0, w, h);
+  updateBeaconCalButton();
+  const frame = radioSmoothedRf();
+  if (!frame || !frame.bins_db || !frame.bins_db.length || !frame.span_hz) return;
+  const bins = frame.bins_db;
+  const n = bins.length;
+  const hzPerBin = frame.span_hz / n;
+  const loEdge = frame.center_hz - frame.span_hz / 2;
+  const tunedIf = radioState.tune ? radioState.tune.displayed_rf_hz : frame.center_hz;
+  const centerBin = (tunedIf - loEdge) / hzPerBin;
+  const halfBins = ZOOM_HALF_HZ / hzPerBin;
+  const b0 = centerBin - halfBins;
+  const binSpan = 2 * halfBins || 1;
+  const [loDb, hiDb] = radioLevelRange();
+  const dbSpan = (hiDb - loDb) || 1;
+  // USB received passband: the SSB filter keeps the upper sideband, from the
+  // tuned carrier up to +ssb_bw. Faint green band (drawn behind the trace) with
+  // an edge line at +ssb_bw — shows exactly what's being received.
+  const ssbBw = Number(document.getElementById("radio-ssb-bw")?.value) || 2700;
+  const pbW = ((ssbBw / hzPerBin) / binSpan) * w;
+  ctx.fillStyle = "rgba(80,200,120,0.10)";
+  ctx.fillRect(w * 0.5, 0, Math.max(1, pbW), h);
+  // ±kHz grid relative to the centre.
+  ctx.font = `${Math.round(9 * dpr)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  for (const k of [-10, -5, 5, 10]) {
+    const x = (w * ((k * 1000) / hzPerBin + halfBins)) / binSpan;
+    if (x < 0 || x > w) continue;
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.fillStyle = "#8a9099";
+    ctx.fillText(`${k > 0 ? "+" : ""}${k}`, x, h - 1);
+  }
+  // Spectrum trace — peak-preserving per pixel (see drawRadioSpectrum).
+  ctx.strokeStyle = "#29B6F6";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x < w; x++) {
+    const bi0 = Math.floor(b0 + (x / w) * binSpan);
+    const bi1 = Math.max(bi0 + 1, Math.floor(b0 + ((x + 1) / w) * binSpan));
+    let m = -Infinity;
+    for (let b = bi0; b < bi1; b++) if (b >= 0 && b < n && bins[b] > m) m = bins[b];
+    const v = m > -Infinity ? Math.max(0, Math.min(1, (m - loDb) / dbSpan)) : 0;
+    const y = h - v * h;
+    if (x === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // Passband upper edge line at +ssb_bw.
+  ctx.strokeStyle = "rgba(80,200,120,0.6)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(w * 0.5 + pbW, 0);
+  ctx.lineTo(w * 0.5 + pbW, h);
+  ctx.stroke();
+  // Centre line = the tuned frequency (the carrier / tuning reference) — bold.
+  ctx.strokeStyle = "rgba(127,209,255,0.95)";
+  ctx.lineWidth = Math.max(1.5, 1.5 * dpr);
+  ctx.beginPath();
+  ctx.moveTo(w * 0.5, 0);
+  ctx.lineTo(w * 0.5, h);
+  ctx.stroke();
+}
+
 export function drawSsbLevel() {
   const canvas = document.getElementById("radio-fm-excursion");
   const ctx = sizeRadioCanvas(canvas);
@@ -975,6 +1494,9 @@ export function drawRadioFreqScale() {
   if (!frame || !frame.span_hz) return;
   const { lo, hi, ticks } = radioRfTicks(frame);
   const span = hi - lo || 1;
+  // Tick positions stay in the IF domain (the spectrum is LO-centred); only the
+  // printed labels carry the LNB offset so they read as sky frequencies.
+  const skyOffset = currentSkyOffsetHz();
   // Fixed ~10 px CSS font, decoupled from the canvas buffer height so the
   // labels stay small even if the strip is ever laid out taller than its
   // 16 px CSS cap. `h` is device px (CSS px × dpr).
@@ -996,8 +1518,9 @@ export function drawRadioFreqScale() {
     ctx.fillStyle = isCenter ? "#7fd1ff" : "#9aa0aa";
     ctx.textAlign = x < w * 0.06 ? "left" : x > w * 0.94 ? "right" : "center";
     // "MHz" unit only on the last tick to keep the ruler uncluttered.
+    const skyF = f + skyOffset;
     const lbl =
-      i === ticks.length - 1 ? `${(f / 1e6).toFixed(3)} MHz` : (f / 1e6).toFixed(3);
+      i === ticks.length - 1 ? `${(skyF / 1e6).toFixed(3)} MHz` : (skyF / 1e6).toFixed(3);
     ctx.fillText(lbl, x, midY + 1.5 * dpr);
   }
 }
@@ -1061,11 +1584,14 @@ export const SNAP_MIN_DB = 6; // peak must beat the local mean by this to snap
 export function radioSnapHz(canvas, clientX) {
   const clickHz = radioFreqAtX(canvas, clientX);
   if (clickHz === null) return null;
+  // radioFreqAtX returns the IF-domain frequency (the spectrum is centred on the
+  // hardware LO); add the LNB offset so we hand tuneRadioTo a sky frequency.
+  const offset = currentSkyOffsetHz();
   // In SSB you tune to the suppressed carrier (the signal sits ABOVE it as
   // USB), so the strongest RF bin is ~1 kHz off the carrier — peak-snap would
   // mistune. Honor the clicked frequency instead, rounded to the 100 Hz.
   if (radioState.demodMode === "ssb_usb") {
-    return Math.round(clickHz / 100) * 100;
+    return Math.round(clickHz / 100) * 100 + offset;
   }
   const frame = radioState.rf;
   if (frame && frame.bins_db && frame.bins_db.length) {
@@ -1108,21 +1634,249 @@ export function radioSnapHz(canvas, clientX) {
         }
       }
       const hz = loEdge + refined * hzPerBin;
-      return Math.round(hz / 100) * 100;
+      return Math.round(hz / 100) * 100 + offset;
     }
   }
   // Fallback: tune exactly where the user clicked, rounded to the kHz.
-  return Math.round(clickHz / 1000) * 1000;
+  return Math.round(clickHz / 1000) * 1000 + offset;
+}
+
+// QO-100 NB transponder band-plan overlay, drawn on the RF spectrum when the
+// QO-100 preset is active. Beacons are the firm anchors (lower/upper CW edges +
+// central BPSK); the CW/SSB/digital segment shading reflects the conventional
+// AMSAT-DL usage zones (indicative). Markers are sky frequencies, mapped to the
+// IF-domain pixel axis via `ifHz = sky − skyOffset` so they track the tuning and
+// the LNB offset; anything off-screen is clipped.
+export const QO100_BAND_MARKERS = [
+  { hz: QO100_BEACON_LOWER_HZ, label: "Bal. CW", color: "#ff7043" },
+  { hz: QO100_DOWNLINK_CENTER_HZ, label: "Bal. BPSK", color: "#7fd1ff" },
+  { hz: QO100_BEACON_UPPER_HZ, label: "Bal. CW", color: "#ff7043" },
+];
+
+export const QO100_BAND_SEGMENTS = [
+  { lo: 10_489_500_000, hi: 10_489_550_000, color: "rgba(255,112,67,0.10)" }, // CW
+  { lo: 10_489_550_000, hi: 10_489_990_000, color: "rgba(120,200,120,0.07)" }, // SSB
+  { lo: 10_489_990_000, hi: 10_490_000_000, color: "rgba(120,160,200,0.12)" }, // digital
+];
+
+export function drawQo100BandPlan(canvasId) {
+  if (!radioState.bandPlanQo100) return;
+  const canvas = document.getElementById(canvasId);
+  const ctx = sizeRadioCanvas(canvas);
+  if (!ctx) return;
+  const frame = radioState.rf;
+  if (!frame || !frame.span_hz) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  const offset = currentSkyOffsetHz();
+  const loEdge = frame.center_hz - frame.span_hz / 2;
+  const xOf = (skyHz) => ((skyHz - offset - loEdge) / frame.span_hz) * w;
+  // Faint usage-segment bands.
+  for (const s of QO100_BAND_SEGMENTS) {
+    let x0 = xOf(s.lo);
+    let x1 = xOf(s.hi);
+    if (x1 < 0 || x0 > w) continue;
+    x0 = Math.max(0, x0);
+    x1 = Math.min(w, x1);
+    ctx.fillStyle = s.color;
+    ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+  }
+  // Beacon markers (dashed verticals) + labels at the top.
+  ctx.font = `${Math.round(9 * dpr)}px sans-serif`;
+  ctx.textBaseline = "top";
+  for (const m of QO100_BAND_MARKERS) {
+    const x = xOf(m.hz);
+    if (x < 0 || x > w) continue;
+    ctx.strokeStyle = m.color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = m.color;
+    ctx.textAlign = x > w * 0.85 ? "right" : x < w * 0.15 ? "left" : "center";
+    ctx.fillText(m.label, Math.max(2, Math.min(w - 2, x)), 2 * dpr);
+  }
+  // Small caption so the overlay reads as the band plan (UI string: French).
+  ctx.fillStyle = "rgba(180,200,255,0.85)";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "bottom";
+  ctx.fillText("Plan QO-100 (bande étroite)", 3 * dpr, h - 2 * dpr);
+}
+
+// Blend factor for the new RF frame in the temporal average. The "Lissage"
+// slider is a smoothing *strength* (0 % = off → α 1, raw); higher = heavier
+// averaging (smaller α). Floored so the display still tracks the band.
+export function radioFftSmoothAlpha() {
+  const pct = parseFloat(document.getElementById("radio-fft-smooth")?.value ?? "0");
+  return Math.max(0.05, 1 - Math.max(0, Math.min(95, pct)) / 100);
+}
+
+// Exponentially-averaged copy of the latest RF frame (dB-domain EMA per bin).
+// Returns the raw frame unchanged when smoothing is off or before the first
+// frame. The average only folds in a genuinely new frame (dedup on seq), so the
+// RAF cadence doesn't bias it.
+export function radioSmoothedRf() {
+  const f = radioState.rf;
+  if (!f || !f.bins_db || !f.bins_db.length) return f;
+  const pct = parseFloat(document.getElementById("radio-fft-smooth")?.value ?? "0");
+  if (!(pct > 0)) return f;
+  const n = f.bins_db.length;
+  let sm = radioState.rfSmoothed;
+  if (!sm || !sm.bins_db || sm.bins_db.length !== n) {
+    sm = { bins_db: Float32Array.from(f.bins_db), center_hz: f.center_hz, span_hz: f.span_hz, seq: f.seq };
+    radioState.rfSmoothed = sm;
+    radioState.rfSmoothSeq = f.seq;
+    return sm;
+  }
+  if (f.seq !== radioState.rfSmoothSeq) {
+    radioState.rfSmoothSeq = f.seq;
+    const a = radioFftSmoothAlpha();
+    const b = f.bins_db;
+    const s = sm.bins_db;
+    for (let i = 0; i < n; i++) s[i] += a * (b[i] - s[i]);
+    sm.center_hz = f.center_hz;
+    sm.span_hz = f.span_hz;
+    sm.seq = f.seq;
+  }
+  return sm;
+}
+
+export function radioHangMs() {
+  const v = parseFloat(document.getElementById("radio-hang-ms")?.value ?? "225");
+  return Number.isFinite(v) && v >= 0 ? v : 225;
+}
+
+export function radioDecayDbS() {
+  const v = parseFloat(document.getElementById("radio-decay-dbs")?.value ?? "55");
+  return Number.isFinite(v) && v >= 0 ? v : 55;
+}
+
+// Peak hang/decay envelope of the RF line spectrum, fed by the smoothed frame.
+// Per bin: instant attack to the input, hold for `hang` ms, then fall at
+// `decay` dB/s (never below the live input). Runs every RAF on real elapsed
+// time so the decay is frame-rate independent. decay = 0 disables it (returns
+// the smoothed frame). Classic SDR peak display — surfaces weak / fleeting
+// signals that a single FFT snapshot drops into the noise.
+export function radioDisplayRf() {
+  const smf = radioSmoothedRf();
+  if (!smf || !smf.bins_db || !smf.bins_db.length) return smf;
+  const decayDbS = radioDecayDbS();
+  if (!(decayDbS > 0)) {
+    radioState.rfHeld = null;
+    return smf;
+  }
+  const n = smf.bins_db.length;
+  const now = performance.now();
+  const hangMs = radioHangMs();
+  let held = radioState.rfHeld;
+  if (!held || !held.bins_db || held.bins_db.length !== n) {
+    held = {
+      bins_db: Float32Array.from(smf.bins_db),
+      center_hz: smf.center_hz,
+      span_hz: smf.span_hz,
+      seq: smf.seq,
+      hangUntil: new Float64Array(n).fill(now + hangMs),
+    };
+    radioState.rfHeld = held;
+    radioState.rfDisplayLastMs = now;
+    return held;
+  }
+  const dt = Math.max(0, (now - (radioState.rfDisplayLastMs || now)) / 1000);
+  radioState.rfDisplayLastMs = now;
+  const drop = decayDbS * dt; // dB to fall this tick
+  const inp = smf.bins_db;
+  const h = held.bins_db;
+  const hu = held.hangUntil;
+  for (let i = 0; i < n; i++) {
+    const x = inp[i];
+    if (x >= h[i]) {
+      h[i] = x; // attack: instant rise
+      hu[i] = now + hangMs;
+    } else if (now >= hu[i]) {
+      h[i] = Math.max(x, h[i] - drop); // decay, floored at the live input
+    } // else: hang (hold)
+  }
+  held.center_hz = smf.center_hz;
+  held.span_hz = smf.span_hz;
+  held.seq = smf.seq;
+  return held;
+}
+
+// Fit the level window to the current spectrum: park the noise floor (robust
+// ~20th-percentile bin) near the bottom and open a ~40 dB window above it
+// (QO-100 SNR tops out ≈ 35 dB), so weak level differences fill the scale.
+export function autoFitLevels() {
+  const f = radioState.rf;
+  if (!f || !f.bins_db || !f.bins_db.length) return;
+  const sorted = Float64Array.from(f.bins_db).sort();
+  const floor = sorted[Math.floor(sorted.length * 0.20)];
+  const lmin = document.getElementById("radio-level-min");
+  const lmax = document.getElementById("radio-level-max");
+  const clampTo = (el, v) => Math.max(Number(el.min), Math.min(Number(el.max), v));
+  if (lmin) lmin.value = String(Math.round(clampTo(lmin, floor - 3)));
+  if (lmax) lmax.value = String(Math.round(clampTo(lmax, floor + 37)));
+  const r = ensureRadioSettings();
+  if (lmin) r.level_min_dbfs = Number(lmin.value);
+  if (lmax) r.level_max_dbfs = Number(lmax.value);
+  emit("settings:persist");
+}
+
+// Faint vertical frequency gridlines over a fully-repainted canvas (RF line
+// spectrum). Not used on the waterfall, whose scroll buffer would smear them.
+export function drawRfGridlines(canvasId, frame) {
+  if (!frame || !frame.span_hz) return;
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
+  const { lo, hi, ticks } = radioRfTicks(frame);
+  const span = hi - lo || 1;
+  for (const f of ticks) {
+    const x = ((f - lo) / span) * w;
+    const isCenter = Math.abs(f - frame.center_hz) < span * 0.01;
+    ctx.strokeStyle = isCenter ? "rgba(127,209,255,0.35)" : "rgba(255,255,255,0.07)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+}
+
+// Thin vertical line at the tuned frequency, over a fully-repainted canvas (the
+// RF spectrum). The waterfall gets its own scrolling marker column below.
+export function drawTunedMarker(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const x = Math.round(canvas.width * radioMarkerFrac()) + 0.5;
+  ctx.strokeStyle = "rgba(127,209,255,0.85)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, canvas.height);
+  ctx.stroke();
 }
 
 export function drawRadioRf() {
   // Top: line spectrum (with frequency gridlines). Middle: shared Hz
   // ruler. Bottom: scrolling waterfall — all three share the same
-  // horizontal Hz mapping from the latest RF frame.
-  drawRadioSpectrum("radio-rf-fft", radioState.rf, "#9CCC65");
+  // horizontal Hz mapping from the latest RF frame. The line spectrum uses the
+  // peak hang/decay envelope (over the smoothed frame); the waterfall uses the
+  // smoothed frame (time is its own axis). Geometry overlays read identical
+  // center/span from either.
+  const wfFrame = radioSmoothedRf();
+  const lineFrame = radioDisplayRf();
+  drawRadioSpectrum("radio-rf-fft", lineFrame, "#9CCC65");
   drawRfDbGraticule("radio-rf-fft");
-  drawRfGridlines("radio-rf-fft", radioState.rf);
+  drawRfGridlines("radio-rf-fft", lineFrame);
   drawTunedMarker("radio-rf-fft");
+  drawQo100BandPlan("radio-rf-fft");
   drawRadioFreqScale();
   const canvas = document.getElementById("radio-waterfall");
   const ctx = sizeRadioCanvas(canvas);
@@ -1141,7 +1895,7 @@ export function drawRadioRf() {
     radioState.wfH = h;
     radioState.lastWfSeq = -1;
   }
-  const frame = radioState.rf;
+  const frame = wfFrame;
   if (!frame || !frame.bins_db || !frame.bins_db.length) return;
   if (frame.seq === radioState.lastWfSeq) return; // no new frame
   radioState.lastWfSeq = frame.seq;
@@ -1156,8 +1910,12 @@ export function drawRadioRf() {
   const centerX = Math.round((w - 1) * radioMarkerFrac());
   const row = ctx.createImageData(w, 1);
   for (let x = 0; x < w; x++) {
-    const bi = Math.min(n - 1, Math.floor((x / w) * n));
-    const v = Math.max(0, Math.min(1, (bins[bi] - lo) / span));
+    // Peak-preserving downsample (max bin per pixel column) — see drawRadioSpectrum.
+    const b0 = Math.min(n - 1, Math.floor((x / w) * n));
+    const b1 = Math.min(n, Math.max(b0 + 1, Math.floor(((x + 1) / w) * n)));
+    let m = bins[b0];
+    for (let b = b0 + 1; b < b1; b++) if (bins[b] > m) m = bins[b];
+    const v = Math.max(0, Math.min(1, (m - lo) / span));
     const idx = Math.min(255, Math.max(0, Math.round(v * 255)));
     if (x === centerX) {
       // Tint the centre column so a continuous tuned-frequency marker

@@ -140,6 +140,11 @@ struct AppState {
     /// Radio-tab control channel for the active SDR session. `Some` only
     /// while an SDR capture with Radio support is running.
     radio: Mutex<Option<RadioControl>>,
+    /// CW "tune" carrier control. `tune_stop`/`tune_atten` are `Some` while a
+    /// tune carrier thread is running: set the bool to end it, store into the
+    /// u32 (attenuation dB × 100) to ride the power live.
+    tune_stop: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    tune_atten: Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -617,7 +622,15 @@ fn build_capture_session(
             {
                 let tuning = device.capabilities().radio_tuning.clone();
                 let input_rate = device.capabilities().sample_rate_strategy.host_iq_rate_hz as u32;
-                let tuner = RadioTuner::new(&tuning, sdr_cfg.rx_freq_hz, input_rate);
+                let mut tuner = RadioTuner::new(&tuning, sdr_cfg.rx_freq_hz, input_rate);
+                // Wideband captures (QO-100, rf_bandwidth ≥ 450 kHz) pin the LO
+                // across the whole transponder so panning the channel within it
+                // never recenters the spectrum. Widen the digital window toward
+                // Nyquist (clamped inside the tuner); ~280 kHz at the 576 kHz span
+                // covers the ±250 kHz beacons with margin.
+                if sdr_cfg.rf_bandwidth_hz.is_some_and(|bw| bw >= 450_000) {
+                    tuner.set_digital_window_hz(280_000.0);
+                }
                 radio_setup = Some(RadioSetup {
                     telemetry,
                     control,
@@ -734,6 +747,104 @@ fn set_radio_freq(hz: u64, state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn recenter_lo(state: State<'_, AppState>) -> Result<(), String> {
     send_radio_cmd(&state, RadioUiCommand::Recenter)
+}
+
+/// Start a CW "tune" carrier on the Pluto TX (uplink). Full-duplex with a
+/// running RX; auto-stops after 30 s. `atten_db` is the initial TX attenuation;
+/// `set_tune_power` rides it live. Pluto-only (it's the only TX backend).
+#[tauri::command]
+fn start_tune(
+    device_name: String,
+    atten_db: f64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (backend, device_id) = sdr_registry::parse_composite_name(&device_name)
+        .ok_or_else(|| "Périphérique inconnu.".to_string())?;
+    if backend.id() != "pluto" {
+        return Err("La fonction Tune n'est disponible que sur le Pluto.".into());
+    }
+    #[cfg(feature = "pluto")]
+    {
+        let cfg = settings::load().sdr_config_for("pluto", device_id);
+        if cfg.tx_freq_hz == 0 {
+            return Err("Fréquence TX nulle — accordez d'abord (QO-100).".into());
+        }
+        // End any previous tune first.
+        if let Some(old) = state.tune_stop.lock().unwrap().take() {
+            old.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let atten = Arc::new(std::sync::atomic::AtomicU32::new(
+            (atten_db.clamp(0.0, 89.75) * 100.0) as u32,
+        ));
+        let (uri, tx_lo) = (device_id.to_string(), cfg.tx_freq_hz);
+        let (stop_t, atten_t) = (stop.clone(), atten.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = modem_pluto::tx::run_tune_carrier(
+                &uri,
+                tx_lo,
+                modem_pluto::PREFERRED_SAMPLE_RATE_HZ,
+                &stop_t,
+                &atten_t,
+                30,
+            ) {
+                eprintln!("[tune] {e}");
+            }
+        });
+        *state.tune_stop.lock().unwrap() = Some(stop);
+        *state.tune_atten.lock().unwrap() = Some(atten);
+        Ok(())
+    }
+    #[cfg(not(feature = "pluto"))]
+    {
+        let _ = (device_id, atten_db, &state);
+        Err("Support Pluto non compilé.".into())
+    }
+}
+
+/// Stop the CW tune carrier (if any).
+#[tauri::command]
+fn stop_tune(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(stop) = state.tune_stop.lock().unwrap().take() {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    *state.tune_atten.lock().unwrap() = None;
+    Ok(())
+}
+
+/// Ride the tune-carrier TX power live (attenuation in dB). No-op if not tuning.
+#[tauri::command]
+fn set_tune_power(atten_db: f64, state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(atten) = state.tune_atten.lock().unwrap().as_ref() {
+        atten.store(
+            (atten_db.clamp(0.0, 89.75) * 100.0) as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Ok(())
+}
+
+/// Live TX RF power (Pluto): write the AD9361 TX hardware gain on a side
+/// connection so it takes effect immediately on an in-progress image/voice TX —
+/// the Radio-tab power slider rides this. No-op for non-Pluto backends.
+#[tauri::command]
+fn set_tx_power(device_name: String, atten_db: f64) -> Result<(), String> {
+    let (backend, device_id) = match sdr_registry::parse_composite_name(&device_name) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    if backend.id() != "pluto" {
+        return Ok(());
+    }
+    #[cfg(feature = "pluto")]
+    {
+        modem_pluto::tx::set_tx_hardwaregain(device_id, atten_db).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(feature = "pluto"))]
+    {
+        let _ = (device_id, atten_db);
+    }
+    Ok(())
 }
 
 /// Set RX gain. `agc_mode = "manual"` uses `gain_db`; any other value is
@@ -2454,6 +2565,8 @@ fn main() {
                 ptt,
                 sounder_capture: Mutex::new(None),
                 radio: Mutex::new(None),
+                tune_stop: Mutex::new(None),
+                tune_atten: Mutex::new(None),
             });
             // Auto-kiosk on tiny touchscreens (e.g. Pi 7" 800x480) or
             // when `NBFM_KIOSK=1` is set in the environment. Both paths
@@ -2569,6 +2682,10 @@ fn main() {
             delete_history_item,
             set_radio_freq,
             recenter_lo,
+            start_tune,
+            stop_tune,
+            set_tune_power,
+            set_tx_power,
             set_rx_gain,
             set_radio_gain,
             set_antenna,

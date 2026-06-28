@@ -35,10 +35,10 @@ use modem_sdr::config::GainSetting;
 use modem_sdr::telemetry::{DemodMode, RadioCommand, RadioTelemetry, SpectrumFrame, TuneState};
 use modem_sdr_dsp::{NbfmRxChainConfig, RxChain, SpectrumAnalyzer, SsbRxChainConfig, AUDIO_RATE};
 
-/// FFT size for the wideband RF spectrum / waterfall. 2048 bins over a
-/// 576 kHz span ≈ 281 Hz/bin — fine enough to see individual NBFM
-/// channels, cheap enough to run several times a second.
-const RF_FFT_SIZE: usize = 2048;
+/// FFT size for the wideband RF spectrum / waterfall. 8192 bins over a
+/// 576 kHz span ≈ 70 Hz/bin — fine enough for the SSB fine-tuning zoom (the
+/// GUI shows a ±10 kHz slice) while still cheap at the 80 ms emit cadence.
+const RF_FFT_SIZE: usize = 8192;
 
 /// FFT size for the demodulated-audio spectrum. 4096 over the 0–24 kHz
 /// half-band ≈ 11.7 Hz/bin — fine enough to resolve the voice-band detail in

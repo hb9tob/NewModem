@@ -193,6 +193,16 @@ pub struct RadioUiSettings {
     pub monitor_volume: f32,
     /// S-meter calibration trim in dB, added to the dBFS→dBm estimate.
     pub smeter_cal_trim_db: f32,
+    /// RF FFT temporal-smoothing strength, 0..95 % (0 = off).
+    pub fft_smooth_pct: f32,
+    /// Spectrum peak-hold "hang" time in ms before the decay starts.
+    pub hang_ms: f32,
+    /// Spectrum peak-hold decay rate in dB/s (0 = disabled).
+    pub decay_db_s: f32,
+    /// Bottom of the spectrum/waterfall level window, dBFS.
+    pub level_min_dbfs: f32,
+    /// Top of the spectrum/waterfall level window, dBFS.
+    pub level_max_dbfs: f32,
 }
 
 impl Default for RadioUiSettings {
@@ -203,6 +213,11 @@ impl Default for RadioUiSettings {
             monitor_device: None,
             monitor_volume: 0.80,
             smeter_cal_trim_db: 0.0,
+            fft_smooth_pct: 50.0,
+            hang_ms: 225.0,
+            decay_db_s: 55.0,
+            level_min_dbfs: -120.0,
+            level_max_dbfs: -20.0,
         }
     }
 }

@@ -15,7 +15,7 @@ import { startCapture, tryAutoStartCapture, startCaptureFromWav, stopCapture } f
 import { refreshSessions, upsertSession, renderSessionsTable } from "./tabs/sessions.js";
 import { setupChannelTab } from "./tabs/channel.js";
 import { setupSounderTab } from "./tabs/sounder.js";
-import { ensureRadioSettings, radioState, refreshRadioTabVisibility, updateRadioTuneDisplay, tuneRadioTo, setupRadioTab, setupRadioSdrModal, startRadioRender, stopRadioRender, radioRfTicks, radioMarkerFrac, drawRadioRf } from "./tabs/radio.js";
+import { ensureRadioSettings, radioState, refreshRadioTabVisibility, updateRadioTuneDisplay, tuneRadioTo, setupRadioTab, setupRadioSdrModal, startRadioRender, stopRadioRender } from "./tabs/radio.js";
 import { refreshSettingsRxWarn, loadDevices, applyTurboModeStyling, applyRxForceSettingsToUI, loadModemProfiles, applyExperimentalModesToUI, applyPttSettingsToUI, loadSerialPorts, renderPttStatus, persistSettings, setupSettingsTab, loadSaveDir } from "./tabs/settings.js";
 import { makeDefaultOverlays, ensureOverlaySlots, getActiveOverlayPayload, setupOverlaysTab, applyOverlaysToUI } from "./tabs/overlays.js";
 import { setupHistoryTab, refreshHistory } from "./tabs/history.js";
@@ -577,46 +577,6 @@ async function setupAppVersionChip() {
     console.error("get_app_version", e);
     el.textContent = "v?";
   }
-}
-
-// Faint vertical frequency gridlines over a fully-repainted canvas (RF
-// line spectrum). Not used on the waterfall, whose scroll buffer would
-// smear them.
-function drawRfGridlines(canvasId, frame) {
-  if (!frame || !frame.span_hz) return;
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-  const { lo, hi, ticks } = radioRfTicks(frame);
-  const span = hi - lo || 1;
-  for (const f of ticks) {
-    const x = ((f - lo) / span) * w;
-    const isCenter = Math.abs(f - frame.center_hz) < span * 0.01;
-    ctx.strokeStyle = isCenter ? "rgba(127,209,255,0.35)" : "rgba(255,255,255,0.07)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-  }
-}
-
-// Thin vertical line at the tuned frequency, drawn over a fully-repainted
-// canvas (the RF spectrum). The waterfall gets its own scrolling marker
-// column inside drawRadioRf.
-function drawTunedMarker(canvasId) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  const x = Math.round(canvas.width * radioMarkerFrac()) + 0.5;
-  ctx.strokeStyle = "rgba(127,209,255,0.85)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(x, 0);
-  ctx.lineTo(x, canvas.height);
-  ctx.stroke();
 }
 
 // Bridge the SDR subsystem's upward effects to the functions that still live

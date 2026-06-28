@@ -192,7 +192,13 @@ export function makeDefaultSdrConfig(backendId) {
       bias_t: false, fm_notch: false, dab_notch: false,
       ctcss_freq_hz: 0.0, ctcss_level: 0.1,
       rf_bandwidth_hz: 200_000,
-      backend_extras: { tx_attenuation_db: 30.0, prefer_low_rate: true },
+      // lnb_*/tx_rx_shift_hz: satellite/cross-band display offsets read by the
+      // Radio tab (sky = displayed_rf + lnb_lo; TX = sky + shift). 9750 MHz =
+      // standard universal LNB; off by default → terrestrial behaviour unchanged.
+      backend_extras: {
+        tx_attenuation_db: 30.0, prefer_low_rate: true,
+        lnb_lo_hz: 9_750_000_000, lnb_enabled: false, tx_rx_shift_hz: 0,
+      },
     };
   }
   if (backendId === "sdrplay") {
@@ -206,7 +212,10 @@ export function makeDefaultSdrConfig(backendId) {
       bias_t: false, fm_notch: false, dab_notch: false,
       ctcss_freq_hz: 0.0, ctcss_level: 0.1,
       rf_bandwidth_hz: null,
-      backend_extras: { tuner: "B", decimation: 4 },
+      backend_extras: {
+        tuner: "B", decimation: 4,
+        lnb_lo_hz: 9_750_000_000, lnb_enabled: false, tx_rx_shift_hz: 0,
+      },
     };
   }
   if (backendId === "rtlsdr") {
@@ -224,7 +233,10 @@ export function makeDefaultSdrConfig(backendId) {
       bias_t: false, fm_notch: false, dab_notch: false,
       ctcss_freq_hz: 0.0, ctcss_level: 0.1,
       rf_bandwidth_hz: null,
-      backend_extras: { ppm_correction: 0, direct_sampling: false },
+      backend_extras: {
+        ppm_correction: 0, direct_sampling: false,
+        lnb_lo_hz: 9_750_000_000, lnb_enabled: false, tx_rx_shift_hz: 0,
+      },
     };
   }
   return {
@@ -237,7 +249,7 @@ export function makeDefaultSdrConfig(backendId) {
     bias_t: false, fm_notch: false, dab_notch: false,
     ctcss_freq_hz: 0.0, ctcss_level: 0.1,
     rf_bandwidth_hz: null,
-    backend_extras: {},
+    backend_extras: { lnb_lo_hz: 9_750_000_000, lnb_enabled: false, tx_rx_shift_hz: 0 },
   };
 }
 
@@ -280,7 +292,11 @@ export function renderSdrPanel(direction) {
   panel.dataset.backend = backendId;
   const cfg = ensureBackendConfig(backendId);
   rowsEl.innerHTML = "";
-  rowsEl.appendChild(buildFreqRow(direction, backendId, caps, cfg));
+  // TX frequency is derived from the Radio tab (TX = RX + shift), so the TX
+  // panel has no standalone frequency field — only RX shows one here.
+  if (direction === "rx") {
+    rowsEl.appendChild(buildFreqRow(direction, backendId, caps, cfg));
+  }
   if (caps.agc_modes && caps.agc_modes.length > 0) {
     rowsEl.appendChild(buildAgcRow(direction, backendId, caps, cfg));
   }
