@@ -624,6 +624,11 @@ pub struct V3Session {
     /// 2-preamble estimate primary and gates the gardner fallback. Requires a
     /// worker (or the diag harness) that services `RewindRequest`.
     two_preamble_enabled: bool,
+    /// Use the pulp-vectorised `decode_soft_simd` instead of the scalar
+    /// `decode_soft` in the turbo loop (env `V3_LDPC_SIMD`). Bit-identical
+    /// output (proven by `grouped_decode_is_bit_exact_vs_scalar`); opt-in until
+    /// validated on a reference OTA capture, then flipped to default-on.
+    ldpc_simd: bool,
     /// True while a `replay_from_anchor` is re-ingesting buffered audio, so the
     /// étage-B estimator does not emit a nested `RewindRequest` mid-replay.
     replaying: bool,
@@ -876,6 +881,7 @@ impl V3Session {
             preamble1_refined_abs: None,
             two_preamble_attempted: false,
             two_preamble_enabled: std::env::var_os("V3_2PRE_DRIFT").is_some(),
+            ldpc_simd: std::env::var_os("V3_LDPC_SIMD").is_some(),
             replaying: false,
             turbo_sync_enabled: std::env::var_os("V3_NO_TURBO_SYNC").is_none(),
             drift_recommits: 0,
@@ -2191,8 +2197,13 @@ impl V3Session {
                     soft_demod::llr_maxlog(cw_syms, &self.constellation, last_sigma2)
                 };
                 let llr_deint = interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
-                let (info_bits, extrinsic_n, converged) =
-                    self.decoder.decode_soft(&llr_deint[..n], None, damp);
+                // Bit-identical SIMD twin (env V3_LDPC_SIMD); default scalar path
+                // is byte-for-byte the OTA-validated one until capture-validated.
+                let (info_bits, extrinsic_n, converged) = if self.ldpc_simd {
+                    self.decoder.decode_soft_simd(&llr_deint[..n], None, damp)
+                } else {
+                    self.decoder.decode_soft(&llr_deint[..n], None, damp)
+                };
                 if !results[cw_idx].1 {
                     // info bits -> bytes (MSB-first), truncate to k_bytes.
                     let bytes: Vec<u8> = info_bits

@@ -111,6 +111,67 @@ pub fn expand(bm: &BaseMatrix) -> SparseH {
     }
 }
 
+/// Circulant-grouped view of the base matrix for the SIMD/grouped decoder.
+///
+/// The expanded H is an array of z×z circulant (cyclically shifted identity)
+/// blocks. The layered (row-layered) decoder processes one BASE row at a time;
+/// the z expanded rows of a base row are mutually independent parity checks
+/// (each touches a *distinct* variable per base column, since the circulant is a
+/// permutation), so they can be processed across z lanes with bit-identical
+/// results to the scalar per-row loop — this is exactly the structure the
+/// grouped/SIMD decoder exploits.
+///
+/// `layers[br]` lists the base-row's non-zero edges as `(base_col, shift)`,
+/// sorted by `base_col` ascending. That order matches the per-row column order
+/// of [`SparseH::row_indices`] (which `expand` sorts by absolute column index):
+/// because each base column lands in its own length-`Z` block, ascending
+/// absolute column ⇔ ascending base column, identically for every lane. Keeping
+/// the same edge order preserves the scalar decoder's first-minimum tie-break,
+/// so the grouped decode is byte-for-byte identical to the scalar one.
+pub struct GroupedH {
+    /// Circulant expansion factor (z = 96).
+    pub z: usize,
+    /// Number of base rows (layers).
+    pub n_base_rows: usize,
+    /// Number of base columns (always 24).
+    pub n_base_cols: usize,
+    /// Per base row: `(base_col, shift)` edges, ascending `base_col`.
+    pub layers: Vec<Vec<(usize, usize)>>,
+    /// Per base row: start offset into a flat `[edge * z + lane]` message buffer.
+    pub layer_offsets: Vec<usize>,
+    /// Total length of the flat message buffer (`Σ edges · z`).
+    pub total_edge_lanes: usize,
+}
+
+/// Build the [`GroupedH`] circulant view of a base matrix. The edge order per
+/// layer matches `expand`'s sorted `row_indices`, so a grouped decode is
+/// bit-identical to the scalar one (see [`GroupedH`]).
+pub fn group(bm: &BaseMatrix) -> GroupedH {
+    let mut layers: Vec<Vec<(usize, usize)>> = Vec::with_capacity(bm.n_rows);
+    let mut layer_offsets: Vec<usize> = Vec::with_capacity(bm.n_rows);
+    let mut off = 0usize;
+    for br in 0..bm.n_rows {
+        let mut edges = Vec::new();
+        for bc in 0..bm.n_cols {
+            let shift = bm.get(br, bc);
+            if shift >= 0 {
+                edges.push((bc, shift as usize));
+            }
+        }
+        layer_offsets.push(off);
+        off += edges.len() * Z;
+        layers.push(edges);
+    }
+    GroupedH {
+        z: Z,
+        n_base_rows: bm.n_rows,
+        n_base_cols: bm.n_cols,
+        layers,
+        layer_offsets,
+        total_edge_lanes: off,
+    }
+}
+
 // ===========================================================================
 // Base matrices from IEEE 802.16e-2005
 // ===========================================================================

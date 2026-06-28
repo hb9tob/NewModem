@@ -12,3 +12,6 @@ modem-framing = { path = "../modem-framing" }
 realfft = "3"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
+# Stable, portable SIMD with runtime AVX2 (x86_64) / NEON (aarch64) dispatch —
+# used by the grouped QC-LDPC decoder's bit-exact f32 kernel (decode_soft).
+pulp = "0.21"

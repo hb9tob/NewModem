@@ -6,7 +6,8 @@
 //! ~0.2 dB loss vs full BP, acceptable for our SNR margins.
 
 use crate::profile::LdpcRate;
-use super::wimax::{self, SparseH};
+use super::wimax::{self, GroupedH, SparseH};
+use pulp::{Arch, Simd, WithSimd};
 
 /// LNMS normalization factor.
 const ALPHA: f32 = 0.75;
@@ -17,6 +18,7 @@ const LLR_CLIP: f32 = 25.0;
 pub struct LdpcDecoder {
     rate: LdpcRate,
     h: SparseH,
+    grouped: GroupedH,
     k: usize,
     n: usize,
     m: usize,
@@ -27,10 +29,11 @@ impl LdpcDecoder {
     pub fn new(rate: LdpcRate, max_iter: usize) -> Self {
         let bm = wimax::base_matrix(rate);
         let h = wimax::expand(&bm);
+        let grouped = wimax::group(&bm);
         let k = rate.k();
         let n = rate.n();
         let m = n - k;
-        LdpcDecoder { rate, h, k, n, m, max_iter }
+        LdpcDecoder { rate, h, grouped, k, n, m, max_iter }
     }
 
     /// Decode LLR values (length = n = 2304) into info bits.
@@ -249,8 +252,306 @@ impl LdpcDecoder {
         (info_bits, extrinsic, converged)
     }
 
+    /// SIMD-friendly grouped twin of [`decode_soft`], producing **bit-identical**
+    /// output (info bits, extrinsic, converged flag) — verified by
+    /// `grouped_decode_is_bit_exact_vs_scalar`. It walks the QC base matrix
+    /// layer by layer and processes the `z` circulant rows of each layer across
+    /// lanes (here a scalar `for lane`; the pulp SIMD kernel will replace only
+    /// the lane loops). Within a layer the `z` rows touch *disjoint* variables,
+    /// and every channel read (pass A) happens before any write (pass C), so the
+    /// lane-parallel order is indistinguishable from the scalar per-row sweep
+    /// (see [`super::wimax::GroupedH`]).
+    ///
+    /// The grouped layout also reuses flat scratch buffers across iterations
+    /// instead of `decode_soft`'s per-call `Vec<Vec<f32>>` — already most of the
+    /// speed-up before any vectorisation. `decode_soft` is left byte-identical so
+    /// the OTA-validated path is untouched until this twin is validated and wired.
+    pub fn decode_soft_grouped(
+        &self,
+        channel_llr: &[f32],
+        apriori_llr: Option<&[f32]>,
+        extrinsic_damp: f32,
+    ) -> (Vec<u8>, Vec<f32>, bool) {
+        assert_eq!(channel_llr.len(), self.n);
+        if let Some(a) = apriori_llr {
+            assert_eq!(a.len(), self.n);
+        }
+        let z = self.grouped.z;
+        let g = &self.grouped;
+
+        // Seed = (channel + a-priori), clamped — identical to `decode_soft`.
+        let seed: Vec<f32> = (0..self.n)
+            .map(|i| {
+                let ap = apriori_llr.map_or(0.0, |a| a[i]);
+                (channel_llr[i] + ap).clamp(-LLR_CLIP, LLR_CLIP)
+            })
+            .collect();
+        let mut total_llr: Vec<f32> = seed.clone();
+
+        // Flat check-to-variable messages: r_msgs[layer_offset + edge*z + lane].
+        let mut r_msgs: Vec<f32> = vec![0.0f32; g.total_edge_lanes];
+
+        // Reusable per-layer scratch (sized to the widest layer).
+        let max_deg = g.layers.iter().map(|e| e.len()).max().unwrap_or(0);
+        let mut q_buf: Vec<f32> = vec![0.0f32; max_deg * z];
+        let mut min1 = vec![0.0f32; z];
+        let mut min2 = vec![0.0f32; z];
+        let mut min1_idx = vec![0usize; z];
+        let mut sign = vec![1.0f32; z];
+
+        let mut converged = false;
+        for _iter in 0..self.max_iter {
+            for (br, edges) in g.layers.iter().enumerate() {
+                let d = edges.len();
+                let base = g.layer_offsets[br];
+                // Pass A: q[e,lane] = total[col(e,lane)] - r[e,lane].
+                for (e, &(bc, s)) in edges.iter().enumerate() {
+                    let qo = e * z;
+                    let ro = base + e * z;
+                    let cb = bc * z;
+                    for lane in 0..z {
+                        let col = cb + (lane + s) % z;
+                        q_buf[qo + lane] = total_llr[col] - r_msgs[ro + lane];
+                    }
+                }
+                // Pass B: per-lane min1 / min2 / argmin / sign over the d edges
+                // (strict `<`, first-minimum index — exactly the scalar order).
+                for lane in 0..z {
+                    let mut m1 = f32::INFINITY;
+                    let mut m2 = f32::INFINITY;
+                    let mut idx = 0usize;
+                    let mut sg = 1.0f32;
+                    for e in 0..d {
+                        let q = q_buf[e * z + lane];
+                        let a = q.abs();
+                        if q < 0.0 {
+                            sg = -sg;
+                        }
+                        if a < m1 {
+                            m2 = m1;
+                            m1 = a;
+                            idx = e;
+                        } else if a < m2 {
+                            m2 = a;
+                        }
+                    }
+                    min1[lane] = m1;
+                    min2[lane] = m2;
+                    min1_idx[lane] = idx;
+                    sign[lane] = sg;
+                }
+                // Pass C: write new r + update total (disjoint columns per lane).
+                for (e, &(bc, s)) in edges.iter().enumerate() {
+                    let qo = e * z;
+                    let ro = base + e * z;
+                    let cb = bc * z;
+                    for lane in 0..z {
+                        let q = q_buf[qo + lane];
+                        let sign_j = if q < 0.0 { -sign[lane] } else { sign[lane] };
+                        let mag = if e == min1_idx[lane] { min2[lane] } else { min1[lane] };
+                        let new_r = (ALPHA * sign_j * mag).clamp(-LLR_CLIP, LLR_CLIP);
+                        let col = cb + (lane + s) % z;
+                        total_llr[col] += new_r - r_msgs[ro + lane];
+                        r_msgs[ro + lane] = new_r;
+                    }
+                }
+            }
+            if self.check_syndrome(&total_llr) {
+                converged = true;
+                break;
+            }
+        }
+
+        let info_bits: Vec<u8> = total_llr[..self.k]
+            .iter()
+            .map(|&l| if l < 0.0 { 1 } else { 0 })
+            .collect();
+        let extrinsic: Vec<f32> = (0..self.n)
+            .map(|i| (extrinsic_damp * (total_llr[i] - seed[i])).clamp(-LLR_CLIP, LLR_CLIP))
+            .collect();
+        (info_bits, extrinsic, converged)
+    }
+
+    /// pulp-vectorised twin of [`decode_soft_grouped`] — same grouped layout and
+    /// the same per-lane f32 operations, but the `z`-wide lane loops run on AVX2
+    /// (x86_64) / NEON (aarch64) via runtime dispatch, falling back to scalar
+    /// where neither is present. **Bit-identical** to `decode_soft` (verified by
+    /// `simd_decode_is_bit_exact_vs_scalar`): every lane replicates the scalar
+    /// min1/min2/argmin/sign reduction with the same operation order and no
+    /// cross-lane reduction, and the circulant shift is materialised by two
+    /// contiguous copies, so no result-changing reorder occurs.
+    pub fn decode_soft_simd(
+        &self,
+        channel_llr: &[f32],
+        apriori_llr: Option<&[f32]>,
+        extrinsic_damp: f32,
+    ) -> (Vec<u8>, Vec<f32>, bool) {
+        assert_eq!(channel_llr.len(), self.n);
+        if let Some(a) = apriori_llr {
+            assert_eq!(a.len(), self.n);
+        }
+        let z = self.grouped.z;
+        let seed: Vec<f32> = (0..self.n)
+            .map(|i| {
+                let ap = apriori_llr.map_or(0.0, |a| a[i]);
+                (channel_llr[i] + ap).clamp(-LLR_CLIP, LLR_CLIP)
+            })
+            .collect();
+        let mut total_llr = seed.clone();
+        let mut r_msgs = vec![0.0f32; self.grouped.total_edge_lanes];
+        let max_deg = self.grouped.layers.iter().map(|e| e.len()).max().unwrap_or(0);
+        let mut q_buf = vec![0.0f32; max_deg * z];
+        let mut rot = vec![0.0f32; z];
+        let mut rot_delta = vec![0.0f32; z];
+
+        let converged = Arch::new().dispatch(SoftKernel {
+            dec: self,
+            total: &mut total_llr,
+            r_msgs: &mut r_msgs,
+            q_buf: &mut q_buf,
+            rot: &mut rot,
+            rot_delta: &mut rot_delta,
+        });
+
+        let info_bits: Vec<u8> = total_llr[..self.k]
+            .iter()
+            .map(|&l| if l < 0.0 { 1 } else { 0 })
+            .collect();
+        let extrinsic: Vec<f32> = (0..self.n)
+            .map(|i| (extrinsic_damp * (total_llr[i] - seed[i])).clamp(-LLR_CLIP, LLR_CLIP))
+            .collect();
+        (info_bits, extrinsic, converged)
+    }
+
     pub fn k(&self) -> usize { self.k }
     pub fn n(&self) -> usize { self.n }
+}
+
+/// SIMD kernel backing [`LdpcDecoder::decode_soft_simd`]. Runs the whole
+/// layered loop inside one pulp dispatch (amortising feature detection); each
+/// lane reproduces the scalar per-row min-sum exactly — see the method doc.
+struct SoftKernel<'a> {
+    dec: &'a LdpcDecoder,
+    total: &'a mut [f32],
+    r_msgs: &'a mut [f32],
+    q_buf: &'a mut [f32],
+    rot: &'a mut [f32],
+    rot_delta: &'a mut [f32],
+}
+
+impl WithSimd for SoftKernel<'_> {
+    type Output = bool;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> bool {
+        let SoftKernel { dec, total, r_msgs, q_buf, rot, rot_delta } = self;
+        let g = &dec.grouped;
+        let z = g.z;
+        let lanes = core::mem::size_of::<S::f32s>() / core::mem::size_of::<f32>();
+        debug_assert_eq!(z % lanes, 0, "z must be a multiple of the SIMD lane count");
+        let nchunks = z / lanes;
+
+        let inf = simd.splat_f32s(f32::INFINITY);
+        let zero = simd.splat_f32s(0.0);
+        let one = simd.splat_f32s(1.0);
+        let alpha = simd.splat_f32s(ALPHA);
+        let lo = simd.splat_f32s(-LLR_CLIP);
+        let hi = simd.splat_f32s(LLR_CLIP);
+
+        // Per-lane reduction state, one SIMD register per z-chunk.
+        let mut min1 = vec![inf; nchunks];
+        let mut min2 = vec![inf; nchunks];
+        let mut idxf = vec![zero; nchunks];
+        let mut sign = vec![one; nchunks];
+
+        let mut converged = false;
+        for _iter in 0..dec.max_iter {
+            for (br, edges) in g.layers.iter().enumerate() {
+                let base = g.layer_offsets[br];
+                let d = edges.len();
+
+                // PASS A: q = rotate(total_block, s) - r, per edge.
+                for (e, &(bc, s)) in edges.iter().enumerate() {
+                    let cb = bc * z;
+                    rot[..z - s].copy_from_slice(&total[cb + s..cb + z]);
+                    rot[z - s..].copy_from_slice(&total[cb..cb + s]);
+                    let (rotv, _) = S::as_simd_f32s(&rot[..]);
+                    let (rv, _) = S::as_simd_f32s(&r_msgs[base + e * z..base + e * z + z]);
+                    let (qv, _) = S::as_mut_simd_f32s(&mut q_buf[e * z..e * z + z]);
+                    for k in 0..nchunks {
+                        qv[k] = simd.sub_f32s(rotv[k], rv[k]);
+                    }
+                }
+
+                // PASS B: per-lane min1 / min2 / argmin / sign over the d edges
+                // (strict `<`, first-minimum index — exactly the scalar order).
+                for k in 0..nchunks {
+                    min1[k] = inf;
+                    min2[k] = inf;
+                    idxf[k] = zero;
+                    sign[k] = one;
+                }
+                for e in 0..d {
+                    let ef = simd.splat_f32s(e as f32);
+                    let (qv, _) = S::as_simd_f32s(&q_buf[e * z..e * z + z]);
+                    for k in 0..nchunks {
+                        let q = qv[k];
+                        let a = simd.abs_f32s(q);
+                        let m1lt = simd.less_than_f32s(a, min1[k]);
+                        let m2lt = simd.less_than_f32s(a, min2[k]);
+                        // new_min2 = m1lt ? old_min1 : (m2lt ? a : old_min2)
+                        let inner = simd.select_f32s_m32s(m2lt, a, min2[k]);
+                        min2[k] = simd.select_f32s_m32s(m1lt, min1[k], inner);
+                        min1[k] = simd.select_f32s_m32s(m1lt, a, min1[k]);
+                        idxf[k] = simd.select_f32s_m32s(m1lt, ef, idxf[k]);
+                        let qneg = simd.less_than_f32s(q, zero);
+                        sign[k] =
+                            simd.select_f32s_m32s(qneg, simd.sub_f32s(zero, sign[k]), sign[k]);
+                    }
+                }
+
+                // PASS C: new r + scatter delta into total (disjoint per lane).
+                for (e, &(bc, s)) in edges.iter().enumerate() {
+                    let ef = simd.splat_f32s(e as f32);
+                    {
+                        let (qv, _) = S::as_simd_f32s(&q_buf[e * z..e * z + z]);
+                        let (rv, _) =
+                            S::as_mut_simd_f32s(&mut r_msgs[base + e * z..base + e * z + z]);
+                        let (rdv, _) = S::as_mut_simd_f32s(&mut rot_delta[..]);
+                        for k in 0..nchunks {
+                            let q = qv[k];
+                            let isarg = simd.equal_f32s(idxf[k], ef);
+                            let mag = simd.select_f32s_m32s(isarg, min2[k], min1[k]);
+                            let qneg = simd.less_than_f32s(q, zero);
+                            let sj = simd
+                                .select_f32s_m32s(qneg, simd.sub_f32s(zero, sign[k]), sign[k]);
+                            // (ALPHA * sign_j) * mag, then clamp — same assoc/order
+                            // and same strict compares as the scalar `f32::clamp`.
+                            let mut nr = simd.mul_f32s(simd.mul_f32s(alpha, sj), mag);
+                            let above = simd.greater_than_f32s(nr, hi);
+                            nr = simd.select_f32s_m32s(above, hi, nr);
+                            let below = simd.less_than_f32s(nr, lo);
+                            nr = simd.select_f32s_m32s(below, lo, nr);
+                            rdv[k] = simd.sub_f32s(nr, rv[k]);
+                            rv[k] = nr;
+                        }
+                    }
+                    let cb = bc * z;
+                    for i in 0..z - s {
+                        total[cb + s + i] += rot_delta[i];
+                    }
+                    for j in 0..s {
+                        total[cb + j] += rot_delta[z - s + j];
+                    }
+                }
+            }
+            if dec.check_syndrome(total) {
+                converged = true;
+                break;
+            }
+        }
+        converged
+    }
 }
 
 #[cfg(test)]
@@ -321,5 +622,62 @@ mod tests {
         let (decoded, converged) = dec.decode(&llr);
         assert!(converged);
         assert!(decoded.iter().all(|&b| b == 0));
+    }
+
+    /// Pseudo-random LLR vector in roughly `(-scale, scale)`, clamped.
+    fn rand_llr(seed: u32, n: usize, scale: f32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                let u = ((s >> 16) as f32 / 32768.0) - 1.0; // ~U(-1,1)
+                (u * scale).clamp(-LLR_CLIP, LLR_CLIP)
+            })
+            .collect()
+    }
+
+    /// The grouped/SIMD-ready decoder must be **bit-for-bit** identical to the
+    /// OTA-validated scalar `decode_soft` — info bits, the full extrinsic vector
+    /// (compared on raw bit patterns), and the converged flag — across every
+    /// rate, at strong / marginal / pure-noise inputs (the last never converges,
+    /// so it exercises the whole 50-iteration min-tracking path), with and
+    /// without an a-priori. This is the gate for the layout change before pulp.
+    fn assert_grouped_matches(rate: LdpcRate, scale: f32, with_apriori: bool, seed: u32) {
+        let dec = LdpcDecoder::new(rate, 50);
+        let n = dec.n();
+        let channel = rand_llr(seed, n, scale);
+        let apri = if with_apriori {
+            Some(rand_llr(seed ^ 0xABCD, n, 2.0))
+        } else {
+            None
+        };
+        let (b0, e0, c0) = dec.decode_soft(&channel, apri.as_deref(), 0.7);
+        // Both the scalar-grouped layout and the pulp SIMD kernel must match the
+        // OTA-validated scalar `decode_soft` bit-for-bit.
+        for (tag, (b, e, c)) in [
+            ("grouped", dec.decode_soft_grouped(&channel, apri.as_deref(), 0.7)),
+            ("simd", dec.decode_soft_simd(&channel, apri.as_deref(), 0.7)),
+        ] {
+            assert_eq!(c0, c, "[{tag}] converged differs rate={rate:?} scale={scale} apri={with_apriori}");
+            assert_eq!(b0, b, "[{tag}] info bits differ rate={rate:?} scale={scale} apri={with_apriori}");
+            assert_eq!(e0.len(), e.len());
+            for (i, (x, y)) in e0.iter().zip(e.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "[{tag}] extrinsic[{i}] differs rate={rate:?} scale={scale} apri={with_apriori}: {x} vs {y}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_decode_is_bit_exact_vs_scalar() {
+        for &rate in &[LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4, LdpcRate::R5_6] {
+            for &scale in &[6.0f32, 1.5, 0.3] {
+                assert_grouped_matches(rate, scale, false, 0x1234_5678);
+                assert_grouped_matches(rate, scale, true, 0x9E37_79B9);
+            }
+        }
     }
 }
