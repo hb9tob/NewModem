@@ -23,6 +23,19 @@ pub struct LdpcDecoder {
     n: usize,
     m: usize,
     max_iter: usize,
+    /// Stop iterating early on an UNDECODABLE block when the syndrome weight
+    /// (number of unsatisfied checks) stops decreasing — the documented
+    /// failure-case early-termination (UC Davis ISCAS 2011). The success stop
+    /// (weight == 0) is always on; this adds the failure stop, gated by
+    /// `V3_LDPC_FAIL_STOP` because it changes the SISO extrinsic of doomed
+    /// codewords (validate on an OTA capture before defaulting on).
+    fail_stop: bool,
+    /// Ignore the first `fail_warmup` iterations before arming the failure stop
+    /// (min-sum can dip then recover early on). `V3_LDPC_FAIL_WARMUP`.
+    fail_warmup: usize,
+    /// Declare a block undecodable after this many consecutive non-improving
+    /// iterations past the warmup. `V3_LDPC_FAIL_STAG`.
+    fail_stag: usize,
 }
 
 impl LdpcDecoder {
@@ -33,7 +46,21 @@ impl LdpcDecoder {
         let k = rate.k();
         let n = rate.n();
         let m = n - k;
-        LdpcDecoder { rate, h, grouped, k, n, m, max_iter }
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        LdpcDecoder {
+            rate,
+            h,
+            grouped,
+            k,
+            n,
+            m,
+            max_iter,
+            fail_stop: std::env::var_os("V3_LDPC_FAIL_STOP").is_some(),
+            fail_warmup: env_usize("V3_LDPC_FAIL_WARMUP", 5),
+            fail_stag: env_usize("V3_LDPC_FAIL_STAG", 3).max(1),
+        }
     }
 
     /// Decode LLR values (length = n = 2304) into info bits.
@@ -132,7 +159,8 @@ impl LdpcDecoder {
         (info_bits, converged)
     }
 
-    /// Check if all parity checks are satisfied (hard decision).
+    /// Check if all parity checks are satisfied (hard decision). Cheap success
+    /// test (early-returns on the first unsatisfied row).
     fn check_syndrome(&self, total_llr: &[f32]) -> bool {
         for row in 0..self.m {
             let mut parity = 0u8;
@@ -146,6 +174,24 @@ impl LdpcDecoder {
             }
         }
         true
+    }
+
+    /// Number of UNSATISFIED parity checks (the syndrome weight). `0` ⇔
+    /// `check_syndrome` true (converged). Unlike `check_syndrome` this scans all
+    /// rows (no early return) so the turbo loop can watch the weight fall — a
+    /// weight that stops decreasing flags an undecodable block (failure stop).
+    fn syndrome_weight(&self, total_llr: &[f32]) -> usize {
+        let mut weight = 0usize;
+        for row in 0..self.m {
+            let mut parity = 0u8;
+            for &col in &self.h.row_indices[row] {
+                if total_llr[col] < 0.0 {
+                    parity ^= 1;
+                }
+            }
+            weight += parity as usize;
+        }
+        weight
     }
 
     /// Decode LLR and return info bytes. Convenience wrapper.
@@ -203,7 +249,9 @@ impl LdpcDecoder {
         let mut total_llr: Vec<f32> = seed.clone();
 
         let mut converged = false;
-        for _iter in 0..self.max_iter {
+        let mut prev_weight = usize::MAX;
+        let mut stagnant = 0usize;
+        for iter in 0..self.max_iter {
             for row in 0..self.m {
                 let cols = &self.h.row_indices[row];
                 let degree = cols.len();
@@ -236,10 +284,25 @@ impl LdpcDecoder {
                     r_messages[row][j] = new_r;
                 }
             }
-            if self.check_syndrome(&total_llr) {
+            let weight = self.syndrome_weight(&total_llr);
+            if weight == 0 {
                 converged = true;
                 break;
             }
+            // Failure stop (opt-in V3_LDPC_FAIL_STOP): the syndrome weight has
+            // stopped improving on an undecodable block — further iterations
+            // only burn cycles, so bail (returns the stagnation-point extrinsic).
+            if self.fail_stop && iter + 1 > self.fail_warmup {
+                if weight >= prev_weight {
+                    stagnant += 1;
+                    if stagnant >= self.fail_stag {
+                        break;
+                    }
+                } else {
+                    stagnant = 0;
+                }
+            }
+            prev_weight = weight;
         }
 
         let info_bits: Vec<u8> = total_llr[..self.k]
@@ -465,7 +528,9 @@ impl WithSimd for SoftKernel<'_> {
         let mut sign = vec![one; nchunks];
 
         let mut converged = false;
-        for _iter in 0..dec.max_iter {
+        let mut prev_weight = usize::MAX;
+        let mut stagnant = 0usize;
+        for iter in 0..dec.max_iter {
             for (br, edges) in g.layers.iter().enumerate() {
                 let base = g.layer_offsets[br];
                 let d = edges.len();
@@ -545,10 +610,22 @@ impl WithSimd for SoftKernel<'_> {
                     }
                 }
             }
-            if dec.check_syndrome(total) {
+            let weight = dec.syndrome_weight(total);
+            if weight == 0 {
                 converged = true;
                 break;
             }
+            if dec.fail_stop && iter + 1 > dec.fail_warmup {
+                if weight >= prev_weight {
+                    stagnant += 1;
+                    if stagnant >= dec.fail_stag {
+                        break;
+                    }
+                } else {
+                    stagnant = 0;
+                }
+            }
+            prev_weight = weight;
         }
         converged
     }
