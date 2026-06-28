@@ -625,9 +625,10 @@ pub struct V3Session {
     /// worker (or the diag harness) that services `RewindRequest`.
     two_preamble_enabled: bool,
     /// Use the pulp-vectorised `decode_soft_simd` instead of the scalar
-    /// `decode_soft` in the turbo loop (env `V3_LDPC_SIMD`). Bit-identical
-    /// output (proven by `grouped_decode_is_bit_exact_vs_scalar`); opt-in until
-    /// validated on a reference OTA capture, then flipped to default-on.
+    /// `decode_soft` in the turbo loop. Bit-identical output (proven by
+    /// `grouped_decode_is_bit_exact_vs_scalar` + a real OTA capture decoding to
+    /// the same SHA256). Default ON; kill-switch `V3_NO_LDPC_SIMD` falls back to
+    /// the scalar path (e.g. to bisect a suspected NEON-specific issue on a Pi).
     ldpc_simd: bool,
     /// True while a `replay_from_anchor` is re-ingesting buffered audio, so the
     /// étage-B estimator does not emit a nested `RewindRequest` mid-replay.
@@ -881,7 +882,7 @@ impl V3Session {
             preamble1_refined_abs: None,
             two_preamble_attempted: false,
             two_preamble_enabled: std::env::var_os("V3_2PRE_DRIFT").is_some(),
-            ldpc_simd: std::env::var_os("V3_LDPC_SIMD").is_some(),
+            ldpc_simd: std::env::var_os("V3_NO_LDPC_SIMD").is_none(),
             replaying: false,
             turbo_sync_enabled: std::env::var_os("V3_NO_TURBO_SYNC").is_none(),
             drift_recommits: 0,

@@ -26,9 +26,9 @@ pub struct LdpcDecoder {
     /// Stop iterating early on an UNDECODABLE block when the syndrome weight
     /// (number of unsatisfied checks) stops decreasing — the documented
     /// failure-case early-termination (UC Davis ISCAS 2011). The success stop
-    /// (weight == 0) is always on; this adds the failure stop, gated by
-    /// `V3_LDPC_FAIL_STOP` because it changes the SISO extrinsic of doomed
-    /// codewords (validate on an OTA capture before defaulting on).
+    /// (weight == 0) is always on; this adds the failure stop. Default ON
+    /// (validated byte-identical on a real OTA capture); kill-switch
+    /// `V3_NO_LDPC_FAIL_STOP` restores the full 50-iteration budget.
     fail_stop: bool,
     /// Ignore the first `fail_warmup` iterations before arming the failure stop
     /// (min-sum can dip then recover early on). `V3_LDPC_FAIL_WARMUP`.
@@ -57,7 +57,7 @@ impl LdpcDecoder {
             n,
             m,
             max_iter,
-            fail_stop: std::env::var_os("V3_LDPC_FAIL_STOP").is_some(),
+            fail_stop: std::env::var_os("V3_NO_LDPC_FAIL_STOP").is_none(),
             fail_warmup: env_usize("V3_LDPC_FAIL_WARMUP", 5),
             fail_stag: env_usize("V3_LDPC_FAIL_STAG", 3).max(1),
         }
@@ -720,7 +720,12 @@ mod tests {
     /// so it exercises the whole 50-iteration min-tracking path), with and
     /// without an a-priori. This is the gate for the layout change before pulp.
     fn assert_grouped_matches(rate: LdpcRate, scale: f32, with_apriori: bool, seed: u32) {
-        let dec = LdpcDecoder::new(rate, 50);
+        let mut dec = LdpcDecoder::new(rate, 50);
+        // Isolate the vectorisation bit-exactness from the failure early-stop:
+        // `decode_soft_grouped` is the pure-layout reference WITHOUT the stop, so
+        // compare all three with the stop OFF (the stop's scalar/SIMD parity is
+        // covered by `simd_failstop_matches_scalar`).
+        dec.fail_stop = false;
         let n = dec.n();
         let channel = rand_llr(seed, n, scale);
         let apri = if with_apriori {
@@ -754,6 +759,33 @@ mod tests {
             for &scale in &[6.0f32, 1.5, 0.3] {
                 assert_grouped_matches(rate, scale, false, 0x1234_5678);
                 assert_grouped_matches(rate, scale, true, 0x9E37_79B9);
+            }
+        }
+    }
+
+    #[test]
+    fn simd_failstop_matches_scalar() {
+        // With the failure early-stop ON (the default), the SIMD path must still
+        // match the scalar `decode_soft` bit-for-bit: identical syndrome weights
+        // each iteration → identical stagnation → identical stop iteration and
+        // returned extrinsic. Marginal + pure-noise inputs exercise the stop.
+        for &rate in &[LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4, LdpcRate::R5_6] {
+            for &scale in &[1.5f32, 0.3] {
+                let mut dec = LdpcDecoder::new(rate, 50);
+                dec.fail_stop = true;
+                let n = dec.n();
+                let ch = rand_llr(0x5151_3737, n, scale);
+                let (b0, e0, c0) = dec.decode_soft(&ch, None, 0.7);
+                let (b1, e1, c1) = dec.decode_soft_simd(&ch, None, 0.7);
+                assert_eq!(c0, c1, "fail_stop converged differs rate={rate:?} scale={scale}");
+                assert_eq!(b0, b1, "fail_stop info bits differ rate={rate:?} scale={scale}");
+                for (i, (x, y)) in e0.iter().zip(e1.iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "fail_stop extrinsic[{i}] differs rate={rate:?} scale={scale}: {x} vs {y}",
+                    );
+                }
             }
         }
     }
