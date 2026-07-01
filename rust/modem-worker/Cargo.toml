@@ -21,3 +21,4 @@ cpal = "0.15"
 tempfile = "3"
 num-complex = { workspace = true }
 rustfft = { workspace = true }
+modem-core-base = { path = "../modem-core-base" }

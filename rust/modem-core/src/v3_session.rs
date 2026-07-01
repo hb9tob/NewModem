@@ -57,6 +57,8 @@ use crate::rx_v2;
 use crate::soft_demod;
 use crate::types::AUDIO_RATE;
 use modem_core_base::streaming_dsp::StreamingDsp;
+use modem_core_base::timing_loop::TedVariant;
+use modem_core_base::timing_tracker::TimingTracker;
 use modem_core_base::streaming_ffe::StreamingFfe;
 use modem_core_base::types::Complex64;
 use modem_framing::app_header::{decode_meta_payload, AppHeader};
@@ -154,8 +156,12 @@ pub const V3_FFE_TRAINING_LEN: usize = 384;
 /// DD-LMS learning rates for the streaming FFE, matching the `rx_v2` batch
 /// path (`rx_v2.rs`): `mu_train` at known preamble/warmup references,
 /// `mu_dd` on the data-constellation slicer decisions.
-const V3_FFE_MU_TRAIN: f64 = 0.10;
-const V3_FFE_MU_DD: f64 = 0.02;
+fn v3_ffe_mu_train() -> f64 {
+    std::env::var("V3_FFE_MU_TRAIN").ok().and_then(|s| s.parse().ok()).unwrap_or(0.10)
+}
+fn v3_ffe_mu_dd() -> f64 {
+    std::env::var("V3_FFE_MU_DD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02)
+}
 /// Damping gain for the persistent carrier loop's frequency integrator (Couche
 /// 2): `ν += gain·Δω` per forward segment. < 1 smooths the per-segment residual
 /// slope so a noisy fit can't kick the loop; the phase is set exactly each
@@ -540,6 +546,12 @@ pub struct V3Session {
     acq_scan_interval: u64,
     dsp: StreamingDsp,
     ffe: StreamingFfe,
+    /// Coarse timing loop (V3_TIMING_LOOP). `Some` ⇒ the smooth resampler is
+    /// driven per-chunk by the Gardner/AbsGardner tracker (SFO recovery); `None`
+    /// ⇒ the fixed-ratio resampler + `drift_ppm` path (byte-identical to before).
+    /// The bulk-drift COARSE stage; the fine (post-FFE, M&M/turbo) stage is
+    /// wired later (M2b), mirroring the two-stage carrier split.
+    timing: Option<TimingTracker>,
     // ---- Phase 3a: per-cycle CW decode -------------------------------
     decoder: LdpcDecoder,
     constellation: Constellation,
@@ -781,7 +793,7 @@ impl V3Session {
         let acq_mf =
             crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
-        let dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
+        let mut dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
         let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&cfg);
         let mut ffe = StreamingFfe::new(
             n_ff,
@@ -803,7 +815,7 @@ impl V3Session {
             let cons = constellation.clone();
             ffe.set_forward_lms(
                 Box::new(move |y| cons.points[cons.slice_nearest(&[y])[0]]),
-                V3_FFE_MU_DD,
+                v3_ffe_mu_dd(),
             );
         }
         let bps = cfg.constellation.bits_per_sym();
@@ -811,6 +823,68 @@ impl V3Session {
         let syms_per_cw = padded_n / bps;
         let k_bytes = decoder.k() / 8;
         let deinterleave_perm = interleaver::deinterleave_table(padded_n, cfg.constellation);
+        // --- Coarse timing loop (SFO recovery, M2a). Dev opt-in `V3_TIMING_LOOP`;
+        // flips to default-ON + kill `V3_NO_TIMING_LOOP` after NBFM validation
+        // (mirrors `carrier_track`). Absent ⇒ smooth resampler off ⇒ the fixed-
+        // ratio + drift_ppm path is byte-identical. ---
+        let timing = if std::env::var_os("V3_TIMING_LOOP").is_some() {
+            dsp.timing_enable(true);
+            // TED: Gardner for constant-modulus (QPSK/8PSK), AbsGardner for
+            // multi-ring APSK (16/32/64) — count distinct amplitude rings.
+            let mut mags: Vec<f64> = constellation.points.iter().map(|p| p.norm()).collect();
+            mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            mags.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            let ted = if mags.len() > 1 {
+                TedVariant::AbsGardner
+            } else {
+                TedVariant::Gardner
+            };
+            // Recalibrated gains (the naive DVB unit-Es values are ~100-300×
+            // too hot: the AGC-normalised TED K_d on real RRC pulses is far
+            // larger, and AbsGardner (energy-domain) is ~10× larger again than
+            // Gardner — measured on the closed loop, HIGH++ d50 recovers only
+            // with these). Base at Rs=1000; Kp ∝ 1/Rs, Ki ∝ 1/Rs².
+            // AbsGardner base tuned so the Rs=1500 fast family lands on the
+            // closed-loop-validated (2.5e-6, 3.75e-11) after the 1/Rs scaling.
+            // (d50 repair=0 is a knife-edge point; per-profile fine calibration
+            // is a follow-up — override via V3_TIMING_KP/_KI.)
+            let (base_kp, base_ki) = if ted == TedVariant::AbsGardner {
+                (3.75e-6, 8.4e-11)
+            } else {
+                (2.5e-5, 3.75e-9)
+            };
+            let rs = cfg.symbol_rate.max(1.0);
+            let kp = std::env::var("V3_TIMING_KP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base_kp * 1000.0 / rs);
+            let ki = std::env::var("V3_TIMING_KI")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base_ki * (1000.0 / rs).powi(2));
+            let mut tr = TimingTracker::new(ted, kp, ki, dsp.pitch_fse());
+            if let Some(s) = std::env::var("V3_TIMING_SIGN")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                tr.set_control_sign(s); // A/B the AbsGardner/real-pipeline polarity
+            }
+            tr.seed(0.0); // refined from the 2-preamble estimate (next M2 step)
+            // Dev seed hook: force the initial rate for end-to-end A/B before the
+            // real 2-preamble seed is wired (proves the loop RECOVERS the decode
+            // when seeded). ppm = the CORRECTING drift (opposite sign to the
+            // injected SFO, like the coarse `to_ppm`).
+            if let Some(sp) = std::env::var("V3_TIMING_SEED_PPM")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                tr.seed(sp);
+                dsp.timing_seed(1.0 + sp * 1e-6, 0.0);
+            }
+            Some(tr)
+        } else {
+            None
+        };
         let mut sess = Self {
             cfg,
             profile_name,
@@ -861,6 +935,7 @@ impl V3Session {
             acq_scan_interval,
             dsp,
             ffe,
+            timing,
             decoder,
             constellation,
             syms_per_cw,
@@ -1089,8 +1164,17 @@ impl V3Session {
         );
         // `drain_symbols` now yields the T/2 (fse) stream; the FFE keeps a
         // symbol-spaced output interface (see StreamingFfe docs).
+        let sym_start_abs = self.dsp.sym_buffer_start_abs();
         let new_fse = self.dsp.drain_symbols();
         if !new_fse.is_empty() {
+            // Coarse timing loop (M2a): run the TED on the freshly-drained T/2
+            // stream and slew the smooth resampler rate for the NEXT chunk (the
+            // loop is ~0.15 Hz → the one-chunk latency is negligible). `None` ⇒
+            // path untouched (byte-identical fixed-ratio resampler).
+            if let Some(tr) = self.timing.as_mut() {
+                tr.feed(sym_start_abs, &new_fse);
+                self.dsp.set_resample_step(tr.rate());
+            }
             self.ffe.push_raw(&new_fse);
         }
 
@@ -1735,8 +1819,8 @@ impl V3Session {
             &refs,
             reeq,
             |y| cons.points[cons.slice_nearest(&[y])[0]],
-            V3_FFE_MU_TRAIN,
-            V3_FFE_MU_DD,
+            v3_ffe_mu_train(),
+            v3_ffe_mu_dd(),
             true, // acquisition bootstrap: BUILD the tap set from a fresh LS
         );
         // Commit only if the marker actually validates at the implied position.
@@ -1998,8 +2082,8 @@ impl V3Session {
             &refs,
             cycle_period,
             |y| cons.points[cons.slice_nearest(&[y])[0]],
-            V3_FFE_MU_TRAIN * scale,
-            V3_FFE_MU_DD * scale,
+            v3_ffe_mu_train() * scale,
+            v3_ffe_mu_dd() * scale,
             rebuild_meta,
         );
     }
@@ -2128,7 +2212,7 @@ impl V3Session {
                 &refs,
                 &weights,
                 &is_pilot,
-                V3_FFE_MU_DD,
+                v3_ffe_mu_dd(),
                 pll_alpha,
                 pll_beta,
                 carrier_pred.as_deref(),
@@ -3384,6 +3468,13 @@ impl V3Session {
         if self.drift_locked {
             return;
         }
+        // The continuous timing loop owns the resampler rate — the discrete
+        // coarse-drift commit (reboot + replay) would fight it and re-bootstrap
+        // the session (the fragile behaviour M0 measured). Skip it when the loop
+        // is active (M2a); the loop's own seed replaces this estimate later.
+        if self.timing.is_some() {
+            return;
+        }
         // When the 2-preamble path is enabled it is the primary, more precise
         // drift source (run at the first superframe boundary). Give it first
         // commit: only fall back to this marker-grid `estimate_drift_gardner`
@@ -3640,7 +3731,7 @@ impl V3Session {
             let cons = self.constellation.clone();
             self.ffe.set_forward_lms(
                 Box::new(move |y| cons.points[cons.slice_nearest(&[y])[0]]),
-                V3_FFE_MU_DD,
+                v3_ffe_mu_dd(),
             );
         }
         // Decode + FSM state goes back to a fresh-bootstrap regime so

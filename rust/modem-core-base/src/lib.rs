@@ -40,6 +40,11 @@ pub mod farrow;
 // Gardner for PSK + AbsGardner for APSK constellations.
 pub mod timing_loop;
 
+// Continuous symbol-timing tracker: Gardner/AbsGardner TED + AGC + PI loop on
+// the post-RRC T/2 stream, driving the StreamingDsp smooth resampler rate
+// (closed-loop SFO tracking; the actuator counterpart to timing_loop).
+pub mod timing_tracker;
+
 // Channel sounder — probe-signal generators (tone, two-tone, chirp,
 // multitone, AWGN, level sweep) for characterising the radio chain
 // (transceiver + soundcard + SDR). The matching analyser lives in

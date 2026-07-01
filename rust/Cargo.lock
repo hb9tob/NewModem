@@ -3070,6 +3070,7 @@ dependencies = [
  "cpal",
  "hound",
  "modem-core",
+ "modem-core-base",
  "modem-framing",
  "modem-io",
  "modem-sdr",

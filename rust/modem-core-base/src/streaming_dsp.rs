@@ -161,6 +161,21 @@ pub struct StreamingDsp {
     decimation_cursor_abs: u64,
     sym_buffer: Vec<Complex64>,
     sym_buffer_start_abs: u64,
+
+    // --- Continuous timing recovery (V3_TIMING_LOOP, default OFF) ---
+    // When `timing_enabled`, the resampler runs as a phase ACCUMULATOR
+    // (`resample_pos += resample_step`) instead of the byte-exact multiply
+    // form `target = next_tx * ratio`. The accumulator lets a slow timing
+    // loop update the rate every symbol WITHOUT the `next_tx * Δratio` phase
+    // jump the multiply form would incur — the enabling change for closed-loop
+    // SFO tracking. OFF runs the original multiply path verbatim, so the
+    // produced `sym_buffer` is bit-identical to before (see `run_resampler`).
+    timing_enabled: bool,
+    /// Input-sample position the next output is interpolated at (accumulator).
+    resample_pos: f64,
+    /// Input samples per output sample (= 1 + residual_ppm·1e-6). The timing
+    /// loop slews this; nominal 1.0 (RX clock == TX clock).
+    resample_step: f64,
 }
 
 impl StreamingDsp {
@@ -196,7 +211,48 @@ impl StreamingDsp {
             decimation_cursor_abs: 0,
             sym_buffer: Vec::new(),
             sym_buffer_start_abs: 0,
+            timing_enabled: false,
+            resample_pos: 0.0,
+            resample_step: 1.0,
         }
+    }
+
+    /// Enable the continuous-timing-loop resampler (phase-accumulator form).
+    /// While enabled the `drift_ppm` argument to [`feed_audio`](Self::feed_audio)
+    /// is IGNORED — the rate is owned by [`set_resample_step`](Self::set_resample_step),
+    /// seeded by [`timing_seed`](Self::timing_seed). Default OFF = byte-exact
+    /// multiply resampler.
+    pub fn timing_enable(&mut self, on: bool) {
+        self.timing_enabled = on;
+    }
+
+    pub fn timing_enabled(&self) -> bool {
+        self.timing_enabled
+    }
+
+    /// Seed the accumulator state from the preamble estimate: `rate` =
+    /// 1 + slope_ppm·1e-6 (velocity), `pos` = the input-sample position of the
+    /// next output (the fractional timing phase τ₀). Only meaningful with the
+    /// timing loop enabled and at a (re)start boundary.
+    pub fn timing_seed(&mut self, rate: f64, pos: f64) {
+        self.resample_step = rate;
+        self.resample_pos = pos;
+    }
+
+    /// Current resampler rate (input samples per output). The timing loop reads
+    /// this to add its correction; [`set_resample_step`](Self::set_resample_step)
+    /// writes the updated value.
+    pub fn resample_step(&self) -> f64 {
+        self.resample_step
+    }
+
+    pub fn set_resample_step(&mut self, rate: f64) {
+        self.resample_step = rate;
+    }
+
+    /// Input-sample position of the next output (accumulator read pointer).
+    pub fn resample_pos(&self) -> f64 {
+        self.resample_pos
     }
 
     pub fn sps(&self) -> usize {
@@ -258,9 +314,20 @@ impl StreamingDsp {
     /// are convolved against zero state. The NCO phase is reconstructed exactly
     /// from the absolute index, so the downmix stays phase-continuous.
     pub fn rewind_to(&mut self, abs_input: u64, drift_ppm: f64) {
-        let ratio = 1.0 + drift_ppm * 1e-6;
+        // While the timing loop owns the rate, rewind against the live
+        // `resample_step` (the loop's current velocity), not the `drift_ppm`
+        // argument, and re-seat the accumulator on the mapped input position so
+        // the replayed stream stays phase-continuous.
+        let ratio = if self.timing_enabled {
+            self.resample_step
+        } else {
+            1.0 + drift_ppm * 1e-6
+        };
         // Output (resampled) index whose input maps to `abs_input`.
         let out_idx = ((abs_input as f64) / ratio).floor() as u64;
+        if self.timing_enabled {
+            self.resample_pos = out_idx as f64 * ratio;
+        }
         self.resampler_next_tx = out_idx;
         self.resampled_start_abs = out_idx;
         self.resampled.clear();
@@ -344,6 +411,23 @@ impl StreamingDsp {
         audio_drained_samples: u64,
         drift_ppm: f64,
     ) {
+        if self.timing_enabled {
+            self.run_resampler_smooth(audio_buffer, audio_drained_samples);
+        } else {
+            self.run_resampler_fixed(audio_buffer, audio_drained_samples, drift_ppm);
+        }
+    }
+
+    /// Byte-exact multiply-form resampler — the original OFF path. `target =
+    /// next_tx * ratio` is an absolute output-index→input-position map, correct
+    /// only for a CONSTANT ratio. Kept verbatim so a `timing_enabled == false`
+    /// session reproduces the historical `sym_buffer` bit-for-bit.
+    fn run_resampler_fixed(
+        &mut self,
+        audio_buffer: &[f32],
+        audio_drained_samples: u64,
+        drift_ppm: f64,
+    ) {
         let ratio = 1.0 + drift_ppm * 1e-6;
         let half_taps = (N_TAPS / 2) as i64;
         let buf_len = audio_buffer.len() as i64;
@@ -381,6 +465,53 @@ impl StreamingDsp {
             }
             self.resampled.push(acc as f32);
             self.resampler_next_tx += 1;
+        }
+    }
+
+    /// Phase-accumulator resampler — the timing-loop ON path. `resample_pos`
+    /// (the input-sample read position) advances by `resample_step` per output,
+    /// so a slow timing loop can slew the rate every symbol with NO phase jump
+    /// (the multiply form would jump by `next_tx·Δrate`). Interpolation kernel
+    /// is identical to the fixed form (same 1024-phase polyphase bank), so at a
+    /// constant `resample_step == 1+drift_ppm·1e-6` it matches the fixed output.
+    fn run_resampler_smooth(&mut self, audio_buffer: &[f32], audio_drained_samples: u64) {
+        let half_taps = (N_TAPS / 2) as i64;
+        let buf_len = audio_buffer.len() as i64;
+        let drained = audio_drained_samples as i64;
+        loop {
+            let target_abs = self.resample_pos;
+            let centre_abs = target_abs.floor() as i64;
+            let frac = target_abs - centre_abs as f64;
+            let phase = (frac * N_PHASES as f64).round() as i64;
+            let (centre_abs, phase) = if phase >= N_PHASES as i64 {
+                (centre_abs + 1, phase - N_PHASES as i64)
+            } else if phase < 0 {
+                (centre_abs - 1, phase + N_PHASES as i64)
+            } else {
+                (centre_abs, phase)
+            };
+            let abs_start = centre_abs - half_taps + 1;
+            let abs_end = centre_abs + half_taps;
+            if abs_end - drained >= buf_len {
+                break;
+            }
+            let taps = &self.bank[phase as usize];
+            let mut acc = 0.0_f64;
+            for t in 0..N_TAPS {
+                let abs_idx = abs_start + t as i64;
+                let in_buf = abs_idx - drained;
+                let s = if in_buf < 0 {
+                    0.0
+                } else if (in_buf as usize) < audio_buffer.len() {
+                    audio_buffer[in_buf as usize] as f64
+                } else {
+                    break;
+                };
+                acc += taps[t] * s;
+            }
+            self.resampled.push(acc as f32);
+            self.resampler_next_tx += 1;
+            self.resample_pos += self.resample_step;
         }
     }
 
@@ -757,6 +888,59 @@ mod tests {
             mean_pow / total_pow > 0.9,
             "tone not at DC after CFO downmix: mean_pow/total_pow = {:.3}",
             mean_pow / total_pow,
+        );
+    }
+
+    #[test]
+    fn timing_off_is_default_and_fixed_path() {
+        // The timing loop is OFF by construction → the fixed (byte-exact)
+        // resampler runs. This is the OTA-safety contract; the full byte-exact
+        // suite (chunked_feed_matches_monolithic, cfo_zero_is_byte_exact) all
+        // exercise this default-off path unchanged.
+        let dsp = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        assert!(!dsp.timing_enabled());
+        assert_eq!(dsp.resample_step(), 1.0);
+    }
+
+    #[test]
+    fn smooth_resampler_matches_fixed_at_constant_rate() {
+        use std::f64::consts::PI;
+        // The phase-accumulator (ON) resampler at a CONSTANT step must
+        // reproduce the multiply-form (OFF) resampler at the equivalent ratio:
+        // both map the same constant clock rate, just integrate it differently
+        // (next_tx·ratio vs repeated += step). They agree to well within the
+        // polyphase FIR noise floor.
+        let n = 2 * AUDIO_RATE as usize;
+        let audio: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / AUDIO_RATE as f64;
+                (0.3 * (2.0 * PI * 1100.0 * t).sin() + 0.2 * (2.0 * PI * 1450.0 * t).sin()) as f32
+            })
+            .collect();
+        let ppm = 50.0_f64;
+
+        let mut fixed = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        fixed.feed_audio(&audio, 0, ppm);
+
+        let mut smooth = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        smooth.timing_enable(true);
+        smooth.timing_seed(1.0 + ppm * 1e-6, 0.0);
+        smooth.feed_audio(&audio, 0, 0.0); // drift_ppm ignored when timing on
+
+        let sa = fixed.sym_buffer();
+        let sb = smooth.sym_buffer();
+        let m = sa.len().min(sb.len());
+        assert!(m > 500, "too few symbols compared: {m}");
+        let mut max_err = 0.0_f64;
+        for k in 0..m {
+            let e = (sa[k] - sb[k]).norm();
+            if e > max_err {
+                max_err = e;
+            }
+        }
+        assert!(
+            max_err < 1e-3,
+            "smooth vs fixed at {ppm} ppm: max symbol error {max_err}",
         );
     }
 }
