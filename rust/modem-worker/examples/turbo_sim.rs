@@ -549,14 +549,19 @@ fn parse_profile_index(s: &str) -> ProfileIndex {
         "HIGH++" | "HIGHPLUSPLUS" => ProfileIndex::HighPlusPlus,
         "HIGH+" | "HIGHPLUS" => ProfileIndex::HighPlus,
         "HIGH" => ProfileIndex::High,
-        "MEGA" => ProfileIndex::Mega,
+        // "MEGA" retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique.
         "NORMAL" => ProfileIndex::Normal,
         "ROBUST" => ProfileIndex::Robust,
         "ULTRA" => ProfileIndex::Ultra,
-        other => {
-            eprintln!("unknown profile {other:?}");
-            std::process::exit(64);
-        }
+        // Fall back to the canonical registry so every standard mode
+        // (HIGH56, …) is reachable, not just the hand-listed aliases.
+        other => match ProfileIndex::from_name(other) {
+            Some(p) => p,
+            None => {
+                eprintln!("unknown profile {other:?}");
+                std::process::exit(64);
+            }
+        },
     }
 }
 

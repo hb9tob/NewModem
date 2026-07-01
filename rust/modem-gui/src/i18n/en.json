@@ -185,7 +185,7 @@
   "settings.tx_history_hint_html": "Beyond that, the oldest are purged on every new transmission. Stored under <code>&lt;save_dir&gt;/tx_history/</code>.",
   "settings.legend_experimental": "Experimental modes",
   "settings.experimental_enable": "Enable experimental modes",
-  "settings.experimental_hint": "Shows the profiles marked ⚠ in the TX and RX combos (MEGA, FAST, HIGH++, HIGH+56), and the \"Force a profile\" option at RX start. These modes are only decodable by a peer on the same app version in forced mode.",
+  "settings.experimental_hint": "Shows the profiles marked ⚠ in the TX and RX combos (FAST, HIGH++, HIGH+56), and the \"Force a profile\" option at RX start. These modes are only decodable by a peer on the same app version in forced mode.",
   "settings.legend_fdx": "Full-duplex",
   "settings.fdx_enable": "Allow simultaneous transmit and receive",
   "settings.fdx_hint": "By default, transmission interrupts reception (and restarts it after TX). When enabled: both run in parallel (useful with an RX device distinct from the TX device, e.g. SDRplay for RX + sound card for TX). A second progress bar (purple → blue) appears above the RX bar during transmission. Avoid this if RX and TX share the same half-duplex audio chain.",

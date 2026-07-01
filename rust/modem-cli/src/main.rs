@@ -602,7 +602,7 @@ fn parse_explicit_session_id(s: &str) -> u32 {
 
 fn profile_index_of(name: &str) -> u8 {
     match name.to_uppercase().as_str() {
-        "MEGA" => modem_core::profile::ProfileIndex::Mega as u8,
+        // "MEGA" retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique.
         "HIGH" => modem_core::profile::ProfileIndex::High as u8,
         "NORMAL" => modem_core::profile::ProfileIndex::Normal as u8,
         "ROBUST" => modem_core::profile::ProfileIndex::Robust as u8,

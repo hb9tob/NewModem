@@ -68,15 +68,15 @@ mod tests {
     #[test]
     fn derive_profile_index_matches_all_profiles() {
         use crate::profile::{
-            profile_high, profile_mega, profile_normal, profile_robust, profile_ultra,
-            ProfileIndex,
+            profile_high, profile_normal, profile_robust, profile_ultra, ProfileIndex,
         };
-        let cases: [(ModemConfig, ProfileIndex); 5] = [
+        // MEGA retiré 2026-06-30 — hors registre, derive_profile_index le
+        // mappe désormais sur UNKNOWN (comportement attendu d'un profil retiré).
+        let cases: [(ModemConfig, ProfileIndex); 4] = [
             (profile_ultra(), ProfileIndex::Ultra),
             (profile_robust(), ProfileIndex::Robust),
             (profile_normal(), ProfileIndex::Normal),
             (profile_high(), ProfileIndex::High),
-            (profile_mega(), ProfileIndex::Mega),
         ];
         for (cfg, expected) in cases {
             assert_eq!(

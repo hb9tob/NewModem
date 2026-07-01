@@ -35,7 +35,7 @@ export let currentSettings = {
   tx_speed: 6,
   tx_more_count: 5,
   /// If true, the RX profile is locked on rx_forced_profile and auto-
-  /// detection is disabled. Required to receive MEGA, FAST, HIGH++ or
+  /// detection is disabled. Required to receive FAST, HIGH++ or
   /// HIGH+56 (which are outside PROBE_TEMPLATES).
   rx_force_mode: false,
   rx_forced_profile: "HIGH56",

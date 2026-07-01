@@ -125,7 +125,7 @@ fn main() {
     for &profile in &[
         ProfileIndex::Normal,
         ProfileIndex::High,
-        ProfileIndex::Mega,
+        // ProfileIndex::Mega retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique.
         ProfileIndex::Ultra,
         ProfileIndex::Robust,
     ] {

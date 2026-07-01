@@ -280,7 +280,8 @@ impl ProfileIndex {
             "ROBUST" => Some(Self::Robust),
             "NORMAL" => Some(Self::Normal),
             "HIGH" => Some(Self::High),
-            "MEGA" => Some(Self::Mega),
+            // "MEGA" retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique.
+            // "MEGA" => Some(Self::Mega),
             "HIGH+" | "HIGHPLUS" => Some(Self::HighPlus),
             "FAST" => Some(Self::Fast),
             "HIGH++" | "HIGHPLUSPLUS" => Some(Self::HighPlusPlus),
@@ -291,15 +292,20 @@ impl ProfileIndex {
     }
 
     /// All profile indices in canonical order. EXPERIMENTAL profiles
-    /// (Mega, Fast, HighPlusFiveSix) are included so they can be
-    /// selected in forced mode, but they do NOT take part in
-    /// auto-detection (cf. `is_experimental`).
-    pub const ALL: [Self; 10] = [
+    /// (Fast, HighPlusFiveSix) are included so they can be selected in
+    /// forced mode, but they do NOT take part in auto-detection
+    /// (cf. `is_experimental`).
+    ///
+    /// MEGA retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique. Le
+    /// variant `Mega` reste défini (décodage de captures héritées via
+    /// `from_u8`) mais n'est plus dans le registre : ni listé, ni
+    /// auto-détecté, ni sélectionnable par nom/forcé.
+    pub const ALL: [Self; 9] = [
         Self::Ultra,
         Self::Robust,
         Self::Normal,
         Self::High,
-        Self::Mega,
+        // Self::Mega,  // MEGA retiré 2026-06-30 (voir doc ci-dessus)
         Self::HighPlus,
         Self::Fast,
         Self::HighPlusPlus,

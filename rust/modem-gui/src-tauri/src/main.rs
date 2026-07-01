@@ -935,7 +935,7 @@ fn set_monitor_volume(gain: f32, state: State<'_, AppState>) -> Result<(), Strin
 /// capture path's gating exactly.
 fn resolve_profile(name: &str, forced: bool) -> Result<modem_core::profile::ProfileIndex, String> {
     let p = match name.to_uppercase().as_str() {
-        "MEGA" => modem_core::profile::ProfileIndex::Mega,
+        // "MEGA" retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique.
         "HIGH" => modem_core::profile::ProfileIndex::High,
         "NORMAL" => modem_core::profile::ProfileIndex::Normal,
         "ROBUST" => modem_core::profile::ProfileIndex::Robust,

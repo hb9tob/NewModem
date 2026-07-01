@@ -582,14 +582,14 @@ mod tests {
         // n_data_cw = k_source + n_repair_default(k_source), as
         // build_superframe_v3 does under the hood.
         use crate::profile::{
-            profile_high, profile_mega, profile_normal, profile_robust, profile_ultra,
+            profile_high, profile_normal, profile_robust, profile_ultra,
         };
+        // MEGA retiré 2026-06-30 — FTN τ=30/32 inopérant en pratique.
         let profiles: &[(&str, ModemConfig)] = &[
             ("ULTRA", profile_ultra()),
             ("ROBUST", profile_robust()),
             ("NORMAL", profile_normal()),
             ("HIGH", profile_high()),
-            ("MEGA", profile_mega()),
         ];
         let payload_sizes = [50usize, 500, 5000];
         for (name, config) in profiles {

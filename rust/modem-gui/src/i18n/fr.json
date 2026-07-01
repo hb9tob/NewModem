@@ -185,7 +185,7 @@
   "settings.tx_history_hint_html": "Au-delà, les plus anciens sont purgés à chaque nouvelle émission. Stocké sous <code>&lt;save_dir&gt;/tx_history/</code>.",
   "settings.legend_experimental": "Modes expérimentaux",
   "settings.experimental_enable": "Activer les modes expérimentaux",
-  "settings.experimental_hint": "Affiche les profils marqués ⚠ dans les combos TX et RX (MEGA, FAST, HIGH++, HIGH+56), et l'option « Forcer un profil » au démarrage RX. Ces modes ne sont décodables que par un pair sur la même version de l'appli en mode forcé.",
+  "settings.experimental_hint": "Affiche les profils marqués ⚠ dans les combos TX et RX (FAST, HIGH++, HIGH+56), et l'option « Forcer un profil » au démarrage RX. Ces modes ne sont décodables que par un pair sur la même version de l'appli en mode forcé.",
   "settings.legend_fdx": "Full-duplex",
   "settings.fdx_enable": "Autoriser émission et réception simultanées",
   "settings.fdx_hint": "Par défaut, l'émission interrompt la réception (puis la relance après TX). Si activé : les deux tournent en parallèle (utile avec un device RX distinct du device TX, ex. SDRplay en RX + carte son en TX). Une seconde barre de progression (violet → bleu) apparaît au-dessus de la barre RX pendant l'émission. À éviter si RX et TX partagent la même chaîne audio half-duplex.",
