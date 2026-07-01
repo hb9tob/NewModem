@@ -279,6 +279,27 @@ impl IiodClient {
     //     Either way the wire byte layout is identical: I_lo, I_hi,
     //     Q_lo, Q_hi, repeat. 4 bytes per scan cycle.
 
+    /// Set the number of kernel-side buffers iiod queues for `device`
+    /// (double/quad-buffering). MUST be called BEFORE [`Self::open_buffer`].
+    /// Extra buffers keep the DMA fed across a high-latency transport
+    /// (ethernet): with the single-buffer default the DAC drains while waiting
+    /// for the next WRITEBUF round-trip, underrunning and dropping/repeating
+    /// data (corrupt symbols, no audible gap). Mirrors libiio's
+    /// `SET <dev> BUFFERS_COUNT <n>` (it uses 4).
+    pub fn set_buffers_count(&mut self, device: &str, count: usize) -> Result<(), IiodError> {
+        let cmd = format!("SET {device} BUFFERS_COUNT {count}");
+        self.transport.send_line(&cmd)?;
+        let line = self.transport.recv_line()?;
+        let status = parse_status(&line, &cmd)?;
+        if status < 0 {
+            return Err(IiodError::ServerErrno {
+                errno: (-status) as i32,
+                context: cmd,
+            });
+        }
+        Ok(())
+    }
+
     /// Open a streaming buffer on `device`.
     ///
     /// `samples_per_buffer` is the IIO buffer size in *scan cycles*

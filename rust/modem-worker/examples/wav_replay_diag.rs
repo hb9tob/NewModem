@@ -119,7 +119,7 @@ fn main() {
         forced,
         /* deemphasis_enabled */ false,
         /* allow_legacy_grid */ true,
-        /* turbo */ false,
+        /* turbo */ env::var("WAV_REPLAY_TURBO").map(|v| v == "1" || v == "true").unwrap_or(false),
         Arc::new(AtomicU64::new(0)),
     );
 

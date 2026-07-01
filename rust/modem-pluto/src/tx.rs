@@ -68,6 +68,13 @@ const BYTES_PER_SCAN: usize = 4;
 /// (I), bit 1 = voltage1 (Q). Both on for normal complex TX.
 const TX_CHANNEL_MASK: u32 = 0x0000_0003;
 
+/// Kernel-side TX buffer count (double/quad-buffering). The single-buffer
+/// default underruns the DAC DMA between WRITEBUF round-trips over a
+/// high-latency transport (Pluto over ethernet), silently dropping/repeating
+/// data — corrupt symbols with no audible gap, which kills decoding. 4 mirrors
+/// libiio (what SDR Console / GNU Radio use, hence why they don't drop).
+const TX_KERNEL_BUFFERS: usize = 4;
+
 /// Throttled-error tick.
 const STATUS_TICK_PERIOD: Duration = Duration::from_secs(2);
 
@@ -358,6 +365,9 @@ fn run_tx_loop(
     // because the AD9361 DAC clocks every sample in the buffer
     // regardless of whether it carries signal.
     let chunk_iq_samples = TX_CHUNK_AUDIO_SAMPLES * session.negotiated_rate.ratio;
+    // Quad-buffer the kernel TX so the DAC DMA stays fed across a high-latency
+    // transport (ethernet) — see TX_KERNEL_BUFFERS. Must precede OPEN.
+    let _ = client.set_buffers_count(crate::device::iio_names::TX_BUFFER, TX_KERNEL_BUFFERS);
     client
         .open_buffer(
             crate::device::iio_names::TX_BUFFER,
@@ -523,6 +533,11 @@ fn run_tx_loop_ssb(
     let if_rate = session.negotiated_rate.sample_rate_hz as u32;
     let ssb_bw = session.config.rx_ssb_bandwidth_hz;
     let chunk_iq_samples = TX_CHUNK_AUDIO_SAMPLES * ratio;
+    // Quad-buffer the kernel TX so the DAC DMA stays fed across a high-latency
+    // transport (ethernet) — the single-buffer default underruns between
+    // WRITEBUF round-trips and silently drops/repeats data (corrupt symbols, no
+    // audible gap). Mirrors libiio. Must precede OPEN.
+    let _ = client.set_buffers_count(crate::device::iio_names::TX_BUFFER, TX_KERNEL_BUFFERS);
     client
         .open_buffer(crate::device::iio_names::TX_BUFFER, chunk_iq_samples, TX_CHANNEL_MASK, false)
         .map_err(|e| PlutoError::Stream(format!("OPEN cf-ad9361-dds-core-lpc (ssb): {e}")))?;
