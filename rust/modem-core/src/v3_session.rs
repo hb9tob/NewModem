@@ -57,8 +57,6 @@ use crate::rx_v2;
 use crate::soft_demod;
 use crate::types::AUDIO_RATE;
 use modem_core_base::streaming_dsp::StreamingDsp;
-use modem_core_base::timing_loop::TedVariant;
-use modem_core_base::timing_tracker::TimingTracker;
 use modem_core_base::streaming_ffe::StreamingFfe;
 use modem_core_base::types::Complex64;
 use modem_framing::app_header::{decode_meta_payload, AppHeader};
@@ -80,6 +78,149 @@ pub const AUDIO_BUFFER_RETAIN_CYCLES: usize = 4;
 /// path drives it (a single multi-second chunk would under-process the burst).
 /// 2400 samples = 50 ms @ 48 kHz.
 const REPLAY_BATCH_SAMPLES: usize = 2400;
+
+/// Coarse SFO tracker — data-aided symbol timing from the ENTRY PREAMBLE only.
+///
+/// Replaces the earlier decision-directed (Abs)Gardner TED. The preamble is a
+/// known constant-modulus block sitting on an integer symbol boundary, so the
+/// fractional part of its refined landing on the post-RRC T/2 stream IS the
+/// timing phase τ — modulation-independent, unbiased, and correlation-gain-robust
+/// down to the FM threshold (the multi-ring AbsGardner self-noise/bias is gone).
+/// Each new preamble's two-point φ slope since the previous one is the residual
+/// SFO over that gap; it is integrated (gain < 1) into the smooth-resampler rate.
+/// Preambles are ~4 s apart and SFO is slow (clock ppm + ~20 ppm/min triangle
+/// thermal), so this cadence tracks to ~1 ppm. Phase and CFO — which vary fast —
+/// stay on the pilots / carrier loop, not here.
+struct PreambleSfoTracker {
+    reference: Vec<Complex64>,
+    pitch_fse: usize,
+    gain: f64,
+    r_ppm: f64,
+    base_rate: f64,
+    /// Retained tail of the T/2 stream used to locate preambles (bounded).
+    buf: Vec<Complex64>,
+    buf_start_abs: u64,
+    /// Previous preamble anchor: (absolute symbol position, fractional φ).
+    prev: Option<(f64, f64)>,
+    last_sym: f64,
+    /// fse samples accumulated since the last correlation scan (throttle).
+    since_scan: usize,
+    last_resid_ppm: f64,
+    n_updates: u64,
+}
+
+impl PreambleSfoTracker {
+    /// Keep ~3.5 preamble spacings of T/2 history (preamble every ~4 s).
+    const RETAIN_FSE: usize = 48_000;
+
+    fn new(reference: Vec<Complex64>, pitch_fse: usize, gain: f64) -> Self {
+        Self {
+            reference,
+            pitch_fse,
+            gain,
+            r_ppm: 0.0,
+            base_rate: 1.0,
+            buf: Vec::new(),
+            buf_start_abs: 0,
+            prev: None,
+            last_sym: f64::NEG_INFINITY,
+            since_scan: 0,
+            last_resid_ppm: 0.0,
+            n_updates: 0,
+        }
+    }
+
+    /// Re-scan for preambles at most every ~1000 symbols of fresh stream.
+    fn scan_stride(&self) -> usize {
+        1000 * self.pitch_fse.max(1)
+    }
+
+    /// Set the bulk rate (the feedforward seed / per-burst reset to unity).
+    fn seed(&mut self, ppm: f64) {
+        self.r_ppm = ppm;
+        self.base_rate = 1.0 + ppm * 1e-6;
+    }
+    fn rate(&self) -> f64 {
+        self.base_rate
+    }
+    fn rate_ppm(&self) -> f64 {
+        self.r_ppm
+    }
+    fn processed_syms(&self) -> u64 {
+        self.n_updates
+    }
+    fn last_err(&self) -> f64 {
+        self.last_resid_ppm
+    }
+
+    /// Clear the streaming state (buffer + anchor) but keep the seeded bulk rate,
+    /// mirroring `TimingTracker::reset` across a pipeline rebuild/replay.
+    fn reset(&mut self, _start_abs: u64) {
+        self.buf.clear();
+        self.buf_start_abs = 0;
+        self.prev = None;
+        self.last_sym = f64::NEG_INFINITY;
+        self.since_scan = 0;
+    }
+
+    /// Accumulate the freshly-drained T/2 block, locate any new preamble, and
+    /// integrate its residual-SFO into the rate. Returns nothing; read `rate()`.
+    fn feed(&mut self, start_abs: u64, new_fse: &[Complex64]) {
+        if new_fse.is_empty() {
+            return;
+        }
+        if self.buf.is_empty() {
+            self.buf_start_abs = start_abs;
+        }
+        self.buf.extend_from_slice(new_fse);
+        self.since_scan += new_fse.len();
+        if self.since_scan < self.scan_stride() {
+            return;
+        }
+        self.since_scan = 0;
+        let landings = crate::sync::find_sync_landings(
+            &self.buf,
+            self.buf_start_abs,
+            self.pitch_fse,
+            &self.reference,
+            0.85,
+        );
+        for l in &landings {
+            let sym = l.pos_fse / self.pitch_fse as f64;
+            // Gap-based dedup: preambles are ≥ ~4000 sym apart, so a landing
+            // within 1000 sym of the last one is the same preamble re-seen on a
+            // later scan (robust to the correlator's relative threshold shifting).
+            if sym <= self.last_sym + 1000.0 {
+                continue;
+            }
+            if let Some((psym, pphi)) = self.prev {
+                let mut dphi = l.phi - pphi;
+                while dphi > 0.5 {
+                    dphi -= 1.0;
+                }
+                while dphi < -0.5 {
+                    dphi += 1.0;
+                }
+                let dsym = sym - psym;
+                if dsym > 1.0 {
+                    self.last_resid_ppm = dphi / dsym * 1e6; // residual SFO over the gap
+                    self.r_ppm += self.gain * self.last_resid_ppm;
+                    self.base_rate = 1.0 + self.r_ppm * 1e-6;
+                    self.n_updates += 1;
+                }
+            }
+            self.prev = Some((sym, l.phi));
+            self.last_sym = sym;
+        }
+        // Prune to the retained tail; advance the absolute origin so positions
+        // stay correct. `prev`/`last_sym` are absolute → unaffected by pruning.
+        if self.buf.len() > Self::RETAIN_FSE {
+            let drop = self.buf.len() - Self::RETAIN_FSE;
+            self.buf.drain(0..drop);
+            self.buf_start_abs += drop as u64;
+        }
+    }
+}
 
 /// Inter-frame silence gate. The TX separates the data burst from the
 /// EOT trailer with `INTER_FRAME_SILENCE_S` (200 ms) of silence
@@ -551,7 +692,7 @@ pub struct V3Session {
     /// ⇒ the fixed-ratio resampler + `drift_ppm` path (byte-identical to before).
     /// The bulk-drift COARSE stage; the fine (post-FFE, M&M/turbo) stage is
     /// wired later (M2b), mirroring the two-stage carrier split.
-    timing: Option<TimingTracker>,
+    timing: Option<PreambleSfoTracker>,
     // ---- Phase 3a: per-cycle CW decode -------------------------------
     decoder: LdpcDecoder,
     constellation: Constellation,
@@ -823,57 +964,27 @@ impl V3Session {
         let syms_per_cw = padded_n / bps;
         let k_bytes = decoder.k() / 8;
         let deinterleave_perm = interleaver::deinterleave_table(padded_n, cfg.constellation);
-        // --- Coarse timing loop (SFO recovery, M2a). Dev opt-in `V3_TIMING_LOOP`;
-        // flips to default-ON + kill `V3_NO_TIMING_LOOP` after NBFM validation
-        // (mirrors `carrier_track`). Absent ⇒ smooth resampler off ⇒ the fixed-
-        // ratio + drift_ppm path is byte-identical. ---
-        let timing = if std::env::var_os("V3_TIMING_LOOP").is_some() {
+        // --- Coarse timing loop (SFO recovery). Default-ON, kill-switch
+        // `V3_NO_TIMING_LOOP` (mirrors `carrier_track`/`V3_NO_CARRIER_TRACK`).
+        // Recovers 232/232 ESI at +50 ppm on 16/64-APSK where the fixed-ratio
+        // path decodes ~4/232. Data-aided on the entry preamble (see
+        // `PreambleSfoTracker`) — modulation-independent, byte-exact when the
+        // rate settles to unity on a drift-free capture. ---
+        let timing = if std::env::var_os("V3_NO_TIMING_LOOP").is_none() {
             dsp.timing_enable(true);
-            // TED: Gardner for constant-modulus (QPSK/8PSK), AbsGardner for
-            // multi-ring APSK (16/32/64) — count distinct amplitude rings.
-            let mut mags: Vec<f64> = constellation.points.iter().map(|p| p.norm()).collect();
-            mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            mags.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-            let ted = if mags.len() > 1 {
-                TedVariant::AbsGardner
-            } else {
-                TedVariant::Gardner
-            };
-            // Recalibrated gains (the naive DVB unit-Es values are ~100-300×
-            // too hot: the AGC-normalised TED K_d on real RRC pulses is far
-            // larger, and AbsGardner (energy-domain) is ~10× larger again than
-            // Gardner — measured on the closed loop, HIGH++ d50 recovers only
-            // with these). Base at Rs=1000; Kp ∝ 1/Rs, Ki ∝ 1/Rs².
-            // AbsGardner base tuned so the Rs=1500 fast family lands on the
-            // closed-loop-validated (2.5e-6, 3.75e-11) after the 1/Rs scaling.
-            // (d50 repair=0 is a knife-edge point; per-profile fine calibration
-            // is a follow-up — override via V3_TIMING_KP/_KI.)
-            let (base_kp, base_ki) = if ted == TedVariant::AbsGardner {
-                (3.75e-6, 8.4e-11)
-            } else {
-                (2.5e-5, 3.75e-9)
-            };
-            let rs = cfg.symbol_rate.max(1.0);
-            let kp = std::env::var("V3_TIMING_KP")
+            // Data-aided feedforward on the entry preamble (constant-modulus,
+            // modulation-independent). The residual-φ slope between successive
+            // preambles is integrated into the resampler rate with `gain < 1`.
+            let gain = std::env::var("V3_TIMING_GAIN")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(base_kp * 1000.0 / rs);
-            let ki = std::env::var("V3_TIMING_KI")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(base_ki * (1000.0 / rs).powi(2));
-            let mut tr = TimingTracker::new(ted, kp, ki, dsp.pitch_fse());
-            if let Some(s) = std::env::var("V3_TIMING_SIGN")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-            {
-                tr.set_control_sign(s); // A/B the AbsGardner/real-pipeline polarity
-            }
-            tr.seed(0.0); // refined from the 2-preamble estimate (next M2 step)
-            // Dev seed hook: force the initial rate for end-to-end A/B before the
-            // real 2-preamble seed is wired (proves the loop RECOVERS the decode
-            // when seeded). ppm = the CORRECTING drift (opposite sign to the
-            // injected SFO, like the coarse `to_ppm`).
+                .unwrap_or(0.5);
+            let mut tr = PreambleSfoTracker::new(
+                crate::preamble::make_preamble_for_config(&cfg),
+                dsp.pitch_fse(),
+                gain,
+            );
+            // Dev seed hook: force the initial bulk rate for end-to-end A/B.
             if let Some(sp) = std::env::var("V3_TIMING_SEED_PPM")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
@@ -1174,6 +1285,15 @@ impl V3Session {
             if let Some(tr) = self.timing.as_mut() {
                 tr.feed(sym_start_abs, &new_fse);
                 self.dsp.set_resample_step(tr.rate());
+                if std::env::var_os("V3_TIMING_LOG").is_some() && !self.replaying {
+                    eprintln!(
+                        "[timing] tot={} syms={} est_ppm={:+.3} last_ted={:+.4}",
+                        self.total_samples,
+                        tr.processed_syms(),
+                        tr.rate_ppm(),
+                        tr.last_err(),
+                    );
+                }
             }
             self.ffe.push_raw(&new_fse);
         }
@@ -1347,6 +1467,17 @@ impl V3Session {
         // inherited the stale rate. (Root cause of the "1st OK, rest degrade".)
         self.drift_ppm = 0.0;
         self.drift_locked = false;
+        // Timing loop is per-burst too: clear the seeded bulk rate back to unity
+        // so the NEXT burst re-seeds from its own gardner estimate (a different
+        // TX → different SFO) instead of inheriting this burst's rate. Mirrors
+        // the `drift_ppm = 0` reset above.
+        if self.timing.is_some() {
+            if let Some(tr) = self.timing.as_mut() {
+                tr.seed(0.0);
+                tr.reset(0); // clear the preamble anchor + buffer for the new burst
+            }
+            self.dsp.timing_seed(1.0, 0.0);
+        }
         // CFO is per-TX (oscillator offset): clear it so the next burst — a
         // possibly different TX — re-estimates from scratch instead of inheriting
         // the previous burst's carrier offset. `set_cfo_hz(0.0)` also resets the
@@ -3468,10 +3599,10 @@ impl V3Session {
         if self.drift_locked {
             return;
         }
-        // The continuous timing loop owns the resampler rate — the discrete
-        // coarse-drift commit (reboot + replay) would fight it and re-bootstrap
-        // the session (the fragile behaviour M0 measured). Skip it when the loop
-        // is active (M2a); the loop's own seed replaces this estimate later.
+        // Continuous timing loop active: the closed-loop TED is the SOLE coarse
+        // SFO estimator and OWNS the resampler rate (acquire → rewind → track, in
+        // `run_timing_acquisition`). No discrete drift commit here — the old
+        // marker/preamble/gardner estimators are bypassed entirely.
         if self.timing.is_some() {
             return;
         }
@@ -3582,6 +3713,11 @@ impl V3Session {
         events: &mut Vec<V3SessionEvent>,
     ) {
         if !self.two_preamble_enabled {
+            return;
+        }
+        // The closed-loop TED is the sole coarse SFO estimator when the timing
+        // loop is active — the discrete 2-preamble drift path stands down.
+        if self.timing.is_some() {
             return;
         }
         if self.drift_locked || self.replaying || self.two_preamble_attempted {
@@ -3714,6 +3850,21 @@ impl V3Session {
         // across the corrected replay so the second pass keeps the correction
         // and does not re-commit. (0.0 ⇒ byte-exact no-op, the default path.)
         self.dsp.set_cfo_hz(self.cfo_hz);
+        // The fresh `StreamingDsp` defaults timing OFF; when the continuous loop
+        // is active it must survive the rebuild. Re-enable the smooth resampler
+        // and re-seat it on the tracker's current bulk rate (the loop keeps its
+        // `base_rate`; `reset` just clears the residual + AGC for the fresh
+        // stream). Without this a replay/reboot would silently drop to the
+        // fixed-ratio path and lose the seeded SFO correction.
+        if self.timing.is_some() {
+            self.dsp.timing_enable(true);
+            let seed_rate = {
+                let tr = self.timing.as_mut().unwrap();
+                tr.reset(0); // cursor re-bootstraps from the first fed block
+                tr.rate() // == base_rate after reset
+            };
+            self.dsp.timing_seed(seed_rate, 0.0);
+        }
         // The persistent carrier loop re-derives from the first segment of the
         // replayed burst (it is a fine, in-order forward estimate).
         self.carrier_inited = false;

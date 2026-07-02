@@ -185,6 +185,18 @@ impl TimingTracker {
         self.cur_rate
     }
 
+    /// Current commanded rate expressed as a clock offset in ppm
+    /// (`(cur_rate - 1)·1e6`) — the loop's live coarse-SFO estimate.
+    pub fn rate_ppm(&self) -> f64 {
+        (self.cur_rate - 1.0) * 1e6
+    }
+
+    /// Symbols the TED has processed since the last (re)seed — a proxy for how
+    /// far the closed loop has had to converge.
+    pub fn processed_syms(&self) -> u64 {
+        self.diag_n
+    }
+
     /// Latest TED output (diagnostics).
     pub fn last_err(&self) -> f64 {
         self.loop_.last_err()

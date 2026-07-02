@@ -235,6 +235,204 @@ fn correlate_at(mf: &[Complex64], preamble: &[Complex64], start: usize, pitch: u
     acc.norm_sqr()
 }
 
+/// Coarse SFO (sampling-clock-offset) seed measured from TWO preambles on the
+/// post-RRC T/2 stream — the feedforward estimate that seeds the timing loop.
+///
+/// This is the "estimate before the FFE" quantity: it reads the matched-filter
+/// output (the same T/2 `sym_buffer` the TED consumes), NOT the raw audio and
+/// NOT the drift-compensated FFE output. See [`estimate_sfo_seed_two_preambles`].
+#[derive(Clone, Copy, Debug)]
+pub struct SfoSeed {
+    /// Coarse SFO estimate in ppm, with `sign` already applied.
+    pub slope_ppm: f64,
+    /// Preamble #1 fractional on-symbol timing phase, in symbols, centred to
+    /// `[-0.5, 0.5)`. The initial τ₀ for the resampler.
+    pub tau0_frac: f64,
+    /// Measured distance between the two preambles, in symbols. In
+    /// self-calibration mode (`nominal_spacing_syms <= 0`) this is the ONLY
+    /// meaningful field: run on a zero-drift reference to obtain the nominal.
+    pub spacing_syms: f64,
+    /// Minimum of the two peaks' normalised correlation² (∈ [0,1]) — a
+    /// confidence gate against a spurious lock.
+    pub metric: f64,
+}
+
+/// Minimum normalised correlation² for both preamble landings to be trusted.
+const SFO_SEED_METRIC_GATE: f64 = 0.2;
+
+/// Sub-sample (fse-grid) refinement of a preamble landing: parabolic vertex of
+/// the correlation magnitude `|Σ stream[pos+k·pitch]·conj(pre[k])|` at
+/// `pos-1, pos, pos+1` (pos in fse-index units). Generalises
+/// [`crate::marker::refine_sync_pos_subsample`] to an arbitrary reference and
+/// stride. Falls back to `pos` at buffer edges / non-concave curvature.
+fn refine_preamble_pos_fse(
+    stream: &[Complex64],
+    pre: &[Complex64],
+    pos: usize,
+    pitch: usize,
+) -> f64 {
+    if pos == 0 || pos + pre.len() * pitch + 1 > stream.len() {
+        return pos as f64;
+    }
+    let m0 = correlate_at(stream, pre, pos - 1, pitch).sqrt();
+    let m1 = correlate_at(stream, pre, pos, pitch).sqrt();
+    let m2 = correlate_at(stream, pre, pos + 1, pitch).sqrt();
+    let denom = m0 - 2.0 * m1 + m2;
+    if denom >= -1e-12 {
+        return pos as f64; // flat / non-concave → no reliable sub-sample peak
+    }
+    let delta = 0.5 * (m0 - m2) / denom;
+    pos as f64 + delta.clamp(-1.0, 1.0)
+}
+
+/// Normalised correlation² of `pre` against `stream` at `pos` (stride `pitch`):
+/// `|Σ x·conj(s)|² / (Σ|x|²·Σ|s|²)` ∈ [0,1]. A matched-filter confidence metric.
+fn norm_corr_sq(stream: &[Complex64], pre: &[Complex64], pos: usize, pitch: usize) -> f64 {
+    let c = correlate_at(stream, pre, pos, pitch);
+    let pre_energy: f64 = pre.iter().map(|s| s.norm_sqr()).sum();
+    let mut sig = 0.0_f64;
+    for k in 0..pre.len() {
+        let idx = pos + k * pitch;
+        if idx >= stream.len() {
+            break;
+        }
+        sig += stream[idx].norm_sqr();
+    }
+    let denom = sig * pre_energy;
+    if denom <= 0.0 {
+        0.0
+    } else {
+        c / denom
+    }
+}
+
+/// Estimate the coarse SFO + τ₀ from the entry preamble and the first
+/// superframe-boundary reinsertion preamble, located on the **post-RRC T/2
+/// stream** (`sym_buffer`), not raw audio and not the FFE output.
+///
+/// Locates the two earliest preamble landings on the on-symbol grid (stride
+/// `pitch_fse`) via [`find_all_preambles`], sub-sample refines each on the T/2
+/// grid, converts the measured distance to ppm against `nominal_spacing_syms`,
+/// and reports preamble #1's fractional phase as τ₀.
+///
+/// `nominal_spacing_syms`: the zero-drift preamble distance in symbols. Obtain
+/// it by SELF-CALIBRATION — call this on a zero-drift reference and read
+/// [`SfoSeed::spacing_syms`] (pass `0.0` to skip the ppm calc in that pass). The
+/// spacing is segment-composition-dependent, so a hand-derived `period·Rs` would
+/// bias the ppm.
+///
+/// `sign`: multiplies the raw `(measured/nominal − 1)·1e6`. The correct
+/// convention (which sign makes the closed loop converge to the true offset) is
+/// resolved empirically against the known channel-sim `--drift-ppm`.
+///
+/// Returns `None` if fewer than two preambles are found or either peak fails the
+/// [`SFO_SEED_METRIC_GATE`].
+pub fn estimate_sfo_seed_two_preambles(
+    sym_buffer: &[Complex64],
+    sym_buffer_start_abs: u64,
+    pitch_fse: usize,
+    preamble_syms: &[Complex64],
+    nominal_spacing_syms: f64,
+    sign: f64,
+) -> Option<SfoSeed> {
+    if preamble_syms.is_empty() || pitch_fse == 0 {
+        return None;
+    }
+    // Two earliest preamble landings on the on-symbol grid (stride = pitch_fse).
+    let mut pos = find_all_preambles(sym_buffer, preamble_syms, 0, pitch_fse, 0.0, Some(2));
+    pos.sort_unstable();
+    if pos.len() < 2 {
+        return None;
+    }
+    let (p1, p2) = (pos[0], pos[1]);
+    let metric = norm_corr_sq(sym_buffer, preamble_syms, p1, pitch_fse)
+        .min(norm_corr_sq(sym_buffer, preamble_syms, p2, pitch_fse));
+    if metric < SFO_SEED_METRIC_GATE {
+        return None;
+    }
+    let r1 = refine_preamble_pos_fse(sym_buffer, preamble_syms, p1, pitch_fse);
+    let r2 = refine_preamble_pos_fse(sym_buffer, preamble_syms, p2, pitch_fse);
+    let spacing_fse = r2 - r1;
+    if spacing_fse <= 0.0 {
+        return None;
+    }
+    let spacing_syms = spacing_fse / pitch_fse as f64;
+    let raw_ppm = if nominal_spacing_syms > 0.0 {
+        (spacing_syms / nominal_spacing_syms - 1.0) * 1.0e6
+    } else {
+        0.0 // self-calibration pass: only `spacing_syms` is wanted
+    };
+    // τ₀ = preamble #1's fractional on-symbol phase, centred to [-0.5, 0.5).
+    let sym1 = (sym_buffer_start_abs as f64 + r1) / pitch_fse as f64;
+    let mut tau0_frac = sym1 - sym1.round();
+    if tau0_frac >= 0.5 {
+        tau0_frac -= 1.0;
+    }
+    Some(SfoSeed {
+        slope_ppm: sign * raw_ppm,
+        tau0_frac,
+        spacing_syms,
+        metric,
+    })
+}
+
+/// One located reference-symbol landing on the post-RRC T/2 stream.
+///
+/// Because every reference block (entry preamble, marker sync) is inserted at an
+/// **integer TX symbol index**, the fractional part of its refined landing (in
+/// symbol units) is exactly the symbol-timing phase τ at that anchor — a
+/// modulation-independent, unbiased, correlation-gain-robust timing measurement.
+/// Feedforward symbol-timing tracks the drift of `phi` across successive anchors.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncLanding {
+    /// Refined absolute position in fse-index units (`sym_buffer_start_abs` added).
+    pub pos_fse: f64,
+    /// Fractional symbol-timing phase φ = frac(pos_fse / pitch_fse), centred to
+    /// `[-0.5, 0.5)` — the timing error τ at this anchor, in symbols.
+    pub phi: f64,
+    /// Normalised correlation² of the landing (∈ [0,1]) — a confidence weight.
+    pub metric: f64,
+}
+
+/// Locate every landing of `reference` (the entry preamble OR the marker-sync
+/// pattern — both constant-modulus QPSK) on the post-RRC T/2 `sym_buffer`, and
+/// return each refined position with its fractional timing phase φ.
+///
+/// This is the data-aided symbol-timing front end: it operates ONLY on known
+/// reference symbols, so it is free of the modulation-dependent self-noise / gain
+/// that a decision-directed TED on the payload constellation suffers (no
+/// AbsGardner, no per-ring bias). Landings below `metric_gate` are dropped.
+/// Positions are returned sorted ascending.
+pub fn find_sync_landings(
+    sym_buffer: &[Complex64],
+    sym_buffer_start_abs: u64,
+    pitch_fse: usize,
+    reference: &[Complex64],
+    metric_gate: f64,
+) -> Vec<SyncLanding> {
+    if reference.is_empty() || pitch_fse == 0 {
+        return Vec::new();
+    }
+    let mut positions = find_all_preambles(sym_buffer, reference, 0, pitch_fse, 0.0, None);
+    positions.sort_unstable();
+    let mut out = Vec::with_capacity(positions.len());
+    for p in positions {
+        let metric = norm_corr_sq(sym_buffer, reference, p, pitch_fse);
+        if metric < metric_gate {
+            continue;
+        }
+        let r = refine_preamble_pos_fse(sym_buffer, reference, p, pitch_fse);
+        let abs = sym_buffer_start_abs as f64 + r;
+        let sym = abs / pitch_fse as f64;
+        let mut phi = sym - sym.round();
+        if phi >= 0.5 {
+            phi -= 1.0;
+        }
+        out.push(SyncLanding { pos_fse: abs, phi, metric });
+    }
+    out
+}
+
 /// Compute the FSE decimation factor.
 ///
 /// Largest divisor of GCD(sps, pitch) that is <= sps/2.
@@ -411,5 +609,55 @@ mod tests {
 
         let positions = find_all_preambles(&mf, &pre, 1, pitch, 0.0, None);
         assert_eq!(positions.len(), 3, "no cap = all 3 peaks returned");
+    }
+
+    /// Seed estimator: two preamble landings on a synthetic T/2 stream (stride
+    /// pitch_fse = 2) at a known symbol spacing. Noise-free, integer-aligned →
+    /// the estimator must recover the spacing exactly and the ppm to sub-ppm
+    /// against a slightly-detuned nominal.
+    #[test]
+    fn sfo_seed_two_preambles_recovers_spacing_and_ppm() {
+        let pre = synth_preamble();
+        let pitch_fse = 2usize;
+        let spacing_syms = 4000usize;
+        let spacing_fse = spacing_syms * pitch_fse; // 8000
+        let p1 = 200usize; // even → on the pitch_fse coarse grid
+        let p2 = p1 + spacing_fse;
+        let total = p2 + pre.len() * pitch_fse + 200;
+        let sym = synth_mf_with_peaks(&pre, pitch_fse, &[p1, p2], total);
+
+        // Self-calibration pass (nominal = 0): only spacing is meaningful.
+        let cal = super::estimate_sfo_seed_two_preambles(&sym, 0, pitch_fse, &pre, 0.0, 1.0)
+            .expect("two preambles located");
+        assert!(
+            (cal.spacing_syms - spacing_syms as f64).abs() < 1e-6,
+            "spacing {} != {}",
+            cal.spacing_syms,
+            spacing_syms
+        );
+        assert!(cal.metric > 0.99, "clean metric should be ~1, got {}", cal.metric);
+        assert!(cal.tau0_frac.abs() < 0.5);
+
+        // Zero drift: nominal == measured → ~0 ppm.
+        let z = super::estimate_sfo_seed_two_preambles(
+            &sym, 0, pitch_fse, &pre, spacing_syms as f64, 1.0,
+        )
+        .unwrap();
+        assert!(z.slope_ppm.abs() < 0.5, "expected ~0 ppm, got {}", z.slope_ppm);
+
+        // Detune the nominal by -50 ppm → estimator should report +50 ppm.
+        let nominal = spacing_syms as f64 * (1.0 - 50e-6);
+        let d = super::estimate_sfo_seed_two_preambles(&sym, 0, pitch_fse, &pre, nominal, 1.0)
+            .unwrap();
+        assert!(
+            (d.slope_ppm - 50.0).abs() < 0.5,
+            "expected +50 ppm, got {}",
+            d.slope_ppm
+        );
+
+        // Sign flips with `sign = -1`.
+        let n = super::estimate_sfo_seed_two_preambles(&sym, 0, pitch_fse, &pre, nominal, -1.0)
+            .unwrap();
+        assert!((n.slope_ppm + 50.0).abs() < 0.5, "sign flip failed: {}", n.slope_ppm);
     }
 }

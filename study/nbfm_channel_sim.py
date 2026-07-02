@@ -84,11 +84,19 @@ def write_wav(path, samples, sr):
 
 
 def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
-                      thermal_period_s=120.0, thermal_phase=0.0):
+                      thermal_period_s=120.0, thermal_phase=0.0,
+                      thermal_shape="sine"):
     """
     Applique une derive d'horloge soundcard sur un signal audio.
     Modele : le clock effectif est sr * (1 + d(t)*1e-6) ou
-      d(t) = drift_ppm + thermal_ppm * sin(2*pi*t/thermal_period_s + phase)
+      d(t) = drift_ppm + thermal_ppm * wave(2*pi*t/thermal_period_s + phase)
+
+    `thermal_shape` :
+      - "sine"     : oscillation lisse (defaut historique).
+      - "triangle" : rampes lineaires avec inversions de pente — modele reel
+        de la derive thermique (TX keyed -> temperature monte, la derive
+        rampe ; ventilateurs -> elle redescend). Pente max = 4*amp/period,
+        p.ex. 20 ppm/min avec amp=10 ppm sur period=120 s.
 
     Implementation : interpolation aux instants distordus par la derive
     cumulee (integrale du taux). Cela compresse/etire le temps de facon
@@ -98,9 +106,14 @@ def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
         return audio
     n = len(audio)
     t = np.arange(n) / sr
+    ph = 2 * np.pi * t / thermal_period_s + thermal_phase
+    if thermal_shape == "triangle":
+        # Triangle wave in [-1, 1], continuous, slope reverses at each apex.
+        wave = (2.0 / np.pi) * np.arcsin(np.sin(ph))
+    else:
+        wave = np.sin(ph)
     # Taux d'ecart instantane (sans unite, ~1e-6)
-    rate = drift_ppm * 1e-6 + thermal_ppm * 1e-6 * np.sin(
-        2 * np.pi * t / thermal_period_s + thermal_phase)
+    rate = drift_ppm * 1e-6 + thermal_ppm * 1e-6 * wave
     # Decalage temporel cumule (s)
     cum_shift = np.cumsum(rate) / sr
     # Instant d'echantillonnage dans le signal d'origine
@@ -119,7 +132,7 @@ def apply_clock_drift(audio, sr, drift_ppm=0.0, thermal_ppm=0.0,
 def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
              post_lpf=POST_LPF, post_gain_db=POST_GAIN_DB,
              drift_ppm=DRIFT_PPM, thermal_ppm=DRIFT_THERMAL_PPM,
-             thermal_period_s=DRIFT_THERMAL_PERIOD_S,
+             thermal_period_s=DRIFT_THERMAL_PERIOD_S, thermal_shape="sine",
              tx_hard_clip=TX_HARD_CLIP,
              audio_noise_rms=AUDIO_NOISE_RMS,
              multipath_paths=None,
@@ -246,7 +259,7 @@ def simulate(audio_in, if_noise_voltage=0.0, sub_audio_hpf=SUB_AUDIO_HPF,
         audio_out = apply_clock_drift(
             audio_out, AUDIO_RATE,
             drift_ppm=drift_ppm, thermal_ppm=thermal_ppm,
-            thermal_period_s=thermal_period_s)
+            thermal_period_s=thermal_period_s, thermal_shape=thermal_shape)
 
     return audio_out
 
@@ -263,6 +276,8 @@ def main():
                     help="Derive d'horloge statique (ppm)")
     ap.add_argument("--thermal-ppm", type=float, default=DRIFT_THERMAL_PPM,
                     help="Amplitude variation thermique (ppm crete)")
+    ap.add_argument("--thermal-shape", choices=["sine", "triangle"], default="sine",
+                    help="Forme de la derive thermique (triangle = rampes reelles TX/ventilo)")
     ap.add_argument("--thermal-period", type=float, default=DRIFT_THERMAL_PERIOD_S,
                     help="Periode variation thermique (s)")
     ap.add_argument("--start-delay", type=float, default=None,
@@ -291,6 +306,7 @@ def main():
                          drift_ppm=args.drift_ppm,
                          thermal_ppm=args.thermal_ppm,
                          thermal_period_s=args.thermal_period,
+                         thermal_shape=args.thermal_shape,
                          tx_hard_clip=args.tx_clip,
                          audio_noise_rms=args.audio_noise,
                          start_delay_s=args.start_delay,
