@@ -270,6 +270,106 @@ fn v3_ffe_mu_train() -> f64 {
 fn v3_ffe_mu_dd() -> f64 {
     std::env::var("V3_FFE_MU_DD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02)
 }
+/// Continuous forward DD-LMS step (`set_forward_lms`), lower than the
+/// acquisition DD above (0.008 vs 0.02). The higher acquisition step let the
+/// forward taps chase noise into divergence at low SNR — the turbo collapsing
+/// below the non-turbo baseline in the deep-loss regime (>10% ESI loss); 0.008
+/// keeps them from diverging there while staying byte-safe at high SNR
+/// (multi-seed validated 2026-07-03). SCOPED to the forward loop only: a global
+/// cut broke `drift_sweep_marker_validates_with_correction` because it also
+/// slowed the acquisition-drift `train_lms_at`, which keeps 0.02. Override via
+/// `V3_FFE_MU_DD_FWD`.
+fn v3_ffe_mu_dd_forward() -> f64 {
+    std::env::var("V3_FFE_MU_DD_FWD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.008)
+}
+/// Default soft "temperature" as a fraction of the constellation's minimum
+/// inter-point distance² (see [`make_forward_slice`]): `σ² = k · d_min²`. Scaling
+/// by `d_min²` makes the reliability `w` behave consistently across orders
+/// (QPSK's wide spacing → 64-APSK's dense rings) instead of a fixed σ² that
+/// over-damps the dense constellations. Swept via `V3_FWD_SOFT_K`; an absolute
+/// σ² override is available via `V3_FWD_SOFT_SIGMA2`.
+const DEFAULT_FWD_SOFT_K: f64 = 0.25;
+/// Forward DD-LMS decision + reliability for an equalised `y` in the (unit
+/// average power) constellation frame. Returns `(target, w)`: the HARD nearest
+/// data point (unbiased LMS target — drives the output to FULL constellation
+/// power, unlike a shrunk soft estimate) and a soft reliability
+/// `w = |E[a|y]|² / E[|a|²|y] ∈ [0, 1]` from the AWGN posterior over the data
+/// points at temperature σ². `w → 1` when the posterior concentrates on one
+/// point (confident), `w → 0` when it spreads (noisy). Scaling the tap step by
+/// `w` keeps the forward LMS from chasing noise at low SNR — the hard slice's
+/// documented failure mode (turbo < legacy on fading) — while the hard target
+/// keeps the equaliser gain honest. Log-sum-exp stabilised (subtract `dmin`).
+fn forward_decision(points: &[Complex64], y: Complex64, sigma2: f64) -> (Complex64, f64) {
+    let mut dmin = f64::INFINITY;
+    let mut nearest = points[0];
+    for &s in points {
+        let dd = (y - s).norm_sqr();
+        if dd < dmin {
+            dmin = dd;
+            nearest = s;
+        }
+    }
+    let mut sw = 0.0f64;
+    let mut ea = Complex64::new(0.0, 0.0);
+    let mut ea2 = 0.0f64;
+    for &s in points {
+        let w = (-((y - s).norm_sqr() - dmin) / sigma2).exp();
+        sw += w;
+        ea += s * w;
+        ea2 += s.norm_sqr() * w;
+    }
+    if sw <= 0.0 || ea2 <= 1e-30 {
+        return (nearest, 1.0);
+    }
+    let ea = ea / sw;
+    let ea2 = ea2 / sw;
+    (nearest, (ea.norm_sqr() / ea2).clamp(0.0, 1.0))
+}
+/// Build the decision+reliability closure for the continuous forward DD-LMS
+/// ([`StreamingFfe::set_forward_lms`]). Default = reliability-weighted step
+/// ([`forward_decision`]: hard target, step scaled by the posterior confidence
+/// `w`). Kill-switch `V3_NO_FWD_SOFT` → hard target with `w = 1` (legacy A/B
+/// baseline, byte-identical). σ² from `V3_FWD_SOFT_SIGMA2` (default
+/// [`DEFAULT_FWD_SOFT_SIGMA2`]).
+fn make_forward_slice(
+    cons: Constellation,
+) -> Box<dyn Fn(Complex64) -> (Complex64, f64) + Send + Sync> {
+    if std::env::var_os("V3_NO_FWD_SOFT").is_some() {
+        Box::new(move |y| (cons.points[cons.slice_nearest(&[y])[0]], 1.0))
+    } else {
+        // Scale the soft temperature to the constellation: σ² = k · d_min².
+        let dmin2 = {
+            let p = &cons.points;
+            let mut m = f64::INFINITY;
+            for i in 0..p.len() {
+                for j in (i + 1)..p.len() {
+                    let dd = (p[i] - p[j]).norm_sqr();
+                    if dd < m {
+                        m = dd;
+                    }
+                }
+            }
+            if m.is_finite() && m > 0.0 {
+                m
+            } else {
+                1.0
+            }
+        };
+        let sigma2 = std::env::var("V3_FWD_SOFT_SIGMA2")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or_else(|| {
+                let k = std::env::var("V3_FWD_SOFT_K")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(DEFAULT_FWD_SOFT_K);
+                k * dmin2
+            });
+        Box::new(move |y| forward_decision(&cons.points, y, sigma2))
+    }
+}
 /// Sub-sample search radius (48 kHz samples) for the stage-1b channel-matched
 /// preamble refinement around the integer matched-filter peak.
 const V3_PREAMBLE_REFINE_RADIUS: usize = 8;
@@ -893,13 +993,7 @@ impl V3Session {
         // Continuous forward DD-LMS keeps the taps tracking through the DATA
         // cycles between META anchors (mirrors the batch path's whole-burst
         // LMS); the slicer owns its own constellation copy.
-        {
-            let cons = constellation.clone();
-            ffe.set_forward_lms(
-                Box::new(move |y| cons.points[cons.slice_nearest(&[y])[0]]),
-                v3_ffe_mu_dd(),
-            );
-        }
+        ffe.set_forward_lms(make_forward_slice(constellation.clone()), v3_ffe_mu_dd_forward());
         let bps = cfg.constellation.bits_per_sym();
         let padded_n = interleaver::padded_cw_bits(decoder.n(), cfg.constellation);
         let syms_per_cw = padded_n / bps;
@@ -3599,13 +3693,8 @@ impl V3Session {
             pitch_fse,
             mf_delay_frac,
         );
-        {
-            let cons = self.constellation.clone();
-            self.ffe.set_forward_lms(
-                Box::new(move |y| cons.points[cons.slice_nearest(&[y])[0]]),
-                v3_ffe_mu_dd(),
-            );
-        }
+        self.ffe
+            .set_forward_lms(make_forward_slice(self.constellation.clone()), v3_ffe_mu_dd_forward());
         // Decode + FSM state goes back to a fresh-bootstrap regime so
         // the replay sees the burst from scratch. Counters reset so
         // SessionFinalised reports the post-reboot numbers (the only

@@ -86,7 +86,13 @@ pub struct StreamingFfe {
     /// the whole burst (the static-between-anchors forward apply otherwise
     /// lets DATA cycles far from an anchor drift). Off until
     /// [`set_forward_lms`](StreamingFfe::set_forward_lms) is called.
-    forward_slice: Option<Box<dyn Fn(Complex64) -> Complex64 + Send + Sync>>,
+    ///
+    /// The closure returns `(decision, w)`: the LMS TARGET (hard nearest point —
+    /// unbiased, drives the output to full constellation power) and a per-symbol
+    /// RELIABILITY `w ∈ (0, 1]` that scales the step. `w < 1` on a low-confidence
+    /// symbol keeps the taps from chasing noise at low SNR (the FRUE shared
+    /// reliability weight applied to `h`); a hard slicer returns `w = 1` (legacy).
+    forward_slice: Option<Box<dyn Fn(Complex64) -> (Complex64, f64) + Send + Sync>>,
     forward_mu: f64,
     /// Fractionally-spaced (T/`pitch_fse`) matched-filter samples.
     frac_buf: Vec<Complex64>,
@@ -281,13 +287,14 @@ impl StreamingFfe {
         Some(num / den)
     }
 
-    /// Enable continuous forward DD-LMS in `push_raw`. `slice` returns the
-    /// nearest data-constellation point for a soft symbol; `mu` is the NLMS
-    /// step (0 disables the update). Passed as a closure to stay decoupled
-    /// from any concrete `Constellation` type.
+    /// Enable continuous forward DD-LMS in `push_raw`. `slice` maps an equalised
+    /// symbol to `(target, w)` — the hard LMS target point and a reliability
+    /// weight `w ∈ (0, 1]` that scales the step; `mu` is the base NLMS step (0
+    /// disables the update). Passed as a closure to stay decoupled from any
+    /// concrete `Constellation` type.
     pub fn set_forward_lms(
         &mut self,
-        slice: Box<dyn Fn(Complex64) -> Complex64 + Send + Sync>,
+        slice: Box<dyn Fn(Complex64) -> (Complex64, f64) + Send + Sync>,
         mu: f64,
     ) {
         self.forward_slice = Some(slice);
@@ -345,14 +352,17 @@ impl StreamingFfe {
                 // the equalised stream).
                 if self.forward_mu > 0.0 {
                     if let Some(slice) = self.forward_slice.as_ref() {
-                        let d = slice(acc);
+                        // Hard target `d` (unbiased — restores full constellation
+                        // power); reliability `w` scales the step so a noisy
+                        // symbol nudges the taps only a little (FRUE weight on h).
+                        let (d, w) = slice(acc);
                         let e = d - acc;
-                        if e.norm_sqr() < d.norm_sqr() {
+                        if w > 0.0 && e.norm_sqr() < d.norm_sqr() {
                             let mut r_pow = 1e-12f64;
                             for t in 0..n_ff {
                                 r_pow += self.frac_buf[lo + t].norm_sqr();
                             }
-                            let mu_eff = self.forward_mu / r_pow;
+                            let mu_eff = self.forward_mu * w / r_pow;
                             let taps = self.current_taps.as_mut().unwrap();
                             for t in 0..n_ff {
                                 taps[t] +=
