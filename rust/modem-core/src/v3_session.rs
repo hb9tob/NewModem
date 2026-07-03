@@ -222,40 +222,6 @@ impl PreambleSfoTracker {
     }
 }
 
-/// Inter-frame silence gate. The TX separates the data burst from the
-/// EOT trailer with `INTER_FRAME_SILENCE_S` (200 ms) of silence
-/// (`v3_modem.rs:104`). A Locked session that doesn't reset across that
-/// gap stays Locked and ignores the EOT's own preamble (`handle_sc_fire`
-/// acts only in Idle/Acquiring), so the EOT META is never decoded. We
-/// detect the gap by a sustained drop in the SC detector's live window
-/// energy and `finalize()` → Idle, re-arming acquisition for the EOT.
-///
-/// Trip when the live window energy stays below this fraction of the
-/// in-burst peak. The gap is real silence (channel noise floor only);
-/// modulated audio — including V3's periodic PRE+HDR re-insertion — sits
-/// far above it, so this never trips mid-burst, unlike a marker-elapsed
-/// timeout (which the periodic re-insertion would false-trigger).
-const SILENCE_ENERGY_RATIO: f64 = 0.10;
-/// Consecutive low-energy samples before the gate trips: ~100 ms at
-/// 48 kHz, half the 200 ms inter-frame gap. With cpal-sized chunks
-/// (≤ this many samples) the finalize lands a chunk or more before the
-/// EOT preamble arrives, so the EOT re-acquires cleanly in Idle. This is
-/// also the lower edge of the EOT-watch window (arm the short preamble
-/// correlator once we've seen ≥ 100 ms of silence).
-const SILENCE_HOLD_SAMPLES: u64 = (AUDIO_RATE as u64) / 10;
-/// Upper edge of the EOT-watch window: 300 ms. The TX inter-frame gap is
-/// 200 ms, so a preamble that lands between 100 ms and 300 ms of silence
-/// is the EOT trailer; past 300 ms it's an ordinary burst end (disarm).
-const SILENCE_MAX_SAMPLES: u64 = (AUDIO_RATE as u64) * 3 / 10;
-/// How long the short preamble correlator stays armed after a qualifying
-/// gap ends. Must cover the EOT preamble (256 syms) streaming in PLUS the
-/// warmup + header + marker behind it so the marker validates: ~400 ms.
-const EOT_POST_GAP_WATCH_SAMPLES: u64 = (AUDIO_RATE as u64) * 2 / 5;
-/// Normalised preamble-correlation metric `|Σ raw·conj(pre)|² /
-/// (Σ|raw|²·Σ|pre|²) ∈ [0,1]` threshold for declaring the EOT preamble
-/// found. Same 0.5 floor recipe as `SC_THRESHOLD`.
-const EOT_PREAMBLE_CORR_THRESHOLD: f64 = 0.5;
-
 /// Consecutive predicted-marker misses tolerated before the session
 /// concludes the TX has desynced (random next position, or a TxMore stream
 /// that never reached EOT) and returns to Idle for a late-entry re-acquire.
@@ -792,26 +758,11 @@ pub struct V3Session {
     /// Étage-B re-commits emitted this epoch (loop guard; drift is ~constant so
     /// one or two suffice).
     drift_recommits: u32,
-    // ---- Inter-frame silence gate (EOT re-acquisition) --------------
-    /// Peak SC window-energy seen while Locked. The silence gate fires
-    /// when the live energy drops below `SILENCE_ENERGY_RATIO` of this
-    /// peak for `SILENCE_HOLD_SAMPLES` consecutive samples. Reset on
-    /// `finalize()` so the next burst rebuilds its own reference.
-    burst_energy_ref: f64,
-    /// Consecutive samples whose SC window-energy sits below the silence
-    /// threshold (see `burst_energy_ref`). Reset on any above-threshold
-    /// sample.
-    silence_run: u64,
-    /// Deferred silence-gate trip. Set in the per-sample ingest loop,
-    /// consumed AFTER `try_apply_coarse_drift` so a Phase-4 drift commit
-    /// landing in the same chunk isn't dropped by the reset.
-    pending_silence_finalize: bool,
-    /// Remaining samples in the EOT-watch window. Armed (set to
-    /// `SILENCE_MAX_SAMPLES - SILENCE_HOLD_SAMPLES`) when silence first
-    /// reaches 100 ms; counts down every sample. While > 0 and Idle, the
-    /// short preamble correlator runs to catch the EOT trailer's lone
-    /// preamble (the cycle-lag SC can't). Cleared on lock or expiry.
-    eot_watch_remaining: u64,
+    // NB: EOT re-acquisition is handled by the always-on preamble matched
+    // filter (`try_acquire_preamble`), NOT an inter-frame silence gate — there
+    // is no silence on a real radio channel. The burst ends deterministically on
+    // the LAST-flag marker (see `try_decode_pending_cycle`). The legacy silence
+    // gate lives on only in the non-turbo `rx_v2` path.
     /// Last segment's equalised data-symbol scatter (I/Q) for the GUI. Filled
     /// by [`canon_demod_segment`]; read by `try_decode_pending_cycle` to emit a
     /// [`V3SessionEvent::ConstellationDiag`]. Diagnostic only.
@@ -935,12 +886,6 @@ impl V3Session {
             crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
         let mut dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
-        // Fused polyphase-RRC front end (V3_FE_POLY, opt-in): collapses
-        // resample+MF+decimate into one bank (16-48× fewer MACs). Orthogonal to
-        // the timing loop below; OFF = the verbatim 4-stage chain.
-        if std::env::var_os("V3_FE_POLY").is_some() {
-            dsp.poly_fe_enable(true);
-        }
         let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&cfg);
         let mut ffe = StreamingFfe::new(
             n_ff,
@@ -1078,10 +1023,6 @@ impl V3Session {
             replaying: false,
             turbo_sync_enabled: std::env::var_os("V3_NO_TURBO_SYNC").is_none(),
             drift_recommits: 0,
-            burst_energy_ref: 0.0,
-            silence_run: 0,
-            pending_silence_finalize: false,
-            eot_watch_remaining: 0,
             last_diag_constellation: Vec::new(),
             last_diag_pilot_phases: Vec::new(),
             last_diag_data_evm: 0.0,
@@ -1220,54 +1161,6 @@ impl V3Session {
                     .saturating_sub(self.sc.window_samples as u64);
                 pending_sc.push((marker_at_abs, metric));
             }
-            // Inter-frame silence gate. Track the SC detector's live
-            // window energy (its `p2` accumulator, recomputed every primed
-            // push at zero extra cost). A sustained drop to noise-floor
-            // level marks the 200 ms gap before the EOT trailer. Measured
-            // state-INDEPENDENTLY (not gated on Locked) so the gap timer
-            // keeps running across the data-burst finalize → the EOT-watch
-            // window can span the 100–300 ms region the TX puts the EOT in.
-            let e = self.sc.last_energy;
-            if e > self.burst_energy_ref {
-                self.burst_energy_ref = e;
-            }
-            let is_silent = self.burst_energy_ref > 0.0
-                && e < SILENCE_ENERGY_RATIO * self.burst_energy_ref;
-            if is_silent {
-                self.silence_run += 1;
-                // At exactly 100 ms of silence: finalize the data burst
-                // (if still Locked — deferred flag, consumed after the
-                // drift pass) so the FSM is Idle by the time the EOT
-                // preamble arrives.
-                if self.silence_run == SILENCE_HOLD_SAMPLES
-                    && matches!(self.state, V3SessionState::Locked { .. })
-                {
-                    self.pending_silence_finalize = true;
-                }
-            } else {
-                // Signal returned. If the gap that just ended was in the
-                // [100, 300] ms EOT window, arm the short preamble
-                // correlator for the incoming frame. The watch lasts long
-                // enough for the EOT preamble (256 syms) + warmup + header
-                // + marker to stream in and validate (~400 ms), NOT just
-                // the residual silence — the preamble itself is signal.
-                if self.silence_run >= SILENCE_HOLD_SAMPLES
-                    && self.silence_run <= SILENCE_MAX_SAMPLES
-                {
-                    self.eot_watch_remaining = EOT_POST_GAP_WATCH_SAMPLES;
-                }
-                self.silence_run = 0;
-            }
-            // Count the watch down every sample.
-            if self.eot_watch_remaining > 0 {
-                self.eot_watch_remaining -= 1;
-                if self.eot_watch_remaining == 0 {
-                    // Window expired with no EOT lock: ordinary burst end,
-                    // not an EOT. Drop the energy reference so the next
-                    // real burst rebuilds its own.
-                    self.burst_energy_ref = 0.0;
-                }
-            }
         }
 
         // 2. Drive the streaming RX-DSP pipeline forward, then drain
@@ -1321,15 +1214,6 @@ impl V3Session {
         //     ScDetector metric is too weak to pin the marker.
         self.try_acquire_preamble(&mut events);
 
-        // 3b. EOT re-acquisition. While the EOT-watch window is armed
-        //     (100–300 ms of inter-frame silence, set by the per-sample
-        //     gate) and we're Idle, run the short preamble correlator over
-        //     the raw symbol stream. The cycle-lag SC detector can't fire
-        //     on the lone EOT frame — the V3 preamble is a random QPSK
-        //     sequence with no self-similarity — so this matched-filter
-        //     pass against the known preamble is what re-acquires it.
-        self.try_reacquire_eot_preamble(&mut events);
-
         // 4. Drain the decode + advance loop until no more progress
         //    can be made on this chunk. A single chunk may carry
         //    several cycles' worth of symbols (e.g. a long monolithic
@@ -1371,43 +1255,6 @@ impl V3Session {
         //     blocks re-entry), so a single call settles the burst at
         //     the right drift.
         self.try_apply_coarse_drift(&mut events, external_history);
-
-        // 4c. Inter-frame silence gate. The per-sample loop sets
-        //     `pending_silence_finalize` once the live SC window energy
-        //     has sat at noise-floor level for SILENCE_HOLD_SAMPLES — the
-        //     200 ms gap the TX inserts before the EOT trailer
-        //     (`v3_modem.rs:104`). We consume it HERE, after
-        //     `try_apply_coarse_drift`, so a drift commit landing in the
-        //     same chunk isn't dropped by the reset. `finalize()` emits
-        //     SessionFinalised + returns to Idle, re-arming
-        //     `handle_sc_fire` so the EOT's own preamble re-acquires as a
-        //     fresh burst (cycle_idx 0). The `Locked` guard avoids a
-        //     double-reset if a drift reboot already left us non-Locked.
-        //     (This replaces a marker-elapsed timeout, which V3's
-        //     periodic PRE+HDR re-insertion would false-trigger — the
-        //     re-insertion carries energy, so the silence gate ignores
-        //     it.)
-        if self.pending_silence_finalize {
-            self.pending_silence_finalize = false;
-            // The energy silence-gate finalises on a sustained drop to noise
-            // floor. On a real RF cut the carrier is replaced by BAND NOISE
-            // (energy stays high), so the gate never fires on a true end; it only
-            // false-fires on deep fades MID-burst, fragmenting the session before
-            // the flywheel / consecutive-miss coast can carry through. End-of-
-            // burst is now driven by the LAST flag (deterministic) and
-            // MAX_CONSECUTIVE_MISS (loss of structure), so the energy gate is
-            // disabled by default. `V3_LEGACY_EOB` restores it for A/B.
-            let legacy_eob = std::env::var_os("V3_LEGACY_EOB").is_some();
-            if legacy_eob && matches!(self.state, V3SessionState::Locked { .. }) {
-                if std::env::var_os("V3_LOG_SYNC").is_some() {
-                    eprintln!(
-                        "[finalize] SILENCE-GATE tot={} cycles_validated={}",
-                        self.total_samples, self.cycles_validated,
-                    );
-                }
-                events.extend(self.finalize());
-            }
-        }
 
         // 5. Trim the rolling audio buffer. StreamingDsp tracks its own
         //    resampler cursor; we keep the last AUDIO_BUFFER_RETAIN_CYCLES
@@ -1518,12 +1365,6 @@ impl V3Session {
         // `handle_sc_fire` would never fire again. In silence/noise `M` is
         // low, so this can't cause a spurious bootstrap.
         self.sc.rearm();
-        // NB: the silence/EOT-watch fields (`burst_energy_ref`,
-        // `silence_run`, `eot_watch_remaining`) are deliberately NOT reset
-        // here. The data-burst silence gate finalizes the burst → Idle but
-        // must KEEP the watch armed so the short preamble correlator can
-        // catch the EOT trailer across the 200 ms gap. Those fields reset
-        // on the next successful lock (`handle_sc_fire`) instead.
         events
     }
 
@@ -1561,13 +1402,6 @@ impl V3Session {
             }
             return;
         };
-        // Fresh lock incoming: reset the silence/EOT-watch state so this
-        // burst tracks its own energy reference, and disarm any pending
-        // EOT watch (we just re-acquired — whether a normal burst or the
-        // EOT trailer itself).
-        self.burst_energy_ref = 0.0;
-        self.silence_run = 0;
-        self.eot_watch_remaining = 0;
         // The SC pair detector only fires on (DATA, DATA) pairs (META
         // and DATA cycles have different periods), so the bootstrap
         // normally lands on a DATA marker even though every V3 burst
@@ -1988,81 +1822,6 @@ impl V3Session {
             metric,
         });
         self.handle_sc_fire(marker_at_abs_audio, metric, events);
-    }
-
-    /// Short preamble correlator for EOT re-acquisition. Runs only while
-    /// the EOT-watch window is armed (`eot_watch_remaining > 0`) and the
-    /// FSM is Idle — i.e. 100–300 ms into the inter-frame silence that the
-    /// TX puts before the EOT trailer (`v3_modem.rs:104`).
-    ///
-    /// The V3 preamble is a random 256-QPSK sequence (no internal
-    /// repetition), so the cycle-lag Schmidl-Cox detector cannot fire on
-    /// the lone EOT frame. Instead we cross-correlate the KNOWN preamble
-    /// against the raw symbol stream with a scale-invariant normalised
-    /// metric `|Σ raw·conj(pre)|² / (Σ|raw|²·Σ|pre|²) ∈ [0,1]`. On a peak
-    /// above `EOT_PREAMBLE_CORR_THRESHOLD` we compute the implied marker
-    /// position (preamble + warmup + header) and drive `handle_sc_fire`,
-    /// which re-acquires the EOT as a fresh burst (its META marker → cycle
-    /// 0 → `try_decode_pending_cycle` → EOT sentinel → `EotSeen`).
-    fn try_reacquire_eot_preamble(&mut self, events: &mut Vec<V3SessionEvent>) {
-        if self.eot_watch_remaining == 0
-            || !matches!(self.state, V3SessionState::Idle)
-        {
-            return;
-        }
-        let pre = preamble::make_preamble_for_config(&self.cfg);
-        let n_pre = pre.len();
-        let raw = self.ffe.out_buf();
-        if raw.len() < n_pre {
-            return;
-        }
-        let ppre: f64 = pre.iter().map(|s| s.norm_sqr()).sum();
-        let mut best_metric = 0.0f64;
-        let mut best_pos = 0usize;
-        for start in 0..=(raw.len() - n_pre) {
-            let mut acc = Complex64::new(0.0, 0.0);
-            let mut praw = 0.0f64;
-            for (k, &p) in pre.iter().enumerate() {
-                let r = raw[start + k];
-                acc += r * p.conj();
-                praw += r.norm_sqr();
-            }
-            let m = acc.norm_sqr() / (praw * ppre).max(1e-30);
-            if m > best_metric {
-                best_metric = m;
-                best_pos = start;
-            }
-        }
-        if best_metric < EOT_PREAMBLE_CORR_THRESHOLD {
-            // No preamble (fully) present yet — stay armed, retry next
-            // chunk as more symbols stream in.
-            return;
-        }
-        // Preamble located. The EOT marker sits N_PREAMBLE + LMS-warmup +
-        // header symbols past the preamble start (frame::build_eot_frame).
-        // Convert to the audio position `handle_sc_fire` expects (it adds
-        // the MF half-delay back and searches a wide window around it).
-        let (sps, _) =
-            rrc::check_integer_constraints(AUDIO_RATE, self.cfg.symbol_rate, self.cfg.tau)
-                .expect("profile config has valid integer sps");
-        const MF_DELAY_SYM: u64 = (crate::types::RRC_SPAN_SYM / 2) as u64;
-        let preamble_sym_abs = self.ffe.start_abs() + best_pos as u64;
-        // V4 EOT frame: PREAMBLE → MARKER₀(EOT_FRAME) → warmup → meta. The
-        // marker sits directly after the preamble (warmup is now behind it).
-        let marker_sym_abs = preamble_sym_abs + crate::types::N_PREAMBLE as u64;
-        let marker_at_abs_audio =
-            marker_sym_abs.saturating_sub(MF_DELAY_SYM) * sps as u64;
-        // Pre-check that the marker actually validates at the implied
-        // position before committing. If the preamble matched but the
-        // marker hasn't streamed in yet (or doesn't validate), stay armed
-        // and retry next chunk — do NOT let handle_sc_fire drop us into
-        // Acquiring (which the EOT path never re-drives).
-        if self.try_validate_marker_at(marker_at_abs_audio).is_none() {
-            return;
-        }
-        // Disarm and re-acquire (handle_sc_fire also clears on lock).
-        self.eot_watch_remaining = 0;
-        self.handle_sc_fire(marker_at_abs_audio, best_metric, events);
     }
 
     /// Search the FFE's raw symbol buffer around the SC-located audio
@@ -3052,14 +2811,13 @@ impl V3Session {
             });
         }
         // Deterministic end-of-transmission. This segment's marker carried the
-        // LAST flag (the last DATA segment; the TX sends the standalone EOT frame
-        // next), so the burst is over: finalise NOW → Idle, ready for the EOT
-        // frame's preamble, instead of inferring the end from an energy dip (the
-        // silence gate a deep fade false-triggers) or from MAX_CONSECUTIVE_MISS.
-        // `V3_LEGACY_EOB` restores the silence-driven exit for A/B. A blind coast
-        // never reaches here with `is_last` (no validated marker).
-        let legacy_eob = std::env::var_os("V3_LEGACY_EOB").is_some();
-        if pending.is_last && !legacy_eob {
+        // LAST flag (the last DATA segment; the TX only ever emits closed SFs,
+        // padded to a full final SF with repair ESIs, so the last one reliably
+        // carries LAST). The burst is over: finalise NOW → Idle, ready for the
+        // EOT frame's preamble the always-on matched filter re-acquires. This is
+        // the ONLY end-of-burst trigger (no silence gate — there is no silence on
+        // radio). A blind coast never reaches here (no validated marker).
+        if pending.is_last {
             if std::env::var_os("V3_LOG_SYNC").is_some() {
                 eprintln!(
                     "[finalize] LAST-FLAG segment base_esi={} → clean EOT exit",
@@ -3248,8 +3006,8 @@ impl V3Session {
             if b_end > raw_end_abs {
                 // Boundary window not fully arrived — wait before ruling the
                 // miss in or out, so we never escalate prematurely AT a
-                // boundary. (True end-of-burst then waits → the worker
-                // no-progress timer / EOT silence-gate finalizes.)
+                // boundary. (True end-of-burst is driven by the LAST-flag marker;
+                // a marker-less coast ends on the worker no-progress timer.)
                 return false;
             }
             if b_start >= raw_start_abs {
@@ -3850,11 +3608,6 @@ impl V3Session {
             self.cfg.beta,
             self.cfg.center_freq_hz,
         );
-        // The fresh DSP defaults the fused front end OFF; re-apply V3_FE_POLY so a
-        // replay/reboot keeps the same front-end path.
-        if std::env::var_os("V3_FE_POLY").is_some() {
-            self.dsp.poly_fe_enable(true);
-        }
         // The DSP is fresh, so re-apply the committed CFO to its NCO (mirrors how
         // `drift_ppm` is re-applied via feed_audio). `cfo_hz`/`cfo_locked` are
         // deliberately NOT reset here — like `drift_locked`, they must persist
@@ -3930,10 +3683,6 @@ impl V3Session {
         self.consecutive_miss = 0;
         self.next_base_esi = None;
         self.marker_seen = 0;
-        self.burst_energy_ref = 0.0;
-        self.silence_run = 0;
-        self.pending_silence_finalize = false;
-        self.eot_watch_remaining = 0;
         // Allow an immediate acquisition pass after a pipeline reset/replay.
         self.next_acq_scan_abs = 0;
     }
@@ -4007,10 +3756,6 @@ struct ScDetector {
     capacity: usize,
     delay_line: VecDeque<f32>,
     above_threshold: bool,
-    /// Energy of the most-recent `window_samples` samples (the `p2`
-    /// accumulator), refreshed on every primed `push`. Exposed for the
-    /// inter-frame silence gate; stays 0.0 until the delay line fills.
-    last_energy: f64,
 }
 
 impl ScDetector {
@@ -4022,7 +3767,6 @@ impl ScDetector {
             capacity,
             delay_line: VecDeque::with_capacity(capacity),
             above_threshold: false,
-            last_energy: 0.0,
         }
     }
 
@@ -4056,10 +3800,6 @@ impl ScDetector {
         }
         let denom = (p1 * p2).max(1e-30);
         let metric = (r * r) / denom;
-        // p2 = energy of the newest `window_samples` samples (indices
-        // [cycle_samples .. cycle_samples + window_samples)); the live
-        // window energy the silence gate watches.
-        self.last_energy = p2;
         let now_above = metric >= SC_THRESHOLD;
         let edge = now_above && !self.above_threshold;
         self.above_threshold = now_above;
@@ -4857,79 +4597,6 @@ mod tests {
         assert!(
             max >= 4,
             "session did not ride through the QRM (max cycle_idx {max}): {validated:?}",
-        );
-    }
-
-    #[test]
-    fn eot_after_inter_frame_silence_finalises_and_reacquires() {
-        // EOT-propre: the TX layout is `data ++ silence(200ms) ++ EOT`
-        // (v3_modem.rs:104). The EOT trailer carries its OWN preamble +
-        // marker + 1 META (frame.rs:448-462), so the session must reset
-        // to Idle across the silence gap to re-acquire on it — otherwise
-        // it stays Locked, `handle_sc_fire` ignores the EOT preamble
-        // (it acts only in Idle/Acquiring), and the EOT META is never
-        // decoded. The inter-frame silence gate drives that reset.
-        let cfg = high_plus_config();
-        let session_id = 0xBADC_0FFE;
-        let (sps, pitch) =
-            rrc_mod::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
-        let taps = rrc_mod::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
-
-        // Data burst (≥ a few cycles) + 200 ms silence + EOT trailer,
-        // mirroring V3Modem::encode_to_samples in vox==0 mode.
-        let mut audio = build_v3_burst_audio(&cfg, 800, session_id);
-        audio.extend_from_slice(&modulator::silence(0.2));
-        let eot_syms = frame::build_eot_frame(&cfg, session_id);
-        audio.extend_from_slice(&modulator::modulate(
-            &eot_syms,
-            sps,
-            pitch,
-            &taps,
-            cfg.center_freq_hz,
-        ));
-
-        let mut session = V3Session::new(cfg, "HIGH+".to_string());
-        let mut finalised = 0usize;
-        let mut eot_seen = false;
-        let mut seen_first_finalise = false;
-        let mut reacquired_cycle0 = false;
-        for c in audio.chunks(2400) {
-            for e in session.process_audio_chunk(c) {
-                match e {
-                    V3SessionEvent::SessionFinalised { .. } => {
-                        finalised += 1;
-                        seen_first_finalise = true;
-                    }
-                    V3SessionEvent::MarkerValidated { cycle_idx, .. } => {
-                        // After the data burst's silence-gate finalize,
-                        // the EOT must re-acquire as a FRESH burst — its
-                        // first validated marker is cycle_idx 0 again.
-                        if seen_first_finalise && cycle_idx == 0 {
-                            reacquired_cycle0 = true;
-                        }
-                    }
-                    V3SessionEvent::EotSeen => eot_seen = true,
-                    _ => {}
-                }
-            }
-        }
-        assert!(
-            seen_first_finalise,
-            "data burst never finalised — inter-frame silence gate did not trip",
-        );
-        assert!(
-            reacquired_cycle0,
-            "EOT did not re-acquire as a fresh burst (no cycle_idx 0 after finalize)",
-        );
-        assert!(
-            eot_seen,
-            "EOT META never decoded — re-acquisition + sentinel path broken",
-        );
-        // Two finalises expected: the data burst (silence gate) and the
-        // EOT (sentinel → finalize).
-        assert!(
-            finalised >= 2,
-            "expected ≥2 SessionFinalised (data gap + EOT), got {finalised}",
         );
     }
 
