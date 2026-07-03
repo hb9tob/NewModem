@@ -935,6 +935,12 @@ impl V3Session {
             crate::fd_acquire::PreambleMatchedFilter::new(&preamble_template, acq_search_len);
         let retain = AUDIO_BUFFER_RETAIN_CYCLES * cycle_samples;
         let mut dsp = StreamingDsp::new(cfg.symbol_rate, cfg.tau, cfg.beta, cfg.center_freq_hz);
+        // Fused polyphase-RRC front end (V3_FE_POLY, opt-in): collapses
+        // resample+MF+decimate into one bank (16-48× fewer MACs). Orthogonal to
+        // the timing loop below; OFF = the verbatim 4-stage chain.
+        if std::env::var_os("V3_FE_POLY").is_some() {
+            dsp.poly_fe_enable(true);
+        }
         let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&cfg);
         let mut ffe = StreamingFfe::new(
             n_ff,
@@ -3844,6 +3850,11 @@ impl V3Session {
             self.cfg.beta,
             self.cfg.center_freq_hz,
         );
+        // The fresh DSP defaults the fused front end OFF; re-apply V3_FE_POLY so a
+        // replay/reboot keeps the same front-end path.
+        if std::env::var_os("V3_FE_POLY").is_some() {
+            self.dsp.poly_fe_enable(true);
+        }
         // The DSP is fresh, so re-apply the committed CFO to its NCO (mirrors how
         // `drift_ppm` is re-applied via feed_audio). `cfo_hz`/`cfo_locked` are
         // deliberately NOT reset here — like `drift_locked`, they must persist

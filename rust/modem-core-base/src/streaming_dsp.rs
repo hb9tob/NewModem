@@ -53,6 +53,8 @@
 
 use crate::rrc::{self, rrc_taps};
 use crate::types::{Complex64, AUDIO_RATE, RRC_SPAN_SYM};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// FIR tap count of the polyphase resampler. 32 taps × Kaiser β=8 gives
 /// roughly 80 dB stop-band attenuation past the Nyquist of the cut-off
@@ -117,6 +119,70 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// Fused RRC polyphase decimating bank (V3_FE_POLY front end): `N_PHASES`
+/// fractional-phase rows, each a full `span_sym*sps + 1`-tap RRC (Proakis)
+/// evaluated at that fractional OUTPUT phase and L2-normalised. Row 0 is
+/// bit-for-bit `rrc_taps(beta, span_sym, sps)` (both are the L2-normed RRC on
+/// the integer grid; the RRC is symmetric so phase-0 = the legacy MF taps).
+///
+/// The RRC IS both the fractional interpolator / anti-alias filter AND the
+/// matched filter, so ONE dot product per T/2 output replaces the legacy
+/// resample + 48 kHz MF + decimate (16-48× fewer MACs). Analytic group delay
+/// is `span_sym/2 * sps` input samples, identical to the legacy MF, so the
+/// downstream `mf_delay_frac = 6*pitch_fse` is unchanged.
+///
+/// Row `p`, tap `u`: the weight of input sample `m = floor(P)-(L-1)+u` at
+/// output position `P = c + frac` (`frac = p/N_PHASES`) is the RRC evaluated at
+/// `(P - m)/sps - span/2 = (frac + n/2 - u)/sps` symbol-times.
+fn build_rrc_polyphase_bank(beta: f64, sps: usize, span_sym: usize) -> Vec<Vec<f64>> {
+    let n = span_sym * sps; // L - 1 ; taps centred at n/2
+    let l = n + 1;
+    let half = n as f64 / 2.0;
+    // Target DC gain = Σ rrc_taps (the legacy cascade's constant DC gain: the
+    // sinc·Kaiser resampler has sum=1 at every phase, so cascade DC = 1·Σrrc).
+    let g: f64 = rrc_taps(beta, span_sym, sps).iter().sum();
+    let mut bank = Vec::with_capacity(N_PHASES);
+    for phase in 0..N_PHASES {
+        let frac = phase as f64 / N_PHASES as f64;
+        let mut row = vec![0.0_f64; l];
+        for (u, r) in row.iter_mut().enumerate() {
+            let t = (frac + half - u as f64) / sps as f64;
+            *r = rrc::rrc_pulse(beta, t);
+        }
+        // Normalise EACH phase to constant DC gain G (unit-sum × G) so the fused
+        // interpolation is DC-flat across sub-sample phases, exactly like the
+        // legacy resampler (sum=1) ⊛ RRC cascade — no sub-symbol DC ripple. This
+        // also makes phase 0 ≡ `rrc_taps` (G/Σraw₀ = 1/‖raw₀‖), so the fused path
+        // collapses to the legacy matched filter at unity rate.
+        let sum: f64 = row.iter().sum();
+        if sum.abs() > 1e-12 {
+            let scale = g / sum;
+            for r in row.iter_mut() {
+                *r *= scale;
+            }
+        }
+        bank.push(row);
+    }
+    bank
+}
+
+/// Process-wide cache of fused RRC banks keyed by `(beta_bits, sps, span_sym)`.
+/// A bank is 3-9 MB; sessions/reboots that share a profile share the Arc so a
+/// `reboot_pipeline_and_replay` (fresh `StreamingDsp`) does not rebuild it.
+fn poly_bank_cached(beta: f64, sps: usize, span_sym: usize) -> Arc<Vec<Vec<f64>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u64, usize, usize), Arc<Vec<Vec<f64>>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (beta.to_bits(), sps, span_sym);
+    let mut map = cache.lock().unwrap();
+    if let Some(b) = map.get(&key) {
+        return Arc::clone(b);
+    }
+    let bank = Arc::new(build_rrc_polyphase_bank(beta, sps, span_sym));
+    map.insert(key, Arc::clone(&bank));
+    bank
+}
+
 /// Top-level streaming pipeline. One instance per RX session.
 pub struct StreamingDsp {
     sps: usize,
@@ -172,10 +238,25 @@ pub struct StreamingDsp {
     // produced `sym_buffer` is bit-identical to before (see `run_resampler`).
     timing_enabled: bool,
     /// Input-sample position the next output is interpolated at (accumulator).
+    /// Legacy path: input position of the next 48 kHz resampler output. Poly
+    /// path (`poly_fe_enabled`): AUDIO position of the next T/2 fse output's
+    /// window right edge (advances by `sps/pitch_fse * resample_step`).
     resample_pos: f64,
     /// Input samples per output sample (= 1 + residual_ppm·1e-6). The timing
     /// loop slews this; nominal 1.0 (RX clock == TX clock).
     resample_step: f64,
+
+    // --- Fused polyphase-RRC front end (V3_FE_POLY, default OFF) ---
+    // When enabled, `run_downmix_raw` + `run_poly_rrc_decimate` replace the
+    // 4-stage resample→downmix→MF→decimate chain with ONE bank evaluated only
+    // at the ~2·Rs T/2 output phases (16-48× fewer MACs). `baseband` is then
+    // AUDIO-indexed (downmix moved to raw 48 kHz audio, pre-RRC), and
+    // `resampler_next_tx` counts fse outputs. OFF = the verbatim legacy path.
+    /// RRC roll-off retained to (lazily) build the fused bank on enable.
+    beta: f64,
+    poly_fe_enabled: bool,
+    /// Fused RRC bank, built on `poly_fe_enable(true)` (shared via the cache).
+    poly_bank: Option<Arc<Vec<Vec<f64>>>>,
 }
 
 impl StreamingDsp {
@@ -214,7 +295,26 @@ impl StreamingDsp {
             timing_enabled: false,
             resample_pos: 0.0,
             resample_step: 1.0,
+            beta,
+            poly_fe_enabled: false,
+            poly_bank: None,
         }
+    }
+
+    /// Enable the fused polyphase-RRC front end (resample ⊛ RRC MF ⊛ decimate
+    /// collapsed into ONE bank; downmix moved to raw 48 kHz audio). Default OFF
+    /// = the verbatim 4-stage chain (byte-exact OTA path). Orthogonal to the
+    /// timing loop: the fused stage honours both the fixed (multiply) and smooth
+    /// (accumulator) rate forms. The bank is built (cached) on enable.
+    pub fn poly_fe_enable(&mut self, on: bool) {
+        self.poly_fe_enabled = on;
+        if on && self.poly_bank.is_none() {
+            self.poly_bank = Some(poly_bank_cached(self.beta, self.sps, RRC_SPAN_SYM));
+        }
+    }
+
+    pub fn poly_fe_enabled(&self) -> bool {
+        self.poly_fe_enabled
     }
 
     /// Enable the continuous-timing-loop resampler (phase-accumulator form).
@@ -323,6 +423,30 @@ impl StreamingDsp {
         } else {
             1.0 + drift_ppm * 1e-6
         };
+        if self.poly_fe_enabled {
+            // Fused path: re-seat the fse output counter on the next ON-SYMBOL
+            // grid point (fse index a multiple of pitch_fse) whose input maps to
+            // `abs_input`, and clear the single audio-indexed delay line so the
+            // next `feed_audio` refills it from the caller's re-presented audio.
+            let d = self.d_fse as f64;
+            // fse output index whose window right edge maps to `abs_input`.
+            let n_raw = ((abs_input as f64) / (d * ratio)).floor() as u64;
+            let pf = self.pitch_fse as u64;
+            let dec_n = n_raw.div_ceil(pf) * pf; // snap up to on-symbol grid
+            self.resampler_next_tx = dec_n;
+            self.sym_buffer.clear();
+            self.sym_buffer_start_abs = dec_n;
+            let p = dec_n as f64 * d * ratio; // audio pos of that output's right edge
+            if self.timing_enabled {
+                self.resample_pos = p;
+            }
+            let l = self.poly_bank.as_ref().map(|b| b[0].len()).unwrap_or(0) as i64;
+            let win_left = (p.floor() as i64 - (l - 1)).max(0) as u64;
+            self.downmix_next_abs = win_left;
+            self.baseband_start_abs = win_left;
+            self.baseband.clear();
+            return;
+        }
         // Output (resampled) index whose input maps to `abs_input`.
         let out_idx = ((abs_input as f64) / ratio).floor() as u64;
         if self.timing_enabled {
@@ -377,10 +501,17 @@ impl StreamingDsp {
         self.last_drift_ppm = drift_ppm;
         let sym_count_before = self.sym_buffer.len();
 
-        self.run_resampler(audio_buffer, audio_drained_samples, drift_ppm);
-        self.run_downmix();
-        self.run_matched_filter();
-        self.run_decimation();
+        if self.poly_fe_enabled {
+            // Fused path: downmix raw 48 kHz audio (pre-RRC), then one polyphase
+            // RRC bank does resample+MF+decimate straight to sym_buffer.
+            self.run_downmix_raw(audio_buffer, audio_drained_samples);
+            self.run_poly_rrc_decimate();
+        } else {
+            self.run_resampler(audio_buffer, audio_drained_samples, drift_ppm);
+            self.run_downmix();
+            self.run_matched_filter();
+            self.run_decimation();
+        }
 
         self.sym_buffer.len() - sym_count_before
     }
@@ -398,6 +529,21 @@ impl StreamingDsp {
         }
         self.sym_buffer.drain(..drop_syms);
         self.sym_buffer_start_abs += drop_syms as u64;
+        if self.poly_fe_enabled {
+            // The audio-indexed `baseband` is the single fused delay line. Keep
+            // ≥ L + margin samples behind the current consumption position (the
+            // next output's window right edge) so `run_poly_rrc_decimate` never
+            // loses live left context.
+            let consume_pos = if self.timing_enabled {
+                self.resample_pos.floor() as u64
+            } else {
+                self.resampler_next_tx * self.d_fse as u64
+            };
+            let l = self.poly_bank.as_ref().map(|b| b[0].len()).unwrap_or(0) as u64;
+            let bb_keep_from = consume_pos.saturating_sub(l + 4 * self.sps as u64);
+            self.trim_baseband(bb_keep_from);
+            return;
+        }
         let margin = (4 * self.sps) as u64;
         let mf_keep_from = self.decimation_cursor_abs.saturating_sub(margin);
         self.trim_mf_output(mf_keep_from);
@@ -572,6 +718,102 @@ impl StreamingDsp {
             // land at fse index s * pitch_fse — identical samples to the
             // old `+= sps` symbol decimation.
             self.decimation_cursor_abs += self.d_fse as u64;
+        }
+    }
+
+    /// V3_FE_POLY: downmix RAW 48 kHz audio to complex baseband BEFORE the RRC.
+    /// The NCO phase is indexed by the ABSOLUTE AUDIO index `m` (not the
+    /// TX/resampled index), so the carrier is removed at audio rate, upstream of
+    /// the fused RRC. `fc + cfo_hz` with cfo_hz == 0.0 is the IEEE-754 no-op, so
+    /// this is byte-exact to the legacy downmix at unity rate. `baseband` is
+    /// AUDIO-indexed in this path (a rolling delay line, trimmed behind the
+    /// consumption point), and doubles as the fused stage's single delay line.
+    fn run_downmix_raw(&mut self, audio: &[f32], audio_drained_samples: u64) {
+        let audio_end_abs = audio_drained_samples + audio.len() as u64;
+        // Never read before the current audio window (trimmed samples are gone).
+        if self.downmix_next_abs < audio_drained_samples {
+            self.downmix_next_abs = audio_drained_samples;
+        }
+        if self.baseband.is_empty() {
+            self.baseband_start_abs = self.downmix_next_abs;
+        }
+        while self.downmix_next_abs < audio_end_abs {
+            let rel = (self.downmix_next_abs - audio_drained_samples) as usize;
+            let s = audio[rel] as f64;
+            let phase = -2.0
+                * std::f64::consts::PI
+                * (self.fc + self.cfo_hz)
+                * (self.downmix_next_abs as f64)
+                / (AUDIO_RATE as f64);
+            let (sin_p, cos_p) = phase.sin_cos();
+            self.baseband.push(Complex64::new(s * cos_p, s * sin_p));
+            self.downmix_next_abs += 1;
+        }
+    }
+
+    /// V3_FE_POLY: fused resample ⊛ RRC-MF ⊛ decimate. One RRC dot product per
+    /// T/2 (fse) output, at the fractional resample phase, straight into
+    /// `sym_buffer`. Replaces run_resampler + run_matched_filter + run_decimation.
+    ///
+    /// Output `n` (= `resampler_next_tx`) lands at audio position
+    /// `P = n · d_fse · rate` (rate = resample_step timing-on, or
+    /// `1 + drift_ppm·1e-6` timing-off), i.e. `d_fse` audio samples per fse
+    /// output — identical spacing to the legacy decimation. At `P` integer
+    /// (unity rate) `phase == 0` and `bank[0] ≡ rrc_taps` (symmetric), so the
+    /// output equals `mf_output[P]` of the legacy path (FP reorder ~1e-13).
+    fn run_poly_rrc_decimate(&mut self) {
+        let bank = match &self.poly_bank {
+            Some(b) => Arc::clone(b),
+            None => return,
+        };
+        let l = bank[0].len() as i64;
+        let bb_start = self.baseband_start_abs as i64;
+        let bb_end = bb_start + self.baseband.len() as i64;
+        let step_in = self.d_fse as f64; // audio samples per fse output at rate 1
+        loop {
+            // Audio position of this output's window RIGHT edge.
+            let p = if self.timing_enabled {
+                self.resample_pos
+            } else {
+                (self.resampler_next_tx as f64) * step_in * (1.0 + self.last_drift_ppm * 1e-6)
+            };
+            let mut c = p.floor() as i64;
+            let frac = p - c as f64;
+            let mut phase = (frac * N_PHASES as f64).round() as i64;
+            if phase >= N_PHASES as i64 {
+                c += 1;
+                phase -= N_PHASES as i64;
+            } else if phase < 0 {
+                c -= 1;
+                phase += N_PHASES as i64;
+            }
+            // Need the window right edge present in the baseband delay line.
+            if c >= bb_end {
+                break;
+            }
+            let win_left = c - (l - 1);
+            // Left context trimmed away (should not happen — trim keeps ≥ L of
+            // margin behind the consumption point): stop rather than pad live
+            // data with zeros. At stream start bb_start == 0 and negative
+            // indices are the genuine pre-signal warmup (zero-padded below).
+            if win_left < bb_start && bb_start > 0 {
+                break;
+            }
+            let row = &bank[phase as usize];
+            let mut acc = Complex64::new(0.0, 0.0);
+            for (u, &w) in row.iter().enumerate() {
+                let m = win_left + u as i64;
+                if m < bb_start {
+                    continue; // pre-signal zero pad (start-of-stream warmup)
+                }
+                // m <= c < bb_end, so the index is in range.
+                acc += self.baseband[(m - bb_start) as usize] * w;
+            }
+            self.sym_buffer.push(acc);
+            self.resampler_next_tx += 1;
+            if self.timing_enabled {
+                self.resample_pos += step_in * self.resample_step;
+            }
         }
     }
 
@@ -941,6 +1183,242 @@ mod tests {
         assert!(
             max_err < 1e-3,
             "smooth vs fixed at {ppm} ppm: max symbol error {max_err}",
+        );
+    }
+
+    // ---- V3_FE_POLY: fused polyphase-RRC front end ----
+
+    fn test_sps() -> usize {
+        rrc::check_integer_constraints(AUDIO_RATE, TEST_SYMBOL_RATE, TEST_TAU)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn rrc_poly_bank_phase0_matches_rrc_taps() {
+        // Phase 0 (frac = 0) must be bit-for-bit the legacy matched filter, so
+        // the fused path collapses to `rrc_taps` at unity rate.
+        let sps = test_sps();
+        let bank = build_rrc_polyphase_bank(TEST_BETA, sps, RRC_SPAN_SYM);
+        let mf = rrc_taps(TEST_BETA, RRC_SPAN_SYM, sps);
+        assert_eq!(bank[0].len(), mf.len());
+        for (u, (&b, &m)) in bank[0].iter().zip(mf.iter()).enumerate() {
+            assert!((b - m).abs() < 1e-12, "phase-0 tap {u}: {b} != rrc_taps {m}");
+        }
+    }
+
+    #[test]
+    fn rrc_poly_bank_noise_gain_near_unity_per_phase() {
+        // With constant-DC normalisation the matched-filter noise gain (L2²) is
+        // ~1 per phase — exactly 1 at phase 0 (≡ rrc_taps) and within the tiny
+        // sub-sample ripple elsewhere. (Constant DC is the invariant we enforce;
+        // near-constant noise gain is the free by-product, checked loosely.)
+        let sps = test_sps();
+        let bank = build_rrc_polyphase_bank(TEST_BETA, sps, RRC_SPAN_SYM);
+        for (p, row) in bank.iter().enumerate() {
+            let e: f64 = row.iter().map(|x| x * x).sum();
+            assert!((e - 1.0).abs() < 5e-3, "phase {p} noise gain = {e} not ≈ 1");
+        }
+    }
+
+    #[test]
+    fn rrc_poly_bank_constant_dc_gain() {
+        // The fused bank's DC gain is G = Σ rrc_taps (the RRC signal gain), NOT
+        // 1 (that was the legacy 32-tap resampler invariant). It must be ~constant
+        // across phases (no per-phase DC ripple).
+        let sps = test_sps();
+        let bank = build_rrc_polyphase_bank(TEST_BETA, sps, RRC_SPAN_SYM);
+        let g: f64 = rrc_taps(TEST_BETA, RRC_SPAN_SYM, sps).iter().sum();
+        for (p, row) in bank.iter().enumerate() {
+            let s: f64 = row.iter().sum();
+            assert!((s - g).abs() < 1e-6, "phase {p} DC gain = {s} != G = {g}");
+        }
+    }
+
+    #[test]
+    fn rrc_poly_analytic_group_delay() {
+        // fc = 0 → downmix is identity (real), isolating the RRC group delay.
+        // An impulse at audio index I peaks at fse index (I + 6·sps)/d_fse.
+        let mut dsp = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, 0.0);
+        dsp.poly_fe_enable(true);
+        let sps = dsp.sps();
+        let d_fse = dsp.d_fse;
+        let i_imp = 64 * d_fse; // impulse index, multiple of d_fse
+        let n = i_imp + RRC_SPAN_SYM * sps + 8 * d_fse;
+        let mut audio = vec![0.0_f32; n];
+        audio[i_imp] = 1.0;
+        dsp.feed_audio(&audio, 0, 0.0);
+        let sym = dsp.sym_buffer();
+        let (mut peak, mut peak_v) = (0usize, 0.0_f64);
+        for (k, s) in sym.iter().enumerate() {
+            if s.norm() > peak_v {
+                peak_v = s.norm();
+                peak = k;
+            }
+        }
+        let expected = (i_imp + 6 * sps) / d_fse;
+        assert!(
+            peak.abs_diff(expected) <= 1,
+            "impulse peak fse {peak}, expected ≈ {expected} (group delay 6·sps)",
+        );
+    }
+
+    fn two_tone(n: usize, f0: f64, f1: f64) -> Vec<f32> {
+        use std::f64::consts::PI;
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / AUDIO_RATE as f64;
+                (0.3 * (2.0 * PI * f0 * t).sin() + 0.2 * (2.0 * PI * f1 * t).sin()) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn poly_matches_legacy_at_step1_cfo0() {
+        // At unity rate + cfo=0 the fused output equals the legacy 3-stage
+        // sym_buffer to FP-reorder noise (both = decimate(RRC(downmix(audio)))).
+        let audio = two_tone(2 * AUDIO_RATE as usize, 1100.0, 1450.0);
+        let mut legacy = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        legacy.feed_audio(&audio, 0, 0.0);
+        let mut poly = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        poly.poly_fe_enable(true);
+        poly.feed_audio(&audio, 0, 0.0);
+        let a = legacy.sym_buffer();
+        let b = poly.sym_buffer();
+        let m = a.len().min(b.len());
+        assert!(m > 500, "too few symbols: {m}");
+        let mut max_err = 0.0_f64;
+        for k in 0..m {
+            let e = (a[k] - b[k]).norm();
+            if e > max_err {
+                max_err = e;
+            }
+        }
+        assert!(max_err < 1e-9, "poly vs legacy step1/cfo0: max err {max_err}");
+    }
+
+    #[test]
+    fn poly_rrc_fusion_matches_legacy_under_drift() {
+        // fc = 0 → downmix ×1 (real) in BOTH paths, cancelling the intended
+        // NCO-domain divergence (legacy NCO on the TX grid, poly on the audio
+        // grid). This ISOLATES the RRC-fusion error (one bank vs sinc-interp⊛RRC)
+        // under drift, the only legitimate new-vs-old-under-drift comparison.
+        let audio = two_tone(2 * AUDIO_RATE as usize, 300.0, 600.0);
+        let drift = 50.0;
+        let mut legacy = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, 0.0);
+        legacy.feed_audio(&audio, 0, drift);
+        let mut poly = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, 0.0);
+        poly.poly_fe_enable(true);
+        poly.feed_audio(&audio, 0, drift);
+        let a = legacy.sym_buffer();
+        let b = poly.sym_buffer();
+        let m = a.len().min(b.len());
+        assert!(m > 500, "too few symbols: {m}");
+        let mut max_err = 0.0_f64;
+        for k in 0..m {
+            let e = (a[k] - b[k]).norm();
+            if e > max_err {
+                max_err = e;
+            }
+        }
+        // ~1.5e-3 worst-case, reached at frac ≈ 0.5 (bounded, not growing): the
+        // legacy interpolates with a 32-tap Kaiser sinc THEN applies the RRC,
+        // while the fused path samples the RRC ITSELF at the fractional phase.
+        // Both are legitimate fractional-delay filters (the fused one is the
+        // exact matched-filter-at-phase; the Kaiser sinc is non-ideal at the RRC
+        // band edge). The load-bearing gate is real-capture ESI parity, not this
+        // kernel diff. Bound generously above the measured worst case.
+        assert!(max_err < 3e-3, "poly fusion vs legacy under drift: max err {max_err}");
+    }
+
+    #[test]
+    fn poly_passes_dc() {
+        // DC at +130 ppm through the fused path (fc=0 → DC stays DC): the mean
+        // fse output is the DC gain G = Σ rrc_taps times the input level.
+        let sps = test_sps();
+        let g: f64 = rrc_taps(TEST_BETA, RRC_SPAN_SYM, sps).iter().sum();
+        let mut dsp = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, 0.0);
+        dsp.poly_fe_enable(true);
+        let buf = vec![0.5_f32; 4 * AUDIO_RATE as usize];
+        dsp.feed_audio(&buf, 0, 130.0);
+        let sym = dsp.sym_buffer();
+        assert!(sym.len() > 1000, "too few fse outputs: {}", sym.len());
+        let tail = &sym[64..];
+        let mean_re: f64 = tail.iter().map(|c| c.re).sum::<f64>() / tail.len() as f64;
+        let mean_im: f64 = tail.iter().map(|c| c.im).sum::<f64>() / tail.len() as f64;
+        assert!((mean_re - 0.5 * g).abs() < 1e-3, "DC gain: {mean_re} != 0.5·G {}", 0.5 * g);
+        assert!(mean_im.abs() < 1e-3, "DC has no imag: {mean_im}");
+    }
+
+    #[test]
+    fn poly_cfo_zero_is_byte_exact() {
+        // The `fc + 0.0` no-op holds in the fused downmix too (bit-exact).
+        let audio = two_tone(2 * AUDIO_RATE as usize, 1100.0, 1450.0);
+        let drift = 30.0;
+        let mut base = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        base.poly_fe_enable(true);
+        base.feed_audio(&audio, 0, drift);
+        let mut c0 = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        c0.poly_fe_enable(true);
+        c0.set_cfo_hz(0.0);
+        c0.feed_audio(&audio, 0, drift);
+        let a = base.sym_buffer();
+        let b = c0.sym_buffer();
+        assert_eq!(a.len(), b.len(), "sym counts differ");
+        for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                x.re.to_bits() == y.re.to_bits() && x.im.to_bits() == y.im.to_bits(),
+                "poly symbol {k}: cfo=0 not byte-exact",
+            );
+        }
+    }
+
+    #[test]
+    fn poly_rewind_reproduces_symbols() {
+        // Fused-path mirror of rewind_to_reproduces_symbols_byte_exact.
+        let n = 3 * AUDIO_RATE as usize;
+        let audio = two_tone(n, 1100.0, 1450.0);
+        let mut a = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        a.poly_fe_enable(true);
+        a.feed_audio(&audio, 0, 0.0);
+        let ref_syms = a.sym_buffer.clone();
+
+        let mut b = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        b.poly_fe_enable(true);
+        let a_input = (n / 2) as u64;
+        b.rewind_to(a_input, 0.0);
+        b.feed_audio(&audio, 0, 0.0);
+        let a_sym = b.sym_buffer_start_abs;
+        let re = &b.sym_buffer;
+        let margin = 2 * (RRC_SPAN_SYM * b.sps) / b.d_fse + 8;
+        let mut compared = 0usize;
+        for k in margin..re.len() {
+            let abs = a_sym as usize + k;
+            if abs >= ref_syms.len() {
+                break;
+            }
+            let d = (ref_syms[abs] - re[k]).norm();
+            assert!(d < 1e-6, "poly rewind symbol {abs}: |Δ|={d}");
+            compared += 1;
+        }
+        assert!(compared > 500, "too few compared: {compared}");
+    }
+
+    #[test]
+    fn poly_mac_reduction_vs_legacy() {
+        // The fused bank evaluates L taps only at the ~2·Rs fse output rate, vs
+        // the legacy resampler (N_TAPS) + MF (L) at 48 kHz → MAC ratio ≥ d_fse.
+        let dsp = StreamingDsp::new(TEST_SYMBOL_RATE, TEST_TAU, TEST_BETA, TEST_FC);
+        let sps = dsp.sps();
+        let l = RRC_SPAN_SYM * sps + 1;
+        let n_out = TEST_SYMBOL_RATE as usize * dsp.pitch_fse(); // ~2·Rs / s
+        let mac_on = l * n_out;
+        let mac_off = (N_TAPS + l) * AUDIO_RATE as usize;
+        assert!(
+            mac_off / mac_on >= dsp.d_fse,
+            "MAC reduction {} < d_fse {}",
+            mac_off / mac_on,
+            dsp.d_fse,
         );
     }
 }

@@ -5,6 +5,28 @@
 
 use std::f64::consts::PI;
 
+/// Value of the (un-normalised) RRC pulse at symbol-time `t` (Proakis closed
+/// form, with the two removable-singularity special cases). `t` is in SYMBOL
+/// units (t = sample_offset / sps). Factored out of [`rrc_taps`] so the fused
+/// polyphase-RRC front end can evaluate the SAME pulse at arbitrary fractional
+/// phases without duplicating the singularity handling.
+#[inline]
+pub fn rrc_pulse(beta: f64, t: f64) -> f64 {
+    let nyquist_t = 1.0 / (4.0 * beta);
+    if t.abs() < 1e-12 {
+        1.0 - beta + 4.0 * beta / PI
+    } else if (t.abs() - nyquist_t).abs() < 1e-8 {
+        (beta / std::f64::consts::SQRT_2)
+            * ((1.0 + 2.0 / PI) * (PI / (4.0 * beta)).sin()
+                + (1.0 - 2.0 / PI) * (PI / (4.0 * beta)).cos())
+    } else {
+        let num =
+            (PI * t * (1.0 - beta)).sin() + 4.0 * beta * t * (PI * t * (1.0 + beta)).cos();
+        let den = PI * t * (1.0 - (4.0 * beta * t).powi(2));
+        num / den
+    }
+}
+
 /// Compute RRC filter taps, energy-normalised.
 ///
 /// Returns `span_sym * sps + 1` taps, causal, centered at index n/2.
@@ -13,24 +35,10 @@ pub fn rrc_taps(beta: f64, span_sym: usize, sps: usize) -> Vec<f64> {
 
     let n = span_sym * sps;
     let mut taps = Vec::with_capacity(n + 1);
-    let nyquist_t = 1.0 / (4.0 * beta);
 
     for i in 0..=n {
         let t = (i as f64 - n as f64 / 2.0) / sps as f64;
-
-        let val = if t.abs() < 1e-12 {
-            1.0 - beta + 4.0 * beta / PI
-        } else if (t.abs() - nyquist_t).abs() < 1e-8 {
-            (beta / std::f64::consts::SQRT_2)
-                * ((1.0 + 2.0 / PI) * (PI / (4.0 * beta)).sin()
-                    + (1.0 - 2.0 / PI) * (PI / (4.0 * beta)).cos())
-        } else {
-            let num = (PI * t * (1.0 - beta)).sin()
-                + 4.0 * beta * t * (PI * t * (1.0 + beta)).cos();
-            let den = PI * t * (1.0 - (4.0 * beta * t).powi(2));
-            num / den
-        };
-        taps.push(val);
+        taps.push(rrc_pulse(beta, t));
     }
 
     // Energy normalisation
