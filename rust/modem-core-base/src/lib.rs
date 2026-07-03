@@ -66,5 +66,6 @@ pub mod scrambler;
 // `feat/modem-2x`'s `modem-core2x`; placed here so the upcoming V3
 // streaming session in `modem-core::v3_session` and any future RX
 // work can pull both primitives from a single home.
+pub mod rx_estimator;
 pub mod streaming_dsp;
 pub mod streaming_ffe;

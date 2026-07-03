@@ -56,6 +56,7 @@ use crate::rrc;
 use crate::rx_v2;
 use crate::soft_demod;
 use crate::types::AUDIO_RATE;
+use modem_core_base::rx_estimator::RxEstimator;
 use modem_core_base::streaming_dsp::StreamingDsp;
 use modem_core_base::streaming_ffe::StreamingFfe;
 use modem_core_base::types::Complex64;
@@ -269,11 +270,6 @@ fn v3_ffe_mu_train() -> f64 {
 fn v3_ffe_mu_dd() -> f64 {
     std::env::var("V3_FFE_MU_DD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02)
 }
-/// Damping gain for the persistent carrier loop's frequency integrator (Couche
-/// 2): `ν += gain·Δω` per forward segment. < 1 smooths the per-segment residual
-/// slope so a noisy fit can't kick the loop; the phase is set exactly each
-/// segment (gain 1), so phase is always continuous at the segment handoff.
-const CARRIER_FREQ_GAIN: f64 = 0.5;
 /// Sub-sample search radius (48 kHz samples) for the stage-1b channel-matched
 /// preamble refinement around the integer matched-filter peak.
 const V3_PREAMBLE_REFINE_RADIUS: usize = 8;
@@ -616,18 +612,12 @@ pub struct V3Session {
     /// from the residual pilot phase, predicted into every segment's
     /// `reequalise_span_joint` so the bulk carrier + drift are removed BEFORE the
     /// per-segment pilot fit (the per-segment loop then only tracks phase noise).
-    /// The downmix NCO stays static — this is the fine, post-MF stage (DVB-S2 /
-    /// Meyr-Moeneclaey two-stage split). Default ON (validated OTA: +3.2 dB mean
-    /// MER); `V3_NO_CARRIER_TRACK` disables it (→ never predicts → byte-identical
-    /// to the pre-tracking decode, for A/B). Reset on reboot/finalize.
-    carrier_track: bool,
-    carrier_inited: bool,
-    /// Phase (rad) of the model at `carrier_anchor_sym`.
-    carrier_theta: f64,
-    /// Frequency (rad/symbol) of the model.
-    carrier_nu: f64,
-    /// Absolute symbol index the model is anchored at.
-    carrier_anchor_sym: u64,
+    /// Persistent carrier phase/frequency estimator (θ, ν). The downmix NCO stays
+    /// static — this is the fine, post-MF stage (DVB-S2 / Meyr-Moeneclaey
+    /// two-stage split). Default ON (validated OTA: +3.2 dB mean MER);
+    /// `V3_NO_CARRIER_TRACK` disables it (→ never predicts → byte-identical to the
+    /// pre-tracking decode, for A/B). Reset on reboot/finalize.
+    rx_est: RxEstimator,
     sc: ScDetector,
     /// FFT matched filter vs the KNOWN passband preamble — the always-on
     /// acquisition trigger (no silence/energy gate; robust to noise/speech/QRM
@@ -984,11 +974,7 @@ impl V3Session {
             cfo_hz: 0.0,
             cfo_locked: false,
             cfo_enabled: std::env::var_os("V3_NO_CFO").is_none(),
-            carrier_track: std::env::var_os("V3_NO_CARRIER_TRACK").is_none(),
-            carrier_inited: false,
-            carrier_theta: 0.0,
-            carrier_nu: 0.0,
-            carrier_anchor_sym: 0,
+            rx_est: RxEstimator::new(std::env::var_os("V3_NO_CARRIER_TRACK").is_none()),
             sc,
             acq_mf,
             acq_search_len,
@@ -1337,9 +1323,7 @@ impl V3Session {
         // live DSP's NCO to the no-op state.
         self.set_cfo_hz(0.0);
         self.cfo_locked = false;
-        self.carrier_inited = false;
-        self.carrier_theta = 0.0;
-        self.carrier_nu = 0.0;
+        self.rx_est.reset();
         self.drift_anchor_sym_pos = None;
         self.drift_observations.clear();
         self.coarse_drift_cum_offset_sym = 0;
@@ -2056,21 +2040,8 @@ impl V3Session {
         // from the global model θ + ν·(s − anchor). Fixed across the turbo
         // iterations; updated once after the loop (forward-primary only). On the
         // first segment of a burst (not inited) the model is identity → pred ≡ 0
-        // → byte-identical. Disabled (`carrier_track == false`) → None → no-op.
-        let carrier_pred: Option<Vec<f64>> = if self.carrier_track {
-            let (theta, nu, anchor) = if self.carrier_inited {
-                (self.carrier_theta, self.carrier_nu, self.carrier_anchor_sym)
-            } else {
-                (0.0, 0.0, seg_start_abs)
-            };
-            Some(
-                (0..seg_sym_len)
-                    .map(|k| theta + nu * ((seg_start_abs + k as u64) as f64 - anchor as f64))
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        // → byte-identical. Disabled (`rx_est.enabled() == false`) → None → no-op.
+        let carrier_pred: Option<Vec<f64>> = self.rx_est.predict(seg_start_abs, seg_sym_len);
         let mut last_resid: (f64, f64) = (0.0, 0.0);
 
         let mut data_e: Vec<Complex64> = Vec::new();
@@ -2223,22 +2194,10 @@ impl V3Session {
         // FORWARD-PRIMARY decodes only (in order). The model's phase is set
         // exactly to the measured phase at the segment's last symbol (G_phase=1);
         // the frequency integrates the residual slope with a damping gain.
-        if self.carrier_track && update_carrier {
+        if update_carrier {
             let (resid_freq, resid_phase_last) = last_resid;
             let s_last = seg_start_abs + seg_sym_len as u64 - 1;
-            if self.carrier_inited {
-                let pred_last = self.carrier_theta
-                    + self.carrier_nu * (s_last as f64 - self.carrier_anchor_sym as f64);
-                self.carrier_nu += CARRIER_FREQ_GAIN * resid_freq;
-                self.carrier_theta = pred_last + resid_phase_last;
-            } else {
-                // First forward segment: prediction was 0, so the residual IS the
-                // absolute carrier of this segment — grab it in full.
-                self.carrier_nu = resid_freq;
-                self.carrier_theta = resid_phase_last;
-                self.carrier_inited = true;
-            }
-            self.carrier_anchor_sym = s_last;
+            self.rx_est.update(s_last, resid_freq, resid_phase_last);
         }
         if std::env::var_os("V3_LOG_TURBO").is_some() {
             let conv: Vec<u8> = results.iter().map(|(_, c)| *c as u8).collect();
@@ -3631,9 +3590,7 @@ impl V3Session {
         }
         // The persistent carrier loop re-derives from the first segment of the
         // replayed burst (it is a fine, in-order forward estimate).
-        self.carrier_inited = false;
-        self.carrier_theta = 0.0;
-        self.carrier_nu = 0.0;
+        self.rx_est.reset();
         let (pitch_fse, n_ff, mf_delay_frac) = fse_geometry(&self.cfg);
         self.ffe = StreamingFfe::new(
             n_ff,
