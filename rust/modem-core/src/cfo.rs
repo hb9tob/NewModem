@@ -13,9 +13,12 @@
 //!    spectrum to within a few Hz (enough to land inside the matched-filter
 //!    main lobe), robust to narrow QRM because it integrates over the whole
 //!    band (~hundreds of FFT bins) rather than peak-picking.
-//! 2. [`estimate_fine_cfo`] — a **data-aided single-lag (Kay) estimator** on
-//!    the 256 known preamble symbols, unambiguous over ±Rs/2, so a full
-//!    100-250 Hz offset is measured in one shot.
+//! 2. the fine offset is resolved in [`crate::v3_session`] by maximising the
+//!    **time-domain preamble matched-filter metric** on a ±15 Hz grid around
+//!    the coarse bracket, with parabolic sub-bin interpolation — the unbiased
+//!    estimate actually committed. NOTE: [`estimate_fine_cfo`] below, a
+//!    data-aided single-lag (Kay) estimator, is SHELVED (kept for reference /
+//!    A-B); it is not on the live turbo path.
 //!
 //! This module is pure DSP (no I/O, no session state) so it is unit-testable
 //! in isolation and reusable by both the in-session acquisition and the

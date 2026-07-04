@@ -2243,8 +2243,9 @@ impl V3Session {
                     soft_demod::llr_maxlog(cw_syms, &self.constellation, last_sigma2)
                 };
                 let llr_deint = interleaver::apply_permutation_f32(&llr, &self.deinterleave_perm);
-                // Bit-identical SIMD twin (env V3_LDPC_SIMD); default scalar path
-                // is byte-for-byte the OTA-validated one until capture-validated.
+                // Bit-identical SIMD twin; default-ON (kill-switch
+                // V3_NO_LDPC_SIMD falls back to the byte-for-byte OTA-validated
+                // scalar decode_soft).
                 let (info_bits, extrinsic_n, converged) = if self.ldpc_simd {
                     self.decoder.decode_soft_simd(&llr_deint[..n], None, damp)
                 } else {
@@ -2618,9 +2619,11 @@ impl V3Session {
 
     /// Closed-window "turbo sync" pass. For each queued segment whose codewords
     /// did not all converge on the forward pass, re-equalise it over the now
-    /// fully-buffered superframe (forward-backward-forward DD-LMS on a local tap
-    /// copy, leaving the live forward state untouched) and re-decode only the
-    /// failed codewords. Newly-converged codewords emit a `CwDecoded { converged
+    /// fully-buffered superframe (the SAME joint forward-backward-forward loop as
+    /// the forward decode — [`canon_demod_segment`] / [`StreamingFfe::
+    /// reequalise_span_joint`], adapting the LIVE FFE taps in place; there is no
+    /// separate retry equaliser) and re-decode only the failed codewords.
+    /// Newly-converged codewords emit a `CwDecoded { converged
     /// }` (the worker dedups by ESI, so re-emitting is idempotent) and recover
     /// the AppHeader if a META CW lands. Segments are dropped once they decode,
     /// exhaust [`MAX_RETRY_ATTEMPTS`], or age out of the FFE window. This is the

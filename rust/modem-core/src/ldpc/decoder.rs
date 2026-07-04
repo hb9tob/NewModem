@@ -289,9 +289,10 @@ impl LdpcDecoder {
                 converged = true;
                 break;
             }
-            // Failure stop (opt-in V3_LDPC_FAIL_STOP): the syndrome weight has
-            // stopped improving on an undecodable block — further iterations
-            // only burn cycles, so bail (returns the stagnation-point extrinsic).
+            // Failure stop (default-ON; kill-switch V3_NO_LDPC_FAIL_STOP): the
+            // syndrome weight has stopped improving on an undecodable block —
+            // further iterations only burn cycles, so bail (returns the
+            // stagnation-point extrinsic).
             if self.fail_stop && iter + 1 > self.fail_warmup {
                 if weight >= prev_weight {
                     stagnant += 1;

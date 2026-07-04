@@ -971,7 +971,10 @@ impl StreamingFfe {
                 .collect()
         };
 
-        // --- Bidirectional 2nd-order phase smoother (two-filter / RTS form) ---
+        // --- Bidirectional 2nd-order phase smoother (equal-weight two-pass average) ---
+        // NB: this is a plain 0.5/0.5 average of a forward and a time-reversed
+        // DD-PLL pass — NOT an inverse-covariance two-filter (Fraser-Potter) or
+        // RTS smoother; endpoints are therefore half-weight-corrected.
         // The intra-group residual phase θ[k] is estimated by TWO INDEPENDENT
         // reset DD-PLL passes — each is the OTA-validated 2nd-order loop (coast
         // COUPLED to the gated proportional/integrator update, exactly like
