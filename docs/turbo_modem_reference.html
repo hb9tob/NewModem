@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NBFM Modem — Turbo RX: Complete Block Reference &amp; Canon / Optimality / Wiring Audit</title>
+<style>
+    :root {
+        --bg: #fafafa; --fg: #222; --accent: #2b7fbf; --accent-soft: #eef6ff;
+        --warn: #bf5f2b; --ok: #2b8f5f; --bad: #c0392b; --grey: #777;
+        --code-bg: #f3f3f3; --border: #ddd;
+    }
+    html, body {
+        margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap { max-width: 1150px; margin: 0 auto; padding: 2rem 1.5rem 6rem; }
+    h1 { font-size: 2rem; border-bottom: 3px solid var(--accent); padding-bottom: 0.4rem; margin-bottom: 0.2rem; }
+    h1 .sub { display: block; font-size: 1rem; font-weight: 400; color: #666; margin-top: 0.4rem; }
+    h2 { color: var(--accent); margin-top: 2.8rem; border-left: 4px solid var(--accent); padding-left: 0.6rem; }
+    h3 { margin-top: 1.8rem; color: #333; }
+    h4 { margin: 1.1rem 0 0.3rem; color: #444; font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    code { background: var(--code-bg); padding: 0.12em 0.34em; border-radius: 3px; font-family: "Consolas","Monaco",monospace; font-size: 0.9em; }
+    pre { background: #1e1e1e; color: #dcdcaa; padding: 1rem; border-radius: 5px; overflow-x: auto; font-size: 0.82rem; line-height: 1.45; }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    .box { background: white; border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem 1.1rem; margin: 1.2rem 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04); }
+    .note { background: var(--accent-soft); border-left: 4px solid var(--accent); }
+    .warn { background: #fdf3ee; border-left: 4px solid var(--warn); }
+    .ok   { background: #eef9f3; border-left: 4px solid var(--ok); }
+    .bad2 { background: #fbeeec; border-left: 4px solid var(--bad); }
+    table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.88rem; }
+    th, td { border: 1px solid var(--border); padding: 0.4rem 0.55rem; text-align: left; vertical-align: top; }
+    th { background: var(--accent-soft); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .mono { font-family: "Consolas","Monaco",monospace; }
+    .toc { font-size: 0.95rem; columns: 2; }
+    .toc a { color: var(--accent); text-decoration: none; }
+    .refs { font-size: 0.9rem; color: #444; }
+    .refs li { margin-bottom: 0.3rem; }
+    /* verdict badges */
+    .badge { display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 0.12em 0.55em; border-radius: 10px; margin: 0 0.15em; letter-spacing: 0.02em; white-space: nowrap; }
+    .b-ok    { background: #d9f2e5; color: #1c6b45; border: 1px solid #9fd8bd; }
+    .b-blue  { background: #dcecfa; color: #1f5f92; border: 1px solid #a7cdec; }
+    .b-warn  { background: #fae7d6; color: #8a451a; border: 1px solid #e6bd97; }
+    .b-bad   { background: #f7d9d4; color: #8a271b; border: 1px solid #e3a89f; }
+    .b-grey  { background: #e6e6e6; color: #555; border: 1px solid #cfcfcf; }
+    /* block card */
+    .card { border: 1px solid var(--border); border-radius: 8px; padding: 0 1.2rem 1rem; margin: 1.6rem 0; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+    .card > h3 { margin-top: 1rem; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem; }
+    .card .bid { font-family: "Consolas","Monaco",monospace; color: var(--accent); font-size: 0.9rem; }
+    .card .verdicts { margin-left: auto; font-weight: 400; }
+    .kv { margin: 0.35rem 0; }
+    .kv b { display: inline-block; min-width: 8.5rem; color: #555; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.02em; }
+    .sev { font-size: 0.72rem; font-weight: 700; padding: 0.1em 0.5em; border-radius: 4px; }
+    .sev-med { background: #fae7d6; color: #8a451a; }
+    .sev-low { background: #e6e6e6; color: #555; }
+    .sev-high{ background: #f7d9d4; color: #8a271b; }
+    .flow { font-family: "Consolas","Monaco",monospace; font-size: 0.8rem; }
+    ul.tight { margin: 0.3rem 0 0.3rem 0; }
+    ul.tight li { margin-bottom: 0.25rem; }
+    .small { font-size: 0.85rem; color: #555; }
+    @media (max-width: 720px) { .toc { columns: 1; } .kv b { display: block; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Turbo RX — Complete Block Reference &amp; Canon / Optimality / Wiring Audit
+  <span class="sub">Every block of the streaming turbo receive path (V3Session), what it is, how it is wired, and whether it is canonical, optimal and correctly connected · 2026-07-04 · branch <code>feat/ssb-rx</code></span>
+</h1>
+
+<div class="box note">
+  <strong>Scope.</strong> This documents the complete <em>turbo</em> receive pipeline — the streaming,
+  superframe-aware <code>V3Session</code> decoder (<code>modem-core/src/v3_session.rs</code>) driven by
+  <code>RxV3Worker</code> / <code>run_turbo_worker</code> (<code>modem-worker/src/rx_v3_worker.rs</code>),
+  its front-end DSP, equaliser, synchronisers, soft demapper and SISO-LDPC turbo loop — as opposed to the
+  OTA-validated <code>rx_v2</code> <em>batch</em> decoder (the source-of-truth "legacy" path, left untouched).
+  It supersedes the earlier <a href="turbo_rx_architecture.html">canon-demodulator note</a> (which covered
+  only block&nbsp;B07) by covering all 15 blocks, and adds a per-block <strong>canon / optimality / wiring</strong>
+  audit. The turbo path is opt-in at the worker level (<code>turbo = true</code>) and off by default in the GUI.
+</div>
+
+<div class="box ok">
+  <strong>Headline verdict.</strong> The turbo pipeline is <strong>fundamentally canonical and correctly
+  wired</strong>. Across 15 blocks and 4 end-to-end wiring traces there is <strong>no high-severity confirmed
+  defect and no mis-wiring</strong>: every block is <span class="badge b-ok">canonical</span> or
+  <span class="badge b-blue">minor-deviation</span>, and every connection is
+  <span class="badge b-ok">correct</span> or <span class="badge b-warn">questionable</span> (never
+  <span class="badge b-bad">miswired</span>). The soft turbo loop (extrinsic feedback, no double-counting),
+  the FSE equaliser (FFE-frame NLMS, ridge-loaded LS), the DVB-S2X constellations (validated against the
+  EN&nbsp;302&nbsp;307 tables), the synchronisers (Schmidl&amp;Cox, normalized MF/GLRT) and the RaptorQ
+  assembly (RFC&nbsp;6330) are all textbook. The findings are one <strong>medium</strong> correctness item
+  (RaptorQ symbol-size alignment, §3.2 F1) and a cluster of <strong>low-severity</strong> items: a known
+  shared-tap loop-fighting pattern the <em>joint-estimator pivot</em> already targets, Pi-4 compute waste in
+  the hot loop, and stale doc/label drift. Details in §3.
+</div>
+
+<p class="toc">
+  <strong>Contents:</strong><br>
+  <a href="#flow">1. End-to-end signal flow &amp; crate map</a><br>
+  <a href="#blocks">2. Block reference (B01–B15)</a><br>
+  <a href="#b01">B01 Front-end DSP</a> · <a href="#b02">B02 FSE / FFE</a> · <a href="#b03">B03 Acquisition</a> ·
+  <a href="#b04">B04 CFO / NCO</a> · <a href="#b05">B05 Timing / SFO</a> · <a href="#b06">B06 Coarse drift</a> ·
+  <a href="#b07">B07 Canon demod</a> · <a href="#b08">B08 Carrier PLL</a> · <a href="#b09">B09 Soft demap</a> ·
+  <a href="#b10">B10 LDPC SISO</a> · <a href="#b11">B11 FSM / markers</a> · <a href="#b12">B12 Flywheel</a> ·
+  <a href="#b13">B13 Worker</a> · <a href="#b14">B14 RaptorQ</a> · <a href="#b15">B15 Profiles</a><br>
+  <a href="#analysis">3. Analysis — canon / optimality / wiring</a><br>
+  <a href="#knobs">4. Environment-knob reference</a><br>
+  <a href="#method">5. Method &amp; references</a>
+</p>
+
+<!-- ============================================================= -->
+<h2 id="flow">1. End-to-end signal flow &amp; crate map</h2>
+
+<p>
+  The turbo RX consumes 48&nbsp;kHz real audio in ≤100&nbsp;ms sub-pushes and tracks the transmitter's
+  superframe cadence continuously. The transmit frame is V3/V4 (headerless): a passband <strong>preamble</strong>,
+  a bootstrap <strong>marker</strong> carrying <code>profile_index</code>, an LMS <strong>warmup</strong>, a
+  <strong>meta</strong> codeword, then <strong>data segments</strong> (<code>marker → 2 codewords + pilots</code>).
+  The whole PRE+marker+warmup+meta block is re-inserted every 4&nbsp;s as a fresh anchor — one
+  <em>superframe</em> (SF). Signal path, as actually wired:
+</p>
+
+<pre class="flow"><code>48 kHz audio ─ RxV3Worker::push_samples (rx_v3_worker.rs:288)
+  │              ├─ optional NBFM de-emphasis is applied ONCE upstream in the SDR chain — NOT here
+  │              └─ ScDetector.push (Schmidl&amp;Cox marker-pair metric)     ── B03/B11 acquisition trigger
+  ▼
+V3Session::process_audio_chunk_with_history (v3_session.rs:1212)
+  ▼
+[B01] StreamingDsp.feed_audio (streaming_dsp.rs:342)
+        NCO downmix (fc+cfo)  →  ONE fused polyphase-RRC dot product per output
+        = fractional resample (drift/SFO) ⊛ RRC matched filter ⊛ decimate to T/2
+        └ output rate ≈ 2·Rs   "fse" fractionally-spaced samples
+  ▼
+[B02] StreamingFfe.push_raw (v3_session.rs:1277)
+        forward-apply live T/2 taps  +  continuous reliability-weighted forward DD-LMS (μ=0.008)
+        → sym_buffer / out_buf (equalised)  → marker probe reads here
+  ▼
+[B11] V3Session FSM  Idle → Acquiring → Locked      predict-validate markers, 4 s SF re-anchor
+  │      ├─ [B03/B04] fd_acquire FFT-MF preamble  +  cfo.rs coarse-PSD → MF-grid parabolic refine → set_cfo_hz
+  │      ├─ [B05] PreambleSfoTracker → smooth resampler rate     ([B06] coarse-drift bypassed when B05 on)
+  │      └─ per fully-buffered segment:
+  │           [B07] canon_demod_segment  ── THE CANON DEMODULATOR (Tüchler turbo-EQ) ──
+  │                 for it in 0..V3_TURBO_SOFT_ITERS(=5):
+  │                   refs = pilots(w=1) + data E[a] (w=|E[a]|²/E[|a|²]; 0 at it 0)
+  │                   [B02] reequalise_span_joint  → ONE joint FFE+phase FBF (in place)
+  │                          · [B08] persistent carrier θ,ν predict (RxEstimator)
+  │                          · per-group pilot LS gain  · intra-group bidirectional DD-PLL phase
+  │                          · per-symbol σ²(t)
+  │                   [B09] llr_maxlog_per_sym → deinterleave
+  │                   [B10] decode_soft (normalized min-sum) → extrinsic = damp·(posterior−seed)
+  │                   [B09] soft_symbols_from_posterior_llr → E[a],Var[a]  (re-seed next FBF)
+  │                   break when every codeword's LDPC syndrome clears
+  │           [B12] flywheel coast / backward late-entry / replay_from_anchor (recovery)
+  ▼
+CwDecoded(esi, bytes)  ──►  [B13] RxV3Worker accumulates by ESI  ──►  [B14] RaptorQ (RFC 6330) → image
+</code></pre>
+
+<h4>Crate map (which copy is live)</h4>
+<p>
+  The workspace carries two parallel DSP layers. The live turbo path spans both, so knowing which copy runs
+  matters (§3.4):
+</p>
+<ul class="tight">
+  <li><strong><code>modem-core-base</code></strong> supplies the low-level streaming primitives the session
+    imports (<code>v3_session.rs:59-62</code>): <code>StreamingDsp</code> (B01), <code>StreamingFfe</code> (B02/B07),
+    <code>RxEstimator</code> (B08), plus <code>rrc</code> and <code>sync::fse_decim_factor</code>.</li>
+  <li><strong><code>modem-core</code></strong> supplies everything the session touches by <code>crate::</code>:
+    the FSM/canon-demod glue (B07/B11/B12), <code>soft_demod</code> (B09), <code>ldpc::decoder</code> (B10),
+    <code>cfo</code> (B04), <code>turbo_gate</code>/<code>fd_acquire</code> (B03), <code>marker</code>/<code>frame</code>
+    (B11), <code>profile</code>/<code>pilot</code>/<code>constellation</code> (B15).</li>
+  <li><strong><code>modem-worker</code></strong> owns orchestration (B13); <strong><code>modem-framing</code></strong>
+    owns RaptorQ (B14).</li>
+  <li>The <code>modem-core-base</code> copies of <code>soft_demod</code>, <code>ldpc</code>, <code>demodulator</code>,
+    <code>equalizer</code> and <code>pll</code> are <strong>dead for the turbo path</strong> (nothing outside base
+    imports them — verified by workspace grep). See §3.4 F8.</li>
+</ul>
+
+<!-- ============================================================= -->
+<h2 id="blocks">2. Block reference (B01–B15)</h2>
+<p class="small">
+  Each card gives the block's role, algorithm and canonical name, wiring (who feeds it → who consumes it),
+  the load-bearing symbols with <code>file:line</code> anchors, and the audit verdict. Badges:
+  canon = <span class="badge b-ok">canonical</span>/<span class="badge b-blue">minor-deviation</span>/<span class="badge b-warn">non-standard</span>;
+  optimality = <span class="badge b-ok">optimal</span>/<span class="badge b-blue">acceptable</span>/<span class="badge b-warn">suboptimal</span>;
+  wiring = <span class="badge b-ok">correct</span>/<span class="badge b-warn">questionable</span>.
+</p>
+
+<!-- B01 -->
+<div class="card" id="b01">
+  <h3><span class="bid">B01</span> Front-end DSP — StreamingDsp
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Turn 48&nbsp;kHz real audio into a fractionally-spaced (T/2) matched-filter symbol stream.</div>
+  <div class="kv"><b>Algorithm</b> (1) complex heterodyne <strong>NCO downmix</strong> at each absolute audio index
+    (phase reconstructed from the absolute index <code>m</code>, not an accumulator → phase-continuous across
+    chunks &amp; rewinds; <code>cfo_hz=0</code> is a bit-exact no-op). (2+3) <strong>ONE fused polyphase-RRC dot
+    product per output</strong> that simultaneously does fractional resample (drift/SFO), RRC matched filter, and
+    T/2 decimation — a 1024-phase precomputed bank, each row renormalised to constant DC gain so interpolation
+    is DC-flat. Row-0 (frac=0) is bit-for-bit the legacy energy-normalised RRC. <em>Canonical:</em> RRC matched
+    filter (Proakis) + polyphase interpolating FIR / Farrow-equivalent fractionally-spaced sampling
+    (Harris; Erup/Gardner/Meyr).</div>
+  <div class="kv"><b>Wiring</b> ← <code>V3Session.audio_buffer</code> (worker push) → <code>StreamingFfe.push_raw</code> (B02).
+    <code>set_cfo_hz</code> (from B04) folds into the downmix NCO; <code>set_resample_step</code> (from B05) drives the resampler.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">streaming_dsp.rs:342 feed_audio · :392 run_downmix_raw · :423 run_poly_rrc_decimate · :54 build_rrc_polyphase_bank · :289 rewind_to (byte-exact) · :328 warmup_samples</span></div>
+  <div class="kv"><b>Notes</b> The module header says "overlap-save" but the implementation is a single rolling
+    delay-line time-domain convolution (no FFT block-convolution) — a doc label, not a defect. The fused design
+    already resolves the "front-end decimation review" over-compute concern: the bank is evaluated only at the
+    ~2·Rs output phases, never at full 48&nbsp;kHz.</div>
+</div>
+
+<!-- B02 -->
+<div class="card" id="b02">
+  <h3><span class="bid">B02</span> Fractionally-spaced FFE — StreamingFfe (+ forward DD-LMS)
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> A single live T/2 feed-forward equaliser, LS-bootstrapped then continuously adapted.</div>
+  <div class="kv"><b>Algorithm</b> Fractionally-spaced (T/2) FFE (Qureshi 1985; Proakis ch.10–11) with three adaptation
+    modes on one tap set: (a) <strong>ridge-loaded LS</strong> install on the known preamble (<code>train_ls_ridge</code>,
+    the canonical minimum-norm fix for the FSE Gram rank-deficiency on oversampled/clean signals), after an ML
+    matched-filter-peak delay calibration; (b) <strong>continuous forward DD-LMS</strong> in <code>push_raw</code>
+    (μ=0.008, hard nearest-point target with the LMS step <em>scaled by soft reliability</em>
+    <code>w=|E[a|y]|²/E[|a|²|y]</code> so it cannot chase noise at low SNR — the fix for the documented
+    turbo&lt;legacy fading failure); (c) the code-aided soft <strong>joint FBF</strong> used by B07.</div>
+  <div class="kv"><b>Wiring</b> ← B01 fse samples → equalised <code>sym_buffer</code>/<code>out_buf</code> read by the
+    marker probe (B11) and B07's canon demod. Training driven by the FSM (acquisition bootstrap; META anchor).</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">streaming_ffe.rs:353-372 forward DD-LMS · :396 calibrate_delay · :561 train_lms_at (rebuild vs refine) · :758 reequalise_span_joint · :1068-1077 FFE-frame NLMS · v3_session.rs:302 forward_decision · :334 make_forward_slice</span></div>
+  <div class="kv"><b>Strength</b> The NLMS target is derived in the FFE (pre-derotation) frame <code>e_ffe=e_rot/A</code>,
+    which avoids the <code>1/|g|²</code> step blow-up that a naïve <code>e·conj(A)</code> would cause on a fade.</div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> the single live tap vector is mutated by several
+    loops (forward DD-LMS + per-segment FBF + backward/retry) — see §3.2 F2 (loop-fighting; joint-estimator pivot target).</div>
+</div>
+
+<!-- B03 -->
+<div class="card" id="b03">
+  <h3><span class="bid">B03</span> Acquisition &amp; gating — TurboGate / ScDetector / preamble MF
+    <span class="verdicts"><span class="badge b-ok">canon: canonical</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-warn">wiring: questionable</span></span></h3>
+  <div class="kv"><b>Role</b> Cold-start detection: find a burst, classify its geometry family, trigger the FSM.</div>
+  <div class="kv"><b>Algorithm</b> Three textbook detectors. (1) <strong>Normalized FFT matched-filter</strong>
+    metric <code>|Σw·t|²/(E_t·E_w)</code> (<code>fd_acquire.rs:253</code>) — the canonical GLRT / normalized-correlation
+    detector for a known signal of unknown amplitude in white noise (Proakis), zero-padded for linear correlation.
+    (2) <strong>Schmidl&amp;Cox</strong> marker-pair auto-correlation metric (ScDetector) firing the FSM.
+    (3) near-orthogonal 256-QPSK per-family preambles (cross/auto ≈ 16/256) → a single-pass ML geometry classifier.
+    False positives are handled by a deferred-decision architecture: soft floors (MF 0.15 / SC 0.5) only trigger a
+    seek; the hard gate is marker Golay(24,12)+CRC + a RECEIVING grace window.</div>
+  <div class="kv"><b>Wiring</b> ← raw 48&nbsp;kHz audio → FSM lock (B11), CFO estimate (B04), profile choice (B13/B15).
+    <code>rx_v2::detect_best_profile_cold</code> is dead on the turbo path (worker bootstraps via the gate).</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">fd_acquire.rs:253 MF metric · turbo_gate.rs:224 gate · v3_session.rs:3799 ScDetector · :3827 push · :1731 try_acquire_preamble</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> ScDetector recomputes the S&amp;C metric
+    <code>O(W)</code> per sample (W=1024) instead of the canonical <code>O(1)</code> recursive update, and keeps
+    running even when <code>Locked</code> — Pi-4 compute waste (§3.2 F3).</div>
+</div>
+
+<!-- B04 -->
+<div class="card" id="b04">
+  <h3><span class="bid">B04</span> Carrier-frequency (CFO / NCO) recovery
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Acquisition-only, one-shot-per-burst carrier-offset estimate for SSB/QO-100 (±250 Hz).</div>
+  <div class="kv"><b>Algorithm</b> Two open-loop stages. Stage 1 (<code>cfo.rs:193</code>): Welch-periodogram cross-correlated
+    against a raised-cosine <code>|H|²</code> band-shape template — a band-<em>shape</em> matched template (correct
+    for a suppressed-carrier RRC signal with no discrete line), giving a biased but bracketing coarse estimate.
+    Stage 2: a ±15&nbsp;Hz grid scored by the <strong>unbiased time-domain matched-filter metric</strong> with
+    parabolic sub-bin refinement — the value actually committed. <em>Canonical:</em> DA/NDA frequency estimation
+    (Mengali&amp;D'Andrea; Luise&amp;Reggiannini) + periodogram-max/parabolic interpolation. A <code>snap_deadband</code>
+    collapses <code>|cfo|&lt;1.5&nbsp;Hz</code> to exactly 0.0 (bit-exact no-op).</div>
+  <div class="kv"><b>Wiring</b> ← raw passband window (PSD reused from the gate) → <code>set_cfo_hz</code> → B01 NCO →
+    <code>reboot_pipeline_and_replay</code>. Latched once per burst (<code>cfo_locked</code>).</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">cfo.rs:193 coarse · :52 snap_deadband · v3_session.rs:1134 set_cfo_hz · :1811 cfo_locked</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> the module docstring advertises the DEAD Kay
+    single-lag estimator (<code>estimate_fine_cfo</code>) as the live fine stage — pure doc drift (§3.2 F7).</div>
+</div>
+
+<!-- B05 -->
+<div class="card" id="b05">
+  <h3><span class="bid">B05</span> Symbol-timing / SFO loop — PreambleSfoTracker
+    <span class="verdicts"><span class="badge b-ok">canon: canonical</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Track slow sample-clock offset (SFO / drift) and steer the front-end resampler.</div>
+  <div class="kv"><b>Algorithm</b> <strong>Data-aided symbol timing on the known constant-modulus entry preamble</strong>:
+    parabolic sub-sample interpolation of the matched-filter magnitude gives the timing phase τ; the two-preamble
+    (≈4&nbsp;s apart) φ-slope is the residual SFO, integrated (gain 0.5) into the smooth-resampler rate. It is
+    effectively <strong>closed-loop</strong> (residual measured on the post-resampler T/2 stream) and applied through
+    a continuous phase accumulator (smooth velocity change, no phase discontinuity). <em>Canonical:</em>
+    modulation-independent DA timing (Meyr ch.5) — deliberately avoids the per-ring AbsGardner self-noise/bias for
+    the APSK/AWGN target. Default-ON (kill-switch <code>V3_NO_TIMING_LOOP</code>); byte-exact when the rate settles
+    to unity on a drift-free capture.</div>
+  <div class="kv"><b>Wiring</b> ← B01 post-resampler fse + preamble positions (B11) → B01 <code>set_resample_step</code>.
+    Cleanly owns <em>only</em> the slow rate; carrier/CFO own phase; the discrete coarse-drift B06 is fully bypassed
+    (<code>timing.is_some()</code> early-return) → no loop-fighting.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">v3_session.rs:95-224 PreambleSfoTracker · :182-208 residual→rate · :1008 kill-switch · rx_v2.rs:1202 estimate_drift_gardner (dead when B05 on)</span></div>
+  <div class="kv"><b>Notes</b> <span class="sev sev-low">low</span> the ready-made one-shot two-preamble SFO seed is left
+    unwired (cold-starts at unity each burst); two-point slope has no cross-anchor regression — both low-impact for AWGN.</div>
+</div>
+
+<!-- B06 -->
+<div class="card" id="b06">
+  <h3><span class="bid">B06</span> Coarse linear-drift estimation &amp; commit (2-preamble / Gardner)
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-warn">opt: suboptimal</span><span class="badge b-warn">wiring: questionable</span></span></h3>
+  <div class="kv"><b>Role</b> Legacy discrete drift-ppm estimate + rewind/replay — the <em>fallback</em> for B05.</div>
+  <div class="kv"><b>Algorithm</b> <code>estimate_drift_gardner</code> is an OLS line-fit of measured marker positions vs
+    nominal (the canonical feedforward "position-slope" SFO estimator, Meyr), with quality gates (residual RMS&lt;2
+    samples, |ppm|&lt;200). The two-preamble path measures the slope between the entry and boundary preambles.
+    A committed ppm triggers <code>replay_from_anchor</code> over the full history. <em>Discrete commit-rebuild</em>
+    rather than continuous integration — the less optimal actuation, which is why B05 supersedes it.</div>
+  <div class="kv"><b>Wiring</b> Both paths <strong>early-return on <code>timing.is_some()</code></strong>
+    (<code>v3_session.rs:3423, 3537</code>), so they never fight B05. Default-OFF (<code>V3_2PRE_DRIFT</code>);
+    strictly one-shot (<code>drift_locked</code>). The double-count guard uses the <em>absolute</em> estimate, not
+    <code>from_ppm+estimate</code>.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">rx_v2.rs:1202 estimate_drift_gardner · v3_session.rs:3411 try_apply_coarse_drift · :3527 try_two_preamble_drift · :3397 coarse_drift_commit_ppm</span></div>
+  <div class="kv"><b>Notes</b> Effectively an A/B-only alternate to B05 today; mark it as such for the joint-estimator pivot.
+    <code>V3_POURSUITE</code> (per-marker integral drift) is documented as <em>diverging</em> and default-OFF.</div>
+</div>
+
+<!-- B07 -->
+<div class="card" id="b07">
+  <h3><span class="bid">B07</span> Canon demodulator — canon_demod_segment (the turbo core)
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-warn">wiring: questionable</span></span></h3>
+  <div class="kv"><b>Role</b> Per-segment SISO turbo demodulation: joint equalise + phase-track + soft-demap + LDPC + re-seed.</div>
+  <div class="kv"><b>Algorithm</b> A code-aided iterative estimator in the turbo-equalization family (Tüchler/Koetter/Singer
+    2002). Each of up to 5 passes: build soft references (pilots <code>w=1</code>; data <code>E[a]</code> with MMSE
+    weight <code>w=|E[a]|²/E[|a|²]</code>, 0 at iteration&nbsp;0) → <strong>one joint FFE+phase forward-backward-forward
+    (FBF) NLMS pass in place</strong> folding a per-group pilot LS gain and an intra-group bidirectional DD-PLL phase,
+    with the persistent carrier model predicted first → per-symbol σ²(t) → per-CW <code>llr_maxlog_per_sym</code> →
+    LDPC <code>decode_soft</code> → soft symbols from the extrinsic → next pass; break when every codeword's syndrome
+    clears. Strictly soft (no hard-decision path), so a corrupted segment yields <code>E[a]≈0 → w≈0</code> and cannot
+    poison the live taps. <em>Canonical:</em> turbo equalization + per-symbol BICM reliability weighting + code-aided
+    (Colavolpe/Barbieri/Caire 2005) gain/σ² estimation.</div>
+  <div class="kv"><b>Wiring</b> ← B02 taps + B08 carrier + B15 pilots → B09 LLR → B10 LDPC → B14 CwDecoded.
+    Carrier model updated <strong>forward-primary only</strong> (out-of-order re-decodes predict read-only).</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">v3_session.rs:2082 canon_demod_segment · :2147 SISO loop · streaming_ffe.rs:758 reequalise_span_joint · :990-1027 bidirectional DD-PLL</span></div>
+  <div class="kv"><b>Findings</b> <span class="sev sev-low">low</span> the "RTS / two-filter smoother" label is an
+    equal-weight 0.5/0.5 bidirectional DD-PLL average, not an inverse-covariance Fraser-Potter/RTS smoother
+    (§3.2 F5); <span class="sev sev-low">low</span> the FBF adapts the persistent taps even on backward/retry and
+    non-converged segments with no rollback (§3.2 F2). Both benign on AWGN; matter for phase-noise/fading channels.</div>
+</div>
+
+<!-- B08 -->
+<div class="card" id="b08">
+  <h3><span class="bid">B08</span> Persistent carrier phase/frequency — RxEstimator
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> A slow, session-persistent carrier {θ,ν} model that predicts each segment's phase ramp.</div>
+  <div class="kv"><b>Algorithm</b> A decision-directed 2nd-order phase/frequency tracker recast as a per-<em>segment</em>
+    predict/correct recursion (Meyr/Moeneclaey/Fechtel ch.5/8; Mengali&amp;D'Andrea): phase predicted as
+    <code>θ + ν·(s−anchor)</code>; after the forward-primary decode, θ is set to the measured residual phase at the
+    segment's last symbol (G_phase=1) and ν integrates the residual slope with gain 0.5. Default-ON (kill-switch
+    <code>V3_NO_CARRIER_TRACK</code>); identity model on the first segment → <code>pred≡0</code> → byte-identical bootstrap.</div>
+  <div class="kv"><b>Wiring</b> ← B07 residual (forward-primary only) → B07 <code>carrier_pred</code>. Correctly protected from
+    out-of-order corruption (<code>update_carrier=false</code> on backward/retry).</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">rx_estimator.rs (predict/update) · v3_session.rs:2138 carrier_pred · :2291 update gate</span></div>
+  <div class="kv"><b>Notes</b> No confirmed issue. Composes with B07's intra-group DD-PLL and the pilot gain-phase — a fold
+    candidate for the joint estimator (§3.3), not a defect.</div>
+</div>
+
+<!-- B09 -->
+<div class="card" id="b09">
+  <h3><span class="bid">B09</span> Soft demapping / LLR + posterior→soft-symbol
+    <span class="verdicts"><span class="badge b-ok">canon: canonical</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Convert equalised symbols → per-bit LLRs, and LDPC extrinsic → soft symbols E[a],Var[a].</div>
+  <div class="kv"><b>Algorithm</b> <code>llr_maxlog</code>/<code>llr_maxlog_per_sym</code> is the standard max-log-MAP BICM
+    demapper (per-bit LLR = <code>(min_{b=1}|y−s|² − min_{b=0}|y−s|²)/σ²</code>), with per-symbol σ²(t) giving faded
+    symbols near-erasure LLRs. <code>soft_symbols_from_posterior_llr</code> forms <code>E[a]=Σ a·P(a)</code> and
+    <code>Var[a]</code> from the decoder <strong>extrinsic</strong> (numerically robust: stable-tanh logistic, var
+    floor, normalisation guards). <em>Canonical:</em> max-log-MAP BICM demapping; posterior-mean soft symbols.
+    Sign convention (positive=bit0) and MSB/LSB labelling are unit-test-guarded (the classic inverted-LLR trap).</div>
+  <div class="kv"><b>Wiring</b> Live copy is <code>modem-core</code> (<code>v3_session.rs:57 use crate::soft_demod</code>),
+    not the richer base copy. ← B07 out[] / B10 extrinsic → B10 / B07.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">soft_demod.rs:15 llr_maxlog · :61 llr_maxlog_per_sym · :140 soft_symbols_from_posterior_llr</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> <code>ring_prob</code>/<code>ring_cond_mean</code>
+    are computed for every symbol on every turbo iteration but never consumed in the live path — dead work in the
+    hot loop (§3.2 F4).</div>
+</div>
+
+<!-- B10 -->
+<div class="card" id="b10">
+  <h3><span class="bid">B10</span> LDPC SISO decode + turbo iteration
+    <span class="verdicts"><span class="badge b-ok">canon: canonical</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Soft-in/soft-out LDPC decode of each codeword, returning info bits + extrinsic for the equaliser.</div>
+  <div class="kv"><b>Algorithm</b> Layered Normalized Min-Sum over the WiMAX IEEE 802.16e QC-LDPC codes (N=2304): the
+    two-smallest-magnitudes + sign-product check update with <code>ALPHA=0.75</code> normalisation (Chen&amp;Fossorier
+    2005; ~0.2&nbsp;dB from SPA). The extrinsic is <code>damp·(posterior−seed)</code> with <code>seed=clamp(channel+a-priori)</code>
+    — <strong>provably no double-counting</strong> (subtracts channel AND a-priori). A pulp-SIMD twin (<code>decode_soft_simd</code>)
+    is bit-identical to the scalar path (test-verified across rates and at strong/marginal/noise inputs). Fail-stop
+    bails on syndrome stagnation. Both SIMD and fail-stop are now default-ON kill-switches.</div>
+  <div class="kv"><b>Wiring</b> Live copy is <code>modem-core</code>'s decoder (<code>v3_session.rs:51</code>); base
+    <code>decode_with_posterior</code> is dead. In the SISO loop, a-priori into the LDPC is always <code>None</code>
+    — feedback recirculates only through the equaliser (the equaliser-half of turbo-EQ), structurally avoiding the
+    BICM-ID self-feedback hazard.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">ldpc/decoder.rs:226 decode_soft · :312-315 extrinsic · :446 decode_soft_simd · :60-62 fail-stop</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> stale comments at the live call sites misname the
+    knobs (<code>decoder.rs:292</code> "opt-in V3_LDPC_FAIL_STOP", <code>v3_session.rs:2246</code> "V3_LDPC_SIMD;
+    default scalar") — both are actually default-ON <code>V3_NO_*</code> kill-switches (§3.2 F9). Doc-only.</div>
+</div>
+
+<!-- B11 -->
+<div class="card" id="b11">
+  <h3><span class="bid">B11</span> Superframe FSM + markers + cycle advance
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> The Idle→Acquiring→Locked state machine: acquire, validate markers, predict the cadence, advance.</div>
+  <div class="kv"><b>Algorithm</b> Acquisition preamble = coherent FFT matched filter vs the 256-sym template (DA, canonical).
+    Marker detection = non-coherent MF <code>|Σ rx·conj(sync)|</code> — the ML detector for a known sequence under
+    unknown carrier phase on AWGN (Proakis). Double-gate validation: argmax sync-correlation THEN Golay(24,12)+CRC8,
+    decoding only at the single peak so random aliasing is negligible. The cadence predictor
+    (<code>advance_prediction</code>) mirrors the TX <code>build_superframe_v3_range</code> exactly (META elapsed-reset
+    + N_PREAMBLE boundary offset verified against <code>frame.rs</code>). Marker validation runs on the equalised stream.</div>
+  <div class="kv"><b>Wiring</b> Live copy is <code>modem-core</code> (base has no <code>marker.rs</code>/<code>frame.rs</code>).
+    <code>finalize()</code> clears all burst-scoped rate state (drift/timing-seed/cfo) and re-arms the SC latch for
+    late-entry — the documented cure for cross-burst rate inheritance.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">v3_session.rs:1449 handle_sc_fire · :1922 try_validate_marker_at · :3002 try_advance_to_next_marker · :2946 advance_prediction · marker.rs:274 MF detect · :346 decode_marker_at</span></div>
+</div>
+
+<!-- B12 -->
+<div class="card" id="b12">
+  <h3><span class="bid">B12</span> Backward flywheel / late-entry / replay-from-anchor
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Ride through missed markers and recover data emitted before a late RX entry.</div>
+  <div class="kv"><b>Algorithm</b> Decision-directed coasting through outages (accept only self-validating converged CWs —
+    noise never converges, so it cannot poison), plus deterministic <strong>state rewind + forward-replay-to-head</strong>:
+    rewind the live DSP to a warmup margin before the target, replay the borrowed history forward to the live head,
+    which reproduces the earlier fse the FFE never saw and returns every cursor byte-exact (proven by
+    <code>streaming_dsp</code> continuity tests). <em>Canonical:</em> flywheel/coast + late-entry acquisition; the
+    no-copy rewind/replay is the deterministic-replay pattern.</div>
+  <div class="kv"><b>Wiring</b> ← missed-marker / late-entry events (B11) → re-decoded segments (B07) → CwDecoded.
+    Carrier estimator explicitly protected (<code>update_carrier=false</code> read-only prediction). Zero cost on a
+    clean start (<code>entry_esi==0</code> early-returns). Default-ON (<code>V3_NO_BACKWARD</code>).</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">v3_session.rs:2332 extend_ffe_backward · :2422 recover_backward · :2585 search_prev_marker_scan · :3752 replay_from_anchor</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> the in-window backward flywheel mutates the live FFE
+    taps as a side effect — asymmetric with the read-only-protected carrier estimator (§3.2 F2). Benign on AWGN.</div>
+</div>
+
+<!-- B13 -->
+<div class="card" id="b13">
+  <h3><span class="bid">B13</span> Worker orchestration — RxV3Worker / run_turbo_worker
+    <span class="verdicts"><span class="badge b-ok">canon: canonical</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-warn">wiring: questionable</span></span></h3>
+  <div class="kv"><b>Role</b> Own one V3Session for the whole capture: burst boundaries, warm/cold restart, no-progress
+    brickwall, profile auto-detect/refine, cross-family reset.</div>
+  <div class="kv"><b>Algorithm</b> Receiver-management lifecycle (Meyr/Moeneclaey/Fechtel, receiver-control): warm-restart
+    keeps equaliser/timing state across a brief dropout while a clean LAST/EOT flushes cold so a new TX does not
+    inherit the previous clock drift. The no-progress brickwall keys on the <strong>unique-ESI high-water mark</strong>
+    (a monotone useful-work statistic that cannot be gamed by replayed markers). Session-replacing mutations are
+    recorded as flags in <code>route()</code> and applied only after the event batch unwinds (deferred-apply).
+    Cross-family hand-off is lifted to <code>run_turbo_worker</code>; in-session refinement is strictly family-locked.</div>
+  <div class="kv"><b>Wiring</b> ← V3Session events → SessionStore / RaptorQ (B14). DriftCommitted-as-progress relaxation is
+    scoped strictly to <code>is_slow_family()</code>, keeping the OTA-validated fast family byte-identical.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">rx_v3_worker.rs:288 push_samples · :413 is_stuck · :636 pending_rebuild · :811 restart_pending · :994 run_turbo_worker</span></div>
+  <div class="kv"><b>Notes</b> No confirmed issue. "Questionable" reflects the general burst-boundary state-reset
+    surface (history of 0.16.1–0.16.5 fixes), not a live defect.</div>
+</div>
+
+<!-- B14 -->
+<div class="card" id="b14">
+  <h3><span class="bid">B14</span> RX framing / RaptorQ fountain assembly
+    <span class="verdicts"><span class="badge b-ok">canon: canonical</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> Accumulate per-codeword CwDecoded(ESI, bytes) and decode the image via the fountain code.</div>
+  <div class="kv"><b>Algorithm</b> Canonical RFC 6330 RaptorQ delegated to the reference <code>raptorq 2.0.1</code> crate,
+    single source block (Z=1), one LDPC codeword ↔ one fountain symbol. The wrapper does ESI-keyed packet
+    accumulation + a single-source-block OTI.</div>
+  <div class="kv"><b>Wiring</b> ← B13 ESI-keyed accumulation → image bytes + CRC.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">modem-framing/src/raptorq_codec.rs:46 build_oti · :97 encode · :123 decode</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-med">medium</span> <code>T=108</code> is not 8-aligned, so
+    <code>with_defaults</code> sets <code>symbol_size=104</code> and ~3.7% of channel payload is zero-pad — the one
+    genuinely actionable correctness item (§3.2 F1).</div>
+</div>
+
+<!-- B15 -->
+<div class="card" id="b15">
+  <h3><span class="bid">B15</span> Profile / config geometry — constellations, pilots, cadence
+    <span class="verdicts"><span class="badge b-blue">canon: minor-deviation</span><span class="badge b-blue">opt: acceptable</span><span class="badge b-ok">wiring: correct</span></span></h3>
+  <div class="kv"><b>Role</b> The single source of truth mapping one <code>ProfileIndex</code> byte → full <code>ModemConfig</code>.</div>
+  <div class="kv"><b>Algorithm</b> QPSK/8PSK Gray + 16/32/64-APSK DVB-S2/S2X geometries (ring populations 4+12 / 4+12+16 /
+    4+12+20+28, Es=1 exact). 32- and 64-APSK radii AND bit-labels are asserted against the normative EN 302 307-1/-2
+    tables by dedicated reference-point tests — strong rigor. <code>fse_geometry</code> byte-mirrors the <code>rx_v2</code>
+    batch <code>n_ff</code> selection, so turbo and batch use identical T/2 geometry; cycle-to-sample alignment is
+    structurally integer (panics otherwise).</div>
+  <div class="kv"><b>Wiring</b> <code>ProfileIndex::to_config</code> → <code>ModemConfig</code> → <code>make_constellation</code>;
+    <code>config_by_name</code> is the sole name resolver.</div>
+  <div class="kv"><b>Key symbols</b> <span class="mono">profile.rs:242 to_config · :388 config_by_name · constellation.rs:500/525/590/618 EN 302 307 reference tests · v3_session.rs:391 fse_geometry</span></div>
+  <div class="kv"><b>Finding</b> <span class="sev sev-low">low</span> <code>net_bitrate</code> multiplies by <code>tau</code>
+    instead of dividing — dimensionally wrong for FTN; latent (MEGA-only, exact at tau=1 everywhere else) (§3.2 F10).</div>
+</div>
+
+<!-- ============================================================= -->
+<h2 id="analysis">3. Analysis — canon / optimality / wiring</h2>
+
+<h3>3.1 Verdict matrix</h3>
+<table>
+  <tr><th>Block</th><th>Canon</th><th>Optimality</th><th>Wiring</th><th>Confirmed finding(s)</th></tr>
+  <tr><td>B01 Front-end DSP</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">"overlap-save" is a mislabel (time-domain); no defect</td></tr>
+  <tr><td>B02 FSE / FFE</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">F2 shared-tap loop-fighting (low)</td></tr>
+  <tr><td>B03 Acquisition</td><td><span class="badge b-ok">canonical</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-warn">questionable</span></td><td class="small">F3 ScDetector O(W)/runs-when-Locked (low)</td></tr>
+  <tr><td>B04 CFO / NCO</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">F7 stale Kay docstring (low, doc)</td></tr>
+  <tr><td>B05 Timing / SFO</td><td><span class="badge b-ok">canonical</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">—</td></tr>
+  <tr><td>B06 Coarse drift</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-warn">suboptimal</span></td><td><span class="badge b-warn">questionable</span></td><td class="small">default-OFF A/B alternate to B05</td></tr>
+  <tr><td>B07 Canon demod</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-warn">questionable</span></td><td class="small">F5 RTS mislabel (low); F2 tap no-rollback (low)</td></tr>
+  <tr><td>B08 Carrier PLL</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">—</td></tr>
+  <tr><td>B09 Soft demap</td><td><span class="badge b-ok">canonical</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">F4 dead ring compute in hot loop (low)</td></tr>
+  <tr><td>B10 LDPC SISO</td><td><span class="badge b-ok">canonical</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">F9 stale knob comments (low, doc)</td></tr>
+  <tr><td>B11 FSM / markers</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">—</td></tr>
+  <tr><td>B12 Flywheel</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">F2 backward mutates live taps (low)</td></tr>
+  <tr><td>B13 Worker</td><td><span class="badge b-ok">canonical</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-warn">questionable</span></td><td class="small">—</td></tr>
+  <tr><td>B14 RaptorQ</td><td><span class="badge b-ok">canonical</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small"><b>F1 symbol_size=104 zero-pad (medium)</b></td></tr>
+  <tr><td>B15 Profiles</td><td><span class="badge b-blue">minor-dev</span></td><td><span class="badge b-blue">acceptable</span></td><td><span class="badge b-ok">correct</span></td><td class="small">F10 net_bitrate ×tau (low, latent)</td></tr>
+</table>
+
+<h3>3.2 Prioritized findings</h3>
+<p class="small">Severity-verified: the per-block findings below survived an independent adversarial refutation pass;
+  the wiring-trace items (§3.3) that overlap them are corroborated. Nothing is high-severity.</p>
+
+<div class="box bad2">
+  <strong>F1 · <span class="sev sev-med">medium</span> · correctness · B14.</strong>
+  <code>T=108</code> (LDPC info bytes) is not a multiple of 8, so <code>ObjectTransmissionInformation::with_defaults(k·T, T)</code>
+  picks alignment=8 and <code>symbol_size = 108 − (108%8) = 104</code>. The transmitted <code>k_symbols</code> then
+  understates the true source-symbol count and ~3.7% of channel payload is zero-pad. Invisible with the 30%
+  over-provisioning (which is why it passed byte-exact OTA), but it dents efficiency exactly on the primary payload
+  profile and at the ~10% ESI-loss threshold the project benchmarks against.
+  <br><b>Fix:</b> explicit OTI <code>ObjectTransmissionInformation::new(padded_len, T, 1, 1, 1)</code> at
+  <code>raptorq_codec.rs:46,97</code> so <code>symbol_size==T</code> for all profiles.
+</div>
+
+<div class="box note">
+  <strong>F2 · <span class="sev sev-low">low</span> · wiring/correctness · B02·B07·B12 (recurs in §3.3 L2/L3).</strong>
+  The single live tap vector <code>current_taps</code> is mutated by ≥3 loops with no rollback: continuous forward
+  DD-LMS in <code>push_raw</code> (μ=0.008, hard target), the per-segment turbo FBF NLMS (μ=0.02, soft target,
+  ×3 legs ×≤5 iters), and backward/retry re-decodes — which run with <code>update_carrier=false</code> (protecting
+  the carrier model) but <strong>still adapt the taps in place</strong>. The <code>retry_failed_segments</code>
+  docstring even claims a "local tap copy" that does not exist (<code>v3_session.rs:2621</code> vs
+  <code>streaming_ffe.rs:1072-1077</code>). Benign on the characterised AWGN channel (DD-LMS re-converges to the
+  same MMSE solution; measured net-positive), but it is real loop-fighting and the asymmetry with the read-only
+  carrier protection is a latent poison path on fading/low-SNR.
+  <br><b>Fix:</b> snapshot+restore <code>current_taps</code> around <code>update_carrier=false</code> re-decodes
+  (cheap, bounded), and fix the stale docstring. Structurally, this is exactly what the
+  <a href="#pivot">joint-estimator pivot</a> consolidates.
+</div>
+
+<div class="box note">
+  <strong>F3 · <span class="sev sev-low">low</span> · optimality · B03.</strong> <code>ScDetector</code> recomputes the
+  Schmidl&amp;Cox R/P1/P2 as a full W-length sum on every pushed sample (W=1024 for family A) instead of the
+  canonical O(1) recursive accumulator, and keeps running unconditionally through the whole <code>Locked</code>
+  burst — ≈50&nbsp;MMAC/s of avoidable work on the Pi-4 idle budget the gated architecture exists to protect.
+  <br><b>Fix:</b> recursive sliding accumulator (byte-neutral to the edge-trigger), and/or skip <code>sc.push</code> when Locked.
+</div>
+
+<div class="box note">
+  <strong>F4 · <span class="sev sev-low">low</span> · optimality · B09 (recurs L1/L3).</strong>
+  <code>soft_symbols_from_posterior_llr</code> allocates and fills <code>ring_prob</code>/<code>ring_cond_num</code>
+  and calls <code>rings()</code> per symbol, but the live path reads only <code>mean</code>/<code>var</code>
+  (<code>v3_session.rs:2274-2276</code>). This is dead work in the hottest turbo inner loop (per-CW × per-iteration ×
+  up to 6 passes). The ring statistics belong to the still-shelved per-ring EM / soft-DFE lever.
+  <br><b>Fix:</b> a lean mean/var-only variant for the live path; keep the ring outputs feature-gated behind the shelved lever.
+</div>
+
+<div class="box note">
+  <strong>F5 · <span class="sev sev-low">low</span> · canon (labelling) · B07.</strong> The comment calls the phase
+  smoother a "two-filter / RTS form", but the code is two reset 2nd-order DD-PLLs averaged 0.5/0.5
+  (<code>streaming_ffe.rs:990-1027</code>). A true Fraser-Potter two-filter smoother combines forward/backward by
+  <em>inverse-covariance</em> weighting; an RTS smoother is forward-Kalman + backward covariance recursion. Equal
+  weighting under-corrects the endpoints (each direction's unconverged transient gets half-weight). Fine on AWGN;
+  suboptimal on QO-100 phase-noise.
+  <br><b>Fix:</b> relabel as "equal-weight bidirectional DD-PLL average"; if phase-noise proves limiting, weight by each direction's convergence age.
+</div>
+
+<div class="box note">
+  <strong>F6 · <span class="sev sev-low">low</span> · optimality · §3.3 L1.</strong> Inside
+  <code>reequalise_span_joint</code> the tap-invariant equalised sample <code>y[k]=Σ taps·frac_buf</code> is
+  recomputed with identical taps in the gain pass and both phase-smoother legs
+  (<code>streaming_ffe.rs:849, 1006, 1041</code>). Hoisting it to one per-iteration <code>Vec</code> is
+  byte-exact-preserving and saves two full convolutions per iteration (Pi-4).
+</div>
+
+<div class="box note">
+  <strong>F7 · <span class="sev sev-low">low</span> · doc · B04. &nbsp; F9 · <span class="sev sev-low">low</span> · doc · B10.</strong>
+  Doc/label drift that misleads an auditor: <code>cfo.rs:16-18</code> advertises the dead Kay estimator
+  (<code>estimate_fine_cfo</code>) as the live fine stage (the live path is PSD-template coarse → MF-grid parabolic
+  refine); and the live LDPC call sites misname the knobs — <code>decoder.rs:292</code> "opt-in V3_LDPC_FAIL_STOP"
+  and <code>v3_session.rs:2246</code> "V3_LDPC_SIMD; default scalar" are both actually default-ON
+  <code>V3_NO_LDPC_FAIL_STOP</code> / <code>V3_NO_LDPC_SIMD</code> kill-switches. Rewrite the comments to name the live path.
+</div>
+
+<div class="box note">
+  <strong>F8 · <span class="sev sev-low">low</span> · wiring hazard · §3.4 L4.</strong> <code>modem-core-base</code>
+  holds DEAD, DRIFTED duplicates of <code>soft_demod</code> and the LDPC decoder (plus <code>demodulator</code>,
+  <code>equalizer</code>, <code>pll</code>) with the same public API as the live <code>modem-core</code> copies —
+  nothing outside base imports them (verified by workspace grep). Two decoders with the same name, one dead and
+  already drifted (the base <code>soft_demod</code> is richer), is a real maintenance/wiring hazard.
+  <br><b>Fix:</b> one source of truth — keep the module in base and re-export from core, or delete the dead base
+  copies. <code>sync</code> is genuinely live in both crates for different helpers, so it needs a real plan, not deletion.
+</div>
+
+<div class="box note">
+  <strong>F10 · <span class="sev sev-low">low</span> · correctness (latent) · B15.</strong> <code>net_bitrate</code>
+  computes <code>gross = symbol_rate · bps · tau</code>, but the on-air symbol rate under faster-than-Nyquist is
+  <code>R_s/tau</code> (closer spacing → more symbols/s). Zero live impact (every shipping profile is tau=1; the only
+  tau≠1 profile, MEGA, is removed from the registry), but dimensionally wrong. <b>Fix:</b> divide by <code>tau</code>.
+</div>
+
+<div class="box note">
+  <strong>F11 · <span class="sev sev-low">low</span> · canon (subtlety, raised by §3.3 L3, not independently refuted).</strong>
+  The equaliser output fed to the demapper is not <em>strictly</em> extrinsic: because the joint FBF adapts the shared
+  span taps/gain using each data symbol's own a-priori <code>E[a]</code>, a symbol's a-priori partially leaks into its
+  own channel LLR. Canonical MMSE turbo-EQ (Tüchler) forms symbol&nbsp;k's output <em>excluding</em> its own a-priori.
+  The leak here is diffuse (an averaged adaptation effect, weight-bounded) and small on AWGN. The clean fix is again
+  the joint code-aided estimator; until then it is a documented theoretical departure, not a decode bug.
+</div>
+
+<h3 id="rebuild">A deliberate trade-off that is <em>not</em> a finding — the META LS rebuild</h3>
+<div class="box ok">
+  A wiring trace flagged that the default META-anchor path does a full LS <strong>rebuild</strong> every superframe
+  (<code>rebuild_meta = V3_FFE_REFINE.is_none()</code>, default true), which superficially contradicts the
+  project's "refine, don't rebuild" rule (a rebuild lets one bad frame corrupt the chain). On inspection this is a
+  <strong>deliberate, measured choice</strong>, documented at <code>v3_session.rs:2033-2039</code>: on faded low-SNR
+  NORMAL captures a fresh rebuild at every anchor recovers <em>more</em> unique ESI than refine-only or best-of-two
+  (diag 160 vs 156) — "when every anchor is weak there are no good taps to protect, so the extra re-centring wins" —
+  and it is the original OTA-validated behaviour. The refine / best-of-two path is available via <code>V3_FFE_REFINE</code>
+  for A/B. So the refine-not-rebuild rule holds <em>between</em> anchors (continuous forward DD-LMS, §B02); the
+  per-anchor rebuild is the intended, empirically-won exception. No action needed.
+</div>
+
+<h3 id="crosscut">3.3 Cross-cutting themes</h3>
+<ul class="tight">
+  <li><strong>Shared-tap loop-fighting (F2, F11).</strong> One tap vector, several writers, no rollback; the carrier
+    estimator is read-only-protected but the taps are not. Benign on AWGN, latent on fading. The joint-estimator
+    pivot is the structural fix. Note the timing/drift estimators (B05/B06) are <em>not</em> among the fighters —
+    they are cleanly gated by <code>timing.is_some()</code>.</li>
+  <li><strong>Pi-4 compute waste in the hot loop (F3, F4, F6, + GUI diagnostics recomputed every iteration,
+    <code>v3_session.rs:2200-2225</code>).</strong> All byte-exact-preserving optimisations; worth doing before the
+    next Pi-4 perf pass, none change decode behaviour.</li>
+  <li><strong>Doc/label drift (F5, F7, F9, the "local tap copy" docstring).</strong> Cheap to fix, real
+    auditor-confusion cost — several comments name dead code or wrong knob defaults.</li>
+  <li><strong>Dual-crate dead duplicates (F8).</strong> The single biggest maintenance hazard: two same-named
+    decoders/demappers, one dead and drifting.</li>
+</ul>
+
+<h3 id="pivot">3.4 Relation to the joint-estimator pivot</h3>
+<p>
+  Within one <code>reequalise_span_joint</code> pass three phase corrections compose into
+  <code>A = cphase · inv_gain · exp(−jθ)</code>: the persistent carrier from B08, the per-group pilot LS gain-phase,
+  and the intra-group DD-PLL (B07). This is a correct <em>cascade</em> (each stage estimates the residual the
+  previous left), and it is stable and byte-exact where it should be — but it is exactly the stack the pivot
+  (<code>project_joint_estimator</code>) proposes to replace with one code-aided state-space (Kalman/RTS) estimator.
+  The audit corroborates the pivot's premise and sharpens its scope:
+</p>
+<ul class="tight">
+  <li>Fold candidates: B07 intra-group DD-PLL + B08 carrier {θ,ν} into one state vector; B05 timing-rate as a third state.</li>
+  <li>The tap writers (F2) should be the first thing consolidated under a single owner with rollback.</li>
+  <li><strong>Do not</strong> list B05/B06 as loop-fighters — they are already cleanly separated; the fight is among the phase/gain/tap loops, not the timing loop.</li>
+</ul>
+
+<!-- ============================================================= -->
+<h2 id="knobs">4. Environment-knob reference</h2>
+<p class="small">Every turbo runtime optimisation ships <strong>default-ON behind a <code>V3_NO_*</code> kill-switch</strong>,
+  consistent with the project convention. Dev/A-B-only and legacy-alternate knobs are default-OFF. Verified from the
+  actual <code>std::env</code> reads.</p>
+<table>
+  <tr><th>Knob</th><th>Default</th><th>Effect</th></tr>
+  <tr><td class="mono">V3_NO_TIMING_LOOP</td><td>ON (loop active)</td><td>B05 PreambleSfoTracker + smooth resampler; OFF ⇒ fixed-ratio (byte-identical)</td></tr>
+  <tr><td class="mono">V3_TIMING_GAIN</td><td>0.5</td><td>B05 SFO integrator gain</td></tr>
+  <tr><td class="mono">V3_NO_CFO</td><td>ON (CFO active)</td><td>B04 carrier-offset recovery; OFF ⇒ 0.0 de-rotation (byte-identical)</td></tr>
+  <tr><td class="mono">V3_NO_CARRIER_TRACK</td><td>ON (RxEstimator on)</td><td>B08 persistent {θ,ν} carrier loop; OFF ⇒ carrier_pred=None (byte-identical)</td></tr>
+  <tr><td class="mono">V3_NO_TURBO_PLL</td><td>ON (smoother on, α=0.05)</td><td>B07 intra-group bidirectional DD-PLL; OFF ⇒ gain-only (θ≡0 byte-identical)</td></tr>
+  <tr><td class="mono">V3_NO_PERSYM_SIGMA2</td><td>ON (per-symbol σ²)</td><td>B09 per-symbol σ²(t) LLR scaling; OFF ⇒ segment-mean σ² (A/B)</td></tr>
+  <tr><td class="mono">V3_NO_CODE_AIDED_EST</td><td>ON</td><td>B07 fold trusted soft data (w≥0.5) into the LS gain &amp; σ² fits; OFF ⇒ pilot-only</td></tr>
+  <tr><td class="mono">V3_NO_FWD_SOFT</td><td>ON (reliability-weighted)</td><td>B02 forward DD-LMS step scaled by soft w; OFF ⇒ hard w=1 (legacy A/B)</td></tr>
+  <tr><td class="mono">V3_TURBO_SOFT_ITERS</td><td>5 (1..6)</td><td>B07/B10 max SISO turbo passes per segment</td></tr>
+  <tr><td class="mono">V3_TURBO_SOFT_DAMP</td><td>0.7</td><td>B10 LDPC extrinsic damping</td></tr>
+  <tr><td class="mono">V3_NO_LDPC_SIMD</td><td>ON (SIMD)</td><td>B10 pulp-SIMD decode (bit-identical); OFF ⇒ scalar (comment at :2246 is stale)</td></tr>
+  <tr><td class="mono">V3_NO_LDPC_FAIL_STOP</td><td>ON (fail-stop armed)</td><td>B10 syndrome-stagnation early-stop; warmup 5, stag 3 (comment at :292 is stale)</td></tr>
+  <tr><td class="mono">V3_FFE_MU_TRAIN / _MU_DD / _MU_DD_FWD</td><td>0.10 / 0.02 / 0.008</td><td>B02 LMS steps (train / DD+FBF / continuous forward)</td></tr>
+  <tr><td class="mono">V3_FFE_REFINE</td><td>OFF (full LS rebuild)</td><td>B02 META anchor: opt into refine / best-of-two seed (see §3.2 rebuild note)</td></tr>
+  <tr><td class="mono">V3_FWD_SOFT_K / _SIGMA2</td><td>0.25·dₘᵢₙ² / unset</td><td>B02 forward soft-slicer temperature</td></tr>
+  <tr><td class="mono">V3_NO_FLYWHEEL / V3_NO_BACKWARD / V3_NO_TURBO_SYNC</td><td>ON (all active)</td><td>B12/B11 forward coast / backward late-entry / closed-window retry</td></tr>
+  <tr><td class="mono">V3_NO_BRICKWALL</td><td>ON (brickwall on)</td><td>B13 no-progress finalizer; <code>V3_BRICKWALL_S</code> floor 15 s (max with 4×cycle)</td></tr>
+  <tr><td class="mono">V3_NO_ACQ_THROTTLE</td><td>ON (throttle on)</td><td>B03 in-session acq-scan cadence</td></tr>
+  <tr><td class="mono">V3_2PRE_DRIFT / V3_DRIFT_TRACK / V3_POURSUITE</td><td>OFF</td><td>B06 legacy/experimental drift paths (POURSUITE documented divergent); moot while B05 on</td></tr>
+  <tr><td class="mono">V3_FORCE_DRIFT_PPM / V3_TIMING_SEED_PPM / V3_DROP_MARKER / V3_DISCERNING_REFINE</td><td>OFF/unset</td><td>dev &amp; A/B hooks</td></tr>
+  <tr><td class="mono">TURBO_GATED</td><td>OFF (continuous path)</td><td>B13 park DSP while Searching, gate on raw audio</td></tr>
+  <tr><td class="mono">V3_LOG_* / MODEM_PERF / V3_DRIFT_LOG / V3_TIMING_LOG</td><td>OFF</td><td>diagnostics only</td></tr>
+</table>
+
+<!-- ============================================================= -->
+<h2 id="method">5. Method &amp; references</h2>
+<p class="small">
+  This document was produced by a multi-agent audit of the branch <code>feat/ssb-rx</code> source
+  (2026-07-04): 15 blocks were each deep-read into a structured dossier, audited on three axes
+  (canon / optimality / wiring) against the literature below, and each material finding put through an independent
+  adversarial refutation pass (47 agents total). Four end-to-end wiring traces (signal-flow/compute, state-continuity,
+  soft-turbo-loop integrity, defaults/dual-crate) cross-checked the block-level results. The three most consequential
+  wiring-only claims (META rebuild default, dead base duplicates, duplicate FIR convolution) plus the SIMD/fail-stop
+  defaults were re-verified directly against the code by the author. Every claim is anchored to <code>file:line</code>;
+  where a claim could not be proven from code + reference it is marked so rather than asserted.
+</p>
+<ol class="refs">
+  <li>M. Tüchler, R. Koetter, A. C. Singer, "Turbo Equalization: Principles and New Results," <em>IEEE Trans. Commun.</em>, 50(5):754–767, 2002.</li>
+  <li>M. Tüchler, A. C. Singer, R. Koetter, "MMSE Equalization Using A Priori Information," <em>IEEE Trans. Signal Process.</em>, 50(3):673–683, 2002.</li>
+  <li>G. Colavolpe, A. Barbieri, G. Caire, "Algorithms for Iterative Decoding in the Presence of Strong Phase Noise," <em>IEEE JSAC</em>, 23(9):1748–1757, 2005.</li>
+  <li>J. G. Proakis, M. Salehi, <em>Digital Communications</em> (matched filter, FSE ch.10–11, MF/GLRT detection).</li>
+  <li>H. Meyr, M. Moeneclaey, S. Fechtel, <em>Digital Communication Receivers</em> (DA timing ch.5, DD-PLL ch.8, receiver control).</li>
+  <li>U. Mengali, A. N. D'Andrea, <em>Synchronization Techniques for Digital Receivers</em>; A. N. D'Andrea et al.; M. Luise, R. Reggiannini, "Carrier Frequency Recovery," <em>IEEE Trans. Commun.</em>, 43(2/3/4), 1995.</li>
+  <li>T. M. Schmidl, D. C. Cox, "Robust Frequency and Timing Synchronization for OFDM," <em>IEEE Trans. Commun.</em>, 45(12):1613–1621, 1997.</li>
+  <li>J. Chen, M. P. C. Fossorier, "Density Evolution for Two Improved BP-Based Min-Sum Decoding," <em>IEEE Commun. Lett.</em>, 2005; IEEE 802.16e QC-LDPC.</li>
+  <li>F. Harris, <em>Multirate Signal Processing</em>; L. Erup, F. Gardner, R. Harris, "Interpolation in Digital Modems," <em>IEEE Trans. Commun.</em>, 41(6), 1993.</li>
+  <li>M. Luby et al., "RaptorQ Forward Error Correction Scheme," RFC 6330, 2011.</li>
+  <li>ETSI EN 302 307-1/-2 (DVB-S2/S2X APSK constellations &amp; ring ratios).</li>
+</ol>
+
+<p class="small" style="margin-top:2rem;color:#888">
+  Companion: <a href="turbo_rx_architecture.html">Turbo RX — the Canon Demodulator</a> (B07 deep-dive + channel-sim benchmarks).
+  Generated 2026-07-04 · branch <code>feat/ssb-rx</code>.
+</p>
+
+</div>
+</body>
+</html>
