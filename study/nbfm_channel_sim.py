@@ -293,6 +293,10 @@ def main():
                     help=f"RMS bruit audio post-demod (defaut {AUDIO_NOISE_RMS})")
     ap.add_argument("--post-lpf", type=float, default=POST_LPF,
                     help=f"Coupure LPF audio RX (Hz, defaut {POST_LPF}, 0=desactive)")
+    ap.add_argument("--carrier-hz", type=float, default=0.0,
+                    help="Carrier frequency offset on the output (Hz) — SSB/QO-100 LO offset test")
+    ap.add_argument("--carrier-drift-hz", type=float, default=0.0,
+                    help="Carrier frequency drift rate (Hz/s), linear ramp — classic-station LO/up-converter drift")
     args = ap.parse_args()
 
     audio_in, sr = load_wav(args.input_wav)
@@ -311,6 +315,17 @@ def main():
                          audio_noise_rms=args.audio_noise,
                          start_delay_s=args.start_delay,
                          rng_seed=args.seed)
+
+    # Optional carrier frequency offset + linear drift (SSB single-sideband
+    # shift via the analytic signal), applied to the modem's input audio: this
+    # is what the modem sees when a classic-station LO / up-converter drifts.
+    if args.carrier_hz != 0.0 or args.carrier_drift_hz != 0.0:
+        from scipy.signal import hilbert
+        t = np.arange(len(audio_out)) / AUDIO_RATE
+        analytic = hilbert(audio_out.astype(np.float64))
+        phase = 2.0 * np.pi * (args.carrier_hz * t + 0.5 * args.carrier_drift_hz * t * t)
+        audio_out = np.real(analytic * np.exp(1j * phase)).astype(np.float32)
+        print(f"Carrier: {args.carrier_hz:+.1f} Hz + {args.carrier_drift_hz:+.2f} Hz/s drift")
 
     peak = np.max(np.abs(audio_out))
     print(f"Sortie: {len(audio_out)} samples, crete {peak:.4f} "
