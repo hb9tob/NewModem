@@ -923,6 +923,16 @@ struct PendingRetry {
 /// of the FFE retention window, whichever comes first.
 const MAX_RETRY_ATTEMPTS: u32 = 2;
 
+/// Integer-symbol grid offsets the BLIND flywheel decode tries around the
+/// cadence-predicted position (0 first = the nominal single-offset behaviour),
+/// mirroring the legacy batch decoder's overlapping re-scan. Across a marker-less
+/// coast the cadence prediction slips (residual SFO; a deep fade can slip the
+/// symbol clock), shifting the whole pilot/codeword grid by an integer symbol so
+/// the pilot-aided decode mis-aligns. ±3 symbols covers a realistic slip without
+/// a wide (false-positive-prone) scan; the LDPC syndrome=0 accept gate keeps a
+/// wrong alignment from ever being emitted.
+const FLYWHEEL_SWEEP_OFFSETS: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
+
 impl V3Session {
     pub fn new(cfg: ModemConfig, profile_name: String) -> Self {
         let cycle_samples = cycle_period_samples(&cfg);
@@ -2714,6 +2724,66 @@ impl V3Session {
         self.retry_queue = still_pending;
     }
 
+    /// Decode a pending segment's codewords, with a legacy-style overlapping
+    /// re-scan for BLIND flywheel coasts. A marker-VALIDATED segment (or the
+    /// sweep disabled via `V3_NO_FLYWHEEL_SWEEP`) takes a single committed
+    /// [`canon_demod_segment`] pass — byte-identical to the direct call. A BLIND
+    /// coast decodes at a position only PREDICTED from the cadence; across a
+    /// marker-less run that prediction slips by an integer symbol (residual SFO;
+    /// a deep fade can slip the symbol clock), shifting the whole pilot/codeword
+    /// grid so the pilot-aided decode mis-aligns and the codewords fail — exactly
+    /// the coverage the legacy batch decoder recovers by re-scanning overlapping
+    /// windows. So try [`FLYWHEEL_SWEEP_OFFSETS`] integer-symbol offsets around
+    /// the predicted position and keep the first that FULLY LDPC-converges
+    /// (syndrome=0 → never a false alignment). Trials run with
+    /// `update_carrier=false` and roll the live taps back between attempts
+    /// ([`StreamingFfe::snapshot_taps`]/[`restore_taps`]) so a losing alignment
+    /// cannot poison the equaliser; the chosen offset is then decoded once,
+    /// committed. Offset 0 is tried first, so when it converges (the common case)
+    /// the committed pass is byte-identical to the single-offset blind decode.
+    fn decode_pending_span(
+        &mut self,
+        seg_start_abs: u64,
+        seg_sym_len: usize,
+        n_cw: usize,
+        blind: bool,
+    ) -> Option<(Vec<(Vec<u8>, bool)>, f64)> {
+        let sweep = blind && std::env::var_os("V3_NO_FLYWHEEL_SWEEP").is_none();
+        if !sweep {
+            return self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw, true);
+        }
+        let sym_start = self.ffe.start_abs();
+        let sym_end = sym_start + self.ffe.out_buf().len() as u64;
+        let taps0 = self.ffe.snapshot_taps();
+        let mut win: i64 = 0;
+        for &d in &FLYWHEEL_SWEEP_OFFSETS {
+            let s = seg_start_abs as i64 + d;
+            if s < sym_start as i64 || (s as u64) + seg_sym_len as u64 > sym_end {
+                continue;
+            }
+            // Trial: no carrier update, taps rolled back after — a losing
+            // alignment leaves the live equaliser exactly as it was.
+            let all_conv = self
+                .canon_demod_segment(s as u64, seg_sym_len, n_cw, false)
+                .map(|(pc, _)| !pc.is_empty() && pc.iter().all(|(_, c)| *c))
+                .unwrap_or(false);
+            self.ffe.restore_taps(taps0.clone());
+            if all_conv {
+                win = d;
+                break;
+            }
+        }
+        if win != 0 && std::env::var_os("V3_LOG_SYNC").is_some() {
+            eprintln!(
+                "[sync] FLYWHEEL sweep aligned at offset {win} sym (pred seg_start={seg_start_abs})",
+            );
+        }
+        // Committed decode at the chosen offset (taps already at the pre-sweep
+        // snapshot → win=0 is byte-identical to the single-offset blind decode).
+        let s = (seg_start_abs as i64 + win) as u64;
+        self.canon_demod_segment(s, seg_sym_len, n_cw, true)
+    }
+
     /// progress) so the outer loop knows to try `try_advance_to_next_marker`.
     fn try_decode_pending_cycle(&mut self, events: &mut Vec<V3SessionEvent>) -> bool {
         let Some(pending) = self.pending_decode else {
@@ -2778,7 +2848,7 @@ impl V3Session {
         // side-pass + the separate hard/soft retry equalisers. `None` = the span
         // is truncated / not re-equalisable → clear pending so we don't loop.
         let Some((per_cw, sigma2)) =
-            self.canon_demod_segment(seg_start_abs, seg_sym_len, n_cw, true)
+            self.decode_pending_span(seg_start_abs, seg_sym_len, n_cw, pending.blind)
         else {
             self.pending_decode = None;
             return true;

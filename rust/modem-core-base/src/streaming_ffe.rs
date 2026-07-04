@@ -179,6 +179,21 @@ impl StreamingFfe {
         self.current_taps.is_some()
     }
 
+    /// Clone the live tap set so a caller can run trial re-equalisations
+    /// ([`reequalise_span_joint`] adapts the taps IN PLACE) and roll back to
+    /// this snapshot with [`restore_taps`]. Used by the flywheel multi-offset
+    /// sweep to try several grid alignments without letting a losing trial
+    /// poison the live equaliser.
+    pub fn snapshot_taps(&self) -> Option<Vec<Complex64>> {
+        self.current_taps.clone()
+    }
+
+    /// Restore the live tap set to a prior [`snapshot_taps`]. No-op semantics on
+    /// the FIR delay line / buffers — only the adaptive taps are rolled back.
+    pub fn restore_taps(&mut self, taps: Option<Vec<Complex64>>) {
+        self.current_taps = taps;
+    }
+
     /// Extend the FFE BACKWARD in time: prepend `n_symbols` of earlier
     /// fractional (fse) samples to the FRONT of the buffers and lower
     /// `start_abs`, so a subsequent [`reequalise_span_joint`] can run its
