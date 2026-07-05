@@ -499,8 +499,12 @@ fn awgnsweep(args: &[String]) {
             }
         }
         println!("  {esn0_db:>7.1}   {ok}/{trials}");
-        if ok * 10 >= trials * 8 {
-            threshold = Some(esn0_db); // track the lowest Es/N0 with >=80% success
+        if ok * 10 >= trials * 8 && threshold.is_none() {
+            // FIRST (= lowest, loop is ascending) Es/N0 with >=80% success.
+            // Must not overwrite on later points: with few trials the mid-SNR
+            // points can dip below 80% (statistical noise) and a later pass
+            // would otherwise latch the threshold onto the HIGHEST passing point.
+            threshold = Some(esn0_db);
         }
     }
     match threshold {
