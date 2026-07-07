@@ -252,6 +252,25 @@ pub struct PlutoSession {
 ///    rejects with `EINVAL`, retry at `2304000`.
 /// 9. Drop the connection — the chip retains its programmed state.
 pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
+    open_inner(config, true)
+}
+
+/// Same as [`open`] but **does not touch the RX LO** (`altvoltage0`).
+///
+/// A transmitter has no business reprogramming the receive LO: on a
+/// full-duplex QO-100 setup the RX session owns `altvoltage0` (tuned to
+/// the 10 GHz downlink IF via the Radio tab), and the persisted
+/// `config.rx_freq_hz` reaching a TX open is stale (last-saved / default,
+/// e.g. 145.5 MHz). Writing it here yanked the running RX off the
+/// downlink the instant TX started — TX radiated on the right uplink but
+/// the operator could no longer hear themselves. Everything else (TX_LO,
+/// TX atten, bandwidths, FIR, sample rate) is programmed exactly as in
+/// [`open`], so the bench-validated SSB TX sequence is unchanged.
+pub fn open_tx(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
+    open_inner(config, false)
+}
+
+fn open_inner(config: &PlutoConfig, write_rx_lo: bool) -> Result<PlutoSession, PlutoError> {
     let mut client = IiodClient::connect(&config.uri)?;
 
     // RX gain: program the chosen AGC mode, then in `manual` mode
@@ -336,19 +355,23 @@ pub fn open(config: &PlutoConfig) -> Result<PlutoSession, PlutoError> {
         })?;
 
     // LO frequencies. RX_LO = altvoltage0, TX_LO = altvoltage1.
-    client
-        .write_chn_attr(
-            iio_names::PHY,
-            ChanDir::Output,
-            "altvoltage0",
-            "frequency",
-            &config.rx_freq_hz.to_string(),
-        )
-        .map_err(|e| PlutoError::Attribute {
-            device: iio_names::PHY,
-            attr: "altvoltage0/frequency (RX_LO)",
-            detail: format!("{} Hz rejected: {e}", config.rx_freq_hz),
-        })?;
+    // The RX_LO is skipped on a TX open (`write_rx_lo == false`) so a
+    // concurrent full-duplex RX keeps its downlink tuning — see `open_tx`.
+    if write_rx_lo {
+        client
+            .write_chn_attr(
+                iio_names::PHY,
+                ChanDir::Output,
+                "altvoltage0",
+                "frequency",
+                &config.rx_freq_hz.to_string(),
+            )
+            .map_err(|e| PlutoError::Attribute {
+                device: iio_names::PHY,
+                attr: "altvoltage0/frequency (RX_LO)",
+                detail: format!("{} Hz rejected: {e}", config.rx_freq_hz),
+            })?;
+    }
     client
         .write_chn_attr(
             iio_names::PHY,

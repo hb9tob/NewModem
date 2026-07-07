@@ -337,7 +337,10 @@ fn run_tx(
     stop: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), PlutoError>>,
 ) -> Result<(), PlutoError> {
-    let session = match device::open(&config) {
+    // TX open must NOT reprogram the RX LO — a concurrent full-duplex RX
+    // (QO-100 downlink monitoring) owns `altvoltage0`. `open` would write
+    // the stale persisted `rx_freq_hz` and knock the RX off frequency.
+    let session = match device::open_tx(&config) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
