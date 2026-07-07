@@ -265,8 +265,9 @@ pub fn run_tune_carrier(
     client
         .write_chn_attr(phy, ChanDir::Output, "altvoltage1", "frequency", &tx_lo_hz.to_string())
         .map_err(|e| PlutoError::Stream(format!("tune TX_LO: {e}")))?;
-    // Key the PA (TX LO up → firmware pulls the relays). Full-duplex safe.
-    tx_lo_power_up(&mut client);
+    // From here on, ANY exit must free the buffer and un-key the PA. Hand the
+    // connection to the RAII guard and drive it through `tx.client()`.
+    let mut tx = PlutoTxGuard { client: Some(client), buffer_open: false, uri: uri.to_string() };
 
     // Pre-generate an integer number of 1200 Hz tone periods, so repeatedly
     // pushing the SAME buffer forms a phase-seamless continuous carrier. (The
@@ -284,11 +285,24 @@ pub fn run_tune_carrier(
         wire[off..off + 2].copy_from_slice(&i.to_le_bytes());
         wire[off + 2..off + 4].copy_from_slice(&q.to_le_bytes());
     }
-    client
+    // Open the carrier buffer BEFORE keying the PA. A failed OPEN → the guard's
+    // Drop runs with relays still OFF and no buffer to free — a clean, wedge-free exit.
+    tx.client()
         .open_buffer(device::iio_names::TX_BUFFER, n, TX_CHANNEL_MASK, false)
         .map_err(|e| PlutoError::Stream(format!("tune open TX buffer: {e}")))?;
+    tx.buffer_open = true;
+
+    // NOW key the PA (TX LO up → firmware pulls the relays). Full-duplex safe.
+    // Released by the guard's Drop on every exit path.
+    tx_lo_power_up(tx.client());
+    // Baseline: the Tune works, so this is what a HEALTHY ensm_mode looks like on
+    // this chip — compare against the SSB TX's ensm to spot where it wedges.
+    let ensm = tx
+        .client()
+        .read_dev_attr(phy, "ensm_mode")
+        .unwrap_or_else(|e| format!("<err {e}>"));
     eprintln!(
-        "[pluto-tune] carrier ON: TX_LO {} Hz (+{tone_hz} Hz), atten {:.2} dB, ≤{max_secs}s",
+        "[pluto-tune] carrier ON: TX_LO {} Hz (+{tone_hz} Hz), atten {:.2} dB, ensm_mode={ensm}, ≤{max_secs}s",
         tx_lo_hz,
         atten_centidb.load(Ordering::Relaxed) as f64 / 100.0
     );
@@ -301,20 +315,17 @@ pub fn run_tune_carrier(
         if cd != last_centidb {
             last_centidb = cd;
             let gain = -(cd as f64 / 100.0); // AD9361 wants negative dB
-            let _ =
-                client.write_chn_attr(phy, ChanDir::Output, "voltage0", "hardwaregain", &format!("{gain}"));
+            let _ = tx
+                .client()
+                .write_chn_attr(phy, ChanDir::Output, "voltage0", "hardwaregain", &format!("{gain}"));
         }
         // Repeat the same integer-period buffer; on backpressure write_buffer
         // returns 0 and we simply re-push next iteration (no phase drift).
-        let _ = client.write_buffer(device::iio_names::TX_BUFFER, &wire);
+        let _ = tx.client().write_buffer(device::iio_names::TX_BUFFER, &wire);
     }
-    // Stop the carrier stream and drop the streaming connection. A connection
-    // that has been pushing WRITEBUF (with backpressure short-writes) is left
-    // desynced, so attribute writes on it silently fail to reach the firmware.
-    let _ = client.close_buffer(device::iio_names::TX_BUFFER);
-    let _ = client.close();
-    // Relay-safe disengage on a fresh connection (the streaming one is desynced).
-    tx_lo_power_down(uri);
+    // The guard's Drop stops the carrier stream, drops the (WRITEBUF-desynced)
+    // connection, and powers down the TX LO on a fresh connection (relays
+    // release) — on EVERY exit path now, not just this one.
     eprintln!("[pluto-tune] carrier OFF (TX LO powered down → relays release)");
     Ok(())
 }
@@ -496,6 +507,49 @@ fn run_tx_loop(
 /// adjacent QO-100 channels). The RF attenuation sets the final power on top.
 const SSB_TX_PEAK_TARGET: f32 = 0.92;
 
+/// RAII teardown for a Pluto TX streaming session — shared by the modem SSB
+/// burst ([`run_tx_loop_ssb`]) and the CW tune ([`run_tune_carrier`]). On EVERY
+/// exit — the normal end, an early `?`-return (e.g. a failed OPEN), or a panic —
+/// it frees the kernel DMA buffer (dropping the streaming socket, which the
+/// firmware reaps on EOF), drops the connection, and un-keys the PA on a FRESH
+/// connection (max attenuation, then TX-LO powerdown → relays release).
+///
+/// This is what stops a mid-setup failure from stranding the amplifier relays ON
+/// and leaking the single `cf-ad9361-dds-core-lpc` buffer — the wedge that left
+/// the TX starting ~1-in-10 and killed the CW-tune path until a Pluto reboot.
+struct PlutoTxGuard {
+    /// Streaming connection; `Some` until Drop takes it to close it.
+    client: Option<IiodClient>,
+    /// Set once `open_buffer` succeeded, so Drop issues a matching CLOSE.
+    buffer_open: bool,
+    /// Fresh-connection URI for the relay-safe power-down.
+    uri: String,
+}
+
+impl PlutoTxGuard {
+    fn client(&mut self) -> &mut IiodClient {
+        self.client.as_mut().expect("PlutoTxGuard client present until Drop")
+    }
+}
+
+impl Drop for PlutoTxGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.client.take() {
+            // Best-effort CLOSE, then drop the socket. Even if the CLOSE reply is
+            // lost on a WRITEBUF-desynced streaming connection, dropping the
+            // socket EOFs the firmware, which frees the buffer — so the device
+            // never wedges the next OPEN (TX or Tune).
+            if self.buffer_open {
+                let _ = c.close_buffer(device::iio_names::TX_BUFFER);
+            }
+            let _ = c.close();
+        }
+        // Always leave the PA relay-safe on a fresh connection (the streaming one
+        // is WRITEBUF-desynced): max attenuation, then TX-LO powerdown → relays off.
+        tx_lo_power_down(&self.uri);
+    }
+}
+
 /// SSB-USB transmit loop — the QO-100 linear uplink. The modem audio is
 /// modulated to a single sideband with a suppressed carrier (no FM) and
 /// streamed to the AD9361. Mirrors the FM [`run_tx_loop`] lifecycle (dedicated
@@ -510,42 +564,69 @@ fn run_tx_loop_ssb(
     let mut client = IiodClient::connect(&session.config.uri)?;
     let _ = client.set_iiod_timeout(5000); // a TX-quad cal can take ~1 s
 
-    // AD9361 TX quadrature calibration, with the PA relays OFF. We have NOT
-    // written `altvoltage1 powerdown = 0` yet, so the F5OEO firmware keeps the
-    // relay chain RELEASED — the cal's out-of-band sweep never reaches the PA
-    // (validated on the bench: no relay voltage during the cal). This suppresses
-    // the unwanted lower-sideband image that TX I/Q imbalance otherwise leaks
-    // (harmless for FM, but a linear SSB uplink must be clean).
-    let _ = client.write_chn_attr(
-        device::iio_names::PHY,
-        crate::iiod::ChanDir::Output,
-        "altvoltage1",
-        "powerdown",
-        "1",
-    );
-    let _ = client.write_dev_attr(device::iio_names::PHY, "calib_mode", "tx_quad");
-    eprintln!("[pluto-tx ssb] TX quadrature cal done (relays OFF), keying PA");
+    // Chip state as the SSB TX begins — this is AFTER run_tx's device::open
+    // reprogrammed the AD9361 (sample rate, 4× FIR, LO, bandwidth) while the RX
+    // was live. 'alert' HERE = device::open itself wedged the chip before any
+    // cal/stream; 'fdd'/'tx' = healthy start (so the wedge is later).
+    let ensm0 = client
+        .read_dev_attr(device::iio_names::PHY, "ensm_mode")
+        .unwrap_or_else(|e| format!("<err {e}>"));
+    eprintln!("[pluto-tx ssb] START (post device::open): ensm_mode={ensm0}");
 
-    // NOW key the PA before any RF (relays engage on this powerdown=0 write).
-    tx_lo_power_up(&mut client);
+    // Per-burst AD9361 TX quadrature calibration — SKIPPED by default. It used to
+    // be issued here with `altvoltage1 powerdown = 1` (TX LO commanded OFF): on
+    // stock AD9361 semantics (which F5OEO keeps) that powers down the TX RFPLL
+    // synth, so `calib_mode = tx_quad` ran against a DEAD LO. tx_quad injects a
+    // test tone and measures it through an internal TX→RX loopback; with no LO to
+    // upconvert it cannot converge, its error was swallowed, and the AD9361 ENSM
+    // was left stuck in ALERT — which radiated NOTHING for the burst AND killed
+    // the next CW Tune until a Pluto reboot. It was the ONE chip-state op unique
+    // to the SSB path (FM and Tune run no cal and never wedge). Skipping it makes
+    // SSB drive the AD9361 exactly like the OTA-proven FM/Tune paths. Cost: no
+    // per-burst I/Q image rejection (a faint lower-sideband image remains); a
+    // proper ONE-TIME cal with the LO UP belongs in device::open and is bench-
+    // gated (LO-up engages the F5OEO PA relays during the ~1 s cal).
+    //
+    // `PLUTO_SSB_TXQUAD=legacy` restores the exact old (wedging) sequence for a
+    // bench A/B — with the cal result and ENSM state now LOGGED, not swallowed.
+    let txquad_legacy = std::env::var("PLUTO_SSB_TXQUAD").as_deref() == Ok("legacy");
+    if txquad_legacy {
+        let _ = client.write_chn_attr(
+            device::iio_names::PHY,
+            crate::iiod::ChanDir::Output,
+            "altvoltage1",
+            "powerdown",
+            "1",
+        );
+        let cal = client.write_dev_attr(device::iio_names::PHY, "calib_mode", "tx_quad");
+        let ensm = client
+            .read_dev_attr(device::iio_names::PHY, "ensm_mode")
+            .unwrap_or_else(|e| format!("<err {e}>"));
+        eprintln!("[pluto-tx ssb] LEGACY tx_quad (LO down): cal={cal:?} ensm_mode={ensm}");
+    } else {
+        eprintln!(
+            "[pluto-tx ssb] per-burst tx_quad SKIPPED (default; set PLUTO_SSB_TXQUAD=legacy to restore old behaviour)"
+        );
+    }
+
+    // From here on, ANY exit path must free the buffer and un-key the PA. Hand the
+    // connection to the RAII guard and drive it through `tx.client()`.
+    let mut tx = PlutoTxGuard {
+        client: Some(client),
+        buffer_open: false,
+        uri: session.config.uri.clone(),
+    };
 
     let ratio = session.negotiated_rate.ratio;
     let if_rate = session.negotiated_rate.sample_rate_hz as u32;
     let ssb_bw = session.config.rx_ssb_bandwidth_hz;
     let chunk_iq_samples = TX_CHUNK_AUDIO_SAMPLES * ratio;
-    // Quad-buffer the kernel TX so the DAC DMA stays fed across a high-latency
-    // transport (ethernet) — the single-buffer default underruns between
-    // WRITEBUF round-trips and silently drops/repeats data (corrupt symbols, no
-    // audible gap). Mirrors libiio. Must precede OPEN.
-    let _ = client.set_buffers_count(crate::device::iio_names::TX_BUFFER, TX_KERNEL_BUFFERS);
-    client
-        .open_buffer(crate::device::iio_names::TX_BUFFER, chunk_iq_samples, TX_CHANNEL_MASK, false)
-        .map_err(|e| PlutoError::Stream(format!("OPEN cf-ad9361-dds-core-lpc (ssb): {e}")))?;
 
     // Analytic USB at audio rate over the whole burst — the SAME analytic
     // band-pass the SsbRxChain selects with, so TX/RX are exactly symmetric.
-    // Computing it up front lets us peak-normalise the entire transmission to
-    // near full scale (linear mode → power follows the digital level).
+    // Computed up front (BEFORE opening the buffer / keying the PA) so a panic in
+    // this DSP can never strand an open, keyed buffer. Peak-normalise the whole
+    // transmission to near full scale (linear mode → power follows the level).
     let mut analytic = ComplexFir::new(ssb_tx_analytic_taps(ssb_bw, Sideband::Usb));
     let z48 = {
         let audio_c: Vec<Complex32> = audio.iter().map(|&a| Complex32::new(a, 0.0)).collect();
@@ -553,6 +634,30 @@ fn run_tx_loop_ssb(
     };
     let peak = z48.iter().fold(0.0f32, |m, c| m.max(c.re.hypot(c.im)));
     let scale = if peak > 1e-6 { SSB_TX_PEAK_TARGET * i16::MAX as f32 / peak } else { 0.0 };
+
+    // Quad-buffer the kernel TX so the DAC DMA stays fed across a high-latency
+    // transport (ethernet) — the single-buffer default underruns between
+    // WRITEBUF round-trips and silently drops/repeats data (corrupt symbols, no
+    // audible gap). Mirrors libiio. Must precede OPEN.
+    let _ = tx.client().set_buffers_count(crate::device::iio_names::TX_BUFFER, TX_KERNEL_BUFFERS);
+    // Open the streaming buffer. If this fails, the guard's Drop runs with the PA
+    // still un-keyed (relays OFF) and no buffer to free — a clean, wedge-free exit.
+    tx.client()
+        .open_buffer(crate::device::iio_names::TX_BUFFER, chunk_iq_samples, TX_CHANNEL_MASK, false)
+        .map_err(|e| PlutoError::Stream(format!("OPEN cf-ad9361-dds-core-lpc (ssb): {e}")))?;
+    tx.buffer_open = true;
+
+    // ONLY NOW key the PA — after a healthy OPEN — so a failed OPEN can never
+    // strand the relays ON. Released by the guard's Drop on every exit path.
+    tx_lo_power_up(tx.client());
+    // Read back the ENSM state at stream time: 'fdd'/'tx' = healthy; 'alert' means
+    // the chip is wedged (e.g. by a legacy tx_quad against a dead LO) and no RF
+    // will leave the DAC — pinpoints a wedge without a Pluto in hand.
+    let ensm = tx
+        .client()
+        .read_dev_attr(device::iio_names::PHY, "ensm_mode")
+        .unwrap_or_else(|e| format!("<err {e}>"));
+    eprintln!("[pluto-tx ssb] PA keyed, ensm_mode={ensm} (expect fdd/tx; 'alert' = wedged), streaming");
 
     // Anti-imaging interpolation, Re & Im branches (real taps preserve the
     // analytic/USB property and reject the interpolation images).
@@ -587,7 +692,7 @@ fn run_tx_loop_ssb(
             wire_buf[off..off + 2].copy_from_slice(&i.to_le_bytes());
             wire_buf[off + 2..off + 4].copy_from_slice(&q.to_le_bytes());
         }
-        match client.write_buffer(crate::device::iio_names::TX_BUFFER, &wire_buf) {
+        match tx.client().write_buffer(crate::device::iio_names::TX_BUFFER, &wire_buf) {
             Ok(_n) => total_iq_pushed += re_if.len() as u64,
             Err(e) => {
                 push_errors += 1;
@@ -609,8 +714,15 @@ fn run_tx_loop_ssb(
         }
     }
 
-    let _ = client.close_buffer(crate::device::iio_names::TX_BUFFER);
-    let _ = client.close();
-    tx_lo_power_down(&session.config.uri);
+    if total_iq_pushed == 0 {
+        eprintln!(
+            "[pluto-tx ssb] WARNING: 0 I/Q samples reached the DAC ({push_errors} push errors) \
+             — nothing was transmitted (check ensm_mode above)"
+        );
+    }
+
+    // Normal end: the guard's Drop frees the buffer, drops the connection, and
+    // un-keys the PA (relay-safe). The same teardown now runs on EVERY exit path
+    // (early `?`-return, panic), not just this happy one.
     Ok(())
 }
