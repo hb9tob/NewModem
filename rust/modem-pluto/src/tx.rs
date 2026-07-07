@@ -633,7 +633,23 @@ fn run_tx_loop_ssb(
         analytic.process(&audio_c) // audio_c freed here, only z48 persists
     };
     let peak = z48.iter().fold(0.0f32, |m, c| m.max(c.re.hypot(c.im)));
-    let scale = if peak > 1e-6 { SSB_TX_PEAK_TARGET * i16::MAX as f32 / peak } else { 0.0 };
+    // Optional digital drive back-off (dB) below the SSB_TX_PEAK_TARGET peak. SSB
+    // is linear, so a two-tone (or real modem) signal driven at ~0.92 full scale
+    // sits right at the AD9361 TX compression knee → strong in-Pluto IMD3 that RF
+    // attenuation (applied AFTER the mixer) cannot remove. Backing the *digital*
+    // level down trades output power for linearity. Default 0 dB = byte-identical
+    // to the previous behaviour (OTA-preserving); a bench sweep of this vs. the RF
+    // attenuation separates Pluto-generated IMD3 from external-amp IMD3.
+    let backoff_db: f32 = std::env::var("PLUTO_SSB_DIGITAL_BACKOFF_DB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let backoff_lin = 10f32.powf(-backoff_db.abs() / 20.0);
+    if backoff_db.abs() > 1e-3 {
+        eprintln!("[pluto-tx ssb] digital drive back-off {backoff_db:.1} dB (×{backoff_lin:.3} below peak target)");
+    }
+    let scale =
+        if peak > 1e-6 { backoff_lin * SSB_TX_PEAK_TARGET * i16::MAX as f32 / peak } else { 0.0 };
 
     // Quad-buffer the kernel TX so the DAC DMA stays fed across a high-latency
     // transport (ethernet) — the single-buffer default underruns between
