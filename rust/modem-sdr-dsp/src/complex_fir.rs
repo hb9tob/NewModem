@@ -52,7 +52,7 @@ pub enum Sideband {
 /// Transition-band width of the analytic band-pass, as a fraction of the
 /// passband half-width. 0.5 leaves half the half-band as transition —
 /// the same comfortable Kaiser trade-off the channel filter uses.
-pub const SSB_TRANSITION_RATIO: f32 = 0.5;
+pub const SSB_TRANSITION_RATIO: f32 = 0.2;
 
 /// Floor on the analytic band-pass transition width, in Hz. Keeps the
 /// tap count bounded for narrow bandwidths (a 2.2 kHz channel would
@@ -201,6 +201,24 @@ mod tests {
         let rej_db = 20.0 * (image / pass).log10();
         assert!(pass_db.abs() < 1.0, "USB passband gain = {pass_db:.2} dB (want ~0)");
         assert!(rej_db <= -70.0, "image rejection = {rej_db:.1} dB (want <= -70)");
+    }
+
+    /// The LOW audio edge (300–500 Hz) must also get full image rejection,
+    /// not just mid-band. Regression guard for the analytic filter's low-edge
+    /// transition (`SSB_TRANSITION_RATIO`): the shipped 1500-Bd modem modes
+    /// carry real energy down to ~200 Hz, whose opposite-sideband image would
+    /// otherwise splatter into the LSB (bench-measured −24 dBc @400 Hz with the
+    /// old 0.5 ratio — this test fails there and passes with the 0.2 fix).
+    #[test]
+    fn low_edge_image_rejection() {
+        let fs = 48_000.0_f32;
+        let taps = analytic_bandpass_taps(fs, 100.0, 2700.0, Sideband::Usb, 80.0);
+        for f in [300.0_f32, 400.0, 500.0] {
+            let pass_db = 20.0 * tone_gain(&taps, fs, f).log10();
+            let rej_db = 20.0 * (tone_gain(&taps, fs, -f) / tone_gain(&taps, fs, f)).log10();
+            assert!(pass_db.abs() < 1.0, "passband gain at {f} Hz = {pass_db:.2} dB (want ~0)");
+            assert!(rej_db <= -70.0, "low-edge image rejection at {f} Hz = {rej_db:.1} dB (want <= -70)");
+        }
     }
 
     /// Flat across the wanted voice band.
