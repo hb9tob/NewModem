@@ -24,7 +24,14 @@ use rustfft::FftPlanner;
 use modem_core::frame::effective_packet_count;
 use modem_core::ldpc::encoder::LdpcEncoder;
 use modem_core::profile::ProfileIndex;
-use modem_core::rx_v2::rx_v2;
+// rx_v3 = the robust multi-pass production decoder (what the CLI/worker use).
+// The single-pass rx_v2 is symbol-sequence-marginal on very short 0-margin
+// bursts (proven: it drops CWs for some payload/repair combos even with
+// V3_NO_SCRAMBLER); energy dispersal (crate::scrambler) re-rolls those symbols
+// and exposes the flakiness. Using rx_v3 both sides keeps the SSB-transparency
+// assertion (got.data == reference.data) on a decoder that doesn't randomly
+// drop the reference.
+use modem_core::rx_v2::rx_v3;
 use modem_core::traits::{EncodeRequest, Modem};
 use modem_core::v3_modem::V3Modem;
 use modem_framing::payload_envelope::PayloadEnvelope;
@@ -134,7 +141,7 @@ fn ssb_tx_modulator_roundtrip_decodes_byte_exact() {
     let audio = encode_modem_audio();
     let cfg = ProfileIndex::Normal.to_config();
 
-    let reference = rx_v2(&audio, &cfg).expect("reference decode failed on clean modem audio");
+    let reference = rx_v3(&audio, &cfg).expect("reference decode failed on clean modem audio");
     assert!(!reference.data.is_empty(), "reference decode recovered no data");
 
     // Pluto path: suppressed carrier at DC (lo_offset 0).
@@ -142,7 +149,7 @@ fn ssb_tx_modulator_roundtrip_decodes_byte_exact() {
     let mut chain = SsbRxChain::new(SsbRxChainConfig::new(INPUT_RATE, 2700.0, 0.0));
     let ssb_audio = chain.process(&iq);
 
-    let got = rx_v2(&ssb_audio, &cfg).expect("TX-modulator SSB audio failed to decode");
+    let got = rx_v3(&ssb_audio, &cfg).expect("TX-modulator SSB audio failed to decode");
     assert_eq!(
         got.data, reference.data,
         "the streaming SSB TX modulator corrupted the waveform (TX/RX not symmetric)",
@@ -155,7 +162,7 @@ fn ssb_usb_roundtrip_decodes_byte_exact() {
     let cfg = ProfileIndex::Normal.to_config();
 
     // Reference: the modem RX decoding its own clean audio.
-    let reference = rx_v2(&audio, &cfg).expect("reference decode failed on clean modem audio");
+    let reference = rx_v3(&audio, &cfg).expect("reference decode failed on clean modem audio");
     assert!(
         !reference.data.is_empty(),
         "reference decode recovered no data — test setup is wrong, not the SSB chain",
@@ -168,7 +175,7 @@ fn ssb_usb_roundtrip_decodes_byte_exact() {
         let mut chain = SsbRxChain::new(SsbRxChainConfig::new(INPUT_RATE, 2700.0, lo_offset));
         let ssb_audio = chain.process(&iq);
 
-        let got = rx_v2(&ssb_audio, &cfg)
+        let got = rx_v3(&ssb_audio, &cfg)
             .unwrap_or_else(|| panic!("[{label}] SSB-demodulated audio failed to decode"));
         assert_eq!(
             got.data, reference.data,

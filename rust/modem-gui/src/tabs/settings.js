@@ -359,6 +359,8 @@ export async function persistSettings() {
     currentSettings.rx_turbo = !!turbo.checked;
     applyTurboModeStyling();
   }
+  const scrambler = document.getElementById("scrambler-enabled");
+  if (scrambler) currentSettings.scrambler_enabled = !!scrambler.checked;
   const alsaBackend = document.getElementById("audio-backend-alsa");
   if (alsaBackend) currentSettings.audio_backend = alsaBackend.checked ? "alsa" : "cpal";
 
@@ -481,6 +483,13 @@ export function setupSettingsTab() {
     turboCb.addEventListener("change", () => {
       currentSettings.rx_turbo = turboCb.checked;
       applyTurboModeStyling();
+      persistSettings();
+    });
+  }
+  const scramblerCb = document.getElementById("scrambler-enabled");
+  if (scramblerCb) {
+    scramblerCb.addEventListener("change", () => {
+      currentSettings.scrambler_enabled = scramblerCb.checked;
       persistSettings();
     });
   }

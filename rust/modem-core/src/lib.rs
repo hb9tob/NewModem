@@ -14,6 +14,7 @@ pub mod header;
 pub mod marker;
 pub mod profile;
 pub mod interleaver;
+pub mod scrambler;
 
 pub mod ldpc;
 

@@ -149,8 +149,18 @@ fn encode_one_codeword(
     interleave_perm: &[usize],
     constellation: &Constellation,
 ) -> Vec<Complex64> {
+    // Energy dispersal: whiten the k-byte info block (incl. zero padding)
+    // BEFORE LDPC encode so the transmitted symbols carry no residual carrier
+    // from low-entropy control/payload content. Descrambled on the RX decode
+    // path (rx_v2 / v3_session). Gated by V3_NO_SCRAMBLER. See crate::scrambler.
+    let k_bytes = encoder.k() / 8;
+    let mut info_buf = vec![0u8; k_bytes];
+    let m = info_bytes.len().min(k_bytes);
+    info_buf[..m].copy_from_slice(&info_bytes[..m]);
+    let info_buf = crate::scrambler::scramble(&info_buf);
+
     let mut info_bits = vec![0u8; encoder.k()];
-    for (byte_idx, &byte) in info_bytes.iter().enumerate() {
+    for (byte_idx, &byte) in info_buf.iter().enumerate() {
         for bit in 0..8 {
             info_bits[byte_idx * 8 + bit] = (byte >> (7 - bit)) & 1;
         }

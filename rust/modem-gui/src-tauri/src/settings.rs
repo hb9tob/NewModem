@@ -100,6 +100,13 @@ pub struct Settings {
     #[serde(default)]
     pub rx_turbo: bool,
 
+    /// Energy-dispersal scrambler (whitening) on the TX/RX wire, ON by default.
+    /// Turn OFF only to interoperate with an un-scrambled (legacy/other) peer —
+    /// this is a wire-format change, both ends must match. Applied to the
+    /// `modem_core::scrambler` global at startup and on every save.
+    #[serde(default = "default_true")]
+    pub scrambler_enabled: bool,
+
     /// Audio backend for TX playback + RX capture: `"alsa"` (direct
     /// `hw:` PCM — the Linux/Pi default, bypasses cpal's resampling
     /// `plug` layer) or `"cpal"` (the cross-platform fallback, kept
@@ -428,6 +435,7 @@ impl Default for Settings {
             rx_deemphasis_enabled: false,
             rx_allow_legacy_grid: default_rx_allow_legacy_grid(),
             rx_turbo: false,
+            scrambler_enabled: true,
             audio_backend: default_audio_backend(),
             collector_url: default_collector_url(),
             tx_quality: default_tx_quality(),

@@ -188,6 +188,12 @@ fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 /// 192 coded bits → 96 QPSK symbols (2 bits/symbol).
 pub fn encode_control_symbols(payload: &MarkerPayload) -> Vec<Complex64> {
     let bytes = payload.to_bytes();
+    // Energy dispersal: whiten the 12 ctrl bytes before Golay so the marker
+    // symbols carry no residual carrier (the low-entropy ctrl payload was the
+    // dominant DC source). Descrambled after Golay in decode_control_symbols.
+    // Gated by V3_NO_SCRAMBLER. The 32-symbol sync pattern is NOT scrambled
+    // (correlation reference, already zero-mean). See crate::scrambler.
+    let bytes = crate::scrambler::scramble(&bytes);
     let bits = bytes_to_bits(&bytes);
     assert_eq!(bits.len(), 96);
 
@@ -232,6 +238,8 @@ pub fn decode_control_symbols(symbols: &[Complex64]) -> Option<MarkerPayload> {
     assert_eq!(info_bits.len(), 96);
 
     let bytes = bits_to_bytes(&info_bits);
+    // Undo the TX energy dispersal (crate::scrambler) before CRC/field parse.
+    let bytes = crate::scrambler::descramble(&bytes);
     let mut buf = [0u8; MARKER_CTRL_BYTES];
     buf.copy_from_slice(&bytes);
     MarkerPayload::from_bytes(&buf)

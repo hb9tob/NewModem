@@ -24,6 +24,7 @@ export let currentSettings = {
   /// legacy sliding-window `rx_v2`. Independent of `rx_allow_legacy_grid`
   /// (Power Mode) and of `rx_force_mode`. Drives the dark-red background.
   rx_turbo: false,
+  scrambler_enabled: true,
   audio_backend: "alsa",
   collector_url: "",
   tx_quality: 10,

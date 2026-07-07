@@ -399,6 +399,9 @@ fn save_settings(
     // skip the refresh, the disk file must be up to date.
     let previous = settings::load();
     settings::save(&settings)?;
+    // Push the scrambler toggle to the modem-core global so it takes effect
+    // immediately for both TX (scramble) and RX (descramble).
+    modem_core::scrambler::set_enabled(settings.scrambler_enabled);
     // Re-opening the serial port toggles DTR/RTS for a few ms (OS-level
     // behavior of `serialport-rs`), which keys the radio for a short
     // burst. The frontend calls `save_settings` on every settings change
@@ -2549,6 +2552,9 @@ fn main() {
             // event and leave `ptt` at None for the session - the UI can
             // still re-open it later via Settings -> save_settings.
             let startup_settings = settings::load();
+            // Apply the persisted scrambler (energy-dispersal) toggle to the
+            // modem-core global before any TX/RX runs.
+            modem_core::scrambler::set_enabled(startup_settings.scrambler_enabled);
             let status = compute_ptt_status(&ptt, &startup_settings);
             if status.state == "error" {
                 eprintln!("[ptt] {}", status.message);

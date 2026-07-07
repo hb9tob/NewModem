@@ -391,6 +391,17 @@
             foncé quand la réception turbo est active.
           </p>
           <label class="ptt-row" style="margin-top: 0.7rem;">
+            <input type="checkbox" id="scrambler-enabled">
+            <span>Scrambler (dispersion d'énergie)</span>
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;">
+            Blanchit les bits avant le codage pour supprimer la porteuse
+            résiduelle qui plafonne la puissance. Activé par défaut. Décochez
+            uniquement pour communiquer avec une station <strong>non
+            scramblée</strong> : c'est un changement de format on-air, les deux
+            extrémités doivent être réglées pareil.
+          </p>
+          <label class="ptt-row" style="margin-top: 0.7rem;">
             <input type="checkbox" id="audio-backend-alsa">
             <span data-i18n="settings.audio_backend_alsa">ALSA direct (hw:)</span>
           </label>

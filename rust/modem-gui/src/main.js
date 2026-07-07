@@ -150,6 +150,8 @@ async function loadSettings() {
   const turbo = document.getElementById("rx-turbo-enabled");
   if (turbo) turbo.checked = !!currentSettings.rx_turbo;
   applyTurboModeStyling();
+  const scrambler = document.getElementById("scrambler-enabled");
+  if (scrambler) scrambler.checked = currentSettings.scrambler_enabled !== false;
   const alsaBackend = document.getElementById("audio-backend-alsa");
   if (alsaBackend) alsaBackend.checked = (currentSettings.audio_backend || "alsa") !== "cpal";
   const fdx = document.getElementById("full-duplex-enabled");
