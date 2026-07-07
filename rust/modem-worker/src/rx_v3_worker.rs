@@ -619,18 +619,19 @@ impl RxV3Worker {
                     self.active = true;
                     // One-shot exact-profile refinement (auto mode only). The
                     // bootstrap anchor pinned the geometry FAMILY; the marker
-                    // advertises the exact TX profile. If they differ and the
-                    // exact profile is non-experimental + geometry-compatible
-                    // (same preamble family, so the marker positions we just
-                    // locked stay valid after a rebuild), request the switch.
-                    // Experimental / family-incompatible advertisements are
-                    // ignored — auto-detect never silently switches into a
-                    // forced-only profile.
+                    // advertises the exact TX profile via its `profile_index`.
+                    // That field is the TX's AUTHORITATIVE declaration — not a
+                    // blind auto-detect guess — so we honour it even when it
+                    // names an EXPERIMENTAL profile (e.g. the shared 32-APSK
+                    // geometry is pinned as HIGH+, then a validated HIGH+56
+                    // marker upgrades the LDPC rate 3/4 → 5/6). We still gate on
+                    // geometry-compatibility (same preamble family) so the marker
+                    // positions we just locked stay valid across the rebuild; a
+                    // family-incompatible advertisement is ignored.
                     if !self.detected_locked {
                         self.detected_locked = true;
                         if let Some(p) = ProfileIndex::from_u8(profile_index) {
                             if p != self.profile
-                                && !p.is_experimental()
                                 && p.preamble_family() == self.profile.preamble_family()
                             {
                                 self.pending_rebuild = Some(p);
@@ -1248,6 +1249,56 @@ mod tests {
             decoded_sids.contains(&sid_b),
             "HIGH+ burst B ({sid_b:#010x}) not assembled — profile refinement not \
              re-armed at the burst boundary: {decoded_sids:#010x?}",
+        );
+    }
+
+    #[test]
+    fn auto_worker_honours_experimental_profile_advertised_by_marker() {
+        // Auto mode. HIGH+56 (32-APSK, LDPC 5/6) is an EXPERIMENTAL profile,
+        // absent from the auto-detect templates — but it shares the family-A
+        // geometry of the non-experimental HIGH+ (32-APSK, LDPC 3/4). The gate
+        // therefore pins the geometry as HIGH+, then the burst's marker
+        // advertises the exact TX profile via `profile_index`. That declaration
+        // is the TX's AUTHORITATIVE ground truth, so the driver must UPGRADE
+        // HIGH+ -> HIGH+56 (rebuilding at rate 5/6) even though the target is
+        // experimental. Before the fix, the refinement filtered out experimental
+        // advertisements and stayed on HIGH+ (3/4), decoding the 5/6 data with
+        // the wrong LDPC rate -> the burst silently failed (the "HIGH+56 not
+        // decoded by the turbo modem" bug). We assert on the profile-upgrade
+        // event rather than a full decode: the whitened 0xAA payload exercises
+        // the dense 32-APSK outer rings where rate 5/6 is decode-margin-marginal
+        // (see the ignored `loopback_v3_high_plus_5_6` demod case), so the
+        // *upgrade* is the invariant this fix owns.
+        let cfg = ProfileIndex::HighPlusFiveSix.to_config();
+        let sid = 0x56FE_56FEu32;
+        let audio = build_v3_burst_audio(&cfg, 800, sid);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let save_dir = Arc::new(Mutex::new(tmp.path().to_path_buf()));
+        let sink = Arc::new(crate::event_sink::RecordingSink::new());
+        // Auto mode, anchored on the shared-geometry HIGH+ (non-experimental) —
+        // exactly what `TurboGate::auto` pins for this 32-APSK family.
+        let mut worker = RxV3Worker::new(
+            ProfileIndex::HighPlus,
+            /*forced=*/ false,
+            save_dir,
+            sink.clone() as Arc<dyn EventSink>,
+        )
+        .unwrap();
+
+        push_stream(&mut worker, &audio);
+        let _ = worker.finalize();
+
+        let upgraded = sink
+            .events()
+            .into_iter()
+            .any(|(name, payload)| name == "v3_profile_detected" && payload["to"] == "HIGH+56");
+        assert!(
+            upgraded,
+            "auto driver did not upgrade to the experimental HIGH+56 profile \
+             advertised by the marker — the refinement wrongly filtered it out; \
+             events: {:?}",
+            sink.events()
         );
     }
 
