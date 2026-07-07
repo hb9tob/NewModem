@@ -29,8 +29,8 @@ to the right per-device sub-struct in the API.
 | RSP1B | 6 | ✅ wired | RSP1A's API contract verbatim (electrical refresh) |
 | RSP1 | 1 | ✅ wired | Single SMA, **no** bias-T / notches, 4-state VHF LNA |
 | RSP2 | 2 | ❌ scaffold only | Rejected with a clear error at `open()` |
-| RSPdx | 4 | ❌ scaffold only | " |
-| RSPdx-R2 | 7 | ❌ scaffold only | " |
+| RSPdx | 4 | ✅ wired | Antenna A/B/C, bias-T, FM/DAB notch, HDR (≤ 2 MHz), band-aware LNA (19–28 states) |
+| RSPdx-R2 | 7 | ✅ wired | Shares the RSPdx branch (inherits its gain tables); the bench-tested part |
 
 `SdrBackend::capabilities_for(&descriptor)` returns the per-device
 capability surface (different antenna list, gain table, feature set)
@@ -112,12 +112,13 @@ sees it).
 | Field | Maps to | Honoured on |
 |---|---|---|
 | `tuner: Tuner::{A, B}` | `sdrplay_api_DeviceT.tuner` | RSPduo only — single-tuner parts force `Tuner::A` |
-| `antenna: AntennaPort::{Hiz, Fifty}` | `RspDuoTunerParams.tuner1AmPortSel` | RSPduo Tuner-A only; ignored elsewhere (single SMA) |
-| `bias_t: bool` | RSPduo: `RspDuoTunerParams.biasTEnable`<br>RSP1A/B: `Rsp1aTunerParams.biasTEnable` | RSPduo (tuner B) and RSP1A/B; **no-op on RSP1** |
-| `fm_notch: bool` | RSPduo: `RspDuoTunerParams.rfNotchEnable`<br>RSP1A/B: `devParams.rsp1aParams.rfNotchEnable` | RSPduo + RSP1A/B; no-op on RSP1 |
-| `dab_notch: bool` | RSPduo: `RspDuoTunerParams.rfDabNotchEnable`<br>RSP1A/B: `devParams.rsp1aParams.rfDabNotchEnable` | RSPduo + RSP1A/B; no-op on RSP1 |
+| `antenna: AntennaPort::{Hiz, Fifty, AntA, AntB, AntC}` | RSPduo: `RspDuoTunerParams.tuner1AmPortSel`<br>RSPdx/-R2: `devParams.rspDxParams.antennaSel` | RSPduo Tuner-A (Hi-Z/50 Ω) and RSPdx/-R2 ports A/B/C; ignored on single-SMA parts |
+| `bias_t: bool` | RSPduo: `RspDuoTunerParams.biasTEnable`<br>RSP1A/B: `Rsp1aTunerParams.biasTEnable`<br>RSPdx/-R2: `devParams.rspDxParams.biasTEnable` | RSPduo (tuner B), RSP1A/B and RSPdx/-R2; **no-op on RSP1** |
+| `fm_notch: bool` | RSPduo: `RspDuoTunerParams.rfNotchEnable`<br>RSP1A/B: `devParams.rsp1aParams.rfNotchEnable`<br>RSPdx/-R2: `devParams.rspDxParams.rfNotchEnable` | RSPduo + RSP1A/B + RSPdx/-R2; no-op on RSP1 |
+| `dab_notch: bool` | RSPduo: `RspDuoTunerParams.rfDabNotchEnable`<br>RSP1A/B: `devParams.rsp1aParams.rfDabNotchEnable`<br>RSPdx/-R2: `devParams.rspDxParams.rfDabNotchEnable` | RSPduo + RSP1A/B + RSPdx/-R2; no-op on RSP1 |
+| `hdr: bool` | RSPdx/-R2: `devParams.rspDxParams.hdrEnable` + `rspDxTunerParams.hdrBw` | RSPdx / RSPdx-R2 only; gated to `rf_freq_hz ≤ 2 MHz` |
 | `rf_freq_hz: u64` | `tunerParams.rfFreq.rfHz` | All — LO frequency, default 145.5 MHz |
-| `lna_state: u8` | `tunerParams.gain.LNAstate` | All — VHF table is 10 states on RSPduo/1A/1B (0–9), 4 states on RSP1 (0–3) |
+| `lna_state: u8` | `tunerParams.gain.LNAstate` | All — clamped per model: RSPduo/1A/1B 10 states (0–9), RSP1 4 (0–3), RSPdx/-R2 **frequency-dependent 19–28** (band-aware, ported from gr-sdrplay3) |
 | `if_gain_reduction_db: i32` | `tunerParams.gain.gRdB` | All — IF reduction 20–59 dB. Default 40. Daemon-managed when `agc_mode != Disable` |
 | `agc_mode: AgcMode` | `ctrlParams.agc.enable` | All — `Disable` (manual), `Slow` (5 Hz), `Mid` (50 Hz, SDRplay default), `Fast` (100 Hz). LNA stays manual whatever the AGC mode |
 
@@ -137,13 +138,19 @@ sees it).
 - Phase 3 — multi-device support: **done** for RSP1 / RSP1A / RSP1B /
   RSPduo. `SdrBackend::capabilities_for(&descriptor)` returns
   per-device caps so the panel hides knobs the part doesn't have.
-- Phase 4 — RSP2 / RSPdx / RSPdxR2 wiring: pending. Each needs its
-  own `program_params` branch (different antenna structs, HDR mode
-  for the dx parts).
-- Phase 5 — live retune via `sdrplay_api_Update`: pending. Borrowing
-  the band-aware LNA-state → dB table from
-  [gr-sdrplay3](https://github.com/fventuri/gr-sdrplay3) for the
-  GUI gain slider.
+- Phase 4 — RSPdx / RSPdx-R2 wiring: **done**. One shared
+  `program_params` branch programs the device-level `rspDxParams`
+  (antenna A/B/C, bias-T, FM/DAB notch, HDR mode gated to ≤ 2 MHz)
+  and `rspDxTunerParams.hdrBw`. The frequency-dependent LNA-state
+  clamp (19–28 states) is ported verbatim from
+  [gr-sdrplay3](https://github.com/fventuri/gr-sdrplay3)
+  `rspdx_impl::rf_gr_values()`. RSP2 still pending (separate
+  `rsp2Params` struct).
+- Phase 5 — live retune via `sdrplay_api_Update`: **done** for LO +
+  gain (`hardware.rs`), including the RSPdx band-aware LNA re-clamp
+  when a retune crosses a band boundary. Live antenna / HDR switching
+  (the `Update_RspDx_*` extension-1 reasons) stays deferred — antenna
+  and HDR are applied at `open()`, matching the RSPduo.
 
 ## Smoke test
 

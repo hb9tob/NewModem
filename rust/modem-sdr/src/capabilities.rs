@@ -171,6 +171,9 @@ pub struct BackendFeatures {
     pub bias_t: bool,
     pub fm_notch: bool,
     pub dab_notch: bool,
+    /// High-Dynamic-Range mode — RSPdx / RSPdx-R2 only, valid for
+    /// reception below 2 MHz. `false` on every other backend.
+    pub hdr: bool,
     pub ctcss_tx: bool,
     /// RF-bandwidth control range, when the backend exposes it
     /// (Pluto AD9361: 200 kHz – 56 MHz). `None` for SDRplay

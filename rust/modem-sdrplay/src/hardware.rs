@@ -17,7 +17,7 @@ use crate::api::{
     self, sdrplay_api_ReasonForUpdateExtension1T, sdrplay_api_ReasonForUpdateT,
     sdrplay_api_RxChannelParamsT, sdrplay_api_TunerSelectT, SdrplayApi, HANDLE,
 };
-use crate::device::{SdrplaySession, Tuner};
+use crate::device::{SdrplayHardware, SdrplaySession, Tuner};
 
 /// Live tuner control for the active SDRplay RX channel while streaming.
 pub(crate) struct SdrplayRadioHw {
@@ -25,10 +25,16 @@ pub(crate) struct SdrplayRadioHw {
     rx_chan: *mut sdrplay_api_RxChannelParamsT,
     tuner: sdrplay_api_TunerSelectT,
     lib: &'static SdrplayApi,
-    /// Highest valid `LNAstate` index for this device model. The live gain
-    /// setpoint is clamped to it before every `Update`, so a value past the
-    /// GUI input's `max` can never reach the daemon and crash the service.
-    max_lna_state: u8,
+    /// Device model — drives the frequency-aware LNA-state clamp. On the
+    /// RSPdx family the number of valid `LNAstate` indices shrinks in the
+    /// higher bands, so the max can't be cached as a single number the way
+    /// the flat-table parts allow; it's recomputed from the current LO on
+    /// every gain change / retune. An out-of-range `LNAstate` crashes the
+    /// SDR service, so this clamp is mandatory.
+    hardware: SdrplayHardware,
+    /// HDR mode from the open config — only shifts the LNA count below
+    /// 2 MHz, but carried so the clamp matches what `program_params` did.
+    hdr_mode: bool,
 }
 
 // SAFETY: same contract as `SdrplaySession` (device.rs) — the device
@@ -54,8 +60,22 @@ impl SdrplayRadioHw {
             rx_chan,
             tuner: session.device.tuner,
             lib,
-            max_lna_state: session.hardware.lna_state_count().saturating_sub(1),
+            hardware: session.hardware,
+            hdr_mode: session.config.hdr,
         }
+    }
+
+    /// Highest valid `LNAstate` index at the channel's current LO — the
+    /// per-band clamp ceiling. Reads `rfFreq.rfHz` off the daemon-owned
+    /// params tree (already carries the +LO offset; the sub-MHz offset is
+    /// immaterial to the band boundaries).
+    ///
+    /// SAFETY: caller must ensure `rx_chan` is non-null.
+    unsafe fn max_lna_state(&self) -> u8 {
+        let rf_hz = (*self.rx_chan).tunerParams.rfFreq.rfHz as u64;
+        self.hardware
+            .lna_state_count_at(rf_hz, self.hdr_mode)
+            .saturating_sub(1)
     }
 
     fn update(&self, reason: sdrplay_api_ReasonForUpdateT, what: &str) {
@@ -80,10 +100,31 @@ impl RadioHardware for SdrplayRadioHw {
         if self.rx_chan.is_null() {
             return;
         }
+        // On the RSPdx family the number of valid LNA states shrinks in the
+        // higher bands. Moving to a lower-state band while the current
+        // LNAstate exceeds the new maximum makes the daemon abort. Lower the
+        // gain FIRST (a reduction is valid in the old band too, since the new
+        // ceiling is ≤ the old one), issue the Gr update, THEN retune — so
+        // there is never an invalid intermediate state. On flat-table parts
+        // (RSPduo / RSP1x) the ceiling never shrinks, so this is a no-op.
+        // SAFETY: `rx_chan` is the daemon-owned active channel params.
+        let new_max = self
+            .hardware
+            .lna_state_count_at(lo_hz, self.hdr_mode)
+            .saturating_sub(1);
+        let cur_lna = unsafe { (*self.rx_chan).tunerParams.gain.LNAstate };
+        if cur_lna > new_max {
+            unsafe {
+                (*self.rx_chan).tunerParams.gain.LNAstate = new_max;
+            }
+            self.update(
+                sdrplay_api_ReasonForUpdateT::sdrplay_api_Update_Tuner_Gr,
+                "Gr(band-reclamp)",
+            );
+        }
         // `lo_hz` is already the programmed LO (the runtime carries the
         // +lo_offset), so write it straight to `rfHz` — mirrors the open
         // path (`device::program_params`) without adding the offset twice.
-        // SAFETY: `rx_chan` is the daemon-owned active channel params.
         unsafe {
             (*self.rx_chan).tunerParams.rfFreq.rfHz = lo_hz as f64;
         }
@@ -97,8 +138,10 @@ impl RadioHardware for SdrplayRadioHw {
         if self.rx_chan.is_null() {
             return;
         }
-        // SAFETY: `rx_chan` is the daemon-owned active channel params.
-        let max_lna = self.max_lna_state;
+        // SAFETY: `rx_chan` is the daemon-owned active channel params
+        // (non-null checked above); the LNA ceiling is band-aware for the
+        // RSPdx family.
+        let max_lna = unsafe { self.max_lna_state() };
         let g = unsafe { &mut (*self.rx_chan).tunerParams.gain };
         match gain {
             GainSetting::Manual(ManualGainValue::LnaPlusIf { lna_state, if_grdb }) => {

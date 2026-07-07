@@ -64,6 +64,10 @@ pub struct SdrConfig {
     pub bias_t: bool,
     pub fm_notch: bool,
     pub dab_notch: bool,
+    /// High-Dynamic-Range mode — only meaningful on backends with
+    /// `BackendFeatures::hdr = true` (SDRplay RSPdx / RSPdx-R2). The
+    /// backend gates it to reception below 2 MHz. Default false.
+    pub hdr: bool,
 
     /// CTCSS sub-audible tone for repeater squelch — TX-only.
     /// `0.0` = disabled. Only meaningful on backends with
@@ -111,6 +115,7 @@ impl Default for SdrConfig {
             bias_t: false,
             fm_notch: false,
             dab_notch: false,
+            hdr: false,
             ctcss_freq_hz: 0.0,
             ctcss_level: 0.1,
             rf_bandwidth_hz: None,

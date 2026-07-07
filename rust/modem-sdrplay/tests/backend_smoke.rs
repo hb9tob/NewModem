@@ -7,7 +7,7 @@ use modem_sdr::{
 };
 use modem_sdrplay::backend::{
     build_sdrplay_config, capabilities_for_hint, SdrplayBackend, BACKEND_ID, HINT_RSP1,
-    HINT_RSP1A, HINT_RSP1B, HINT_RSPDUO,
+    HINT_RSP1A, HINT_RSP1B, HINT_RSPDUO, HINT_RSPDX, HINT_RSPDXR2,
 };
 use modem_sdrplay::device::{AgcMode, AntennaPort, SdrplayHardware, Tuner};
 use serde_json::json;
@@ -222,14 +222,17 @@ const PROGRAMMABLE_HARDWARE: &[SdrplayHardware] = &[
     SdrplayHardware::Rsp1a,
     SdrplayHardware::Rsp1b,
     SdrplayHardware::Rsp1,
+    SdrplayHardware::RspDx,
+    SdrplayHardware::RspDxR2,
 ];
 
 #[test]
 fn programmable_hardware_count_matches_supported_branches() {
-    // 4 device branches today: RSPduo, RSP1A, RSP1B, RSP1. Bumping
-    // this number means you've added a new hardware branch and
-    // should also have wired its per-device programming.
-    assert_eq!(PROGRAMMABLE_HARDWARE.len(), 4);
+    // 6 device branches today: RSPduo, RSP1A, RSP1B, RSP1, RSPdx, RSPdx-R2
+    // (the last two share one `program_params` arm). Bumping this number
+    // means you've added a new hardware branch and should also have wired
+    // its per-device programming.
+    assert_eq!(PROGRAMMABLE_HARDWARE.len(), 6);
 }
 
 #[test]
@@ -274,6 +277,30 @@ fn capabilities_for_hint_returns_per_device_caps() {
     } else {
         panic!("RSP1 should ship LnaPlusIf shape");
     }
+
+    // RSPdx / RSPdx-R2 ⇒ 3 antenna ports (a/b/c), no tuner selector,
+    // bias-T + notches + HDR, 28-state LNA ceiling. Both hwVer share one cell.
+    let rspdx = capabilities_for_hint(Some(HINT_RSPDX));
+    assert!(rspdx.tuner_options.is_empty());
+    assert_eq!(rspdx.antennas.len(), 3);
+    assert!(rspdx.antennas.iter().any(|a| a.id == "a"));
+    assert!(rspdx.antennas.iter().any(|a| a.id == "b"));
+    assert!(rspdx.antennas.iter().any(|a| a.id == "c"));
+    assert!(rspdx.features.bias_t);
+    assert!(rspdx.features.fm_notch);
+    assert!(rspdx.features.dab_notch);
+    assert!(rspdx.features.hdr, "RSPdx advertises HDR mode");
+    if let ManualGainShape::LnaPlusIf { lna_states, .. } = rspdx.manual_gain {
+        assert_eq!(lna_states, 28, "RSPdx advertises the 28-state ceiling");
+    } else {
+        panic!("RSPdx should ship LnaPlusIf shape");
+    }
+    // RSPdx-R2 reuses RSPdx's caps cell verbatim — same backing pointer.
+    let rspdxr2 = capabilities_for_hint(Some(HINT_RSPDXR2));
+    assert!(
+        std::ptr::eq(rspdx, rspdxr2),
+        "RSPdx and RSPdx-R2 share one caps cell"
+    );
 
     // Unknown hint ⇒ family caps. Family caps are RSPduo-flavoured
     // (full feature set) so the GUI never under-promises.
@@ -354,4 +381,73 @@ fn build_sdrplay_config_lna_state_defaults_to_4_under_agc_when_absent() {
     cfg.backend_extras.insert("tuner".into(), json!("B"));
     let scfg = build_sdrplay_config(&descriptor, &cfg).unwrap();
     assert_eq!(scfg.lna_state, 4);
+}
+
+#[test]
+fn rspdx_lna_state_count_is_band_aware() {
+    // Ported from gr-sdrplay3 `rspdx_impl::rf_gr_values()` array lengths;
+    // RSPdx-R2 inherits the same tables. One point per band boundary.
+    for hw in [SdrplayHardware::RspDx, SdrplayHardware::RspDxR2] {
+        assert_eq!(hw.lna_state_count_at(1_000_000, true), 22, "≤2 MHz + HDR");
+        assert_eq!(hw.lna_state_count_at(1_000_000, false), 19, "≤12 MHz");
+        assert_eq!(hw.lna_state_count_at(40_000_000, false), 20, "≤50 MHz");
+        assert_eq!(hw.lna_state_count_at(55_000_000, false), 25, "≤60 MHz");
+        assert_eq!(hw.lna_state_count_at(145_000_000, false), 27, "≤250 MHz");
+        assert_eq!(hw.lna_state_count_at(300_000_000, false), 28, "≤420 MHz");
+        assert_eq!(hw.lna_state_count_at(500_000_000, false), 21, "≤1000 MHz");
+        assert_eq!(hw.lna_state_count_at(1_500_000_000, false), 19, "≤2000 MHz");
+        // Frequency-independent ceiling drives the GUI gain-slider max.
+        assert_eq!(hw.lna_state_count(), 28);
+    }
+    // Flat-table parts ignore frequency / HDR.
+    assert_eq!(
+        SdrplayHardware::RspDuo.lna_state_count_at(145_000_000, false),
+        10
+    );
+    assert_eq!(
+        SdrplayHardware::RspDuo.lna_state_count_at(1_500_000_000, false),
+        10
+    );
+    assert_eq!(SdrplayHardware::Rsp1.lna_state_count_at(145_000_000, false), 4);
+}
+
+#[test]
+fn build_sdrplay_config_maps_rspdx_antenna_and_hdr() {
+    let descriptor = DeviceDescriptor::new("sdrplay", "x", "x");
+    for (id, want) in [
+        ("a", AntennaPort::AntA),
+        ("b", AntennaPort::AntB),
+        ("c", AntennaPort::AntC),
+    ] {
+        let cfg = SdrConfig {
+            backend_id: "sdrplay".into(),
+            device_id: "x".into(),
+            gain: GainSetting::Manual(ManualGainValue::LnaPlusIf {
+                lna_state: 4,
+                if_grdb: 40,
+            }),
+            antenna: id.into(),
+            hdr: true,
+            ..SdrConfig::default()
+        };
+        let scfg = build_sdrplay_config(&descriptor, &cfg).unwrap();
+        assert_eq!(scfg.antenna, want, "antenna id={id}");
+        assert!(scfg.hdr, "hdr should propagate for id={id}");
+    }
+
+    // A stale RSPduo "fifty" still builds — maps to Fifty; the dx
+    // `program_params` arm routes it to ANTENNA_A. hdr defaults false.
+    let cfg = SdrConfig {
+        backend_id: "sdrplay".into(),
+        device_id: "x".into(),
+        gain: GainSetting::Manual(ManualGainValue::LnaPlusIf {
+            lna_state: 4,
+            if_grdb: 40,
+        }),
+        antenna: "fifty".into(),
+        ..SdrConfig::default()
+    };
+    let scfg = build_sdrplay_config(&descriptor, &cfg).unwrap();
+    assert_eq!(scfg.antenna, AntennaPort::Fifty);
+    assert!(!scfg.hdr);
 }

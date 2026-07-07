@@ -1,6 +1,6 @@
 //! `modem_sdr::SdrBackend` implementation for SDRplay RX devices
-//! (RSPduo + RSP1A wired today; RSP1 / RSP2 / RSPdx scaffolded but
-//! gated off until their per-device sub-struct programming lands).
+//! (RSPduo, RSP1, RSP1A/B and RSPdx / RSPdx-R2 wired; RSP2 scaffolded
+//! but gated off until its per-device sub-struct programming lands).
 //!
 //! [`SdrplayBackend`] is a zero-sized type that registers in
 //! `modem-gui/src-tauri/src/sdr_registry.rs` behind the `sdrplay`
@@ -61,6 +61,7 @@ static SDRPLAY_CAPS_FAMILY: OnceLock<BackendCapabilities> = OnceLock::new();
 static SDRPLAY_CAPS_RSPDUO: OnceLock<BackendCapabilities> = OnceLock::new();
 static SDRPLAY_CAPS_RSP1A: OnceLock<BackendCapabilities> = OnceLock::new();
 static SDRPLAY_CAPS_RSP1: OnceLock<BackendCapabilities> = OnceLock::new();
+static SDRPLAY_CAPS_RSPDX: OnceLock<BackendCapabilities> = OnceLock::new();
 
 /// Wire string the SDRplay backend stamps in `descriptor.hardware_hint`
 /// for each variant. Kept as constants so the matching in
@@ -70,6 +71,8 @@ pub const HINT_RSPDUO: &str = "rspduo";
 pub const HINT_RSP1A: &str = "rsp1a";
 pub const HINT_RSP1B: &str = "rsp1b";
 pub const HINT_RSP1: &str = "rsp1";
+pub const HINT_RSPDX: &str = "rspdx";
+pub const HINT_RSPDXR2: &str = "rspdxr2";
 
 /// Produce `descriptor.hardware_hint` from the daemon's `hwVer` byte.
 /// Single source of truth — every other lookup goes through here.
@@ -79,9 +82,11 @@ fn hint_for_hardware(hw: SdrplayHardware) -> Option<&'static str> {
         SdrplayHardware::Rsp1a => Some(HINT_RSP1A),
         SdrplayHardware::Rsp1b => Some(HINT_RSP1B),
         SdrplayHardware::Rsp1 => Some(HINT_RSP1),
-        // RSP2 / RSPdx / RSPdxR2 / Unsupported(_) — list_devices still
-        // surfaces them so the user sees the device, but `open()`
-        // rejects with a clear error. No per-device caps cell yet.
+        SdrplayHardware::RspDx => Some(HINT_RSPDX),
+        SdrplayHardware::RspDxR2 => Some(HINT_RSPDXR2),
+        // RSP2 / Unsupported(_) — list_devices still surfaces them so the
+        // user sees the device, but `open()` rejects with a clear error.
+        // No per-device caps cell yet.
         _ => None,
     }
 }
@@ -189,6 +194,7 @@ fn sdrplay_capabilities() -> &'static BackendCapabilities {
             bias_t: true,
             fm_notch: true,
             dab_notch: true,
+            hdr: false,
             ctcss_tx: false,
             rf_bandwidth_range_hz: None,
         },
@@ -229,6 +235,7 @@ fn sdrplay_capabilities_rsp1a() -> &'static BackendCapabilities {
             bias_t: true,
             fm_notch: true,
             dab_notch: true,
+            hdr: false,
             ctcss_tx: false,
             rf_bandwidth_range_hz: None,
         },
@@ -264,6 +271,58 @@ fn sdrplay_capabilities_rsp1() -> &'static BackendCapabilities {
             bias_t: false,
             fm_notch: false,
             dab_notch: false,
+            hdr: false,
+            ctcss_tx: false,
+            rf_bandwidth_range_hz: None,
+        },
+        sample_rate_strategy: shared_sample_rate_strategy(),
+        radio_tuning: shared_radio_tuning(),
+    })
+}
+
+/// RSPdx and RSPdx-R2 share this cell — identical API surface (device-level
+/// `rspDxParams`: three antenna ports A/B/C, bias-T, FM/DAB notch, HDR mode).
+/// The R2 is an electrical refresh that, per gr-sdrplay3, inherits the RSPdx
+/// gain tables, so one shared cell is correct (same reasoning as RSP1A/RSP1B).
+/// The advertised `lna_states` is the frequency-independent CEILING (28); the
+/// backend clamps per-band at open / retune — see
+/// `device::SdrplayHardware::lna_state_count_at`.
+fn sdrplay_capabilities_rspdx() -> &'static BackendCapabilities {
+    SDRPLAY_CAPS_RSPDX.get_or_init(|| BackendCapabilities {
+        rx_supported: true,
+        tx_supported: false,
+        rx_freq_range_hz: Some((1_000, 2_000_000_000)),
+        tx_freq_range_hz: None,
+        independent_rx_tx_freq: false,
+        manual_gain: ManualGainShape::LnaPlusIf {
+            lna_states: 28,
+            if_grdb_range: (20, 59),
+            if_grdb_step: 1,
+        },
+        agc_modes: shared_agc_modes(),
+        // Three switchable SMA ports (device-level `rspDxParams.antennaSel`).
+        antennas: vec![
+            AntennaChoice {
+                id: "a".into(),
+                label: "Antenne A (1 kHz – 2 GHz)".into(),
+            },
+            AntennaChoice {
+                id: "b".into(),
+                label: "Antenne B (1 kHz – 2 GHz)".into(),
+            },
+            AntennaChoice {
+                id: "c".into(),
+                label: "Antenne C (HF/VHF, ≤ 200 MHz)".into(),
+            },
+        ],
+        // Single tuner — no tuner selector.
+        tuner_options: vec![],
+        features: BackendFeatures {
+            bias_t: true,
+            fm_notch: true,
+            dab_notch: true,
+            // HDR mode — gated to ≤ 2 MHz by `device::program_params`.
+            hdr: true,
             ctcss_tx: false,
             rf_bandwidth_range_hz: None,
         },
@@ -280,9 +339,10 @@ pub fn capabilities_for_hint(hint: Option<&str>) -> &'static BackendCapabilities
         Some(HINT_RSPDUO) => sdrplay_capabilities_rspduo(),
         Some(HINT_RSP1A) | Some(HINT_RSP1B) => sdrplay_capabilities_rsp1a(),
         Some(HINT_RSP1) => sdrplay_capabilities_rsp1(),
-        // No hint, or a hint we don't recognise (RSP2 / RSPdx) —
-        // fall back to family caps. The `open()` path will reject
-        // unsupported hwVer bytes with a clear error.
+        Some(HINT_RSPDX) | Some(HINT_RSPDXR2) => sdrplay_capabilities_rspdx(),
+        // No hint, or a hint we don't recognise (RSP2) — fall back to
+        // family caps. The `open()` path will reject unsupported hwVer
+        // bytes with a clear error.
         _ => sdrplay_capabilities(),
     }
 }
@@ -513,6 +573,7 @@ pub fn build_sdrplay_config(
         bias_t: cfg.bias_t,
         fm_notch: cfg.fm_notch,
         dab_notch: cfg.dab_notch,
+        hdr: cfg.hdr,
         rf_freq_hz: cfg.rx_freq_hz,
         sample_rate_hz: PREFERRED_SAMPLE_RATE_HZ as f64,
         decimation,
@@ -542,6 +603,10 @@ fn parse_antenna(id: &str) -> Result<AntennaPort, SdrError> {
     match id {
         "" | "fifty" => Ok(AntennaPort::Fifty),
         "hiz" => Ok(AntennaPort::Hiz),
+        // RSPdx / RSPdx-R2 three-port selector.
+        "a" => Ok(AntennaPort::AntA),
+        "b" => Ok(AntennaPort::AntB),
+        "c" => Ok(AntennaPort::AntC),
         other => Err(SdrError::InvalidConfig {
             field: "antenna",
             detail: format!("unknown antenna '{other}' for SDRplay"),

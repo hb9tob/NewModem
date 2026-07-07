@@ -17,8 +17,12 @@
 //!    contract — it's an electrical refresh, not a new API surface.
 //!  * **RSP1** (the original) has no bias-T / notches / antenna
 //!    selector — only the common rxChannel programming runs.
-//! Other variants (RSP2, RSPdx, RSPdxR2) surface as
-//! [`SdrplayError::Api`] until they grow their own branch.
+//!  * **RSPdx** and **RSPdx-R2** share a branch: device-level
+//!    `rspDxParams` for the three antenna ports (A/B/C), bias-T,
+//!    FM/DAB notches and HDR mode (gated to ≤ 2 MHz). The gain
+//!    table is frequency-dependent (see [`SdrplayHardware::lna_state_count_at`]).
+//! RSP2 still surfaces as [`SdrplayError::Api`] until it grows its
+//! own branch.
 
 use std::os::raw::c_uint;
 use std::ptr;
@@ -26,7 +30,8 @@ use std::ptr;
 use crate::api::{
     api, check, check_open, cstr_field_to_string, sdrplay_api_AgcControlT, sdrplay_api_Bw_MHzT,
     sdrplay_api_DeviceParamsT, sdrplay_api_DeviceT, sdrplay_api_If_kHzT,
-    sdrplay_api_RspDuoModeT, sdrplay_api_RspDuo_AmPortSelectT, sdrplay_api_TunerSelectT,
+    sdrplay_api_RspDuoModeT, sdrplay_api_RspDuo_AmPortSelectT, sdrplay_api_RspDx_AntennaSelectT,
+    sdrplay_api_RspDx_HdrModeBwT, sdrplay_api_TunerSelectT,
 };
 use crate::error::SdrplayError;
 use modem_sdr::telemetry::DemodMode;
@@ -113,7 +118,49 @@ impl SdrplayHardware {
         match self {
             // RSP1's slim VHF gain table is only 4 states (0-3).
             Self::Rsp1 => 4,
-            // RSP1A/B, RSP2, RSPduo, RSPdx(-R2): 10-state table (0-9).
+            // RSPdx / RSPdx-R2 top out at 28 states (250–420 MHz band).
+            // This is the frequency-independent CEILING used for the GUI
+            // gain-slider advertisement; the per-band clamp that keeps
+            // the daemon safe lives in `lna_state_count_at`.
+            Self::RspDx | Self::RspDxR2 => 28,
+            // RSP1A/B, RSP2, RSPduo: flat 10-state table (0-9).
+            _ => 10,
+        }
+    }
+
+    /// Number of valid `LNAstate` indices at a given tuner frequency —
+    /// valid `LNAstate` is `0 ..= lna_state_count_at()-1`. On the
+    /// RSPdx / RSPdx-R2 the gain table is frequency-dependent (and, below
+    /// 2 MHz, HDR-dependent), so the clamp must know where the tuner
+    /// sits: an out-of-range `LNAstate` makes the daemon abort the whole
+    /// SDR service. Counts are the `rf_gr` array lengths ported verbatim
+    /// from gr-sdrplay3 `lib/rspdx_impl.cc::rf_gr_values()` (the RSPdx-R2
+    /// inherits the RSPdx tables via `rspdxr2_impl : rspdx_impl`). The
+    /// flat-table parts (RSP1 / RSP1A/B / RSP2 / RSPduo) ignore
+    /// `freq_hz` / `hdr_mode` and return their fixed count.
+    pub fn lna_state_count_at(&self, freq_hz: u64, hdr_mode: bool) -> u8 {
+        match self {
+            Self::Rsp1 => 4,
+            Self::RspDx | Self::RspDxR2 => {
+                let f = freq_hz as f64;
+                if hdr_mode && f <= 2e6 {
+                    22
+                } else if f <= 12e6 {
+                    19
+                } else if f <= 50e6 {
+                    20
+                } else if f <= 60e6 {
+                    25
+                } else if f <= 250e6 {
+                    27
+                } else if f <= 420e6 {
+                    28
+                } else if f <= 1000e6 {
+                    21
+                } else {
+                    19
+                }
+            }
             _ => 10,
         }
     }
@@ -133,8 +180,15 @@ pub enum Tuner {
     B,
 }
 
-/// Antenna port selection — only meaningful on Tuner A. Tuner B is
-/// hard-wired to its single 50 Ω port.
+/// Antenna port selection.
+///
+/// [`Hiz`](AntennaPort::Hiz) / [`Fifty`](AntennaPort::Fifty) are the
+/// RSPduo Tuner-A AM-port choices (only meaningful on Tuner A — Tuner B
+/// is hard-wired to its single 50 Ω port).
+///
+/// [`AntA`](AntennaPort::AntA) / [`AntB`](AntennaPort::AntB) /
+/// [`AntC`](AntennaPort::AntC) are the RSPdx / RSPdx-R2 three-port
+/// selector (`rspDxParams.antennaSel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntennaPort {
     /// Tuner-1 high-impedance AM port (`AMPORT_1`). 1 kHz – 60 MHz —
@@ -143,6 +197,12 @@ pub enum AntennaPort {
     /// Tuner-1 50 Ω port (`AMPORT_2`). 60 MHz – 2 GHz. Default for
     /// any 144 / 430 MHz amateur work.
     Fifty,
+    /// RSPdx antenna port A (`ANTENNA_A`). 1 kHz – 2 GHz.
+    AntA,
+    /// RSPdx antenna port B (`ANTENNA_B`). 1 kHz – 2 GHz.
+    AntB,
+    /// RSPdx antenna port C (`ANTENNA_C`). HF/VHF (≤ ~200 MHz).
+    AntC,
 }
 
 /// IF gain AGC loop bandwidth. Maps onto `sdrplay_api_AgcControlT`
@@ -196,6 +256,10 @@ pub struct SdrplayConfig {
     pub fm_notch: bool,
     /// DAB band-III rejection notch (~174 – 240 MHz). Default false.
     pub dab_notch: bool,
+    /// HDR (High Dynamic Range) mode — RSPdx / RSPdx-R2 only.
+    /// [`program_params`] gates it to `rf_freq_hz <= 2 MHz` (the band
+    /// where it is valid); ignored on every other part. Default false.
+    pub hdr: bool,
     /// RF tuner LO frequency in Hz. 145.5 MHz default (matches the
     /// modem-pluto default — 2 m simplex).
     pub rf_freq_hz: u64,
@@ -246,6 +310,7 @@ impl Default for SdrplayConfig {
             bias_t: false,
             fm_notch: false,
             dab_notch: false,
+            hdr: false,
             rf_freq_hz: 145_500_000,
             sample_rate_hz: PREFERRED_SAMPLE_RATE_HZ as f64,
             decimation: PREFERRED_DECIMATION,
@@ -459,7 +524,7 @@ pub fn open(config: &SdrplayConfig) -> Result<SdrplaySession, SdrplayError> {
             code: -1,
             api_message: format!(
                 "unsupported SDRplay hardware (hwVer={v}); \
-                 RSPduo / RSP1A / RSP1B / RSP1 are wired"
+                 RSPduo / RSP1A / RSP1B / RSP1 / RSPdx / RSPdx-R2 are wired"
             ),
         });
     }
@@ -618,10 +683,15 @@ fn program_params(
         tuner_params.rfFreq.rfHz =
             (config.rf_freq_hz as i64 + DEFAULT_LO_OFFSET_HZ as i64) as f64;
         tuner_params.gain.gRdB = config.if_gain_reduction_db;
-        // Clamp to the device's LNA table — an out-of-range index makes the
-        // daemon abort the service (see `lna_state_count`).
-        tuner_params.gain.LNAstate =
-            config.lna_state.min(hardware.lna_state_count().saturating_sub(1));
+        // Clamp to the device's LNA table at THIS frequency — an out-of-range
+        // index makes the daemon abort the service (see `lna_state_count_at`).
+        // On the RSPdx family the valid count shrinks in the higher bands, so
+        // the clamp is frequency-aware.
+        tuner_params.gain.LNAstate = config.lna_state.min(
+            hardware
+                .lna_state_count_at(config.rf_freq_hz, config.hdr)
+                .saturating_sub(1),
+        );
         tuner_params.bwType = sdrplay_api_Bw_MHzT::sdrplay_api_BW_1_536;
         tuner_params.ifType = sdrplay_api_If_kHzT::sdrplay_api_IF_Zero;
 
@@ -650,7 +720,13 @@ fn program_params(
                     AntennaPort::Hiz => {
                         sdrplay_api_RspDuo_AmPortSelectT::sdrplay_api_RspDuo_AMPORT_1
                     }
-                    AntennaPort::Fifty => {
+                    // Fifty and any stray RSPdx A/B/C value (can't occur on
+                    // an RSPduo config, but the match must stay total) → the
+                    // 50 Ω port.
+                    AntennaPort::Fifty
+                    | AntennaPort::AntA
+                    | AntennaPort::AntB
+                    | AntennaPort::AntC => {
                         sdrplay_api_RspDuo_AmPortSelectT::sdrplay_api_RspDuo_AMPORT_2
                     }
                 };
@@ -678,11 +754,49 @@ fn program_params(
                 // toggles are silently ignored; addressing that needs
                 // device-aware capabilities (follow-up).
             }
+            SdrplayHardware::RspDx | SdrplayHardware::RspDxR2 => {
+                // cf. sdrplay_api_rspDx.h. On the RSPdx / RSPdx-R2 the
+                // antenna port (A/B/C), bias-T, and FM/DAB notches live on
+                // the DEVICE-level `rspDxParams` sub-struct — unlike the
+                // RSPduo, whose antenna/notch/bias-T are per-rxChannel.
+                // Only the HDR bandwidth sits on the rxChannel sub-struct.
+                let dx = &mut (*dev_params).rspDxParams;
+                dx.biasTEnable = if config.bias_t { 1 } else { 0 };
+                dx.rfNotchEnable = if config.fm_notch { 1 } else { 0 };
+                dx.rfDabNotchEnable = if config.dab_notch { 1 } else { 0 };
+                dx.antennaSel = match config.antenna {
+                    AntennaPort::AntA => {
+                        sdrplay_api_RspDx_AntennaSelectT::sdrplay_api_RspDx_ANTENNA_A
+                    }
+                    AntennaPort::AntB => {
+                        sdrplay_api_RspDx_AntennaSelectT::sdrplay_api_RspDx_ANTENNA_B
+                    }
+                    AntennaPort::AntC => {
+                        sdrplay_api_RspDx_AntennaSelectT::sdrplay_api_RspDx_ANTENNA_C
+                    }
+                    // A stale RSPduo Hi-Z / 50 Ω value (persisted before the
+                    // user picked an RSPdx port) → antenna A, the daemon
+                    // default.
+                    AntennaPort::Hiz | AntennaPort::Fifty => {
+                        sdrplay_api_RspDx_AntennaSelectT::sdrplay_api_RspDx_ANTENNA_A
+                    }
+                };
+                // HDR mode is only valid below 2 MHz; enabling it at
+                // VHF/UHF is an invalid state, so gate it (matches
+                // gr-sdrplay3 semantics). hdrBw defaults to 1.7 MHz.
+                dx.hdrEnable = if config.hdr && config.rf_freq_hz <= 2_000_000 {
+                    1
+                } else {
+                    0
+                };
+                (*rx_chan_ptr).rspDxTunerParams.hdrBw =
+                    sdrplay_api_RspDx_HdrModeBwT::sdrplay_api_RspDx_HDRMODE_BW_1_700;
+            }
             other => {
-                // `open()` already filters `Unsupported(_)` out, but
-                // RSP2 / RSPdx / RSPdxR2 don't have their per-device
-                // branches yet. Surface as a clear error rather than
-                // silently skip the per-device writes.
+                // `open()` already filters `Unsupported(_)` out, but RSP2
+                // doesn't have its per-device branch yet (separate
+                // `rsp2Params` struct). Surface as a clear error rather
+                // than silently skip the per-device writes.
                 return Err(SdrplayError::Api {
                     call: "program_params",
                     code: -1,

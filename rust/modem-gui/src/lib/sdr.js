@@ -209,7 +209,7 @@ export function makeDefaultSdrConfig(backendId) {
       max_deviation_hz: 5000.0, tx_deviation_hz: 5000.0,
       rx_demod_mode: "nbfm", ssb_bandwidth_hz: 2700.0,
       antenna: "fifty",
-      bias_t: false, fm_notch: false, dab_notch: false,
+      bias_t: false, fm_notch: false, dab_notch: false, hdr: false,
       ctcss_freq_hz: 0.0, ctcss_level: 0.1,
       rf_bandwidth_hz: null,
       backend_extras: {
@@ -558,13 +558,23 @@ export function buildAntennaRow(backendId, caps, cfg) {
   sel.dataset.sdrField = "antenna";
   sel.dataset.sdrTransform = "string";
   sel.dataset.backend = backendId;
+  const ids = [];
   for (const a of caps.antennas) {
     const opt = document.createElement("option");
     opt.value = a.id;
     opt.textContent = a.label;
     sel.appendChild(opt);
+    ids.push(a.id);
   }
-  if (cfg.antenna) sel.value = cfg.antenna;
+  if (cfg.antenna && ids.includes(cfg.antenna)) {
+    sel.value = cfg.antenna;
+  } else if (ids.length > 0) {
+    // Persisted value doesn't apply to this model (e.g. a stale RSPduo
+    // "fifty" on an RSPdx panel, whose ports are a/b/c) — fall back to the
+    // first offered port and adopt it so the saved config matches the UI.
+    sel.value = ids[0];
+    cfg.antenna = ids[0];
+  }
   sel.addEventListener("change", onSdrFieldChange);
   row.appendChild(sel);
   return row;
@@ -575,6 +585,7 @@ export function buildFeatureRow(direction, backendId, caps, cfg) {
   if (caps.features.bias_t) row.appendChild(makeCheckbox(backendId, "bias_t", t("rx.dev_bias_t"), !!cfg.bias_t));
   if (caps.features.fm_notch) row.appendChild(makeCheckbox(backendId, "fm_notch", "Filtre rejet FM (88-108 MHz)", !!cfg.fm_notch));
   if (caps.features.dab_notch) row.appendChild(makeCheckbox(backendId, "dab_notch", "Filtre rejet DAB (174-240 MHz)", !!cfg.dab_notch));
+  if (caps.features.hdr) row.appendChild(makeCheckbox(backendId, "hdr", "Mode HDR (< 2 MHz)", !!cfg.hdr));
   return row;
 }
 

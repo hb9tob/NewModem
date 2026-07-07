@@ -65,6 +65,7 @@ fn rtlsdr_capabilities() -> &'static BackendCapabilities {
                 bias_t: true,
                 fm_notch: false,
                 dab_notch: false,
+                hdr: false,
                 ctcss_tx: false,
                 rf_bandwidth_range_hz: None,
             },
