@@ -503,12 +503,22 @@ fn run_tx_loop(
     Ok(())
 }
 
-/// Peak target for the SSB I/Q, as a fraction of the i16 DAC full scale. SSB
-/// is linear, so the radiated power follows the digital level: we push the
-/// whole-burst peak to ~0.92 of full scale — near maximum Pluto output — while
-/// staying just under the ceiling (clipping a linear signal splatters the
-/// adjacent QO-100 channels). The RF attenuation sets the final power on top.
+/// Peak target for the SSB I/Q, as a fraction of the i16 DAC full scale (the
+/// 0 dB back-off reference). SSB is linear, so the radiated power follows the
+/// digital level. 0.92 sits right at the AD9361 TX compression knee, though:
+/// bench + OTA showed our direct Pluto SSB TX at this level generates enough
+/// in-Pluto IMD3 / AM-PM to smear the 8PSK constellation so the peer can't even
+/// acquire (preamble metric 0.21 vs 0.89 from a linear SDR-Console TX of the
+/// same burst). The actual drive is [`SSB_TX_DEFAULT_BACKOFF_DB`] below this.
 const SSB_TX_PEAK_TARGET: f32 = 0.92;
+
+/// Default digital drive back-off (dB) below [`SSB_TX_PEAK_TARGET`], applied on
+/// every SSB burst. Keeps the AD9361 TX in its linear region so a QO-100 8PSK
+/// uplink stays decodable; trades peak output power (recover it with the
+/// external PA / lower RF attenuation) for linearity that RF attenuation — sat
+/// AFTER the mixer — cannot buy back. `PLUTO_SSB_DIGITAL_BACKOFF_DB` overrides
+/// this; set it to `0` to restore the old at-the-knee drive for an A/B.
+const SSB_TX_DEFAULT_BACKOFF_DB: f32 = 9.0;
 
 /// RAII teardown for a Pluto TX streaming session — shared by the modem SSB
 /// burst ([`run_tx_loop_ssb`]) and the CW tune ([`run_tune_carrier`]). On EVERY
@@ -636,17 +646,18 @@ fn run_tx_loop_ssb(
         analytic.process(&audio_c) // audio_c freed here, only z48 persists
     };
     let peak = z48.iter().fold(0.0f32, |m, c| m.max(c.re.hypot(c.im)));
-    // Optional digital drive back-off (dB) below the SSB_TX_PEAK_TARGET peak. SSB
-    // is linear, so a two-tone (or real modem) signal driven at ~0.92 full scale
-    // sits right at the AD9361 TX compression knee → strong in-Pluto IMD3 that RF
-    // attenuation (applied AFTER the mixer) cannot remove. Backing the *digital*
-    // level down trades output power for linearity. Default 0 dB = byte-identical
-    // to the previous behaviour (OTA-preserving); a bench sweep of this vs. the RF
-    // attenuation separates Pluto-generated IMD3 from external-amp IMD3.
+    // Digital drive back-off (dB) below the SSB_TX_PEAK_TARGET peak. SSB is
+    // linear, so a signal driven at ~0.92 full scale sits right at the AD9361 TX
+    // compression knee → strong in-Pluto IMD3 that RF attenuation (applied AFTER
+    // the mixer) cannot remove. Backing the *digital* level down trades output
+    // power for linearity. Default is now SSB_TX_DEFAULT_BACKOFF_DB (9 dB) — the
+    // at-the-knee 0.92 drive left the peer unable to acquire our QO-100 8PSK
+    // uplink while an SDR-Console TX of the same burst decoded 68/68.
+    // `PLUTO_SSB_DIGITAL_BACKOFF_DB` overrides; `=0` restores the old drive.
     let backoff_db: f32 = std::env::var("PLUTO_SSB_DIGITAL_BACKOFF_DB")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
+        .unwrap_or(SSB_TX_DEFAULT_BACKOFF_DB);
     let backoff_lin = 10f32.powf(-backoff_db.abs() / 20.0);
     if backoff_db.abs() > 1e-3 {
         eprintln!("[pluto-tx ssb] digital drive back-off {backoff_db:.1} dB (×{backoff_lin:.3} below peak target)");
