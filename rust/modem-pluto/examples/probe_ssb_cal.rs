@@ -16,9 +16,12 @@ use modem_pluto::iiod::{ChanDir, IiodClient};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let uri = std::env::args().nth(1).expect("usage: probe_ssb_cal <ip:HOST> [none|txquad|auto] [secs]");
+    let uri = std::env::args().nth(1).expect("usage: probe_ssb_cal <ip:HOST> [none|txquad|auto] [secs] [atten_db]");
     let calmode = std::env::args().nth(2).unwrap_or_else(|| "txquad".to_string());
     let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(15);
+    // TX attenuation in dB (default 30 = LEILA / analyzer-safe). NEVER default to
+    // 0: 20 W single carrier on QO-100 is forbidden and trips LEILA.
+    let atten_db: f64 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(30.0);
     let tx_lo: u64 = 2_400_250_000;
     let rate = modem_pluto::PREFERRED_SAMPLE_RATE_HZ; // 576 kHz
     let tone = 1500.0_f64;
@@ -75,10 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = c.close();
     } else {
         // Key the PA + emit a pure USB tone (single complex exponential at +tone).
-        println!("[3] KEYING PA (relays engage NOW) — USB tone {tone} Hz for {secs}s");
+        println!("[3] KEYING PA (relays engage NOW) — USB tone {tone} Hz for {secs}s at {atten_db} dB atten");
         let _ = c.write_chn_attr(phy, ChanDir::Output, "altvoltage1", "frequency", &tx_lo.to_string());
         let _ = c.write_chn_attr(phy, ChanDir::Output, "altvoltage1", "powerdown", "0"); // relays ON
-        let _ = c.write_chn_attr(phy, ChanDir::Output, "voltage0", "hardwaregain", "0"); // full power
+        let gain = -(atten_db.clamp(0.0, 89.75)); // AD9361 wants negative dB
+        let _ = c.write_chn_attr(phy, ChanDir::Output, "voltage0", "hardwaregain", &format!("{gain}"));
 
         let period = (rate as f64 / tone).round().max(1.0) as usize;
         let n = period * 8;
