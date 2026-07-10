@@ -103,13 +103,21 @@ fn poly_bank_cached(beta: f64, sps: usize, span_sym: usize) -> Arc<Vec<Vec<f64>>
 pub struct StreamingDsp {
     sps: usize,
     fc: f64,
-    /// Carrier-frequency-offset correction (Hz) folded into the downmix NCO.
-    /// `0.0` (the default) makes the downmix bit-identical to `fc` alone, so a
-    /// CFO-unaware caller is unaffected. May only be changed at a pipeline
-    /// reset/replay boundary (a fresh DSP or right after [`rewind_to`], where
-    /// the absolute index restarts), never mid-`feed_audio`, otherwise the NCO
-    /// phase would step. See [`set_cfo_hz`](Self::set_cfo_hz).
-    cfo_hz: f64,
+    /// Carrier-frequency-offset correction folded into the downmix NCO, as a
+    /// phase-continuous frequency RAMP: the instantaneous offset at absolute
+    /// audio index `m` is `cfo0_hz + cfo_rate_hz_s·(m − cfo_anchor_abs)/Fs` (Hz),
+    /// and the CFO phase is its closed-form integral (a chirp in `m − anchor`)
+    /// plus the carried `cfo_phase0`. All-zero (the default) makes the downmix
+    /// bit-identical to `fc` alone. [`set_cfo_hz`](Self::set_cfo_hz) writes a
+    /// STATIC offset (rate 0, anchor 0) at a reset boundary;
+    /// [`advance_cfo_ramp`](Self::advance_cfo_ramp) slews the ramp mid-`feed_audio`
+    /// with NO phase jump so the continuous drift tracker can follow the LNB.
+    /// Kept a pure function of the absolute index `m` so `rewind_to`/replay
+    /// reproduces the baseband exactly.
+    cfo0_hz: f64,
+    cfo_rate_hz_s: f64,
+    cfo_anchor_abs: u64,
+    cfo_phase0: f64,
 
     /// Index of the next T/2 fse output sample the fused stage will emit
     /// (cumulative across the whole session).
@@ -168,7 +176,10 @@ impl StreamingDsp {
         Self {
             sps,
             fc: center_freq_hz,
-            cfo_hz: 0.0,
+            cfo0_hz: 0.0,
+            cfo_rate_hz_s: 0.0,
+            cfo_anchor_abs: 0,
+            cfo_phase0: 0.0,
             resampler_next_tx: 0,
             last_drift_ppm: 0.0,
             downmix_next_abs: 0,
@@ -228,18 +239,63 @@ impl StreamingDsp {
         self.sps
     }
 
-    /// Set the carrier-frequency-offset correction (Hz) folded into the
-    /// downmix NCO. `0.0` is a true no-op (downmix bit-identical to `fc`).
-    /// Must only be called at a reset/replay boundary (see the `cfo_hz`
-    /// field doc): the NCO phase is reconstructed from the absolute index,
-    /// so changing the frequency only stays phase-continuous when the index
-    /// also restarts (a fresh DSP or right after [`rewind_to`]).
+    /// Set a STATIC carrier-frequency-offset correction (Hz), anchored at index
+    /// 0 (rate 0) — the coarse commit / reset-boundary form. `0.0` is a true
+    /// no-op (downmix bit-identical to `fc`). Resets the ramp: for a
+    /// phase-continuous mid-stream slew use [`advance_cfo_ramp`](Self::advance_cfo_ramp).
     pub fn set_cfo_hz(&mut self, hz: f64) {
-        self.cfo_hz = hz;
+        self.cfo0_hz = hz;
+        self.cfo_rate_hz_s = 0.0;
+        self.cfo_anchor_abs = 0;
+        self.cfo_phase0 = 0.0;
+    }
+
+    /// Instantaneous NCO offset frequency (Hz) at the current downmix position
+    /// (`cfo0_hz + rate·(m − anchor)/Fs`). The drift loop reads this to form the
+    /// new offset before slewing.
+    pub fn cfo_freq_now(&self) -> f64 {
+        let dm = self.downmix_next_abs as f64 - self.cfo_anchor_abs as f64;
+        self.cfo0_hz + self.cfo_rate_hz_s * dm / (AUDIO_RATE as f64)
+    }
+
+    /// Slew the CFO ramp to `(cfo0_hz at now, rate_hz_s)` WITHOUT a phase jump:
+    /// the accumulated NCO CFO-phase at the current downmix index is carried into
+    /// `cfo_phase0` and the anchor re-seated there, so only the frequency slope
+    /// changes. Safe mid-`feed_audio` (unlike [`set_cfo_hz`](Self::set_cfo_hz),
+    /// which re-slopes the whole ramp back to index 0 and thus steps the phase).
+    pub fn advance_cfo_ramp(&mut self, cfo0_hz: f64, rate_hz_s: f64) {
+        let anchor_new = self.downmix_next_abs;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let fs = AUDIO_RATE as f64;
+        let dm = anchor_new as f64 - self.cfo_anchor_abs as f64;
+        // Phase the OLD ramp has reached at `anchor_new` — carry it so the new
+        // ramp starts from the same phase (continuity).
+        self.cfo_phase0 -=
+            two_pi / fs * (self.cfo0_hz * dm + 0.5 * (self.cfo_rate_hz_s / fs) * dm * dm);
+        self.cfo_anchor_abs = anchor_new;
+        self.cfo0_hz = cfo0_hz;
+        self.cfo_rate_hz_s = rate_hz_s;
     }
 
     pub fn cfo_hz(&self) -> f64 {
-        self.cfo_hz
+        self.cfo0_hz
+    }
+
+    /// Current CFO ramp rate (Hz/s) — the drift loop's velocity state.
+    pub fn cfo_rate_hz_s(&self) -> f64 {
+        self.cfo_rate_hz_s
+    }
+
+    /// Absolute audio index the CFO ramp is anchored at (the previous slew
+    /// point). The drift loop uses `downmix_next_abs − anchor` to time its
+    /// rate update.
+    pub fn cfo_anchor_abs(&self) -> u64 {
+        self.cfo_anchor_abs
+    }
+
+    /// Absolute audio index of the next raw sample the downmix will consume.
+    pub fn downmix_next_abs(&self) -> u64 {
+        self.downmix_next_abs
     }
 
     /// Number of fse samples per symbol in `sym_buffer` (= `sps / d_fse`).
@@ -398,15 +454,22 @@ impl StreamingDsp {
         if self.baseband.is_empty() {
             self.baseband_start_abs = self.downmix_next_abs;
         }
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let fs = AUDIO_RATE as f64;
         while self.downmix_next_abs < audio_end_abs {
             let rel = (self.downmix_next_abs - audio_drained_samples) as usize;
             let s = audio[rel] as f64;
-            let phase = -2.0
-                * std::f64::consts::PI
-                * (self.fc + self.cfo_hz)
-                * (self.downmix_next_abs as f64)
-                / (AUDIO_RATE as f64);
-            let (sin_p, cos_p) = phase.sin_cos();
+            let m = self.downmix_next_abs as f64;
+            // Carrier term (indexed from 0), IDENTICAL bit-for-bit to the old
+            // `-2π·(fc+0)·m/Fs` when the CFO is off.
+            let phase_fc = -2.0 * std::f64::consts::PI * self.fc * m / (AUDIO_RATE as f64);
+            // CFO term = the closed-form integral of the frequency ramp
+            // `cfo0 + rate·(m−anchor)/Fs`, i.e. a chirp in (m−anchor), plus the
+            // carried phase. Exactly 0.0 when cfo0 = rate = phase0 = 0.
+            let dm = m - self.cfo_anchor_abs as f64;
+            let phase_cfo = self.cfo_phase0
+                - two_pi / fs * (self.cfo0_hz * dm + 0.5 * (self.cfo_rate_hz_s / fs) * dm * dm);
+            let (sin_p, cos_p) = (phase_fc + phase_cfo).sin_cos();
             self.baseband.push(Complex64::new(s * cos_p, s * sin_p));
             self.downmix_next_abs += 1;
         }

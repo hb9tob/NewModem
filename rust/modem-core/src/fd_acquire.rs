@@ -284,15 +284,27 @@ impl PreambleMatchedFilter {
         })
     }
 
-    /// Like [`best_match`](Self::best_match), but first de-rotates `window` by a
-    /// carrier-frequency offset of `cfo_hz` (multiplying sample `i` by
-    /// `exp(-j·2π·cfo_hz·i/Fs)`) before correlating. A signal whose carrier has
-    /// drifted by `cfo_hz` (e.g. SSB TX/RX oscillator mismatch) smears the
-    /// real-input correlation to nothing once the offset exceeds the template's
-    /// sinc main lobe (~6 Hz over a 256-symbol preamble); de-rotating first
-    /// brings its preamble back onto the template's carrier so the peak
-    /// survives. De-rotation is unitary, so the per-lag energy normaliser is
-    /// unchanged.
+    /// Like [`best_match`](Self::best_match), but first frequency-shifts `window`
+    /// down by a carrier offset of `cfo_hz` before correlating. A signal whose
+    /// carrier has drifted by `cfo_hz` (e.g. an SSB TX/RX oscillator mismatch or
+    /// an un-beacon-locked QO-100 LNB) smears the real-input correlation to
+    /// nothing once the offset exceeds the template's sinc main lobe (~6 Hz over
+    /// a 256-symbol preamble); recentring first brings its preamble back onto the
+    /// template's carrier so the peak survives.
+    ///
+    /// The recentring is done in the **analytic** (Hilbert) domain, NOT by
+    /// de-rotating the real passband directly. A real preamble at `fc + cfo`
+    /// carries energy in *both* sidebands (±fc); multiplying the real signal by
+    /// `e^{-j2π·cfo·t}` realigns only one of them onto the real template, so half
+    /// the coherent energy is lost and the metric is capped at **¼** of its true
+    /// value (measured 0.88 → 0.22 on a QO-100 SSB capture — enough to clear the
+    /// MF floor yet leave every Golay+CRC marker un-validatable). Instead we form
+    /// the analytic signal (one-sided spectrum), shift its single sideband down
+    /// by `cfo_hz`, and take the real part — the lossless inverse of an SSB
+    /// carrier offset, exactly the offline `Re{hilbert(x)·e^{-j2π·Δf·t}}`
+    /// recentring that restored the full metric. [`best_match`] then correlates a
+    /// clean on-carrier real passband preamble and recovers the full matched-
+    /// filter gain, on the same normalised `[0,1]` scale as the 0 Hz path.
     ///
     /// `cfo_hz == 0.0` dispatches to the unmodified [`best_match`](Self::best_match)
     /// (real path), so it is **bit-identical** — the caller's deadband makes the
@@ -305,64 +317,37 @@ impl PreambleMatchedFilter {
             return None;
         }
         let usable = window.len().min(self.fft_size);
-        // FFT of the complex de-rotated, zero-padded window.
+
+        // Analytic signal of the (zero-padded) window via the size-`fft_size`
+        // plans the struct already owns: FFT → keep the one-sided spectrum
+        // (double the positive freqs, zero the negatives, DC/Nyquist kept) →
+        // IFFT. `fft_size` is a power of two so `hn` is the exact Nyquist bin.
         let mut buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); self.fft_size];
-        let w0 = -2.0 * std::f64::consts::PI * cfo_hz / AUDIO_RATE as f64;
         for (i, &w) in window[..usable].iter().enumerate() {
-            let (s, c) = (w0 * i as f64).sin_cos();
-            buf[i] = Complex::new(w as f64 * c, w as f64 * s);
+            buf[i] = Complex::new(w as f64, 0.0);
         }
         self.fwd.process(&mut buf);
-        for (b, t) in buf.iter_mut().zip(self.template_spec_conj.iter()) {
-            *b *= *t;
+        let hn = self.fft_size / 2;
+        for b in buf.iter_mut().take(hn).skip(1) {
+            *b *= 2.0;
+        }
+        for b in buf.iter_mut().skip(hn + 1) {
+            *b = Complex::new(0.0, 0.0);
         }
         self.inv.process(&mut buf);
         let inv_n = 1.0 / self.fft_size as f64;
 
-        // Sliding window energy = Σ|window|²; de-rotation is unitary so this is
-        // the same as the real-path energy (|w·e^{jθ}|² = |w|²).
-        let last_lag = usable - self.n_template;
-        let mut prefix = vec![0.0f64; usable + 1];
-        for i in 0..usable {
-            let w = window[i] as f64;
-            prefix[i + 1] = prefix[i] + w * w;
-        }
+        // Recentre: z(t)·e^{-j2π·cfo·t}, real part → an on-carrier real preamble.
+        let w0 = -2.0 * std::f64::consts::PI * cfo_hz / AUDIO_RATE as f64;
+        let recentred: Vec<f32> = (0..usable)
+            .map(|i| {
+                let z = buf[i] * inv_n; // analytic sample
+                let (s, c) = (w0 * i as f64).sin_cos(); // e^{jw0 i}, w0 = -2π cfo/Fs
+                (z.re * c - z.im * s) as f32 // Re{ z · e^{-j2π cfo i/Fs} }
+            })
+            .collect();
 
-        let mut best_lag = 0usize;
-        let mut best_metric = 0.0f64;
-        for lag in 0..=last_lag {
-            // Correlation is now complex; use its magnitude.
-            let corr2 = buf[lag].norm_sqr() * inv_n * inv_n;
-            let e_w = prefix[lag + self.n_template] - prefix[lag];
-            if e_w <= 0.0 {
-                continue;
-            }
-            let metric = corr2 / (self.template_energy * e_w);
-            if metric > best_metric {
-                best_metric = metric;
-                best_lag = lag;
-            }
-        }
-
-        let frac = if best_lag > 0 && best_lag < last_lag {
-            let mag = |l: usize| buf[l].norm() * inv_n;
-            let m_minus = mag(best_lag - 1);
-            let m_zero = mag(best_lag);
-            let m_plus = mag(best_lag + 1);
-            let denom = m_minus - 2.0 * m_zero + m_plus;
-            if denom < -1e-12 {
-                (0.5 * (m_minus - m_plus) / denom).clamp(-1.0, 1.0)
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-        Some(PreambleMatch {
-            lag: best_lag,
-            frac,
-            metric: best_metric,
-        })
+        self.best_match(&recentred)
     }
 }
 
@@ -565,9 +550,19 @@ mod tests {
 
         let mf = PreambleMatchedFilter::new(&template, window_len);
 
-        // Plain MF: degraded — should not lock cleanly.
+        // Ceiling: the SAME preamble embedded on-carrier (delta = 0) in the same
+        // noise, scored by the plain real MF — the metric a beacon-locked RX sees.
+        let mut centred = noise(window_len, 0.1, 0x55AA);
+        for k in 0..n_t {
+            centred[offset + k] += template[k];
+        }
+        let ceiling = mf.best_match(&centred).expect("window ≥ template").metric;
+
+        // Plain MF on the offset signal: degraded — should not lock cleanly.
         let plain = mf.best_match(&window).expect("window ≥ template");
-        // De-rotated MF at the true offset: locks at the right lag, strong metric.
+        // Recentred MF at the true offset: locks at the right lag, and recovers
+        // essentially the FULL coherent gain (the analytic recentring restores
+        // both sidebands, vs the ¼-metric a naive real de-rotation would give).
         let derot = mf
             .best_match_derotated(&window, delta)
             .expect("window ≥ template");
@@ -579,13 +574,23 @@ mod tests {
             "de-rotated lag {} far from true offset {offset}",
             derot.lag,
         );
-        // De-rotation lifts the metric above the acquisition threshold while
-        // the plain MF stays below it: the difference between locking and not.
+        // Recentring lifts the metric above the acquisition threshold while the
+        // plain MF stays below it: the difference between locking and not.
         assert!(
             derot.metric > MF_ACQ_THRESHOLD && plain.metric < MF_ACQ_THRESHOLD,
-            "de-rotated metric {:.4} (want > {MF_ACQ_THRESHOLD}) vs plain {:.4} (want < {MF_ACQ_THRESHOLD})",
+            "recentred metric {:.4} (want > {MF_ACQ_THRESHOLD}) vs plain {:.4} (want < {MF_ACQ_THRESHOLD})",
             derot.metric,
             plain.metric,
+        );
+        // Full recovery, not the ¼ a real de-rotation would cap at: the recentred
+        // metric must reach most of the on-carrier ceiling (a naive real
+        // de-rotation would sit at ~0.25·ceiling).
+        assert!(
+            derot.metric > 0.85 * ceiling,
+            "recentred metric {:.4} did not recover the ceiling {ceiling:.4} \
+             (0.25·ceiling = {:.4} is the broken real-de-rotation level)",
+            derot.metric,
+            0.25 * ceiling,
         );
 
         // 0 Hz is bit-identical to best_match.

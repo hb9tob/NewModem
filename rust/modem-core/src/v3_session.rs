@@ -437,6 +437,27 @@ const ETAGE_B_MAX_RECOMMITS: u32 = 4;
 /// overshoots and oscillates; 0.5 converges in ~1 step.
 const ETAGE_B_GAIN: f64 = 0.5;
 
+/// Continuous carrier-drift tracker — an α-β (g-h) loop over the front-end NCO
+/// ramp, making the whole carrier stack type-3 (NCO phase + frequency + rate),
+/// which zeroes steady-state error to a constant LNB drift (frequency ramp).
+/// Each forward-primary segment the estimator's residual frequency ν is the
+/// innovation: the NCO offset is corrected by `α·ν` (position) and the ramp rate
+/// by `(β/Δt)·ν` (velocity), then `α` of ν is drained from the estimator so ONE
+/// integrator owns the absolute carrier. α = 0.5 (a few-segment pull-in without
+/// chasing pilot noise); β = α²/(2−α) ≈ 0.167 is the critically-damped
+/// (Benedict-Bordner) partner. The slew is phase-continuous, so the drift is
+/// followed without the fragmenting re-commit/reboot the static NCO forced.
+///
+/// The rate (velocity) is a double integrator, so on a STATIC carrier it would
+/// random-walk off pilot noise and wreck a decode with no drift to lock to. So
+/// it is LEAKY (`DRIFT_RATE_LEAK` pulls it toward 0 each segment ⇒ finite memory
+/// ~1/leak segments) and CLAMPED to a physical LNB bound (`DRIFT_MAX_RATE`). The
+/// leak costs a negligible steady-state lag at the slow drifts seen here.
+const DRIFT_FREQ_GAIN: f64 = 0.5;
+const DRIFT_RATE_GAIN: f64 = 0.1667;
+const DRIFT_RATE_LEAK: f64 = 0.1;
+const DRIFT_MAX_RATE: f64 = 2.0;
+
 /// Per-cycle timing-poursuite integral gain. After the coarse grid locks
 /// the bulk drift, each validated marker's residual timing error (refined
 /// observed − predicted, in symbols) is converted to a ppm slip over the
@@ -1819,7 +1840,24 @@ impl V3Session {
                             }
                             self.set_cfo_hz(refined);
                             self.cfo_locked = true;
-                            self.reboot_pipeline_and_replay(events);
+                            // Forward-relock, NOT reboot+replay. Applying the CFO
+                            // to the ongoing pipeline and letting the next preamble
+                            // validate on the corrected stream decodes offset SSB
+                            // across 0..±250 Hz. The internal
+                            // `reboot_pipeline_and_replay` cannot reproduce the
+                            // burst mid-stream with the fused polyphase front-end:
+                            // its fresh resampler cursor starts at 0 while the
+                            // replayed baseband sits at `audio_drained_samples`, so
+                            // `run_poly_rrc_decimate` emits ZERO symbols, the FFE
+                            // never refills and no marker validates. That was
+                            // invisible for the coarse-drift replay (it already had
+                            // a forward decode) but fatal here — a carrier offset
+                            // blocks ALL forward decode, so the failed replay left
+                            // nothing. `V3_CFO_REBOOT=1` restores the old replay for
+                            // an A/B. (0 Hz never reaches here — deadband no-op.)
+                            if std::env::var_os("V3_CFO_REBOOT").is_some() {
+                                self.reboot_pipeline_and_replay(events);
+                            }
                             return;
                         }
                     }
@@ -2308,6 +2346,35 @@ impl V3Session {
             let (resid_freq, resid_phase_last) = last_resid;
             let s_last = seg_start_abs + seg_sym_len as u64 - 1;
             self.rx_est.update(s_last, resid_freq, resid_phase_last);
+            // Continuous carrier-drift tracking. Once the coarse CFO is committed
+            // (SSB / offset path), hand the estimator's slow frequency ν to the
+            // front-end NCO as a phase-continuous ramp and drain the same fraction
+            // from the estimator, so ONE integrator (the NCO) owns the absolute
+            // carrier and the LNB drift is removed BEFORE the matched filter — no
+            // re-commit, no reboot. The NCO slew is phase-continuous, so unlike the
+            // old discrete `set_cfo_hz` re-commit it does not step the phase and
+            // fragment the decode. On the clean/NBFM path the CFO is never
+            // committed (`cfo_locked == false`), so this is entirely inert.
+            if self.cfo_locked && self.rx_est.enabled() {
+                // Innovation = the frequency the NCO ramp still missed this
+                // segment (rad/sym → Hz).
+                let nu_hz =
+                    self.rx_est.nu() * self.cfg.symbol_rate / (2.0 * std::f64::consts::PI);
+                // Δt since the last slew (s), from the ramp anchor. Clamped so the
+                // first hand-off after commit (anchor = 0 ⇒ huge Δt) and any long
+                // gap can't spike the rate integrator.
+                let now_abs = self.dsp.downmix_next_abs();
+                let dt = ((now_abs.saturating_sub(self.dsp.cfo_anchor_abs())) as f64
+                    / AUDIO_RATE as f64)
+                    .clamp(0.05, 5.0);
+                // α-β update: correct the offset (position) and the rate (velocity).
+                let new_cfo0 = self.dsp.cfo_freq_now() + DRIFT_FREQ_GAIN * nu_hz;
+                let new_rate = (self.dsp.cfo_rate_hz_s() * (1.0 - DRIFT_RATE_LEAK)
+                    + (DRIFT_RATE_GAIN / dt) * nu_hz)
+                    .clamp(-DRIFT_MAX_RATE, DRIFT_MAX_RATE);
+                self.dsp.advance_cfo_ramp(new_cfo0, new_rate);
+                self.rx_est.scale_nu(1.0 - DRIFT_FREQ_GAIN);
+            }
         }
         if std::env::var_os("V3_LOG_TURBO").is_some() {
             let conv: Vec<u8> = results.iter().map(|(_, c)| *c as u8).collect();

@@ -45,6 +45,21 @@ impl RxEstimator {
         self.enabled
     }
 
+    /// Current frequency estimate (rad/symbol). The continuous drift loop reads
+    /// this each forward segment, converts to Hz, and hands it off to the
+    /// front-end NCO ramp.
+    pub fn nu(&self) -> f64 {
+        self.nu
+    }
+
+    /// Drain the frequency estimate after part of it is handed off to the NCO
+    /// ramp, so exactly ONE integrator owns the absolute carrier (no
+    /// double-correction / loop-fighting). `factor` in [0, 1] scales ν; θ and the
+    /// anchor are untouched (the phase track stays with the estimator).
+    pub fn scale_nu(&mut self, factor: f64) {
+        self.nu *= factor;
+    }
+
     /// Reset the carrier model for a fresh burst / replay (mirrors the
     /// `carrier_inited=false; carrier_theta=0; carrier_nu=0` reset). `anchor_sym`
     /// is left as-is: the first post-reset [`predict`](Self::predict) ignores it
