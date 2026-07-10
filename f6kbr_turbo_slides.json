@@ -1,0 +1,158 @@
+{
+  "$brief": "Brief technique pour Fable — nouvelles slides 'récepteur turbo' à insérer dans la présentation F6KBR/HB9MM (Partie 2 · Sous le capot). Généré à partir du code (rust/modem-core/src/cfo.rs, rust/modem-core-base/src/timing_tracker.rs, rust/modem-core/src/scrambler.rs) et de l'audit docs/turbo_modem_reference.html. Contenu vérifié, non inventé.",
+
+  "meta": {
+    "presentation": "presentation_f6kbr.html",
+    "occasion": "HB9MM — soirée du 2026-07-10",
+    "builder": "build_f6kbr.py (deck SVG en français, split par <section class=\"slide\">)",
+    "insertion_point": "Partie 2 · Sous le capot, après E_RX / E_NCO et avant / autour des slides FFE existantes. Le récepteur turbo est la nouveauté à mettre en avant.",
+    "auteur": "HB9TOB",
+    "repo": "github.com/hb9tob/NewModem"
+  },
+
+  "constraints": {
+    "langue": "Slides en FRANÇAIS (public radioamateur francophone). Garder les acronymes techniques (CFO, SFO, LDPC, RRC, NLMS, DD-PLL, PAPR, G3RUH) tels quels.",
+    "style": "Reprendre exactement le gabarit du deck existant : <section class=\"slide\">, .eyebrow, <h2>, .two-col / .body, listes <ul><li> avec <strong>, chips <span class=\"chip\">, tableaux .profiles. Diagrammes en SVG inline sobres (couleurs ACC=#b8412a, ACC2=#2a5f8a, OK=#2f7a3a, WARN=#b8893a, INK=#1a1a1a, MUT=#555, SOFT=#e6e2d8).",
+    "niveau": "Partie 2 = technique, pour techniciens. Rester rigoureux mais lisible : une idée clé par slide, l'analogie AVANT l'équation.",
+    "honnetete": "Ne rien inventer au-delà de ce brief. Les chiffres cités (108 Hz, ±250 Hz, 6 Hz, 16384 pts, 2,93 Hz/bin, ±15 Hz, 5 passes, alpha=0,75, N=2304, G(x)=1+x^12+x^17, seed 0xACE1, ~4 s, gain 0,5) sont exacts — les conserver."
+  },
+
+  "framing": {
+    "accroche": "Le récepteur a été refait en 'turbo' : au lieu d'égaliser puis décoder une fois, l'égaliseur, la boucle de phase et le décodeur LDPC s'entraident et s'affinent en boucle. Autour, deux estimateurs 'd'acquisition' (CFO et SFO) recalent fréquence porteuse et horloge, et un scrambler blanchit le signal pour tenir sur QO-100.",
+    "fil_rouge": "Trois recalages emboîtés : (1) FRÉQUENCE porteuse = CFO, une fois par salve ; (2) HORLOGE d'échantillonnage = SFO, en continu ; (3) CANAL + PHASE + BITS = boucle turbo, à chaque segment. Plus un pré-traitement TX : le scrambler.",
+    "cible_canal": "Nouveau contexte QO-100 / SSB-USB : transpondeur LINÉAIRE, porteuse SUPPRIMÉE, SNR bas. C'est ce qui rend CFO et scrambler nécessaires (inutiles en NBFM à porteuse démodulée)."
+  },
+
+  "slides": [
+    {
+      "id": "TURBO-DIVIDER",
+      "type": "section_divider",
+      "eyebrow_or_chnum": "PARTIE 2 · LE RÉCEPTEUR TURBO",
+      "titre": "Le récepteur turbo : égaliser et décoder ensemble",
+      "sous_titre": "Trois recalages emboîtés — fréquence porteuse (CFO), horloge (SFO), et la boucle turbo canal↔bits — plus un blanchiment à l'émission.",
+      "notes_orateur": "Slide de transition. Poser les 3 échelles de temps : CFO une fois/salve, SFO en continu, turbo par segment."
+    },
+
+    {
+      "id": "TURBO-CORE",
+      "type": "content_two_col",
+      "eyebrow": "Partie 2 · Le cœur turbo",
+      "titre": "La boucle turbo : le canal aide les bits, les bits aident le canal",
+      "idee_cle": "Boucler entre l'égaliseur et le décodeur au lieu d'un aller simple.",
+      "bullets": [
+        "Chaîne classique : on égalise UNE fois, puis on décode UNE fois. Le décodeur ne renvoie jamais ce qu'il a appris.",
+        "Turbo (famille turbo-equalization, Tüchler/Koetter/Singer 2002) : jusqu'à <strong>5 passes</strong> par segment. À chaque passe, le décodeur LDPC renvoie des <strong>symboles souples</strong> qui ré-entraînent l'égaliseur et la boucle de phase.",
+        "Une passe = <strong>égaliseur FFE + phase (DD-PLL) + démapping souple + LDPC + ré-injection</strong>. On s'arrête dès que <strong>tous les codewords ont leur syndrome nul</strong> (inutile de forcer 5 passes).",
+        "Références 'pilotes' pondérées à 1 ; données pondérées par leur fiabilité <span class=\"mono\">w = |E[a]|² / E[|a|²]</span> (nulle au premier tour, croît quand on devient sûr).",
+        "<strong>Tout est souple, jamais de décision dure</strong> : un segment massacré donne E[a]≈0 → poids≈0 → il ne peut pas <strong>empoisonner</strong> les coefficients de l'égaliseur. Sécurité intrinsèque à bas SNR."
+      ],
+      "diagramme": {
+        "type": "boucle",
+        "description": "Boucle fermée : [Reçu] → [FFE égaliseur] → [DD-PLL phase] → [Démapping souple → LLR] → [LDPC SISO] → (extrinsèque / symboles souples) —retour→ FFE. Annoter '×5 passes max, arrêt sur syndrome nul'. Couleur ACC2 pour le chemin avant, ACC (pointillé) pour la ré-injection.",
+        "svg_hint": "Reprendre le style chain_svg() de build_f6kbr.py mais refermer la flèche du dernier bloc vers le premier."
+      },
+      "notes_orateur": "Insister sur le mot 'affinage' : chaque passe rend l'estimée du canal meilleure, ce qui rend le décodage meilleur, ce qui rend l'estimée encore meilleure. Le LDPC est un min-sum normalisé (alpha=0,75, ~0,2 dB de la borne SPA), codes WiMAX 802.16e QC-LDPC N=2304. Le retour ne repasse QUE par l'égaliseur (pas de ré-injection a-priori dans le LDPC) → évite l'auto-renforcement dangereux (BICM-ID)."
+    },
+
+    {
+      "id": "CFO",
+      "type": "content_two_col",
+      "eyebrow": "Partie 2 · Recalage fréquence (CFO)",
+      "titre": "CFO : recentrer la porteuse en SSB / QO-100",
+      "idee_cle": "En porteuse supprimée, un décalage TX/RX de ~100 Hz suffit à tuer l'acquisition — il faut le mesurer et le corriger.",
+      "bullets": [
+        "En <strong>SSB / QO-100</strong> (porteuse supprimée), les oscillateurs TX et RX diffèrent → le signal arrive décalé d'un <strong>offset porteuse constant</strong> (~108 Hz mesuré sur l'air).",
+        "Le filtre adapté du préambule (256 symboles) a un <strong>lobe principal de ±6 Hz</strong> : même 100 Hz de décalage détruit la détection. D'où le recalage.",
+        "Estimation en <strong>deux étages, boucle ouverte, une seule fois par salve</strong>, sur ±250 Hz :",
+        "<span class=\"chip\">Grossier</span> périodogramme de Welch (FFT 16384 @ 48 kHz → <strong>2,93 Hz/bin</strong>) corrélé à un gabarit de bande en <strong>cosinus surélevé |H|²</strong>. Robuste à un QRM étroit car il intègre toute la bande. Estimée biaisée mais qui 'encadre'.",
+        "<span class=\"chip\">Fin</span> grille ±15 Hz notée par la <strong>métrique du filtre adapté temporel</strong> + interpolation parabolique sous-bin → c'est la valeur réellement appliquée (non biaisée).",
+        "<strong>Zone morte</strong> : |CFO| &lt; 1,5 Hz est forcé à 0,000 → sur un signal propre, le récepteur retombe sur le chemin <strong>bit-à-bit identique</strong> (aucune régression). L'offset pilote un NCO de descente (<span class=\"mono\">set_cfo_hz</span>), verrouillé une fois par salve."
+      ],
+      "rappel_nbfm": "À rappeler : en FM/PM démodulée, un décalage de porteuse n'est qu'un terme continu (DC) → pas de CFO nécessaire (voir slide 'NCO inutile en FM'). Le CFO est la brique qui ouvre QO-100.",
+      "diagramme": {
+        "type": "spectre",
+        "description": "PSD de la bande RRC (bosse en cosinus surélevé centrée 1100 Hz) décalée de +Δf ; superposer le gabarit template glissant qui vient se caler dessus. Marquer la zone morte ±1,5 Hz.",
+        "svg_hint": "Deux étages : étage 1 corrélation de gabarit (courbe large), étage 2 grille fine ±15 Hz avec pic parabolique."
+      },
+      "notes_orateur": "Canonique : estimation de fréquence DA/NDA (Mengali & D'Andrea ; Luise & Reggiannini) + max de périodogramme / interpolation parabolique. Ne PAS confondre avec l'estimateur Kay single-lag qui est présent dans le code mais 'étagère' (non branché)."
+    },
+
+    {
+      "id": "SFO",
+      "type": "content_two_col",
+      "eyebrow": "Partie 2 · Recalage horloge (SFO)",
+      "titre": "SFO : rattraper la dérive des horloges d'échantillonnage",
+      "idee_cle": "Les quartz des convertisseurs A/D (RX) et D/A (TX) dérivent → le rythme des symboles glisse. On le suit en continu.",
+      "bullets": [
+        "Les horloges des <strong>convertisseurs A/D (RX) et D/A (TX)</strong> — les quartz des cartes son / SDR — dérivent l'une par rapport à l'autre, typiquement <strong>quelques dizaines de ppm</strong> → rampe de timing symbole (SFO).",
+        "<strong>PreambleSfoTracker</strong> : timing <strong>assisté par les données</strong>, sur le préambule connu à module constant. Interpolation parabolique sous-échantillon de la magnitude du filtre adapté → phase de timing τ.",
+        "Deux préambules <strong>espacés de ~4 s</strong> → la <strong>pente de φ</strong> donne la SFO résiduelle, intégrée (<strong>gain 0,5</strong>) dans le débit du <strong>ré-échantillonneur lisse</strong>.",
+        "Appliqué par un <strong>accumulateur de phase continu</strong> (changement de vitesse doux, aucune discontinuité) → boucle <strong>type 2</strong> : erreur permanente nulle face à une SFO.",
+        "Le détecteur de timing est <strong>AVANT le FFE</strong>, et le ré-échantillonneur est le <strong>seul actionneur</strong> de timing, séparé de la boucle turbo → le timing est résolu <strong>une fois, en continu</strong>, sans se battre avec les autres boucles.",
+        "Timing DA <strong>indépendant de la modulation</strong> (Meyr ch.5) : on évite le bruit propre par-anneau d'un Gardner sur APSK. <strong>Activé par défaut</strong>. Banc : <strong>+50 ppm sans pénalité</strong> mesurable, genou vers 50 ppm."
+      ],
+      "diagramme": {
+        "type": "timing",
+        "description": "Deux préambules à t et t+4 s, chacun avec un pic de corrélation ; la différence de phase τ₂−τ₁ = pente → SFO. Sous : un ré-échantillonneur dont le 'débit' est légèrement ≠ 1, corrigé en douceur.",
+        "svg_hint": "Montrer 'boucle type 2, erreur permanente nulle' comme légende."
+      },
+      "notes_orateur": "Différence pédagogique clé avec le CFO : CFO = FRÉQUENCE de la porteuse, mesuré et figé une fois par salve. SFO = FRÉQUENCE de l'HORLOGE d'échantillonnage, suivi en permanence. Les deux sont orthogonaux : la porteuse possède la phase, la SFO possède le débit. Sur une capture sans dérive, le débit se cale à l'unité → sortie octet-exacte."
+    },
+
+    {
+      "id": "SCRAMBLER",
+      "type": "content_two_col",
+      "eyebrow": "Partie 2 · Blanchiment (scrambler)",
+      "titre": "Scrambler : blanchir le signal pour tenir sur QO-100",
+      "idee_cle": "Un contenu à faible entropie (zéros, en-têtes) crée une raie porteuse résiduelle qui plafonne la puissance TX sur un transpondeur linéaire. On le blanchit.",
+      "bullets": [
+        "Problème : un bloc à <strong>faible entropie</strong> (padding, zéros, méta répétitive) a une moyenne biaisée → le modulateur émet une <strong>raie / porteuse résiduelle</strong> à 1100 Hz (mesurée +12 dB) qui <strong>plafonne la puissance crête</strong> et gaspille la linéarité de QO-100.",
+        "Solution : <strong>dispersion d'énergie (whitening)</strong> des octets d'information → 0 et 1 quasi équilibrés (ratio ≈ 0,5) → spectre plat, PAPR normalisée, plus de porteuse résiduelle.",
+        "Scrambler <strong>G3RUH auto-synchronisant</strong> (multiplicatif), polynôme <span class=\"mono\">G(x) = 1 + x¹² + x¹⁷</span>, état initial 0xACE1 (asymétrique, sans point fixe). Bit MSB d'abord.",
+        "Appliqué au niveau octet <strong>EN DEHORS de l'enveloppe FEC</strong> : avant FEC à l'émission (avant RaptorQ / avant l'encodage LDPC), après FEC à la réception → <strong>LDPC, Golay, entrelaceur, démappeur souple et boucle turbo restent intacts</strong>, ils travaillent de façon transparente sur le codeword blanchi.",
+        "Blanchit aussi les <strong>12 octets de contrôle du marker</strong> (avant Golay). <strong>Jamais</strong> blanchis : préambule, motif de sync du marker, warmup LMS, pilotes — ce sont des références de corrélation / entraînement, déjà à moyenne nulle.",
+        "<strong>Activé par défaut</strong> (kill-switch <span class=\"mono\">V3_NO_SCRAMBLER</span>). C'est un changement de format d'onde <strong>V4</strong> : les deux extrémités doivent être d'accord (bascule runtime pour interopérer avec un correspondant non blanchi)."
+      ],
+      "diagramme": {
+        "type": "spectre_avant_apres",
+        "description": "À gauche : spectre avec grosse raie DC/porteuse à 1100 Hz (contenu faible entropie). À droite : après scrambler, plancher plat sans raie. Sous : registre à décalage 17 bits avec taps x^12 et x^17.",
+        "svg_hint": "Souligner 'hors enveloppe FEC' avec un schéma TX: [source] → scramble → RaptorQ → LDPC → mod ; et RX symétrique inverse."
+      },
+      "notes_orateur": "Bien préciser que le scrambler ne change PAS la modulation ni le codage : c'est juste un XOR pseudo-aléatoire réversible sur les octets utiles. Le bénéfice PAPR/porteuse résiduelle est décisif sur un transpondeur LINÉAIRE (QO-100) où une raie fixe cape la puissance ; en NBFM écrêté c'est moins critique mais toujours propre. Auto-sync : le descrambler se resynchronise après 17 bits, pas de mot de sync nécessaire."
+    },
+
+    {
+      "id": "TURBO-RECAP",
+      "type": "content_table",
+      "eyebrow": "Partie 2 · Récapitulatif",
+      "titre": "Qui recale quoi, et à quelle cadence",
+      "table": {
+        "colonnes": ["Bloc", "Grandeur recalée", "Méthode", "Cadence"],
+        "lignes": [
+          ["CFO", "Fréquence porteuse (SSB/QO-100)", "Welch + gabarit RRC (grossier) → grille filtre adapté ±15 Hz (fin)", "1× par salve (verrouillé)"],
+          ["SFO", "Horloge d'échantillonnage (A/D, D/A)", "Timing DA 2-préambules → ré-échantillonneur lisse, boucle type 2", "Continu"],
+          ["Boucle turbo", "Canal + phase + bits", "FFE+DD-PLL souple ↔ LDPC SISO, jusqu'à 5 passes", "Par segment"],
+          ["Scrambler", "Statistique du signal (PAPR / raie)", "Whitening G3RUH hors FEC", "Chaque octet, à l'émission"]
+        ]
+      },
+      "notes_orateur": "Slide de synthèse. Message : ce ne sont pas des rustines empilées, mais des boucles ORTHOGONALES qui possèdent chacune une grandeur propre, ce qui évite qu'elles se combattent (loop-fighting). C'est ce découplage qui rend le récepteur turbo robuste à bas SNR sur QO-100."
+    }
+  ],
+
+  "references_canoniques": {
+    "turbo_equalization": "Tüchler, Koetter, Singer, 2002 — turbo equalization.",
+    "code_aided_estimation": "Colavolpe, Barbieri, Caire, 2005 — code-aided gain/σ² estimation.",
+    "ldpc_min_sum": "Chen & Fossorier, 2005 — normalized min-sum (~0,2 dB de la SPA).",
+    "timing_da": "Meyr, Digital Communication Receivers, ch. 5 — timing DA indépendant de la modulation.",
+    "cfo_estimation": "Mengali & D'Andrea ; Luise & Reggiannini — estimation de fréquence DA/NDA.",
+    "scrambler": "G3RUH (James Miller, 1991) — multiplicatif auto-synchronisant, 1 + x^12 + x^17."
+  },
+
+  "sources_code": [
+    "rust/modem-core/src/cfo.rs — CFO grossier/fin, deadband, template RRC",
+    "rust/modem-core-base/src/timing_tracker.rs + rust/modem-core/src/v3_session.rs (PreambleSfoTracker) — SFO",
+    "rust/modem-core/src/scrambler.rs + rust/modem-core-base/src/scrambler.rs — whitening G3RUH",
+    "rust/modem-core/src/v3_session.rs (canon_demod_segment) — cœur turbo SISO",
+    "docs/turbo_modem_reference.html — audit 15 blocs (B01–B15)"
+  ]
+}
