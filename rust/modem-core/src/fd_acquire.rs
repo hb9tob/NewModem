@@ -313,15 +313,34 @@ impl PreambleMatchedFilter {
         if cfo_hz == 0.0 {
             return self.best_match(window);
         }
+        // Factored into the CFO-invariant analytic transform + the per-cfo
+        // recentre-and-correlate, so a CFO grid can hoist the former out of the
+        // loop (see `best_match_from_analytic`). Redefining the method in terms
+        // of the two helpers keeps it bit-identical to the previous inline body.
+        let (z, usable) = self.analytic_signal(window)?;
+        self.best_match_from_analytic(&z, usable, cfo_hz)
+    }
+
+    /// The analytic (Hilbert) signal of `window`, zero-padded to `fft_size`,
+    /// computed with the struct's own plans — the **CFO-invariant** half of
+    /// [`best_match_derotated`](Self::best_match_derotated). Returns the raw
+    /// inverse-FFT buffer (length `fft_size`, only `[..usable]` meaningful; the
+    /// caller applies the `1/fft_size` normalisation) plus `usable`, or `None`
+    /// if `window` is shorter than the template.
+    ///
+    /// Hoisting this out of a CFO grid lets a caller pay ONE forward+inverse
+    /// transform for the whole grid instead of one per grid point — the turbo
+    /// gate's phase-2 hot path, which today re-derives this identical transform
+    /// at every `refine_grid` step.
+    pub fn analytic_signal(&self, window: &[f32]) -> Option<(Vec<Complex<f64>>, usize)> {
         if window.len() < self.n_template {
             return None;
         }
         let usable = window.len().min(self.fft_size);
 
-        // Analytic signal of the (zero-padded) window via the size-`fft_size`
-        // plans the struct already owns: FFT → keep the one-sided spectrum
-        // (double the positive freqs, zero the negatives, DC/Nyquist kept) →
-        // IFFT. `fft_size` is a power of two so `hn` is the exact Nyquist bin.
+        // FFT → keep the one-sided spectrum (double the positive freqs, zero the
+        // negatives, DC/Nyquist kept) → IFFT. `fft_size` is a power of two so
+        // `hn` is the exact Nyquist bin.
         let mut buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); self.fft_size];
         for (i, &w) in window[..usable].iter().enumerate() {
             buf[i] = Complex::new(w as f64, 0.0);
@@ -335,19 +354,124 @@ impl PreambleMatchedFilter {
             *b = Complex::new(0.0, 0.0);
         }
         self.inv.process(&mut buf);
+        Some((buf, usable))
+    }
+
+    /// Correlate a precomputed [`analytic_signal`](Self::analytic_signal)
+    /// recentred by `cfo_hz` — the per-grid-point half of
+    /// [`best_match_derotated`](Self::best_match_derotated). Given the analytic
+    /// buffer `z` (the raw inverse-FFT output from `analytic_signal` on the same
+    /// window) and `usable`, form `Re{ z · e^{-j2π·cfo·t} }` and run
+    /// [`best_match`](Self::best_match). For `cfo_hz != 0` and a `z` produced from
+    /// the same `window`, this is **bit-identical** to
+    /// `best_match_derotated(window, cfo_hz)`.
+    pub fn best_match_from_analytic(
+        &self,
+        z: &[Complex<f64>],
+        usable: usize,
+        cfo_hz: f64,
+    ) -> Option<PreambleMatch> {
         let inv_n = 1.0 / self.fft_size as f64;
 
         // Recentre: z(t)·e^{-j2π·cfo·t}, real part → an on-carrier real preamble.
         let w0 = -2.0 * std::f64::consts::PI * cfo_hz / AUDIO_RATE as f64;
         let recentred: Vec<f32> = (0..usable)
             .map(|i| {
-                let z = buf[i] * inv_n; // analytic sample
+                let z = z[i] * inv_n; // analytic sample
                 let (s, c) = (w0 * i as f64).sin_cos(); // e^{jw0 i}, w0 = -2π cfo/Fs
                 (z.re * c - z.im * s) as f32 // Re{ z · e^{-j2π cfo i/Fs} }
             })
             .collect();
 
         self.best_match(&recentred)
+    }
+
+    /// Correlate `window` against the template over a WHOLE CFO grid in one shot,
+    /// via the bin-shift identity: a carrier de-rotation is a circular shift of
+    /// the window's one-sided (analytic) spectrum, so the entire grid shares ONE
+    /// forward FFT and pays only one inverse FFT per grid point — vs
+    /// [`best_match_derotated`](Self::best_match_derotated)'s 4 FFTs *per point*
+    /// (analytic fwd+inv + best_match fwd+inv), and with none of its per-point
+    /// `sin_cos` recentre or repeated energy/peak passes.
+    ///
+    /// Returns the `(lag, metric, cfo)` of the grid's strongest peak (metric on
+    /// the same normalised `[0,1]` scale / `MF_ACQ_THRESHOLD` as `best_match`), or
+    /// `None` if `window` is shorter than the template or `cfos` is empty.
+    ///
+    /// GATE-ONLY / COARSE — two deliberate approximations vs `best_match_derotated`:
+    /// (1) each cfo is **bin-snapped** to `round(cfo·n/Fs)` (residual ≤ Fs/2n ≈
+    ///     0.18–0.37 Hz, far under the 3 Hz grid step and the ≥1.9 Hz main lobe);
+    /// (2) the per-lag energy normaliser is the grid-independent `Σwindow²`
+    ///     (exactly `best_match`'s cfo=0 normaliser), which differs from the
+    ///     recentred-signal energy only by the <few-% cos²-averaging term over the
+    ///     multi-hundred-cycle preamble.
+    /// The correlation numerator is EXACT for the snapped cfo. This is NOT a
+    /// substitute for `best_match_derotated` / the in-session fine-CFO estimate —
+    /// it only has to clear `MF_ACQ_THRESHOLD` and rank candidates for the gate.
+    pub fn best_match_cfo_grid(&self, window: &[f32], cfos: &[f64]) -> Option<(usize, f64, f64)> {
+        if window.len() < self.n_template || cfos.is_empty() {
+            return None;
+        }
+        let n = self.fft_size;
+        let usable = window.len().min(n);
+        let last_lag = usable - self.n_template;
+
+        // One-sided (analytic) spectrum S of the window: forward FFT, then double
+        // the positive freqs and zero the negatives (DC/Nyquist kept) — the exact
+        // spectrum whose IFFT is the analytic signal. We KEEP it and bin-shift it
+        // per cfo instead of IFFT-ing once per grid point.
+        let mut s: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n];
+        for (i, &w) in window[..usable].iter().enumerate() {
+            s[i] = Complex::new(w as f64, 0.0);
+        }
+        self.fwd.process(&mut s);
+        let hn = n / 2;
+        for c in s.iter_mut().take(hn).skip(1) {
+            *c *= 2.0;
+        }
+        for c in s.iter_mut().skip(hn + 1) {
+            *c = Complex::new(0.0, 0.0);
+        }
+
+        // Grid-independent sliding energy of the window (E_w), via prefix sums of
+        // w² — computed ONCE (vs best_match_derotated re-summing it per grid point).
+        let mut prefix = vec![0.0f64; usable + 1];
+        for i in 0..usable {
+            let w = window[i] as f64;
+            prefix[i + 1] = prefix[i] + w * w;
+        }
+
+        let inv_n = 1.0 / n as f64;
+        let mut work: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n];
+        let mut best: Option<(usize, f64, f64)> = None;
+        for &cfo in cfos {
+            // Carrier de-rotation e^{-j2π·cfo·i/Fs} == circular bin shift of the
+            // analytic spectrum: DFT(z·e^{-j2π k0 i/n})[k] = S[(k+k0) mod n].
+            let k0 = (cfo * n as f64 / AUDIO_RATE as f64)
+                .round()
+                .rem_euclid(n as f64) as usize;
+            // work[k] = S[(k+k0) mod n] · conj(template)[k]  (correlation spectrum).
+            for (k, wk) in work.iter_mut().enumerate() {
+                let src = (k + k0) & (n - 1); // n is a power of two
+                *wk = s[src] * self.template_spec_conj[k];
+            }
+            self.inv.process(&mut work);
+            // Peak of the normalised correlation metric over valid lags. The real
+            // part of the IFFT is the correlation of Re{recentred} with the real
+            // template (exact), since the template is real.
+            for lag in 0..=last_lag {
+                let corr = work[lag].re * inv_n;
+                let e_w = prefix[lag + self.n_template] - prefix[lag];
+                if e_w <= 0.0 {
+                    continue;
+                }
+                let metric = (corr * corr) / (self.template_energy * e_w);
+                if best.map(|(_, bm, _)| metric > bm).unwrap_or(true) {
+                    best = Some((lag, metric, cfo));
+                }
+            }
+        }
+        best
     }
 }
 
@@ -599,5 +723,128 @@ mod tests {
         assert_eq!(a.lag, b.lag);
         assert_eq!(a.frac.to_bits(), b.frac.to_bits());
         assert_eq!(a.metric.to_bits(), b.metric.to_bits());
+    }
+
+    /// The hoisted `analytic_signal` + `best_match_from_analytic` pair must be
+    /// **bit-for-bit** identical to the monolithic `best_match_derotated` for
+    /// every non-zero cfo — the correctness contract that lets the turbo gate
+    /// compute the analytic transform ONCE per filter and reuse it across the
+    /// whole CFO refine-grid. A single analytic buffer is reused for all cfos
+    /// (exactly what the gate does), so this also guards against the analytic
+    /// step accidentally depending on cfo.
+    #[test]
+    fn analytic_hoist_bit_identical_to_derotated() {
+        use std::f64::consts::PI;
+        let fs = AUDIO_RATE as f64;
+        let n_t = 2048usize;
+        let tones = [800.0, 1000.0, 1100.0, 1250.0, 1400.0];
+        let template: Vec<f32> = (0..n_t)
+            .map(|k| {
+                let t = k as f64 / fs;
+                (tones.iter().map(|&f| (2.0 * PI * f * t).sin()).sum::<f64>()
+                    / (tones.len() as f64).sqrt()) as f32
+            })
+            .collect();
+
+        let window_len = 20000usize;
+        let offset = 8000usize;
+        let mut window = noise(window_len, 0.1, 0x55AA);
+        let an = analytic(&template);
+        for k in 0..n_t {
+            let i = offset + k;
+            let ph = 2.0 * PI * 137.0 * i as f64 / fs;
+            let rot = Complex::new(ph.cos(), ph.sin());
+            window[i] += (an[k] * rot).re as f32;
+        }
+
+        let mf = PreambleMatchedFilter::new(&template, window_len);
+        // Hoist the analytic transform once, reuse across the whole grid.
+        let (z, usable) = mf.analytic_signal(&window).expect("window ≥ template");
+        // Cover positive/negative, small and near-±500 Hz offsets, and a grid
+        // step that lands exactly on 0.0 (which the gate routes to best_match).
+        for &cfo in &[137.0, -75.0, 3.0, -15.0, 250.0, -500.0, 500.0] {
+            let direct = mf.best_match_derotated(&window, cfo).expect("direct");
+            let hoisted = mf
+                .best_match_from_analytic(&z, usable, cfo)
+                .expect("hoisted");
+            assert_eq!(direct.lag, hoisted.lag, "lag mismatch at cfo={cfo}");
+            assert_eq!(
+                direct.frac.to_bits(),
+                hoisted.frac.to_bits(),
+                "frac mismatch at cfo={cfo}",
+            );
+            assert_eq!(
+                direct.metric.to_bits(),
+                hoisted.metric.to_bits(),
+                "metric mismatch at cfo={cfo}",
+            );
+        }
+    }
+
+    /// The bin-shift grid `best_match_cfo_grid` must agree with the reference
+    /// per-grid `best_match_derotated` scan on the WINNING (lag, cfo), and its
+    /// metric must track the reference to within a few percent (the grid-
+    /// independent Σw² normaliser + bin snap). Checked clean AND at ~6 dB SNR —
+    /// the QO-100 weakest-mode guard: the fast path must not lose a lock the slow
+    /// path finds, nor shift the peak.
+    #[test]
+    fn cfo_grid_matches_perpoint_derotated() {
+        use std::f64::consts::PI;
+        let fs = AUDIO_RATE as f64;
+        let n_t = 2048usize;
+        let tones = [800.0, 1000.0, 1100.0, 1250.0, 1400.0];
+        let template: Vec<f32> = (0..n_t)
+            .map(|k| {
+                let t = k as f64 / fs;
+                (tones.iter().map(|&f| (2.0 * PI * f * t).sin()).sum::<f64>()
+                    / (tones.len() as f64).sqrt()) as f32
+            })
+            .collect();
+        let mf = PreambleMatchedFilter::new(&template, 20000);
+        let an = analytic(&template);
+        // Coarse estimate 135 Hz (biased ~2 Hz off the true 137, as the real
+        // spectral coarse estimator is); fine grid ±15 Hz at 3 Hz steps.
+        let grid: Vec<f64> = (-5..=5).map(|k| 135.0 + k as f64 * 3.0).collect();
+
+        for &(noise_amp, seed, metric_tol) in &[(0.1f32, 0x55AA_u64, 0.06f64), (0.5, 0x9E37, 0.12)] {
+            let window_len = 20000usize;
+            let offset = 8000usize;
+            let mut window = noise(window_len, noise_amp, seed);
+            for k in 0..n_t {
+                let i = offset + k;
+                let ph = 2.0 * PI * 137.0 * i as f64 / fs;
+                let rot = Complex::new(ph.cos(), ph.sin());
+                window[i] += (an[k] * rot).re as f32;
+            }
+
+            // Reference: max over the grid of the exact per-point derotated MF.
+            let mut ref_best: Option<(usize, f64, f64)> = None;
+            for &cfo in &grid {
+                if let Some(m) = mf.best_match_derotated(&window, cfo) {
+                    if ref_best.map(|(_, bm, _)| m.metric > bm).unwrap_or(true) {
+                        ref_best = Some((m.lag, m.metric, cfo));
+                    }
+                }
+            }
+            let (rlag, rmetric, rcfo) = ref_best.expect("reference locked");
+            let (flag, fmetric, fcfo) = mf
+                .best_match_cfo_grid(&window, &grid)
+                .expect("fast grid locked");
+
+            assert_eq!(flag, rlag, "lag differs (noise={noise_amp})");
+            assert!(
+                (fcfo - rcfo).abs() <= 3.0,
+                "winning cfo differs: fast={fcfo} ref={rcfo} (noise={noise_amp})",
+            );
+            assert!(
+                fmetric >= MF_ACQ_THRESHOLD,
+                "fast metric {fmetric:.4} below floor (noise={noise_amp})",
+            );
+            assert!(
+                (fmetric - rmetric).abs() <= metric_tol * rmetric,
+                "fast metric {fmetric:.4} vs ref {rmetric:.4} exceeds {:.0}% (noise={noise_amp})",
+                metric_tol * 100.0,
+            );
+        }
     }
 }

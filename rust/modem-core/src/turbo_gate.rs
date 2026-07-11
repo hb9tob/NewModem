@@ -16,6 +16,7 @@
 
 use crate::cfo::{self, CfoBand};
 use crate::fd_acquire::{PreambleMatchedFilter, MF_ACQ_THRESHOLD};
+use crate::gate_mf::GateMf;
 use crate::profile::ProfileIndex;
 use crate::types::{AUDIO_RATE, RRC_SPAN_SYM};
 use crate::{modulator, preamble, rrc};
@@ -24,6 +25,21 @@ use crate::{modulator, preamble, rrc};
 /// (A/B testing and OTA safety). Read once at gate construction.
 fn cfo_enabled() -> bool {
     std::env::var_os("V3_NO_CFO").is_none()
+}
+
+/// The gate runs the f32 / real-FFT matched filter ([`GateMf`]) unless the
+/// `V3_NO_GATE_FASTPATH` kill-switch is set, in which case it falls back to the
+/// f64 [`PreambleMatchedFilter`]. Read once at gate construction.
+fn gate_fast_path() -> bool {
+    std::env::var_os("V3_NO_GATE_FASTPATH").is_none()
+}
+
+/// Within the f64 fallback (`V3_NO_GATE_FASTPATH` set), the phase-2 grid uses the
+/// bin-shift `best_match_cfo_grid` unless `V3_NO_GATE_FASTCFO` is ALSO set, which
+/// restores the exact per-grid-point `best_match_derotated`. (On the default f32
+/// fast path the phase-2 grid is always the f32 bin-shift.) Read once.
+fn gate_fast_cfo() -> bool {
+    std::env::var_os("V3_NO_GATE_FASTCFO").is_none()
 }
 
 
@@ -49,7 +65,12 @@ pub struct GateOpen {
 /// refined later from the first validated marker.
 struct GeomFilter {
     profile: ProfileIndex,
+    /// f64 exact matched filter — the fallback path and the numerical reference
+    /// (also the primitive the in-session acquisition shares).
     mf: PreambleMatchedFilter,
+    /// f32 / real-FFT matched filter with reusable scratch — the default gate
+    /// path ([`gate_fast_path`]).
+    gate_mf: GateMf,
     template_len: usize,
     /// Occupied-band signature for the coarse CFO estimate of this geometry.
     band: CfoBand,
@@ -71,10 +92,13 @@ impl GeomFilter {
             cfg.center_freq_hz,
         );
         let template_len = template.len();
-        let mf = PreambleMatchedFilter::new(&template, search_len.max(template_len));
+        let max_window = search_len.max(template_len);
+        let mf = PreambleMatchedFilter::new(&template, max_window);
+        let gate_mf = GateMf::new(&template, max_window);
         Self {
             profile,
             mf,
+            gate_mf,
             template_len,
             band: CfoBand::from_config(&cfg),
         }
@@ -95,6 +119,12 @@ pub struct TurboGate {
     /// Coarse CFO de-rotation enabled (off iff `V3_NO_CFO` is set). When off
     /// the gate de-rotates by 0.0 → byte-identical to the pre-CFO behaviour.
     cfo_enabled: bool,
+    /// Use the f32 / real-FFT [`GateMf`] (off iff `V3_NO_GATE_FASTPATH` is set →
+    /// f64 fallback). See [`gate_fast_path`].
+    fast_path: bool,
+    /// Within the f64 fallback, phase-2 uses the bin-shift grid (off iff
+    /// `V3_NO_GATE_FASTCFO` is set → exact per-point). See [`gate_fast_cfo`].
+    fast_cfo: bool,
 }
 
 impl TurboGate {
@@ -129,6 +159,8 @@ impl TurboGate {
             scan_interval,
             next_scan_abs: 0,
             cfo_enabled: cfo_enabled(),
+            fast_path: gate_fast_path(),
+            fast_cfo: gate_fast_cfo(),
         }
     }
 
@@ -180,6 +212,8 @@ impl TurboGate {
             scan_interval,
             next_scan_abs: 0,
             cfo_enabled: cfo_enabled(),
+            fast_path: gate_fast_path(),
+            fast_cfo: gate_fast_cfo(),
         }
     }
 
@@ -198,19 +232,32 @@ impl TurboGate {
         let start_rel = ring.len().saturating_sub(self.search_len);
         let win = &ring[start_rel..];
 
-        // Phase 1 — cheap detection at cfo = 0 (the pre-CFO behaviour, exactly).
-        // A clean or small-offset signal locks here, byte-identically; the
-        // expensive CFO search below only runs when this finds nothing.
+        // Flags captured into locals so the filter loops can borrow
+        // `&mut self.filters` (the f32 `GateMf` reuses scratch → needs `&mut`)
+        // without also borrowing `self`'s flag fields.
+        let fast_path = self.fast_path;
+        let fast_cfo = self.fast_cfo;
+        let cfo_enabled = self.cfo_enabled;
+
+        // Phase 1 — cheap detection at cfo = 0 (the pre-CFO behaviour). A clean or
+        // small-offset signal locks here; the expensive CFO search below only runs
+        // when this finds nothing. Default = f32 `GateMf`; `V3_NO_GATE_FASTPATH`
+        // falls back to the f64 `PreambleMatchedFilter`.
         let mut best: Option<(f64, usize, ProfileIndex, f64)> = None;
-        for f in &self.filters {
+        for f in &mut self.filters {
             if win.len() < f.template_len {
                 continue;
             }
-            if let Some(m) = f.mf.best_match(win) {
-                if m.metric >= MF_ACQ_THRESHOLD
-                    && best.map(|(bm, _, _, _)| m.metric > bm).unwrap_or(true)
+            let hit = if fast_path {
+                f.gate_mf.best_match(win)
+            } else {
+                f.mf.best_match(win).map(|m| (m.lag, m.metric))
+            };
+            if let Some((lag, metric)) = hit {
+                if metric >= MF_ACQ_THRESHOLD
+                    && best.map(|(bm, _, _, _)| metric > bm).unwrap_or(true)
                 {
-                    best = Some((m.metric, m.lag, f.profile, 0.0));
+                    best = Some((metric, lag, f.profile, 0.0));
                 }
             }
         }
@@ -221,9 +268,9 @@ impl TurboGate {
         // it with a small MF-metric grid (the grid absorbs the modem spectrum's
         // intrinsic ~10 Hz centroid bias). Idle noise has no in-band energy, so
         // this never pays the grid on an idle channel.
-        if best.is_none() && self.cfo_enabled {
+        if best.is_none() && cfo_enabled {
             if let Some(psd) = cfo::coarse_psd(win) {
-                for f in &self.filters {
+                for f in &mut self.filters {
                     if win.len() < f.template_len {
                         continue;
                     }
@@ -234,13 +281,32 @@ impl TurboGate {
                     if coarse == 0.0 {
                         continue; // already covered by phase 1
                     }
-                    for cfo in cfo::refine_grid(coarse) {
-                        if let Some(m) = f.mf.best_match_derotated(win, cfo) {
-                            if m.metric >= MF_ACQ_THRESHOLD
-                                && best.map(|(bm, _, _, _)| m.metric > bm).unwrap_or(true)
-                            {
-                                best = Some((m.metric, m.lag, f.profile, cfo));
+                    let grid: Vec<f64> = cfo::refine_grid(coarse).collect();
+                    // Default (f32 fast path) and the f64 bin-shift fallback both
+                    // evaluate the whole grid in one shot (one shared forward FFT +
+                    // one inverse per point) via `best_match_cfo_grid`. Only when
+                    // BOTH `V3_NO_GATE_FASTPATH` and `V3_NO_GATE_FASTCFO` are set do
+                    // we run the exact per-point `best_match_derotated` reference.
+                    let hit: Option<(usize, f64, f64)> = if fast_path {
+                        f.gate_mf.best_match_cfo_grid(win, &grid)
+                    } else if fast_cfo {
+                        f.mf.best_match_cfo_grid(win, &grid)
+                    } else {
+                        let mut b: Option<(usize, f64, f64)> = None;
+                        for &cfo in &grid {
+                            if let Some(m) = f.mf.best_match_derotated(win, cfo) {
+                                if b.map(|(_, bm, _)| m.metric > bm).unwrap_or(true) {
+                                    b = Some((m.lag, m.metric, cfo));
+                                }
                             }
+                        }
+                        b
+                    };
+                    if let Some((lag, metric, cfo)) = hit {
+                        if metric >= MF_ACQ_THRESHOLD
+                            && best.map(|(bm, _, _, _)| metric > bm).unwrap_or(true)
+                        {
+                            best = Some((metric, lag, f.profile, cfo));
                         }
                     }
                 }
@@ -344,6 +410,54 @@ mod tests {
             (open.cfo_hz - 108.0).abs() <= 15.0,
             "reported cfo_hz {:.1} far from 108 Hz",
             open.cfo_hz,
+        );
+    }
+
+    /// The default production path (f32 `GateMf` + bin-shift grid) must open on a
+    /// real carrier-offset burst at the SAME preamble position + family + carrier
+    /// as the fully-exact f64 per-grid-point `best_match_derotated` reference
+    /// (`V3_NO_GATE_FASTPATH` + `V3_NO_GATE_FASTCFO`), with a metric that tracks it
+    /// closely and still clears the floor — the whole phase-2 CFO acquisition
+    /// (the QO-100 case) is a speed change, not a detection change.
+    #[test]
+    fn fast_path_open_matches_exact_reference() {
+        let profile = ProfileIndex::HighPlus;
+        let burst = build_burst(profile, 4000);
+        let win = TurboGate::forced(profile).search_len().min(burst.len());
+        let shifted = shift_carrier(&burst[..win], 137.0);
+
+        // Default production path: f32 GateMf + bin-shift grid.
+        let mut fast = TurboGate::forced(profile);
+        fast.fast_path = true;
+        // Fully-exact reference: f64 per-point best_match_derotated.
+        let mut exact = TurboGate::forced(profile);
+        exact.fast_path = false;
+        exact.fast_cfo = false;
+
+        let of = fast.poll(&shifted, 0).expect("fast path opened");
+        let oe = exact.poll(&shifted, 0).expect("exact path opened");
+        // Coarse position: the Σw² normaliser (vs the recentred-signal energy) plus
+        // f32 roundoff can nudge the integer peak by ~1 sample. The gate only needs
+        // a coarse anchor (the DSP replay re-acquires sub-sample), so allow a few.
+        assert!(
+            of.preamble_abs.abs_diff(oe.preamble_abs) <= 2,
+            "preamble_abs differs by >2 samples: fast={} exact={}",
+            of.preamble_abs,
+            oe.preamble_abs,
+        );
+        assert_eq!(of.profile, oe.profile, "profile differs");
+        assert!(of.metric >= MF_ACQ_THRESHOLD, "fast metric {} below floor", of.metric);
+        assert!(
+            (of.metric - oe.metric).abs() <= 0.12 * oe.metric,
+            "fast metric {:.4} vs exact {:.4} exceeds 12%",
+            of.metric,
+            oe.metric,
+        );
+        assert!(
+            (of.cfo_hz - oe.cfo_hz).abs() <= 3.0,
+            "fast cfo {:.1} vs exact {:.1} differ >3 Hz",
+            of.cfo_hz,
+            oe.cfo_hz,
         );
     }
 

@@ -33,6 +33,7 @@ pub mod gate;
 pub mod traits;
 pub mod fd_acquire;
 pub mod cfo;
+pub(crate) mod gate_mf;
 pub mod turbo_gate;
 pub mod v3_modem;
 pub mod v3_session;

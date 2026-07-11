@@ -926,13 +926,66 @@ fn benchdetect(args: &[String]) {
     }
     let gper = t1.elapsed().as_secs_f64() * 1000.0 / giters as f64;
     println!(
-        "NEW FFT TurboGate::auto poll: {:.3} ms/poll (scans recent ~{} samples, all geometries)\n\
+        "NEW FFT TurboGate::auto poll (idle/phase-1): {:.3} ms/poll (scans recent ~{} samples, all geometries)\n\
          Pi 4 ~10-15x slower -> ~{:.1}-{:.1} ms/poll  (throttled to ~5 polls/s)",
         gper,
         gate.search_len(),
         gper * 10.0,
         gper * 15.0,
     );
+
+    // PHASE-2 (carrier-offset) bench — the QO-100 hot path. Build a real burst
+    // modulated 137 Hz off the gate's template carrier so phase-1 (cfo=0) misses
+    // and the phase-2 CFO refine-grid fires over every band. Run with and without
+    // V3_NO_GATE_FASTCFO to compare the analytic-hoist fast path vs the
+    // per-grid-point best_match_derotated.
+    {
+        use modem_core::rrc;
+        let profile = ProfileIndex::HighPlus;
+        let cfg = profile.to_config();
+        let (sps, pitch) =
+            rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau).unwrap();
+        let taps = rrc::rrc_taps(cfg.beta, RRC_SPAN_SYM, sps);
+        let payload = vec![0xAAu8; 4000];
+        let n_packets = ((payload.len() + 31) / 32) as u32;
+        let symbols = modem_core::frame::build_superframe_v3_range(
+            &payload, &cfg, 0xABCD_1234, 0x01, 0x1234, 0, n_packets,
+        );
+        // Modulate 137 Hz above the nominal carrier → a genuine carrier-offset burst.
+        let burst =
+            modem_core::modulator::modulate(&symbols, sps, pitch, &taps, cfg.center_freq_hz + 137.0);
+        let mut g = modem_core::turbo_gate::TurboGate::auto();
+        let wlen = g.search_len().min(burst.len());
+        let win = burst[..wlen].to_vec();
+        let fast_path = std::env::var_os("V3_NO_GATE_FASTPATH").is_none();
+        let fast_cfo = std::env::var_os("V3_NO_GATE_FASTCFO").is_none();
+        let mode = if fast_path {
+            "f32-binshift"
+        } else if fast_cfo {
+            "f64-binshift"
+        } else {
+            "f64-perpoint"
+        };
+        let _ = g.poll(&win, 0); // warm
+        let piters = 40;
+        let t2 = Instant::now();
+        let mut ph = 0u64;
+        for _ in 0..piters {
+            g.reset_to(ph);
+            let _ = g.poll(&win, ph);
+            ph += 1;
+        }
+        let pper = t2.elapsed().as_secs_f64() * 1000.0 / piters as f64;
+        g.reset_to(0);
+        let opened = g.poll(&win, 0).is_some();
+        println!(
+            "PHASE-2 CFO poll (offset burst, mode={mode}, opened={opened}): {:.3} ms/poll\n\
+             Pi 4 ~10-15x slower -> ~{:.0}-{:.0} ms/poll  (V3_NO_GATE_FASTPATH / V3_NO_GATE_FASTCFO to compare)",
+            pper,
+            pper * 10.0,
+            pper * 15.0,
+        );
+    }
 }
 
 fn main() {
