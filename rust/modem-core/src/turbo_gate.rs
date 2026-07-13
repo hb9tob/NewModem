@@ -42,6 +42,40 @@ fn gate_fast_cfo() -> bool {
     std::env::var_os("V3_NO_GATE_FASTCFO").is_none()
 }
 
+/// Wall-clock self-throttle enabled unless `V3_NO_GATE_SELFTHROTTLE` is set.
+/// When on, the gate spaces its next scan by at least the audio-time it would
+/// take to consume this poll's wall duration ×[`SELF_THROTTLE_K`], so a poll
+/// that overruns its audio budget (thermal throttle, cold-cache Ultra FFT,
+/// scheduler preemption) backs the gate OFF instead of running back-to-back and
+/// falling out of real-time. Read once at construction.
+fn gate_self_throttle() -> bool {
+    std::env::var_os("V3_NO_GATE_SELFTHROTTLE").is_none()
+}
+
+/// Slow phase-2 (CFO) cadence enabled unless `V3_NO_GATE_CFO_SLOW` is set. The
+/// carrier offset (QO-100 LNB) is quasi-static, so re-running the expensive CFO
+/// grid 5×/s buys nothing — cheap phase-1 runs every poll and gates the CFO
+/// search to ~[`CFO_SCAN_INTERVAL_MULT`]× the phase-1 interval. Costs
+/// acquisition LATENCY only, not detection (the search window overlaps the
+/// slower cadence, so no audio is skipped). Read once at construction.
+fn gate_cfo_slow() -> bool {
+    std::env::var_os("V3_NO_GATE_CFO_SLOW").is_none()
+}
+
+/// Per-poll gate timing logged to stderr when `V3_LOG_GATE` is set (also surfaced
+/// via [`TurboGate::last_poll_ms`] for the worker log on the GUI).
+fn gate_log() -> bool {
+    std::env::var_os("V3_LOG_GATE").is_some()
+}
+
+/// Self-throttle factor: bound the gate to ≤ 1/K of real-time.
+const SELF_THROTTLE_K: f64 = 3.0;
+
+/// Phase-2 (CFO) cadence = this × the phase-1 scan interval (~200 ms → ~800 ms).
+/// Kept below `search_len` in samples so consecutive CFO windows overlap and no
+/// audio is skipped.
+const CFO_SCAN_INTERVAL_MULT: u64 = 4;
+
 
 /// A gate "open": a preamble was detected on raw audio; the worker should seek
 /// the DSP here and let the marker validation confirm it.
@@ -125,6 +159,23 @@ pub struct TurboGate {
     /// Within the f64 fallback, phase-2 uses the bin-shift grid (off iff
     /// `V3_NO_GATE_FASTCFO` is set → exact per-point). See [`gate_fast_cfo`].
     fast_cfo: bool,
+    /// Wall-clock self-throttle (off iff `V3_NO_GATE_SELFTHROTTLE`). See
+    /// [`gate_self_throttle`].
+    self_throttle: bool,
+    /// Slow phase-2 (CFO) cadence (off iff `V3_NO_GATE_CFO_SLOW`). See
+    /// [`gate_cfo_slow`].
+    cfo_slow: bool,
+    /// Next absolute ring-head at which phase-2 (CFO) is allowed to run (a
+    /// separate, slower throttle than `next_scan_abs`; only used when `cfo_slow`).
+    next_cfo_scan_abs: u64,
+    /// Phase-2 cadence in samples (`CFO_SCAN_INTERVAL_MULT × scan_interval`).
+    cfo_scan_interval: u64,
+    /// Log per-poll gate timing to stderr (`V3_LOG_GATE`).
+    log_gate: bool,
+    /// Wall time (ms) of the most recent heavy poll — surfaced for the worker log.
+    last_poll_ms: f64,
+    /// Whether the most recent heavy poll ran the phase-2 CFO grid.
+    last_ran_cfo: bool,
 }
 
 impl TurboGate {
@@ -161,6 +212,13 @@ impl TurboGate {
             cfo_enabled: cfo_enabled(),
             fast_path: gate_fast_path(),
             fast_cfo: gate_fast_cfo(),
+            self_throttle: gate_self_throttle(),
+            cfo_slow: gate_cfo_slow(),
+            next_cfo_scan_abs: 0,
+            cfo_scan_interval: scan_interval * CFO_SCAN_INTERVAL_MULT,
+            log_gate: gate_log(),
+            last_poll_ms: 0.0,
+            last_ran_cfo: false,
         }
     }
 
@@ -214,6 +272,13 @@ impl TurboGate {
             cfo_enabled: cfo_enabled(),
             fast_path: gate_fast_path(),
             fast_cfo: gate_fast_cfo(),
+            self_throttle: gate_self_throttle(),
+            cfo_slow: gate_cfo_slow(),
+            next_cfo_scan_abs: 0,
+            cfo_scan_interval: scan_interval * CFO_SCAN_INTERVAL_MULT,
+            log_gate: gate_log(),
+            last_poll_ms: 0.0,
+            last_ran_cfo: false,
         }
     }
 
@@ -228,7 +293,7 @@ impl TurboGate {
         if ring.len() < min_template || head < self.next_scan_abs {
             return None;
         }
-        self.next_scan_abs = head + self.scan_interval;
+        let t0 = std::time::Instant::now();
         let start_rel = ring.len().saturating_sub(self.search_len);
         let win = &ring[start_rel..];
 
@@ -268,7 +333,16 @@ impl TurboGate {
         // it with a small MF-metric grid (the grid absorbs the modem spectrum's
         // intrinsic ~10 Hz centroid bias). Idle noise has no in-band energy, so
         // this never pays the grid on an idle channel.
-        if best.is_none() && cfo_enabled {
+        // Phase-2 runs at a SLOWER cadence than phase-1 when `cfo_slow` (the LNB
+        // offset is quasi-static): cheap phase-1 gates whether the expensive CFO
+        // grid runs at all, and it runs at most every `cfo_scan_interval`. Cuts
+        // the busy-channel duty ~5× at the cost of acquisition latency only — the
+        // search window overlaps the slower cadence, so no audio is skipped.
+        let run_cfo = best.is_none()
+            && cfo_enabled
+            && (!self.cfo_slow || head >= self.next_cfo_scan_abs);
+        if run_cfo {
+            self.next_cfo_scan_abs = head + self.cfo_scan_interval;
             if let Some(psd) = cfo::coarse_psd(win) {
                 for f in &mut self.filters {
                     if win.len() < f.template_len {
@@ -313,6 +387,29 @@ impl TurboGate {
             }
         }
 
+        // Wall-clock self-throttle: space the next scan by at least this poll's
+        // wall duration (×K) in audio-time, so a poll that overruns its audio
+        // budget backs the gate OFF instead of running back-to-back and losing
+        // real-time. Floored at the nominal scan interval.
+        let wall_s = t0.elapsed().as_secs_f64();
+        self.last_poll_ms = wall_s * 1000.0;
+        self.last_ran_cfo = run_cfo;
+        let throttle = if self.self_throttle {
+            self.scan_interval
+                .max((SELF_THROTTLE_K * wall_s * AUDIO_RATE as f64) as u64)
+        } else {
+            self.scan_interval
+        };
+        self.next_scan_abs = head + throttle;
+        if self.log_gate {
+            eprintln!(
+                "[gate] poll {:.1} ms cfo={} throttle={:.0} ms",
+                self.last_poll_ms,
+                run_cfo,
+                throttle as f64 / AUDIO_RATE as f64 * 1000.0,
+            );
+        }
+
         let (metric, lag, profile, cfo_hz) = best?;
         Some(GateOpen {
             preamble_abs: origin + (start_rel + lag) as u64,
@@ -339,6 +436,18 @@ impl TurboGate {
     /// window). The worker keeps at least this much ring while searching.
     pub fn search_len(&self) -> usize {
         self.search_len
+    }
+
+    /// Wall time (ms) of the most recent heavy poll, and whether it ran the
+    /// phase-2 CFO grid — for the worker log (`V3_LOG_GATE`). 0.0 before the
+    /// first heavy poll.
+    pub fn last_poll_ms(&self) -> f64 {
+        self.last_poll_ms
+    }
+
+    /// Whether the most recent heavy poll ran the phase-2 CFO grid.
+    pub fn last_ran_cfo(&self) -> bool {
+        self.last_ran_cfo
     }
 }
 
@@ -459,6 +568,36 @@ mod tests {
             of.cfo_hz,
             oe.cfo_hz,
         );
+    }
+
+    /// Phase-2 (the expensive CFO grid) must run on a SLOWER cadence than
+    /// phase-1: cheap phase-1 gates every poll, but the CFO search fires only
+    /// once every `CFO_SCAN_INTERVAL_MULT` scan intervals. This is the
+    /// busy-channel duty-cycle fix (a poll in-between does phase-1 only).
+    #[test]
+    fn phase2_cadence_is_slower_than_phase1() {
+        let mut gate = TurboGate::auto();
+        gate.self_throttle = false; // deterministic phase-1 cadence for the test
+        let n = gate.search_len();
+        // Deterministic pseudo-noise, no preamble → phase-1 finds nothing → the
+        // phase-2 cadence gate governs whether the CFO block runs.
+        let mut s: u64 = 0x00C0_FFEE;
+        let noise: Vec<f32> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 0.2
+            })
+            .collect();
+        let si = (AUDIO_RATE as u64) / 5; // scan_interval
+
+        assert!(gate.poll(&noise, 0).is_none());
+        assert!(gate.last_ran_cfo(), "poll 1 must run phase-2");
+        // One scan interval later (< the CFO interval): phase-1 only.
+        assert!(gate.poll(&noise, si).is_none());
+        assert!(!gate.last_ran_cfo(), "a poll inside the CFO interval must skip phase-2");
+        // At the CFO interval: phase-2 runs again.
+        assert!(gate.poll(&noise, si * CFO_SCAN_INTERVAL_MULT).is_none());
+        assert!(gate.last_ran_cfo(), "poll at the CFO interval must run phase-2 again");
     }
 
     #[test]

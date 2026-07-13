@@ -1042,6 +1042,11 @@ fn run_turbo_worker(
     // burst-end cross-family reset we re-seed `warm` with this many tail samples
     // so a near-back-to-back burst already begun is not lost.
     let gate_search_len = auto_gate.as_ref().map(|g| g.search_len()).unwrap_or(0);
+    // `V3_LOG_GATE`: surface each heavy gate poll's wall time in the worker log.
+    // The gate itself `eprintln`s the same line, but the GUI has no stderr, so we
+    // mirror it here. Logged on change of `last_poll_ms` (one line per heavy poll).
+    let log_gate = std::env::var_os("V3_LOG_GATE").is_some();
+    let mut last_gate_ms = -1.0f64;
 
     let mut deemph =
         deemphasis_enabled.then(|| DeemphasisLpf::calibrated(AUDIO_RATE as f32));
@@ -1222,6 +1227,18 @@ fn run_turbo_worker(
                 let open = auto_gate
                     .as_mut()
                     .and_then(|g| g.poll(&warm, warm_origin));
+                if log_gate {
+                    if let Some(g) = auto_gate.as_ref() {
+                        let ms = g.last_poll_ms();
+                        if ms != last_gate_ms {
+                            last_gate_ms = ms;
+                            worker_log(&format!(
+                                "[gate] heavy poll {ms:.1} ms cfo={}",
+                                g.last_ran_cfo()
+                            ));
+                        }
+                    }
+                }
                 if let Some(open) = open {
                     let fam = open.profile;
                     worker_log(&format!(
