@@ -2736,11 +2736,13 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
   grid-template-columns: minmax(140px, 0.8fr) minmax(210px, 1.3fr) minmax(210px, 1.3fr);
   gap: 0.4rem;
   flex: 0 0 auto;
-  /* Hard cap: the top block must never exceed ~18% of the tab height so
-     the RF spectrum + waterfall below always keep the bulk of the screen. */
-  max-height: 18vh;
+  /* Content-sized (no hard vh cap): the top strip is only as tall as its
+     cards need (~160px), so the fixed controls at the bottom of each card —
+     the ⚙ SDR-params button and the monitor sound-card select — are never
+     clipped on short/large windows alike. The strip stays compact, so the
+     RF spectrum + waterfall below still keep the bulk of the panel. The
+     narrow-panel query below shrinks these cards further for the Pi kiosk. */
   min-height: 0;
-  overflow: hidden;
 }
 .radio-card {
   background: #15171c;
