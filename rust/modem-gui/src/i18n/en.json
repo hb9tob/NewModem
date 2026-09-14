@@ -342,6 +342,8 @@
   "tx.parts_with_k": "K={k} needed for decoding",
   "tx.dur_blocks": "{base}{dur}, {n} blocks emitted",
   "tx.emit_n_more": "emit +{count} RaptorQ blocks",
+  "tx.error_callsign_required": "Set a callsign in Settings before transmitting.",
+  "tx.error_device_required": "Select a TX device in Settings before transmitting.",
   "tx.compress_stale_suffix": " · stale",
   "tx.passthrough_short": "Native AVIF → passthrough (no re-encoding)",
   "tx.drop_busy": "loading or compression already in progress",

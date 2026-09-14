@@ -84,6 +84,7 @@ export const txState = {
   estimate: null,
   // Tracking of an in-progress transmission.
   progress: null,
+  error: null,
   restartRxAfter: false,
 };
 
@@ -1048,6 +1049,20 @@ export async function txStart() {
     logEvent("tx_start_skipped", { reason: "pas d'estimation (compresse d'abord)" });
     return;
   }
+  const callsign = (txState.resumeCallsign || currentSettings.callsign || "").trim();
+  const txDevice = (currentSettings.tx_device || "").trim();
+  if (!callsign) {
+    txState.error = t("tx.error_callsign_required");
+    updateTxProgressText();
+    logEvent("tx_start_skipped", { reason: "indicatif vide" });
+    return;
+  }
+  if (!txDevice) {
+    txState.error = t("tx.error_device_required");
+    updateTxProgressText();
+    logEvent("tx_start_skipped", { reason: "périphérique TX vide" });
+    return;
+  }
   // Kiosk: show a transient info bubble (auto-hides after 5 s) with
   // the same content the desktop hover tooltip carries. The "long
   // transmission" wording uses the same threshold as refreshTxButtons
@@ -1074,6 +1089,7 @@ export async function txStart() {
   txState.restartRxAfter = rxWasActive && !fdx;
   txState.txActive = true;
   txState.progress = null;
+  txState.error = null;
   updateTxProgressText();
   refreshTxButtons();
   logEvent("tx_start", {
@@ -1088,7 +1104,6 @@ export async function txStart() {
   // burst), or the continuation point for a re-sent / resumed session. This
   // guarantees every TX (and every TX more) adds NEW fountain symbols rather
   // than re-emitting packets recipients already hold.
-  const callsign = txState.resumeCallsign || currentSettings.callsign || "";
   const filename = getTxFilename();
   const nInitial = computeNInitial() || 1;
   const prior =
@@ -1106,7 +1121,7 @@ export async function txStart() {
           mode: txState.mode,
           callsign,
           filename,
-          tx_device: currentSettings.tx_device || "",
+          tx_device: txDevice,
           esi_start: prior,
           count: nInitial,
         },
@@ -1120,7 +1135,7 @@ export async function txStart() {
           mode: txState.mode,
           callsign,
           filename,
-          tx_device: currentSettings.tx_device || "",
+          tx_device: txDevice,
           repair_pct: txState.repairPct,
         },
       });
@@ -1131,6 +1146,8 @@ export async function txStart() {
   } catch (err) {
     logEvent("tx_start_error", { message: String(err) });
     txState.txActive = false;
+    txState.error = String(err);
+    updateTxProgressText();
     refreshTxButtons();
     await maybeRestartRx();
   }
@@ -1251,6 +1268,11 @@ export async function maybeRestartRx() {
 export function updateTxProgressText() {
   const txt = document.getElementById("tx-progress-text");
   if (!txt) return;
+  txt.classList.toggle("error", !!txState.error);
+  if (txState.error) {
+    txt.textContent = txState.error;
+    return;
+  }
   const p = txState.progress;
   const est = txState.estimate;
   if (!p) {
@@ -1314,6 +1336,7 @@ export function refreshDuplexTxBar() {
 }
 
 export function onTxProgress(payload) {
+  txState.error = null;
   txState.progress = payload;
   updateTxProgressText();
   if (isDuplexActive()) {
@@ -1340,6 +1363,7 @@ export async function onTxComplete(payload) {
   logEvent("tx_complete", payload);
   txState.txActive = false;
   txState.progress = null;
+  txState.error = null;
   updateTxProgressText();
   refreshTxButtons();
   refreshDuplexTxBar();
@@ -1357,6 +1381,7 @@ export async function onTxError(payload) {
   logEvent("tx_error", payload);
   txState.txActive = false;
   txState.progress = null;
+  txState.error = payload && payload.message ? payload.message : String(payload);
   updateTxProgressText();
   refreshTxButtons();
   refreshDuplexTxBar();
