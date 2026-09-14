@@ -1,0 +1,10 @@
+*
+!rust/
+!rust/**
+!scripts/
+!scripts/fix_appimage_egl.sh
+
+rust/target/
+rust/modem-gui/src-tauri/binaries/
+rust/modem-gui/src-tauri/secret.txt
+rust/newmodem-collector/secret.txt

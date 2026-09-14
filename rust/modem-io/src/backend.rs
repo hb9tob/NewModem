@@ -51,10 +51,23 @@ impl AudioBackend {
             AudioBackend::Cpal => "cpal",
         }
     }
+
+    /// Resolve the configured backend for a concrete device. Virtual ALSA
+    /// aliases such as `default`, `pulse`, and `pipewire` cannot be opened as
+    /// direct `hw:` PCMs, so route those through cpal instead.
+    pub fn for_device(self, device_name: &str) -> Self {
+        #[cfg(target_os = "linux")]
+        if self == AudioBackend::AlsaDirect && crate::alsa_pcm::hw_pcm_name(device_name).is_none() {
+            return AudioBackend::Cpal;
+        }
+
+        self
+    }
 }
 
-/// Build the TX sample sink for `backend`.
-pub fn make_sink(backend: AudioBackend) -> Arc<dyn SampleSink> {
+/// Build the TX sample sink for `backend` and the selected device.
+pub fn make_sink(backend: AudioBackend, device_name: &str) -> Arc<dyn SampleSink> {
+    let backend = backend.for_device(device_name);
     #[cfg(target_os = "linux")]
     {
         if backend == AudioBackend::AlsaDirect {
@@ -71,6 +84,7 @@ pub fn start_capture(
     backend: AudioBackend,
     device_name: &str,
 ) -> Result<(CaptureHandle, Receiver<Vec<f32>>), String> {
+    let backend = backend.for_device(device_name);
     #[cfg(target_os = "linux")]
     {
         if backend == AudioBackend::AlsaDirect {
@@ -79,4 +93,41 @@ pub fn start_capture(
     }
     let _ = backend;
     cpal_capture::start(device_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudioBackend;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn direct_alsa_uses_cpal_for_virtual_devices() {
+        for name in ["default", "pulse", "pipewire"] {
+            assert_eq!(
+                AudioBackend::AlsaDirect.for_device(name),
+                AudioBackend::Cpal
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn direct_alsa_stays_direct_for_hardware_devices() {
+        assert_eq!(
+            AudioBackend::AlsaDirect.for_device("hw:CARD=S102i,DEV=0"),
+            AudioBackend::AlsaDirect
+        );
+        assert_eq!(
+            AudioBackend::AlsaDirect.for_device("plughw:CARD=S102i,DEV=0"),
+            AudioBackend::AlsaDirect
+        );
+    }
+
+    #[test]
+    fn explicit_cpal_is_preserved() {
+        assert_eq!(
+            AudioBackend::Cpal.for_device("hw:CARD=S102i,DEV=0"),
+            AudioBackend::Cpal
+        );
+    }
 }

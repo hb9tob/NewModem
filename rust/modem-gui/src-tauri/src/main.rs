@@ -506,9 +506,10 @@ fn resolve_tx_sink(device_name: &str, cfg: &Settings) -> Result<Arc<dyn SampleSi
     } else {
         // Sound-card TX: pick ALSA-direct vs cpal per the persisted
         // audio_backend setting (Linux only; cpal everywhere else).
-        Ok(modem_io::make_sink(modem_io::AudioBackend::from_setting(
-            &cfg.audio_backend,
-        )))
+        Ok(modem_io::make_sink(
+            modem_io::AudioBackend::from_setting(&cfg.audio_backend),
+            device_name,
+        ))
     }
 }
 

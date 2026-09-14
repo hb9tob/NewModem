@@ -314,6 +314,19 @@ Détails et dépannage : [`rust/modem-gui/BUILD_DEBIAN.md`](rust/modem-gui/BUILD
 ./make-portable.sh "" --skip-build   # saute les cargo build
 ```
 
+**AppImage x86_64 via Docker** (notamment pour Arch Linux) :
+
+```bash
+make appimage-docker
+./dist/appimage/nbfm-modem-gui-x86_64.AppImage
+```
+
+Cette cible ne demande que Docker avec BuildKit et produit un unique
+exécutable qui contient la GUI et le sidecar CLI. Le build reproductible se
+fait sous Debian 12 pour rester compatible avec les distributions à glibc
+plus récentes. Le SDK SDRplay n'étant pas redistribuable, cette variante
+active Pluto et RTL-SDR mais pas SDRplay.
+
 ### Build — Raspberry Pi 5 (Debian 13 trixie, 7" écran tactile)
 
 Build natif identique au flux Linux ci-dessus, avec deux particularités :
@@ -724,6 +737,18 @@ Details and troubleshooting: [`rust/modem-gui/BUILD_DEBIAN.md`](rust/modem-gui/B
 ./make-portable.sh v0.1.0-test       # explicit tag
 ./make-portable.sh "" --skip-build   # skip cargo build
 ```
+
+**x86_64 AppImage via Docker** (including on Arch Linux):
+
+```bash
+make appimage-docker
+./dist/appimage/nbfm-modem-gui-x86_64.AppImage
+```
+
+This target only requires Docker with BuildKit and produces one executable
+containing the GUI and CLI sidecar. It builds reproducibly on Debian 12 for
+compatibility with newer glibc distributions. Because the SDRplay SDK cannot
+be redistributed, this variant enables Pluto and RTL-SDR but not SDRplay.
 
 ### Build — Raspberry Pi 5 (Debian 13 trixie, 7" touchscreen)
 
