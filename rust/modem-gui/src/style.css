@@ -939,6 +939,9 @@ body.compressing-lock {
   text-align: center;
   min-height: 1.2em;
 }
+.tx-progress-text.error {
+  color: #ff8a80;
+}
 
 .rx-device-label {
   font-family: ui-monospace, monospace;

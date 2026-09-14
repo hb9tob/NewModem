@@ -342,6 +342,8 @@
   "tx.parts_with_k": "K={k} nécessaires au décodage",
   "tx.dur_blocks": "{base}{dur}, {n} blocs émis",
   "tx.emit_n_more": "émettre +{count} blocs RaptorQ",
+  "tx.error_callsign_required": "Renseignez un indicatif dans Paramètres avant d'émettre.",
+  "tx.error_device_required": "Sélectionnez un périphérique TX dans Paramètres avant d'émettre.",
   "tx.compress_stale_suffix": " · obsolète",
   "tx.passthrough_short": "AVIF natif → passthrough (pas de ré-encodage)",
   "tx.drop_busy": "chargement ou compression déjà en cours",
