@@ -1,5 +1,13 @@
 # NewModem
 
+> ⚠️ **Version en développement.** La branche `main` porte la 0.21.0, non
+> publiée et en cours de validation. Pour un usage en station, préférez la
+> dernière [Release](https://github.com/hb9tob/NewModem/releases/latest).
+>
+> ⚠️ **Development version.** The `main` branch carries 0.21.0, which is
+> unreleased and still being validated. For on-air use, prefer the latest
+> [Release](https://github.com/hb9tob/NewModem/releases/latest).
+
 [Français](#français) — [English](#english)
 
 ---
