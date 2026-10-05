@@ -60,7 +60,8 @@ fn friendly(name: &str, cards: &std::collections::HashMap<String, String>) -> St
     // backend opens untouched — tag them so the combo makes the difference
     // obvious. The virtual aliases below route through the sound server
     // (PulseAudio/PipeWire/dmix), which can resample and which the
-    // ALSA-direct backend refuses; flag them as such.
+    // ALSA-direct backend refuses unless the operator opted into the cpal
+    // fallback (`audio_sound_server_fallback`); flag them as such.
     if let Some(rest) = name.strip_prefix("hw:CARD=") {
         let card_id = rest.split(',').next().unwrap_or(rest);
         if let Some(desc) = cards.get(card_id) {

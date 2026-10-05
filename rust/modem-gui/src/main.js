@@ -116,7 +116,7 @@ async function loadSettings() {
       ptt_enabled: false, ptt_port: "",
       ptt_use_rts: true, ptt_use_dtr: false,
       ptt_rts_tx_high: true, ptt_dtr_tx_high: true,
-      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, audio_backend: "alsa", collector_url: "",
+      tx_attenuation_db: 0, tx_preemphasis_enabled: false, tx_save_wav: false, rx_deemphasis_enabled: false, rx_allow_legacy_grid: true, audio_backend: "alsa", audio_sound_server_fallback: false, collector_url: "",
       tx_quality: 10, tx_repair_pct: 5,
       tx_mode: "HIGH", tx_resize: "800x600",
       tx_free_w: 800, tx_free_h: 600,
@@ -154,6 +154,12 @@ async function loadSettings() {
   if (scrambler) scrambler.checked = currentSettings.scrambler_enabled !== false;
   const alsaBackend = document.getElementById("audio-backend-alsa");
   if (alsaBackend) alsaBackend.checked = (currentSettings.audio_backend || "alsa") !== "cpal";
+  const soundServerFallback = document.getElementById("audio-sound-server-fallback");
+  if (soundServerFallback) {
+    soundServerFallback.checked = !!currentSettings.audio_sound_server_fallback;
+    // Only meaningful while ALSA direct is on (cpal accepts the aliases anyway).
+    soundServerFallback.disabled = !!alsaBackend && !alsaBackend.checked;
+  }
   const fdx = document.getElementById("full-duplex-enabled");
   if (fdx) fdx.checked = !!currentSettings.full_duplex_enabled;
 

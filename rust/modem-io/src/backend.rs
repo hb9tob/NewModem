@@ -52,22 +52,56 @@ impl AudioBackend {
         }
     }
 
-    /// Resolve the configured backend for a concrete device. Virtual ALSA
-    /// aliases such as `default`, `pulse`, and `pipewire` cannot be opened as
-    /// direct `hw:` PCMs, so route those through cpal instead.
-    pub fn for_device(self, device_name: &str) -> Self {
+    /// Resolve the configured backend for a concrete device.
+    ///
+    /// The sound-server aliases (`default`, `pulse`, `pipewire`) cannot be
+    /// opened as direct `hw:` PCMs. By default ALSA-direct refuses them (the
+    /// open fails downstream), because routing the modem through a sound
+    /// server can resample behind the operator's back. Only when the
+    /// operator has explicitly opted in (`allow_sound_server`) are those
+    /// three aliases routed through cpal instead. Any other non-`hw:` name
+    /// still errors out.
+    pub fn for_device(self, device_name: &str, allow_sound_server: bool) -> Self {
         #[cfg(target_os = "linux")]
-        if self == AudioBackend::AlsaDirect && crate::alsa_pcm::hw_pcm_name(device_name).is_none() {
+        if self == AudioBackend::AlsaDirect
+            && allow_sound_server
+            && SOUND_SERVER_ALIASES.contains(&device_name)
+        {
             return AudioBackend::Cpal;
         }
-
+        let _ = (device_name, allow_sound_server);
         self
     }
 }
 
+/// Sound-server aliases the device list offers next to the `hw:` cards.
+#[cfg(target_os = "linux")]
+const SOUND_SERVER_ALIASES: [&str; 3] = ["default", "pulse", "pipewire"];
+
+/// [`AudioBackend::for_device`] plus a log line whenever the opt-in
+/// sound-server fallback actually overrides ALSA-direct, so the audio log
+/// shows the modem is not on a direct `hw:` PCM.
+fn resolve(backend: AudioBackend, device_name: &str, allow_sound_server: bool) -> AudioBackend {
+    let resolved = backend.for_device(device_name, allow_sound_server);
+    #[cfg(target_os = "linux")]
+    if resolved != backend {
+        crate::alsa_pcm::log(&format!(
+            "[audio] WARNING: ALSA-direct overridden for '{device_name}' — \
+             routing through cpal / the sound server (may resample)"
+        ));
+    }
+    resolved
+}
+
 /// Build the TX sample sink for `backend` and the selected device.
-pub fn make_sink(backend: AudioBackend, device_name: &str) -> Arc<dyn SampleSink> {
-    let backend = backend.for_device(device_name);
+/// `allow_sound_server` is the operator opt-in described on
+/// [`AudioBackend::for_device`].
+pub fn make_sink(
+    backend: AudioBackend,
+    device_name: &str,
+    allow_sound_server: bool,
+) -> Arc<dyn SampleSink> {
+    let backend = resolve(backend, device_name, allow_sound_server);
     #[cfg(target_os = "linux")]
     {
         if backend == AudioBackend::AlsaDirect {
@@ -83,8 +117,9 @@ pub fn make_sink(backend: AudioBackend, device_name: &str) -> Arc<dyn SampleSink
 pub fn start_capture(
     backend: AudioBackend,
     device_name: &str,
+    allow_sound_server: bool,
 ) -> Result<(CaptureHandle, Receiver<Vec<f32>>), String> {
-    let backend = backend.for_device(device_name);
+    let backend = resolve(backend, device_name, allow_sound_server);
     #[cfg(target_os = "linux")]
     {
         if backend == AudioBackend::AlsaDirect {
@@ -101,10 +136,21 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn direct_alsa_uses_cpal_for_virtual_devices() {
+    fn direct_alsa_refuses_sound_server_aliases_by_default() {
         for name in ["default", "pulse", "pipewire"] {
             assert_eq!(
-                AudioBackend::AlsaDirect.for_device(name),
+                AudioBackend::AlsaDirect.for_device(name, false),
+                AudioBackend::AlsaDirect
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn direct_alsa_uses_cpal_for_sound_server_aliases_when_opted_in() {
+        for name in ["default", "pulse", "pipewire"] {
+            assert_eq!(
+                AudioBackend::AlsaDirect.for_device(name, true),
                 AudioBackend::Cpal
             );
         }
@@ -112,22 +158,39 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn direct_alsa_stays_direct_for_hardware_devices() {
+    fn opt_in_does_not_cover_unknown_names() {
         assert_eq!(
-            AudioBackend::AlsaDirect.for_device("hw:CARD=S102i,DEV=0"),
+            AudioBackend::AlsaDirect.for_device("hdmi:CARD=NVidia,DEV=0", true),
             AudioBackend::AlsaDirect
         );
         assert_eq!(
-            AudioBackend::AlsaDirect.for_device("plughw:CARD=S102i,DEV=0"),
+            AudioBackend::AlsaDirect.for_device("some stale name", true),
             AudioBackend::AlsaDirect
         );
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn direct_alsa_stays_direct_for_hardware_devices() {
+        for allow in [false, true] {
+            assert_eq!(
+                AudioBackend::AlsaDirect.for_device("hw:CARD=S102i,DEV=0", allow),
+                AudioBackend::AlsaDirect
+            );
+            assert_eq!(
+                AudioBackend::AlsaDirect.for_device("plughw:CARD=S102i,DEV=0", allow),
+                AudioBackend::AlsaDirect
+            );
+        }
+    }
+
+    #[test]
     fn explicit_cpal_is_preserved() {
-        assert_eq!(
-            AudioBackend::Cpal.for_device("hw:CARD=S102i,DEV=0"),
-            AudioBackend::Cpal
-        );
+        for allow in [false, true] {
+            assert_eq!(
+                AudioBackend::Cpal.for_device("hw:CARD=S102i,DEV=0", allow),
+                AudioBackend::Cpal
+            );
+        }
     }
 }

@@ -363,6 +363,11 @@ export async function persistSettings() {
   if (scrambler) currentSettings.scrambler_enabled = !!scrambler.checked;
   const alsaBackend = document.getElementById("audio-backend-alsa");
   if (alsaBackend) currentSettings.audio_backend = alsaBackend.checked ? "alsa" : "cpal";
+  const soundServerFallback = document.getElementById("audio-sound-server-fallback");
+  if (soundServerFallback) {
+    currentSettings.audio_sound_server_fallback = !!soundServerFallback.checked;
+    soundServerFallback.disabled = !!alsaBackend && !alsaBackend.checked;
+  }
 
   // SDR-specific config is mutated directly on
   // `currentSettings.sdr_settings.backends[id].config` by the
@@ -495,6 +500,18 @@ export function setupSettingsTab() {
   }
   const alsaCb = document.getElementById("audio-backend-alsa");
   if (alsaCb) alsaCb.addEventListener("change", persistSettings);
+  const soundServerCb = document.getElementById("audio-sound-server-fallback");
+  if (soundServerCb) {
+    soundServerCb.addEventListener("change", () => {
+      // Enabling routes the modem through the sound server: make the
+      // operator acknowledge the risk; a refusal reverts the checkbox.
+      if (soundServerCb.checked && !confirm(t("settings.audio_sound_server_fallback_confirm"))) {
+        soundServerCb.checked = false;
+        return;
+      }
+      persistSettings();
+    });
+  }
   const stopRxBtn = document.getElementById("settings-stop-rx-btn");
   if (stopRxBtn) {
     stopRxBtn.addEventListener("click", async () => {

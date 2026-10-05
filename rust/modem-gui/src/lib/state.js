@@ -26,6 +26,7 @@ export let currentSettings = {
   rx_turbo: false,
   scrambler_enabled: true,
   audio_backend: "alsa",
+  audio_sound_server_fallback: false,
   collector_url: "",
   tx_quality: 10,
   tx_repair_pct: 5,

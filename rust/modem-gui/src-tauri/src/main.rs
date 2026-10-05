@@ -509,6 +509,7 @@ fn resolve_tx_sink(device_name: &str, cfg: &Settings) -> Result<Arc<dyn SampleSi
         Ok(modem_io::make_sink(
             modem_io::AudioBackend::from_setting(&cfg.audio_backend),
             device_name,
+            cfg.audio_sound_server_fallback,
         ))
     }
 }
@@ -651,7 +652,11 @@ fn build_capture_session(
             // Sound-card capture: ALSA-direct vs cpal per the persisted
             // audio_backend setting (Linux only; cpal everywhere else).
             let backend = modem_io::AudioBackend::from_setting(&cfg.audio_backend);
-            let (h, rx) = modem_io::start_capture(backend, device_name)?;
+            let (h, rx) = modem_io::start_capture(
+                backend,
+                device_name,
+                cfg.audio_sound_server_fallback,
+            )?;
             let dropped = h.dropped_samples.clone();
             (CaptureKind::Cpal(h), rx, dropped, false)
         };
@@ -2212,7 +2217,8 @@ fn sounding_rx_start_capture(
         (CaptureKind::Sdr(device, cap_handle), rx)
     } else {
         let backend = modem_io::AudioBackend::from_setting(&cfg.audio_backend);
-        let (h, rx) = modem_io::start_capture(backend, &device_name)?;
+        let (h, rx) =
+            modem_io::start_capture(backend, &device_name, cfg.audio_sound_server_fallback)?;
         (CaptureKind::Cpal(h), rx)
     };
 

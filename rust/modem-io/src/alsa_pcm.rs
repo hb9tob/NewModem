@@ -20,7 +20,9 @@ use alsa::ValueOr;
 /// - a bare `CARD=Device,DEV=0` token → `hw:CARD=Device,DEV=0`.
 /// - high-level aliases (`default`/`pulse`/`pipewire`) and non-card names
 ///   (SDR composites, HDMI) → `None`: the caller errors out, since the
-///   whole point of this backend is to bypass those layers.
+///   whole point of this backend is to bypass those layers. (The three
+///   sound-server aliases never get here when the operator has opted into
+///   the cpal fallback — see `AudioBackend::for_device`.)
 pub fn hw_pcm_name(device_name: &str) -> Option<String> {
     if let Some(rest) = device_name.strip_prefix("hw:") {
         return Some(format!("hw:{rest}"));

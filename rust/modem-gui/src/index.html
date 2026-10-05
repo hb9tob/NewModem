@@ -412,6 +412,18 @@
             Raspberry Pi. Décocher pour revenir au backend cpal si la carte
             refuse l'ouverture directe. Sans effet hors Linux.
           </p>
+          <label class="ptt-row" style="margin-top: 0.7rem;">
+            <input type="checkbox" id="audio-sound-server-fallback">
+            <span data-i18n="settings.audio_sound_server_fallback">Autoriser le serveur son avec ALSA direct</span>
+          </label>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n-html="settings.audio_sound_server_fallback_hint_html">
+            <strong>Déconseillé.</strong> Avec ALSA direct, les entrées
+            « via serveur son » (<code>default</code>, <code>pulse</code>,
+            <code>pipewire</code>) sont normalement refusées. Cocher pour
+            les faire passer par cpal : le serveur son peut alors
+            rééchantillonner ou traiter l'audio et dégrader fortement le
+            modem. Sans effet hors Linux.
+          </p>
           <!-- Generic SDR RX panel. The frontend's `renderSdrPanel("rx")`
                in main.js fills this from `BackendCapabilities` of the
                currently-selected SDR backend. Adding a new backend is

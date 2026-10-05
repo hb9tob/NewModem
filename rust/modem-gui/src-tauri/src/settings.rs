@@ -116,6 +116,14 @@ pub struct Settings {
     #[serde(default = "default_audio_backend")]
     pub audio_backend: String,
 
+    /// Opt-in: with the ALSA-direct backend, let the sound-server aliases
+    /// (`default` / `pulse` / `pipewire`) fall back to cpal instead of
+    /// erroring out. Off by default — the sound server can resample
+    /// behind the operator's back, which is what ALSA-direct exists to
+    /// avoid. The GUI asks for confirmation before enabling it.
+    #[serde(default)]
+    pub audio_sound_server_fallback: bool,
+
     /// Base URL of the Phase-D collector. Pre-filled with
     /// [`DEFAULT_COLLECTOR_URL`] so out-of-the-box installs talk to the
     /// shared aggregator at `hb9tob.duckdns.org`. The user can override
@@ -437,6 +445,7 @@ impl Default for Settings {
             rx_turbo: false,
             scrambler_enabled: true,
             audio_backend: default_audio_backend(),
+            audio_sound_server_fallback: false,
             collector_url: default_collector_url(),
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),
