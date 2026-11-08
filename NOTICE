@@ -1,0 +1,93 @@
+NewModem — licensing notice
+===========================
+
+Copyright (C) 2026 Olivier Maillard (HB9TOB) and contributors.
+
+NewModem is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the file LICENSE for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+
+1. Component with a different licence
+-------------------------------------
+
+`rust/newmodem-collector/` is licensed under the **GNU Affero General Public
+License, version 3 or later** (SPDX: `AGPL-3.0-or-later`); see
+`rust/newmodem-collector/LICENSE`.
+
+Rationale: the collector is a network-facing HTTP service meant to be hosted.
+Under the plain GPL, an operator could run a modified instance without ever
+publishing the modifications. The AGPL closes that gap. The collector is a
+standalone binary and depends on no `modem-*` crate, so this does not affect
+the licence of the modem itself.
+
+Everything else in this repository — the `modem-*` crates, the Tauri GUI, the
+`nbfm-modem` CLI, the study scripts and the documentation — is
+GPL-3.0-or-later.
+
+
+2. Additional permission under GNU GPL version 3 section 7
+----------------------------------------------------------
+
+If you modify this Program, or any covered work, by linking or combining it
+with the SDRplay API (`sdrplay_api` / `libsdrplay_api`, a proprietary library
+distributed by SDRplay Limited), or with a modified version of that library,
+the licensors of this Program grant you additional permission to convey the
+resulting work.
+
+This additional permission is limited to the SDRplay API and does not extend
+to any other non-free component.
+
+Note that the `modem-sdrplay` crate loads that library at **run time** via
+`dlopen` (through `libloading`), not as an ELF `NEEDED` dependency, and the
+distributed binaries do not contain any part of it: the library has to be
+installed separately by the user from SDRplay. The permission above is
+belt-and-braces for anyone distributing a build with SDRplay support enabled.
+
+
+3. Third-party native libraries
+-------------------------------
+
+For the benefit of anyone redistributing a build, the native libraries this
+program can use are all GPL-compatible:
+
+  librtlsdr      GPL-2.0-or-later  (copyleft; the "or later" permits GPLv3)
+  libiio         LGPL-2.1-or-later
+  libasound/ALSA LGPL-2.1-or-later
+  SoapySDR       Boost Software License 1.0
+  WebKitGTK      LGPL-2.0-or-later / LGPL-2.1-or-later
+  sdrplay_api    proprietary — see section 2
+
+The Rust dependency tree (706 third-party crates) is MIT, Apache-2.0,
+BSD, ISC, Zlib, Unicode-3.0, MPL-2.0 or dual-licensed combinations thereof.
+MPL-2.0 crates are GPL-compatible by their own section 3.3 ("Secondary
+Licenses"). Note that the presence of Apache-2.0-only crates makes this work
+incompatible with GPL-2.0-**only**; GPLv3 is required.
+
+
+4. Pending contributor consent
+------------------------------
+
+The licence above was added on 2026-11-08, after the commits it covers. The
+author of commits `cbb5de6` and `5b074c1` (git author `xerxes`) has not yet
+confirmed relicensing consent. Pending that confirmation, the following are
+NOT yet covered by the licence stated above:
+
+  docker/appimage.Dockerfile
+  scripts/fix_appimage_egl.sh
+  Makefile
+  .dockerignore
+  the portions of those two commits that touch rust/modem-gui/src/{index.html,
+    style.css, tabs/tx.js, i18n/en.json, i18n/fr.json},
+    rust/modem-gui/src-tauri/{src/main.rs,tauri.conf.json} and
+    rust/modem-io/src/backend.rs
+
+This section is to be deleted once consent is recorded (or once those parts
+have been reimplemented independently).

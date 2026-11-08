@@ -2,6 +2,8 @@
 name = "modem-worker"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "GUI-agnostic TX/RX orchestration for the NBFM modem (extracted from modem-gui in phase 2 of layered-arch)"
 
 [dependencies]

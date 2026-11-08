@@ -2,6 +2,8 @@
 name = "modem-core"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "NBFM audio modem library — APSK/PSK/QPSK + LDPC WiMAX"
 
 [dependencies]

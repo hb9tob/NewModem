@@ -2,6 +2,8 @@
 name = "modem-sdr-dsp"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "Shared NBFM signal-processing primitives for SDR backends — Rust ports of GNU Radio's analog NBFM blocks (quadrature_demod_cf, frequency_modulator_fc, fm_deemph, fm_preemph) plus polyphase resamplers locked to integer ratios against 48 kHz."
 publish = false
 

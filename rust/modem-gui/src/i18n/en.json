@@ -192,6 +192,8 @@
   "settings.legend_fdx": "Full-duplex",
   "settings.fdx_enable": "Allow simultaneous transmit and receive",
   "settings.fdx_hint": "By default, transmission interrupts reception (and restarts it after TX). When enabled: both run in parallel (useful with an RX device distinct from the TX device, e.g. SDRplay for RX + sound card for TX). A second progress bar (purple → blue) appears above the RX bar during transmission. Avoid this if RX and TX share the same half-duplex audio chain.",
+  "settings.legend_about": "About",
+  "settings.about_license": "NewModem — © 2026 Olivier Maillard (HB9TOB). Free software under the GNU GPL v3 or later; the sounding collector is AGPL v3. Source code and full licence: github.com/hb9tob/NewModem",
 
   "sessions.refresh": "Refresh",
   "sessions.count_zero": "0 sessions",

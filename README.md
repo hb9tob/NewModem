@@ -435,6 +435,44 @@ Les bancs `study/*.py` utilisent radioconda :
 
 ---
 
+### Licence
+
+NewModem est un logiciel libre, distribué sous **GNU General Public License
+version 3 ou ultérieure** (`GPL-3.0-or-later`). Voir le fichier
+[LICENSE](LICENSE).
+
+Ce choix est délibéré : la GPL garantit que **tout fork reste libre**. Si vous
+distribuez une version modifiée — binaire compris — vous devez en fournir le
+code source sous la même licence.
+
+Deux particularités, détaillées dans [NOTICE](NOTICE) :
+
+- **`rust/newmodem-collector/` est sous AGPL-3.0-or-later.** C'est un service
+  HTTP destiné à être hébergé : l'AGPL impose de publier les modifications même
+  lorsque le logiciel n'est que *mis à disposition par le réseau*, ce que la GPL
+  seule n'exige pas. Le collecteur est un binaire autonome, cela n'affecte pas
+  la licence du modem.
+- **Permission additionnelle GPLv3 §7 pour l'API SDRplay**, qui est
+  propriétaire. Elle autorise explicitement la distribution d'un build avec
+  support SDRplay. L'API est chargée dynamiquement à l'exécution et n'est
+  jamais incluse dans les binaires distribués — l'utilisateur l'installe
+  lui-même.
+
+Les bibliothèques natives utilisables (librtlsdr, libiio, ALSA, SoapySDR) sont
+toutes compatibles GPL ; la liste figure dans [NOTICE](NOTICE).
+
+Pour contribuer, voir [CONTRIBUTING.md](CONTRIBUTING.md) : le projet utilise un
+**DCO** (`Signed-off-by`) et non un CLA, afin que personne — pas même l'auteur
+principal — ne puisse refermer le projet unilatéralement.
+
+> ⚠ La licence a été ajoutée le 2026-11-08, après coup. L'outillage de build
+> AppImage (`docker/`, `scripts/fix_appimage_egl.sh`, `Makefile`,
+> `.dockerignore`) et quelques portions de la GUI provenant des commits
+> `cbb5de6` et `5b074c1` attendent encore l'accord de relicenciement de leur
+> auteur ; voir la section 4 de [NOTICE](NOTICE).
+
+---
+
 ## English
 
 Audio modem for image transmission over amateur-radio NBFM repeaters.
@@ -854,3 +892,39 @@ The `study/*.py` benchmarks use radioconda:
 | `modem_ber_bench.py` | Multi-constellation BER vs symbol rate |
 | `modem_apsk16_ftn_bench.py` | 16-APSK + FTN benchmark |
 | `modem_ldpc_ber_bench.py` | WiMAX 2304 LDPC LNMS benchmark |
+
+---
+
+### License
+
+NewModem is free software, distributed under the **GNU General Public License
+version 3 or later** (`GPL-3.0-or-later`). See [LICENSE](LICENSE).
+
+The choice is deliberate: the GPL guarantees that **every fork stays free**. If
+you distribute a modified version — binaries included — you must provide its
+source under the same licence.
+
+Two specifics, detailed in [NOTICE](NOTICE):
+
+- **`rust/newmodem-collector/` is AGPL-3.0-or-later.** It is an HTTP service
+  meant to be hosted: the AGPL requires publishing modifications even when the
+  software is merely *made available over a network*, which the plain GPL does
+  not. The collector is a standalone binary, so this does not affect the
+  modem's licence.
+- **Additional permission under GPLv3 section 7 for the SDRplay API**, which is
+  proprietary. It explicitly allows distributing a build with SDRplay support.
+  The API is loaded dynamically at run time and is never bundled in the
+  distributed binaries — the user installs it themselves.
+
+The native libraries this program can use (librtlsdr, libiio, ALSA, SoapySDR)
+are all GPL-compatible; see [NOTICE](NOTICE) for the list.
+
+To contribute, see [CONTRIBUTING.md](CONTRIBUTING.md): the project uses a
+**DCO** (`Signed-off-by`) rather than a CLA, so that nobody — not even the lead
+author — can close the project down unilaterally.
+
+> ⚠ The licence was added on 2026-11-08, after the fact. The AppImage build
+> tooling (`docker/`, `scripts/fix_appimage_egl.sh`, `Makefile`,
+> `.dockerignore`) and a few GUI portions coming from commits `cbb5de6` and
+> `5b074c1` are still awaiting their author's relicensing consent; see
+> section 4 of [NOTICE](NOTICE).

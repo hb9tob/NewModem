@@ -2,6 +2,8 @@
 name = "modem-rtlsdr"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "RTL-SDR (RTL2832U + Rafael Micro tuners, including the RTL-SDR Blog V4) backend for the NBFM modem. Loads librtlsdr at runtime via libloading so the GUI binary still launches on machines where the driver isn't installed — list_devices() degrades to an empty list and the Paramètres panel surfaces a 'Bibliothèque manquante' status."
 publish = false
 

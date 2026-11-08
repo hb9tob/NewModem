@@ -2,6 +2,11 @@
 members = ["modem-core-base", "modem-core", "modem-cli", "modem-framing", "modem-gui/src-tauri", "modem-io", "modem-pluto", "modem-rtlsdr", "modem-sdr", "modem-sdr-dsp", "modem-sdr-radio", "modem-sdrplay", "modem-worker", "modem-worker-base", "newmodem-collector"]
 resolver = "2"
 
+[workspace.package]
+authors = ["Olivier Maillard (HB9TOB) <hb9tob@gmail.com>"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/hb9tob/NewModem"
+
 [workspace.dependencies]
 num-complex = "0.4"
 rustfft = "6"

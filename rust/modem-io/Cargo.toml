@@ -2,6 +2,8 @@
 name = "modem-io"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "Audio I/O backends for the NBFM modem (cpal devices + capture, future SDR sinks). Extracted from modem-gui in phase 3 of layered-arch."
 
 [dependencies]

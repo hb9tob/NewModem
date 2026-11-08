@@ -2,6 +2,8 @@
 name = "modem-sdr-radio"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "Backend-agnostic Radio-tab runtime for the NBFM modem: wideband RF + audio spectra, S-meter, and hybrid digital-NCO / hardware-LO tune-command application. Shared by every SDR backend (Pluto / SDRplay / RTL-SDR) so the GUI sees one uniform telemetry + control surface. Hardware LO / gain writes are delegated to the backend via the RadioHardware trait."
 publish = false
 

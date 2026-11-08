@@ -2,6 +2,8 @@
 name = "modem-core-base"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "Shared DSP primitives for NewModem modems — constellations, LDPC, RRC, FFE, PLL, Golay, demodulator (V3 and 2x both depend on this)"
 
 [dependencies]

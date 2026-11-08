@@ -2,6 +2,8 @@
 name = "modem-sdrplay"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "SDRplay RSPduo (closed binary API 3.x) backend for the NBFM modem. RX-only — opens libsdrplay_api, configures one tuner of the RSPduo, runs the radio-faithful demod chain from modem-sdr-dsp, and exposes the same `mpsc::Receiver<Vec<f32>>` shape as the cpal soundcard backend so rx_worker is agnostic to which radio fed it."
 publish = false
 

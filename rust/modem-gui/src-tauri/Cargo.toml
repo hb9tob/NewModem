@@ -2,6 +2,8 @@
 name = "modem-gui"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "NBFM modem GUI — Tauri 2 receiver"
 
 [[bin]]

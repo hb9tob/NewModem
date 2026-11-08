@@ -2,6 +2,8 @@
 name = "modem-framing"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
 description = "Transport-agnostic framing utilities — payload envelope, app header, RaptorQ fountain codec. Reusable across modem families and over non-RF transports (UDP, …)."
 
 [dependencies]
