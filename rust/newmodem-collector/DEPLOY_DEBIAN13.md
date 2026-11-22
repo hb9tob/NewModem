@@ -308,6 +308,27 @@ axum rejette si l'upload dépasse `--max-upload-mb`, et nginx rejette
 silencieusement (413) si l'upload dépasse `client_max_body_size` —
 **les deux limites doivent évoluer ensemble**.
 
+### 8.2 Journaux du modem
+
+`POST /api/v1/journal` reçoit les journaux envoyés par la GUI, la page publique
+`/journals` les liste.
+
+- Stockage : `journals/` à côté de `--reports-dir`, donc
+  `/var/lib/newmodem-collector/journals`, déjà couvert par `ReadWritePaths`.
+  Autre emplacement : `--journals-dir`.
+- Limites : 20 Mio par journal, 2 Gio au total (`--journals-quota-mb`). Quota
+  atteint ⇒ envoi refusé, supprimer de vieux dossiers.
+- nginx : `client_max_body_size` ≥ 22m.
+- Mise à jour d'une install existante : procédure « MAJ du binaire » ci-dessus,
+  puis vérifier :
+
+```bash
+curl -sI https://hb9tob.duckdns.org/journals | head -1   # → 200
+```
+
+Retrait d'un journal à la demande d'un OM :
+supprimer son dossier sous `journals/<date>/`, l'index suit immédiatement.
+
 ## 9. Troubleshooting
 
 | Symptôme | Cause / fix |

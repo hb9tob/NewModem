@@ -5,6 +5,8 @@
 //! `<reports_dir>/<YYYY-MM-DD>/<callsign>_<HHMMSS>_<short_hash>/`, and
 //! exposes an HTML index that globs that directory.
 //!
+//! Modem journals are stored and listed separately, see `journals`.
+//!
 //! No database: the filesystem IS the source of truth. The admin can
 //! `rm -rf` any folder and the index reflects it immediately.
 
@@ -29,6 +31,8 @@ use tokio::fs;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+
+mod journals;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -59,6 +63,14 @@ struct Cli {
     #[arg(long, default_value = "/var/lib/newmodem-collector/reports")]
     reports_dir: PathBuf,
 
+    /// Modem journals root. Default: `journals` next to the reports root.
+    #[arg(long)]
+    journals_dir: Option<PathBuf>,
+
+    /// Total storage allowed to the modem journals, in megabytes.
+    #[arg(long, default_value_t = 2048)]
+    journals_quota_mb: u64,
+
     /// Max upload size, in megabytes. Guard-rail against abuse.
     #[arg(long, default_value_t = 50)]
     max_upload_mb: usize,
@@ -68,6 +80,8 @@ struct Cli {
 struct AppState {
     reports_dir: Arc<PathBuf>,
     max_upload_bytes: usize,
+    journals_dir: Arc<PathBuf>,
+    journals_quota_bytes: u64,
 }
 
 #[tokio::main]
@@ -96,7 +110,18 @@ async fn main() -> anyhow::Result<()> {
     let upload_limit =
         DefaultBodyLimit::max(cli.max_upload_mb * 1024 * 1024 + MULTIPART_OVERHEAD_BYTES);
 
+    let journals_dir = cli
+        .journals_dir
+        .clone()
+        .unwrap_or_else(|| cli.reports_dir.with_file_name("journals"));
+    fs::create_dir_all(&journals_dir).await?;
+    info!("journals dir = {}", journals_dir.display());
+    let journal_limit =
+        DefaultBodyLimit::max(journals::MAX_JOURNAL_BYTES + MULTIPART_OVERHEAD_BYTES);
+
     let state = AppState {
+        journals_dir: Arc::new(journals_dir),
+        journals_quota_bytes: cli.journals_quota_mb * 1024 * 1024,
         reports_dir: Arc::new(cli.reports_dir.clone()),
         max_upload_bytes: cli.max_upload_mb * 1024 * 1024,
     };
@@ -105,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index_html))
         .route("/sondage/:date/:folder", get(sondage_detail))
         .route("/api/v1/sondage", post(submit_sondage).layer(upload_limit))
+        .route("/api/v1/journal", post(journals::submit).layer(journal_limit))
+        .route("/journals", get(journals::index))
+        .route("/journals/:date/:folder/:file", get(journals::download))
         .route("/api/v1/health", get(health))
         .nest_service(
             "/reports",
@@ -112,6 +140,8 @@ async fn main() -> anyhow::Result<()> {
                 .precompressed_gzip()
                 .precompressed_br(),
         )
+        // Uploaded files are public: never let a browser guess their type.
+        .layer(axum::middleware::map_response(no_sniff))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -126,6 +156,14 @@ async fn main() -> anyhow::Result<()> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received");
+}
+
+async fn no_sniff(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn health() -> &'static str {
@@ -179,22 +217,7 @@ async fn submit_sondage(
     mut multipart: Multipart,
 ) -> Result<axum::Json<SubmitResponse>, ApiError> {
     // 1. HMAC headers.
-    let sig_hex = headers
-        .get("x-newmodem-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::bad("missing X-Newmodem-Signature"))?
-        .to_string();
-    let ts_str = headers
-        .get("x-newmodem-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::bad("missing X-Newmodem-Timestamp"))?;
-    let client_ts: i64 = ts_str
-        .parse()
-        .map_err(|_| ApiError::bad("X-Newmodem-Timestamp not an integer"))?;
-    let now_ts = Utc::now().timestamp();
-    if (now_ts - client_ts).abs() > TIMESTAMP_WINDOW_SECS {
-        return Err(ApiError::bad("timestamp out of window (clock skew?)"));
-    }
+    let (sig_hex, client_ts) = signed_timestamp(&headers)?;
 
     // 2. Slurp every multipart field into memory (cap = max_upload_bytes).
     //    For our use case (one sounding = ~a few MB) this is fine, and it
@@ -241,7 +264,7 @@ async fn submit_sondage(
     }
 
     let callsign = callsign_field.ok_or_else(|| ApiError::bad("missing 'callsign' field"))?;
-    if callsign.is_empty() || !callsign.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
+    if !valid_callsign(&callsign) {
         return Err(ApiError::bad("callsign must be ASCII alphanumeric (slash allowed)"));
     }
     let metadata_bytes = metadata_bytes.ok_or_else(|| ApiError::bad("missing 'metadata' field"))?;
@@ -256,17 +279,7 @@ async fn submit_sondage(
         h.update(&report_bytes);
         h.finalize()
     };
-    let mut mac = HmacSha256::new_from_slice(HMAC_SECRET.trim().as_bytes())
-        .map_err(|_| ApiError::server("HMAC key init failed"))?;
-    mac.update(callsign.as_bytes());
-    mac.update(b"|");
-    mac.update(client_ts.to_string().as_bytes());
-    mac.update(b"|");
-    mac.update(&body_hash);
-    let sig_expected = hex::encode(mac.finalize().into_bytes());
-    if !constant_time_eq(sig_expected.as_bytes(), sig_hex.trim().as_bytes()) {
-        return Err(ApiError::unauthorized("bad signature"));
-    }
+    verify_signature(&callsign, client_ts, &body_hash, &sig_hex)?;
 
     // 4. Parse metadata.json (minimal validation + callsign extraction
     //    for consistency with the field).
@@ -362,6 +375,7 @@ fn render_index(rows: &[IndexRow]) -> String {
     use html_escape::encode_text as h;
     let mut html = String::new();
     html.push_str(INDEX_HEADER);
+    html.push_str("<p><a href=\"/journals\">Modem journals &rarr;</a></p>");
     html.push_str(&format!(
         "<p class=\"summary\">{} sounding(s) collected.</p>",
         rows.len()
@@ -402,7 +416,7 @@ fn render_index(rows: &[IndexRow]) -> String {
                 h(m.locator.as_deref().unwrap_or("-")),
                 h(m.tx_model.as_deref().unwrap_or("-")),
                 h(m.relay.as_deref().unwrap_or("-")),
-                h(&url),
+                html_escape::encode_double_quoted_attribute(&url),
                 h(&row.folder),
             ));
         }
@@ -498,7 +512,7 @@ async fn sondage_detail(
         let url = format!("/reports/{date}/{folder}/{f}");
         html.push_str(&format!(
             "<li><a href=\"{}\">{}</a></li>",
-            h(&url),
+            html_escape::encode_double_quoted_attribute(&url),
             h(f)
         ));
     }
@@ -516,6 +530,51 @@ fn is_safe_segment(s: &str) -> bool {
 }
 
 // ─────────────────────────────────────────── Helpers
+
+/// Signature and timestamp headers, timestamp inside the replay window.
+fn signed_timestamp(headers: &HeaderMap) -> Result<(String, i64), ApiError> {
+    let sig_hex = headers
+        .get("x-newmodem-signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::bad("missing X-Newmodem-Signature"))?
+        .to_string();
+    let client_ts: i64 = headers
+        .get("x-newmodem-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::bad("missing X-Newmodem-Timestamp"))?
+        .parse()
+        .map_err(|_| ApiError::bad("X-Newmodem-Timestamp not an integer"))?;
+    if client_ts.abs_diff(Utc::now().timestamp()) > TIMESTAMP_WINDOW_SECS as u64 {
+        return Err(ApiError::bad("timestamp out of window (clock skew?)"));
+    }
+    Ok((sig_hex, client_ts))
+}
+
+/// Check the HMAC over `callsign | timestamp | body hash`.
+fn verify_signature(
+    callsign: &str,
+    client_ts: i64,
+    body_hash: &[u8],
+    sig_hex: &str,
+) -> Result<(), ApiError> {
+    let mut mac = HmacSha256::new_from_slice(HMAC_SECRET.trim().as_bytes())
+        .map_err(|_| ApiError::server("HMAC key init failed"))?;
+    mac.update(callsign.as_bytes());
+    mac.update(b"|");
+    mac.update(client_ts.to_string().as_bytes());
+    mac.update(b"|");
+    mac.update(body_hash);
+    let expected = hex::encode(mac.finalize().into_bytes());
+    if constant_time_eq(expected.as_bytes(), sig_hex.trim().as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized("bad signature"))
+    }
+}
+
+fn valid_callsign(callsign: &str) -> bool {
+    !callsign.is_empty() && callsign.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+}
 
 /// A validated callsign as ONE path segment. Callsigns may contain `/`
 /// (`HB9TOB/P`): used raw it nests directories, and a leading `/` turns

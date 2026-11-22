@@ -2,7 +2,7 @@
 
 **Date d'ouverture** : 2026-11-22
 **Branche** : `feat/modem-journal` (depuis main 6fa5bc9)
-**État** : lot 0 en cours
+**État** : lots 0, 1, 4 committés ; lot 2 écrit, en attente de mesure sur hôte non bridé (voir « Reprise »)
 **Objet** : remédiation n° 9 de `plan_acquisition_turbo_vs_legacy.md`. Avant de
 reprendre l'optimisation de l'entrée, journaliser ce que fait le modem, le temps
 d'audio en attente dans chaque buffer, et l'encodage (pour chiffrer son impact
@@ -22,11 +22,11 @@ Ce document est mis à jour **à chaque étape franchie** (la machine peut crash
 |---|---|---|---|---|
 | 0 | Branche, commit du lot 1 acquisition + harness | **fait** | 2026-11-22 | aucune régression mesurée sur les 2 tests en échec (voir « Lot 0 : validation ») ; validation partielle (S5, S6, S9 non rejoués) |
 | 1 | Journal, compteur de file, sonde 1 Hz, CPU | **fait** | 2026-11-22 | 27/27 tests (dont blocage de 2 s vu pendant le blocage, écrivain bloqué sans effet) ; `cpu.rs` vérifié par `cargo check` Windows isolé, crate complète non vérifiée sous Windows (pas de mingw ici) |
-| 2 | Branchement RX turbo + legacy, étages turbo, compteurs capture | à faire | — | — |
+| 2 | Branchement RX turbo + legacy, étages turbo, compteurs capture | en attente | 2026-11-22 | 63/63 tests en optimisé ; 12 rejeux, mêmes ESI et fichiers ; jeu égal avec 872ca5f sur S1 ; **critère duty / lag pas encore tenu sur S3 / S10** (hôte bridé) ; non committé |
 | 3 | Encodage, TX, sonde du thread principal | à faire | — | — |
-| 4 | Collecteur : correctifs, puis route journal | en cours | 2026-11-22 | C1 + C2 reproduits sur main puis corrigés et vérifiés sur serveur local ; à redéployer ; route journal à faire |
+| 4 | Collecteur : correctifs, puis route journal | **fait** | 2026-11-22 | route, page `/journals`, quota, doc ; 2/2 tests, 24/24 contrôles de bout en bout sur serveur local ; **reste le push + redéploiement par Olivier** |
 | 5 | GUI : dialogue de sortie, reprise, Paramètres, i18n | à faire | — | — |
-| 6 | Script d'analyse + validation | à faire | — | — |
+| 6 | Script d'analyse + validation | en cours | 2026-11-22 | `study/analyze_modem_journal.py` essayé sur journaux réels et entrée hostile ; a révélé la cause ⑨ (plan d'acquisition) ; validation AVIF à faire |
 
 ---
 
@@ -112,3 +112,60 @@ l'optimisation de l'entrée.
   `metadata + report`. Deux envois dans la même seconde qui ne diffèrent que par
   le WAV tombent dans le même dossier, le second écrase le premier (observé sur
   serveur local). Sur la route journal, le gzip entrera dans le hachage.
+
+## Lot 2 : validation (2026-11-22)
+
+| Scénario | Modem | Journal | Fichiers | Duty | Lag max (ms) |
+|---|---|---|---|---|---|
+| S1 | turbo | coupé / actif | 1 / 1 | 0,374 / 0,375 | 513 / 512 |
+| S1 | legacy | coupé / actif | 1 / 1 | 0,176 / 0,176 | 871 / 886 |
+| S3 | turbo | coupé / actif | 1 / 1 | 0,312 / 0,313 | 1085 / 1109 |
+| S3 | legacy | coupé / actif | 1 / 1 | 0,151 / 0,156 | 917 / 908 |
+| S10 | turbo | coupé / actif | 3 / 3 | 0,291 / 0,404 | 1175 / 1950 |
+| S10 | legacy | coupé / actif | 3 / 3 | 0,189 / 0,135 | 2840 / 1187 |
+
+96 ESI partout, 0 décrochage. S10 varie dans les deux sens (turbo pire avec
+journal, legacy deux fois meilleur) : ces chiffres mesurent l'hôte.
+
+**Hôte bridé ce jour-là** : pendant une compilation à 2 rustc, le cœur le plus
+rapide reste à 637–791 MHz (20 relevés en 20 s) pour 3,7 GHz nominal, secteur
+branché, 38 °C, compteurs de throttling thermique à 0. Cause du bridage inconnue.
+Les journaux concordent : CPU thread / mur = 1,0 sur les activités lentes (le
+worker n'est pas préempté, le cœur est lent) et le même poll de gate passe de
+6,5–7 à 13–14 ms au cours de S10 (4,75 ms le 11.11).
+
+Conséquences :
+
+- les durées et lags du 2026-11-22 ne se comparent pas à ceux du 11.11 ;
+- les échecs en debug du lot 0 peuvent venir de ce bridage ;
+- avant toute mesure de temps, relever `scaling_cur_freq` sous charge ;
+- rejouer avec / sans journal et contre 872ca5f (avant journal) sur hôte sain.
+
+### Contrôle contre le commit d'avant le journal (872ca5f)
+
+S1, 3 tours entrelacés, même jour, même hôte, binaire actuel avec journal coupé
+(relais de file et chronos d'étages actifs) :
+
+| Modem | Duty 872ca5f | Duty actuel | Lag max 872ca5f | Lag max actuel |
+|---|---|---|---|---|
+| turbo | 0,389 / 0,388 / 0,393 | 0,389 / 0,397 / 0,390 | 521 / 518 / 534 | 535 / 527 / 534 |
+| legacy | 0,198 / 0,193 / 0,189 | 0,192 / 0,184 / 0,192 | 1204 / 937 / 925 | 931 / 951 / 944 |
+
+Le code du journal n'explique donc pas l'écart avec le 11.11.
+
+## Reprise (après redémarrage de la machine)
+
+Le scratchpad peut avoir disparu ; tout le code est dans l'arbre de travail
+(lot 2 et `study/analyze_modem_journal.py` **non committés**, ne pas les perdre).
+
+1. Vérifier l'hôte, une compilation en cours : le cœur le plus rapide doit
+   dépasser nettement 1 GHz.
+   `cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | sort -n | tail -1`
+2. Construire :
+   `cd rust && ~/.cargo/bin/cargo build --release -j 2 -p modem-worker --example acq_replay`
+   et, hors de l'arbre, le même exemple depuis `git archive 872ca5f rust`.
+3. S1, S3, S10, deux modems, entrelacés, 3 tours : binaire 872ca5f, binaire
+   actuel, binaire actuel avec `--journal <dossier>`
+   (`acq_replay --input <wav> --mode turbo|legacy --summary <json>`).
+   Critère : mêmes ESI, duty +0,01 max, lag +20 ms max, sur les médianes.
+4. Critère tenu : commit du lot 2. Puis lots 3, 5, fin du 6.
