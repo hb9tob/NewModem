@@ -13,6 +13,8 @@ rust/modem-gui/src-tauri/secret.txt
 *.swp
 *~
 *.log
+# Journals fetched from the collector: third parties' data, never committed.
+/journals/
 .DS_Store
 Thumbs.db
 

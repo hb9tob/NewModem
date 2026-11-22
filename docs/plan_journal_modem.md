@@ -2,7 +2,7 @@
 
 **Date d'ouverture** : 2026-11-22
 **Branche** : `feat/modem-journal` (depuis main 6fa5bc9)
-**État** : lots 0, 1, 4 committés ; lot 2 écrit, en attente de mesure sur hôte non bridé (voir « Reprise »)
+**État** : lots 0, 1, 4 committés, 4b (envoi compressé, téléchargement) aussi ; lot 2 écrit, en attente de mesure sur hôte non bridé (voir « Reprise »)
 **Objet** : remédiation n° 9 de `plan_acquisition_turbo_vs_legacy.md`. Avant de
 reprendre l'optimisation de l'entrée, journaliser ce que fait le modem, le temps
 d'audio en attente dans chaque buffer, et l'encodage (pour chiffrer son impact
@@ -25,8 +25,9 @@ Ce document est mis à jour **à chaque étape franchie** (la machine peut crash
 | 2 | Branchement RX turbo + legacy, étages turbo, compteurs capture | en attente | 2026-11-22 | 63/63 tests en optimisé ; 12 rejeux, mêmes ESI et fichiers ; jeu égal avec 872ca5f sur S1 ; **critère duty / lag pas encore tenu sur S3 / S10** (hôte bridé) ; non committé |
 | 3 | Encodage, TX, sonde du thread principal | à faire | — | — |
 | 4 | Collecteur : correctifs, puis route journal | **fait** | 2026-11-22 | route, page `/journals`, quota, doc ; 2/2 tests, 24/24 contrôles de bout en bout sur serveur local ; **reste le push + redéploiement par Olivier** |
-| 5 | GUI : dialogue de sortie, reprise, Paramètres, i18n | à faire | — | — |
-| 6 | Script d'analyse + validation | en cours | 2026-11-22 | `study/analyze_modem_journal.py` essayé sur journaux réels et entrée hostile ; a révélé la cause ⑨ (plan d'acquisition) ; validation AVIF à faire |
+| 4b | Envoi compressé (client Rust), API de liste, téléchargeur | **fait** | 2026-11-22 | gzip 7,4–8,2× ; 65/65 de bout en bout, 24/24 en non-régression, serveur local ; voir « Lot 4b » |
+| 5 | GUI : dialogue de sortie, reprise, Paramètres, i18n | à faire | — | `collector_client::submit_journal` est prêt et testé, **appelé par personne** tant que ce lot manque |
+| 6 | Script d'analyse + validation | en cours | 2026-11-22 | `study/analyze_modem_journal.py` committé, essayé sur journaux réels et entrée hostile ; a révélé la cause ⑨ (plan d'acquisition) ; validation AVIF à faire |
 
 ---
 
@@ -153,10 +154,31 @@ S1, 3 tours entrelacés, même jour, même hôte, binaire actuel avec journal co
 
 Le code du journal n'explique donc pas l'écart avec le 11.11.
 
+## Lot 4b : envoi compressé et téléchargement (2026-11-22)
+
+- **Format figé** : gzip niveau 6, un membre par segment. Mesuré sur 6 journaux
+  réels (0,85 Mo) : 7,7×, soit environ 0,5 Mo/h. Niveau 9 : +4 % pour presque
+  2× le CPU. zstd-10 : 20 % plus petit, mais une dépendance pour qui analyse.
+- 100 Mo synthétiques (enregistrements réels répétés) : 12,6 Mo envoyés, rien
+  d'omis, 12,7 s sur la Surface bridée. Le lot 5 doit afficher une progression.
+- `store::submission` calcule le résumé sur ce qui est envoyé ;
+  `collector_client::submit_journal` signe et envoie (timeout 300 s).
+- `GET /api/v1/journals` : liste JSON, du plus récent au plus ancien, journaux
+  complets seulement (`metadata.json` est écrit en dernier).
+- `study/fetch_modem_journals.py URL` : HTTP ou HTTPS, incrémental, liste non
+  fiable (noms validés, tailles bornées, redirection même hôte seulement).
+- **Défaut du lot 1 trouvé et corrigé** : l'événement RX `header` avait le
+  `kind` de l'en-tête du journal ; il devient `rx_header`.
+- Non testé : nginx réel, production, build Windows, clic dans la GUI (lot 5).
+- **C4** (non corrigé) : `setup-nginx.sh` pose `client_max_body_size 60m` alors
+  que le service et la doc disent 200 Mio. Sans effet sur les journaux (20 Mio),
+  bloque les sondages au-delà de 60 Mo sur une install faite par ce script.
+
 ## Reprise (après redémarrage de la machine)
 
 Le scratchpad peut avoir disparu ; tout le code est dans l'arbre de travail
-(lot 2 et `study/analyze_modem_journal.py` **non committés**, ne pas les perdre).
+(lot 2 **non committé**, ne pas le perdre). Un export `git archive` se compile
+dans son propre `CARGO_TARGET_DIR`, jamais dans `rust/target`.
 
 1. Vérifier l'hôte, une compilation en cours : le cœur le plus rapide doit
    dépasser nettement 1 GHz.

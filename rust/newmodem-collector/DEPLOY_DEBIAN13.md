@@ -324,7 +324,24 @@ silencieusement (413) si l'upload dépasse `client_max_body_size` —
 
 ```bash
 curl -sI https://hb9tob.duckdns.org/journals | head -1   # → 200
+curl -s https://hb9tob.duckdns.org/api/v1/journals       # → {"journals":[...]}
 ```
+
+Téléchargement pour analyse (HTTP ou HTTPS, depuis n'importe quel poste avec
+Python 3.10+, sans dépendance) :
+
+```bash
+python3 -I study/fetch_modem_journals.py https://hb9tob.duckdns.org --list
+python3 -I study/fetch_modem_journals.py https://hb9tob.duckdns.org   # les nouveaux, dans ./journals
+python3 -I study/analyze_modem_journal.py journals/<date>/<dossier>/journal.jsonl.gz
+```
+
+Options : `--dest`, `--since AAAA-MM-JJ`, `--callsign INDICATIF`. Sans le script :
+la page `/journals`, ou `curl -OJ` sur le champ `url` de `/api/v1/journals`.
+
+Les journaux sont envoyés compressés (gzip, environ 7 fois plus petits), stockés
+et servis tels quels. L'URL du collecteur dans la GUI doit être l'adresse finale :
+un POST redirigé de http vers https par le 301 de nginx perd son contenu.
 
 Retrait d'un journal à la demande d'un OM :
 supprimer son dossier sous `journals/<date>/`, l'index suit immédiatement.

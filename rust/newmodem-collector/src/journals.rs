@@ -1,8 +1,9 @@
-//! Modem journals: submission, public index and download.
+//! Modem journals: submission, public index (HTML and JSON) and download.
 //!
 //! Stored apart from the soundings:
 //! `<journals_dir>/<YYYY-MM-DD>/<callsign>_<HHMMSS>_<hash>/` holding
-//! `metadata.json` and `journal.jsonl.gz`.
+//! `metadata.json` and `journal.jsonl.gz`. The metadata is written last:
+//! a journal is listed once it parses, hence never half written.
 //!
 //! The gzip is never decompressed here: it is untrusted, and the HMAC
 //! secret ships inside every client binary. Everything the index shows
@@ -10,13 +11,13 @@
 
 use axum::{
     extract::{Multipart, Path as AxumPath, State},
-    http::{header, HeaderMap},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     Json,
 };
 use chrono::Utc;
 use html_escape::{encode_double_quoted_attribute as attr, encode_text as text};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tracing::info;
@@ -33,7 +34,7 @@ const FILE_NAME: &str = "journal.jsonl.gz";
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// What the index shows. Computed by the client, hence only indicative.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct JournalMeta {
     callsign: String,
     #[serde(default)]
@@ -126,31 +127,37 @@ pub async fn submit(
     fs::create_dir_all(&dir)
         .await
         .map_err(|e| ApiError::server(format!("mkdir journal: {e}")))?;
-    write_file(&dir, "metadata.json", &metadata).await?;
     write_file(&dir, FILE_NAME, &journal).await?;
+    write_file(&dir, "metadata.json", &metadata).await?;
     info!("stored journal callsign={callsign} folder={date}/{folder}");
 
     Ok(Json(SubmitResponse {
         ok: true,
-        url: format!("/journals/{date}/{folder}/{FILE_NAME}"),
+        url: download_url(&date, &folder),
         folder: format!("{date}/{folder}"),
     }))
+}
+
+/// `HHMMSS` of a `<callsign>_<HHMMSS>_<hash>` folder; callsigns have no `_`.
+fn received_time(folder: &str) -> &str {
+    folder.split('_').nth(1).unwrap_or("")
 }
 
 /// Every stored journal as (date, folder), newest first.
 async fn stored(state: &AppState) -> Result<Vec<(String, String)>, ApiError> {
     let mut out = Vec::new();
-    for date in read_dir_sorted(&state.journals_dir).await?.into_iter().rev() {
+    for date in read_dir_sorted(&state.journals_dir).await? {
         if !date.is_dir {
             continue;
         }
         let dir = state.journals_dir.join(&date.name);
-        for entry in read_dir_sorted(&dir).await?.into_iter().rev() {
+        for entry in read_dir_sorted(&dir).await? {
             if entry.is_dir {
                 out.push((date.name.clone(), entry.name));
             }
         }
     }
+    out.sort_by(|a, b| (&b.0, received_time(&b.1)).cmp(&(&a.0, received_time(&a.1))));
     Ok(out)
 }
 
@@ -167,37 +174,85 @@ async fn stored_bytes(state: &AppState) -> Result<u64, ApiError> {
     Ok(total)
 }
 
+fn download_url(date: &str, folder: &str) -> String {
+    format!("/journals/{date}/{folder}/{FILE_NAME}")
+}
+
+/// One journal as listed by `GET /api/v1/journals`.
+#[derive(Debug, Serialize)]
+struct Listed {
+    date: String,
+    folder: String,
+    /// Size of the gzip, for the downloader to check.
+    bytes: u64,
+    url: String,
+    #[serde(flatten)]
+    meta: JournalMeta,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Listing {
+    journals: Vec<Listed>,
+}
+
+/// Every complete journal, newest first.
+async fn complete(state: &AppState) -> Result<Vec<Listed>, ApiError> {
+    let mut out = Vec::new();
+    for (date, folder) in stored(state).await? {
+        let dir = state.journals_dir.join(&date).join(&folder);
+        let Ok(raw) = fs::read(dir.join("metadata.json")).await else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_slice(&raw) else {
+            continue;
+        };
+        let Ok(file) = fs::metadata(dir.join(FILE_NAME)).await else {
+            continue;
+        };
+        out.push(Listed {
+            url: download_url(&date, &folder),
+            bytes: file.len(),
+            date,
+            folder,
+            meta,
+        });
+    }
+    Ok(out)
+}
+
+pub async fn list(State(state): State<AppState>) -> Result<Json<Listing>, ApiError> {
+    Ok(Json(Listing {
+        journals: complete(&state).await?,
+    }))
+}
+
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, ApiError> {
-    let entries = stored(&state).await?;
+    let entries = complete(&state).await?;
     let mut html = String::from(INDEX_HEADER);
     html.push_str(&format!(
         "<p><a href=\"/\">&larr; channel soundings</a></p>\
-         <h2>Modem journals</h2><p class=\"summary\">{} journal(s) collected.</p>\
+         <h2>Modem journals</h2><p class=\"summary\">{} journal(s) collected. \
+         Machine-readable list: <a href=\"/api/v1/journals\">/api/v1/journals</a>.</p>\
          <table><thead><tr><th>Date</th><th>Callsign</th><th>Version</th><th>Host</th>\
          <th>Duration</th><th>Max queue</th><th>Incidents</th><th>Notes</th><th>Journal</th>\
          </tr></thead><tbody>",
         entries.len()
     ));
-    for (date, folder) in &entries {
-        let path = state.journals_dir.join(date).join(folder).join("metadata.json");
-        let meta: JournalMeta = match fs::read(&path).await {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
-            Err(_) => continue,
-        };
-        html.push_str(&render_row(date, folder, &meta));
+    for entry in &entries {
+        html.push_str(&render_row(entry));
     }
     html.push_str("</tbody></table>");
     html.push_str(INDEX_FOOTER);
     Ok(Html(html))
 }
 
-fn render_row(date: &str, folder: &str, meta: &JournalMeta) -> String {
+fn render_row(entry: &Listed) -> String {
+    let meta = &entry.meta;
     let or_dash = |v: &Option<String>| text(v.as_deref().unwrap_or("-")).into_owned();
-    let url = format!("/journals/{date}/{folder}/{FILE_NAME}");
     format!(
         "<tr><td><code>{}</code></td><td><strong>{}</strong>{}</td><td>{}</td><td>{}</td>\
-         <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">download</a></td></tr>",
-        text(date),
+         <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">download</a> ({} KiB)</td></tr>",
+        text(&entry.date),
         text(&meta.callsign),
         if meta.crashed { " (crash)" } else { "" },
         or_dash(&meta.gui_version),
@@ -206,7 +261,8 @@ fn render_row(date: &str, folder: &str, meta: &JournalMeta) -> String {
         meta.queue_max_ms.map_or("-".into(), |ms| format!("{ms:.0} ms")),
         meta.incidents.map_or("-".into(), |n| n.to_string()),
         or_dash(&meta.notes),
-        attr(&url),
+        attr(&entry.url),
+        entry.bytes.div_ceil(1024),
     )
 }
 
@@ -219,7 +275,7 @@ pub async fn download(
     }
     let path = state.journals_dir.join(&date).join(&folder).join(FILE_NAME);
     let Ok(body) = fs::read(&path).await else {
-        return ApiError::bad("no such journal").into_response();
+        return (StatusCode::NOT_FOUND, "no such journal\n").into_response();
     };
     (
         [
@@ -247,7 +303,13 @@ mod tests {
             host: Some("<img src=x>".into()),
             ..Default::default()
         };
-        let row = render_row("2026-11-22", "X\" onmouseover=\"y", &meta);
+        let row = render_row(&Listed {
+            date: "2026-11-22".into(),
+            folder: "x".into(),
+            bytes: 1,
+            url: download_url("2026-11-22", "X\" onmouseover=\"y"),
+            meta,
+        });
         assert!(!row.contains("<script>"));
         assert!(!row.contains("<img"));
         assert!(!row.contains("\" onmouseover=\""));

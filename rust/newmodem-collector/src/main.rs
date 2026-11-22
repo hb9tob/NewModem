@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/sondage", post(submit_sondage).layer(upload_limit))
         .route("/api/v1/journal", post(journals::submit).layer(journal_limit))
         .route("/journals", get(journals::index))
+        .route("/api/v1/journals", get(journals::list))
         .route("/journals/:date/:folder/:file", get(journals::download))
         .route("/api/v1/health", get(health))
         .nest_service(
