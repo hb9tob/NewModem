@@ -2,7 +2,8 @@
 //!
 //! Builds the multipart payload of a sounding report from a raw capture
 //! (WAV + event-log JSON) and POSTs it (HMAC-signed) to
-//! `<base_url>/api/v1/sondage`.
+//! `<base_url>/api/v1/sondage`. Modem journals go gzipped to
+//! `<base_url>/api/v1/journal`.
 //!
 //! The HMAC secret is shared with the collector through two twin
 //! `secret.txt` files (gitignored) - the "near-mandatory NewModem"
@@ -16,6 +17,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
+
+const REPORT_TIMEOUT: Duration = Duration::from_secs(120);
+/// 20 MiB at 1 Mbit/s up takes 170 s.
+const JOURNAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Must not exceed `MAX_JOURNAL_BYTES` of the collector.
+const JOURNAL_MAX_GZ: usize = 20 * 1024 * 1024;
+/// Keeps the metadata under the collector's 16 KiB.
+const JOURNAL_MAX_NOTES: usize = 2000;
 
 const HMAC_SECRET: &str = include_str!("../secret.txt");
 
@@ -174,7 +183,7 @@ pub async fn submit(args: SubmitCaptureArgs) -> Result<SubmitResult, String> {
                 .map_err(|e| e.to_string())?,
         );
 
-    post_signed_multipart(&url, &signature, ts, form, bytes_uploaded).await
+    post_signed_multipart(&url, &signature, ts, form, bytes_uploaded, REPORT_TIMEOUT).await
 }
 
 /// Args passed from the frontend via the Tauri command `submit_sounding`.
@@ -335,22 +344,103 @@ pub async fn submit_sounding(args: SubmitSoundingArgs) -> Result<SubmitResult, S
         );
     }
 
-    post_signed_multipart(&url, &signature_hmac, ts, form, bytes_uploaded).await
+    post_signed_multipart(&url, &signature_hmac, ts, form, bytes_uploaded, REPORT_TIMEOUT).await
 }
 
-/// Shared POST path used by both submit flavours. Builds a reqwest
-/// client with a 120 s timeout (covers multi-MB uploads on asymmetric
-/// ADSL), attaches the HMAC signature + timestamp headers, and parses
-/// the server's `{ok,folder,url}` reply.
+/// Compress a journal session and publish it on the collector.
+///
+/// `dir` comes from the journal store, never from the frontend: whatever
+/// is in it becomes public.
+#[allow(dead_code)] // Called by the exit dialog (journal plan, lot 5).
+pub async fn submit_journal(
+    dir: std::path::PathBuf,
+    callsign: &str,
+    collector_url: &str,
+    notes: &str,
+) -> Result<SubmitResult, String> {
+    let secret = checked_secret()?;
+    let callsign = callsign.trim().to_uppercase();
+    if callsign.is_empty() {
+        return Err("indicatif vide (Paramètres → Indicatif)".into());
+    }
+    if callsign.len() > 16 || !callsign.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
+        return Err("indicatif invalide (16 caractères max : lettres, chiffres, /)".into());
+    }
+    let base = collector_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("URL collecteur vide (Paramètres → Collecteur)".into());
+    }
+    let url = format!("{base}/api/v1/journal");
+
+    let (bundle, summary) = tokio::task::spawn_blocking(move || {
+        modem_worker::journal::store::submission(&dir, JOURNAL_MAX_GZ)
+    })
+    .await
+    .map_err(|e| format!("compression du journal : {e}"))?
+    .map_err(|e| format!("lecture du journal : {e}"))?;
+
+    let notes: String = notes
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(JOURNAL_MAX_NOTES)
+        .collect();
+    let notes = Some(notes.trim()).filter(|s| !s.is_empty());
+    let metadata = serde_json::json!({
+        "callsign": callsign,
+        // The version that wrote the journal, which may have crashed and
+        // been upgraded since.
+        "gui_version": summary.version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+        "host": summary.host,
+        "duration_s": summary.duration_s,
+        "queue_max_ms": summary.queue_max_ms,
+        "incidents": summary.incidents,
+        "crashed": summary.crashed,
+        "notes": notes,
+    });
+    let metadata_bytes =
+        serde_json::to_vec(&metadata).map_err(|e| format!("metadata serialize: {e}"))?;
+
+    // Taken after compressing: the collector allows 300 s of skew.
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let signature = compute_signature(secret, &callsign, ts, &metadata_bytes, &bundle.gz)?;
+    let bytes_uploaded = metadata_bytes.len() + bundle.gz.len();
+    let form = reqwest::multipart::Form::new()
+        .text("callsign", callsign.clone())
+        .part(
+            "metadata",
+            reqwest::multipart::Part::bytes(metadata_bytes)
+                .file_name("metadata.json")
+                .mime_str("application/json")
+                .map_err(|e| e.to_string())?,
+        )
+        .part(
+            "journal",
+            reqwest::multipart::Part::bytes(bundle.gz)
+                .file_name("journal.jsonl.gz")
+                .mime_str("application/gzip")
+                .map_err(|e| e.to_string())?,
+        );
+
+    post_signed_multipart(&url, &signature, ts, form, bytes_uploaded, JOURNAL_TIMEOUT).await
+}
+
+/// Shared POST path of every submit flavour. Builds a reqwest client
+/// with the caller's timeout (multi-MB uploads on asymmetric ADSL),
+/// attaches the HMAC signature + timestamp headers, and parses the
+/// server's `{ok,folder,url}` reply.
 async fn post_signed_multipart(
     url: &str,
     signature: &str,
     ts: i64,
     form: reqwest::multipart::Form,
     bytes_uploaded: usize,
+    timeout: Duration,
 ) -> Result<SubmitResult, String> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
     let resp = client
