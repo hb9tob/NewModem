@@ -14,6 +14,7 @@
 //! subprocess dependency for TX.
 
 pub mod event_sink;
+pub mod journal;
 pub mod ptt;
 pub mod radio;
 pub mod rx_v3_worker;

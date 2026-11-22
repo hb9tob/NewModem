@@ -21,10 +21,10 @@ Ce document est mis à jour **à chaque étape franchie** (la machine peut crash
 | Lot | Contenu | État | Date | Sortie |
 |---|---|---|---|---|
 | 0 | Branche, commit du lot 1 acquisition + harness | **fait** | 2026-11-22 | aucune régression mesurée sur les 2 tests en échec (voir « Lot 0 : validation ») ; validation partielle (S5, S6, S9 non rejoués) |
-| 1 | Journal, compteur de file, sonde 1 Hz, CPU | en cours | 2026-11-22 | `journal/{mod,queue,probe,cpu,sanitize,store}.rs` écrits avec tests unitaires ; **pas encore compilés** (attente fin des tests du lot 0, figé dans l'index git) |
+| 1 | Journal, compteur de file, sonde 1 Hz, CPU | **fait** | 2026-11-22 | 27/27 tests (dont blocage de 2 s vu pendant le blocage, écrivain bloqué sans effet) ; `cpu.rs` vérifié par `cargo check` Windows isolé, crate complète non vérifiée sous Windows (pas de mingw ici) |
 | 2 | Branchement RX turbo + legacy, étages turbo, compteurs capture | à faire | — | — |
 | 3 | Encodage, TX, sonde du thread principal | à faire | — | — |
-| 4 | Collecteur : correctifs, puis route journal | en cours | 2026-11-22 | correctifs C1 + C2 écrits avec test, **pas encore compilés** ; route journal à faire |
+| 4 | Collecteur : correctifs, puis route journal | en cours | 2026-11-22 | C1 + C2 reproduits sur main puis corrigés et vérifiés sur serveur local ; à redéployer ; route journal à faire |
 | 5 | GUI : dialogue de sortie, reprise, Paramètres, i18n | à faire | — | — |
 | 6 | Script d'analyse + validation | à faire | — | — |
 
@@ -105,3 +105,10 @@ debug sur cette machine. Pour le test inter-familles, la dépendance passe par
 l'auto-limitation murale du gate (cause ⑤ du plan d'acquisition) : un poll lent
 espace le suivant et le 2e burst peut tomber dans le trou. À reprendre avec
 l'optimisation de l'entrée.
+
+## Collecteur : constat supplémentaire (2026-11-22)
+
+- **C3** (non corrigé sur la route sondage) : le nom de dossier ne hache que
+  `metadata + report`. Deux envois dans la même seconde qui ne diffèrent que par
+  le WAV tombent dans le même dossier, le second écrase le premier (observé sur
+  serveur local). Sur la route journal, le gzip entrera dans le hachage.

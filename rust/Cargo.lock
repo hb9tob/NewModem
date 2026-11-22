@@ -3068,7 +3068,9 @@ name = "modem-worker"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "flate2",
  "hound",
+ "libc",
  "modem-core",
  "modem-core-base",
  "modem-framing",
@@ -3081,6 +3083,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "tempfile",
+ "windows-sys 0.59.0",
  "zstd",
 ]
 
