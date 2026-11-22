@@ -22,7 +22,7 @@ Ce document est mis à jour **à chaque étape franchie** (la machine peut crash
 |---|---|---|---|---|
 | 0 | Branche, commit du lot 1 acquisition + harness | **fait** | 2026-11-22 | aucune régression mesurée sur les 2 tests en échec (voir « Lot 0 : validation ») ; validation partielle (S5, S6, S9 non rejoués) |
 | 1 | Journal, compteur de file, sonde 1 Hz, CPU | **fait** | 2026-11-22 | 27/27 tests (dont blocage de 2 s vu pendant le blocage, écrivain bloqué sans effet) ; `cpu.rs` vérifié par `cargo check` Windows isolé, crate complète non vérifiée sous Windows (pas de mingw ici) |
-| 2 | Branchement RX turbo + legacy, étages turbo, compteurs capture | en attente | 2026-11-22 | 63/63 tests en optimisé ; 12 rejeux, mêmes ESI et fichiers ; jeu égal avec 872ca5f sur S1 ; **critère duty / lag pas encore tenu sur S3 / S10** (hôte bridé) ; non committé |
+| 2 | Branchement RX turbo + legacy, étages turbo, compteurs capture | en attente | 2026-11-22 | 63/63 tests en optimisé ; 12 rejeux, mêmes ESI et fichiers ; jeu égal avec a02ef65 sur S1 ; **critère duty / lag pas encore tenu sur S3 / S10** (hôte bridé) ; non committé |
 | 3 | Encodage, TX, sonde du thread principal | à faire | — | — |
 | 4 | Collecteur : correctifs, puis route journal | **fait** | 2026-11-22 | route, page `/journals`, quota, doc ; 2/2 tests, 24/24 contrôles de bout en bout sur serveur local ; **reste le push + redéploiement par Olivier** |
 | 4b | Envoi compressé (client Rust), API de liste, téléchargeur | **fait** | 2026-11-22 | gzip 7,4–8,2× ; 65/65 de bout en bout, 24/24 en non-régression, serveur local ; voir « Lot 4b » |
@@ -38,7 +38,10 @@ Ce document est mis à jour **à chaque étape franchie** (la machine peut crash
   nom de fichier.
 - Proposé à la sortie **s'il y a eu activité**, avec « ne plus demander » ;
   reproposé au lancement qui suit un plantage. Aucun envoi sans clic.
-- Lot 1 acquisition committé sur branche, validation partielle. Pas de push.
+- Lot 1 acquisition committé sur branche, validation partielle.
+- 2026-11-22, après le lot 4b : commits signés (DCO) et branche poussée à sa
+  demande (les identifiants de commit ont changé, mêmes contenus), puis lots 3
+  et 5 lancés.
 
 ## Constats avant chantier (lecture des sources, 2026-11-22)
 
@@ -140,14 +143,14 @@ Conséquences :
 - les durées et lags du 2026-11-22 ne se comparent pas à ceux du 11.11 ;
 - les échecs en debug du lot 0 peuvent venir de ce bridage ;
 - avant toute mesure de temps, relever `scaling_cur_freq` sous charge ;
-- rejouer avec / sans journal et contre 872ca5f (avant journal) sur hôte sain.
+- rejouer avec / sans journal et contre a02ef65 (avant journal) sur hôte sain.
 
-### Contrôle contre le commit d'avant le journal (872ca5f)
+### Contrôle contre le commit d'avant le journal (a02ef65)
 
 S1, 3 tours entrelacés, même jour, même hôte, binaire actuel avec journal coupé
 (relais de file et chronos d'étages actifs) :
 
-| Modem | Duty 872ca5f | Duty actuel | Lag max 872ca5f | Lag max actuel |
+| Modem | Duty a02ef65 | Duty actuel | Lag max a02ef65 | Lag max actuel |
 |---|---|---|---|---|
 | turbo | 0,389 / 0,388 / 0,393 | 0,389 / 0,397 / 0,390 | 521 / 518 / 534 | 535 / 527 / 534 |
 | legacy | 0,198 / 0,193 / 0,189 | 0,192 / 0,184 / 0,192 | 1204 / 937 / 925 | 931 / 951 / 944 |
@@ -185,8 +188,8 @@ dans son propre `CARGO_TARGET_DIR`, jamais dans `rust/target`.
    `cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | sort -n | tail -1`
 2. Construire :
    `cd rust && ~/.cargo/bin/cargo build --release -j 2 -p modem-worker --example acq_replay`
-   et, hors de l'arbre, le même exemple depuis `git archive 872ca5f rust`.
-3. S1, S3, S10, deux modems, entrelacés, 3 tours : binaire 872ca5f, binaire
+   et, hors de l'arbre, le même exemple depuis `git archive a02ef65 rust`.
+3. S1, S3, S10, deux modems, entrelacés, 3 tours : binaire a02ef65, binaire
    actuel, binaire actuel avec `--journal <dossier>`
    (`acq_replay --input <wav> --mode turbo|legacy --summary <json>`).
    Critère : mêmes ESI, duty +0,01 max, lag +20 ms max, sur les médianes.
