@@ -110,7 +110,10 @@ pub fn event_record(name: &str, payload: &Value) -> Option<(String, Map<String, 
         let stage = payload.get("stage")?.as_str()?;
         (format!("rx.{}", text(stage)), milestone_fields(stage))
     } else {
-        (name.to_string(), allowed_fields(name)?)
+        let fields = allowed_fields(name)?;
+        // `header` is the kind of the journal's own first record.
+        let kind = if name == "header" { "rx_header" } else { name };
+        (kind.to_string(), fields)
     };
     let mut out = Map::new();
     for &key in fields {
@@ -164,6 +167,14 @@ pub fn text(raw: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn decoded_header_cannot_pass_for_the_journal_header() {
+        let (kind, fields) =
+            event_record("header", &serde_json::json!({"profile": "HighPlus"})).unwrap();
+        assert_eq!(kind, "rx_header");
+        assert_eq!(fields["profile"], "HighPlus");
+    }
 
     #[test]
     fn paths_and_file_names_never_pass() {
