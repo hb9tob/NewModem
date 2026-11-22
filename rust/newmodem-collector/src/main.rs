@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Multipart, Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -43,6 +43,9 @@ const HMAC_SECRET: &str = include_str!("../secret.txt");
 /// Outside this we reject to prevent replays. +/-300 s covers a reasonable
 /// client clock drift plus network round-trip.
 const TIMESTAMP_WINDOW_SECS: i64 = 300;
+
+/// Multipart boundaries and part headers, allowed on top of the payload cap.
+const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(about = "Newmodem channel-sounding collector")]
@@ -88,6 +91,11 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&cli.reports_dir).await?;
     info!("storage dir = {}", cli.reports_dir.display());
 
+    // Without this layer axum caps `Multipart` at 2 MiB, whatever
+    // `--max-upload-mb` says. The handler still enforces the exact cap.
+    let upload_limit =
+        DefaultBodyLimit::max(cli.max_upload_mb * 1024 * 1024 + MULTIPART_OVERHEAD_BYTES);
+
     let state = AppState {
         reports_dir: Arc::new(cli.reports_dir.clone()),
         max_upload_bytes: cli.max_upload_mb * 1024 * 1024,
@@ -96,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index_html))
         .route("/sondage/:date/:folder", get(sondage_detail))
-        .route("/api/v1/sondage", post(submit_sondage))
+        .route("/api/v1/sondage", post(submit_sondage).layer(upload_limit))
         .route("/api/v1/health", get(health))
         .nest_service(
             "/reports",
@@ -276,7 +284,7 @@ async fn submit_sondage(
     let date = now.format("%Y-%m-%d").to_string();
     let hhmmss = now.format("%H%M%S").to_string();
     let short = hex::encode(&body_hash[..4]);
-    let folder_name = format!("{callsign}_{hhmmss}_{short}");
+    let folder_name = format!("{}_{hhmmss}_{short}", callsign_segment(&callsign));
     let folder_rel = format!("{date}/{folder_name}");
     let folder_abs = state.reports_dir.join(&date).join(&folder_name);
     fs::create_dir_all(&folder_abs)
@@ -509,6 +517,14 @@ fn is_safe_segment(s: &str) -> bool {
 
 // ─────────────────────────────────────────── Helpers
 
+/// A validated callsign as ONE path segment. Callsigns may contain `/`
+/// (`HB9TOB/P`): used raw it nests directories, and a leading `/` turns
+/// the folder into an absolute path, which `Path::join` follows out of
+/// the storage root.
+fn callsign_segment(callsign: &str) -> String {
+    callsign.replace('/', "-")
+}
+
 struct DirEntryInfo {
     name: String,
     is_dir: bool,
@@ -578,5 +594,20 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         warn!(status = self.status.as_u16(), "{}", self.msg);
         (self.status, format!("{}\n", self.msg)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callsign_folder_stays_one_segment_inside_the_root() {
+        let root = Path::new("/srv/reports").join("2026-11-22");
+        for callsign in ["HB9TOB", "HB9TOB/P", "F/HB9TOB/P", "/TMP/X", "///"] {
+            let folder = format!("{}_120000_abcd1234", callsign_segment(callsign));
+            assert!(is_safe_segment(&folder), "{folder}");
+            assert_eq!(root.join(&folder).parent(), Some(root.as_path()), "{folder}");
+        }
     }
 }
