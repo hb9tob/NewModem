@@ -1,0 +1,418 @@
+{
+  "_common": {
+    "profile": "HIGH+",
+    "tx_ref": "results/acq_scenarios/tx_ref_HIGHPLUS.wav",
+    "payload": "results/acq_scenarios/payload_acq.bin (20000 B, RandomState(20261108))",
+    "session_id": "0xA0C00001",
+    "K": 93,
+    "n_total": 96,
+    "repair_pct": 0,
+    "vox_s": 0.5,
+    "preamble_period_s": 4.0,
+    "if_noise": 0.02,
+    "if_chan_bw_hz": 8000.0,
+    "seed": 1,
+    "cfo_hz": 0.0,
+    "sim": "study/nbfm_channel_sim.py simulate_link (FM_DEV 5 kHz, tau 75 us, HPF 300, LPF 2000, clip 0.55, gain -6.5 dB)",
+    "time_convention": "seconds from the start of the WAV; *_nominal = before clock drift, plain = in the file"
+  },
+  "S1_clean": {
+    "scenario": "S1_clean",
+    "cause": "reference",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5,
+    "gaps_s": [],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S1_clean.wav",
+    "peak_dbfs": -2.06
+  },
+  "S2_noise20": {
+    "scenario": "S2_noise20",
+    "cause": "1 without CPU cost (P1)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 20.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 20.0,
+    "burst_start_s": 20.0,
+    "first_preamble_s": 20.5,
+    "gaps_s": [],
+    "duration_s": 63.135,
+    "file": "results/acq_scenarios/S2_noise20.wav",
+    "peak_dbfs": -2.06
+  },
+  "S3_voice20": {
+    "scenario": "S3_voice20",
+    "cause": "1 + CPU saturation (P2)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 20.5,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 20.5,
+    "burst_start_s": 20.5,
+    "first_preamble_s": 21.0,
+    "gaps_s": [],
+    "duration_s": 63.635,
+    "file": "results/acq_scenarios/S3_voice20.wav",
+    "peak_dbfs": -2.06
+  },
+  "S4_voice20_2hops": {
+    "scenario": "S4_voice20_2hops",
+    "cause": "real repeater colouring",
+    "hops": 2,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 20.5,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 20.5,
+    "burst_start_s": 20.5,
+    "first_preamble_s": 21.0,
+    "gaps_s": [],
+    "duration_s": 63.635,
+    "file": "results/acq_scenarios/S4_voice20_2hops.wav",
+    "peak_dbfs": -1.48
+  },
+  "S5_late6s": {
+    "scenario": "S5_late6s",
+    "cause": "late entry / backward flywheel",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": -6.0,
+    "first_preamble_s": null,
+    "gaps_s": [],
+    "cut_at_burst_s": 6.0,
+    "note": "file starts 6.0 s into the burst; first complete preamble after the cut must be found via the 4 s cadence",
+    "duration_s": 37.135,
+    "file": "results/acq_scenarios/S5_late6s.wav",
+    "peak_dbfs": -8.64
+  },
+  "S6_trunc150": {
+    "scenario": "S6_trunc150",
+    "cause": "repeater opening (4)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 1.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.65,
+    "preamble_cut_ms": 150.0,
+    "burst_start_s_nominal": 1.0,
+    "burst_start_s": 1.0,
+    "first_preamble_s": 1.0,
+    "gaps_s": [],
+    "duration_s": 43.485,
+    "file": "results/acq_scenarios/S6_trunc150.wav",
+    "peak_dbfs": -2.06
+  },
+  "S6_trunc300": {
+    "scenario": "S6_trunc300",
+    "cause": "repeater opening (4)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 1.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.8,
+    "preamble_cut_ms": 300.0,
+    "burst_start_s_nominal": 1.0,
+    "burst_start_s": 1.0,
+    "first_preamble_s": 1.0,
+    "gaps_s": [],
+    "duration_s": 43.335,
+    "file": "results/acq_scenarios/S6_trunc300.wav",
+    "peak_dbfs": -2.06
+  },
+  "S6_trunc600": {
+    "scenario": "S6_trunc600",
+    "cause": "repeater opening (4)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 1.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 1.1,
+    "preamble_cut_ms": 600.0,
+    "burst_start_s_nominal": 1.0,
+    "burst_start_s": 1.0,
+    "first_preamble_s": 1.0,
+    "gaps_s": [],
+    "duration_s": 43.035,
+    "file": "results/acq_scenarios/S6_trunc600.wav",
+    "peak_dbfs": -2.06
+  },
+  "S7_drift-20": {
+    "scenario": "S7_drift-20",
+    "cause": "2 and P4",
+    "hops": 1,
+    "drift_ppm": -20.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5,
+    "gaps_s": [],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S7_drift-20.wav",
+    "peak_dbfs": -2.06
+  },
+  "S7_drift-50": {
+    "scenario": "S7_drift-50",
+    "cause": "2 and P4",
+    "hops": 1,
+    "drift_ppm": -50.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5,
+    "gaps_s": [],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S7_drift-50.wav",
+    "peak_dbfs": -2.06
+  },
+  "S7_drift-105": {
+    "scenario": "S7_drift-105",
+    "cause": "2 and P4",
+    "hops": 1,
+    "drift_ppm": -105.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.4999,
+    "gaps_s": [],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S7_drift-105.wav",
+    "peak_dbfs": -2.06
+  },
+  "S7_drift+105": {
+    "scenario": "S7_drift+105",
+    "cause": "2 and P4",
+    "hops": 1,
+    "drift_ppm": 105.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5001,
+    "gaps_s": [],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S7_drift+105.wav",
+    "peak_dbfs": -2.06
+  },
+  "S8_gap0.5s": {
+    "scenario": "S8_gap0.5s",
+    "cause": "3 (P6)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5,
+    "gaps_s": [
+      [
+        15.0,
+        0.5
+      ]
+    ],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S8_gap0.5s.wav",
+    "peak_dbfs": -1.47
+  },
+  "S8_gap1s": {
+    "scenario": "S8_gap1s",
+    "cause": "3 (P6)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5,
+    "gaps_s": [
+      [
+        15.0,
+        1.0
+      ]
+    ],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S8_gap1s.wav",
+    "peak_dbfs": -1.47
+  },
+  "S8_gap2s": {
+    "scenario": "S8_gap2s",
+    "cause": "3 (P6)",
+    "hops": 1,
+    "drift_ppm": 0.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 0.0,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 0.0,
+    "burst_start_s": 0.0,
+    "first_preamble_s": 0.5,
+    "gaps_s": [
+      [
+        15.0,
+        2.0
+      ]
+    ],
+    "duration_s": 43.135,
+    "file": "results/acq_scenarios/S8_gap2s.wav",
+    "peak_dbfs": -1.47
+  },
+  "S9_repeater_drift-105": {
+    "scenario": "S9_repeater_drift-105",
+    "cause": "combined (S4 + -105 ppm)",
+    "hops": 2,
+    "drift_ppm": -105.0,
+    "start_delay_s": 0.0,
+    "prefix_s": 20.5,
+    "truncate_head_s": 0.0,
+    "preamble_cut_ms": 0.0,
+    "burst_start_s_nominal": 20.5,
+    "burst_start_s": 20.4978,
+    "first_preamble_s": 20.9978,
+    "gaps_s": [],
+    "duration_s": 63.635,
+    "file": "results/acq_scenarios/S9_repeater_drift-105.wav",
+    "peak_dbfs": -1.48
+  },
+  "S10_multi3": {
+    "scenario": "S10_multi3",
+    "cause": "back-to-back transmissions (2nd/3rd file failures)",
+    "profile": "HIGH+",
+    "gaps_s": [
+      15.0,
+      40.0
+    ],
+    "squelch_rms": 0.001,
+    "bursts": [
+      {
+        "session_id": "0xA0C00100",
+        "tx": "results/acq_scenarios/tx_multi_0.wav",
+        "start_s": 0.0,
+        "burst_start_s": 20.5,
+        "first_preamble_s": 21.0,
+        "end_s": 63.6354
+      },
+      {
+        "session_id": "0xA0C00101",
+        "tx": "results/acq_scenarios/tx_multi_1.wav",
+        "start_s": 78.6354,
+        "burst_start_s": 99.1354,
+        "first_preamble_s": 99.6354,
+        "end_s": 142.2707
+      },
+      {
+        "session_id": "0xA0C00102",
+        "tx": "results/acq_scenarios/tx_multi_2.wav",
+        "start_s": 182.2707,
+        "burst_start_s": 202.7707,
+        "first_preamble_s": 203.2707,
+        "end_s": 245.9061
+      }
+    ],
+    "first_preamble_s": 21.0,
+    "duration_s": 245.906,
+    "file": "results/acq_scenarios/S10_multi3.wav"
+  },
+  "S10_multi3_cut450": {
+    "scenario": "S10_multi3_cut450",
+    "cause": "back-to-back transmissions (2nd/3rd file failures)",
+    "profile": "HIGH+",
+    "gaps_s": [
+      15.0,
+      40.0
+    ],
+    "cut_tail_ms": 450.0,
+    "squelch_rms": 0.001,
+    "bursts": [
+      {
+        "session_id": "0xA0C00100",
+        "tx": "results/acq_scenarios/tx_multi_0.wav",
+        "start_s": 0.0,
+        "burst_start_s": 20.5,
+        "first_preamble_s": 21.0,
+        "end_s": 63.1854
+      },
+      {
+        "session_id": "0xA0C00101",
+        "tx": "results/acq_scenarios/tx_multi_1.wav",
+        "start_s": 78.1854,
+        "burst_start_s": 98.6854,
+        "first_preamble_s": 99.1854,
+        "end_s": 141.3707
+      },
+      {
+        "session_id": "0xA0C00102",
+        "tx": "results/acq_scenarios/tx_multi_2.wav",
+        "start_s": 181.3707,
+        "burst_start_s": 201.8707,
+        "first_preamble_s": 202.3707,
+        "end_s": 244.5561
+      }
+    ],
+    "first_preamble_s": 21.0,
+    "duration_s": 244.556,
+    "file": "results/acq_scenarios/S10_multi3_cut450.wav"
+  },
+  "S10_multi2_cut650": {
+    "scenario": "S10_multi2_cut650",
+    "cause": "back-to-back transmissions (2nd/3rd file failures)",
+    "profile": "HIGH+",
+    "gaps_s": [
+      15.0
+    ],
+    "cut_tail_ms": 650.0,
+    "squelch_rms": 0.001,
+    "bursts": [
+      {
+        "session_id": "0xA0C00100",
+        "tx": "results/acq_scenarios/tx_multi_0.wav",
+        "start_s": 0.0,
+        "burst_start_s": 20.5,
+        "first_preamble_s": 21.0,
+        "end_s": 62.9854
+      },
+      {
+        "session_id": "0xA0C00101",
+        "tx": "results/acq_scenarios/tx_multi_1.wav",
+        "start_s": 77.9854,
+        "burst_start_s": 98.4854,
+        "first_preamble_s": 98.9854,
+        "end_s": 140.9707
+      }
+    ],
+    "first_preamble_s": 21.0,
+    "duration_s": 140.971,
+    "file": "results/acq_scenarios/S10_multi2_cut650.wav"
+  }
+}

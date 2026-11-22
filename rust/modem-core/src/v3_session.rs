@@ -1175,6 +1175,13 @@ impl V3Session {
         self.drift_ppm
     }
 
+    /// Rate (ppm) currently applied by the closed-loop preamble SFO tracker,
+    /// `None` when the timing loop is disabled. Instrumentation: lets the
+    /// acquisition harness compare the applied SFO with the true one (P4).
+    pub fn timing_ppm(&self) -> Option<f64> {
+        self.timing.as_ref().map(|t| t.rate_ppm())
+    }
+
     pub fn profile_name(&self) -> &str {
         &self.profile_name
     }

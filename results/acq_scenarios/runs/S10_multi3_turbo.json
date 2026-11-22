@@ -1,0 +1,77 @@
+{
+  "audio_s": 253.9060625,
+  "brickwall": 0,
+  "burst_exit": 6,
+  "chunk_ms": 20.0,
+  "cpu_duty": 0.17711274617556644,
+  "cpu_duty_max_1s": 0.4696182243341457,
+  "cpu_s": 44.970000000000006,
+  "drops_in_burst": 0,
+  "end_wall_s": 253.922168348,
+  "entered": true,
+  "entry": {
+    "audio_s": 21.44,
+    "lag_ms": 222.38360799999768,
+    "wall_s": 21.662383608
+  },
+  "entry_algo_s": 0.4400000000000013,
+  "entry_delay_s": 0.662383607999999,
+  "esi_needed": 93,
+  "esi_ratio": 1.032258064516129,
+  "esi_received": 96,
+  "feed_wall_s": 253.920209103,
+  "file_complete": {
+    "audio_s": 61.82,
+    "lag_ms": 10.146949000002792,
+    "wall_s": 61.830146949
+  },
+  "file_s": 245.9060625,
+  "first_esi": {
+    "audio_s": 22.4,
+    "lag_ms": 9.161226999999883,
+    "wall_s": 22.409161227
+  },
+  "first_marker": {
+    "cycle_idx": 0,
+    "lag_ms": 80.10420799999807,
+    "marker_s": 21.1973125,
+    "seg_id": 0,
+    "wall_s": 21.520104208
+  },
+  "forced": false,
+  "gate_cfo_polls": 164,
+  "gate_ms_max": 32.50274,
+  "gate_ms_sum": 4669.840686999996,
+  "gate_open": {
+    "family": "NORMAL",
+    "lag_ms": 5.381446000001233,
+    "metric": 0.9787979613228664,
+    "preamble_s": 21.030645833333335,
+    "wall_s": 21.385381446
+  },
+  "gate_polls": 655,
+  "harness_late_releases": 0,
+  "input": "/home/hb9tob/git/NewModem/results/acq_scenarios/S10_multi3.wav",
+  "last_ppm": 0.0,
+  "legacy_preamble": null,
+  "markers": 183,
+  "max_lag_at_wall_s": 100.312429128,
+  "max_lag_ms": 232.4291280000068,
+  "mode": "turbo",
+  "n_events": 14672,
+  "pace": "realtime",
+  "power_mode": true,
+  "profile": "NORMAL",
+  "restart_requests": 0,
+  "rewinds": 0,
+  "scan_decode_ms_max": 0.0,
+  "scan_decode_ms_sum": 0.0,
+  "scans": 0,
+  "session_armed": {
+    "audio_s": 21.66,
+    "lag_ms": 31.253323000001387,
+    "wall_s": 21.691253323
+  },
+  "session_lost": 0,
+  "signal_start_s": 21.0
+}

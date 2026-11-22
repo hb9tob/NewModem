@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::event_sink::{EventSink, EventSinkExt};
+use crate::event_sink::{EventSink, EventSinkExt, StampingSink};
 use crate::session_store::{self, SessionStore};
 
 type WavFileWriter = WavWriter<BufWriter<std::fs::File>>;
@@ -104,6 +104,33 @@ fn worker_log(msg: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path()) {
         let _ = writeln!(f, "{msg}");
     }
+}
+
+/// Emit an `rx_milestone` event `{"stage": stage, ..fields}`.
+///
+/// Timing instrumentation of the acquisition chain, symmetric between the
+/// turbo and legacy workers. Every milestone also carries `_audio_s` /
+/// `_wall_s` (added by [`StampingSink`]), so a consumer gets, for each
+/// step, both *where in the stream* the worker was and *how far behind
+/// real time* it was. Stages:
+///
+/// - turbo: `gate_poll` (each heavy FFT gate poll: cost + whether the CFO
+///   grid ran), `gate_open`, `driver_ready` (warm-up replay cost),
+///   `marker` (every validated marker, with its stream position and the
+///   SFO/drift state), `drift_committed`, `rewind`, `session_lost`,
+///   `burst_finalised`, `burst_exit`, `brickwall`;
+/// - legacy: `scan` (every scan tick: probe/decode cost, passes, drift,
+///   CWs, last preamble stream position), `brickwall`.
+///
+/// The GUI ignores this event; it exists for the acquisition harness
+/// (`examples/acq_replay.rs`) and post-mortem analysis.
+pub(crate) fn emit_milestone(sink: &dyn EventSink, stage: &str, fields: serde_json::Value) {
+    let mut m = match fields {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    m.insert("stage".into(), serde_json::Value::from(stage));
+    sink.emit_json("rx_milestone", serde_json::Value::Object(m));
 }
 
 /// Fold one tick's per-stage breakdown into the rolling accumulator + max
@@ -518,6 +545,15 @@ pub fn spawn(
 ) -> WorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    // Stream position (samples consumed by the worker), published by the
+    // worker loop and read by the stamping sink so every event carries the
+    // worker's audio position + wall time (real-time lag per event).
+    let stream_pos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sink: Arc<dyn EventSink> = Arc::new(StampingSink::new(
+        sink,
+        stream_pos.clone(),
+        AUDIO_RATE as f64,
+    ));
     let thread = thread::spawn(move || {
         // The main worker forks by mode: turbo runs the stateful
         // fully-streaming V3Session path; legacy runs the sliding-window
@@ -533,6 +569,7 @@ pub fn spawn(
                 forced,
                 deemphasis_enabled,
                 dropped_samples,
+                stream_pos,
                 stop_thread,
             );
         } else {
@@ -546,6 +583,7 @@ pub fn spawn(
                 deemphasis_enabled,
                 allow_legacy_grid,
                 dropped_samples,
+                stream_pos,
                 stop_thread,
             );
         }
@@ -1000,6 +1038,7 @@ fn run_turbo_worker(
     forced: bool,
     deemphasis_enabled: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
+    stream_pos: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = std::fs::remove_file(log_path());
@@ -1031,6 +1070,9 @@ fn run_turbo_worker(
     };
     // Warm-up ring used only while detecting (auto mode, driver not yet built).
     let mut warm: Vec<f32> = Vec::new();
+    // Worker-stream position (`total_samples`) at which the current auto-mode
+    // driver was built, for the orphan guard (see `orphan_grace_samples`).
+    let mut driver_born: u64 = 0;
     // THE single turbo detection chain at cold startup (auto mode): the FFT
     // matched-filter gate, multi-geometry. Replaces the naive symbol-domain
     // `detect_best_profile_cold` (an O(N·taps) re-scan of the whole warm buffer
@@ -1126,6 +1168,11 @@ fn run_turbo_worker(
             worker_log(&format!(
                 "[turbo] BRICKWALL capture: +{delta} samples dropped → finalize + idle"
             ));
+            emit_milestone(
+                &*sink,
+                "brickwall",
+                serde_json::json!({"reason": "capture", "dropped": delta}),
+            );
             if let Some(d) = driver.as_mut() {
                 let _ = d.finalize();
             }
@@ -1148,6 +1195,7 @@ fn run_turbo_worker(
         }
 
         total_samples += chunk.len() as u64;
+        stream_pos.store(total_samples, Ordering::Relaxed);
         let (peak, rms, crest_db) = compute_audio_stats(&chunk);
         let overdrive =
             rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
@@ -1197,6 +1245,7 @@ fn run_turbo_worker(
                 // headless/sim case where nothing services the restart event.
                 if d.is_stuck() {
                     worker_log("[turbo] BRICKWALL no-progress: active but no new ESI -> finalize + re-detect");
+                    emit_milestone(&*sink, "brickwall", serde_json::json!({"reason": "noprogress"}));
                     finalised += d.finalize().bursts_finalised;
                     sink.emit(
                         "worker_requests_restart",
@@ -1209,6 +1258,31 @@ fn run_turbo_worker(
                 // above). In AUTO mode (auto_gate.is_some() ⇔ !forced) flag a
                 // return to the cold-startup detection state below.
                 if finalised > 0 && auto_gate.is_some() {
+                    burst_ended = true;
+                }
+                // Orphan guard (auto mode): a driver built on a gate-open that
+                // never validates a single marker (false open on speech, a
+                // squelch tail, a damaged EOT) never reaches a burst boundary,
+                // so nothing above would ever drop it. It would run the
+                // in-session search until the next transmission and grow its
+                // history to HISTORY_SAMPLES, which the next burst's profile
+                // rebuild then replays in one go (tens of seconds of lag).
+                // Return to cold detection instead.
+                if !burst_ended
+                    && auto_gate.is_some()
+                    && !d.has_validated_marker()
+                    && total_samples.saturating_sub(driver_born) >= d.orphan_grace_samples()
+                {
+                    worker_log("[turbo] orphan driver: no marker within grace -> cold-detect");
+                    emit_milestone(
+                        &*sink,
+                        "driver_drop",
+                        serde_json::json!({
+                            "reason": "orphan",
+                            "alive_s": total_samples.saturating_sub(driver_born) as f64
+                                / AUDIO_RATE as f64,
+                        }),
+                    );
                     burst_ended = true;
                 }
             }
@@ -1227,11 +1301,23 @@ fn run_turbo_worker(
                 let open = auto_gate
                     .as_mut()
                     .and_then(|g| g.poll(&warm, warm_origin));
-                if log_gate {
-                    if let Some(g) = auto_gate.as_ref() {
-                        let ms = g.last_poll_ms();
-                        if ms != last_gate_ms {
-                            last_gate_ms = ms;
+                // One `gate_poll` milestone per heavy poll (detected as a change
+                // of `last_poll_ms`): its wall cost and whether the phase-2 CFO
+                // grid ran. This is the search-phase CPU trace (P1/P2).
+                if let Some(g) = auto_gate.as_ref() {
+                    let ms = g.last_poll_ms();
+                    if ms != last_gate_ms {
+                        last_gate_ms = ms;
+                        emit_milestone(
+                            &*sink,
+                            "gate_poll",
+                            serde_json::json!({
+                                "ms": ms,
+                                "cfo": g.last_ran_cfo(),
+                                "warm_s": warm.len() as f64 / AUDIO_RATE as f64,
+                            }),
+                        );
+                        if log_gate {
                             worker_log(&format!(
                                 "[gate] heavy poll {ms:.1} ms cfo={}",
                                 g.last_ran_cfo()
@@ -1245,6 +1331,16 @@ fn run_turbo_worker(
                         "[turbo] gate auto-detected family anchor {fam:?} (metric={:.3})",
                         open.metric,
                     ));
+                    emit_milestone(
+                        &*sink,
+                        "gate_open",
+                        serde_json::json!({
+                            "family": fam.name(),
+                            "metric": open.metric,
+                            "cfo_hz": open.cfo_hz,
+                            "preamble_s": open.preamble_abs as f64 / AUDIO_RATE as f64,
+                        }),
+                    );
                     match crate::rx_v3_worker::RxV3Worker::new(
                         fam,
                         /*forced=*/ false,
@@ -1252,17 +1348,44 @@ fn run_turbo_worker(
                         sink.clone(),
                     ) {
                         Ok(mut d) => {
-                            // Replay the warm-up so no audio is lost; the driver
-                            // refines to the exact profile from the first marker
-                            // inside this push. Feed it in ~100 ms batches (not
-                            // one big chunk) so the throttled acquisition scan
-                            // runs across the warm-up and catches the preamble
-                            // (the SC detector, run per-sample on ingest, is the
-                            // backstop regardless).
-                            for batch in warm.chunks(ACQ_PUSH_SPLIT) {
+                            // Replay only from just before the detected preamble,
+                            // not the whole 8 s warm ring: what precedes it is
+                            // speech / noise the session has nothing to do with,
+                            // and replaying it cost ~2.5 s of lag per entry (the
+                            // ring is replayed once here and again by the profile
+                            // rebuild at the first marker, which replays the
+                            // driver history). `preamble_abs` is in the worker
+                            // frame (same origin as `warm_origin`).
+                            let lead = (TURBO_REPLAY_LEAD_S * AUDIO_RATE as f64) as u64;
+                            let start_abs = open
+                                .preamble_abs
+                                .saturating_sub(lead)
+                                .clamp(warm_origin, total_samples);
+                            let off = (start_abs - warm_origin) as usize;
+                            // Session frame 0 = first replayed sample.
+                            d.set_stream_base(start_abs);
+                            let t_replay = Instant::now();
+                            // Feed it in ~100 ms batches (not one big chunk) so
+                            // the throttled acquisition scan runs across the
+                            // replay and catches the preamble (the SC detector,
+                            // run per-sample on ingest, is the backstop
+                            // regardless). The driver refines to the exact
+                            // profile from the first marker inside this push.
+                            for batch in warm[off..].chunks(ACQ_PUSH_SPLIT) {
                                 d.push_samples(batch);
                             }
+                            emit_milestone(
+                                &*sink,
+                                "driver_ready",
+                                serde_json::json!({
+                                    "replay_ms": t_replay.elapsed().as_secs_f64() * 1000.0,
+                                    "warm_s": warm.len() as f64 / AUDIO_RATE as f64,
+                                    "replayed_s": (warm.len() - off) as f64 / AUDIO_RATE as f64,
+                                    "active": d.is_active(),
+                                }),
+                            );
                             warm.clear();
+                            driver_born = total_samples;
                             driver = Some(d);
                         }
                         Err(e) => worker_log(&format!("[turbo] driver init failed: {e}")),
@@ -1296,6 +1419,7 @@ fn run_turbo_worker(
                 g.reset_to(total_samples - warm.len() as u64);
             }
             worker_log("[turbo] burst exit -> reset to cold-detect (cross-family re-arm)");
+            emit_milestone(&*sink, "burst_exit", serde_json::json!({}));
         }
     }
 
@@ -1309,6 +1433,10 @@ fn run_turbo_worker(
 /// family. 8 s spans ≥1 full `V3_PREAMBLE_PERIOD_S` (~4 s) preamble, so a
 /// burst that starts mid-window is still caught on the next re-insertion.
 const TURBO_WARM_MAX_SAMPLES: usize = 8 * AUDIO_RATE as usize;
+/// Audio replayed into a freshly built auto-mode driver ahead of the
+/// gate-detected preamble (seconds). Covers the matched filter's position
+/// uncertainty and gives the session's acquisition some lead-in.
+const TURBO_REPLAY_LEAD_S: f64 = 1.0;
 /// Max sub-push fed to the turbo driver at once (~100 ms). Bounds the gap
 /// between throttled acquisition scans so the matched filter's ~325 ms search
 /// window can never be jumped over, regardless of the source's buffer size.
@@ -1324,6 +1452,7 @@ fn run_worker(
     deemphasis_enabled: bool,
     allow_legacy_grid: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
+    stream_pos: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = std::fs::remove_file(log_path());
@@ -1380,6 +1509,7 @@ fn run_worker(
         }
 
         state.total_samples += batch.len() as u64;
+        stream_pos.store(state.total_samples, Ordering::Relaxed);
 
         // Capture-side brickwall: did the OS-audio 30 s ring overflow
         // since the last iteration? If yes and we're mid-session, the
@@ -1403,8 +1533,14 @@ fn run_worker(
                     "[worker] BRICKWALL capture: +{delta} mono-samples dropped \
                      during active session → flush + idle"
                 ));
+                emit_milestone(
+                    &*sink,
+                    "brickwall",
+                    serde_json::json!({"reason": "capture", "dropped": delta}),
+                );
                 state.soft_reset_buffer();
                 let flushed = drain_mpsc(&samples, &mut state.total_samples);
+                stream_pos.store(state.total_samples, Ordering::Relaxed);
                 if flushed > 0 {
                     worker_log(&format!(
                         "[worker] flushed {flushed} mpsc samples on brickwall"
@@ -1496,6 +1632,7 @@ fn run_worker(
                 ));
                 state.soft_reset_buffer();
                 let flushed = drain_mpsc(&samples, &mut state.total_samples);
+                stream_pos.store(state.total_samples, Ordering::Relaxed);
                 if flushed > 0 {
                     worker_log(&format!(
                         "[worker] flushed {flushed} mpsc samples on brickwall"
@@ -1791,6 +1928,17 @@ fn scan_and_route(
                 "[scan] active=false buf={:.1}s gated profile={:?} rms_sqr={:.6} t_probe_us={} probe={}@{:.1} (<{})",
                 buf_secs, state.profile, rms_sqr, t_probe_us, probe_label, probe_ratio, modem_core::gate::PROBE_THRESHOLD,
             ));
+            emit_milestone(
+                sink,
+                "scan",
+                serde_json::json!({
+                    "gated": true,
+                    "active": false,
+                    "probe_ms": t_probe_us as f64 / 1000.0,
+                    "probe_ratio": probe_ratio,
+                    "buf_s": buf_secs,
+                }),
+            );
             return;
         }
         // Gate fired with an anchor profile. Switch state.profile when
@@ -1960,6 +2108,36 @@ fn scan_and_route(
                 recent: 0,
                 quota: 0,
             },
+        );
+    }
+    // `scan` milestone: one per decode tick, with the stream position of the
+    // last preamble the window walked (buffer = tail of the stream).
+    {
+        let buf_origin = state
+            .total_samples
+            .saturating_sub(state.session_buffer.len() as u64);
+        let r = rx_v3_opt.as_ref();
+        emit_milestone(
+            sink,
+            "scan",
+            serde_json::json!({
+                "gated": false,
+                "ok": r.is_some(),
+                "active": state.session_active,
+                "finalize": finalize,
+                "probe_ms": t_probe_us as f64 / 1000.0,
+                "decode_ms": t_rx_v3_us as f64 / 1000.0,
+                "n_passes": perf_this_tick.n_passes,
+                "buf_s": buf_secs,
+                "drift_ppm": r.map(|r| r.drift_ppm),
+                "cws": r.map(|r| r.cw_bytes_map.len()),
+                "converged": r.map(|r| r.converged_blocks),
+                "total_blocks": r.map(|r| r.total_blocks),
+                "sigma2": r.map(|r| r.sigma2),
+                "last_preamble_s": r
+                    .and_then(|r| r.last_preamble_offset)
+                    .map(|o| (buf_origin + o as u64) as f64 / AUDIO_RATE as f64),
+            }),
         );
     }
     perf_log_accumulate(state, perf_this_tick);
@@ -3168,6 +3346,7 @@ mod tests {
             /*forced=*/ false,
             /*deemphasis=*/ false,
             dropped,
+            Arc::new(AtomicU64::new(0)),
             stop,
         );
 

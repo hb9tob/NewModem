@@ -19,7 +19,9 @@
 //!   * `RecordingSink`: keeps every emission in memory; lets unit tests
 //!     assert what a worker emitted without standing up a Tauri app.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -61,6 +63,51 @@ pub struct NoopSink;
 
 impl EventSink for NoopSink {
     fn emit_json(&self, _name: &str, _payload: Value) {}
+}
+
+/// Wrapper that stamps every object payload with the worker's timing
+/// context before forwarding it:
+///
+/// - `_audio_s`: audio consumed by the worker so far (stream position,
+///   seconds), read from the shared `stream_pos` sample counter the worker
+///   bumps as it ingests audio;
+/// - `_wall_s`: wall-clock seconds since the wrapper was created.
+///
+/// `_wall_s - _audio_s` is the worker's real-time lag at the instant the
+/// event fired, so every milestone (gate open, first marker, session armed,
+/// each new ESI...) carries its own lag without per-event bookkeeping.
+/// Non-object payloads are forwarded untouched. Extra fields are ignored by
+/// the GUI listeners, which read named fields only.
+pub struct StampingSink {
+    inner: Arc<dyn EventSink>,
+    stream_pos: Arc<AtomicU64>,
+    sample_rate: f64,
+    started: Instant,
+}
+
+impl StampingSink {
+    pub fn new(inner: Arc<dyn EventSink>, stream_pos: Arc<AtomicU64>, sample_rate: f64) -> Self {
+        Self {
+            inner,
+            stream_pos,
+            sample_rate,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl EventSink for StampingSink {
+    fn emit_json(&self, name: &str, mut payload: Value) {
+        if let Value::Object(ref mut m) = payload {
+            let audio_s = self.stream_pos.load(Ordering::Relaxed) as f64 / self.sample_rate;
+            m.insert("_audio_s".into(), Value::from(audio_s));
+            m.insert(
+                "_wall_s".into(),
+                Value::from(self.started.elapsed().as_secs_f64()),
+            );
+        }
+        self.inner.emit_json(name, payload);
+    }
 }
 
 /// In-memory sink useful for unit tests: collects every (name, payload)
@@ -136,6 +183,21 @@ mod tests {
         // Both methods callable through the trait object.
         sink.emit_json("a", Value::Null);
         sink.emit("b", DummyPayload { n: 2, msg: "x" });
+    }
+
+    #[test]
+    fn stamping_sink_adds_stream_position() {
+        let rec = Arc::new(RecordingSink::new());
+        let pos = Arc::new(AtomicU64::new(0));
+        let sink = StampingSink::new(rec.clone(), pos.clone(), 48_000.0);
+        pos.store(96_000, Ordering::Relaxed);
+        sink.emit("obj", DummyPayload { n: 3, msg: "x" });
+        sink.emit_json("null", Value::Null);
+        let ev = rec.events();
+        assert_eq!(ev[0].1["_audio_s"].as_f64(), Some(2.0));
+        assert!(ev[0].1["_wall_s"].as_f64().unwrap() >= 0.0);
+        assert_eq!(ev[0].1["n"], 3);
+        assert!(ev[1].1.is_null());
     }
 
     #[test]

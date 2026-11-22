@@ -38,7 +38,7 @@ use modem_core::v3_session::{V3Session, V3SessionEvent};
 use modem_framing::app_header::AppHeader;
 
 use crate::event_sink::{EventSink, EventSinkExt};
-use crate::rx_worker::emit_decoded_file;
+use crate::rx_worker::{emit_decoded_file, emit_milestone};
 use crate::session_store::{DecodedFile, SessionStore};
 
 /// Idle span (FSM not receiving) after which a warm-kept session is HARD-flushed
@@ -115,6 +115,18 @@ pub struct RxV3Worker {
     /// `history_origin + history.len()` is the live head. Maps a
     /// `RewindRequest.anchor_abs_sample` to its offset inside `history`.
     history_origin: u64,
+    /// Worker-stream position (samples since capture start) of the first
+    /// sample ever pushed into this driver. Set by the owner via
+    /// [`Self::set_stream_base`] (the auto-mode driver is built late, at the
+    /// gate open, and fed the warm-up ring first).
+    stream_base: u64,
+    /// Samples pushed live into this driver since construction.
+    pushed_total: u64,
+    /// Worker-stream position of the session's absolute-sample frame 0.
+    /// Moves on every frame reset (`restart_session_fresh`, `rebuild_at`), so
+    /// `frame0_stream + marker_at_abs` is always the marker's stream position
+    /// (timing instrumentation only — never feeds the DSP).
+    frame0_stream: u64,
     /// Set once the exact profile has been resolved: `true` from the start in
     /// forced mode (the operator locked `profile`), otherwise flipped `true`
     /// by the first validated marker. Gates the one-shot marker-driven
@@ -154,6 +166,9 @@ pub struct RxV3Worker {
     receiving_locked: bool,
     /// Ring head (abs) past which an un-locked `Receiving` is a false positive.
     receiving_deadline: u64,
+    /// At least one marker has validated since this driver was built. The
+    /// auto-mode worker drops a driver that never gets here (orphan guard).
+    marker_seen: bool,
     /// Latest segment scatter (equalised data I/Q) for the GUI constellation,
     /// from `V3SessionEvent::ConstellationDiag`. Emitted on every `v2_progress`.
     last_constellation: Vec<[f32; 2]>,
@@ -237,6 +252,9 @@ impl RxV3Worker {
             exit_was_clean: false,
             history: VecDeque::with_capacity(HISTORY_SAMPLES),
             history_origin: 0,
+            stream_base: 0,
+            pushed_total: 0,
+            frame0_stream: 0,
             detected_locked: forced,
             forced,
             pending_rebuild: None,
@@ -252,6 +270,7 @@ impl RxV3Worker {
             gate: TurboGate::forced(profile),
             receiving_locked: false,
             receiving_deadline: 0,
+            marker_seen: false,
             samples_since_progress: 0,
             unique_hwm: HashMap::new(),
             brickwall_enabled: std::env::var_os("V3_NO_BRICKWALL").is_none(),
@@ -275,6 +294,31 @@ impl RxV3Worker {
         self.active
     }
 
+    /// `true` once any marker has validated since the driver was built.
+    pub fn has_validated_marker(&self) -> bool {
+        self.marker_seen
+    }
+
+    /// Live samples an auto-mode driver may run without validating a single
+    /// marker before the worker treats its gate-open as false and returns to
+    /// cold detection: 4 s (one preamble re-insertion period), or 3 marker
+    /// cycles on the slow families whose cycle is longer.
+    pub fn orphan_grace_samples(&self) -> u64 {
+        (4 * AUDIO_RATE as u64).max(3 * self.session.cycle_samples() as u64)
+    }
+
+    /// Declare the worker-stream position of the first sample that will be
+    /// pushed (call before the first `push_samples`). Instrumentation only.
+    pub fn set_stream_base(&mut self, base: u64) {
+        self.stream_base = base;
+        self.frame0_stream = base + self.pushed_total;
+    }
+
+    /// Session-frame absolute sample → worker-stream seconds.
+    fn stream_s(&self, abs: u64) -> f64 {
+        (self.frame0_stream + abs) as f64 / AUDIO_RATE as f64
+    }
+
     /// Forward the caller-provided drift hint (ppm) to the session's
     /// streaming resampler. See `V3Session::set_drift_ppm`.
     pub fn set_drift_ppm(&mut self, ppm: f64) {
@@ -286,6 +330,7 @@ impl RxV3Worker {
     /// sample with persistent state, so there is no fixed chunk size and no
     /// boundary effect.
     pub fn push_samples(&mut self, samples: &[f32]) -> PushOutcome {
+        self.pushed_total += samples.len() as u64;
         // Append to the rolling central ring first, so a rewind/seek triggered
         // while routing this chunk's events can reach right up to the live head.
         self.history.extend(samples.iter().copied());
@@ -452,6 +497,8 @@ impl RxV3Worker {
         // (same invariant `rebuild_at` relies on).
         self.history.clear();
         self.history_origin = 0;
+        // The next pushed sample is frame 0 of the fresh session.
+        self.frame0_stream = self.stream_base + self.pushed_total;
         if self.gated {
             self.turbo_state = TurboState::Searching;
             self.receiving_locked = false;
@@ -612,11 +659,13 @@ impl RxV3Worker {
                 };
                 eprintln!("[exit] route {label}");
             }
+            self.emit_route_milestone(&e);
             match e {
                 V3SessionEvent::MarkerValidated { profile_index, .. } => {
                     // Forward sync progress — arms the burst and resets the
                     // burst as active.
                     self.active = true;
+                    self.marker_seen = true;
                     // One-shot exact-profile refinement (auto mode only). The
                     // bootstrap anchor pinned the geometry FAMILY; the marker
                     // advertises the exact TX profile via its `profile_index`.
@@ -823,6 +872,7 @@ impl RxV3Worker {
                     // the anchor has already aged out of the history window.
                     if anchor_abs_sample >= self.history_origin {
                         let lo = (anchor_abs_sample - self.history_origin) as usize;
+                        let t_rw = std::time::Instant::now();
                         let mut hist = std::mem::take(&mut self.history);
                         let replay = {
                             let buf = hist.make_contiguous();
@@ -836,6 +886,14 @@ impl RxV3Worker {
                                 Vec::new()
                             }
                         };
+                        emit_milestone(
+                            self.sink.as_ref(),
+                            "rewind_replay",
+                            serde_json::json!({
+                                "span_s": hist.len().saturating_sub(lo) as f64 / AUDIO_RATE as f64,
+                                "replay_ms": t_rw.elapsed().as_secs_f64() * 1000.0,
+                            }),
+                        );
                         self.history = hist;
                         // Route the corrected decode in this same pass.
                         for re in replay {
@@ -852,6 +910,83 @@ impl RxV3Worker {
             }
         }
         outcome
+    }
+
+    /// Timing milestones for the acquisition harness (see
+    /// `rx_worker::emit_milestone`). Marker positions are converted to
+    /// worker-stream seconds so they compare directly with the ground truth
+    /// of a replayed WAV. Replays (profile rebuild, drift rewind) re-emit
+    /// markers already reported; consumers keep the first per position.
+    fn emit_route_milestone(&self, e: &V3SessionEvent) {
+        let sink = self.sink.as_ref();
+        match e {
+            V3SessionEvent::MarkerValidated {
+                marker_at_abs,
+                cycle_idx,
+                seg_id,
+                base_esi,
+                is_meta,
+                profile_index,
+                ..
+            } => emit_milestone(
+                sink,
+                "marker",
+                serde_json::json!({
+                    "marker_s": self.stream_s(*marker_at_abs),
+                    "cycle_idx": cycle_idx,
+                    "seg_id": seg_id,
+                    "base_esi": base_esi,
+                    "is_meta": is_meta,
+                    "profile_index": profile_index,
+                    "first": !self.active,
+                    "timing_ppm": self.session.timing_ppm(),
+                    "drift_ppm": self.session.drift_ppm(),
+                }),
+            ),
+            V3SessionEvent::DriftCommitted {
+                from_ppm,
+                to_ppm,
+                n_observations,
+                applied,
+            } => emit_milestone(
+                sink,
+                "drift_committed",
+                serde_json::json!({
+                    "from_ppm": from_ppm, "to_ppm": to_ppm,
+                    "n_obs": n_observations, "applied": applied,
+                }),
+            ),
+            V3SessionEvent::RewindRequest {
+                anchor_abs_sample,
+                new_drift_ppm,
+            } => emit_milestone(
+                sink,
+                "rewind",
+                serde_json::json!({
+                    "anchor_s": self.stream_s(*anchor_abs_sample),
+                    "new_drift_ppm": new_drift_ppm,
+                }),
+            ),
+            V3SessionEvent::SessionLost { reason } => emit_milestone(
+                sink,
+                "session_lost",
+                serde_json::json!({"reason": reason}),
+            ),
+            V3SessionEvent::SessionFinalised {
+                cycles_validated,
+                cws_converged,
+            } => emit_milestone(
+                sink,
+                "burst_finalised",
+                serde_json::json!({
+                    "cycles": cycles_validated, "cws": cws_converged,
+                }),
+            ),
+            V3SessionEvent::EotSeen => {
+                emit_milestone(sink, "eot", serde_json::json!({}))
+            }
+            _ => {}
+        }
     }
 
     /// Rebuild the streaming session at `profile` and replay the rolling
@@ -882,6 +1017,9 @@ impl RxV3Worker {
         self.active = false;
 
         let hist: Vec<f32> = self.history.iter().copied().collect();
+        let t_replay = std::time::Instant::now();
+        // The replay restarts the frame at hist[0], i.e. old `history_origin`.
+        self.frame0_stream += self.history_origin;
         self.history_origin = 0;
         let mut acc: Vec<f32> = Vec::with_capacity(hist.len());
         let mut events = Vec::new();
@@ -892,6 +1030,17 @@ impl RxV3Worker {
                     .process_audio_chunk_with_history(chunk, &acc, 0),
             );
         }
+        // Replay cost scales with the WHOLE history (up to HISTORY_SAMPLES),
+        // not with the distance to the preamble.
+        emit_milestone(
+            self.sink.as_ref(),
+            "rebuild",
+            serde_json::json!({
+                "to": profile.name(),
+                "history_s": hist.len() as f64 / AUDIO_RATE as f64,
+                "replay_ms": t_replay.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         self.route(events)
     }
 

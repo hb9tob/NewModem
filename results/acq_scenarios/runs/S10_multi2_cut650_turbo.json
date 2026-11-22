@@ -1,0 +1,77 @@
+{
+  "audio_s": 148.97070833333333,
+  "brickwall": 0,
+  "burst_exit": 4,
+  "chunk_ms": 20.0,
+  "cpu_duty": 0.20413409011894676,
+  "cpu_duty_max_1s": 0.4695383222188345,
+  "cpu_s": 30.41,
+  "drops_in_burst": 0,
+  "end_wall_s": 148.982265018,
+  "entered": true,
+  "entry": {
+    "audio_s": 21.44,
+    "lag_ms": 217.5074259999974,
+    "wall_s": 21.657507426
+  },
+  "entry_algo_s": 0.4400000000000013,
+  "entry_delay_s": 0.6575074259999987,
+  "esi_needed": 93,
+  "esi_ratio": 1.032258064516129,
+  "esi_received": 96,
+  "feed_wall_s": 148.980270545,
+  "file_complete": {
+    "audio_s": 61.82,
+    "lag_ms": 9.92221199999932,
+    "wall_s": 61.829922212
+  },
+  "file_s": 140.97070833333333,
+  "first_esi": {
+    "audio_s": 22.4,
+    "lag_ms": 9.078736000002863,
+    "wall_s": 22.409078736
+  },
+  "first_marker": {
+    "cycle_idx": 0,
+    "lag_ms": 72.59118800000053,
+    "marker_s": 21.1973125,
+    "seg_id": 0,
+    "wall_s": 21.512591188000002
+  },
+  "forced": false,
+  "gate_cfo_polls": 74,
+  "gate_ms_max": 32.014345999999996,
+  "gate_ms_sum": 2420.4045209999995,
+  "gate_open": {
+    "family": "NORMAL",
+    "lag_ms": 5.019710999999205,
+    "metric": 0.9787977231780582,
+    "preamble_s": 21.030645833333335,
+    "wall_s": 21.385019710999998
+  },
+  "gate_polls": 298,
+  "harness_late_releases": 0,
+  "input": "/home/hb9tob/git/NewModem/results/acq_scenarios/S10_multi2_cut650.wav",
+  "last_ppm": 0.033368147309657814,
+  "legacy_preamble": null,
+  "markers": 118,
+  "max_lag_at_wall_s": 21.657508385,
+  "max_lag_ms": 217.50838499999858,
+  "mode": "turbo",
+  "n_events": 8574,
+  "pace": "realtime",
+  "power_mode": true,
+  "profile": "NORMAL",
+  "restart_requests": 0,
+  "rewinds": 0,
+  "scan_decode_ms_max": 0.0,
+  "scan_decode_ms_sum": 0.0,
+  "scans": 0,
+  "session_armed": {
+    "audio_s": 21.66,
+    "lag_ms": 27.065334999999635,
+    "wall_s": 21.687065335
+  },
+  "session_lost": 0,
+  "signal_start_s": 21.0
+}

@@ -19,3 +19,7 @@ Thumbs.db
 # Intermediate sim artifacts (reproducible)
 results/sim_*.wav
 results/ota_results.json
+
+# Acquisition campaign audio (regenerate: see docs/plan_acquisition_turbo_vs_legacy.md, steps 2-4)
+results/acq_scenarios/*.wav
+results/acq_scenarios/runs/*.jsonl

@@ -21,5 +21,5 @@ pub mod rx_worker;
 pub mod session_store;
 pub mod tx_worker;
 
-pub use event_sink::{EventSink, EventSinkExt, NoopSink, RecordingSink};
+pub use event_sink::{EventSink, EventSinkExt, NoopSink, RecordingSink, StampingSink};
 pub use radio::{RadioSessionHandle, RadioTuner, RadioUiCommand};
