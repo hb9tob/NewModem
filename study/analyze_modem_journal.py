@@ -31,7 +31,7 @@ MAX_BYTES = 256 * 1024 * 1024
 MAX_LINE = 256 * 1024
 MAX_MEMBERS = 256  # a bundle has about 25; each one costs a copy of the rest
 INCIDENT_KINDS = {
-    "rx.brickwall", "rx.session_lost", "rx.driver_drop", "error", "tx_error",
+    "rx.brickwall", "rx.session_lost", "rx.driver_drop", "error", "panic", "tx_error",
     "worker_requests_restart", "truncated",
 }
 
@@ -183,8 +183,13 @@ def print_encoding(records):
     buffers = [r for r in records if r["kind"] == "buffer"]
     if not buffers:
         return
-    during = [r for r in buffers if r.get("ops")]
-    without = [r for r in buffers if not r.get("ops")]
+    def encoding(record):
+        ops = record.get("ops")
+        # Playback is listed as an operation, it is not encoding.
+        return isinstance(ops, list) and any(op != "tx_play" for op in ops)
+
+    during = [r for r in buffers if encoding(r)]
+    without = [r for r in buffers if not encoding(r)]
     print("== RX queue with and without encoding")
     for label, items in (("without", without), ("during", during)):
         if not items:

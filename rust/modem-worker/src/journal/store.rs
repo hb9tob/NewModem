@@ -276,11 +276,12 @@ pub fn bundle(dir: &Path, max_gz: usize) -> io::Result<Bundle> {
 /// Queue level counted as an incident; default of `analyze_modem_journal.py`.
 const INCIDENT_QUEUE_MS: f64 = 500.0;
 /// Same set as `INCIDENT_KINDS` in that script.
-const INCIDENT_KINDS: [&str; 7] = [
+const INCIDENT_KINDS: [&str; 8] = [
     "rx.brickwall",
     "rx.session_lost",
     "rx.driver_drop",
     "error",
+    "panic",
     "tx_error",
     "worker_requests_restart",
     "truncated",

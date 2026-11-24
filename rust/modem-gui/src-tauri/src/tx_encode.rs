@@ -2,6 +2,7 @@ use crate::overlay::{apply_overlay, Overlay};
 use exif::{In, Reader as ExifReader, Tag};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
+use modem_worker::journal::Op;
 use ravif::{BitDepth, Encoder, Img};
 use rgb::FromSlice;
 use serde::{Deserialize, Serialize};
@@ -125,7 +126,11 @@ pub fn compress_zstd(source_bytes: &[u8]) -> Result<CompressedFile, String> {
     })
 }
 
-pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<CompressedImage, String> {
+pub fn compress_avif(
+    source_bytes: Vec<u8>,
+    opts: &CompressOpts,
+    op: &mut Op,
+) -> Result<CompressedImage, String> {
     // Passthrough: the source is already an AVIF (direct drop or relay from
     // history). We don't touch the bytes - no re-encode, hence no loss and
     // no CPU cycles. We don't decode the AVIF on the Rust side to read the
@@ -200,6 +205,8 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
         img.apply_orientation(orientation);
     }
     let (src_w, src_h) = (img.width(), img.height());
+    op.set("src_px", u64::from(src_w) * u64::from(src_h));
+    op.stage("decode");
 
     let needs_resize = opts.target_w > 0
         && opts.target_h > 0
@@ -220,12 +227,14 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
         img
     };
     mem_trace("resized");
+    op.stage("resize");
 
     // Bake the active overlay (text + logo) into the resized buffer so
     // both preview and transmit share the exact same pixels. Skipped when
     // no overlay is provided or the overlay has no non-empty element.
     if let Some(overlay) = opts.overlay.as_ref() {
         apply_overlay(&mut resized, overlay);
+        op.stage("overlay");
     }
 
     // RGBA conversion + ravif encode, scoped so `resized` (DynamicImage)
@@ -237,6 +246,8 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
         let rgba = resized.to_rgba8();
         drop(resized); // pixel data now lives in `rgba` alone
         mem_trace("rgba");
+        op.stage("rgba");
+        op.set("px", u64::from(rgba.width()) * u64::from(rgba.height()));
         let (w, h) = (rgba.width(), rgba.height());
 
         let encoded = {
@@ -254,6 +265,7 @@ pub fn compress_avif(source_bytes: Vec<u8>, opts: &CompressOpts) -> Result<Compr
                 .map_err(|e| format!("encode: {e}"))?
         };
         mem_trace("encoded");
+        op.stage("encode");
         // rgba drops here at scope exit; encoded.avif_file is moved out.
         (encoded.avif_file, w, h)
     };

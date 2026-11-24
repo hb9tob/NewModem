@@ -29,6 +29,7 @@ fn main() {
     let ext = if is_windows { ".exe" } else { "" };
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    emit_commit(&manifest_dir);
     let workspace_target = manifest_dir
         .parent()
         .and_then(|p| p.parent())
@@ -78,4 +79,28 @@ fn main() {
     println!("cargo:rerun-if-changed={}", secret_path.display());
 
     tauri_build::build();
+}
+
+/// `NEWMODEM_COMMIT` for the journal header; `unknown` outside a checkout.
+fn emit_commit(manifest_dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(manifest_dir)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let commit = git(&["rev-parse", "--short=9", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=NEWMODEM_COMMIT={commit}");
+    // Grows at every commit, checkout or rebase.
+    if let Some(log) = git(&["rev-parse", "--git-path", "logs/HEAD"]) {
+        let log = manifest_dir.join(log);
+        if log.exists() {
+            println!("cargo:rerun-if-changed={}", log.display());
+        }
+    }
 }

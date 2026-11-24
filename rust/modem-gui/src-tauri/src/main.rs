@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod collector_client;
+mod modem_journal;
 mod overlay;
 mod ptt;
 mod sdr_registry;
 mod settings;
 mod tx_encode;
 
+use modem_worker::journal::{Journal, JournalSink};
 use modem_worker::session_store;
 use modem_worker::radio::{self, RadioSessionHandle, RadioTuner, RadioUiCommand};
 use modem_worker::{rx_worker, tx_worker, EventSink};
@@ -112,6 +114,8 @@ struct SounderCapture {
 }
 
 struct AppState {
+    /// What the modem does over time, publishable (see `modem_journal`).
+    journal: Journal,
     session: Mutex<Option<CaptureSession>>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
@@ -699,7 +703,16 @@ fn build_capture_session(
         (samples, None)
     };
 
-    let worker = rx_worker::spawn(
+    let capture_stats = match &capture {
+        CaptureKind::Cpal(h) => Some(h.stats.clone()),
+        _ => None,
+    };
+    modem_journal::record_rx_source(
+        &state.journal,
+        &modem_journal::device_kind(device_name),
+        (!is_sdr_source).then_some(cfg.audio_backend.as_str()),
+    );
+    let worker = rx_worker::spawn_journalled(
         worker_samples,
         sink,
         state.save_dir.clone(),
@@ -710,6 +723,8 @@ fn build_capture_session(
         cfg.rx_allow_legacy_grid,
         cfg.rx_turbo,
         dropped_samples,
+        state.journal.clone(),
+        capture_stats,
     );
     Ok(CaptureSession {
         capture,
@@ -1079,7 +1094,8 @@ fn start_capture_from_wav(
     // can't drop samples (the pacer paces wall-clock). Pass an
     // always-zero counter; the rx_realtime event will report
     // `dropped_samples = 0` throughout.
-    let worker = rx_worker::spawn(
+    modem_journal::record_rx_source(&state.journal, "wav", None);
+    let worker = rx_worker::spawn_journalled(
         rx_chan,
         sink,
         state.save_dir.clone(),
@@ -1090,6 +1106,8 @@ fn start_capture_from_wav(
         cfg.rx_allow_legacy_grid,
         cfg.rx_turbo,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        state.journal.clone(),
+        None,
     );
     *guard = Some(CaptureSession {
         capture: CaptureKind::WavFile {
@@ -1331,7 +1349,7 @@ fn tx_start(
     )
     .map(|p| p.to_string_lossy().into_owned())
     .unwrap_or_default();
-    let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
+    let event_sink = tx_event_sink(app, &state.journal, &args.tx_device);
     let handle = tx_worker::spawn(
         payload_path,
         args.mode,
@@ -1346,6 +1364,7 @@ fn tx_start(
         state.ptt.clone(),
         event_sink,
         save_wav_dir,
+        state.journal.clone(),
     );
     *tx_guard = Some(handle);
     // The archive path lets the GUI persist this session's ESI high-water
@@ -1403,7 +1422,7 @@ fn tx_more(
     let preemphasis_enabled = cfg.tx_preemphasis_enabled;
     let save_wav_dir = if cfg.tx_save_wav { Some(save_dir.clone()) } else { None };
     let audio_sink = resolve_tx_sink(&args.tx_device, &cfg)?;
-    let event_sink: Arc<dyn EventSink> = Arc::new(TauriEventSink(app));
+    let event_sink = tx_event_sink(app, &state.journal, &args.tx_device);
     let handle = tx_worker::spawn_more(
         payload_path,
         args.mode,
@@ -1419,6 +1438,7 @@ fn tx_more(
         state.ptt.clone(),
         event_sink,
         save_wav_dir,
+        state.journal.clone(),
     );
     *tx_guard = Some(handle);
     Ok(())
@@ -1829,7 +1849,14 @@ fn compress_image(
     // produced the decoded pixel buffer — keeps the resident set
     // bounded to one full pixel buffer at the ravif stage instead of
     // two (decoded) + one (compressed source) + one (rgba copy).
-    let result = compress_avif(source, &opts)?;
+    let mut about = serde_json::Map::new();
+    about.insert("bytes_in".into(), source.len().into());
+    about.insert("speed".into(), opts.speed.unwrap_or(6).into());
+    about.insert("quality".into(), opts.quality.into());
+    about.insert("passthrough".into(), opts.passthrough.into());
+    let mut op = state.journal.start_op("avif", about);
+    let result = compress_avif(source, &opts, &mut op)?;
+    op.set("bytes_out", result.byte_len);
     eprintln!("[compress_image] back from compress_avif, byte_len={}", result.byte_len);
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1850,6 +1877,7 @@ fn compress_image(
         drop(f);
         std::fs::rename(&tmp, &avif_path).map_err(|e| format!("rename: {e}"))?;
     }
+    op.stage("write");
     eprintln!(
         "[compress_image] wrote AVIF {} bytes to {}",
         result.byte_len,
@@ -1883,6 +1911,7 @@ fn compress_image(
     unsafe {
         libc::malloc_trim(0);
     }
+    op.succeed();
     eprintln!("[compress_image] returning to Tauri runtime");
     Ok(CompressResult {
         preview_path: preview_path.to_string_lossy().into_owned(),
@@ -1918,11 +1947,18 @@ fn compress_file_zstd(state: State<'_, AppState>) -> Result<CompressFileResult, 
         let slot = state.tx_source.lock().map_err(|e| e.to_string())?;
         slot.clone().ok_or_else(|| "no tx source loaded".to_string())?
     };
+    let mut about = serde_json::Map::new();
+    about.insert("bytes_in".into(), source.len().into());
+    let mut op = state.journal.start_op("zstd", about);
     let result = compress_zstd(&source)?;
+    op.set("bytes_out", result.byte_len);
+    op.stage("encode");
     let dir = state.save_dir.lock().map_err(|e| e.to_string())?.clone();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("tx_preview.zst");
     std::fs::write(&path, &result.zst_bytes).map_err(|e| format!("write: {e}"))?;
+    op.stage("write");
+    op.succeed();
     if let Ok(mut p) = state.tx_payload_path.lock() {
         *p = Some(path.clone());
     }
@@ -2415,6 +2451,15 @@ impl EventSink for TauriEventSink {
     }
 }
 
+/// Sink of a TX worker: the journal keeps the publishable part of its
+/// events, the frontend gets them unchanged.
+fn tx_event_sink(app: AppHandle, journal: &Journal, tx_device: &str) -> Arc<dyn EventSink> {
+    let mut f = serde_json::Map::new();
+    f.insert("sink".into(), modem_journal::device_kind(tx_device).into());
+    journal.record("tx_start", None, f);
+    Arc::new(JournalSink::new(Arc::new(TauriEventSink(app)), journal.clone(), None))
+}
+
 /// Install a process-wide panic hook that mirrors the panic info and a
 /// full backtrace to stderr AND to `<save_dir>/panic.log` before the
 /// abort fires. Called once at the very top of `main()`.
@@ -2439,6 +2484,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         // Let the default hook print its usual one-liner to stderr first.
         prior(info);
+        modem_journal::on_panic(info);
 
         let backtrace = std::backtrace::Backtrace::force_capture();
         let ts = std::time::SystemTime::now()
@@ -2567,7 +2613,9 @@ fn main() {
                 eprintln!("[ptt] {}", status.message);
             }
             let _ = app.handle().emit("ptt_status", status);
+            let journal = modem_journal::open(app.handle(), &startup_settings);
             app.manage(AppState {
+                journal,
                 session: Mutex::new(None),
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
                 wav_sink: Arc::new(Mutex::new(None)),

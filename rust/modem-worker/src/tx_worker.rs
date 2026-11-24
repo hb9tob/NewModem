@@ -24,7 +24,7 @@
 use hound::{SampleFormat, WavSpec, WavWriter};
 use modem_core::{
     profile::{self, ModemConfig, ProfileIndex},
-    traits::{EncodeRequest, Modem},
+    traits::EncodeRequest,
     types::AUDIO_RATE,
     v3_modem::V3Modem,
 };
@@ -43,6 +43,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::event_sink::{EventSink, EventSinkExt};
+use crate::journal::{Journal, Op};
 use crate::ptt::{SharedPtt, PTT_GUARD_MS};
 
 /// VOX preamble duration passed to `V3Modem.encode_to_samples`. 0.5 s
@@ -257,10 +258,13 @@ pub fn spawn_more(
     // is built as `<save_wav_dir>/tx_history/tx-{ts}-{filename}.wav`
     // so it sits next to the source archived by `archive_payload`.
     save_wav_dir: Option<PathBuf>,
+    journal: Journal,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
+        let mut op = start_encode_op(&journal, &mode, esi_start, attenuation_db, preemphasis_enabled);
+        op.set("blocks", count);
         let samples = match encode_in_process(
             &avif_path,
             &mode,
@@ -268,6 +272,7 @@ pub fn spawn_more(
             &filename,
             esi_start,
             count,
+            &mut op,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -305,6 +310,8 @@ pub fn spawn_more(
             stop_thread,
             ptt,
             sink,
+            journal,
+            op,
         );
     });
     TxHandle {
@@ -332,10 +339,12 @@ pub fn spawn(
     // See `spawn_more::save_wav_dir`. Same semantics for the initial
     // burst.
     save_wav_dir: Option<PathBuf>,
+    journal: Journal,
 ) -> TxHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = thread::spawn(move || {
+        let mut op = start_encode_op(&journal, &mode, 0, attenuation_db, preemphasis_enabled);
         let payload_bytes = match std::fs::metadata(&avif_path).map(|m| m.len() as usize) {
             Ok(n) => n,
             Err(e) => {
@@ -362,6 +371,7 @@ pub fn spawn(
             }
         };
         let total_blocks = plan.n_initial;
+        op.set("blocks", total_blocks);
 
         let samples = match encode_in_process(
             &avif_path,
@@ -370,6 +380,7 @@ pub fn spawn(
             &filename,
             0,
             total_blocks,
+            &mut op,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -410,6 +421,8 @@ pub fn spawn(
             stop_thread,
             ptt,
             sink,
+            journal,
+            op,
         );
     });
     TxHandle {
@@ -484,6 +497,7 @@ fn encode_in_process(
     filename: &str,
     esi_start: u32,
     n_packets: u32,
+    op: &mut Op,
 ) -> Result<Vec<f32>, String> {
     let payload = std::fs::read(avif_path)
         .map_err(|e| format!("read {}: {e}", avif_path.display()))?;
@@ -503,6 +517,10 @@ fn encode_in_process(
     let session_id =
         app_header::compute_session_id(&wire_payload, cfg.mode_code(), profile_index);
     let hash_short = fnv_short(&wire_payload);
+    op.set("bytes_in", wire_payload.len());
+    // The receiving station journals the same id.
+    op.set("session_id", session_id);
+    op.stage("read");
 
     let req = EncodeRequest {
         profile: mode,
@@ -515,7 +533,7 @@ fn encode_in_process(
         vox_seconds: TX_VOX_SECONDS,
     };
     V3Modem
-        .encode_to_samples(&req)
+        .encode_to_samples_observed(&req, &mut |stage| op.stage(stage))
         .map_err(|e| format!("encode: {e}"))
 }
 
@@ -561,6 +579,8 @@ fn run_playback(
     stop: Arc<AtomicBool>,
     ptt: SharedPtt,
     sink: Arc<dyn EventSink>,
+    journal: Journal,
+    mut op: Op,
 ) {
     // Optional PM-emulation pre-emphasis (+6 dB/oct, 300 Hz zero /
     // 12 kHz pole). Symmetric counterpart of the RX-side
@@ -599,9 +619,12 @@ fn run_playback(
     // *post-processing* signal — what actually goes to the sound card
     // / Pluto — so reopening the file in Audacity reproduces the on-air
     // audio exactly. Best-effort: errors get logged, never abort the TX.
+    op.stage("post_process");
     if !wav_path.is_empty() {
         write_tx_wav(&wav_path, &samples);
+        op.stage("wav_write");
     }
+    op.succeed();
     let total_samples = samples.len();
 
     // Force the sound card's "Auto Gain Control" OFF before every burst.
@@ -636,6 +659,7 @@ fn run_playback(
     // ignored by the Pluto adapter (it already knows its libiio URI from
     // the SdrConfig that built the sink) but kept for the cpal sink
     // which still needs it for device lookup.
+    let mut play_op = journal.start_op("tx_play", serde_json::Map::new());
     let handle = match tx_sink.play_buffer(device_name, AUDIO_RATE, samples) {
         Ok(h) => h,
         Err(e) => {
@@ -692,6 +716,8 @@ fn run_playback(
     }
 
     drop(handle);
+    play_op.set("stopped_early", stopped_early);
+    play_op.succeed();
     // 200 ms of silence before releasing the PTT, then switch back to RX.
     if ptt_engaged {
         thread::sleep(Duration::from_millis(PTT_GUARD_MS));
@@ -705,6 +731,22 @@ fn run_playback(
             stopped_early,
         },
     );
+}
+
+/// The journal's record of one TX encode, up to the start of playback.
+fn start_encode_op(
+    journal: &Journal,
+    mode: &str,
+    esi_start: u32,
+    attenuation_db: f32,
+    preemphasis_enabled: bool,
+) -> Op {
+    let mut about = serde_json::Map::new();
+    about.insert("mode".into(), crate::journal::sanitize::text(mode).into());
+    about.insert("esi_start".into(), esi_start.into());
+    about.insert("att_db".into(), attenuation_db.into());
+    about.insert("preemphasis".into(), preemphasis_enabled.into());
+    journal.start_op("tx_encode", about)
 }
 
 /// Archive the TX payload file under `<save_dir>/tx_history/` at the

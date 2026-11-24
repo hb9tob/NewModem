@@ -46,6 +46,18 @@ impl Modem for V3Modem {
     }
 
     fn encode_to_samples(&self, req: &EncodeRequest<'_>) -> Result<Vec<f32>, ModemError> {
+        self.encode_to_samples_observed(req, &mut |_| {})
+    }
+}
+
+impl V3Modem {
+    /// [`Modem::encode_to_samples`], calling `stage_done` as each stage ends
+    /// ("fec": RaptorQ + LDPC + framing, then "modulation"). Same output.
+    pub fn encode_to_samples_observed(
+        &self,
+        req: &EncodeRequest<'_>,
+        stage_done: &mut dyn FnMut(&'static str),
+    ) -> Result<Vec<f32>, ModemError> {
         // Same call sequence as `modem-cli tx` (cf. modem-cli/src/main.rs
         // Commands::Tx around line 279). Any deviation breaks bit-for-bit
         // compatibility with WAVs produced by the CLI — guarded by the
@@ -66,6 +78,7 @@ impl Modem for V3Modem {
             req.esi_start,
             req.n_packets,
         );
+        stage_done("fec");
 
         let (sps, pitch) = rrc::check_integer_constraints(AUDIO_RATE, cfg.symbol_rate, cfg.tau)
             .map_err(|e| {
@@ -112,6 +125,7 @@ impl Modem for V3Modem {
             data_modulated.append(&mut eot_modulated);
             data_modulated
         };
+        stage_done("modulation");
         Ok(out)
     }
 }
