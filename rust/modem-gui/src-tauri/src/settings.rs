@@ -131,6 +131,11 @@ pub struct Settings {
     /// setting the field empty disables submission for that session.
     #[serde(default = "default_collector_url")]
     pub collector_url: String,
+    /// Offer to send the modem journal when leaving after some activity.
+    /// "Ne plus demander" in that dialog clears it, Paramètres restores it.
+    /// A session that crashed is offered whatever this says.
+    #[serde(default = "default_true")]
+    pub journal_prompt_on_exit: bool,
     /// AVIF quality remembered across sessions (0-100). Default 10:
     /// compact file for slow NBFM passes.
     #[serde(default = "default_tx_quality")]
@@ -447,6 +452,7 @@ impl Default for Settings {
             audio_backend: default_audio_backend(),
             audio_sound_server_fallback: false,
             collector_url: default_collector_url(),
+            journal_prompt_on_exit: true,
             tx_quality: default_tx_quality(),
             tx_repair_pct: default_tx_repair_pct(),
             tx_mode: default_tx_mode(),
@@ -522,6 +528,17 @@ pub fn load() -> Settings {
         s.collector_url = default_collector_url();
     }
     s
+}
+
+/// True when the operator saved an empty collector URL, documented in
+/// Paramètres as "no submission". [`load`] hides this by putting the default
+/// back, so read the file as saved.
+pub fn collector_disabled() -> bool {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("collector_url")?.as_str().map(|url| url.trim().is_empty()))
+        .unwrap_or(false)
 }
 
 pub fn save(s: &Settings) -> Result<(), String> {

@@ -3135,3 +3135,116 @@ body.kiosk-mode .kiosk-only { display: inline-flex; }
     flex-basis: 13px;
   }
 }
+
+/* Modem journal: dialog and Paramètres buttons. Above every other modal
+   (closing can be requested from any of them), under the virtual keyboard. */
+.journal-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.88);
+  z-index: 270;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+}
+.journal-modal:not([hidden]) ~ .virt-keyboard-modal {
+  z-index: 280;
+}
+.journal-panel {
+  background: #1e2a36;
+  border: 1px solid #4a90c8;
+  border-radius: 6px;
+  padding: 0.8rem;
+  width: 100%;
+  max-width: 760px;
+  max-height: 96vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.journal-panel h2 {
+  margin: 0;
+  font-size: 1.1rem;
+  color: #9ccc65;
+}
+.journal-panel p {
+  margin: 0;
+}
+.journal-warning {
+  color: #ffcc80;
+}
+.journal-summary {
+  color: #b0bec5;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.journal-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.journal-notes input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0.3rem 0.5rem;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #555;
+  border-radius: 3px;
+}
+.journal-no-ask {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 36px;
+}
+.journal-status {
+  overflow-wrap: anywhere;
+}
+.journal-status.error {
+  color: #ef5350;
+}
+.journal-preview-text {
+  max-height: 30vh;
+  margin: 0.3rem 0 0;
+  padding: 0.4rem;
+  overflow: auto;
+  background: #141414;
+  font-size: 0.7rem;
+  user-select: text;
+}
+.journal-actions,
+.journal-settings-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.journal-settings-buttons {
+  margin-top: 0.4rem;
+}
+.journal-actions {
+  position: sticky;
+  bottom: 0;
+  justify-content: flex-end;
+  background: #1e2a36;
+  padding-top: 0.3rem;
+}
+.journal-actions button,
+.journal-settings-buttons button {
+  min-height: 44px;
+  padding: 0.3rem 0.8rem;
+  background: #2a3845;
+  color: #e0e0e0;
+  border: 1px solid #4a5868;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.journal-actions #journal-send {
+  background: #2d5a2d;
+}
+.journal-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

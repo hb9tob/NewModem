@@ -625,6 +625,19 @@ fn run_playback(
         op.stage("wav_write");
     }
     op.succeed();
+    if stop.load(Ordering::Relaxed) {
+        // Stopped while encoding (TX stop, or leaving the application):
+        // do not key the radio for nothing.
+        sink.emit(
+            "tx_complete",
+            TxCompleteEvent {
+                duration_s: 0.0,
+                wav_path,
+                stopped_early: true,
+            },
+        );
+        return;
+    }
     let total_samples = samples.len();
 
     // Force the sound card's "Auto Gain Control" OFF before every burst.

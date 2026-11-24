@@ -13,7 +13,7 @@
 //! that crashed or was killed: the interesting case, offered on next launch.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -186,6 +186,42 @@ pub fn unfinished(root: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter(|d| !d.join(CLOSED).exists() && !d.join(HANDLED).exists() && !is_live(d))
         .collect()
+}
+
+/// The most recent session that is no longer running, sent or not.
+pub fn previous(root: &Path) -> Option<PathBuf> {
+    sessions(root).into_iter().rev().find(|d| !is_live(d))
+}
+
+/// What the operator reads before publishing: the header and the last
+/// `max` bytes of records, whole lines only.
+pub fn preview(dir: &Path, max: u64) -> io::Result<String> {
+    let mut text = String::from_utf8_lossy(&fs::read(dir.join(HEADER))?).into_owned();
+    let mut tail: Vec<Vec<u8>> = Vec::new();
+    let mut left = max;
+    let mut cut = false;
+    for seg in segments(dir).iter().rev() {
+        let mut file = File::open(seg)?;
+        let len = file.metadata()?.len();
+        let take = len.min(left);
+        cut |= take < len;
+        file.seek(SeekFrom::Start(len - take))?;
+        let mut raw = Vec::new();
+        file.take(take).read_to_end(&mut raw)?;
+        if take < len {
+            let first = raw.iter().position(|&b| b == b'\n').map_or(raw.len(), |i| i + 1);
+            raw.drain(..first);
+        }
+        left -= take;
+        tail.push(raw);
+    }
+    if cut {
+        text.push_str("...\n");
+    }
+    for raw in tail.iter().rev() {
+        text.push_str(&String::from_utf8_lossy(raw));
+    }
+    Ok(text)
 }
 
 /// Do not offer this session again.
@@ -468,6 +504,36 @@ mod tests {
         assert_eq!((summary.duration_s, summary.queue_max_ms), (6.0, 900.0));
         assert_eq!(summary.incidents, 3);
         assert!(summary.crashed);
+    }
+
+    #[test]
+    fn preview_keeps_header_and_whole_tail_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), &json!({"h": 1}), small()).unwrap();
+        for i in 0..150 {
+            w.write_line(&format!("{{\"i\":{i}}}")).unwrap();
+        }
+        w.flush().unwrap();
+        let dir = w.dir().to_path_buf();
+        let all = preview(&dir, 1 << 20).unwrap();
+        assert!(all.contains("{\"i\":0}") && !all.contains("..."));
+
+        let tail = preview(&dir, 100).unwrap();
+        let mut lines = tail.lines();
+        assert_eq!(lines.next(), Some("{\"h\":1}"));
+        assert_eq!(lines.next(), Some("..."));
+        assert!(lines.clone().all(|l| l.starts_with("{\"i\":") && l.ends_with('}')));
+        assert_eq!(lines.last(), Some("{\"i\":149}"));
+    }
+
+    #[test]
+    fn previous_is_the_newest_dead_session() {
+        let root = tempfile::tempdir().unwrap();
+        let w = SessionWriter::create(root.path(), &json!({}), Limits::default()).unwrap();
+        assert!(previous(root.path()).is_none(), "live session returned");
+        let dir = w.dir().to_path_buf();
+        w.close().unwrap();
+        assert_eq!(previous(root.path()), Some(dir));
     }
 
     #[test]

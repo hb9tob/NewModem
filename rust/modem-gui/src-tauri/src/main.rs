@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod collector_client;
+mod journal_exit;
 mod modem_journal;
 mod overlay;
 mod ptt;
@@ -116,6 +117,7 @@ struct SounderCapture {
 struct AppState {
     /// What the modem does over time, publishable (see `modem_journal`).
     journal: Journal,
+    exit: journal_exit::ExitControl,
     session: Mutex<Option<CaptureSession>>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
@@ -429,7 +431,8 @@ fn save_settings(
             .ok()
             .map(|g| g.is_none())
             .unwrap_or(false);
-    if ptt_changed || needs_recovery {
+    // Not while leaving: the released PTT would be keyed by the re-open.
+    if (ptt_changed || needs_recovery) && !state.exit.is_quitting() {
         let status = compute_ptt_status(&state.ptt, &settings);
         let _ = app.emit("ptt_status", status);
     }
@@ -527,6 +530,7 @@ fn start_capture(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    state.exit.ensure_running()?;
     if guard.is_some() {
         return Err("capture already running".into());
     }
@@ -553,6 +557,7 @@ fn start_capture(
 #[tauri::command]
 fn restart_capture(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    state.exit.ensure_running()?;
     let old = match guard.take() {
         Some(s) => s,
         None => {
@@ -782,6 +787,7 @@ fn start_tune(
     atten_db: f64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    state.exit.ensure_running()?;
     let (backend, device_id) = sdr_registry::parse_composite_name(&device_name)
         .ok_or_else(|| "Périphérique inconnu.".to_string())?;
     if backend.id() != "pluto" {
@@ -1003,6 +1009,7 @@ fn start_capture_from_wav(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    state.exit.ensure_running()?;
     if guard.is_some() {
         return Err("capture already running".into());
     }
@@ -1303,6 +1310,7 @@ fn tx_start(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
+    state.exit.ensure_running()?;
     if tx_guard.is_some() {
         return Err("TX déjà en cours".into());
     }
@@ -1392,6 +1400,7 @@ fn tx_more(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut tx_guard = state.tx_handle.lock().map_err(|e| e.to_string())?;
+    state.exit.ensure_running()?;
     if tx_guard.is_some() {
         return Err("TX déjà en cours".into());
     }
@@ -2128,12 +2137,17 @@ fn sounding_tx_emit(
     let sink = resolve_tx_sink(&args.tx_device, &cfg)?;
     let device = args.tx_device.clone();
     let ptt_slot = state.ptt.clone();
+    state.exit.ensure_running()?;
+    let quitting = state.exit.quitting_flag();
     // Run the playback on a dedicated thread — the PlaybackHandle wraps
     // a cpal `Stream` whose underlying object is `Box<dyn Any>` (not
     // marked Send), so we can't move it across threads after creation.
     // Instead, we build it ON the worker thread; the Arc<dyn
     // SampleSink> + the audio Vec are both Send.
     std::thread::spawn(move || {
+        if quitting.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let ptt_engaged = engage_ptt_sounder(&ptt_slot);
         if ptt_engaged {
             std::thread::sleep(std::time::Duration::from_millis(
@@ -2156,6 +2170,9 @@ fn sounding_tx_emit(
         let mut consecutive_done = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            if quitting.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             if handle.is_done() {
                 consecutive_done += 1;
                 if consecutive_done >= 5 {
@@ -2220,6 +2237,7 @@ fn sounding_rx_start_capture(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mut guard = state.sounder_capture.lock().map_err(|e| e.to_string())?;
+    state.exit.ensure_running()?;
     if guard.is_some() {
         return Err("Capture sondeur déjà active".into());
     }
@@ -2599,6 +2617,13 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    journal_exit::on_close_requested(window.app_handle(), api);
+                }
+            }
+        })
         .setup(move |app| {
             let ptt: SharedPtt = Arc::new(Mutex::new(None));
             // Best-effort PTT port open at startup. On failure we emit an
@@ -2616,6 +2641,7 @@ fn main() {
             let journal = modem_journal::open(app.handle(), &startup_settings);
             app.manage(AppState {
                 journal,
+                exit: journal_exit::ExitControl::new(),
                 session: Mutex::new(None),
                 save_dir: Arc::new(Mutex::new(save_dir.clone())),
                 wav_sink: Arc::new(Mutex::new(None)),
@@ -2717,6 +2743,17 @@ fn main() {
             is_raw_recording,
             submit_capture,
             submit_sounding,
+            journal_exit::journal_exit_ack,
+            journal_exit::journal_exit_cancel,
+            journal_exit::journal_exit_send,
+            journal_exit::journal_exit_quit,
+            journal_exit::journal_current,
+            journal_exit::journal_previous,
+            journal_exit::journal_crashed,
+            journal_exit::journal_send,
+            journal_exit::journal_decline,
+            journal_exit::journal_preview,
+            journal_exit::journal_set_prompt,
             sounding_tx_render,
             sounding_tx_emit,
             sounding_rx_start_capture,
@@ -2757,6 +2794,11 @@ fn main() {
             set_monitor_output,
             set_monitor_volume,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                journal_exit::on_exit(app);
+            }
+        });
 }

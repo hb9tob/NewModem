@@ -536,6 +536,21 @@
           </p>
         </fieldset>
         <fieldset>
+          <legend data-i18n="journal.legend">Journal du modem</legend>
+          <label class="ptt-row">
+            <input type="checkbox" id="journal-prompt-enabled" checked>
+            <span data-i18n="journal.prompt_enable">Proposer l'envoi du journal en quittant</span>
+          </label>
+          <div class="journal-settings-buttons">
+            <button type="button" id="journal-send-current" data-i18n="journal.send_current">Envoyer le journal de cette session…</button>
+            <button type="button" id="journal-send-previous" data-i18n="journal.send_previous">Envoyer celui de la session précédente…</button>
+          </div>
+          <p class="tx-hint" id="journal-settings-status"></p>
+          <p class="tx-hint" style="margin: 0.4rem 0 0;" data-i18n="journal.hint">
+            Journal technique : activité du modem, audio en attente, encodage, indicatifs reçus. Ni audio, ni image, ni nom de fichier. Rien n'est envoyé sans ton accord. Après un arrêt anormal, l'envoi est proposé au lancement suivant.
+          </p>
+        </fieldset>
+        <fieldset>
           <legend data-i18n="settings.legend_tx_history">Historique TX</legend>
           <label class="ptt-row">
             <span data-i18n="settings.tx_history_max">Nombre maximum de fichiers conservés :</span>
@@ -1187,6 +1202,33 @@
       </div>
       <div class="select-picker-list" id="select-picker-list">
         <!-- Rows injected by openSelectPicker(). -->
+      </div>
+    </div>
+  </div>
+  <!-- Before the virtual keyboard, which must open above it. -->
+  <div id="journal-modal" class="journal-modal" role="dialog" aria-modal="true" aria-labelledby="journal-title" hidden>
+    <div class="journal-panel">
+      <h2 id="journal-title"></h2>
+      <p class="journal-warning" data-i18n="journal.warning">Le journal sera publié publiquement sur le collecteur, avec ton indicatif et ceux des stations reçues. Il ne contient ni audio, ni image, ni nom de fichier.</p>
+      <p id="journal-summary" class="journal-summary"></p>
+      <label class="journal-notes">
+        <span data-i18n="journal.notes">Remarque publique (facultatif) :</span>
+        <input type="text" id="journal-notes" maxlength="500" autocomplete="off">
+      </label>
+      <label id="journal-no-ask-row" class="journal-no-ask">
+        <input type="checkbox" id="journal-no-ask">
+        <span data-i18n="journal.no_ask">Ne plus demander en quittant</span>
+      </label>
+      <p id="journal-status" class="journal-status" role="status"></p>
+      <div id="journal-preview" hidden>
+        <p id="journal-preview-dir" class="journal-summary"></p>
+        <pre id="journal-preview-text" class="journal-preview-text"></pre>
+      </div>
+      <div class="journal-actions">
+        <button type="button" id="journal-view" data-i18n="journal.view">Voir le journal</button>
+        <button type="button" id="journal-cancel"></button>
+        <button type="button" id="journal-decline"></button>
+        <button type="button" id="journal-send"></button>
       </div>
     </div>
   </div>

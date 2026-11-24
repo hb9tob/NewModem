@@ -347,18 +347,8 @@ pub async fn submit_sounding(args: SubmitSoundingArgs) -> Result<SubmitResult, S
     post_signed_multipart(&url, &signature_hmac, ts, form, bytes_uploaded, REPORT_TIMEOUT).await
 }
 
-/// Compress a journal session and publish it on the collector.
-///
-/// `dir` comes from the journal store, never from the frontend: whatever
-/// is in it becomes public.
-#[allow(dead_code)] // Called by the exit dialog (journal plan, lot 5).
-pub async fn submit_journal(
-    dir: std::path::PathBuf,
-    callsign: &str,
-    collector_url: &str,
-    notes: &str,
-) -> Result<SubmitResult, String> {
-    let secret = checked_secret()?;
+/// A callsign the collector accepts for a journal.
+pub fn checked_callsign(callsign: &str) -> Result<String, String> {
     let callsign = callsign.trim().to_uppercase();
     if callsign.is_empty() {
         return Err("indicatif vide (Paramètres → Indicatif)".into());
@@ -366,6 +356,21 @@ pub async fn submit_journal(
     if callsign.len() > 16 || !callsign.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
         return Err("indicatif invalide (16 caractères max : lettres, chiffres, /)".into());
     }
+    Ok(callsign)
+}
+
+/// Compress a journal session and publish it on the collector.
+///
+/// `dir` comes from the journal store, never from the frontend: whatever
+/// is in it becomes public.
+pub async fn submit_journal(
+    dir: std::path::PathBuf,
+    callsign: &str,
+    collector_url: &str,
+    notes: &str,
+) -> Result<SubmitResult, String> {
+    let secret = checked_secret()?;
+    let callsign = checked_callsign(callsign)?;
     let base = collector_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("URL collecteur vide (Paramètres → Collecteur)".into());

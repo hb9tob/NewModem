@@ -28,6 +28,8 @@ export let currentSettings = {
   audio_backend: "alsa",
   audio_sound_server_fallback: false,
   collector_url: "",
+  /// Offer to send the modem journal on exit (see tabs/journal.js).
+  journal_prompt_on_exit: true,
   tx_quality: 10,
   tx_repair_pct: 5,
   tx_mode: "HIGH56",
