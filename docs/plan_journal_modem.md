@@ -2,7 +2,7 @@
 
 **Date d'ouverture** : 2026-11-22
 **Branche** : `feat/modem-journal` (depuis main 6fa5bc9)
-**État** : lots 0 à 5 committés (lot 2 : 405d009, lot 3 : c7d6f24, lot 5 : b49c1ce, le 2026-11-24, après remesure sur hôte sain) ; lot 6 (analyse et validation) en cours ; branche non poussée
+**État** : lots 0 à 5 committés (lot 2 : 405d009, lot 3 : c7d6f24, lot 5 : b49c1ce, le 2026-11-24, après remesure sur hôte sain) ; collecteur redéployé, premiers journaux réels reçus ; lot 6 (analyse et validation) en cours ; branche poussée. **Reprise : voir « Reprise du 2026-11-25 » en fin de document**
 **Objet** : remédiation n° 9 de `plan_acquisition_turbo_vs_legacy.md`. Avant de
 reprendre l'optimisation de l'entrée, journaliser ce que fait le modem, le temps
 d'audio en attente dans chaque buffer, et l'encodage (pour chiffrer son impact
@@ -322,3 +322,72 @@ dans son propre `CARGO_TARGET_DIR`, jamais dans `rust/target`.
   lot 3 `c7d6f24`, lot 5 `b49c1ce`. Chaque état intermédiaire compile (worker,
   exemples, GUI) ; tests du journal 29 → 29 (+ TX) → 31, automate de sortie 6/6. Le
   court-circuit « TX arrêté pendant l'encodage » est rangé dans le lot 5.
+
+## Lot 6 : premiers journaux réels et évolution de l'analyseur (2026-11-24)
+
+Deux journaux RX de la Surface (binaire natif 8912e0c, ALSA direct, carte son),
+reçus par le collecteur redéployé.
+
+- Image HIGH+ de 36 Ko décodée en legacy ; image HIGH++ de 66 Ko décodée en turbo.
+- Décrochage turbo à 03:41 : changement de fréquence RX volontaire (Olivier).
+- Rafale HIGH+ de 00:57 jamais décodée (markers validés, 0 bloc de données,
+  sigma2 legacy 4,8 fois celui des rafales décodées) : niveau TX trop haut,
+  involontaire (Olivier).
+- Le niveau d'entrée ne dit pas si une émission est finie : relais qui retombe
+  ou trafic en direct, le souffle à AGC maximale peut être aussi fort que le
+  signal (Olivier).
+
+Analyseur (`study/analyze_modem_journal.py`) :
+
+- plusieurs journaux à la fois ; une perte de synchro RX est comparée à la
+  lecture TX de la même `session_id` (journal TX) : « vraie perte RX » ou
+  « TX terminée » ;
+- section « RX bursts » : une ligne par émission détectée, CW du burst et de la
+  session, markers, sigma2, fin (EOT, après décodage, même session reprise X s
+  plus tard), alerte « structure décodée, aucun bloc de données » et sigma2
+  rapporté aux rafales décodées ; aucune déduction tirée du niveau ;
+- section « samples waiting » : arriéré (capture, file, bloc en cours, lag) et
+  tampons du modem (session, warm, history) par run ;
+- `worker_requests_restart eot` n'est plus un incident.
+
+Échantillons en attente : file, bloc en cours, warm / history / session étaient
+bien journalisés. **Manquait le tampon noyau ALSA** en ALSA direct (le cas
+réel) : `ring_max_ms` jamais écrit. Corrigé dans `modem-io/src/alsa_capture.rs`
+(`pcm.avail()` après chaque lecture) ; mesuré en vrai : 0 à 80 trames en
+attente sur 4 × 100 ms de tampon, carte USB et carte interne. À noter : en
+turbo, `history` a atteint 116 s pendant une longue rafale (remédiation 8 du
+plan d'acquisition : borner le replay au préambule courant).
+
+Testé : les deux journaux réels, un journal TX synthétique (perte pendant la
+lecture TX, perte après sa fin), enregistrements malformés. Commits `bb8c444`
+(mesure ALSA) et `0bb0a07` (analyseur), poussés.
+
+## Reprise du 2026-11-25
+
+État au soir du 2026-11-24 : tout est committé et poussé sur
+`feat/modem-journal` ; collecteur en production avec la route journaux.
+
+- Binaire natif de la Surface (`-C target-cpu=native`, icelake, LTO) :
+  `dist/native-icelake-0.21.0-<commit>/` (GUI + CLI), avec la mesure ALSA.
+  `CARGO_TARGET_DIR=~/.cache/newmodem-target-native`. Ne tourne que sur
+  Ice Lake ou plus récent : pas à distribuer.
+- Journaux téléchargés : `python3 -I study/fetch_modem_journals.py
+  https://hb9tob.duckdns.org --dest <dossier>` puis
+  `python3 -I study/analyze_modem_journal.py <rx.gz> [<tx.gz> ...]`.
+
+À faire, dans l'ordre proposé :
+
+1. Session de test avec **les journaux RX et TX** des deux stations, pour
+   valider le rapprochement par `session_id` sur données réelles (testé
+   seulement en synthétique) et la mesure ALSA (`capture` dans « samples
+   waiting »).
+2. Journaliser les **changements de réglages en cours de session** (seuls ceux
+   du lancement sont dans l'en-tête ; ex. scrambler, mode RX).
+3. M1 : AVIF sur le thread principal (GUI figée 57,7 s en vitesse 1) →
+   commandes `compress_image` / `compress_file_zstd` asynchrones.
+4. C4 (`setup-nginx.sh` 60m vs 200 Mio annoncés), C5 (`settings::load` remet
+   l'URL par défaut quand elle est vide).
+5. Plan d'acquisition : cause ⑨ (`ScDetector` en O(W) par échantillon, 62–72 %
+   du CPU turbo) ; remédiation 8 (`history` turbo jusqu'à 116 s vu en réel) ;
+   validation du lot 1 sur S5, S6_trunc300, S9.
+6. Merge vers `main` et release quand le lot 6 est clos.
