@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
-"""Analyse modem journals: timeline, incidents, RX with and without encoding.
+"""Analyse modem journals: timeline, incidents, RX bursts, waiting samples.
 
-Input: a `journal.jsonl.gz` from the collector, or a local session directory
-(`journal-<unix>-<pid>/`).
+Input: one or more `journal.jsonl.gz` from the collector, or local session
+directories (`journal-<unix>-<pid>/`). Give the RX and the TX station's
+journals together: a burst lost by the RX is then compared with what the TX
+was playing for the same session_id.
 
-    python3 -I study/analyze_modem_journal.py JOURNAL [--timeline] [--min-ms 500]
+    python3 -I study/analyze_modem_journal.py JOURNAL [JOURNAL ...] [--timeline] [--min-ms 500]
 
 Journals are public uploads, hence untrusted: bounded decompression, every
 printed string escaped. Run with `python -I`.
 
 Reading the figures:
   queue         audio captured and not yet taken by the RX worker
+  waiting       every place where captured audio waits, p95/max per RX run.
+                Backlog (not yet processed): capture (cpal ring, or ALSA
+                kernel buffer), queue, in flight (chunk being processed);
+                lag = wall clock - audio consumed, clock drift included.
+                Modem buffers: session = audio held for decoding; warm and
+                history = audio already processed, kept to replay it.
+  bursts        one line per detected transmission. How it ended comes
+                from the decoder (EOT, decode, same session re-acquired,
+                TX journal), never from the input level: hiss at full AGC
+                after a carrier drop can be as loud as the signal.
   cpu/wall      on slow worker activities. Near 1: the work itself is slow
                 (or the core is). Well below 1: the worker was preempted,
                 the signature of an encode competing with it. The legacy
@@ -224,6 +236,220 @@ def print_encoding(records):
         print(f"  GUI main thread worst latency: {max(blocked):.0f} ms")
 
 
+WAITING = (
+    ("capture", "ring_max_ms"),
+    ("queue", "queue_max_ms"),
+    ("in_flight", "in_flight_ms"),
+    ("warm", "warm_ms"),
+    ("history", "history_ms"),
+    ("session", "session_ms"),
+    ("lag", "lag_ms"),
+)
+
+
+def int_or_none(value):
+    """An integer id from an untrusted record, else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) < 2**63:
+        return value
+    return None
+
+
+def by_run(records):
+    runs = collections.OrderedDict()
+    for r in records:
+        if isinstance(r.get("run"), int):
+            runs.setdefault(r["run"], []).append(r)
+    return runs
+
+
+def print_waiting(records):
+    """Where captured samples wait, per run: p95 / max in ms."""
+    runs = by_run(records)
+    if not any(r["kind"] == "buffer" for items in runs.values() for r in items):
+        return
+    print("== samples waiting (ms, p95/max per run; - = never seen)")
+    print("               " + "-" * 21 + " backlog " + "-" * 19 + "  " + "-" * 6
+          + " modem buffers " + "-" * 15)
+    order = ("capture", "queue", "in_flight", "lag", "session", "warm", "history")
+    print("  run  modem   " + " ".join(f"{name:>11s}" for name in order)
+          + "  dropped  stream_err")
+    capture_seen = False
+    for run, items in runs.items():
+        buffers = [r for r in items if r["kind"] == "buffer"]
+        if not buffers:
+            continue
+        start = next((r for r in items if r["kind"] == "run_start"), {})
+        cells = []
+        for _, key in sorted(WAITING, key=lambda w: order.index(w[0])):
+            values = [num(r, key) for r in buffers if key in r]
+            capture_seen |= key == "ring_max_ms" and bool(values)
+            cells.append(f"{percentile(values, 0.95):5.0f}/{max(values):<5.0f}" if values else f"{'-':>11s}")
+        dropped = max(num(r, "dropped_ms") for r in buffers)
+        errors = max(num(r, "stream_errors") for r in buffers)
+        print(f"  {run:3d}  {safe(start.get('modem', '?'), 7):7s} " + " ".join(cells)
+              + f"  {dropped:7.0f}  {errors:10.0f}")
+    if not capture_seen:
+        print("  capture-side buffer not measured (ALSA-direct before 2026-11-25, or no capture)")
+
+
+def journal_utc(records):
+    header = next((r for r in records if r["kind"] == "header"), {})
+    return num(header, "utc", None) if "utc" in header else None
+
+
+def tx_windows(journals):
+    """session_id -> list of (utc_start, utc_end, stopped_early) of TX playbacks."""
+    out = collections.defaultdict(list)
+    for records in journals:
+        utc = journal_utc(records)
+        if utc is None:
+            continue
+        session = None
+        open_play = {}
+        for r in records:
+            op = int_or_none(r.get("op"))
+            if r["kind"] == "op_end" and r.get("name") == "tx_encode":
+                session = int_or_none(r.get("session_id"))
+            elif r["kind"] == "op_start" and r.get("name") == "tx_play" and op is not None:
+                open_play[op] = (session, utc + num(r, "t_ms") / 1000)
+            elif r["kind"] == "op_end" and r.get("name") == "tx_play" and op in open_play:
+                sid, t0 = open_play.pop(op)
+                if sid is not None:
+                    out[sid].append((t0, utc + num(r, "t_ms") / 1000, bool(r.get("stopped_early"))))
+    return out
+
+
+def find_bursts(records):
+    """Detected transmissions, from the decoder's events."""
+    bursts, current = [], None
+    modem = {}
+
+    def close(r, end):
+        nonlocal current
+        current["end_t"] = num(r, "t_ms")
+        current["end"] = end
+        bursts.append(current)
+        current = None
+
+    for r in records:
+        kind, run = r["kind"], r.get("run")
+        if not isinstance(run, (int, type(None))) or isinstance(run, bool):
+            continue
+        if kind == "run_start":
+            modem[run] = safe(r.get("modem", "?"), 8)
+        if kind in ("rx.gate_open", "preamble") and current is None:
+            current = {"run": run, "modem": modem.get(run, "?"), "start_t": num(r, "t_ms"),
+                       "profile": safe(r.get("profile"), 12) if r.get("profile") else None,
+                       "session": None, "size": None,
+                       "markers": 0, "cws": None, "received": None, "needed": None, "converged": 0,
+                       "blocks": 0, "sigma2": [], "decoded": False, "reason": None}
+            continue
+        if current is None or run != current["run"]:
+            if current is not None and kind == "run_start":
+                current["reason"] = "RX restarted"
+                close(r, "stopped")
+            continue
+        if kind == "v3_profile_detected":
+            current["profile"] = safe(r.get("to"), 12)
+        elif kind == "session_armed":
+            current["session"] = int_or_none(r.get("session_id"))
+            current["size"] = int_or_none(r.get("file_size"))
+            current["needed"] = int_or_none(r.get("k"))
+        elif kind == "rx.marker":
+            current["markers"] += 1
+        elif kind == "sf_detail":
+            current["markers"] += 1
+            current["converged"] += int(num(r, "converged_blocks"))
+            current["blocks"] += int(num(r, "total_blocks"))
+        elif kind in ("rx.scan", "v2_progress") and "sigma2" in r and (r.get("ok", True)):
+            current["sigma2"].append(num(r, "sigma2"))
+        elif kind == "session_progress":
+            current["received"] = int(num(r, "received"))
+            current["needed"] = int(num(r, "needed")) or current["needed"]
+        elif kind in ("file_complete", "session_decoded"):
+            current["decoded"] = True
+        elif kind in ("rx.eot", "rx.session_lost", "rx.brickwall"):
+            current["reason"] = safe(r.get("reason") or kind, 120)
+            current["end_kind"] = kind
+        elif kind == "rx.burst_finalised":
+            current["cws"] = int(num(r, "cws"))
+            end = {"rx.eot": "eot", "rx.session_lost": "lost", "rx.brickwall": "brickwall"}.get(
+                current.get("end_kind"), "ended")
+            close(r, end)
+        elif kind == "worker_requests_restart":
+            close(r, "eot" if r.get("reason") == "eot" else "restart")
+        elif kind == "run_stop":
+            close(r, "stopped")
+    return bursts
+
+
+def decoded_sigma2(journals):
+    """Median sigma2 of the decoded bursts, the reference of a clean link."""
+    values = [statistics.median(b["sigma2"]) for records in journals
+              for b in find_bursts(records) if b["decoded"] and b["sigma2"]]
+    return statistics.median(values) if values else None
+
+
+def print_bursts(records, tx, ref_sigma2):
+    bursts = find_bursts(records)
+    if not bursts:
+        return
+    utc = journal_utc(records)
+    print("== RX bursts")
+    for i, b in enumerate(bursts):
+        dur = (b["end_t"] - b["start_t"]) / 1000
+        if b["modem"] == "legacy":
+            # The legacy modem only reports the session's running count.
+            cws = b["received"] if b["received"] is not None else b["converged"]
+        else:
+            cws = b["cws"] or 0
+        need = ""
+        if b["received"] is not None and b["needed"]:
+            need = f" (session {b['received']}/{b['needed']})"
+        sig = f" sigma2={statistics.median(b['sigma2']):.4f}" if b["sigma2"] else ""
+        size = f" {b['size']} B" if b["size"] else ""
+        print(f"  {clock({'t_ms': b['start_t']})} {safe(b['modem'], 7):7s} "
+              f"{safe(b['profile'] or '?', 9):9s} {dur:6.1f}s  cw {cws}{need}{size}"
+              f" markers {b['markers']}{sig}")
+
+        notes = []
+        if b["decoded"]:
+            notes.append("file decoded")
+        if b["markers"] >= 3 and not cws and not b["converged"]:
+            notes.append("frame structure decoded but no data block: symbols too distorted"
+                         " (TX audio level / deviation, or interference)")
+        if not b["decoded"] and b["sigma2"] and ref_sigma2:
+            ratio = statistics.median(b["sigma2"]) / ref_sigma2
+            if ratio >= 2:
+                notes.append(f"sigma2 {ratio:.1f}x the decoded bursts' ({ref_sigma2:.4f})")
+        if b["end"] == "eot":
+            notes.append("clean end (EOT)")
+        elif b["end"] in ("lost", "brickwall", "ended"):
+            later = [x for x in bursts[i + 1:] if b["session"] is not None and x["session"] == b["session"]]
+            matched = tx.get(b["session"], []) if b["session"] is not None else []
+            if b["decoded"]:
+                notes.append(f"{b['end']} after the decode")
+            elif matched and utc is not None:
+                at = utc + b["end_t"] / 1000
+                playing = [w for w in matched if w[0] <= at <= w[1] - 2]
+                if playing:
+                    notes.append(f"{b['end']} while the TX was still playing: real RX loss")
+                else:
+                    notes.append(f"{b['end']} after the TX playback had ended")
+            else:
+                notes.append(f"{safe(b['end'])}: {safe(b['reason'] or '?', 70)}")
+                if not matched:
+                    notes.append("cause unknown from the RX alone (add the TX journal)")
+            if later:
+                gap = (later[0]["start_t"] - b["end_t"]) / 1000
+                notes.append(f"same session re-acquired {gap:.1f}s later"
+                             + (", then decoded" if any(x["decoded"] for x in later) else ""))
+        elif b["end"] == "stopped":
+            notes.append("RX stopped or restarted during the burst")
+        for note in notes:
+            print(f"        - {note}")
+
+
 def print_incidents(records, min_ms):
     print(f"== incidents (queue >= {min_ms:.0f} ms, or an error / restart / loss)")
     shown, high = 0, False
@@ -232,6 +458,8 @@ def print_incidents(records, min_ms):
         detail = None
         if kind in INCIDENT_KINDS:
             detail = r.get("reason", "")
+            if kind == "worker_requests_restart" and detail == "eot":
+                continue  # normal end of a legacy burst
         elif kind == "buffer":
             above = num(r, "queue_max_ms") >= min_ms
             # Report the crossing, not every second spent above.
@@ -259,22 +487,36 @@ def print_timeline(records):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("journal", help="journal.jsonl.gz or session directory")
+    parser.add_argument("journal", nargs="+",
+                        help="journal.jsonl.gz or session directory (RX and TX journals together)")
     parser.add_argument("--timeline", action="store_true", help="print the event timeline")
     parser.add_argument("--min-ms", type=float, default=500.0,
                         help="queue level that counts as an incident")
     args = parser.parse_args()
 
-    records, bad = load(args.journal)
-    if not records:
+    loaded = []
+    for path in args.journal:
+        records, bad = load(path)
+        if not records:
+            print(f"! {safe(path)}: no journal record found", file=sys.stderr)
+            continue
+        loaded.append((path, records, bad))
+    if not loaded:
         sys.exit("no journal record found")
-    print_header(records, bad)
-    print_runs(records)
-    print_activities(records)
-    print_encoding(records)
-    print_incidents(records, args.min_ms)
-    if args.timeline:
-        print_timeline(records)
+    tx = tx_windows([records for _, records, _ in loaded])
+    ref_sigma2 = decoded_sigma2([records for _, records, _ in loaded])
+    for path, records, bad in loaded:
+        if len(loaded) > 1:
+            print(f"######## {safe(path, 200)}")
+        print_header(records, bad)
+        print_runs(records)
+        print_waiting(records)
+        print_bursts(records, tx, ref_sigma2)
+        print_activities(records)
+        print_encoding(records)
+        print_incidents(records, args.min_ms)
+        if args.timeline:
+            print_timeline(records)
 
 
 if __name__ == "__main__":
