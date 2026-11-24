@@ -200,6 +200,23 @@
 <!-- ======================================================================= -->
 <h2 id="intro">1. Introduction — objectif de la V3</h2>
 
+<div class="callout info" style="border-left:4px solid #bf2b2b;background:#fbeaea">
+    <strong>⚠️ Mise à jour V4 (0.14.0) — format sans header.</strong>
+    Depuis la 0.14.0, le <strong>header protocole est supprimé</strong> de la trame.
+    Son seul champ vivant, <code>profile_index</code>, est déplacé dans le
+    <strong>marker de bootstrap</strong>, et le <strong>warmup LMS passe après le
+    marker</strong>. Nouvelle disposition de burst :
+    <code>PRÉAMBULE → MARKER(profile_index, META) → WARMUP → META_CW → [MARKER → 2·CW]*</code>.
+    Le RX lit ainsi la modulation <em>avant</em> d'entraîner le FFE sur le warmup
+    (plus de devinette d'ancre, cause racine du bug d'auto-detect HIGH+ éliminée).
+    Le marker porte désormais <code>profile_index</code> + <code>fmt_version</code>
+    (= <code>WIRE_FMT_V4</code>) + un flag <code>EOT_FRAME</code> ; la trame EOT est
+    elle aussi sans header. <strong>Rupture dure avec la V3</strong> (les deux bouts
+    en 0.14.0). Les sections « HEADER » et les figures ci-dessous décrivent
+    l'ancienne disposition V3 (≤ 0.13.18) ; voir <code>rust/V4_WIRE_FORMAT_PLAN.md</code>
+    pour le détail V4.
+</div>
+
 <p>
     La <strong>V3 est un sur-ensemble additif de la V2</strong> côté TX, et un
     <strong>décodeur en fenêtre glissante</strong> qui réutilise <code>rx_v2</code>
@@ -232,8 +249,9 @@
     <figcaption>
         <strong>Fig. 1 —</strong> timeline approchée (HIGH, 1500 Bd) de deux cycles
         BOOT (cadence meta = 5 data-segs) suivis d'un cycle STEADY (cadence 10).
-        La flèche rouge pointe la réinsertion <code>PREAMBLE + HEADER</code> typique
-        V3. Chaque couleur correspond à un champ de modulation distincte.
+        La flèche rouge pointe la réinsertion périodique (V3 : <code>PREAMBLE + HEADER</code> ;
+        <strong>V4 : <code>PREAMBLE + MARKER + WARMUP</code></strong>, sans header).
+        Chaque couleur correspond à un champ de modulation distincte. <em>Figure : disposition V3 héritée.</em>
     </figcaption>
 </figure>
 
@@ -253,17 +271,17 @@
             <td>QPSK fixe<br>(seed 1234)</td>
             <td>Séquence déterministe connue. Utilisée pour l'acquisition et l'entraînement FFE.</td>
         </tr>
-        <tr>
+        <tr style="opacity:.55;text-decoration:line-through">
             <td><span class="swatch" style="background:#7fbf3f"></span><strong>HEADER v3</strong></td>
             <td>96 syms</td>
             <td>QPSK<br>Golay(24,12)×8</td>
-            <td>version (=3), payload_length, mode_code, flags.</td>
+            <td>version (=3), payload_length, mode_code, flags. <strong>Supprimé en V4</strong> — son <code>profile_index</code> est passé dans le marker.</td>
         </tr>
         <tr>
             <td><span class="swatch" style="background:#bf5f2b"></span><strong>MARKER</strong></td>
             <td>128 syms</td>
             <td>QPSK</td>
-            <td>32 sync fixe + 96 ctrl Golay+CRC8 portant seg_id, session_id_low, base_esi, META_FLAG.</td>
+            <td>32 sync fixe + 96 ctrl Golay+CRC8 : seg_id, session_id_low, base_esi, META_FLAG. <strong>V4 :</strong> + <code>profile_index</code>, <code>fmt_version</code>, flag <code>EOT_FRAME</code> (toujours 12 B / 96 syms). En tête de bloc, le marker précède le warmup puis le META_CW.</td>
         </tr>
         <tr>
             <td><span class="swatch" style="background:#bfa02b"></span><strong>META segment</strong></td>
@@ -322,8 +340,8 @@
             <td>—</td>
             <td>— (séquence connue)</td>
         </tr>
-        <tr>
-            <td>HEADER v3</td>
+        <tr style="opacity:.55;text-decoration:line-through">
+            <td>HEADER v3 <span style="text-decoration:none">(supprimé en V4)</span></td>
             <td>QPSK</td>
             <td>2</td>
             <td>3000 b/s</td>
@@ -468,8 +486,9 @@
     (<code>profile.rs:368&nbsp;ultra_uses_dense_pilot_pattern</code>) : tout
     autre profil que ULTRA <em>doit</em> rester sur <code>default_v3</code>.
     Le pattern est transporté implicitement via le <code>profile_index</code>
-    (header octet 10) — il n'est pas dans le <code>mode_code</code>, donc le
-    RX reconstruit le bon pattern à partir du profil annoncé.
+    (V4 : octet 7 du <em>marker</em> ; V3 : octet 10 du header) — il n'est pas
+    dans le <code>mode_code</code>, donc le RX reconstruit le bon pattern à
+    partir du profil annoncé.
 </p>
 
 <div class="callout info">
@@ -505,16 +524,23 @@
          alt="Layouts binaires HDR, MK ctrl, META" />
     <figcaption>
         <strong>Fig. 3 —</strong> layout byte-par-byte de chaque champ protocolaire.
-        <strong>HEADER</strong> (12 B → Golay → 96 QPSK) porte l'identification
-        de la transmission et du profil. <strong>MARKER ctrl</strong> (12 B → Golay →
-        96 QPSK, précédé de 32 sync fixes) porte seg_id / session / base_esi.
+        <strong>HEADER</strong> (12 B → Golay → 96 QPSK) portait l'identification
+        de la transmission et du profil <em>(supprimé en V4 — voir bandeau §1)</em>.
+        <strong>MARKER ctrl</strong> (12 B → Golay → 96 QPSK, précédé de 32 sync
+        fixes) porte seg_id / session / base_esi, et en V4 aussi
+        <code>profile_index</code> / <code>fmt_version</code> / flag EOT.
         <strong>META</strong> réplique l'<em>AppHeader</em> (17 B) 4 fois dans un codeword
         LDPC, suivi de zero-padding — un seul CRC16 valide sur les 4 suffit.
         Valeurs d'exemple : session 0x4C2D0D68, file_size 10240 B, HIGH, mime=binary.
     </figcaption>
 </figure>
 
-<h3>3bis.1 HEADER protocole (12 B)</h3>
+<h3>3bis.1 HEADER protocole (12 B) — <span style="color:#bf2b2b">supprimé en V4</span></h3>
+<div class="callout info" style="border-left:4px solid #bf2b2b;background:#fbeaea">
+    Ce header n'existe plus dans la trame depuis la 0.14.0. Son seul champ utile,
+    <code>profile_index</code>, est passé dans le marker (§3bis.2). Table conservée
+    pour référence du format V3 (≤ 0.13.18).
+</div>
 <table>
     <thead><tr><th>Offset</th><th>Champ</th><th>Taille</th><th>Rôle</th></tr></thead>
     <tbody>
@@ -537,8 +563,10 @@
         <tr><td>0-1</td><td>seg_id</td><td>2 B</td><td>compteur segment (wrap 65536)</td></tr>
         <tr><td>2</td><td>session_id_low</td><td>1 B</td><td>LSB du session_id, pour session lock</td></tr>
         <tr><td>3-5</td><td>base_esi</td><td>3 B (24 bits)</td><td>ESI du 1er codeword du segment</td></tr>
-        <tr><td>6</td><td>flags</td><td>1 B</td><td>bit 0 = META_FLAG (1 = meta, 0 = data)</td></tr>
-        <tr><td>7-10</td><td>reserved</td><td>4 B</td><td>0, extensions futures</td></tr>
+        <tr><td>6</td><td>flags</td><td>1 B</td><td>bit 0 = META_FLAG ; <strong>bit 1 = LAST_FLAG</strong> (dernier segment data) ; <strong>bit 2 = EOT_FRAME</strong> (trame EOT, V4)</td></tr>
+        <tr><td>7</td><td><strong>profile_index</strong></td><td>1 B</td><td><strong>V4 :</strong> profil/modulation (était dans le header). Lu par le RX avant le warmup.</td></tr>
+        <tr><td>8</td><td><strong>fmt_version</strong></td><td>1 B</td><td><strong>V4 :</strong> version du wire-format = <code>WIRE_FMT_V4</code> (4), pour négociation</td></tr>
+        <tr><td>9-10</td><td>reserved</td><td>2 B</td><td>0, extensions futures (était 4 B avant V4)</td></tr>
         <tr><td>11</td><td>CRC8</td><td>1 B</td><td>CCITT sur les 11 octets précédents</td></tr>
     </tbody>
 </table>
@@ -643,10 +671,10 @@
             <td>Normalise amplitude + phase résiduelle.</td>
         </tr>
         <tr>
-            <td>4.B.5 decode header</td>
-            <td><code>header::decode_header_symbols</code></td>
-            <td>HEADER</td>
-            <td>Version ∈ {2,3}, sinon fenêtre rejetée.</td>
+            <td>4.B.5 decode bootstrap marker</td>
+            <td><code>marker::decode_marker_at</code></td>
+            <td>MARKER (bootstrap)</td>
+            <td>V4 : lit <code>profile_index</code> + vérifie <code>fmt_version</code> ; reconstruit le warmup avant la passe data. (V3 décodait ici un header ; <code>decode_header_symbols</code> supprimé.)</td>
         </tr>
         <tr>
             <td>4.B.6 marker walk</td>

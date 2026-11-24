@@ -3,7 +3,8 @@
 Transport layer of the NBFM modem — DSP and superframe assembly. Owns
 constellations (QPSK, 8PSK, 16/32/64-APSK DVB-S2X), root-raised cosine
 shaping, LDPC WiMAX (IEEE 802.16e, N=2304), interleaver, FFE T/2 +
-DD-PLL receiver, marker-based sync, and the V3 superframe layout.
+DD-PLL receiver, marker-based sync, and the V4 superframe layout
+(headerless, marker-bootstrap; built by `build_superframe_v3`).
 
 ## Public API
 
@@ -20,12 +21,18 @@ not pull in any audio device crate (cpal lives in `modem-io`).
 
 ## What stays here vs goes elsewhere
 
-- DSP, FEC, modulation, sync, V3 superframe → here.
+- DSP, FEC, modulation, sync, V4 superframe → here.
 - Payload envelope, app header, RaptorQ codec, CRC → `modem-framing`
   (transport-agnostic, reusable over non-RF transports).
 - Audio device IO → `modem-io`.
 - TX/RX worker threads, session persistence, PTT → `modem-worker`.
 
-The wire format (V3 superframe + AppHeader + envelope) is frozen
-bit-for-bit on `main`. Do not change it without bumping the protocol
-version and updating the OTA-deployed receivers.
+The wire format is the **V4 headerless layout** (since 0.14.0): the protocol
+header is dropped and its `profile_index` lives in the bootstrap marker, which
+is followed by the LMS warmup, then the data — burst layout
+`PREAMBLE → MARKER(profile_index, META) → WARMUP → META_CW → [MARKER → 2·CW]*`.
+The marker payload carries `profile_index` + `fmt_version` (= `WIRE_FMT_V4`) +
+an `EOT_FRAME` flag. Hard break with V3 (≤ 0.13.18): both ends must run V4.
+The format is frozen bit-for-bit on `main`; do not change it without bumping
+`fmt_version` and updating the OTA-deployed receivers. See
+`rust/V4_WIRE_FORMAT_PLAN.md`.

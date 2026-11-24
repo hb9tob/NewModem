@@ -868,7 +868,7 @@ svg text { font-family: system-ui, sans-serif; }
         <circle cx="40" cy="0" r="5" class="pt"/>
         <circle cx="-40" cy="0" r="5" class="pt"/>
         <text x="0" y="100" text-anchor="middle" class="lbl">BPSK</text>
-        <text x="0" y="118" text-anchor="middle" class="sublbl">1 bit · header V3</text>
+        <text x="0" y="118" text-anchor="middle" class="sublbl">1 bit · runout</text>
       </g>
 
       <!-- QPSK -->
@@ -1258,24 +1258,21 @@ svg text { font-family: system-ui, sans-serif; }
         <text x="60" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Préambule</text>
         <text x="60" y="135" text-anchor="middle" fill="#555" font-size="10">256 QPSK</text>
 
-        <rect x="100" y="60" width="55" height="60" fill="#d96b4e"/>
-        <text x="127" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Warmup</text>
-        <text x="127" y="135" text-anchor="middle" fill="#555" font-size="10">32 sym</text>
+        <rect x="100" y="60" width="80" height="60" fill="#4d83b3"/>
+        <text x="140" y="92" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Marker</text>
+        <text x="140" y="106" text-anchor="middle" fill="#fff" font-size="9">profile_index</text>
+        <text x="140" y="135" text-anchor="middle" fill="#555" font-size="10">128 sym</text>
 
-        <rect x="155" y="60" width="60" height="60" fill="#2a5f8a"/>
-        <text x="185" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Header</text>
-        <text x="185" y="135" text-anchor="middle" fill="#555" font-size="10">96 QPSK</text>
+        <rect x="180" y="60" width="55" height="60" fill="#d96b4e"/>
+        <text x="207" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Warmup</text>
+        <text x="207" y="135" text-anchor="middle" fill="#555" font-size="10">32 sym</text>
 
-        <rect x="215" y="60" width="60" height="60" fill="#4d83b3"/>
-        <text x="245" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Marker</text>
-        <text x="245" y="135" text-anchor="middle" fill="#555" font-size="10">128 sym</text>
+        <rect x="235" y="60" width="50" height="60" fill="#7a9bc4"/>
+        <text x="260" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Meta</text>
 
-        <rect x="275" y="60" width="50" height="60" fill="#7a9bc4"/>
-        <text x="300" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Meta</text>
-
-        <rect x="325" y="60" width="265" height="60" fill="#e6e2d8" stroke="#999"/>
-        <text x="457" y="95" text-anchor="middle" font-size="13" font-weight="700">Data segments (LDPC + RaptorQ)</text>
-        <text x="457" y="135" text-anchor="middle" fill="#555" font-size="10">pilotes TDM 32/2 (16/2 sur ULTRA et HIGH++)</text>
+        <rect x="285" y="60" width="305" height="60" fill="#e6e2d8" stroke="#999"/>
+        <text x="437" y="95" text-anchor="middle" font-size="13" font-weight="700">Data segments (LDPC + RaptorQ)</text>
+        <text x="437" y="135" text-anchor="middle" fill="#555" font-size="10">pilotes TDM 32/2 (16/2 sur ULTRA et HIGH++)</text>
       </g>
 
       <!-- Cycle 2 (next) -->
@@ -1283,20 +1280,18 @@ svg text { font-family: system-ui, sans-serif; }
         <rect x="590" y="60" width="80" height="60" fill="#b8412a"/>
         <text x="630" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Préambule</text>
 
-        <rect x="670" y="60" width="55" height="60" fill="#d96b4e"/>
-        <text x="697" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Warmup</text>
+        <rect x="670" y="60" width="80" height="60" fill="#4d83b3"/>
+        <text x="710" y="92" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Marker</text>
+        <text x="710" y="106" text-anchor="middle" fill="#fff" font-size="9">profile_index</text>
 
-        <rect x="725" y="60" width="60" height="60" fill="#2a5f8a"/>
-        <text x="755" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Header</text>
+        <rect x="750" y="60" width="55" height="60" fill="#d96b4e"/>
+        <text x="777" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Warmup</text>
 
-        <rect x="785" y="60" width="60" height="60" fill="#4d83b3"/>
-        <text x="815" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Marker</text>
+        <rect x="805" y="60" width="50" height="60" fill="#7a9bc4"/>
+        <text x="830" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Meta</text>
 
-        <rect x="845" y="60" width="50" height="60" fill="#7a9bc4"/>
-        <text x="870" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Meta</text>
-
-        <rect x="895" y="60" width="265" height="60" fill="#e6e2d8" stroke="#999"/>
-        <text x="1027" y="95" text-anchor="middle" font-size="13" font-weight="700">Data segments (suite)</text>
+        <rect x="855" y="60" width="305" height="60" fill="#e6e2d8" stroke="#999"/>
+        <text x="1007" y="95" text-anchor="middle" font-size="13" font-weight="700">Data segments (suite)</text>
       </g>
 
       <!-- Period bracket -->
@@ -1305,7 +1300,7 @@ svg text { font-family: system-ui, sans-serif; }
         <line x1="20" y1="35" x2="20" y2="45"/>
         <line x1="590" y1="35" x2="590" y2="45"/>
       </g>
-      <text x="305" y="30" text-anchor="middle" font-size="14" fill="#b8412a" font-weight="700">Période ~4 s — préambule + header rejoués</text>
+      <text x="305" y="30" text-anchor="middle" font-size="14" fill="#b8412a" font-weight="700">Période ~4 s — préambule + marker + warmup rejoués</text>
 
       <text x="600" y="200" text-anchor="middle" font-size="13" fill="#555" font-style="italic">Permet à un RX qui démarre en cours de route de se synchroniser dans 4 s max.</text>
     </svg>
@@ -1318,10 +1313,9 @@ svg text { font-family: system-ui, sans-serif; }
   <div class="body">
     <ul>
       <li><strong>3 familles de préambules</strong> (A / B / C) — séparent ULTRA, ROBUST, et le reste, pour éviter les faux verrous entre profils</li>
-      <li>Header de 96 symboles QPSK protégé par <strong>Golay(24,12)</strong> + CRC8 — décodable à très bas SNR</li>
-      <li>Marker de 128 symboles avec sync pattern + payload Golay → re-synchro entre segments</li>
+      <li><strong>Marker</strong> de 128 symboles (32 sync + 96 ctrl Golay(24,12)+CRC8) → re-synchro entre segments, décodable à très bas SNR, et <strong>auto-égalisé</strong> par son propre sync</li>
       <li>Innovations déclenchées par HIGH++ : <strong>LMS warmup</strong> propagé à tous les profils (marge gratuite), <strong>pilotes densifiés 16/2</strong> gardés sur ULTRA et HIGH++ là où ils comptent</li>
-      <li>Profile_index sur 1 octet dédié dans le header → le RX sait quel profil décoder dès la 1ʳᵉ trame complète</li>
+      <li><strong>V4 (0.14.0) — trame sans header :</strong> le <code>profile_index</code> (la modulation) est passé du header dans le <strong>marker</strong>, et le warmup est placé <em>après</em> le marker. Le RX lit donc le profil <em>avant</em> d'entraîner le FFE → plus de devinette d'ancre (cause racine du bug d'auto-detect HIGH+ éliminée), et chaque segment est auto-descriptif</li>
     </ul>
   </div>
 </section>
@@ -1377,7 +1371,7 @@ svg text { font-family: system-ui, sans-serif; }
 
           <rect x="100" y="406" width="260" height="44" rx="6" fill="#2f7a3a"/>
           <text x="230" y="426" fill="#fff" font-weight="700">Mise en trame V3</text>
-          <text x="230" y="442" fill="#c8e0cc" font-size="11">préambule + warmup + header + pilotes</text>
+          <text x="230" y="442" fill="#c8e0cc" font-size="11">préambule + marker(profile_index) + warmup + pilotes</text>
           <line x1="230" y1="450" x2="230" y2="470" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#tx-arr)"/>
 
           <rect x="100" y="472" width="260" height="44" rx="6" fill="#2f7a3a"/>
@@ -1414,7 +1408,8 @@ svg text { font-family: system-ui, sans-serif; }
         <text x="80" y="110" fill="#fff" font-weight="700">Preamble probe</text>
 
         <rect x="170" y="80" width="120" height="50" rx="6" fill="#2a5f8a"/>
-        <text x="230" y="110" fill="#fff" font-weight="700">Header decode</text>
+        <text x="230" y="108" fill="#fff" font-weight="700">Marker decode</text>
+        <text x="230" y="122" fill="#cfe0ee" font-size="9">profile_index</text>
 
         <rect x="320" y="80" width="100" height="50" rx="6" fill="#2a5f8a"/>
         <text x="370" y="110" fill="#fff" font-weight="700">DD-PLL</text>
