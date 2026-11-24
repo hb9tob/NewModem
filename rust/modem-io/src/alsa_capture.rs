@@ -165,6 +165,11 @@ mod imp {
                 continue;
             }
             frames_total += frames as u64;
+            // Frames captured and still waiting in the kernel buffer: the
+            // ALSA-direct counterpart of the cpal ring, for the journal.
+            if let Ok(waiting) = pcm.avail() {
+                stats.note_ring(waiting.max(0) as u64);
+            }
 
             // Channel 0 → f32, matching cpal_capture's mono decoder
             // (`decode_native_to_mono_f32` keeps the first channel).

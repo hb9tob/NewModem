@@ -113,7 +113,9 @@ fn log(msg: &str) {
 /// threads, never by the OS audio callback.
 #[derive(Debug, Default)]
 pub struct CaptureStats {
-    /// Highest ring occupancy since last read, in frames + 1 (0 = no ring).
+    /// Highest occupancy since last read of the capture-side buffer (cpal
+    /// ring, or ALSA kernel buffer in ALSA-direct mode), in frames + 1
+    /// (0 = not measured).
     ring_peak: AtomicU64,
     stream_errors: AtomicU64,
 }
@@ -127,8 +129,8 @@ impl CaptureStats {
         self.stream_errors.store(count, Ordering::Relaxed);
     }
 
-    /// Highest ring occupancy since the previous call, in frames. `None`
-    /// without a ring (ALSA-direct) or while the reader itself is stalled.
+    /// Highest capture-side occupancy since the previous call, in frames.
+    /// `None` while the reader itself is stalled (nothing measured).
     pub fn take_ring_peak(&self) -> Option<u64> {
         self.ring_peak.swap(0, Ordering::Relaxed).checked_sub(1)
     }
