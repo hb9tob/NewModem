@@ -109,7 +109,38 @@ fn log(msg: &str) {
     }
 }
 
+/// Capture-side health, for the modem journal. Written by the reader
+/// threads, never by the OS audio callback.
+#[derive(Debug, Default)]
+pub struct CaptureStats {
+    /// Highest ring occupancy since last read, in frames + 1 (0 = no ring).
+    ring_peak: AtomicU64,
+    stream_errors: AtomicU64,
+}
+
+impl CaptureStats {
+    pub(crate) fn note_ring(&self, frames: u64) {
+        self.ring_peak.fetch_max(frames + 1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_stream_errors(&self, count: u64) {
+        self.stream_errors.store(count, Ordering::Relaxed);
+    }
+
+    /// Highest ring occupancy since the previous call, in frames. `None`
+    /// without a ring (ALSA-direct) or while the reader itself is stalled.
+    pub fn take_ring_peak(&self) -> Option<u64> {
+        self.ring_peak.swap(0, Ordering::Relaxed).checked_sub(1)
+    }
+
+    /// Cumulative stream errors (cpal) or overruns (ALSA-direct).
+    pub fn stream_errors(&self) -> u64 {
+        self.stream_errors.load(Ordering::Relaxed)
+    }
+}
+
 pub struct CaptureHandle {
+    pub stats: Arc<CaptureStats>,
     pub stop: Arc<AtomicBool>,
     /// Background threads to join on stop. The cpal backend uses two
     /// (capture owns the `Stream` — not `Send` on Windows — and parks on
@@ -202,14 +233,17 @@ pub fn start(device_name: &str) -> Result<(CaptureHandle, Receiver<Vec<f32>>), S
         }
     };
 
+    let stats = Arc::new(CaptureStats::default());
+    let stats_reader = stats.clone();
     let stop_reader = stop.clone();
     let dropped_reader = dropped_samples.clone();
     let reader_thread = thread::spawn(move || {
-        run_reader(handoff, sample_tx, dropped_reader, stop_reader);
+        run_reader(handoff, sample_tx, dropped_reader, stats_reader, stop_reader);
     });
 
     Ok((
         CaptureHandle {
+            stats,
             stop,
             threads: Some(vec![capture_thread, reader_thread]),
             sample_rate,
@@ -519,6 +553,7 @@ fn run_reader(
     mut handoff: ReaderHandoff,
     sample_tx: mpsc::Sender<Vec<f32>>,
     dropped_samples: Arc<AtomicU64>,
+    stats: Arc<CaptureStats>,
     stop: Arc<AtomicBool>,
 ) {
     let rt_ok = lift_rt_priority();
@@ -557,6 +592,8 @@ fn run_reader(
         // number of frames. Anything below frame granularity stays in
         // the ring for the next tick.
         let avail = handoff.consumer.slots();
+        stats.note_ring((avail / bytes_per_frame) as u64);
+        stats.set_stream_errors(handoff.error_count.load(Ordering::Relaxed));
         if avail > ring_high_water {
             ring_high_water = avail;
         }

@@ -60,6 +60,8 @@ mod imp {
         // ready_tx phase). The PCM is `Send`, so we hand it to the reader.
         let (pcm, channels, period_frames) = open_capture(device_name)?;
 
+        let stats = Arc::new(crate::cpal_capture::CaptureStats::default());
+        let stats_reader = stats.clone();
         let stop_reader = stop.clone();
         let dropped_reader = dropped_samples.clone();
         let reader = thread::spawn(move || {
@@ -69,12 +71,14 @@ mod imp {
                 period_frames,
                 sample_tx,
                 dropped_reader,
+                stats_reader,
                 stop_reader,
             );
         });
 
         Ok((
             CaptureHandle {
+                stats,
                 stop,
                 threads: Some(vec![reader]),
                 sample_rate: TARGET_RATE,
@@ -115,6 +119,7 @@ mod imp {
         period_frames: usize,
         sample_tx: mpsc::Sender<Vec<f32>>,
         dropped_samples: Arc<AtomicU64>,
+        stats: Arc<crate::cpal_capture::CaptureStats>,
         stop: Arc<AtomicBool>,
     ) {
         let ch = channels as usize;
@@ -140,6 +145,7 @@ mod imp {
                     // signal the lost period to the worker via the same
                     // mono-sample counter cpal uses for its brickwall.
                     overruns += 1;
+                    stats.set_stream_errors(overruns);
                     dropped_samples.fetch_add(period_frames as u64, Ordering::Relaxed);
                     if let Err(e2) = pcm.try_recover(e, true) {
                         crate::alsa_pcm::log(&format!(

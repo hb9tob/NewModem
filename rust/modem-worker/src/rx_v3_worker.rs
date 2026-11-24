@@ -339,6 +339,9 @@ impl RxV3Worker {
             self.history.drain(..drop);
             self.history_origin += drop as u64;
         }
+        // Published before processing: a rebuild below replays all of it.
+        crate::journal::probe::set_buffer(crate::journal::probe::Buffer::History, self.history.len());
+        crate::journal::probe::set_buffer(crate::journal::probe::Buffer::Session, self.session.buffered_samples());
         let outcome = if !self.gated {
             self.push_continuous(samples)
         } else {
@@ -537,6 +540,7 @@ impl RxV3Worker {
         // fine offset on its own, so correctness doesn't depend on it.
         self.session.set_cfo_hz(open.cfo_hz);
         let replay = {
+            let _activity = crate::journal::probe::enter(crate::journal::probe::Activity::ReplayWarm);
             let mut hist = std::mem::take(&mut self.history);
             let ev = {
                 let buf = hist.make_contiguous();
@@ -617,6 +621,7 @@ impl RxV3Worker {
     /// Flush the session at end-of-capture (stream disconnected). Emits the
     /// `SessionFinalised` summary for an in-flight burst and resets to Idle.
     pub fn finalize(&mut self) -> PushOutcome {
+        let _activity = crate::journal::probe::enter(crate::journal::probe::Activity::Finalize);
         let events = self.session.finalize();
         let outcome = self.route(events);
         self.samples_since_progress = 0;
@@ -875,6 +880,7 @@ impl RxV3Worker {
                         let t_rw = std::time::Instant::now();
                         let mut hist = std::mem::take(&mut self.history);
                         let replay = {
+                            let _activity = crate::journal::probe::enter(crate::journal::probe::Activity::ReplayRewind);
                             let buf = hist.make_contiguous();
                             if lo <= buf.len() {
                                 self.session.replay_from_anchor(
@@ -1021,6 +1027,7 @@ impl RxV3Worker {
         // The replay restarts the frame at hist[0], i.e. old `history_origin`.
         self.frame0_stream += self.history_origin;
         self.history_origin = 0;
+        let _activity = crate::journal::probe::enter(crate::journal::probe::Activity::ReplayRebuild);
         let mut acc: Vec<f32> = Vec::with_capacity(hist.len());
         let mut events = Vec::new();
         for chunk in hist.chunks(REPLAY_BATCH_SAMPLES) {

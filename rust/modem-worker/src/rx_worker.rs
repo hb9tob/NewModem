@@ -40,6 +40,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use crate::journal::probe::{self, Activity, Buffer};
+use crate::journal::queue::MeteredReceiver;
+use crate::journal::{Journal, JournalSink};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -95,6 +98,22 @@ impl WavSink {
 /// Shared raw-capture sink. None = not recording ; Some = worker is teeing
 /// every ingested batch into the WAV.
 pub type SharedWavSink = Arc<Mutex<Option<WavSink>>>;
+
+/// Hand the legacy per-stage timings to the journal.
+fn report_legacy_stages(perf: &modem_core::rx_v2::PerfBreakdown) {
+    probe::add_stages(&[
+        ("downmix", perf.downmix_us),
+        ("matched_filter", perf.matched_filter_us),
+        ("find_preamble", perf.find_preamble_us),
+        ("decimate", perf.decimate_us),
+        ("ffe_ls", perf.ffe_ls_us),
+        ("ffe_lms", perf.ffe_lms_us),
+        ("marker_scan", perf.marker_scan_us),
+        ("ldpc", perf.ldpc_us),
+        ("raptorq", perf.raptorq_us),
+        ("resample", perf.resample_us),
+    ]);
+}
 
 fn log_path() -> std::path::PathBuf {
     std::env::temp_dir().join("nbfm-worker.log")
@@ -543,6 +562,53 @@ pub fn spawn(
     turbo: bool,
     dropped_samples: Arc<std::sync::atomic::AtomicU64>,
 ) -> WorkerHandle {
+    spawn_journalled(
+        samples,
+        sink,
+        save_dir,
+        wav_sink,
+        profile,
+        forced,
+        deemphasis_enabled,
+        allow_legacy_grid,
+        turbo,
+        dropped_samples,
+        Journal::disabled(),
+        None,
+    )
+}
+
+/// [`spawn`], recording the run in `journal`. `capture` is the capture-side
+/// health when the source has one (sound cards).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_journalled(
+    samples: Receiver<Vec<f32>>,
+    sink: Arc<dyn EventSink>,
+    save_dir: Arc<Mutex<PathBuf>>,
+    wav_sink: SharedWavSink,
+    profile: ProfileIndex,
+    forced: bool,
+    deemphasis_enabled: bool,
+    allow_legacy_grid: bool,
+    turbo: bool,
+    dropped_samples: Arc<std::sync::atomic::AtomicU64>,
+    journal: Journal,
+    capture: Option<Arc<modem_io::cpal_capture::CaptureStats>>,
+) -> WorkerHandle {
+    let samples = MeteredReceiver::new(samples);
+    let run_probe = journal.is_enabled().then(|| {
+        let mut about = serde_json::Map::new();
+        about.insert("modem".into(), if turbo { "turbo" } else { "legacy" }.into());
+        about.insert("profile".into(), profile.name().into());
+        about.insert("forced".into(), forced.into());
+        about.insert("deemphasis".into(), deemphasis_enabled.into());
+        about.insert("legacy_grid".into(), allow_legacy_grid.into());
+        journal.worker_started_with(samples.meter(), about, capture, dropped_samples.clone())
+    });
+    let sink: Arc<dyn EventSink> = match run_probe.as_ref() {
+        Some(p) => Arc::new(JournalSink::new(sink, journal.clone(), Some(p.run()))),
+        None => sink,
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     // Stream position (samples consumed by the worker), published by the
@@ -555,6 +621,7 @@ pub fn spawn(
         AUDIO_RATE as f64,
     ));
     let thread = thread::spawn(move || {
+        probe::install(run_probe.clone());
         // The main worker forks by mode: turbo runs the stateful
         // fully-streaming V3Session path; legacy runs the sliding-window
         // rx_v2 path. Both share the same capture-side plumbing
@@ -586,6 +653,10 @@ pub fn spawn(
                 stream_pos,
                 stop_thread,
             );
+        }
+        probe::install(None);
+        if let Some(p) = run_probe.as_ref() {
+            journal.worker_stopped(p);
         }
     });
     WorkerHandle {
@@ -1030,7 +1101,7 @@ impl WorkerState {
 /// handle the capture-level lifecycle: a ring-buffer overflow flushes the
 /// session to Idle (brickwall parity), and a stream disconnect finalizes.
 fn run_turbo_worker(
-    samples: Receiver<Vec<f32>>,
+    samples: MeteredReceiver,
     sink: Arc<dyn EventSink>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
@@ -1150,12 +1221,18 @@ fn run_turbo_worker(
             }
         }
 
-        let mut chunk = match samples.recv_timeout(Duration::from_millis(200)) {
+        probe::set_buffer(Buffer::InFlight, 0);
+        let received = {
+            let _activity = probe::enter(Activity::Wait);
+            samples.recv_timeout(Duration::from_millis(200))
+        };
+        let mut chunk = match received {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
+        probe::set_buffer(Buffer::InFlight, chunk.len());
         // Capture-side brickwall parity: a producer-ring overflow leaves a
         // hole in the stream the matched filter can't bridge. Flush the
         // session to Idle and request a clean restart, dropping the
@@ -1197,6 +1274,7 @@ fn run_turbo_worker(
         total_samples += chunk.len() as u64;
         stream_pos.store(total_samples, Ordering::Relaxed);
         let (peak, rms, crest_db) = compute_audio_stats(&chunk);
+        probe::set_level(rms, peak);
         let overdrive =
             rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
         sink.emit(
@@ -1230,8 +1308,11 @@ fn run_turbo_worker(
                 // missed. A no-op for the small chunks a sound card delivers.
                 let t0 = Instant::now();
                 let mut finalised = 0usize;
-                for sub in chunk.chunks(ACQ_PUSH_SPLIT) {
-                    finalised += d.push_samples(sub).bursts_finalised;
+                {
+                    let _activity = probe::enter(Activity::Push);
+                    for sub in chunk.chunks(ACQ_PUSH_SPLIT) {
+                        finalised += d.push_samples(sub).bursts_finalised;
+                    }
                 }
                 last_push_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 max_push_ms = max_push_ms.max(last_push_ms);
@@ -1298,9 +1379,11 @@ fn run_turbo_worker(
                     warm.drain(..drop);
                 }
                 let warm_origin = total_samples - warm.len() as u64;
-                let open = auto_gate
-                    .as_mut()
-                    .and_then(|g| g.poll(&warm, warm_origin));
+                probe::set_buffer(Buffer::Warm, warm.len());
+                let open = {
+                    let _activity = probe::enter(Activity::Gate);
+                    auto_gate.as_mut().and_then(|g| g.poll(&warm, warm_origin))
+                };
                 // One `gate_poll` milestone per heavy poll (detected as a change
                 // of `last_poll_ms`): its wall cost and whether the phase-2 CFO
                 // grid ran. This is the search-phase CPU trace (P1/P2).
@@ -1365,6 +1448,7 @@ fn run_turbo_worker(
                             // Session frame 0 = first replayed sample.
                             d.set_stream_base(start_abs);
                             let t_replay = Instant::now();
+                            let replaying = probe::enter(Activity::ReplayWarm);
                             // Feed it in ~100 ms batches (not one big chunk) so
                             // the throttled acquisition scan runs across the
                             // replay and catches the preamble (the SC detector,
@@ -1374,6 +1458,7 @@ fn run_turbo_worker(
                             for batch in warm[off..].chunks(ACQ_PUSH_SPLIT) {
                                 d.push_samples(batch);
                             }
+                            drop(replaying);
                             emit_milestone(
                                 &*sink,
                                 "driver_ready",
@@ -1385,6 +1470,7 @@ fn run_turbo_worker(
                                 }),
                             );
                             warm.clear();
+                            probe::set_buffer(Buffer::Warm, 0);
                             driver_born = total_samples;
                             driver = Some(d);
                         }
@@ -1403,6 +1489,7 @@ fn run_turbo_worker(
         // hand-off MUST happen at this layer. `burst_ended` was only set when
         // `auto_gate.is_some()` (⇔ !forced), so a forced single-profile capture
         // stays locked on the operator's profile and is never torn down.
+        probe::add_stages(&modem_core::v3_session::take_perf());
         if burst_ended {
             // Seed `warm` with the most-recent tail (one gate search window) so a
             // near-back-to-back burst already begun is not lost, then re-arm a
@@ -1414,6 +1501,9 @@ fn run_turbo_worker(
             warm.clear();
             warm.extend_from_slice(&chunk[chunk.len() - tail_n..]);
             driver = None;
+            probe::set_buffer(Buffer::History, 0);
+            probe::set_buffer(Buffer::Session, 0);
+            probe::set_buffer(Buffer::Warm, warm.len());
             auto_gate = Some(modem_core::turbo_gate::TurboGate::auto());
             if let Some(g) = auto_gate.as_mut() {
                 g.reset_to(total_samples - warm.len() as u64);
@@ -1443,7 +1533,7 @@ const TURBO_REPLAY_LEAD_S: f64 = 1.0;
 const ACQ_PUSH_SPLIT: usize = AUDIO_RATE as usize / 10;
 
 fn run_worker(
-    samples: Receiver<Vec<f32>>,
+    samples: MeteredReceiver,
     sink: Arc<dyn EventSink>,
     save_dir: Arc<Mutex<PathBuf>>,
     wav_sink: SharedWavSink,
@@ -1488,7 +1578,12 @@ fn run_worker(
     let mut last_dropped: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let first = match samples.recv_timeout(Duration::from_millis(200)) {
+        probe::set_buffer(Buffer::InFlight, 0);
+        let received = {
+            let _activity = probe::enter(Activity::Wait);
+            samples.recv_timeout(Duration::from_millis(200))
+        };
+        let first = match received {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle : still pulse the maintenance checks (silence trigger)
@@ -1508,6 +1603,7 @@ fn run_worker(
             }
         }
 
+        probe::set_buffer(Buffer::InFlight, batch.len());
         state.total_samples += batch.len() as u64;
         stream_pos.store(state.total_samples, Ordering::Relaxed);
 
@@ -1571,6 +1667,7 @@ fn run_worker(
 
         // Audio level metrics + silence tracker
         let (peak, rms, crest_db) = compute_audio_stats(&batch);
+        probe::set_level(rms, peak);
         let overdrive =
             rms > OVERDRIVE_RMS_GATE_LINEAR && crest_db < OVERDRIVE_CREST_GATE_DB;
         sink.emit(
@@ -1669,7 +1766,9 @@ fn run_worker(
             }
         }
 
+        probe::set_buffer(Buffer::Session, state.session_buffer.len());
         maintenance_tick(&*sink, &save_dir, &mut state, &samples);
+        probe::set_buffer(Buffer::Session, state.session_buffer.len());
         state.check_and_emit_modem_state(&*sink);
 
         // Per-batch wall time, tracked so the 2 s telemetry tick can
@@ -1755,7 +1854,7 @@ fn run_worker(
 /// Called on both brickwall paths (capture ring overflow and worker
 /// 5 min cap) so we don't restart the next session on top of a stale
 /// backlog.
-fn drain_mpsc(samples: &Receiver<Vec<f32>>, total_samples: &mut u64) -> usize {
+fn drain_mpsc(samples: &MeteredReceiver, total_samples: &mut u64) -> usize {
     let mut n = 0;
     while let Ok(chunk) = samples.try_recv() {
         *total_samples += chunk.len() as u64;
@@ -1791,12 +1890,13 @@ fn maintenance_tick(
     sink: &dyn EventSink,
     save_dir: &Arc<Mutex<PathBuf>>,
     state: &mut WorkerState,
-    samples: &Receiver<Vec<f32>>,
+    samples: &MeteredReceiver,
 ) {
     let now = Instant::now();
 
     if now.duration_since(state.last_scan_at) >= Duration::from_millis(SCAN_INTERVAL_MS) {
         state.last_scan_at = now;
+        let _activity = probe::enter(Activity::Scan);
         scan_and_route(sink, save_dir, state);
     }
 
@@ -2064,6 +2164,7 @@ fn scan_and_route(
     // estimator, hint-resampled decode, fast-path single-shot, optional
     // ±15 ppm grid). Resets the accumulator -- next tick gets a fresh one.
     let perf_this_tick = rx_v2::take_perf();
+    report_legacy_stages(&perf_this_tick);
     // Lowpower grid-quota accounting. `n_passes` accumulates one entry
     // per internal pass : 1 = Gardner-only, 2 = +fast-path fallback,
     // > 2 = the ±15 ppm grid was entered (it adds up to 6 more passes).
@@ -2214,7 +2315,9 @@ fn scan_and_route(
                     // the same per-tick perf accumulator as the primary
                     // path. (The `take_perf()` clears the thread-local,
                     // so we can't lose this contribution by not harvesting.)
-                    perf_log_accumulate(state, rx_v2::take_perf());
+                    let redecode_perf = rx_v2::take_perf();
+                    report_legacy_stages(&redecode_perf);
+                    perf_log_accumulate(state, redecode_perf);
                     match auto_redecode {
                         Some(refresh) => {
                             // Defensive : if the fresh header still claims a
@@ -2847,6 +2950,7 @@ pub(crate) fn emit_decoded_file(
         },
     );
 
+    let _activity = probe::enter(Activity::Save);
     let dir = save_dir.lock().ok().map(|p| p.clone()).unwrap_or_default();
     let env = PayloadEnvelope::decode_or_fallback(&df.payload);
     let (fname, callsign, content) = if env.version != 0 {
@@ -3338,7 +3442,7 @@ mod tests {
         drop(tx);
 
         super::run_turbo_worker(
-            rx,
+            crate::journal::queue::MeteredReceiver::new(rx),
             sink,
             save_dir,
             wav_sink,

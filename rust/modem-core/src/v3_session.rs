@@ -628,6 +628,49 @@ pub enum V3SessionEvent {
 /// Max equalised data symbols sampled per segment for the GUI constellation.
 pub const MAX_TURBO_CONSTELLATION: usize = 500;
 
+/// Stage names of [`take_perf`], in pipeline order.
+pub const STAGE_NAMES: [&str; 9] = [
+    "ingest", "dsp", "ffe", "sc_marker", "acquire", "decode", "marker", "retry", "rewind",
+];
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Ingest,
+    Dsp,
+    Ffe,
+    ScMarker,
+    Acquire,
+    Decode,
+    Marker,
+    Retry,
+    Rewind,
+}
+
+thread_local! {
+    static STAGE_US: std::cell::RefCell<[f64; STAGE_NAMES.len()]> =
+        const { std::cell::RefCell::new([0.0; STAGE_NAMES.len()]) };
+}
+
+/// Take this thread's per-stage wall time (microseconds), the turbo
+/// counterpart of `rx_v2::take_perf`. Instrumentation only. Inclusive: the
+/// replay run by a rewind is in `rewind` and in the stages it went through.
+pub fn take_perf() -> [(&'static str, u64); STAGE_NAMES.len()] {
+    let us = STAGE_US.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    std::array::from_fn(|i| (STAGE_NAMES[i], us[i] as u64))
+}
+
+/// Attributes the time since the previous lap to a stage.
+struct StageClock(std::time::Instant);
+
+impl StageClock {
+    fn lap(&mut self, stage: Stage) {
+        let now = std::time::Instant::now();
+        let us = now.duration_since(self.0).as_secs_f64() * 1e6;
+        STAGE_US.with(|s| s.borrow_mut()[stage as usize] += us);
+        self.0 = now;
+    }
+}
+
 pub struct V3Session {
     /// Stored verbatim for Phase 3+ — drives the constellation, RRC,
     /// pilot pattern, LDPC rate, warmup at PLS/Header validation time.
@@ -1262,6 +1305,7 @@ impl V3Session {
         external_history: Option<(&[f32], u64)>,
     ) -> Vec<V3SessionEvent> {
         let mut events = Vec::new();
+        let mut clock = StageClock(std::time::Instant::now());
         let mut pending_sc: Vec<(u64, f64)> = Vec::new();
 
         // 1. Ingest into audio buffer + SC detector. Defer SC-fire
@@ -1281,6 +1325,7 @@ impl V3Session {
             }
         }
 
+        clock.lap(Stage::Ingest);
         // 2. Drive the streaming RX-DSP pipeline forward, then drain
         //    new symbols into the streaming FFE. Drift comes from
         //    `set_drift_ppm` (caller-provided in Phase 2; Phase 4
@@ -1312,7 +1357,11 @@ impl V3Session {
                     );
                 }
             }
+            clock.lap(Stage::Dsp);
             self.ffe.push_raw(&new_fse);
+            clock.lap(Stage::Ffe);
+        } else {
+            clock.lap(Stage::Dsp);
         }
 
         // 3. Handle SC fires now that the sym_buffer is up-to-date.
@@ -1324,6 +1373,7 @@ impl V3Session {
             self.handle_sc_fire(marker_at_abs, metric, &mut events);
         }
 
+        clock.lap(Stage::ScMarker);
         // 3c. Always-on preamble acquisition via the FFT matched filter. No
         //     silence/energy gate — the channel between bursts may carry
         //     noise, speech or QRM; only a real preamble correlates, and the
@@ -1331,6 +1381,7 @@ impl V3Session {
         //     is what locks on real colored NBFM captures where the lag-auto
         //     ScDetector metric is too weak to pin the marker.
         self.try_acquire_preamble(&mut events);
+        clock.lap(Stage::Acquire);
 
         // 4. Drain the decode + advance loop until no more progress
         //    can be made on this chunk. A single chunk may carry
@@ -1341,7 +1392,9 @@ impl V3Session {
         //    so termination is guaranteed.
         loop {
             let decoded = self.try_decode_pending_cycle(&mut events);
+            clock.lap(Stage::Decode);
             let advanced = self.try_advance_to_next_marker(&mut events);
+            clock.lap(Stage::Marker);
             if !decoded && !advanced {
                 break;
             }
@@ -1352,6 +1405,7 @@ impl V3Session {
         //     have adapted over the rest of the superframe and the whole segment
         //     is buffered for a forward-backward-forward re-equalisation.
         self.retry_failed_segments(&mut events);
+        clock.lap(Stage::Retry);
 
         // 4a-ter. Backward flywheel: once the FFE/phase have trained over the
         //     first ~superframe of forward decode, retreat the cadence and
@@ -1373,6 +1427,7 @@ impl V3Session {
         //     blocks re-entry), so a single call settles the burst at
         //     the right drift.
         self.try_apply_coarse_drift(&mut events, external_history);
+        clock.lap(Stage::Rewind);
 
         // 5. Trim the rolling audio buffer. StreamingDsp tracks its own
         //    resampler cursor; we keep the last AUDIO_BUFFER_RETAIN_CYCLES

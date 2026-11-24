@@ -4,7 +4,9 @@
 //! The record is therefore still written while the worker is stuck in a
 //! long replay, which is exactly when it matters.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -13,6 +15,7 @@ use serde_json::{json, Map, Value};
 use super::cpu;
 use super::queue::QueueMeter;
 use super::Journal;
+use modem_io::cpal_capture::CaptureStats;
 
 const SAMPLES_PER_MS: f64 = modem_core::types::AUDIO_RATE as f64 / 1000.0;
 
@@ -105,6 +108,57 @@ struct Stat {
     max: Duration,
 }
 
+thread_local! {
+    static CURRENT: RefCell<Option<Arc<RunProbe>>> = const { RefCell::new(None) };
+}
+
+/// Make `probe` the one the free functions below report to on this thread.
+/// They let the driver and the save path report without carrying the probe
+/// in every signature; without a probe they do nothing.
+pub fn install(probe: Option<Arc<RunProbe>>) {
+    CURRENT.with(|c| *c.borrow_mut() = probe);
+}
+
+/// [`RunProbe::enter`] on this thread's probe.
+#[must_use = "the activity ends when the guard drops"]
+pub fn enter(activity: Activity) -> Option<ActivityGuard> {
+    CURRENT.with(|c| c.borrow().as_ref().map(|p| p.enter(activity)))
+}
+
+/// [`RunProbe::set_buffer`] on this thread's probe.
+pub fn set_buffer(buffer: Buffer, samples: usize) {
+    CURRENT.with(|c| {
+        if let Some(p) = c.borrow().as_ref() {
+            p.set_buffer(buffer, samples);
+        }
+    });
+}
+
+/// Input level of the chunk just taken from the queue.
+pub fn set_level(rms: f32, peak: f32) {
+    CURRENT.with(|c| {
+        if let Some(p) = c.borrow().as_ref() {
+            p.rms.store(rms.to_bits(), Ordering::Relaxed);
+            // Non-negative floats order like their bit patterns.
+            p.peak.fetch_max(peak.max(0.0).to_bits(), Ordering::Relaxed);
+        }
+    });
+}
+
+/// Add DSP stage timings (microseconds) to the current window.
+pub fn add_stages(stages: &[(&'static str, u64)]) {
+    CURRENT.with(|c| {
+        if let Some(p) = c.borrow().as_ref() {
+            let mut sum = p.stages.lock().unwrap_or_else(PoisonError::into_inner);
+            for &(name, us) in stages {
+                if us > 0 {
+                    *sum.entry(name).or_insert(0) += us;
+                }
+            }
+        }
+    });
+}
+
 /// Shared state of one worker run.
 pub struct RunProbe {
     run: u32,
@@ -115,10 +169,26 @@ pub struct RunProbe {
     activity_since_us: AtomicU64,
     buffers: [AtomicU64; Buffer::ALL.len()],
     stats: Mutex<[Stat; Activity::ALL.len()]>,
+    stages: Mutex<BTreeMap<&'static str, u64>>,
+    rms: AtomicU32,
+    peak: AtomicU32,
+    capture: Option<Arc<CaptureStats>>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl RunProbe {
     pub fn new(run: u32, journal: Journal, meter: Arc<QueueMeter>) -> Arc<Self> {
+        Self::with_capture(run, journal, meter, None, Arc::default())
+    }
+
+    /// As [`Self::new`], also sampling the capture side.
+    pub fn with_capture(
+        run: u32,
+        journal: Journal,
+        meter: Arc<QueueMeter>,
+        capture: Option<Arc<CaptureStats>>,
+        dropped: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             run,
             journal,
@@ -128,6 +198,11 @@ impl RunProbe {
             activity_since_us: AtomicU64::new(0),
             buffers: Default::default(),
             stats: Mutex::new(Default::default()),
+            stages: Mutex::new(BTreeMap::new()),
+            rms: AtomicU32::new(0),
+            peak: AtomicU32::new(0),
+            capture,
+            dropped,
         })
     }
 
@@ -170,7 +245,30 @@ impl RunProbe {
         out.insert("queue_max_ms".into(), samples_ms(self.meter.take_peak()).into());
         out.insert("captured_ms".into(), samples_ms(self.meter.produced()).into());
         out.insert("consumed_ms".into(), samples_ms(self.meter.consumed()).into());
-        out.insert("run_wall_ms".into(), ms(self.started.elapsed()).into());
+        let wall_ms = ms(self.started.elapsed());
+        out.insert("run_wall_ms".into(), wall_ms.into());
+        // For comparison only: includes clock drift, see `journal::queue`.
+        let lag = wall_ms - samples_ms(self.meter.consumed());
+        out.insert("lag_ms".into(), ((lag * 10.0).round() / 10.0).into());
+
+        let round4 = |bits: u32| (f64::from(f32::from_bits(bits)) * 10_000.0).round() / 10_000.0;
+        out.insert("rms".into(), round4(self.rms.load(Ordering::Relaxed)).into());
+        out.insert("peak".into(), round4(self.peak.swap(0, Ordering::Relaxed)).into());
+        out.insert("dropped_ms".into(), samples_ms(self.dropped.load(Ordering::Relaxed)).into());
+        if let Some(c) = self.capture.as_deref() {
+            out.insert("stream_errors".into(), c.stream_errors().into());
+            if let Some(frames) = c.take_ring_peak() {
+                out.insert("ring_max_ms".into(), samples_ms(frames).into());
+            }
+        }
+        let stages = std::mem::take(&mut *self.stages.lock().unwrap_or_else(PoisonError::into_inner));
+        if !stages.is_empty() {
+            let stages: Map<String, Value> = stages
+                .into_iter()
+                .map(|(name, us)| (name.to_string(), ms(Duration::from_micros(us)).into()))
+                .collect();
+            out.insert("stages".into(), Value::Object(stages));
+        }
         for buffer in Buffer::ALL {
             let n = self.buffers[buffer as usize].load(Ordering::Relaxed);
             if n > 0 {

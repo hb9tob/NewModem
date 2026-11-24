@@ -50,12 +50,14 @@
 //!                          results/acq_scenarios/manifest.json
 //!   --events FILE          write the timestamped event trace (JSONL)
 //!   --summary FILE         write the summary JSON
+//!   --journal DIR          also record a modem journal under DIR
 //!   --keep-dir             keep the temporary session/save directory
 
 #![recursion_limit = "256"]
 
 use modem_core::profile::ProfileIndex;
 use modem_worker::event_sink::EventSink;
+use modem_worker::journal::{store::Limits, Journal};
 use modem_worker::rx_worker;
 use serde_json::{json, Value};
 use std::io::Write;
@@ -81,6 +83,7 @@ struct Args {
     signal_start: Option<f64>,
     events: Option<PathBuf>,
     summary: Option<PathBuf>,
+    journal: Option<PathBuf>,
     keep_dir: bool,
 }
 
@@ -99,6 +102,7 @@ fn parse_args() -> Args {
         signal_start: None,
         events: None,
         summary: None,
+        journal: None,
         keep_dir: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -139,6 +143,7 @@ fn parse_args() -> Args {
             "--deemph" => a.deemph = true,
             "--signal-start" => a.signal_start = Some(val(&mut i).parse().expect("--signal-start")),
             "--events" => a.events = Some(PathBuf::from(val(&mut i))),
+            "--journal" => a.journal = Some(PathBuf::from(val(&mut i))),
             "--summary" => a.summary = Some(PathBuf::from(val(&mut i))),
             "--keep-dir" => a.keep_dir = true,
             "-h" | "--help" => {
@@ -242,8 +247,14 @@ fn main() {
         events: Mutex::new(Vec::new()),
     });
 
+    let journal = match a.journal.as_deref() {
+        Some(root) => Journal::open(root, serde_json::Map::new(), Limits::default())
+            .expect("open journal"),
+        None => Journal::disabled(),
+    };
+
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    let mut worker = rx_worker::spawn(
+    let mut worker = rx_worker::spawn_journalled(
         rx,
         trace.clone(),
         Arc::new(Mutex::new(save_dir.clone())),
@@ -254,6 +265,8 @@ fn main() {
         a.power_mode,
         a.turbo,
         Arc::new(AtomicU64::new(0)),
+        journal.clone(),
+        None,
     );
 
     // CPU monitor: (wall_s, cpu_s) every 250 ms.
@@ -301,6 +314,7 @@ fn main() {
     if let Some(h) = worker.thread.take() {
         let _ = h.join();
     }
+    journal.close(Duration::from_secs(5));
     let end_wall = start.elapsed().as_secs_f64();
     let cpu_total = match (cpu_start, process_cpu_s()) {
         (Some(a0), Some(a1)) => Some(a1 - a0),

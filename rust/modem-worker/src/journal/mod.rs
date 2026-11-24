@@ -38,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 use crate::event_sink::EventSink;
+use modem_io::cpal_capture::CaptureStats;
 use probe::RunProbe;
 use queue::QueueMeter;
 use store::{Limits, SessionWriter};
@@ -172,13 +173,29 @@ impl Journal {
         }
     }
 
+    /// False for [`Journal::disabled`].
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
     /// Register a worker; keep the probe for as long as the worker runs.
     pub fn worker_started(&self, meter: Arc<QueueMeter>, about: Map<String, Value>) -> Arc<RunProbe> {
+        self.worker_started_with(meter, about, None, Arc::default())
+    }
+
+    /// As [`Self::worker_started`], also sampling the capture side.
+    pub fn worker_started_with(
+        &self,
+        meter: Arc<QueueMeter>,
+        about: Map<String, Value>,
+        capture: Option<Arc<CaptureStats>>,
+        dropped: Arc<AtomicU64>,
+    ) -> Arc<RunProbe> {
         let run = self
             .inner
             .as_ref()
             .map_or(0, |i| i.next_run.fetch_add(1, Ordering::Relaxed));
-        let probe = RunProbe::new(run, self.clone(), meter);
+        let probe = RunProbe::with_capture(run, self.clone(), meter, capture, dropped);
         if let Some(inner) = self.inner.as_ref() {
             *lock(&inner.current) = Arc::downgrade(&probe);
             inner.had_activity.store(true, Ordering::Relaxed);
