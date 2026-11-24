@@ -592,6 +592,26 @@ comparer avec les mesures d'avant.
 directeur : sur **chaque** scénario, turbo ≥ legacy pour l'entrée, les ESI
 uniques et le nombre de décochages, à duty CPU inférieur.
 
+### Cause ⑨ : détecteur SC par échantillon en O(W) (mesurée le 2026-11-22)
+
+Premier résultat du journal modem (`docs/plan_journal_modem.md`) : en turbo,
+l'étage `ingest` de `process_audio_chunk_impl` est de loin le premier poste.
+
+| Scénario | CPU process | dont `ingest` |
+|---|---|---|
+| S1 | 19,1 s | 13,7 s (72 %) |
+| S3 | 22,4 s | 13,9 s (62 %) |
+| S10 | 102,5 s | 64,3 s (63 %) |
+
+`ScDetector::push` recalcule ses trois sommes sur toute la fenêtre à **chaque
+échantillon** (boucle `0..window_samples` sur une `VecDeque`), à 48 kHz, session
+verrouillée ou non, et aussi pendant chaque replay. Le temps est mesuré sur hôte
+bridé : les secondes ne valent que ce jour-là, la proportion est le résultat.
+
+Pistes, non appliquées (chantier journal = mesure seule) : sommes glissantes en
+O(1) par échantillon à métrique identique, ou ne plus faire tourner le détecteur
+une fois verrouillé. À traiter en premier à la reprise de l'optimisation.
+
 ---
 
 ## Contraintes d'exécution

@@ -1,0 +1,69 @@
+{
+  "audio_s": 71.63535416666667,
+  "brickwall": 0,
+  "burst_exit": 0,
+  "chunk_ms": 20.0,
+  "cpu_duty": 0.053465220414617196,
+  "cpu_duty_max_1s": 0.2597266026875782,
+  "cpu_s": 3.83,
+  "drops_in_burst": 0,
+  "end_wall_s": 71.641067927,
+  "entered": true,
+  "entry": {
+    "audio_s": 22.24,
+    "lag_ms": 136.69175100000075,
+    "wall_s": 22.376691751
+  },
+  "entry_algo_s": null,
+  "entry_delay_s": null,
+  "esi_needed": 93,
+  "esi_ratio": 1.032258064516129,
+  "esi_received": 96,
+  "feed_wall_s": 71.640194979,
+  "file_complete": {
+    "audio_s": 63.74,
+    "lag_ms": 240.96927800000145,
+    "wall_s": 63.980969278
+  },
+  "file_s": 63.635354166666666,
+  "first_esi": {
+    "audio_s": 26.26,
+    "lag_ms": 79.74901499999731,
+    "wall_s": 26.339749015
+  },
+  "first_marker": null,
+  "forced": false,
+  "gate_cfo_polls": 0,
+  "gate_ms_max": 0.0,
+  "gate_ms_sum": 0.0,
+  "gate_open": null,
+  "gate_polls": 0,
+  "harness_late_releases": 0,
+  "input": "/home/hb9tob/git/NewModem/results/acq_scenarios/S3_voice20.wav",
+  "last_ppm": 0.0,
+  "legacy_preamble": {
+    "audio_s": 22.24,
+    "lag_ms": 136.43254100000135,
+    "wall_s": 22.376432541
+  },
+  "markers": 0,
+  "max_lag_at_wall_s": 63.98497602,
+  "max_lag_ms": 244.97601999999574,
+  "mode": "legacy",
+  "n_events": 3801,
+  "pace": "realtime",
+  "power_mode": true,
+  "profile": "NORMAL",
+  "restart_requests": 2,
+  "rewinds": 0,
+  "scan_decode_ms_max": 237.936,
+  "scan_decode_ms_sum": 2507.2870000000003,
+  "scans": 70,
+  "session_armed": {
+    "audio_s": 22.24,
+    "lag_ms": 136.4414690000011,
+    "wall_s": 22.376441469
+  },
+  "session_lost": 0,
+  "signal_start_s": null
+}
